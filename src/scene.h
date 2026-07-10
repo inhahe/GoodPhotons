@@ -7,7 +7,7 @@
 #include "spectrum.h"
 #include "scene_film.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -65,7 +65,34 @@ struct Material {
     Spectrum fluoEmit   = constantSpectrum(0.0);  // emission SPD M(lambda') (shape)
     EmissionSampler fluoEmitSampler;              // built from fluoEmit
     double fluoYield = 1.0;                        // quantum yield Q in [0,1]
+
+    // --- Stochastic mix (MatType::Mix) --------------------------------------
+    // A probabilistic blend of other materials: a photon (or camera path) picks
+    // child k with probability mixWeights[k], then behaves exactly as that child.
+    // Weights are constants that must sum to <= 1; any leftover (1 - sum) is the
+    // probability the photon is absorbed at the surface. This is the "same
+    // machinery" the spec's `layered`/`mix` design calls for — per-photon lobe
+    // selection — implemented by resolving the child BEFORE the material switch,
+    // so every transport path (forward, backward, CUDA) shares one code path.
+    // mixChildren holds indices into Scene::mats; a child may itself be any
+    // non-Mix material (nested Mix is disallowed by the parser to keep resolve
+    // single-step and the CDF bounded).
+    std::vector<int>    mixChildren;               // indices into Scene::mats
+    std::vector<double> mixWeights;                // selection probs, sum <= 1
 };
+
+// Resolve a Mix material to one of its child material indices using a single
+// uniform u in [0,1). Returns the chosen child index, or -1 if the photon falls
+// in the leftover (1 - sum weights) absorption slice. Non-Mix materials never
+// call this. Kept in the header so forward/backward transport share it verbatim.
+inline int mixPickChild(const Material& m, double u) {
+    double acc = 0.0;
+    for (size_t k = 0; k < m.mixChildren.size(); ++k) {
+        acc += m.mixWeights[k];
+        if (u < acc) return m.mixChildren[k];
+    }
+    return -1;   // leftover slice -> absorbed
+}
 
 // A classic "green highlighter" fluorophore: absorbs blue/violet strongly, glows
 // green (~560 nm). Shared by the fluoro demo scene and the -checkfluoro self-test

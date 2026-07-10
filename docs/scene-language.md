@@ -18,9 +18,13 @@
 > the engine now supports **multiple emitters** (any number of `light` blocks)
 > with a power-weighted selection CDF in the forward tracer (CPU + CUDA) and an
 > emitter-summing backward reference; validated by `scenes/twolight.ftsl` under
-> mode V. The still-unimplemented pieces (configurable spectral *range*, absolute
-> light power/units, layered materials, multi-camera/paths, textures/UVs, extra
-> light shapes) remain tagged **[needs engine work]** below. Alongside them, constructs
+> mode V. Phase 2d is done: the `type mix` material stochastically picks among
+> named child materials per photon (weights sum ≤ 1, remainder absorbs), shared by
+> the forward tracer, backward reference, and CUDA kernel; validated by
+> `scenes/mixmat.ftsl` under mode V. The still-unimplemented pieces (configurable
+> spectral *range*, absolute light power/units, the full physical `layered`
+> material, multi-camera/paths, textures/UVs, extra light shapes) remain tagged
+> **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
 >
@@ -178,6 +182,7 @@ material "glow"    { type fluorescent  absorb spectrum:excite  emit spectrum:emi
 | `thinfilm`    | **iridescence** (Airy interference) | `ior <spectrum>` (substrate) → `ior`; `film_ior <n>` → `filmIor`; `film_thickness <nm>` → `filmThickness`.       |
 | `grating`     | **diffraction** (vector grating eq.) | `reflect <spectrum>` → `reflect`; `groove_spacing <nm>` → `grooveSpacing`; `groove_dir x y z` → `grooveDir`; `max_order <int>` → `gratingMaxOrder`. |
 | `fluorescent` | **fluorescence** (wavelength shift) | `absorb <spectrum>` → `fluoAbsorb` (excitation ε(λ)); `emit <spectrum>` → `fluoEmit` (re-emission M(λ′), auto-baked into `fluoEmitSampler`); `yield <0..1>` → `fluoYield` (quantum yield Q); `reflect <spectrum>` → `reflect` (elastic base). |
+| `mix`         | **stochastic blend of materials** | `layer "<name>" <weight>` (repeatable) → `mixChildren`/`mixWeights`. Per photon, pick child `k` with prob `weight_k`; leftover `1 − Σweight` absorbs. Children are named non-mix materials. See §3.2. |
 
 ### 3.2 Combining effects on one surface — the `layered` material
 
@@ -253,10 +258,34 @@ material "lacquered_shell" {
 A `mix` of whole named materials (probabilistic pick among sub-materials) is a
 simpler, less-physical alternative that the same machinery supports; `layered`
 is preferred because the coat/body split is energy-consistent and matches how
-real surfaces work. Both are **[needs engine work]**. (Note: the existing
-backward reference tracer can't validate a body with `fluorescent` — see
-known-issues — so `layered` materials that fluoresce stay forward-only, same
-restriction as the standalone `fluorescent` type.)
+real surfaces work. (Note: the existing backward reference tracer can't validate
+a body with `fluorescent` — see known-issues — so `layered`/`mix` materials that
+include a fluorescent child stay forward-only, same restriction as the standalone
+`fluorescent` type; such scenes also fall back to the CPU forward tracer.)
+
+**`mix` is implemented** (Phase 2d). A photon (or backward path) that hits a mix
+picks child `k` with probability `weight_k`, then behaves *exactly* as that child
+material; the leftover `1 − Σ weight_k` is absorption. This is unbiased per-photon
+lobe selection shared verbatim by the forward tracer, the backward reference, and
+the CUDA kernel, so `mix` scenes validate with mode V. Children are named
+materials resolved by name (declared before or after the mix); nesting a mix
+inside a mix is rejected. The CUDA path supports up to 8 child lobes (more falls
+back to CPU).
+
+```
+# SUPPORTED: a stochastic mix of named materials (weights sum ≤ 1; remainder absorbs)
+material "warm"  { type diffuse reflect rgb 0.85 0.55 0.30 }
+material "cool"  { type diffuse reflect rgb 0.30 0.45 0.85 }
+material "blend" {
+    type mix
+    layer "warm" 0.5       # pick 'warm' with prob 0.5
+    layer "cool" 0.3       # pick 'cool' with prob 0.3
+    # leftover 0.2 ⇒ absorbed
+}
+```
+
+The full physical `layered` material (Fresnel/Airy-weighted coat over exotic body
+lobes) is still **[needs engine work]**.
 
 ---
 
@@ -717,7 +746,7 @@ designed to grow into.
 6. `units` scaling + configurable `spectral` range.
 7. Multiple lights (emitter list + power-weighted selection CDF). **[done — Phase 2b; `scenes/twolight.ftsl`]**
 8. RGB→reflectance upsampler (unlocks `rgb` spectra and later textures). **[done — `src/upsample.h`, Jakob-Hanika sigmoid fit, `-checkupsample`]**
-9. `mix`/layered materials (generalize `halfmirror`).
+9. `mix`/layered materials (generalize `halfmirror`). **[`mix` done — Phase 2d; per-photon lobe selection in forward + backward + CUDA; `scenes/mixmat.ftsl`. Full physical `layered` still needs engine work.]**
 
 **Phase 3 — larger features**
 10. Multiple cameras / `camera_path`; per-camera films; physical film size +

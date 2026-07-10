@@ -289,7 +289,17 @@ struct Renderer {
                 return;
             }
 
-            const Material& m = scene.mats[h.matId];
+            const Material* matp = &scene.mats[h.matId];
+            // Stochastic mix: pick a child material (or absorb on the leftover
+            // slice) BEFORE the switch, so the chosen child drives the vertex
+            // exactly as if it were the surface material. Weights are constants,
+            // so this is an unbiased per-photon lobe selection with beta unchanged.
+            if (matp->type == MatType::Mix) {
+                int child = mixPickChild(*matp, rng.uniform());
+                if (child < 0) { e.absorbed += beta; return; }
+                matp = &scene.mats[child];
+            }
+            const Material& m = *matp;
             // Specular/glossy vertices skip the camera connection (delta or
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {

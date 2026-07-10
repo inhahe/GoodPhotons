@@ -118,7 +118,11 @@ HD static inline void onb(const DVec3& n, DVec3& t, DVec3& b) {
 HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
 // Material type tags (must match MatType order in scene.h).
-enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM, D_GRATING };
+enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM, D_GRATING, D_MIX };
+
+// Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
+// exceed this fall back to the CPU forward tracer (cudaForwardSupported).
+#define D_MIXMAX 8
 
 // Camera measurement model (mirrors -mode A/B/C).
 enum { CAM_A = 0, CAM_B = 1, CAM_C = 2 };
@@ -132,6 +136,11 @@ struct DMaterial {
     double grooveSpacing;
     DVec3  grooveDir;
     int    gratingMaxOrder;
+    // Stochastic mix (D_MIX): pick child mixChild[k] with prob mixWeight[k];
+    // leftover (1 - sum) absorbs. Resolved before the material switch.
+    int    mixCount;
+    int    mixChild[D_MIXMAX];
+    double mixWeight[D_MIXMAX];
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; int matId, sensorId; };
@@ -670,7 +679,18 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
                 eSensor += beta; done = true; break;
             }
 
-            const DMaterial& m = sc.mats[h.matId];
+            const DMaterial* mptr = &sc.mats[h.matId];
+            // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
+            if (mptr->type == D_MIX) {
+                Real u = rng.uniform(), acc = 0; int child = -1;
+                for (int k = 0; k < mptr->mixCount; ++k) {
+                    acc += (Real)mptr->mixWeight[k];
+                    if (u < acc) { child = mptr->mixChild[k]; break; }
+                }
+                if (child < 0) { eAbsorbed += beta; done = true; break; }
+                mptr = &sc.mats[child];
+            }
+            const DMaterial& m = *mptr;
             if (m.type == D_DIELECTRIC) {
                 DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; continue;
             } else if (m.type == D_THINFILM) {
@@ -741,12 +761,24 @@ bool cudaForwardSupported(const Scene& scene) {
     // Only reject if geometry actually USES a fluorescent material — buildCornell
     // keeps a fluorescent entry in the material palette even when nothing points at
     // it, so scanning scene.mats alone would spuriously disable the GPU path.
-    auto usesFluoro = [&](int matId) {
+    auto isFluoro = [&](int matId) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
                scene.mats[matId].type == MatType::Fluorescent;
     };
-    for (const auto& t : scene.tris)    if (usesFluoro(t.matId)) return false;
-    for (const auto& s : scene.spheres) if (usesFluoro(s.matId)) return false;
+    // A used material is unsupported if it is fluorescent, or is a mix that either
+    // has too many child lobes for the GPU or references a fluorescent child.
+    auto unsupported = [&](int matId) {
+        if (isFluoro(matId)) return true;
+        if (matId >= 0 && matId < (int)scene.mats.size() &&
+            scene.mats[matId].type == MatType::Mix) {
+            const Material& mx = scene.mats[matId];
+            if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
+            for (int c : mx.mixChildren) if (isFluoro(c)) return true;
+        }
+        return false;
+    };
+    for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
+    for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
     return true;
 }
 
@@ -807,6 +839,9 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         d.grooveSpacing = m.grooveSpacing;
         d.grooveDir = {m.grooveDir.x, m.grooveDir.y, m.grooveDir.z};
         d.gratingMaxOrder = m.gratingMaxOrder;
+        d.mixCount = (int)m.mixChildren.size();
+        if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;   // cudaForwardSupported already rejected
+        for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
     }
 
     // --- upload ---

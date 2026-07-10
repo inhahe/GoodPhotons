@@ -5,6 +5,29 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Limitations (by design, tracked for future work)
 
+### Full physical `layered` material not yet implemented (`mix` is)
+- **What:** the FTSL `type mix` material (stochastic per-photon pick among named
+  child materials, weights ≤ 1, remainder absorbs) is implemented and validated
+  (Phase 2d — `scenes/mixmat.ftsl`, mode V PASS, CPU==GPU). The richer physical
+  `layered` material from the spec (§3.2) — a Fresnel/Airy-weighted specular *coat*
+  over a weighted *body* of diffuse/transmit/subsurface/fluorescent lobes with
+  energy-consistent coat↔body coupling — is **not** built yet.
+- **Why acceptable:** `mix` covers the "blend two finished materials" use case with
+  the same unbiased lobe-selection machinery; `layered` adds physically-correct
+  interface/substrate coupling (the transmitted fraction enters the body, internal
+  reflection, etc.) which is a larger transport change. The spec documents it as the
+  preferred long-term form.
+- **Constraints of `mix` (by design):** children must be non-mix materials (nesting
+  rejected by the parser to keep resolution single-step and the CUDA CDF bounded);
+  the CUDA path supports ≤ 8 child lobes (more → CPU fallback); a mix containing a
+  fluorescent child is forward-only and CPU-only (same fluorescence restriction as
+  the standalone type — see below).
+- **Proper fix (future):** implement `layered` as a coat interface (reuse
+  thinfilm/Fresnel reflect-or-enter) feeding a body lobe selector, with the body's
+  transmitted radiance re-emerging through the coat. Forward-first; backward support
+  follows the same per-lobe pattern except for fluorescent bodies.
+- **Status:** OPEN (acceptable) — `mix` done 2026-07-10; `layered` deferred.
+
 ### Backward reference tracer cannot validate fluorescence
 - **What:** `src/backward.h` has no Fluorescent case — a fluorescent material
   falls through to the Diffuse branch, so modes R (reference) and V (validate)

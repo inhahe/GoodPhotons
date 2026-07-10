@@ -135,7 +135,16 @@ struct BackwardRenderer {
             }
 
             if (!h.valid) return L;
-            const Material& m = scene.mats[h.matId];
+            const Material* mp = &scene.mats[h.matId];
+            // Stochastic mix: resolve to a child material (or terminate on the
+            // leftover absorption slice) before the switch, mirroring the forward
+            // tracer so the two agree on the blended surface by construction.
+            if (mp->type == MatType::Mix) {
+                int child = mixPickChild(*mp, rng.uniform());
+                if (child < 0) return L;   // absorbed
+                mp = &scene.mats[child];
+            }
+            const Material& m = *mp;
 
             // Emission (add only on specular/camera arrival; NEE covers diffuse).
             // The surface's own emitted radiance Le=m.emit(lambda), weighted by the

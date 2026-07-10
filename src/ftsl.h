@@ -9,6 +9,7 @@
 //   # line comment
 //   spectrum "name" = <spectrum-expr>          # named reusable spectrum
 //   material "name" { key value ...  key value }
+//   material "name" { type mix  layer "child" w  layer "child2" w  ... }  # stochastic blend
 //   sphere   { center x y z  radius r  material name }
 //   quad     { origin x y z  u x y z  v x y z  material name }
 //   triangle { v0 x y z  v1 x y z  v2 x y z  material name }
@@ -280,6 +281,14 @@ public:
             matIndex_[b.name] = id;
         }
 
+        // Pass 2b: resolve Mix child references (now that every name is known).
+        for (const auto& b : blocks) {
+            if (b.type != "material") continue;
+            int id = matIndex_[b.name];
+            if (L.scene.mats[id].type != MatType::Mix) continue;
+            if (!resolveMixChildren(b, L.scene.mats[id], L)) return false;
+        }
+
         // Pass 3: geometry, lights, medium, camera, render.
         bool haveLight = false;
         for (const auto& b : blocks) {
@@ -437,10 +446,41 @@ private:
             m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
             m.fluoYield = dblOf(b, "yield", 1.0);
             m.fluoEmitSampler.build(m.fluoEmit, 1.0);
+        } else if (type == "mix") {
+            // Stochastic mix of named child materials. Children are resolved to
+            // indices in a second pass (they may be declared later in the file);
+            // here we only mark the type — resolveMixChildren() fills the lists.
+            m.type = MatType::Mix;
         } else {
             fail("unknown material type '" + type + "'");
         }
         return m;
+    }
+
+    // Second material pass: resolve a Mix material's `layer "name" weight` entries
+    // to child indices + weights. Called after every material name is registered,
+    // so a mix may reference children declared before OR after it. Nested mixes are
+    // rejected to keep resolution single-step (and the CUDA CDF bounded).
+    bool resolveMixChildren(const Block& b, Material& m, Loaded& L) {
+        double sum = 0.0;
+        for (const auto& s : b.stmts) {
+            if (s.key != "layer") continue;
+            if (s.val.words.size() < 2) { fail("mix 'layer' needs a material name and a weight"); return false; }
+            const std::string& cname = s.val.words[0];
+            double w = num(s.val.words[1]);
+            auto it = matIndex_.find(cname);
+            if (it == matIndex_.end()) { fail("mix layer references unknown material '" + cname + "'"); return false; }
+            if (L.scene.mats[it->second].type == MatType::Mix) {
+                fail("mix layer '" + cname + "' is itself a mix (nesting is not allowed)"); return false;
+            }
+            if (w < 0.0) { fail("mix layer weight must be >= 0"); return false; }
+            m.mixChildren.push_back(it->second);
+            m.mixWeights.push_back(w);
+            sum += w;
+        }
+        if (m.mixChildren.empty()) { fail("mix material has no 'layer' entries"); return false; }
+        if (sum > 1.0 + 1e-9) { fail("mix layer weights sum to " + std::to_string(sum) + " (> 1)"); return false; }
+        return true;
     }
 
     // ---- geometry ----
