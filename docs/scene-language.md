@@ -161,24 +161,84 @@ material "glow"    { type fluorescent  absorb spectrum:excite  emit spectrum:emi
 | `grating`     | **diffraction** (vector grating eq.) | `reflect <spectrum>` → `reflect`; `groove_spacing <nm>` → `grooveSpacing`; `groove_dir x y z` → `grooveDir`; `max_order <int>` → `gratingMaxOrder`. |
 | `fluorescent` | **fluorescence** (wavelength shift) | `absorb <spectrum>` → `fluoAbsorb` (excitation ε(λ)); `emit <spectrum>` → `fluoEmit` (re-emission M(λ′), auto-baked into `fluoEmitSampler`); `yield <0..1>` → `fluoYield` (quantum yield Q); `reflect <spectrum>` → `reflect` (elastic base). |
 
-**Combining effects.** The user's wishlist mentions "combine semi-mirror with
-semi-transparency", mirror + glossy, etc. Today each surface is exactly one
-`MatType`, so a *layered* material (e.g. glossy clear-coat over diffuse, or
-partial mirror + partial transmit + partial diffuse in arbitrary ratios) is
-**[needs engine work]**: it requires a `layered`/`mix` material that stores
-child materials + per-photon selection probabilities. The format should reserve
-the syntax now so the engine can grow into it:
+### 3.2 Combining effects on one surface — the `layered` material
+
+**Can a single material be semi-mirror + glossy + transparent + translucent +
+iridescent + fluorescent at once? Yes — but only under the right model, and it
+is [needs engine work] (today a surface is exactly one `MatType`).** The
+important correction is that these are **not** independent, additively-stacked
+flags. Physically a surface is a **two-layer stack — one specular *interface* on
+top of a *body*** — and most of the "effects" are different knobs on the *same*
+lobe:
+
+**The interface** (the boundary the photon hits first). One specular lobe that
+splits incoming light into a reflected and a transmitted part:
+
+- `roughness` — 0 gives a **mirror**-sharp reflection; > 0 gives **glossy**. These
+  are not two effects to combine; they are one slider. ("mirror + glossy" is a
+  category error — you just pick a roughness.)
+- reflectance model — plain **Fresnel** (from `ior`) *or* thin-film **Airy**. The
+  Airy option *is* **iridescence**: it's a wavelength/angle-dependent replacement
+  for the interface's reflectance, not a separate layer. So "rough iridescence"
+  (oil-sheen / soap-film glint) = thin-film reflectance on a rough interface.
+- reflect-vs-transmit split — Fresnel-governed (physical), or a manual
+  `specular`/reflectance weight. A partial, angle-independent reflectance *is*
+  the **semi-mirror**; the part that isn't reflected transmits inward, which is
+  where **transparency** begins. "Semi-mirror + semi-transparent" is literally
+  one dielectric interface.
+
+**The body** (what happens to the transmitted part). A weighted choice, summing
+with the interface to ≤ 1 (energy conservation):
+
+- `diffuse reflect <spectrum>` — opaque **color** under the interface (paint under
+  clear-coat).
+- `transmit` with interior `absorb <spectrum>` — **transparency**; Beer-Lambert
+  absorption inside gives a tinted glass **translucence-by-absorption**.
+- `subsurface` — diffuse transmission / random-walk **translucence** (wax, skin,
+  marble).
+- `fluorescent { absorb / emit / yield }` — **fluorescence** (wavelength shift)
+  living in the body, under any interface.
+
+So the meaningful combinations all compose as a stack — e.g. *a rough iridescent
+coat over a tinted-transparent, subsurface, faintly-fluorescent body* is one
+coherent material. The only "combinations" that don't exist are the ones that
+are secretly the same lobe (mirror ≡ glossy at roughness 0).
+
+**In a photon tracer this is just weighted lobe selection per photon**, which is
+exactly how `halfmirror` already works (reflect-or-transmit by probability,
+`src/render.h:322`) and how dielectric/thinfilm pick reflect-vs-refract by
+Fresnel/Airy probability. The `layered` material generalizes that: pick the
+interface reflection vs. entering the body by probability, then pick the body
+lobe by weight.
 
 ```
-# PROPOSED (not yet supported): probabilistic mix of sub-materials
-material "coated" { type mix
-    layer material:brushed  weight 0.1     # 10% of photons take the glossy coat
-    layer material:white    weight 0.9     # 90% hit the diffuse base
+# PROPOSED (not yet supported): one physically-layered material
+material "lacquered_shell" {
+    type layered
+    coat {                       # the specular interface
+        roughness     0.15       # 0 = mirror, >0 = glossy
+        reflectance   thinfilm   # fresnel | thinfilm(=iridescent)
+        film_ior      1.4        # (thinfilm only)
+        film_thickness 380       # nm  (thinfilm only)
+        # specular   0.5         # optional manual partial reflectance ⇒ semi-mirror
+    }
+    body {                       # what the transmitted light does; weights sum ≤ 1
+        diffuse      { reflect rgb 0.2 0.5 0.9   weight 0.5 }
+        transmit     { ior glass:BK7  absorb spectrum:amber_tint   weight 0.3 }
+        subsurface   { reflect 0.8   weight 0.1 }         # translucence
+        fluorescent  { absorb spectrum:excite  emit spectrum:emit_green
+                       yield 0.9   weight 0.1 }
+    }
 }
 ```
 
-`halfmirror` is the one built-in "mix" today (reflect-or-transmit by
-probability); `mix` generalizes it.
+A `mix` of whole named materials (probabilistic pick among sub-materials) is a
+simpler, less-physical alternative that the same machinery supports; `layered`
+is preferred because the coat/body split is energy-consistent and matches how
+real surfaces work. Both are **[needs engine work]**. (Note: the existing
+backward reference tracer can't validate a body with `fluorescent` — see
+known-issues — so `layered` materials that fluoresce stay forward-only, same
+restriction as the standalone `fluorescent` type.)
 
 ---
 
@@ -422,35 +482,132 @@ the existing `connect()` since photons are camera-independent until the splat.
 
 ---
 
-## 9. Skins / UV mapping / textures — where this lands
+## 9. Skins / textures — import, mapping, and spectral color
 
-The wishlist asks about mapping "skins" to meshes (UV) and getting per-color
-spectral envelopes for them. Current state: **none of this exists** — meshes
-carry one material, no UVs, no textures (`src/mesh.h` ignores `vt`/`vn`).
+The wishlist: *"provide ways of mapping skins to meshes (to get as evenly
+distributed / without warp as possible, such as UV mapping)? can we also get
+skins with spectral envelopes somehow defined for their various colors?"*
 
-Design direction when it's built **[needs engine work]**:
+**Current state: none of this exists.** Meshes carry one material, there are no
+UVs, no image loader, and no texture concept (`src/mesh.h` reads only `v`/`f`,
+ignores `vt`/`vn`; the project only reads/writes PPM). Everything in this
+section is **[needs engine work]**. It breaks into three independent pieces:
+**(9.1) importing the image, (9.2) mapping it onto geometry, (9.3) turning its
+colors into spectra.**
 
-- **UVs:** read OBJ `vt` and store per-vertex UVs on `Tri`; barycentric-interp
-  at the hit point.
-- **Spectral textures:** a texture is a function `(u,v) → spectrum`. The honest
-  version stores a *spectral* image or, pragmatically, an sRGB image plus the
-  reflectance-upsampler from §2.1 (`rgb → smooth reflectance`) so ordinary
-  albedo maps become physically plausible spectra. Proposed syntax:
+### 9.1 Importing a skin (the image)
+
+Add a `texture` block and an image loader. Recommend **stb_image** (single
+public-domain header; PNG/JPG/TGA/BMP + `.hdr`) — no heavy dependency, matches
+the project's "no external deps" style.
+
+```
+texture "face_albedo" {
+    file     "face_albedo.png"
+    encoding srgb            # srgb | linear  — how to decode the file
+    filter   bilinear        # nearest | bilinear  (texel interpolation)
+    wrap     repeat          # repeat | clamp | mirror
+}
+```
+
+**Color management matters for physical correctness:** art PNG/JPGs are
+sRGB-**display-encoded** (gamma). `encoding srgb` linearizes each texel before
+use; data maps (roughness, masks, thickness) are `encoding linear` and skip it.
+HDR/`.hdr`/`.pfm` are already linear.
+
+### 9.2 Mapping the skin onto the mesh (the "even / without warp" question)
+
+A texture is sampled at a `(u,v)` produced from the surface hit. How that
+`(u,v)` is chosen is the mapping method, set per mesh:
+
+```
+mesh "head" { file "head.obj"  material face
+    uv use_mesh              # use the OBJ's own vt coordinates (preferred)
+    # uv triplanar scale 1.0 # box projection from 3 axes, blended by normal
+    # uv planar axis y       # single-axis projection
+    # uv spherical           # lat/long — globes, eyeballs
+    # uv cylindrical         # bottles, limbs
+}
+```
+
+- **`use_mesh` (UV mapping) — the low-warp answer.** Read OBJ `vt`, store
+  per-vertex UVs on `Tri`, barycentric-interpolate at the hit. **Crucial point:
+  "evenly distributed / without warp" is a property of the UV *unwrap* authored
+  in the modeling tool** (Blender/Maya minimize stretch + seams) — it is *not*
+  something the renderer solves. The renderer's job is to faithfully sample the
+  UVs the mesh already carries (with correct filtering/wrap). So the answer to
+  "how do I avoid warp?" is: author a good unwrap and export `vt`; the renderer
+  will honor it. This is exactly what UV mapping is for.
+- **`triplanar` — the renderer-side way to avoid warp with NO/bad UVs.** Project
+  the texture from the ±X/±Y/±Z axes and blend the three samples by the surface
+  normal. Gives seam-free, low-stretch mapping on organic shapes without any
+  unwrap — the best default when a mesh has no usable UVs. (Costs 3 texture
+  lookups; not tileable-artistically but distortion-free.)
+- **`planar` / `spherical` / `cylindrical`** — cheap procedural projections for
+  simple/known geometry; they warp on curvature (planar) or at poles
+  (spherical), so they're fallbacks, not general solutions.
+
+Needed engine plumbing: per-vertex UVs on `Tri` + a `Texture` type + a tangent
+frame from UV derivatives (only once normal/bump maps arrive).
+
+### 9.3 Spectral envelopes for the skin's colors (the key question)
+
+*Yes — a skin can carry proper spectra for its colors, two ways:*
+
+- **RGB → reflectance upsampling (general, for any color image).** Run each
+  linearized texel through a **reflectance upsampler** (Jakob-Hanika 2019, or
+  Scott Burns' method) to produce a smooth, physically-plausible reflectance
+  *spectrum* for that color. This is the same machine as the inline `rgb …`
+  spectrum in §2.1, applied per texel. It lets ordinary painted skins
+  participate correctly in the spectral pipeline (proper metamerism, correct
+  colour under non-D65 lights) without hand-authoring curves.
 
   ```
-  # PROPOSED:
-  spectrum_texture "skin_albedo" { file "face_albedo.png"  upsample reflectance }
-  material "face" { type diffuse  reflect texture:skin_albedo }
+  texture "face_albedo" { file "face_albedo.png"  encoding srgb  upsample reflectance }
+  material "face" { type diffuse  reflect texture:face_albedo }
   ```
 
-- **Even distribution / low warp:** that's an authoring-tool concern (the UV
-  layout in the mesh), not a renderer concern — the renderer just samples
-  whatever UVs the mesh provides.
+- **Indexed-spectral (precise, for known pigments / scientific skins).** The
+  image stores *indices*, and a palette maps each index to a named spectrum
+  (measured pigment, dye, metal). Exact where you know the actual materials —
+  e.g. a flag or a chart of paint chips.
 
-The reflectance-upsampler (Jakob-Hanika 2019 or Scott Burns' method) is the
-single most useful piece to build here: it unlocks both `rgb …` spectra (§2.1)
-and future RGB textures, letting non-spectral art assets participate in the
-spectral pipeline without hand-authoring curves.
+  ```
+  texture "flag" { file "flag_index.png"  encoding linear
+      palette { 0 spectrum:navy   1 spectrum:crimson   2 spectrum:offwhite } }
+  ```
+
+- **True spectral images** (per-texel measured spectra, e.g. hyperspectral
+  captures) are the most faithful but rarely available and storage-heavy; the
+  `texture` block could grow a `spectral` encoding later. Upsampling covers the
+  99% case.
+
+### 9.4 Textures drive *any* parameter, not just base color
+
+Because a texture resolves to a value at `(u,v)`, it can bind to any material
+parameter — spectral or scalar. That is what makes skins expressive:
+
+```
+material "face" {
+    type layered
+    coat { roughness texture:face_rough   reflectance fresnel  film_ior 1.45 }
+    body {
+        diffuse    { reflect texture:face_albedo }
+        subsurface { reflect texture:sss_map  weight texture:sss_mask }
+    }
+}
+```
+
+e.g. a **roughness map** (oily forehead vs. matte cheek), a **mix/weight mask**
+(where a coat or subsurface applies), or a spatially-varying **film-thickness
+map** driving §3.2 iridescence for a peacock/beetle skin. All the same texture
+machinery.
+
+**Build order for this section:** (1) stb_image + `texture` block + `use_mesh`
+UVs — makes ordinary albedo maps work; (2) the reflectance upsampler (shared
+with §2.1 `rgb`) — makes them spectrally correct; (3) triplanar + procedural
+projections — covers un-UV'd meshes; (4) parameter-driving + indexed/spectral
+textures — full expressiveness.
 
 ---
 
