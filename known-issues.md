@@ -112,9 +112,48 @@ as practical; this file is the fallback for what can't be addressed immediately.
     renders stay bit-identical (verified: cornell FTSL==C++==pre-3c hash).
 - **Deferred (still future):**
   1. **HDRI / environment lighting** — an image-based infinite emitter (`light env
-     { file "sky.hdr" }`). Larger: an environment sampler (importance-sampled by
-     luminance), escaped-ray environment lookup in forward + backward, and CUDA. The
-     `.hdr` loader already exists (stb float path in `src/texture.h`).
+     { file "sky.hdr"  rotate deg }`). This is the one Phase 3c item not yet built:
+     unlike the finite point/area/sphere/spot emitters, an environment illuminates
+     from infinity, so it needs a new transport path rather than an extra
+     `EmitterShape`. The `.hdr` loader already exists (stb float path in
+     `src/texture.h`), and the Jakob-Hanika RGB→reflectance upsampler
+     (`src/upsample.h`) gives the per-direction spectral emission. **Concrete plan
+     (each sub-step independently buildable + validatable):**
+     1. *Scene bounding sphere.* Add `Vec3 sceneCenter; double sceneRadius;`
+        computed in `Scene::build()` from the BVH root AABB (`center`, `0.5·diag`).
+        The env disk/emission and the "to infinity" shadow-ray length key off this.
+     2. *Env data + importance sampler.* Store the lat-long map as linear RGB +
+        per-texel JH coeffs (reuse `Texture`). Precompute a 2D luminance CDF
+        (marginal over rows, conditional over columns, each row weighted by
+        `sin θ`) → `sampleEnvDir(u1,u2, pdfω)` and `envPdf(ω)`. `envRadiance(ω,λ)`
+        = `reflAt(coeff(ω), λ)` scaled by an intensity factor.
+     3. *Backward first (easiest to validate in mode R).* In `radiance()`, on
+        `!h.valid` return `L + thr·envRadiance(ray.d,λ)·invPdfLambda` when
+        `specularArrival` (direct/mirror view of the sky). Add env NEE at diffuse
+        vertices: sample `ω~envPdf`, shadow-ray to `sceneRadius`, add
+        `f·envRadiance(ω,λ)·cosSurf·invPdfLambda/envPdf(ω)`. Fold the env into the
+        combined wavelength sampler `g(λ)` (its geomWeight ≈ `π·sceneRadius²·avgLum`).
+     4. *Forward emission.* New branch in `tracePhoton`: `shape == Env` emits a
+        photon FROM the sky — importance-sample `ω~envPdf`, pick a point on the disk
+        of radius `sceneRadius` perpendicular to `-ω` tangent to the bounding sphere,
+        fire along `-ω`, `beta = envPower · envRadiance(ω)/(avgLum·envPdf(ω))`.
+        `envPower = π·sceneRadius²·∫envRadiance dω` feeds the selection CDF like any
+        other emitter's `power`.
+     5. *Mode-B background.* In forward mode B a camera ray isn't traced, so the sky
+        isn't directly visible via `connect()`. Add a per-pixel background pass:
+        for each pixel, project the pinhole ray, and if it escapes, splat
+        `envRadiance(dir,λ)` (spectrally integrated) — a cheap deterministic add,
+        analogous to the existing direct-emitter `connect`.
+     6. *CUDA.* Upload the env RGB+coeff tables + the marginal/conditional CDFs;
+        port `sampleEnvDir`/`envPdf`/`envRadiance` and the forward disk-emission
+        branch. Escaped photons already terminate; only emission + (optional) the
+        mode-B background pass need device code. Keep `cudaForwardSupported()`
+        returning true for env scenes once ported (else fall back to CPU).
+     7. *Validation.* `scenes/envlight.ftsl` (a diffuse box open to the sky):
+        mode V forward-vs-backward RMSE < 5%; energy conserves; CPU==GPU. A constant
+        (single-colour) env is the smallest first milestone — it exercises steps
+        1/3/4/5/6 with a trivial step 2 (uniform pdf), so land that before the full
+        image-based 2D CDF.
   2. **Sphere-light importance sampling.** The current sphere sampler is uniform
      over the whole surface (half the samples face away → cosLight=0, wasted). The
      efficient fix is cone/solid-angle sampling of the visible cap toward the
@@ -124,8 +163,10 @@ as practical; this file is the fallback for what can't be addressed immediately.
      cone then reweights by falloff, so photons in the dark penumbra edge carry
      small weights (mild variance). Exact CDF sampling of the smoothstep band would
      be lower-variance but needs a quartic inverse; uniform+reweight is correct.
-- **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; HDRI environment +
-  sphere/spot importance-sampling deferred.
+- **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; HDRI environment
+  deferred with a concrete 7-step plan above (start with a constant-colour env to
+  land the transport plumbing, then add the image-based 2D CDF); sphere/spot
+  importance-sampling also deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
