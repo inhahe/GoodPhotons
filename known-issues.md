@@ -56,6 +56,33 @@ as practical; this file is the fallback for what can't be addressed immediately.
   `-checkfog` (deterministic transmittance / HG mean-cosine / phase-normalization
   self-test) is retained as a fast complementary check.
 
+### GPU backend (`-device gpu`) covers model B only
+- **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCudaMB`) implements
+  only the forward model-B light trace (connect/splat to the pinhole). It is used
+  for `-mode B` and the forward pass of `-mode V`; it silently falls back to the CPU
+  for modes A (contact sensor), C (finite-aperture forward catch), R (backward
+  reference), and for the mode-P camera-side/backward layer. Fluorescent scenes are
+  rejected on-device (fall back to CPU) because the emission-sampler reradiation
+  path is not ported — `cudaForwardSupported()` checks whether any *geometry* uses a
+  Fluorescent material (not just the palette, which buildCornell always populates).
+- **Why acceptable:** model B is the default forward mode and the one that dominates
+  render cost; mode R/backward and mode C are validation/creative paths that run at
+  lower sample counts. Validated: GPU vs CPU image RMSE ≈ 0.85/255 at 200M photons
+  (pure MC noise), energy report matches to 4 sig figs, and `-mode V -device gpu`
+  PASSes against the independent backward reference (bulk RMSE 4.17% ≈ CPU 4.22%).
+  Measured ~14× speedup (400M photons @256²: 153s CPU → 10.9s GPU on an RTX 4090).
+- **Spectral baking:** device materials/fog sample each `std::function` Spectrum into
+  a fixed 96-entry table over [360,830] nm with linear interpolation (`SPEC_N=96`).
+  Smooth reflectances/Sellmeier indices make this accurate to within MC noise; a
+  pathologically spiky spectrum would need a finer table. CIE CMFs are ported
+  analytically (no table).
+- **Proper fix (future):** port models A/C (photon aperture catch) and the backward
+  tracer to CUDA if those paths ever become the bottleneck; add a device
+  fluorescence path (bake `fluoEmitSampler`'s CDF) to lift the fluoro restriction.
+- **Status:** OPEN (acceptable) — logged 2026-07-10. Requires a CUDA toolkit at
+  configure time; without one the project builds CPU-only and `-device gpu` warns
+  and uses the CPU.
+
 ## Performance
 
 ### RESOLVED: Diffuse-mesh renders were ~60× slower per photon (degenerate BVH)

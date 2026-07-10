@@ -12,7 +12,11 @@ foreach(cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
 endforeach()
 
 if(MSVC)
-    add_compile_options(/W4 /permissive- /Zc:preprocessor)
+    # C++ only: passing these MSVC flags to nvcc directly makes it mis-parse the
+    # command line, so scope them to the CXX compile with a generator expression.
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>
+                        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
     # Fast math is NOT enabled: physical correctness matters more than speed for now.
 endif()
 
@@ -20,3 +24,32 @@ add_executable(ftrace
     src/main.cpp
 )
 target_include_directories(ftrace PRIVATE src)
+
+# --- Optional CUDA backend (GPU forward light tracer, model B) ---------------
+# If a CUDA toolkit is present, compile src/render_cuda.cu (by nvcc) into ftrace
+# and define HAVE_CUDA so main.cpp exposes the -device gpu path. Without CUDA the
+# renderer builds and runs exactly as before (CPU-only), so CUDA is not required.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 89)   # RTX 40-series (Ada, sm_89)
+    endif()
+    target_sources(ftrace PRIVATE src/render_cuda.cu)
+    target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
+    set_target_properties(ftrace PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_ARCHITECTURES "89")   # RTX 4090 (Ada, sm_89); adjust for other GPUs
+    # cudart_static is built against the static CRT (LIBCMT) while our C++ uses the
+    # dynamic CRT (/MD). Drop the static CRT from the default lib set so the linker
+    # resolves the CRT once (dynamic) — clears the benign LNK4098 conflict warning.
+    if(MSVC)
+        target_link_options(ftrace PRIVATE /NODEFAULTLIB:LIBCMT)
+    endif()
+    message(STATUS "CUDA backend enabled (arch 89)")
+else()
+    message(STATUS "CUDA not found; building CPU-only (-device gpu unavailable)")
+endif()

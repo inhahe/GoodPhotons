@@ -9,6 +9,12 @@
 //             surfaces (which model B alone leaves black). See renderComposite.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
+//
+// -device cpu|gpu selects the backend. gpu runs the model-B forward light trace
+// (mode B, and the forward pass of mode V) as a CUDA megakernel on the GPU; it
+// falls back to the CPU for modes A/C/R, the mode-P camera-side layer, and
+// fluorescent scenes. Requires a CUDA toolkit at build time (see CMakeLists.txt);
+// without one the renderer is CPU-only and -device gpu warns and uses the CPU.
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +29,9 @@
 #include "backward.h"
 #include "lights.h"
 #include "mesh.h"
+#ifdef HAVE_CUDA
+#include "render_cuda.h"
+#endif
 
 // Resolve a -light name to an emission SPD. "bbNNNN" means a Planckian at NNNN K
 // (e.g. bb3200). Unknown names fall back to a 6500 K blackbody.
@@ -654,7 +663,16 @@ static void thinFilmSwatch(double n1, double n2) {
 // backward reference.
 static Film renderForward(const Scene& scene, const Camera* cam, int res, long long N,
                           int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut,
-                          bool diffraction = true) {
+                          bool diffraction = true, bool useGpu = false) {
+#ifdef HAVE_CUDA
+    // GPU path: model B only (connect/splat). mode C (forwardCatch) and model A
+    // (no camera) stay on the CPU. Fluorescent scenes are unsupported on-device.
+    if (useGpu && useCamera && !forwardCatch && cam &&
+        cudaAvailable() && cudaForwardSupported(scene))
+        return renderForwardCudaMB(scene, *cam, res, N, eOut, diffraction);
+#else
+    (void)useGpu;
+#endif
     std::vector<Film> films(nThreads);
     std::vector<EnergyReport> reports(nThreads);
     for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
@@ -856,6 +874,7 @@ int main(int argc, char** argv) {
     bool thinFilmSwatchOnly = false;
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
+    const char* device = "cpu";   // -device cpu|gpu (GPU = CUDA model-B light tracer)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -888,6 +907,7 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-nodiffraction")) diffraction = false;
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
+        else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
     }
     if (nThreads < 1) nThreads = 1;
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
@@ -945,6 +965,24 @@ int main(int argc, char** argv) {
     // aperture forward catch. mode R: backward reference. mode V: validate B vs R.
     const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
     const bool forwardCatch = (mode == 'C');
+
+    // Resolve the -device request to an actual GPU-usable flag. The GPU path only
+    // covers the model-B forward light trace (mode B, and the forward pass of modes
+    // V/P); it silently falls back to the CPU for mode A/C/R and unsupported scenes.
+    bool useGpu = false;
+    if (!std::strcmp(device, "gpu")) {
+#ifdef HAVE_CUDA
+        if (!cudaAvailable())
+            std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
+        else if (!cudaForwardSupported(scene))
+            std::fprintf(stderr, "[device] scene has a GPU-unsupported material "
+                                 "(fluorescent); using CPU\n");
+        else { useGpu = true; std::printf("[device] GPU: %s\n", cudaDeviceName()); }
+#else
+        std::fprintf(stderr, "[device] built without CUDA; using CPU "
+                             "(reconfigure with a CUDA toolkit for -device gpu)\n");
+#endif
+    }
     Camera cam;
     if (useCamera) {
         if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
@@ -964,7 +1002,7 @@ int main(int argc, char** argv) {
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
         Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                                 /*forwardCatch*/false, /*useCamera*/true, e, diffraction);
+                                 /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
         double tot = e.absorbed + e.sensor + e.escaped + e.residual;
         std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                     e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
@@ -989,7 +1027,7 @@ int main(int argc, char** argv) {
                 mode, N, res, res, nThreads, (prism || grating) ? "beam" : lightName);
 
     EnergyReport e;
-    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction);
+    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction, useGpu);
 
     double tot = e.absorbed + e.sensor + e.escaped + e.residual;
     std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
