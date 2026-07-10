@@ -63,6 +63,9 @@ HD static inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); 
 // Material type tags (must match MatType order in scene.h).
 enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM, D_GRATING };
 
+// Camera measurement model (mirrors -mode A/B/C).
+enum { CAM_A = 0, CAM_B = 1, CAM_C = 2 };
+
 struct DMaterial {
     int    type;
     double reflect[SPEC_N];     // baked reflect spectrum
@@ -95,12 +98,14 @@ struct DScene {
     int    collimated; DVec3 beamDir;
     const double* lightCdf; int lightCdfN; double lightStep;
     DMedium medium;
+    DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
 };
 
 struct DCamera {
     DVec3  eye, u, v, w;
     double tanHalfX, tanHalfY;
     int    resX, resY;
+    double apertureR, filmDist, lensF;   // model C finite aperture / thin lens
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     HD bool project(const DVec3& p, int& px, int& py, double& cosCam, double& dist2) const {
         DVec3 d = p - eye;
@@ -113,6 +118,38 @@ struct DCamera {
         py = (int)((iy * 0.5 + 0.5) * resY);
         dist2 = dot(d, d);
         cosCam = cz / sqrt(dist2);
+        return true;
+    }
+    // Model A/C perspective catch: does this photon fly through the finite aperture
+    // disc (before hitting the scene, within hitDist) and land on the film? Port of
+    // Camera::catchPhoton, including the thin-lens paraxial refraction u' = u - rho/f.
+    HD bool catchPhoton(const DVec3& ro, const DVec3& rd, double hitDist, int& px, int& py) const {
+        double dw = dot(rd, w);
+        if (dw >= -1e-9) return false;
+        double tAp = dot(eye - ro, w) / dw;
+        if (tAp <= 1e-6 || tAp >= hitDist) return false;
+        DVec3 P = ro + rd * tAp;
+        DVec3 rho = P - eye;
+        if (dot(rho, rho) > apertureR * apertureR) return false;
+        DVec3 nAxis = w * (-1.0);
+        DVec3 dir = rd;
+        if (lensF > 0.0) {
+            double dax = dot(dir, nAxis);
+            DVec3 slope = (dir - nAxis * dax) / dax;
+            DVec3 slopeP = slope - rho * (1.0 / lensF);
+            dir = normalize(nAxis + slopeP);
+        }
+        double ddax = dot(dir, nAxis);
+        if (ddax <= 1e-9) return false;
+        double s = filmDist / ddax;
+        DVec3 Fcenter = eye + nAxis * filmDist;
+        DVec3 Q = P + dir * s;
+        DVec3 rel = Q - Fcenter;
+        double ix = -dot(rel, u) / (filmDist * tanHalfX);
+        double iy = -dot(rel, v) / (filmDist * tanHalfY);
+        if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
+        px = (int)((ix * 0.5 + 0.5) * resX);
+        py = (int)((iy * 0.5 + 0.5) * resY);
         return true;
     }
 };
@@ -433,6 +470,16 @@ __device__ static void filmAdd(double* film, int resX, int px, int py, double la
     atomicAdd(&film[idx + 1], cieY(lambda) * w);
     atomicAdd(&film[idx + 2], cieZ(lambda) * w);
 }
+// Model A: map a contact-sensor hit to a pixel on the output film and deposit.
+__device__ static void deposit(const DScene& sc, double* film, int resX, int resY,
+                               const DVec3& p, double lambda, double beta) {
+    DVec3 rel = p - sc.sensorOrigin;
+    double uu = dot(rel, sc.sensorUAxis) / dot(sc.sensorUAxis, sc.sensorUAxis);
+    double vv = dot(rel, sc.sensorVAxis) / dot(sc.sensorVAxis, sc.sensorVAxis);
+    if (uu < 0 || uu >= 1 || vv < 0 || vv >= 1) return;
+    int px = (int)(uu * resX), py = (int)(vv * resY);
+    filmAdd(film, resX, px, py, lambda, beta);
+}
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film,
                                const DVec3& p, const DVec3& n, double lambda, double beta, double rho) {
     DVec3 toCam = cam.eye - p;
@@ -481,7 +528,8 @@ __device__ static double sampleLambda(const DScene& sc, DRng& rng, double& pdf) 
 }
 
 __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
-                       long long N, int diffraction, unsigned long long seedBase, int maxBounce) {
+                       long long N, int diffraction, unsigned long long seedBase, int maxBounce,
+                       int camMode) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seed((unsigned long long)(g * 2 + 1), seedBase ^ (unsigned long long)g);
@@ -498,7 +546,10 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         double beta = sc.lightEmitIntegral * sc.lightArea * DPI;
         eEmitted += beta;
 
-        connect(sc, cam, film, origin, sc.lightNormal, lambda, beta, 1.0);
+        // Model B: connect the emitter itself to the pinhole (makes the source
+        // visible). Modes A/C instead catch photons that physically arrive.
+        if (camMode == CAM_B)
+            connect(sc, cam, film, origin, sc.lightNormal, lambda, beta, 1.0);
 
         DVec3 ro = origin + dir * 1e-6, rd = dir;
         bool done = false;
@@ -506,17 +557,28 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             DHit h = closestHit(sc, ro, rd);
             double dSurf = h.valid ? h.t : 1e30;
 
-            // fog free-flight
-            bool mediumEvent = false; DVec3 mp;
+            // fog free-flight; dEvent is the nearer of surface hit / volume collision.
+            bool mediumEvent = false; DVec3 mp; double dEvent = dSurf;
             if (sc.medium.enabled) {
                 double st = medSigmaT(sc.medium, lambda);
                 if (st > 0.0) {
                     double tMed = -log(1.0 - rng.uniform()) / st;
-                    if (tMed < dSurf) { mediumEvent = true; mp = ro + rd * tMed; }
+                    if (tMed < dSurf) { mediumEvent = true; mp = ro + rd * tMed; dEvent = tMed; }
                 }
             }
+
+            // Model C perspective catch: if the photon flies through the aperture
+            // nearer than the surface/fog event, it lands on the film. Analog physics.
+            if (camMode == CAM_C) {
+                int px, py;
+                if (cam.catchPhoton(ro, rd, dEvent, px, py)) {
+                    filmAdd(film, cam.resX, px, py, lambda, beta);
+                    eSensor += beta; done = true; break;
+                }
+            }
+
             if (mediumEvent) {
-                connectVolume(sc, cam, film, mp, rd, lambda, beta);
+                if (camMode == CAM_B) connectVolume(sc, cam, film, mp, rd, lambda, beta);
                 if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; done = true; break; }
                 DVec3 nd = sampleHG(rd, sc.medium.g, rng);
                 ro = mp; rd = nd;
@@ -524,7 +586,10 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             }
 
             if (!h.valid) { eEscaped += beta; done = true; break; }
-            if (h.sensorId >= 0) { eSensor += beta; done = true; break; }
+            if (h.sensorId >= 0) {
+                if (camMode == CAM_A) deposit(sc, film, cam.resX, cam.resY, h.p, lambda, beta);
+                eSensor += beta; done = true; break;
+            }
 
             const DMaterial& m = sc.mats[h.matId];
             if (m.type == D_DIELECTRIC) {
@@ -555,7 +620,7 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             } else {
                 // Diffuse (Fluorescent scenes are rejected on the host; never reached).
                 double rho = clamp01(specLookup(m.reflect, lambda));
-                connect(sc, cam, film, h.p, h.n, lambda, beta, rho);
+                if (camMode == CAM_B) connect(sc, cam, film, h.p, h.n, lambda, beta, rho);
                 if (rng.uniform() >= rho) { eAbsorbed += beta; done = true; break; }
                 ro = h.p + h.n * 1e-6; rd = cosineHemisphere(h.n, rng); continue;
             }
@@ -622,8 +687,9 @@ static T* uploadVec(const std::vector<T>& v) {
     return d;
 }
 
-Film renderForwardCudaMB(const Scene& scene, const Camera& cam, int res,
-                         long long N, EnergyReport& eOut, bool diffraction) {
+Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
+                       long long N, EnergyReport& eOut, bool diffraction,
+                       char camMode) {
     using namespace gpu;
     Film out; out.resX = res; out.resY = res; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -691,6 +757,10 @@ Film renderForwardCudaMB(const Scene& scene, const Camera& cam, int res,
     sc.medium.g = scene.medium.g;
     bakeSpec(scene.medium.sigma_a, sc.medium.sigma_a);
     bakeSpec(scene.medium.sigma_s, sc.medium.sigma_s);
+    // Model-A contact sensor plane (only used when camMode == 'A').
+    sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
+    sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
+    sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
 
     DCamera dc;
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
@@ -699,16 +769,20 @@ Film renderForwardCudaMB(const Scene& scene, const Camera& cam, int res,
     dc.w = {cam.w.x, cam.w.y, cam.w.z};
     dc.tanHalfX = cam.tanHalfX; dc.tanHalfY = cam.tanHalfY;
     dc.resX = res; dc.resY = res;
+    // Finite-aperture thin-lens parameters (only used when camMode == 'C').
+    dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
 
     double* d_film = nullptr;   cudaMalloc(&d_film, (size_t)res * res * 3 * sizeof(double));
     cudaMemset(d_film, 0, (size_t)res * res * 3 * sizeof(double));
     double* d_energy = nullptr; cudaMalloc(&d_energy, 5 * sizeof(double));
     cudaMemset(d_energy, 0, 5 * sizeof(double));
 
+    int camModeInt = (camMode == 'A') ? CAM_A : (camMode == 'C') ? CAM_C : CAM_B;
+
     int blockSize = 128;
     int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
     kTrace<<<numBlocks, blockSize>>>(sc, dc, d_film, d_energy, N, diffraction ? 1 : 0,
-                                     0x9e3779b97f4a7c15ULL, 32);
+                                     0x9e3779b97f4a7c15ULL, 32, camModeInt);
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
     if (kerr != cudaSuccess) {

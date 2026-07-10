@@ -7,11 +7,12 @@
 // POD materials), uploads them, launches a megakernel that mirrors
 // Renderer::tracePhoton, then downloads the accumulated film.
 //
-// Only model B (connect/splat to the pinhole) is implemented on the GPU — that is
-// the default forward mode and the one mode V validates. Fluorescence is NOT
-// supported on the device (it needs the emission-sampler reradiation path); a
-// scene containing a Fluorescent material must fall back to the CPU. The caller is
-// responsible for that check via cudaForwardSupported().
+// The GPU covers the three forward camera models: A (contact sensor deposit),
+// B (connect/splat to the pinhole — the default, and the one mode V validates), and
+// C (finite-aperture thin-lens forward catch). Fluorescence is NOT supported on the
+// device (it needs the emission-sampler reradiation path); a scene containing a
+// Fluorescent material must fall back to the CPU. The caller is responsible for that
+// check via cudaForwardSupported().
 #pragma once
 #include "scene.h"
 #include "camera.h"
@@ -28,11 +29,13 @@ const char* cudaDeviceName();
 // Fluorescent). When false, the caller must use the CPU renderer.
 bool cudaForwardSupported(const Scene& scene);
 
-// GPU forward light trace, model B (connect/splat to the pinhole). Traces N photons
-// and returns the accumulated camera film (same units/convention as the CPU
-// renderForward with useCamera=true, forwardCatch=false), so writePPM(film, N) and
-// the mode-V comparison work unchanged. Fills eOut with the same energy report.
-// Requires cudaAvailable() && cudaForwardSupported(scene); otherwise returns an
-// empty film.
-Film renderForwardCudaMB(const Scene& scene, const Camera& cam, int res,
-                         long long N, EnergyReport& eOut, bool diffraction);
+// GPU forward light trace. camMode selects the camera model: 'A' (contact-sensor
+// deposit), 'B' (connect/splat to the pinhole), or 'C' (finite-aperture forward
+// catch). Traces N photons and returns the accumulated camera film (same
+// units/convention as the CPU renderForward for the matching mode), so
+// writePPM(film, N) and the mode-V comparison work unchanged. Fills eOut with the
+// same energy report. Requires cudaAvailable() && cudaForwardSupported(scene);
+// otherwise returns an empty film.
+Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
+                       long long N, EnergyReport& eOut, bool diffraction,
+                       char camMode);

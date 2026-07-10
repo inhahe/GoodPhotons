@@ -56,32 +56,46 @@ as practical; this file is the fallback for what can't be addressed immediately.
   `-checkfog` (deterministic transmittance / HG mean-cosine / phase-normalization
   self-test) is retained as a fast complementary check.
 
-### GPU backend (`-device gpu`) covers model B only
-- **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCudaMB`) implements
-  only the forward model-B light trace (connect/splat to the pinhole). It is used
-  for `-mode B` and the forward pass of `-mode V`; it silently falls back to the CPU
-  for modes A (contact sensor), C (finite-aperture forward catch), R (backward
-  reference), and for the mode-P camera-side/backward layer. Fluorescent scenes are
+### GPU backend (`-device gpu`) covers all three forward camera models (A/B/C)
+- **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCuda`) implements
+  the three forward camera models — A (contact-sensor deposit), B (connect/splat to
+  the pinhole), and C (finite-aperture thin-lens forward catch) — selected by the
+  `camMode` parameter. It is used for `-mode A/B/C` and the forward pass of `-mode V`.
+  It still falls back to the CPU for mode R (backward reference) and the mode-P
+  camera-side/backward layer (no backward tracer on-device). Fluorescent scenes are
   rejected on-device (fall back to CPU) because the emission-sampler reradiation
   path is not ported — `cudaForwardSupported()` checks whether any *geometry* uses a
   Fluorescent material (not just the palette, which buildCornell always populates).
-- **Why acceptable:** model B is the default forward mode and the one that dominates
-  render cost; mode R/backward and mode C are validation/creative paths that run at
-  lower sample counts. Validated: GPU vs CPU image RMSE ≈ 0.85/255 at 200M photons
-  (pure MC noise), energy report matches to 4 sig figs, and `-mode V -device gpu`
-  PASSes against the independent backward reference (bulk RMSE 4.17% ≈ CPU 4.22%).
-  Measured ~14× speedup (400M photons @256²: 153s CPU → 10.9s GPU on an RTX 4090).
+- **Why acceptable / validated:** model B is the default and the one mode V
+  validates. The kernel `kTrace` mirrors `Renderer::tracePhoton` exactly and gates the
+  camera-specific work on `camMode`: emitter→pinhole connect, in-scatter
+  `connectVolume`, and diffuse-vertex `connect` run only for B; `catchPhoton` (thin
+  lens `u' = u - rho/f`) runs only for C; the sensor-plane `deposit` runs only for A.
+  Validation vs CPU (Cornell, 128²):
+  - **Mode B:** image RMSE ≈ 0.85/255 at 200M photons (pure MC noise); `-mode V
+    -device gpu` PASSes vs the backward reference (bulk RMSE 4.17% ≈ CPU 4.22%);
+    ~14× speedup (400M @256²: 153s CPU → 10.9s GPU on an RTX 4090).
+  - **Mode A:** energy report matches to 4 sig figs (sensor 0.3298 vs 0.3299); image
+    RMSE scales as √N — 11.18/255 @40M → 5.11/255 @200M (5× photons, ideal 2.24×,
+    measured 2.19×), proving variance not bias.
+  - **Mode C:** energy report matches to 4 sig figs; with a wide aperture (0.25,
+    focus 2.2) the caught fraction matches exactly (sensor=0.0058) and per-image
+    auto-exposure agrees (1.60e-8 vs 1.59e-8). Image RMSE scales as √N —
+    15.70/255 @200M → 8.10/255 @800M (4× photons, ideal 2×, measured 1.94×) —
+    proving variance not bias. (The CPU is deterministic across runs, so GPU is the
+    only independent noise realization; the small default aperture is catch-starved
+    and its tone-mapped RMSE is dominated by per-image auto-exposure.)
 - **Spectral baking:** device materials/fog sample each `std::function` Spectrum into
   a fixed 96-entry table over [360,830] nm with linear interpolation (`SPEC_N=96`).
   Smooth reflectances/Sellmeier indices make this accurate to within MC noise; a
   pathologically spiky spectrum would need a finer table. CIE CMFs are ported
   analytically (no table).
-- **Proper fix (future):** port models A/C (photon aperture catch) and the backward
-  tracer to CUDA if those paths ever become the bottleneck; add a device
+- **Proper fix (future):** port the backward tracer (modes R and the mode-P
+  camera-side layer) to CUDA if those paths ever become the bottleneck; add a device
   fluorescence path (bake `fluoEmitSampler`'s CDF) to lift the fluoro restriction.
-- **Status:** OPEN (acceptable) — logged 2026-07-10. Requires a CUDA toolkit at
-  configure time; without one the project builds CPU-only and `-device gpu` warns
-  and uses the CPU.
+- **Status:** OPEN (acceptable) — logged 2026-07-10; A/C added same day. Requires a
+  CUDA toolkit at configure time; without one the project builds CPU-only and
+  `-device gpu` warns and uses the CPU.
 
 ## Performance
 

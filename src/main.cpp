@@ -665,11 +665,15 @@ static Film renderForward(const Scene& scene, const Camera* cam, int res, long l
                           int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut,
                           bool diffraction = true, bool useGpu = false) {
 #ifdef HAVE_CUDA
-    // GPU path: model B only (connect/splat). mode C (forwardCatch) and model A
-    // (no camera) stay on the CPU. Fluorescent scenes are unsupported on-device.
-    if (useGpu && useCamera && !forwardCatch && cam &&
-        cudaAvailable() && cudaForwardSupported(scene))
-        return renderForwardCudaMB(scene, *cam, res, N, eOut, diffraction);
+    // GPU path covers all three forward camera models: A (contact-sensor deposit,
+    // useCamera==false), B (connect/splat to the pinhole), C (finite-aperture
+    // forward catch). Fluorescent scenes are unsupported on-device and fall back to
+    // the CPU. cam is non-null in every mode (mode A passes a default Camera whose
+    // frame is unused; the sensor plane is baked from scene.sensor).
+    if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
+        char camMode = forwardCatch ? 'C' : (useCamera ? 'B' : 'A');
+        return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode);
+    }
 #else
     (void)useGpu;
 #endif
@@ -966,9 +970,9 @@ int main(int argc, char** argv) {
     const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
     const bool forwardCatch = (mode == 'C');
 
-    // Resolve the -device request to an actual GPU-usable flag. The GPU path only
-    // covers the model-B forward light trace (mode B, and the forward pass of modes
-    // V/P); it silently falls back to the CPU for mode A/C/R and unsupported scenes.
+    // Resolve the -device request to an actual GPU-usable flag. The GPU path covers
+    // the three forward camera models A/B/C (mode B is also the forward pass of modes
+    // V/P); it falls back to the CPU for mode R (backward) and unsupported scenes.
     bool useGpu = false;
     if (!std::strcmp(device, "gpu")) {
 #ifdef HAVE_CUDA
