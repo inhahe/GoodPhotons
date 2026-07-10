@@ -57,6 +57,36 @@ as practical; this file is the fallback for what can't be addressed immediately.
     the auto-exposure anchor in `writePPM`. Validated by `scenes/expo.ftsl` (ISO 200
     is exactly 2.0× ISO 100 in linear space).
 
+### Texturing is base-color only, PPM/PFM only, `use_mesh`/quad UVs only (Phase 3b partial)
+- **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear
+  filter nearest|bilinear wrap repeat|clamp|mirror }` block loads an image into
+  `Scene::textures` (`src/texture.h`); `reflect texture:<name>` on a `diffuse`
+  material binds it (`Material::reflectTex`); per-vertex UVs live on `Tri`
+  (`src/geometry.h`), auto-generated for quads and read from OBJ `vt` when a mesh
+  sets `uv use_mesh`; each texel is Jakob-Hanika–upsampled to a reflectance
+  spectrum (coefficients precomputed at load via `Texture::buildReflCoeff`, bilerped
+  + sigmoid-evaluated per hit through `diffuseReflectance()`). Shared by the forward
+  tracer and the backward reference. Validated by `scenes/textured.ftsl` (quad) and
+  `scenes/uvmesh.ftsl` (mesh) — the checker maps with correct orientation (blue band
+  at v≈1/top, yellow at u≈0/left) and spectral colour.
+- **Remaining [needs engine work]:**
+  1. **Image formats.** Only PPM (P6/P3) and PFM (PF/Pf) load. PNG/JPG need an
+     stb_image drop-in — only `Texture::load()` learns the new magic bytes; all
+     downstream sampling/coeff/plumbing is format-agnostic.
+  2. **UV projections.** Only `uv use_mesh` (OBJ `vt`) and quad corners exist. The
+     procedural projections in the spec (§9.2 triplanar/planar/spherical/cylindrical)
+     are not built — meshes without `vt` fall back to zero UVs.
+  3. **Non-albedo parameters.** A texture can only bind to diffuse `reflect` today.
+     Spec §9.4 wants textures on roughness, mix weights, ior, thickness, etc. — each
+     needs the corresponding material param to accept a per-hit texture lookup.
+  4. **GPU.** Textured scenes force the CPU tracer (`cudaForwardSupported()` returns
+     false): the CUDA kernel bakes one reflect spectrum per material and has no
+     per-hit texture sampler. A device port would upload texel coeff tables + UVs.
+  5. **Indexed-spectral palettes** (§9.3) — an index image + name→spectrum palette —
+     not implemented.
+- **Status:** OPEN (acceptable) — base-color texturing done 2026-07-10; the five
+  items above deferred.
+
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
   child materials, weights ≤ 1, remainder absorbs) is implemented and validated

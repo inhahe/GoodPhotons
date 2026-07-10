@@ -945,9 +945,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
             if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
-                                              "material (fluorescent); using CPU\n");
-            else         std::printf("[device] auto -> CPU (fluorescent scene "
-                                     "unsupported on GPU)\n");
+                                              "material (fluorescent, textured, or "
+                                              "oversized mix); using CPU\n");
+            else         std::printf("[device] auto -> CPU (GPU-unsupported material: "
+                                     "fluorescent, textured, or oversized mix)\n");
         } else {
             useGpu = true;
             std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",

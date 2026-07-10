@@ -3,6 +3,8 @@
 #pragma once
 #include <vector>
 #include <cfloat>
+#include <cmath>
+#include <algorithm>
 #include "linalg.h"
 
 constexpr double PI = 3.141592653589793;
@@ -14,6 +16,9 @@ struct Tri {
     int matId = 0;
     int sensorId = -1;      // >=0 if this triangle is part of a sensor
     Vec3 gn;               // geometric normal (unit)
+    // Per-vertex texture coordinates (u in .x, v in .y; .z unused). Defaults give
+    // a sensible mapping for an untextured tri; quads and OBJ `vt` fill real values.
+    Vec3 uv0{0, 0, 0}, uv1{1, 0, 0}, uv2{1, 1, 0};
     void finalize() { gn = normalize(cross(v1 - v0, v2 - v0)); }
 };
 
@@ -28,6 +33,7 @@ struct Hit {
     Vec3 p, n, ng;         // n = oriented against ray; ng = raw geometric normal
     int matId = 0;
     int sensorId = -1;
+    double u = 0, v = 0;   // interpolated surface texture coordinates
 };
 
 inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
@@ -49,6 +55,11 @@ inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
     hit.ng = tri.gn;
     hit.n = (dot(r.d, tri.gn) < 0.0) ? tri.gn : -tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
+    // Barycentric-interpolate the per-vertex UVs (u,v here are the Moller-Trumbore
+    // weights of v1,v2; the v0 weight is 1-u-v).
+    double w0 = 1.0 - u - v;
+    hit.u = w0 * tri.uv0.x + u * tri.uv1.x + v * tri.uv2.x;
+    hit.v = w0 * tri.uv0.y + u * tri.uv1.y + v * tri.uv2.y;
     return true;
 }
 
@@ -68,5 +79,8 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     hit.ng = ng;
     hit.n = (dot(r.d, ng) < 0.0) ? ng : -ng;
     hit.matId = s.matId; hit.sensorId = -1;
+    // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs).
+    hit.u = 0.5 + std::atan2(ng.z, ng.x) / (2.0 * PI);
+    hit.v = 0.5 - std::asin(std::clamp(ng.y, -1.0, 1.0)) / PI;
     return true;
 }

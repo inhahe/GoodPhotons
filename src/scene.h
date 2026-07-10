@@ -6,6 +6,7 @@
 #include "bvh.h"
 #include "spectrum.h"
 #include "scene_film.h"
+#include "texture.h"
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix };
 
@@ -30,6 +31,10 @@ struct Material {
     Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
     double roughness = 0.1;                    // glossy lobe width [0,1]
     bool isLight = false;
+    // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
+    // constant `reflect` spectrum). When set, the reflectance at a hit is the
+    // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
+    int reflectTex = -1;
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
@@ -159,6 +164,7 @@ struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Material> mats;
+    std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     Sensor sensor;
     Medium medium;   // optional global fog / participating medium (disabled by default)
 
@@ -291,3 +297,13 @@ struct Scene {
         return h;
     }
 };
+
+// Diffuse albedo at a hit: the material's spatially-varying texture reflectance if
+// one is bound (Phase 3b), else its constant `reflect` spectrum. Shared by the
+// forward tracer and the backward reference so both see identical albedo.
+inline double diffuseReflectance(const Scene& scene, const Material& m,
+                                 const Hit& h, double lambda) {
+    if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size())
+        return scene.textures[m.reflectTex].reflectanceAt(h.u, h.v, lambda);
+    return m.reflect(lambda);
+}

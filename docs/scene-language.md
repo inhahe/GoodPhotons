@@ -27,10 +27,17 @@
 > block expands into keyframe-interpolated frame cameras (`scenes/dolly.ftsl`); and
 > physical film `size` (mm) → focal length, `fstop` → aperture radius, plus relative
 > exposure compensation via `iso`/`shutter`/`exposure` (`scenes/expo.ftsl`).
-> The still-unimplemented
+> Phase 3b (partial) is done: a `texture` block loads a PPM/PFM image and binds it
+> to a diffuse material's albedo via `reflect texture:<name>`; per-vertex UVs flow
+> through quads (auto-generated corners) and OBJ meshes (`uv use_mesh` reads `vt`),
+> and each texel is Jakob-Hanika–upsampled to a reflectance spectrum at the sampled
+> wavelength (`scenes/textured.ftsl`, `scenes/uvmesh.ftsl`). Textured scenes run on
+> the CPU (the CUDA kernel bakes only one reflect spectrum, so it defers to the CPU
+> tracer). The still-unimplemented
 > pieces (configurable spectral *range*, absolute light power/units — which also
 > gates absolute-EV film sensitivity — the full physical `layered` material, the
-> shared multi-camera mode-B pass, non-square films, textures/UVs, extra light
+> shared multi-camera mode-B pass, non-square films, PNG/JPG texture import
+> (stb_image), textures on non-albedo parameters, per-face OBJ `usemtl`, extra light
 > shapes) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
@@ -317,18 +324,20 @@ mesh     { file "bunny.obj"   material white
 
 - `sphere` / `quad` / `triangle` — **[maps 1:1]** onto `Sphere` / two `Tri` /
   one `Tri` (`src/geometry.h`).
-- `mesh` — **[maps 1:1 for the basics]** via `loadObj` (`src/mesh.h:27`), which
-  reads `v`/`f` and applies `translate` + uniform `scale`. **[needs engine
-  work]** for: non-uniform scale + rotation (loader only does translate+uniform
-  scale today — add a full 4×4 transform), per-face / per-group materials (OBJ
-  `usemtl` is ignored — currently one `matId` for the whole mesh), and vertex
-  normals/UVs (ignored). See §6 for the UV/texture/skin discussion.
+- `mesh` — **[maps 1:1]** via `loadObj` (`src/mesh.h`), which reads `v`/`f`, the
+  full affine `translate` + `rotate` (Euler XYZ, degrees) + non-uniform `scale`
+  transform (Phase 1e), and — when `uv use_mesh` is set — per-vertex texture
+  coordinates from `vt` (Phase 3b, §9). **[needs engine work]** for: per-face /
+  per-group materials (OBJ `usemtl` is ignored — currently one `matId` for the
+  whole mesh) and vertex normals (`vn` ignored; geometric normals are recomputed).
+  See §9 for the UV/texture/skin discussion.
 
-**Reserved transform syntax** (for when the loader gains a full transform):
+**Full transform syntax** (implemented — `rotate` is Euler XYZ in degrees, `scale`
+is a single uniform value or a vec3):
 
 ```
 mesh { file "teapot.obj" material brushed
-       translate 0 0.5 -1   rotate_y 30   scale 0.5 0.5 0.5 }
+       translate 0 0.5 -1   rotate 0 30 0   scale 0.5 0.5 0.5 }
 ```
 
 ---
@@ -603,32 +612,42 @@ The wishlist: *"provide ways of mapping skins to meshes (to get as evenly
 distributed / without warp as possible, such as UV mapping)? can we also get
 skins with spectral envelopes somehow defined for their various colors?"*
 
-**Current state: none of this exists.** Meshes carry one material, there are no
-UVs, no image loader, and no texture concept (`src/mesh.h` reads only `v`/`f`,
-ignores `vt`/`vn`; the project only reads/writes PPM). Everything in this
-section is **[needs engine work]**. It breaks into three independent pieces:
-**(9.1) importing the image, (9.2) mapping it onto geometry, (9.3) turning its
-colors into spectra.**
+**Current state: base-color texturing works (Phase 3b).** A `texture` block loads
+a PPM/PFM image; `reflect texture:<name>` binds it to a `diffuse` material's albedo;
+per-vertex UVs flow through quads (auto corners) and OBJ meshes (`uv use_mesh` reads
+`vt`), barycentric-interpolated at the hit (`src/geometry.h`); and each texel is
+Jakob-Hanika–upsampled to a reflectance spectrum at the sampled wavelength
+(`src/texture.h`). Validated by `scenes/textured.ftsl` (quad) and `scenes/uvmesh.ftsl`
+(mesh). **Still [needs engine work]:** PNG/JPG import (stb_image — only PPM/PFM
+load today), procedural UV projections (triplanar/planar/spherical/cylindrical —
+only `use_mesh` + quad corners exist), indexed-spectral palettes, and textures on
+non-albedo parameters (§9.4). Textured scenes run on the CPU (the CUDA kernel bakes
+a single reflect spectrum, so it defers to the CPU tracer). The section breaks into
+three pieces: **(9.1) importing the image, (9.2) mapping it onto geometry, (9.3)
+turning its colors into spectra.**
 
 ### 9.1 Importing a skin (the image)
 
-Add a `texture` block and an image loader. Recommend **stb_image** (single
-public-domain header; PNG/JPG/TGA/BMP + `.hdr`) — no heavy dependency, matches
-the project's "no external deps" style.
+A `texture` block names an image and its sampling parameters. **Implemented now:**
+PPM (P6/P3) and PFM (PF/Pf float) via the dependency-free loader in `src/texture.h`.
+PNG/JPG (recommended: **stb_image**, a single public-domain header matching the
+project's "no external deps" style) is a drop-in follow-up — only `Texture::load()`
+needs the new magic bytes; sampling and coefficient precompute are shared.
 
 ```
 texture "face_albedo" {
-    file     "face_albedo.png"
-    encoding srgb            # srgb | linear  — how to decode the file
-    filter   bilinear        # nearest | bilinear  (texel interpolation)
-    wrap     repeat          # repeat | clamp | mirror
+    file     scenes/face_albedo.ppm
+    encoding srgb            # srgb | linear  — how to decode the file  [implemented]
+    filter   bilinear        # nearest | bilinear  (texel interpolation) [implemented]
+    wrap     repeat          # repeat | clamp | mirror                   [implemented]
 }
 ```
 
 **Color management matters for physical correctness:** art PNG/JPGs are
 sRGB-**display-encoded** (gamma). `encoding srgb` linearizes each texel before
-use; data maps (roughness, masks, thickness) are `encoding linear` and skip it.
-HDR/`.hdr`/`.pfm` are already linear.
+use (`srgbToLinear`, `src/color.h`); data maps (roughness, masks, thickness) are
+`encoding linear` and skip it. HDR/`.hdr`/`.pfm` are already linear (the PFM
+loader forces `encoding linear`).
 
 ### 9.2 Mapping the skin onto the mesh (the "even / without warp" question)
 
@@ -637,16 +656,16 @@ A texture is sampled at a `(u,v)` produced from the surface hit. How that
 
 ```
 mesh "head" { file "head.obj"  material face
-    uv use_mesh              # use the OBJ's own vt coordinates (preferred)
-    # uv triplanar scale 1.0 # box projection from 3 axes, blended by normal
-    # uv planar axis y       # single-axis projection
-    # uv spherical           # lat/long — globes, eyeballs
-    # uv cylindrical         # bottles, limbs
+    uv use_mesh              # use the OBJ's own vt coordinates  [implemented]
+    # uv triplanar scale 1.0 # box projection from 3 axes, blended by normal  [needs engine work]
+    # uv planar axis y       # single-axis projection                          [needs engine work]
+    # uv spherical           # lat/long — globes, eyeballs                      [needs engine work]
+    # uv cylindrical         # bottles, limbs                                   [needs engine work]
 }
 ```
 
-- **`use_mesh` (UV mapping) — the low-warp answer.** Read OBJ `vt`, store
-  per-vertex UVs on `Tri`, barycentric-interpolate at the hit. **Crucial point:
+- **`use_mesh` (UV mapping) — the low-warp answer. [implemented]** Reads OBJ `vt`,
+  stores per-vertex UVs on `Tri`, barycentric-interpolates at the hit. **Crucial point:
   "evenly distributed / without warp" is a property of the UV *unwrap* authored
   in the modeling tool** (Blender/Maya minimize stretch + seams) — it is *not*
   something the renderer solves. The renderer's job is to faithfully sample the
@@ -662,24 +681,27 @@ mesh "head" { file "head.obj"  material face
   simple/known geometry; they warp on curvature (planar) or at poles
   (spherical), so they're fallbacks, not general solutions.
 
-Needed engine plumbing: per-vertex UVs on `Tri` + a `Texture` type + a tangent
-frame from UV derivatives (only once normal/bump maps arrive).
+Per-vertex UVs on `Tri` and the `Texture` type are implemented; a tangent frame
+from UV derivatives is still future work (only needed once normal/bump maps arrive).
 
 ### 9.3 Spectral envelopes for the skin's colors (the key question)
 
 *Yes — a skin can carry proper spectra for its colors, two ways:*
 
-- **RGB → reflectance upsampling (general, for any color image).** Run each
-  linearized texel through the **reflectance upsampler** — implemented as the
-  Jakob-Hanika 2019 sigmoid fit in `src/upsample.h` (`rgbToReflectanceJH`) — to
-  produce a smooth, physically-plausible reflectance *spectrum* for that color.
-  This is the same machine as the inline `rgb …` spectrum in §2.1 (already
-  wired), to be applied per texel once textures land. It lets ordinary painted skins
-  participate correctly in the spectral pipeline (proper metamerism, correct
-  colour under non-D65 lights) without hand-authoring curves.
+- **RGB → reflectance upsampling (general, for any color image). [implemented]**
+  Each linearized texel is run through the **reflectance upsampler** — the
+  Jakob-Hanika 2019 sigmoid fit in `src/upsample.h` — to produce a smooth,
+  physically-plausible reflectance *spectrum* for that color. The coefficients are
+  precomputed per texel at load (`Texture::buildReflCoeff`), then bilinearly
+  interpolated and evaluated at the sampled wavelength per hit — the standard
+  Jakob-Hanika coefficient interpolation, so per-hit cost is a bilerp + sigmoid,
+  not a Gauss-Newton fit. This is the same machine as the inline `rgb …` spectrum
+  in §2.1. It lets ordinary painted skins participate correctly in the spectral
+  pipeline (proper metamerism, correct colour under non-D65 lights) without
+  hand-authoring curves. Upsampling is automatic — no `upsample` keyword needed:
 
   ```
-  texture "face_albedo" { file "face_albedo.png"  encoding srgb  upsample reflectance }
+  texture "face_albedo" { file scenes/face_albedo.ppm  encoding srgb }
   material "face" { type diffuse  reflect texture:face_albedo }
   ```
 

@@ -21,6 +21,21 @@ inline int objVertexIndex(const std::string& tok, int vertexCount) {
     return -1;
 }
 
+// Parse the texture-coordinate index (the 2nd field) of an OBJ face token
+// ("12/3", "12/3/4"). Returns -1 when the token carries no vt ("12" or "12//4").
+inline int objTexIndex(const std::string& tok, int texCount) {
+    auto p = tok.find('/');
+    if (p == std::string::npos) return -1;
+    auto q = tok.find('/', p + 1);
+    std::string field = (q == std::string::npos) ? tok.substr(p + 1)
+                                                  : tok.substr(p + 1, q - p - 1);
+    if (field.empty()) return -1;              // "12//4" has no vt
+    int idx = std::atoi(field.c_str());
+    if (idx > 0)  return idx - 1;
+    if (idx < 0)  return texCount + idx;       // relative
+    return -1;
+}
+
 // A local->world affine transform for a loaded mesh: world = translate + R*(scale⊙local),
 // with R = Rz(rz)·Ry(ry)·Rx(rx) built from Euler angles in DEGREES. Uniform scale is
 // just scale={k,k,k}; identity is the default (translate 0, scale 1, no rotation).
@@ -47,13 +62,17 @@ struct MeshXform {
 };
 
 // Load an OBJ into the scene as triangles of material `matId`, applying the full
-// affine transform `xf` (translate + rotation + non-uniform scale). Returns the
-// number of triangles added (0 on failure). Call before Scene::build().
-inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf) {
+// affine transform `xf` (translate + rotation + non-uniform scale). When `loadUV`
+// is set, per-vertex texture coordinates are read from `vt` lines and assigned to
+// the triangles (for textured materials); otherwise the Tri default UVs are kept.
+// Returns the number of triangles added (0 on failure). Call before Scene::build().
+inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
+                   bool loadUV = false) {
     std::ifstream f(path);
     if (!f) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
 
     std::vector<Vec3> verts;
+    std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
     int added = 0;
     std::string line;
     while (std::getline(f, line)) {
@@ -62,17 +81,30 @@ inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf) {
             std::istringstream ss(line.substr(2));
             Vec3 v; ss >> v.x >> v.y >> v.z;
             verts.push_back(xf.apply(v));
+        } else if (loadUV && line[0] == 'v' && line[1] == 't') {
+            std::istringstream ss(line.substr(2));
+            double u = 0, v = 0; ss >> u >> v;
+            texcoords.push_back(Vec3{u, v, 0});
         } else if (line[0] == 'f' && line[1] == ' ') {
             std::istringstream ss(line.substr(2));
-            std::vector<int> idx;
+            std::vector<int> idx, tidx;
             std::string tok;
             while (ss >> tok) {
                 int vi = objVertexIndex(tok, (int)verts.size());
-                if (vi >= 0 && vi < (int)verts.size()) idx.push_back(vi);
+                if (vi < 0 || vi >= (int)verts.size()) continue;
+                idx.push_back(vi);
+                tidx.push_back(loadUV ? objTexIndex(tok, (int)texcoords.size()) : -1);
             }
             // Fan-triangulate the polygon (0, k, k+1).
+            auto uvAt = [&](int ti) -> Vec3 {
+                return (ti >= 0 && ti < (int)texcoords.size()) ? texcoords[ti] : Vec3{0, 0, 0};
+            };
             for (size_t k = 1; k + 1 < idx.size(); ++k) {
-                s.tris.push_back(Tri{verts[idx[0]], verts[idx[k]], verts[idx[k + 1]], matId, -1, {}});
+                Tri t{verts[idx[0]], verts[idx[k]], verts[idx[k + 1]], matId, -1, {}};
+                if (loadUV) {
+                    t.uv0 = uvAt(tidx[0]); t.uv1 = uvAt(tidx[k]); t.uv2 = uvAt(tidx[k + 1]);
+                }
+                s.tris.push_back(t);
                 ++added;
             }
         }

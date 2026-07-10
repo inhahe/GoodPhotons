@@ -375,7 +375,7 @@ struct Renderer {
                 }
                 case MatType::Diffuse:
                 default: {
-                    double rho = clamp01(m.reflect(lambda));
+                    double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
                     if (cam && camFilm && !forwardCatch) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)

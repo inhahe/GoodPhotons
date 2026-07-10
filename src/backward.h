@@ -203,7 +203,7 @@ struct BackwardRenderer {
                 }
                 case MatType::Diffuse:
                 default: {
-                    double rho = clamp01(m.reflect(lambda));
+                    double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
                     L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng);
                     // Russian roulette on the albedo (throughput unchanged on
                     // survival) — matches the forward tracer's diffuse handling.

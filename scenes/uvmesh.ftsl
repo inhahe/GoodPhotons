@@ -1,0 +1,49 @@
+# Textured MESH test (Phase 3b): a plane OBJ with `vt` records rendered inside a
+# Cornell box, using `mesh { uv use_mesh }` to read the OBJ texture coordinates
+# and a bound image texture for the albedo. Complements textured.ftsl (which
+# exercises the quad UV path).
+#
+#   ftrace -in scenes/uvmesh.ftsl -n 40000000 -o uvmesh.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+texture "checker" {
+    file     scenes/checker.ppm
+    encoding srgb
+    filter   bilinear
+    wrap     clamp
+}
+
+material "white"     { type diffuse reflect whitewall 0.75 }
+material "red"       { type diffuse reflect redwall }
+material "green"     { type diffuse reflect greenwall }
+material "wallpaper" { type diffuse reflect texture:checker }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# Textured plane facing the camera (unit XY plane -> scaled + centred at z=0.5).
+mesh {
+    file      scenes/uvplane.obj
+    material  wallpaper
+    uv        use_mesh
+    scale     0.6
+    translate 0.2 0.2 0.5
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

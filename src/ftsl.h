@@ -305,6 +305,12 @@ public:
         for (const auto& b : blocks)
             if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
 
+        // Pass 1b: image textures (must exist before materials that bind them).
+        for (const auto& b : blocks) {
+            if (b.type != "texture") continue;
+            if (!addTexture(b, L)) return false;
+        }
+
         // Pass 2: materials (must exist before geometry references them).
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
@@ -336,7 +342,7 @@ public:
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
             else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
-            else if (b.type == "scene" || b.type == "spectrum" || b.type == "material") { /* handled */ }
+            else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" || b.type == "texture") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         if (!haveLight) { fail("scene has no 'light' block"); return false; }
@@ -351,6 +357,7 @@ public:
 private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
+    std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
 
@@ -444,13 +451,66 @@ private:
         return evalSpectrum(s->val);
     }
 
+    // ---- textures ----
+    // A `texture "name" { file "path" [encoding srgb|linear] [filter nearest|
+    // bilinear] [wrap repeat|clamp|mirror] }` block loads an image into
+    // Scene::textures and records its name -> index. Reflectance coefficients are
+    // precomputed here so per-hit sampling is a cheap bilerp+sigmoid.
+    bool addTexture(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("texture needs a \"name\""); return false; }
+        if (textureIndex_.count(b.name)) { fail("duplicate texture name '" + b.name + "'"); return false; }
+        std::string file = strOf(b, "file");
+        if (file.empty()) { fail("texture '" + b.name + "' needs a file"); return false; }
+        Texture tex;
+        tex.name = b.name;
+        std::string enc = strOf(b, "encoding", "srgb");
+        if      (enc == "srgb")   tex.encoding = TexEncoding::sRGB;
+        else if (enc == "linear") tex.encoding = TexEncoding::Linear;
+        else { fail("texture '" + b.name + "': unknown encoding '" + enc + "' (srgb|linear)"); return false; }
+        std::string flt = strOf(b, "filter", "bilinear");
+        if      (flt == "bilinear") tex.filter = TexFilter::Bilinear;
+        else if (flt == "nearest")  tex.filter = TexFilter::Nearest;
+        else { fail("texture '" + b.name + "': unknown filter '" + flt + "' (nearest|bilinear)"); return false; }
+        std::string wr = strOf(b, "wrap", "repeat");
+        if      (wr == "repeat") tex.wrap = TexWrap::Repeat;
+        else if (wr == "clamp")  tex.wrap = TexWrap::Clamp;
+        else if (wr == "mirror") tex.wrap = TexWrap::Mirror;
+        else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
+        std::string terr;
+        if (!tex.load(file, terr)) { fail("texture '" + b.name + "': " + terr); return false; }
+        tex.buildReflCoeff();   // precompute Jakob-Hanika reflectance coefficients
+        int id = (int)L.scene.textures.size();
+        L.scene.textures.push_back(std::move(tex));
+        textureIndex_[b.name] = id;
+        return true;
+    }
+
+    // If the material's `reflect` statement is `texture:<name>`, bind the texture to
+    // the material (spatially-varying diffuse albedo) and return true. Otherwise the
+    // caller falls back to spectrumParam for a uniform reflectance.
+    bool bindReflectTexture(const Block& b, Material& m) {
+        const Stmt* s = find(b, "reflect");
+        if (!s || s->val.words.empty()) return false;
+        const std::string& w0 = s->val.words[0];
+        if (w0.rfind("texture:", 0) != 0) return false;
+        std::string nm = w0.substr(8);
+        auto it = textureIndex_.find(nm);
+        if (it == textureIndex_.end()) { fail("reflect references unknown texture '" + nm + "'"); return false; }
+        m.reflectTex = it->second;
+        return true;
+    }
+
     // ---- materials ----
     Material buildMaterial(const Block& b) {
         Material m;
         std::string type = strOf(b, "type", "diffuse");
         if (type == "diffuse") {
             m.type = MatType::Diffuse;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.75));
+            // `reflect texture:<name>` binds a spatially-varying albedo; otherwise a
+            // uniform reflectance spectrum. A bound texture leaves m.reflect as the
+            // fallback used where UVs are unavailable (e.g. the CUDA bake path).
+            if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.75);
+            else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.75));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
             m.ior = spectrumParam(b, "ior", iorBK7());
@@ -536,8 +596,15 @@ private:
         if (mat.empty()) { fail("quad needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
         Vec3 a = P(o), bb = P(o + u), cc = P(o + u + v), dd = P(o + v);
-        L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
-        L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
+        // UVs span the parallelogram: origin=(0,0), +u=(1,0), +v=(0,1). The two
+        // triangles share the o and o+u+v corners; assign matching corner UVs so a
+        // bound texture maps continuously across the quad.
+        Tri t1{a, bb, cc, id, -1, {}};
+        t1.uv0 = {0, 0, 0}; t1.uv1 = {1, 0, 0}; t1.uv2 = {1, 1, 0};
+        Tri t2{a, cc, dd, id, -1, {}};
+        t2.uv0 = {0, 0, 0}; t2.uv1 = {1, 1, 0}; t2.uv2 = {0, 1, 0};
+        L.scene.tris.push_back(t1);
+        L.scene.tris.push_back(t2);
         return true;
     }
     bool addTriangle(const Block& b, Loaded& L) {
@@ -571,7 +638,10 @@ private:
         // translation live in authored units, so multiply both by L_ to reach metres.
         xf.scale = xf.scale * L_;
         xf.translate = xf.translate * L_;
-        loadObj(L.scene, file.c_str(), id, xf);
+        // `uv use_mesh` reads texture coordinates from the OBJ's `vt` records (needed
+        // for textured materials); the default keeps the Tri fallback UVs.
+        bool loadUV = (strOf(b, "uv") == "use_mesh");
+        loadObj(L.scene, file.c_str(), id, xf, loadUV);
         return true;
     }
 

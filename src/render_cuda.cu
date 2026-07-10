@@ -765,15 +765,21 @@ bool cudaForwardSupported(const Scene& scene) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
                scene.mats[matId].type == MatType::Fluorescent;
     };
-    // A used material is unsupported if it is fluorescent, or is a mix that either
-    // has too many child lobes for the GPU or references a fluorescent child.
+    // A used material is unsupported if it is fluorescent, uses a spatially-varying
+    // (textured) albedo — the GPU kernel bakes only a single reflect spectrum, so
+    // textured scenes fall back to the CPU tracer — or is a mix that either has too
+    // many child lobes for the GPU or references an unsupported child.
+    auto textured = [&](int matId) {
+        return matId >= 0 && matId < (int)scene.mats.size() &&
+               scene.mats[matId].reflectTex >= 0;
+    };
     auto unsupported = [&](int matId) {
-        if (isFluoro(matId)) return true;
+        if (isFluoro(matId) || textured(matId)) return true;
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
             if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
-            for (int c : mx.mixChildren) if (isFluoro(c)) return true;
+            for (int c : mx.mixChildren) if (isFluoro(c) || textured(c)) return true;
         }
         return false;
     };
