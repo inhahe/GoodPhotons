@@ -41,6 +41,7 @@
 #include "spectrum.h"
 #include "lights.h"
 #include "mesh.h"
+#include "upsample.h"
 
 namespace ftsl {
 
@@ -359,7 +360,7 @@ private:
         }
         if (h == "rgb") {
             if (w.size() < 4) { fail("rgb needs 3 components"); return constantSpectrum(0); }
-            return rgbToReflectance(num(w[1]), num(w[2]), num(w[3]));
+            return rgbToReflectanceJH(num(w[1]), num(w[2]), num(w[3]));
         }
         if (h.rfind("glass:", 0) == 0) {
             std::string g = h.substr(6);

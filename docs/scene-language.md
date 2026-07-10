@@ -11,9 +11,12 @@
 > `scenes/cornell.ftsl` reproduces the hard-coded `buildCornell` **bit-for-bit**.
 > Phase 2a is also done: the `scene { units … }` length unit
 > (meters/centimeters/millimeters/inches/feet) is scaled to internal metres at
-> load time, so a scene authored in any unit renders identically. The
-> still-unimplemented pieces (configurable spectral *range*, multiple lights, RGB
-> upsampling quality, layered materials, multi-camera/paths, textures/UVs, extra
+> load time, so a scene authored in any unit renders identically. Phase 2c is
+> done too: `rgb r g b` now upsamples through a **Jakob-Hanika 2019** sigmoid
+> fit (`src/upsample.h`) that round-trips linear sRGB under D65 to <1e-3 for
+> unsaturated colours (validated by `ftrace -checkupsample`). The
+> still-unimplemented pieces (configurable spectral *range*, multiple lights,
+> layered materials, multi-camera/paths, textures/UVs, extra
 > light shapes) remain tagged **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -113,7 +116,7 @@ declared once as a named `spectrum` block and referenced as `spectrum:name`.
 | `glass:BK7`, `glass:SF10`              | Named Sellmeier dispersion curve (refractive index)           | `iorBK7`, `iorSF10` — **[maps 1:1]** |
 | `ior 1.5`                              | Constant refractive index                                     | `iorConstant` — **[maps 1:1]** |
 | `table { 400:0.05 450:0.12 ... }`      | Piecewise-linear measured curve (λnm:value pairs)             | **[needs engine work]** — add a `tabulatedSpectrum(pairs)` builder (trivial: linear interp) |
-| `rgb 0.63 0.06 0.05`                   | Convenience: upsample an sRGB triple to a smooth reflectance   | **[needs engine work]** — add a reflectance upsampler (e.g. Scott Burns / Jakob-Hanika); see §9 |
+| `rgb 0.63 0.06 0.05`                   | Convenience: upsample an sRGB triple to a smooth reflectance   | `rgbToReflectanceJH` (Jakob-Hanika sigmoid fit, `src/upsample.h`) — **[maps 1:1]**; validated by `-checkupsample` |
 | `spectrum:name`                        | Reference a named `spectrum` block                            | name resolution                |
 | `preset:D65`, `preset:led`, ...        | Named illuminant SPD (see §5)                                 | `src/lights.h` — **[maps 1:1]** |
 
@@ -571,10 +574,11 @@ frame from UV derivatives (only once normal/bump maps arrive).
 *Yes — a skin can carry proper spectra for its colors, two ways:*
 
 - **RGB → reflectance upsampling (general, for any color image).** Run each
-  linearized texel through a **reflectance upsampler** (Jakob-Hanika 2019, or
-  Scott Burns' method) to produce a smooth, physically-plausible reflectance
-  *spectrum* for that color. This is the same machine as the inline `rgb …`
-  spectrum in §2.1, applied per texel. It lets ordinary painted skins
+  linearized texel through the **reflectance upsampler** — implemented as the
+  Jakob-Hanika 2019 sigmoid fit in `src/upsample.h` (`rgbToReflectanceJH`) — to
+  produce a smooth, physically-plausible reflectance *spectrum* for that color.
+  This is the same machine as the inline `rgb …` spectrum in §2.1 (already
+  wired), to be applied per texel once textures land. It lets ordinary painted skins
   participate correctly in the spectral pipeline (proper metamerism, correct
   colour under non-D65 lights) without hand-authoring curves.
 
@@ -701,7 +705,7 @@ designed to grow into.
 **Phase 2 — near-term engine features the format already anticipates**
 6. `units` scaling + configurable `spectral` range.
 7. Multiple lights (emitter list + power-weighted selection CDF).
-8. RGB→reflectance upsampler (unlocks `rgb` spectra and later textures).
+8. RGB→reflectance upsampler (unlocks `rgb` spectra and later textures). **[done — `src/upsample.h`, Jakob-Hanika sigmoid fit, `-checkupsample`]**
 9. `mix`/layered materials (generalize `halfmirror`).
 
 **Phase 3 — larger features**

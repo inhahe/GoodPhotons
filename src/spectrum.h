@@ -89,20 +89,10 @@ inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) 
     };
 }
 
-// Upsample a linear-sRGB triple to a smooth reflectance spectrum in [0,1].
-// PLACEHOLDER (Phase 2c will replace with a proper Jakob-Hanika / Scott Burns
-// upsampler that round-trips sRGB exactly). This three-lobe blend is only good
-// enough to keep `rgb r g b` usable; for physically-exact wall colours prefer the
-// dedicated builders (redWall/greenWall) or a measured `table { }`.
-inline Spectrum rgbToReflectance(double r, double g, double b) {
-    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
-    return [=](double w) {
-        auto bump = [](double x, double mu, double s) { double t = (x - mu) / s; return std::exp(-0.5 * t * t); };
-        double B = bump(w, 450.0, 55.0), G = bump(w, 550.0, 55.0), R = bump(w, 620.0, 55.0);
-        double v = r * R + g * G + b * B;
-        return std::clamp(v, 0.0, 1.0);
-    };
-}
+// RGB -> reflectance upsampling now lives in src/upsample.h
+// (`rgbToReflectanceJH`, a Jakob-Hanika 2019 sigmoid fit that round-trips linear
+// sRGB under D65). The earlier three-lobe placeholder was removed once the
+// proper fit landed; `rgb r g b` in FTSL routes through the JH upsampler.
 
 // --- Emission importance sampling ------------------------------------------
 // Precomputes a CDF over [LAMBDA_MIN, LAMBDA_MAX] to sample lambda ~ SPD, and

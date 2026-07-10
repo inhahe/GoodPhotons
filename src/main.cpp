@@ -606,6 +606,64 @@ static int checkGrating() {
     return pass ? 0 : 1;
 }
 
+// Deterministic RGB -> reflectance upsampling self-test (Jakob-Hanika sigmoid
+// fit, src/upsample.h). Each colour is fitted to sigmoid coefficients, the
+// resulting reflectance is integrated under D65 through the CIE observer, and
+// converted back to linear sRGB. Validates, independent of the renderer:
+//   (a) the fitted spectrum round-trips every test colour to small error;
+//   (b) the reflectance stays physical (S in [0,1]) across the visible band;
+//   (c) neutral greys round-trip essentially exactly.
+// Note: pure white (1,1,1) is an inherently unreachable target for a sigmoid
+// (S=1 everywhere requires p->inf), so it carries a small residual (~1-2%) that
+// is expected and not a failure. Every non-saturated colour hits <1e-3.
+static int checkUpsample() {
+    struct C { double r, g, b; const char* name; };
+    const C tests[] = {
+        {0.0, 0.0, 0.0, "black"},   {1.0, 1.0, 1.0, "white"},
+        {0.5, 0.5, 0.5, "grey"},    {0.8, 0.1, 0.1, "red"},
+        {0.1, 0.7, 0.2, "green"},   {0.15, 0.2, 0.85, "blue"},
+        {0.9, 0.8, 0.1, "yellow"},  {0.1, 0.75, 0.8, "cyan"},
+        {0.8, 0.15, 0.75, "magenta"}, {0.7, 0.45, 0.2, "tan"},
+    };
+    const upsample::Basis& B = upsample::basis();
+
+    double maxErr = 0.0, whiteErr = 0.0; bool physical = true;
+    for (const C& c : tests) {
+        std::array<double, 3> co = upsample::fit(c.r, c.g, c.b);
+        // Reflectance stays in [0,1] over the band.
+        for (int i = 0; i < B.N; ++i) {
+            double s = upsample::reflAt(co, B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) physical = false;
+        }
+        // Integrate under D65 -> XYZ -> linear sRGB.
+        double X, Y, Z; B.integrate(co, X, Y, Z);
+        Vec3 lin = xyzToLinearSrgb(Vec3{X, Y, Z});
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        bool isWhite = (c.r == 1.0 && c.g == 1.0 && c.b == 1.0);
+        if (isWhite) whiteErr = e; else maxErr = std::max(maxErr, e);
+        std::printf("[checkupsample] %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+
+    bool passA = maxErr < 1e-3;          // non-saturated colours are near-exact
+    bool passB = physical;
+    bool passW = whiteErr < 0.02;        // pure white: sigmoid can only asymptote to 1
+    // (c) mid grey round-trips essentially exactly.
+    std::array<double, 3> cg = upsample::fit(0.5, 0.5, 0.5);
+    double gX, gY, gZ; B.integrate(cg, gX, gY, gZ);
+    Vec3 gl = xyzToLinearSrgb(Vec3{gX, gY, gZ});
+    double greyErr = std::max({std::fabs(gl.x - 0.5), std::fabs(gl.y - 0.5), std::fabs(gl.z - 0.5)});
+    bool passC = greyErr < 1e-4;
+
+    bool pass = passA && passB && passW && passC;
+    std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
+    std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
+    std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
+    std::printf("[checkupsample] mid-grey round-trip = %.6f  (%s)\n", greyErr, passC ? "ok" : "BAD");
+    std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -885,6 +943,7 @@ int main(int argc, char** argv) {
     bool thinFilmSwatchOnly = false;
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
+    bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
@@ -943,6 +1002,7 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-nodiffraction")) diffraction = false;
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
+        else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
@@ -953,6 +1013,7 @@ int main(int argc, char** argv) {
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
+    if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");
