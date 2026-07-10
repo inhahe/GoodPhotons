@@ -52,6 +52,16 @@ struct Camera {
     // Camera importance normaliser: image-plane area at unit distance.
     double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
 
+    // Generate a pinhole ray through raster pixel (px,py) with in-pixel jitter
+    // (jx,jy in [0,1)). Exact inverse of project(): sx,sy are the [-1,1] view
+    // coordinates project() would recover. Used by the backward reference tracer.
+    Ray genRay(int px, int py, double jx, double jy) const {
+        double sx = 2.0 * ((px + jx) / (double)film.resX) - 1.0;
+        double sy = 2.0 * ((py + jy) / (double)film.resY) - 1.0;
+        Vec3 d = normalize(w + u * (sx * tanHalfX) + v * (sy * tanHalfY));
+        return Ray{eye, d};
+    }
+
     // Model A perspective catch: does this photon ray pass through the finite
     // aperture disc (before hitting the scene, within hitDist) and land on the
     // film? Pure forward physics — no connect/splat. On success sets px,py.

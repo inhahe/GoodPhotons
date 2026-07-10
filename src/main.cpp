@@ -13,6 +13,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "render.h"
+#include "backward.h"
 #include "lights.h"
 #include "mesh.h"
 
@@ -82,7 +83,8 @@ static Scene buildPrism(int res) {
 
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
 static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
-                          const char* meshPath = nullptr, double meshScale = 1.0) {
+                          const char* meshPath = nullptr, double meshScale = 1.0,
+                          bool diffuseSphere = false) {
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
@@ -110,7 +112,10 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     if (meshPath && meshPath[0]) {
         loadObj(s, meshPath, /*mat*/5, /*translate*/{0.5, 0.4, 0.5}, meshScale);
     } else {
-        s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, 4});
+        // Diffuse sphere (mat 5) for the reference/validation modes so there is no
+        // specular black-glass mismatch; the dispersive glass sphere (mat 4)
+        // otherwise casts a spectral caustic on the floor.
+        s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, diffuseSphere ? 5 : 4});
     }
 
     s.build();
@@ -268,6 +273,83 @@ static void writePPM(const char* path, const Film& f, double N) {
     std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
 }
 
+// Forward photon trace (models A/B/C) into a merged film. Accumulates the energy
+// report across threads. Factored out so mode V can reuse it alongside the
+// backward reference.
+static Film renderForward(const Scene& scene, const Camera* cam, int res, long long N,
+                          int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut) {
+    std::vector<Film> films(nThreads);
+    std::vector<EnergyReport> reports(nThreads);
+    for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
+
+    auto worker = [&](int tid) {
+        Renderer r; r.forwardCatch = forwardCatch;
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
+        long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
+        Film* sensorFilm = useCamera ? nullptr : &films[tid];
+        const Camera* camPtr = useCamera ? cam : nullptr;
+        Film* camFilm = useCamera ? &films[tid] : nullptr;
+        for (long long i = lo; i < hi; ++i)
+            r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+
+    Film out; out.resX = res; out.resY = res; out.alloc();
+    for (int t = 0; t < nThreads; ++t) { out.merge(films[t]); }
+    for (auto& rp : reports) {
+        eOut.emitted += rp.emitted; eOut.absorbed += rp.absorbed; eOut.sensor += rp.sensor;
+        eOut.escaped += rp.escaped; eOut.residual += rp.residual;
+    }
+    return out;
+}
+
+// Backward reference: `spp` samples per pixel, threads render disjoint row bands
+// of a shared film (no shared-pixel writes, so no race).
+static Film renderBackward(const Scene& scene, const Camera& cam, int res,
+                           long long spp, int nThreads) {
+    Film out; out.resX = res; out.resY = res; out.alloc();
+    auto worker = [&](int tid) {
+        BackwardRenderer br;
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7, 0xD1B54A32D192ED03ULL ^ (uint64_t)tid);
+        int y0 = res * tid / nThreads, y1 = res * (tid + 1) / nThreads;
+        br.renderRows(scene, cam, out, y0, y1, spp, rng);
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+    return out;
+}
+
+// Compare forward vs backward films in raw linear-XYZ radiance. Because the two
+// estimators measure the same image under different conventions, we solve for the
+// single best-fit scale s (backward -> forward) and report the relative RMSE of
+// the residual. A small RMSE validates the forward transport/camera math; a large
+// or structured residual flags a bug.
+static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long long spp) {
+    const double invF = 1.0 / (double)Nfwd, invR = 1.0 / (double)spp;
+    double sfr = 0, srr = 0, sff = 0;
+    size_t n = fwd.xyz.size();
+    for (size_t i = 0; i < n; ++i) {
+        Vec3 f = fwd.xyz[i] * invF, r = ref.xyz[i] * invR;
+        sfr += dot(f, r); srr += dot(r, r); sff += dot(f, f);
+    }
+    double s = (srr > 0) ? sfr / srr : 0.0;
+    double num = 0;
+    for (size_t i = 0; i < n; ++i) {
+        Vec3 f = fwd.xyz[i] * invF, r = ref.xyz[i] * invR;
+        Vec3 d = f - r * s; num += dot(d, d);
+    }
+    double rmse = (sff > 0) ? std::sqrt(num / sff) : 0.0;
+    std::printf("[validate] best-fit scale (backward->forward) = %.6g\n", s);
+    std::printf("[validate] relative RMSE after scale = %.3f%%  (lower = better agreement)\n",
+                100.0 * rmse);
+    std::printf("[validate] %s\n", rmse < 0.05
+                ? "PASS: forward light tracer agrees with backward reference."
+                : "review: residual above 5% — increase -n/-spp, or investigate transport.");
+}
+
 int main(int argc, char** argv) {
     long long N = 2'000'000;
     int res = 256;
@@ -281,6 +363,7 @@ int main(int argc, char** argv) {
     bool bvhStatsOnly = false;
     const char* meshPath = nullptr;
     double meshScale = 1.0;
+    long long spp = 256;      // backward reference samples/pixel (modes R and V)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -294,6 +377,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
     }
     if (nThreads < 1) nThreads = 1;
     bool prism     = !std::strcmp(sceneName, "prism");
@@ -301,9 +385,14 @@ int main(int argc, char** argv) {
 
     selfTestColor();
 
+    // Modes R (backward reference) and V (validate: forward vs backward) need an
+    // all-diffuse scene so the known model-B specular limitation doesn't pollute
+    // the comparison — use a diffuse sphere when no mesh is supplied.
+    const bool refMode = (mode == 'R' || mode == 'V');
     Scene scene = prism     ? buildPrism(res)
                 : materials ? buildMaterials(res, resolveLight(lightName))
-                            : buildCornell(res, mode, resolveLight(lightName), meshPath, meshScale);
+                            : buildCornell(res, mode, resolveLight(lightName), meshPath,
+                                           meshScale, /*diffuseSphere*/refMode);
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test
@@ -314,9 +403,9 @@ int main(int argc, char** argv) {
         return checkBvh(scene, rays) == 0 ? 0 : 1;
     }
     if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
-    // mode A: contact sensor (no camera). mode B: connect/splat. mode C:
-    // finite-aperture forward catch (perspective, pure forward, supports mirrors).
-    const bool useCamera    = (mode == 'B' || mode == 'C');
+    // mode A: contact sensor (no camera). mode B: connect/splat. mode C: finite-
+    // aperture forward catch. mode R: backward reference. mode V: validate B vs R.
+    const bool useCamera    = (mode == 'B' || mode == 'C' || refMode);
     const bool forwardCatch = (mode == 'C');
     Camera cam;
     if (useCamera) {
@@ -325,40 +414,33 @@ int main(int argc, char** argv) {
         cam.apertureR = apertureR;
     }
 
+    // --- Backward reference (mode R) and validation (mode V) ---
+    if (refMode) {
+        std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
+                    mode, spp, res, res, nThreads, lightName);
+        Film ref = renderBackward(scene, cam, res, spp, nThreads);
+        if (mode == 'R') { writePPM(out, ref, (double)spp); return 0; }
+
+        // mode V: also run the forward light tracer (model B) and compare.
+        std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
+        EnergyReport e;
+        Film fwd = renderForward(scene, &cam, res, N, nThreads,
+                                 /*forwardCatch*/false, /*useCamera*/true, e);
+        double tot = e.absorbed + e.sensor + e.escaped + e.residual;
+        std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                    e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
+                    e.residual / e.emitted, tot / e.emitted);
+        compareFilms(fwd, N, ref, spp);
+        writePPM("validate_forward.ppm", fwd, (double)N);
+        writePPM("validate_backward.ppm", ref, (double)spp);
+        return 0;
+    }
+
     std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
                 mode, N, res, res, nThreads, prism ? "beam" : lightName);
 
-    // Per-thread films + energy reports, merged after. Each thread gets a
-    // distinct RNG stream so photons are independent.
-    std::vector<Film> films(nThreads);
-    std::vector<EnergyReport> reports(nThreads);
-    for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
-
-    auto worker = [&](int tid) {
-        Renderer r; r.forwardCatch = forwardCatch;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
-        long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
-        // mode A writes the in-scene contact sensor; B/C write the camera film.
-        Film* sensorFilm = useCamera ? nullptr : &films[tid];
-        Camera* camPtr   = useCamera ? &cam : nullptr;
-        Film* camFilm    = useCamera ? &films[tid] : nullptr;
-        for (long long i = lo; i < hi; ++i)
-            r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
-    };
-
-    std::vector<std::thread> pool;
-    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
-    for (auto& th : pool) th.join();
-
-    // Merge.
-    Film out_film; out_film.resX = res; out_film.resY = res; out_film.alloc();
     EnergyReport e;
-    for (int t = 0; t < nThreads; ++t) {
-        out_film.merge(films[t]);
-        e.emitted += reports[t].emitted; e.absorbed += reports[t].absorbed;
-        e.sensor += reports[t].sensor;   e.escaped += reports[t].escaped;
-        e.residual += reports[t].residual;
-    }
+    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e);
 
     double tot = e.absorbed + e.sensor + e.escaped + e.residual;
     std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
