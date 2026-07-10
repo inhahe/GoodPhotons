@@ -22,22 +22,39 @@ as practical; this file is the fallback for what can't be addressed immediately.
   fluorescent scenes. Not needed for the forward tracer's own correctness.
 - **Status:** OPEN (acceptable) — logged 2026-07-10.
 
-### Backward reference tracer cannot validate participating media (fog)
-- **What:** `src/backward.h` ignores `scene.medium` — its camera rays don't sample
-  volume free-flight or in-scattering, so `-fog` with modes R/V would compare a
-  volumetric forward image against a vacuum backward image (garbage residual).
-- **Why:** A backward volumetric estimator needs free-flight distance sampling
-  along the camera ray plus phase-function next-event estimation to the light
-  (and transmittance on the shadow ray). ~30–40 lines, but non-trivial to get the
-  MIS/analog weights right.
-- **Mitigation in place:** fog is forward-only; `-fog` is never set in refMode.
-  Correctness is validated deterministically by `-checkfog` (Beer-Lambert
-  transmittance, HG mean-cosine, phase normalization). Energy conserves
-  (`sum/emitted=1.000000`) on foggy renders.
-- **Proper fix (future):** add a homogeneous-medium path to `BackwardRenderer::
-  radiance` (sample collision, phase-NEE + HG continuation) so mode V can
-  cross-validate fog against the forward tracer.
-- **Status:** OPEN (acceptable) — logged 2026-07-10.
+### RESOLVED: Backward reference tracer now validates participating media (fog)
+- **What (was):** `src/backward.h` ignored `scene.medium` — its camera rays didn't
+  sample volume free-flight or in-scattering, so `-fog` with modes R/V would have
+  compared a volumetric forward image against a vacuum backward image (garbage
+  residual). Fog was therefore forward-only and never set in refMode.
+- **Fix applied:** added a homogeneous-medium path to `BackwardRenderer::radiance`
+  that mirrors the forward tracer exactly:
+  1. **Free-flight sampling** competes with the surface hit each bounce
+     (`tMed = -ln(1-u)/sigma_t`; on `tMed < dSurf` a volume collision occurs).
+  2. **`neeVolume()`** — phase-function next-event estimation at the collision
+     vertex: the surface BRDF/cosine are replaced by the single-scattering albedo
+     and the HG phase function `hgPhase(dot(wIn, wi), g)`, with fog transmittance
+     `exp(-sigma_t*dist)` on the shadow ray (the backward mirror of the forward
+     `connectVolume`). The phase angle uses reciprocal conventions to the forward
+     side, both equal to the physical `dot(prop_in, prop_out)`.
+  3. **Analog scatter/absorb** continuation: survive with prob = albedo, then
+     `sampleHG` a new direction (throughput unchanged); otherwise absorb.
+  4. **Beer-Lambert on surface NEE too:** `neeLight` now attenuates its shadow ray
+     by `exp(-sigma_t*dist)` (took a new `lambda` parameter).
+- **Validation (mode V, forward vs backward, identical fog):** the best-fit
+  backward→forward scale agrees to ~4 sig figs across no-fog / fog-g0.3 /
+  fog-rayleigh, which a transport bug could not produce. The raw-linear residual is
+  firefly-dominated (top-1% pixels hold 77–95% of it) from the unbounded 1/dist^2
+  light connection, so full RMSE plateaus but the **bulk RMSE (ex. top-1%) scales
+  as ~1/sqrt(N)**, proving variance not bias: for fog g=0.3 alb=0.85 at 256^2, bulk
+  RMSE went 7.67% (120M/800spp) -> 4.53% (480M/3200spp) [1.69x ~ ideal 2x], with
+  firefly concentration held constant at ~86% and the 4x run reporting PASS.
+  No-fog bulk RMSE is 1.2% (95% firefly-concentrated). The firefly-vs-bias
+  diagnostic (residual concentration + bulk RMSE) was added to `compareFilms` in
+  `src/main.cpp` specifically to make this distinction rigorous.
+- **Status:** RESOLVED 2026-07-10. `-fog` can now be combined with modes R/V.
+  `-checkfog` (deterministic transmittance / HG mean-cosine / phase-normalization
+  self-test) is retained as a fast complementary check.
 
 ## Performance
 

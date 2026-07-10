@@ -24,10 +24,10 @@
 // whereas forward single-wavelength tracing handles it trivially. A Fluorescent
 // material falls through to the Diffuse case below, so fluoro scenes must not be
 // used with modes R/V (the forward-tracer's -scene fluoro is model A/B/C only).
-// Likewise it ignores scene.medium (participating fog): the camera rays here do
-// not sample volume free-flight or in-scatter, so -fog must not be combined with
-// modes R/V. Adding a volumetric backward estimator (free-flight + phase-function
-// NEE) would let mode V validate fog — tracked in known-issues.md.
+// Participating media (scene.medium / -fog) IS supported here: camera and
+// scattered rays sample volume free-flight, and volume vertices do phase-function
+// NEE to the light (neeVolume). So -fog CAN be combined with modes R/V, which is
+// how the forward fog transport is cross-validated.
 // Emission is added only when a light is reached via the camera ray or a
 // specular/near-specular bounce; diffuse arrivals are covered by NEE (no double
 // counting).
@@ -45,7 +45,7 @@ struct BackwardRenderer {
     // SPD integral, since lambda ~ SPD/integral makes Le/pdf constant — identical
     // to the forward tracer's photon weight convention).
     double neeLight(const Scene& scene, const Hit& h, double rho, double emitW,
-                    Pcg32& rng) const {
+                    double lambda, Pcg32& rng) const {
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 y = scene.lightOrigin + scene.lightU * u1 + scene.lightV * u2;
         Vec3 toL = y - h.p;
@@ -59,7 +59,33 @@ struct BackwardRenderer {
         if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) return 0.0;
         double f = rho / PI;                              // Lambertian BRDF
         double G = cosSurf * cosLight / dist2;            // geometry term
-        return f * emitW * G * scene.lightArea;           // pdf_area = 1/area
+        double contrib = f * emitW * G * scene.lightArea; // pdf_area = 1/area
+        if (scene.medium.enabled)                         // Beer-Lambert on the shadow ray
+            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        return contrib;
+    }
+
+    // Volume next-event estimation: connect a fog scattering vertex `p` (photon
+    // arriving along `wIn`) to a uniformly-sampled light point. The surface BRDF
+    // and cosine are replaced by the single-scattering albedo and the Henyey-
+    // Greenstein phase function; the shadow ray carries fog transmittance. This is
+    // the backward mirror of the forward tracer's connectVolume().
+    double neeVolume(const Scene& scene, const Vec3& p, const Vec3& wIn,
+                     double lambda, double emitW, Pcg32& rng) const {
+        double u1 = rng.uniform(), u2 = rng.uniform();
+        Vec3 y = scene.lightOrigin + scene.lightU * u1 + scene.lightV * u2;
+        Vec3 toL = y - p;
+        double dist2 = dot(toL, toL);
+        double dist = std::sqrt(dist2);
+        Vec3 wi = toL / dist;
+        double cosLight = dot(scene.lightNormal, -wi);    // light is one-sided
+        if (cosLight <= 0) return 0.0;
+        if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) return 0.0;
+        double phase  = hgPhase(dot(wIn, wi), scene.medium.g);
+        double albedo = scene.medium.albedo(lambda);
+        double G = cosLight / dist2;                       // no surface cosine at a volume vertex
+        double T = std::exp(-scene.medium.sigmaT(lambda) * dist);
+        return albedo * phase * emitW * G * scene.lightArea * T;
     }
 
     // Estimate spectral-weighted radiance for a single wavelength along `ray`.
@@ -71,6 +97,27 @@ struct BackwardRenderer {
 
         for (int b = 0; b < maxBounce; ++b) {
             Hit h = scene.closestHit(ray);
+            double dSurf = h.valid ? h.t : 1e30;
+
+            // Homogeneous fog: sample a free-flight collision that competes with
+            // the surface. On a volume collision, estimate direct light via phase-
+            // function NEE, then scatter (HG) or absorb — analog, throughput
+            // unchanged. Mirrors the forward tracer exactly, so the two agree.
+            if (scene.medium.enabled) {
+                double st = scene.medium.sigmaT(lambda);
+                if (st > 0.0) {
+                    double tMed = -std::log(1.0 - rng.uniform()) / st;
+                    if (tMed < dSurf) {
+                        Vec3 p = ray.o + ray.d * tMed;
+                        L += thr * neeVolume(scene, p, ray.d, lambda, emitW, rng);
+                        if (rng.uniform() >= scene.medium.albedo(lambda)) return L; // absorbed
+                        ray = Ray{p, sampleHG(ray.d, scene.medium.g, rng)};
+                        specularArrival = false;   // phase-NEE covered the direct light
+                        continue;
+                    }
+                }
+            }
+
             if (!h.valid) return L;
             const Material& m = scene.mats[h.matId];
 
@@ -110,7 +157,7 @@ struct BackwardRenderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(m.reflect(lambda));
-                    L += thr * neeLight(scene, h, rho, emitW, rng);
+                    L += thr * neeLight(scene, h, rho, emitW, lambda, rng);
                     // Russian roulette on the albedo (throughput unchanged on
                     // survival) — matches the forward tracer's diffuse handling.
                     if (rng.uniform() >= rho) return L;
