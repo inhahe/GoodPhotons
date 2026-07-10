@@ -24,6 +24,10 @@
 // whereas forward single-wavelength tracing handles it trivially. A Fluorescent
 // material falls through to the Diffuse case below, so fluoro scenes must not be
 // used with modes R/V (the forward-tracer's -scene fluoro is model A/B/C only).
+// Likewise it ignores scene.medium (participating fog): the camera rays here do
+// not sample volume free-flight or in-scatter, so -fog must not be combined with
+// modes R/V. Adding a volumetric backward estimator (free-flight + phase-function
+// NEE) would let mode V validate fog — tracked in known-issues.md.
 // Emission is added only when a light is reached via the camera ray or a
 // specular/near-specular bounce; diffuse arrivals are covered by NEE (no double
 // counting).

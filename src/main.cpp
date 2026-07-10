@@ -358,6 +358,45 @@ static int checkFluoro() {
     return pass ? 0 : 1;
 }
 
+// Deterministic participating-media self-test. Validates the three primitives the
+// fog transport relies on, each against a closed-form answer:
+//   (a) free-flight sampling -> transmittance matches Beer-Lambert exp(-sigma_t*d);
+//   (b) Henyey-Greenstein sampling -> mean scattered cosine equals g;
+//   (c) phase-function normalization -> integral over the sphere equals 1.
+static int checkFog() {
+    Pcg32 rng; rng.seed(0xF0602Au, 0x5151u);
+
+    // (a) Transmittance from exponential free-flight.
+    const double st = 2.0, d = 0.75;
+    const long long Nt = 8'000'000; long long through = 0;
+    for (long long i = 0; i < Nt; ++i) {
+        double tMed = -std::log(1.0 - rng.uniform()) / st;
+        if (tMed >= d) ++through;
+    }
+    double Tmeasured = (double)through / Nt, Tanalytic = std::exp(-st * d);
+    bool passA = std::fabs(Tmeasured - Tanalytic) < 0.001;
+
+    // (b) HG mean cosine equals g.
+    const double g = 0.6; Vec3 wi{0, 0, 1};
+    const long long Ns = 4'000'000; double mc = 0;
+    for (long long i = 0; i < Ns; ++i) mc += dot(wi, sampleHG(wi, g, rng));
+    mc /= Ns;
+    bool passB = std::fabs(mc - g) < 0.002;
+
+    // (c) Phase function integrates to 1 over the sphere: int p 2pi dcos = 1.
+    double integ = 0; const int NB = 200000; double dc = 2.0 / NB;
+    for (int i = 0; i < NB; ++i) { double c = -1.0 + (i + 0.5) * dc; integ += hgPhase(c, g) * 2.0 * PI * dc; }
+    bool passC = std::fabs(integ - 1.0) < 1e-3;
+
+    bool pass = passA && passB && passC;
+    std::printf("[checkfog] transmittance @sigma_t*d=%.2f: measured=%.4f analytic=%.4f  (%s)\n",
+                st * d, Tmeasured, Tanalytic, passA ? "ok" : "BAD");
+    std::printf("[checkfog] HG mean cosine @g=%.2f: measured=%.4f  (%s)\n", g, mc, passB ? "ok" : "BAD");
+    std::printf("[checkfog] HG sphere integral: %.5f (want 1)  (%s)\n", integ, passC ? "ok" : "BAD");
+    std::printf("[checkfog] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -480,6 +519,11 @@ int main(int argc, char** argv) {
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
+    double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
+    double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
+    double fogG = 0.0;        // Henyey-Greenstein anisotropy
+    bool fogRayleigh = false; // wavelength-dependent scattering ~1/lambda^4
+    bool checkFogOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -497,10 +541,16 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-fogalbedo") && i + 1 < argc) fogAlbedo = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-fogg") && i + 1 < argc) fogG = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-fograyleigh")) fogRayleigh = true;
+        else if (!std::strcmp(argv[i], "-checkfog")) checkFogOnly = true;
     }
     if (nThreads < 1) nThreads = 1;
     if (checkLensOnly)   return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly) return checkFluoro();   // deterministic, no scene needed
+    if (checkFogOnly)    return checkFog();      // deterministic, no scene needed
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");
@@ -516,6 +566,22 @@ int main(int argc, char** argv) {
                             : buildCornell(res, mode, resolveLight(lightName),
                                            fluoro ? nullptr : meshPath, meshScale,
                                            /*diffuseSphere*/refMode, /*fluoroSphere*/fluoro);
+
+    // Optional global fog / participating medium (-fog sigma_t). With -fograyleigh
+    // the scattering coefficient varies as (550/lambda)^4, so short wavelengths
+    // scatter far more — a bluish haze that transmits red (a spectral sky/sunset).
+    if (fogSigmaT > 0.0) {
+        scene.medium.enabled = true;
+        scene.medium.g = fogG;
+        double ss = fogAlbedo * fogSigmaT, sa = (1.0 - fogAlbedo) * fogSigmaT;
+        if (fogRayleigh) {
+            scene.medium.sigma_s = [ss](double w) { double r = 550.0 / w; double r2 = r * r; return ss * r2 * r2; };
+            scene.medium.sigma_a = constantSpectrum(sa);
+        } else {
+            scene.medium.sigma_s = constantSpectrum(ss);
+            scene.medium.sigma_a = constantSpectrum(sa);
+        }
+    }
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test

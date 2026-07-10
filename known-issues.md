@@ -22,6 +22,23 @@ as practical; this file is the fallback for what can't be addressed immediately.
   fluorescent scenes. Not needed for the forward tracer's own correctness.
 - **Status:** OPEN (acceptable) — logged 2026-07-10.
 
+### Backward reference tracer cannot validate participating media (fog)
+- **What:** `src/backward.h` ignores `scene.medium` — its camera rays don't sample
+  volume free-flight or in-scattering, so `-fog` with modes R/V would compare a
+  volumetric forward image against a vacuum backward image (garbage residual).
+- **Why:** A backward volumetric estimator needs free-flight distance sampling
+  along the camera ray plus phase-function next-event estimation to the light
+  (and transmittance on the shadow ray). ~30–40 lines, but non-trivial to get the
+  MIS/analog weights right.
+- **Mitigation in place:** fog is forward-only; `-fog` is never set in refMode.
+  Correctness is validated deterministically by `-checkfog` (Beer-Lambert
+  transmittance, HG mean-cosine, phase normalization). Energy conserves
+  (`sum/emitted=1.000000`) on foggy renders.
+- **Proper fix (future):** add a homogeneous-medium path to `BackwardRenderer::
+  radiance` (sample collision, phase-NEE + HG continuation) so mode V can
+  cross-validate fog against the forward tracer.
+- **Status:** OPEN (acceptable) — logged 2026-07-10.
+
 ## Performance
 
 ### RESOLVED: Diffuse-mesh renders were ~60× slower per photon (degenerate BVH)

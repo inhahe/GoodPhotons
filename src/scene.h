@@ -1,6 +1,7 @@
 // Scene container: triangles, materials, one area light, one contact sensor.
 #pragma once
 #include <vector>
+#include <algorithm>
 #include "geometry.h"
 #include "bvh.h"
 #include "spectrum.h"
@@ -45,6 +46,30 @@ inline Material makeFluoroMaterial() {
     return f;
 }
 
+// A homogeneous participating medium filling the whole scene (fog / haze). A
+// photon travelling a distance travels freely until a collision sampled from
+// exp(-sigma_t * t); at the collision it scatters (prob albedo = sigma_s/sigma_t,
+// new direction from the Henyey-Greenstein phase function) or is absorbed. Beer-
+// Lambert transmittance is captured implicitly by the free-flight sampling (analog
+// Monte Carlo), so photon throughput stays unchanged — matching the rest of the
+// renderer. Coefficients are spectral, so wavelength-dependent (e.g. Rayleigh
+// ~1/lambda^4) fog that scatters blue and transmits red works for free.
+struct Medium {
+    bool enabled = false;
+    Spectrum sigma_a = constantSpectrum(0.0); // absorption coefficient vs lambda
+    Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
+    double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
+
+    double sigmaT(double lambda) const {
+        return std::max(0.0, sigma_a(lambda) + sigma_s(lambda));
+    }
+    double albedo(double lambda) const {       // single-scattering albedo sigma_s/sigma_t
+        double s = std::max(0.0, sigma_s(lambda));
+        double t = s + std::max(0.0, sigma_a(lambda));
+        return t > 0.0 ? s / t : 0.0;
+    }
+};
+
 // A flat rectangular contact sensor (model A) spanning origin + s*uAxis + t*vAxis.
 struct Sensor {
     Vec3 origin, uAxis, vAxis; // uAxis/vAxis are full edge vectors
@@ -57,6 +82,7 @@ struct Scene {
     std::vector<Sphere> spheres;
     std::vector<Material> mats;
     Sensor sensor;
+    Medium medium;   // optional global fog / participating medium (disabled by default)
 
     // Area light: a quad (two tris) with uniform emission. Cached for sampling.
     Vec3 lightOrigin, lightU, lightV, lightNormal;

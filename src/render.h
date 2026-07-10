@@ -64,6 +64,34 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
     return {FluoroEvent::Absorb, 0.0};
 }
 
+// --- Henyey-Greenstein phase function (participating media) ------------------
+// p(cosTheta) normalized so its integral over the sphere is 1. cosTheta is the
+// cosine between the photon's propagation direction and the scattered direction;
+// g in (-1,1): g>0 forward-peaked, g<0 back-scattering, g=0 isotropic.
+inline double hgPhase(double cosTheta, double g) {
+    double d = 1.0 + g * g - 2.0 * g * cosTheta;
+    if (d < 1e-9) d = 1e-9;
+    return (1.0 - g * g) / (4.0 * PI * d * std::sqrt(d));
+}
+
+// Sample a scattered direction around the propagation direction `wi` from the HG
+// distribution. The sampled cosTheta has mean value g (forward for g>0), so the
+// returned direction is importance-sampled proportional to the phase function.
+inline Vec3 sampleHG(const Vec3& wi, double g, Pcg32& rng) {
+    double u1 = rng.uniform(), u2 = rng.uniform();
+    double cosT;
+    if (std::fabs(g) < 1e-3) {
+        cosT = 1.0 - 2.0 * u1;                          // isotropic
+    } else {
+        double sq = (1.0 - g * g) / (1.0 + g - 2.0 * g * u1);
+        cosT = (1.0 + g * g - sq * sq) / (2.0 * g);
+    }
+    double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
+    double phi = 2.0 * PI * u2;
+    Vec3 t, b; onb(wi, t, b);
+    return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + wi * cosT);
+}
+
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
@@ -99,6 +127,32 @@ struct Renderer {
         double G = cosSurf * cosCam / dist2;
         double We = 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
         double contrib = beta * f * G * We;
+        // Beer-Lambert attenuation of the shadow ray through a global fog.
+        if (scene.medium.enabled)
+            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Model B for a VOLUME scattering vertex: connect the collision point to the
+    // pinhole. The surface BRDF/cosine is replaced by the phase function and the
+    // single-scattering albedo; there is no surface normal. wIn is the photon's
+    // propagation direction into the collision.
+    //   contrib = beta * albedo * p_HG(cos) * (cosCam/dist^2) * We * T_fog
+    void connectVolume(const Scene& scene, const Camera& cam, Film& film,
+                       const Vec3& p, const Vec3& wIn, double lambda, double beta) const {
+        Vec3 toCam = cam.eye - p;
+        double dist = length(toCam);
+        Vec3 wdir = toCam / dist;
+        int px, py; double cosCam, dist2;
+        if (!cam.project(p, px, py, cosCam, dist2)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+
+        double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
+        double Lambda = scene.medium.albedo(lambda);
+        double G = cosCam / dist2;
+        double We = 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
+        double contrib = beta * Lambda * ph * G * We;
+        contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);   // fog transmittance
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -128,18 +182,41 @@ struct Renderer {
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             Hit h = scene.closestHit(ray);
+            double dSurf = h.valid ? h.t : 1e30;
+
+            // Homogeneous fog: sample a free-flight collision. If it precedes the
+            // surface, the photon interacts in the volume (in-scatter connect,
+            // then scatter-or-absorb). Beer-Lambert transmittance is implicit in
+            // the exponential free-flight, so beta is unchanged (analog MC).
+            double dEvent = dSurf;
+            bool mediumEvent = false;
+            Vec3 mp;
+            if (scene.medium.enabled) {
+                double st = scene.medium.sigmaT(lambda);
+                if (st > 0.0) {
+                    double tMed = -std::log(1.0 - rng.uniform()) / st;
+                    if (tMed < dSurf) { dEvent = tMed; mediumEvent = true; mp = ray.o + ray.d * tMed; }
+                }
+            }
 
             // Model A perspective catch: if the photon flies through the aperture
-            // (nearer than any surface), it lands on the film. Supports mirrors,
-            // glass, everything — pure forward physics, no connection.
+            // (nearer than the surface AND any fog collision), it lands on the film.
             if (forwardCatch && cam && camFilm) {
-                double hitDist = h.valid ? h.t : 1e30;
                 int px, py;
-                if (cam->catchPhoton(ray, hitDist, px, py)) {
+                if (cam->catchPhoton(ray, dEvent, px, py)) {
                     camFilm->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
                     e.sensor += beta;
                     return;
                 }
+            }
+
+            if (mediumEvent) {
+                if (cam && camFilm && !forwardCatch)
+                    connectVolume(scene, *cam, *camFilm, mp, ray.d, lambda, beta);
+                // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
+                if (rng.uniform() >= scene.medium.albedo(lambda)) { e.absorbed += beta; return; }
+                ray = Ray{mp, sampleHG(ray.d, scene.medium.g, rng)};
+                continue;
             }
 
             if (!h.valid) { e.escaped += beta; return; }
