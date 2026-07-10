@@ -9,6 +9,17 @@
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm };
 
+// Materials whose last-vertex-before-camera cannot connect to the pinhole in
+// model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
+// light tracer renders them BLACK from the camera (the SDS limitation). The
+// camera-side ray path (mode P) is what fills these pixels in. Diffuse and
+// Fluorescent connect in model B, so they are NOT specular-side.
+inline bool isSpecularType(MatType t) {
+    return t == MatType::Dielectric || t == MatType::Mirror ||
+           t == MatType::HalfMirror || t == MatType::ThinFilm ||
+           t == MatType::Glossy;
+}
+
 struct Material {
     MatType type = MatType::Diffuse;
     // reflect means: diffuse albedo / mirror tint / glossy tint / half-mirror

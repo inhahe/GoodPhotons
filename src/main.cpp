@@ -1,7 +1,14 @@
 // Forward spectral photon tracer — Phase 0 (+ model B camera).
 //   -mode A : contact sensor on the front wall (pure forward catch, no lens)
 //   -mode B : pinhole camera outside the box, light-tracing splat (default)
-// Both trace identical physics; B just also connects each vertex to the camera.
+//   -mode C : finite-aperture forward catch (thin-lens depth of field)
+//   -mode R : backward path-traced reference (independent validation)
+//   -mode V : validate — run B and R and report the best-fit residual
+//   -mode P : forward + camera-side composite — model B for diffuse-first pixels
+//             (and caustics), a backward camera-side ray path for specular/coated
+//             surfaces (which model B alone leaves black). See renderComposite.
+// Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
+// camera measures (splat / aperture catch / composite with the camera-side path).
 
 #include <cstdio>
 #include <cstdlib>
@@ -569,6 +576,86 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int res,
     return out;
 }
 
+// Mode P: forward light tracing (model B) composited with a camera-side ray path,
+// so specular/coated surfaces are finally visible directly from the camera.
+//
+// Model B renders diffuse-first pixels (and the caustics specular surfaces cast
+// onto diffuse ones), but leaves specular/coated surfaces BLACK: a specular
+// last-vertex-before-camera has zero connect pdf (the SDS limitation). The
+// camera-side path is a backward path trace from the camera — it follows the
+// specular chain deterministically and does NEE + GI at the first diffuse vertex —
+// which fills exactly those specular-first pixels. The two path sets are DISJOINT,
+// partitioned by the first camera-ray hit (diffuse-side vs specular-side), so
+// compositing them double-counts nothing; it is the BDPT observation that forward
+// wins on L(S)*D*E caustics while camera-side wins on directly-viewed E*S* paths.
+//
+// The forward film measures radiance x a single global constant s (the model-B
+// camera measurement convention). We recover s by best-fit against the backward
+// radiance over the diffuse-side pixels (where both estimators agree), then convert
+// forward to radiance as F/(N*s) and drop in the backward radiance R/spp on the
+// specular-side pixels. The result is one true-radiance image.
+//
+// NOTE: fluorescence is unsupported here (the backward tracer can't reradiate) —
+// same caveat as modes R/V. Classification uses the pixel-centre camera ray, so
+// silhouette pixels are assigned wholesale to one side (a sub-pixel edge approx).
+static Film renderComposite(const Scene& scene, const Camera& cam, int res,
+                            long long N, long long spp, int nThreads) {
+    EnergyReport e;
+    Film fwd = renderForward(scene, &cam, res, N, nThreads,
+                             /*forwardCatch*/false, /*useCamera*/true, e);
+    Film ref = renderBackward(scene, cam, res, spp, nThreads);
+    const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
+
+    // Classify each pixel by its first camera-ray hit. specular-side pixels take
+    // the camera-side (backward) layer; everything else takes the forward layer.
+    std::vector<char> spec((size_t)res * res, 0);
+    long long nSpec = 0;
+    for (int py = 0; py < res; ++py)
+        for (int px = 0; px < res; ++px) {
+            Ray r = cam.genRay(px, py, 0.5, 0.5);
+            Hit h = scene.closestHit(r);
+            bool s = h.valid && h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type);
+            spec[(size_t)py * res + px] = s ? 1 : 0;
+            nSpec += s;
+        }
+
+    // Best-fit forward->backward scale over the diffuse-side pixels: Fval ~ s*Rval,
+    // so s = sum(Fval.Rval)/sum(Rval.Rval) (same convention as compareFilms).
+    double sfr = 0, srr = 0;
+    for (size_t i = 0; i < spec.size(); ++i) {
+        if (spec[i]) continue;
+        Vec3 f = fwd.xyz[i] * invF, rv = ref.xyz[i] * invR;
+        sfr += dot(f, rv); srr += dot(rv, rv);
+    }
+    double s = (srr > 0) ? sfr / srr : 1.0;
+    if (s <= 0) s = 1.0;
+
+    // Diffuse-side residual after calibration: forward/s should match the backward
+    // radiance on exactly the pixels that feed the fit. A small relative RMSE
+    // confirms the two halves live on one consistent radiance scale (no transport
+    // bug); a large/structured one would flag that the composite seam is real.
+    double num = 0, den = 0;
+    for (size_t i = 0; i < spec.size(); ++i) {
+        if (spec[i]) continue;
+        Vec3 fr = fwd.xyz[i] * (invF / s), rv = ref.xyz[i] * invR;
+        Vec3 dd = fr - rv;
+        num += dot(dd, dd); den += dot(fr, fr);
+    }
+    double rmse = (den > 0) ? std::sqrt(num / den) : 0.0;
+
+    // Composite in radiance-display units: writePPM(comp, 1.0) divides only by
+    // cieYIntegral, so store forward as F/(N*s) and backward as R/spp per pixel.
+    Film comp; comp.resX = res; comp.resY = res; comp.alloc();
+    for (size_t i = 0; i < spec.size(); ++i)
+        comp.xyz[i] = spec[i] ? ref.xyz[i] * invR
+                              : fwd.xyz[i] * (invF / s);
+
+    std::printf("[composite] forward->radiance scale s=%.6g  specular-first pixels=%lld/%lld\n",
+                s, nSpec, (long long)spec.size());
+    std::printf("[composite] diffuse-side residual (forward/s vs backward) rel RMSE=%.4f\n", rmse);
+    return comp;
+}
+
 // Compare forward vs backward films in raw linear-XYZ radiance. Because the two
 // estimators measure the same image under different conventions, we solve for the
 // single best-fit scale s (backward -> forward) and report the relative RMSE of
@@ -722,7 +809,7 @@ int main(int argc, char** argv) {
     if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
     // mode A: contact sensor (no camera). mode B: connect/splat. mode C: finite-
     // aperture forward catch. mode R: backward reference. mode V: validate B vs R.
-    const bool useCamera    = (mode == 'B' || mode == 'C' || refMode);
+    const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
     const bool forwardCatch = (mode == 'C');
     Camera cam;
     if (useCamera) {
@@ -751,6 +838,16 @@ int main(int argc, char** argv) {
         compareFilms(fwd, N, ref, spp);
         writePPM("validate_forward.ppm", fwd, (double)N);
         writePPM("validate_backward.ppm", ref, (double)spp);
+        return 0;
+    }
+
+    // --- Forward + camera-side composite (mode P) ---
+    if (mode == 'P') {
+        std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
+                    "at %dx%d on %d threads (light=%s) ...\n",
+                    N, spp, res, res, nThreads, lightName);
+        Film comp = renderComposite(scene, cam, res, N, spp, nThreads);
+        writePPM(out, comp, 1.0);
         return 0;
     }
 
