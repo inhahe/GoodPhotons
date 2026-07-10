@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <functional>
 #include "geometry.h"
 #include "scene.h"
 
@@ -61,18 +62,26 @@ struct MeshXform {
     }
 };
 
+// Resolve an OBJ `usemtl <name>` group to a scene material index (>=0), or -1 when
+// the name is unknown (the caller then keeps the mesh's default material).
+using MtlResolver = std::function<int(const std::string&)>;
+
 // Load an OBJ into the scene as triangles of material `matId`, applying the full
 // affine transform `xf` (translate + rotation + non-uniform scale). When `loadUV`
 // is set, per-vertex texture coordinates are read from `vt` lines and assigned to
 // the triangles (for textured materials); otherwise the Tri default UVs are kept.
+// When `matResolver` is non-null, OBJ `usemtl <name>` records switch the active
+// material for subsequent faces to `matResolver(name)` (falling back to `matId`
+// when the name is unknown) — this is the per-face `usemtl use_names` path.
 // Returns the number of triangles added (0 on failure). Call before Scene::build().
 inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
-                   bool loadUV = false) {
+                   bool loadUV = false, const MtlResolver* matResolver = nullptr) {
     std::ifstream f(path);
     if (!f) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
 
     std::vector<Vec3> verts;
     std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
+    int curMat = matId;            // active material (switched by `usemtl` when resolving)
     int added = 0;
     std::string line;
     while (std::getline(f, line)) {
@@ -85,6 +94,11 @@ inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
             std::istringstream ss(line.substr(2));
             double u = 0, v = 0; ss >> u >> v;
             texcoords.push_back(Vec3{u, v, 0});
+        } else if (matResolver && line.rfind("usemtl", 0) == 0) {
+            std::istringstream ss(line.substr(6));
+            std::string name; ss >> name;
+            int resolved = name.empty() ? -1 : (*matResolver)(name);
+            curMat = (resolved >= 0) ? resolved : matId;
         } else if (line[0] == 'f' && line[1] == ' ') {
             std::istringstream ss(line.substr(2));
             std::vector<int> idx, tidx;
@@ -100,7 +114,7 @@ inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
                 return (ti >= 0 && ti < (int)texcoords.size()) ? texcoords[ti] : Vec3{0, 0, 0};
             };
             for (size_t k = 1; k + 1 < idx.size(); ++k) {
-                Tri t{verts[idx[0]], verts[idx[k]], verts[idx[k + 1]], matId, -1, {}};
+                Tri t{verts[idx[0]], verts[idx[k]], verts[idx[k + 1]], curMat, -1, {}};
                 if (loadUV) {
                     t.uv0 = uvAt(tidx[0]); t.uv1 = uvAt(tidx[k]); t.uv2 = uvAt(tidx[k + 1]);
                 }

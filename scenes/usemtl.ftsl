@@ -1,0 +1,44 @@
+# Per-face OBJ material test (Phase 3b): a plane split into two `usemtl` groups
+# (matA/matB) rendered with `mesh { usemtl use_names }`, which matches each OBJ
+# group name to the FTSL material of the same name. The two triangles should show
+# distinct colours (blue matA / orange matB) despite being one mesh.
+#
+#   ftrace -in scenes/usemtl.ftsl -n 40000000 -o usemtl.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "matA"  { type diffuse reflect rgb 0.15 0.30 0.85 }   # blue
+material "matB"  { type diffuse reflect rgb 0.90 0.45 0.10 }   # orange
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# One mesh, two materials via usemtl groups (default `material white` is the
+# fallback for any unmatched group name).
+mesh {
+    file      scenes/twomat.obj
+    material  white
+    usemtl    use_names
+    scale     0.6
+    translate 0.2 0.2 0.5
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

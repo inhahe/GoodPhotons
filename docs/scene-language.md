@@ -37,8 +37,8 @@
 > pieces (configurable spectral *range*, absolute light power/units — which also
 > gates absolute-EV film sensitivity — the full physical `layered` material, the
 > shared multi-camera mode-B pass, non-square films, PNG/JPG texture import
-> (stb_image), textures on non-albedo parameters, per-face OBJ `usemtl`, extra light
-> shapes) remain tagged
+> (stb_image), textures on non-albedo parameters, procedural UV projections, extra
+> light shapes) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -326,11 +326,19 @@ mesh     { file "bunny.obj"   material white
   one `Tri` (`src/geometry.h`).
 - `mesh` — **[maps 1:1]** via `loadObj` (`src/mesh.h`), which reads `v`/`f`, the
   full affine `translate` + `rotate` (Euler XYZ, degrees) + non-uniform `scale`
-  transform (Phase 1e), and — when `uv use_mesh` is set — per-vertex texture
-  coordinates from `vt` (Phase 3b, §9). **[needs engine work]** for: per-face /
-  per-group materials (OBJ `usemtl` is ignored — currently one `matId` for the
-  whole mesh) and vertex normals (`vn` ignored; geometric normals are recomputed).
-  See §9 for the UV/texture/skin discussion.
+  transform (Phase 1e); when `uv use_mesh` is set, per-vertex texture coordinates
+  from `vt` (Phase 3b, §9); and when `usemtl use_names` is set, per-face material
+  switching — each OBJ `usemtl <name>` group is matched to the FTSL material of the
+  same name (unmatched → the mesh's default `material`). Two-token maps can't
+  survive the statement splitter, so name-matching is the convention (mirrors
+  `uv use_mesh`). **[needs engine work]** only for vertex normals (`vn` ignored;
+  geometric normals are recomputed). See §9 for the UV/texture/skin discussion.
+
+```
+mesh { file "head.obj"  material skin
+       uv use_mesh          # read OBJ vt texture coordinates
+       usemtl use_names }   # switch material per OBJ usemtl group (name-matched)
+```
 
 **Full transform syntax** (implemented — `rotate` is Euler XYZ in degrees, `scale`
 is a single uniform value or a vec3):

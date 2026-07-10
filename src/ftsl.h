@@ -641,7 +641,16 @@ private:
         // `uv use_mesh` reads texture coordinates from the OBJ's `vt` records (needed
         // for textured materials); the default keeps the Tri fallback UVs.
         bool loadUV = (strOf(b, "uv") == "use_mesh");
-        loadObj(L.scene, file.c_str(), id, xf, loadUV);
+        // `usemtl use_names` switches material per OBJ `usemtl` group by matching the
+        // group name to an FTSL material of the same name (unknown -> the mesh's
+        // default `material`). Two-token maps can't survive the statement splitter,
+        // so name-matching is the grammar-friendly convention (mirrors `uv use_mesh`).
+        bool useNames = (strOf(b, "usemtl") == "use_names");
+        MtlResolver resolver = [this](const std::string& nm) -> int {
+            auto it = matIndex_.find(nm);
+            return (it == matIndex_.end()) ? -1 : it->second;
+        };
+        loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr);
         return true;
     }
 

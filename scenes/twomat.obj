@@ -1,0 +1,11 @@
+# Unit XY plane (z=0) split diagonally into two `usemtl` groups, to test FTSL
+# `mesh { usemtl use_names }` per-face material switching. The group names
+# (matA / matB) are matched to FTSL materials of the same name.
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+usemtl matA
+f 1 2 3
+usemtl matB
+f 1 3 4
