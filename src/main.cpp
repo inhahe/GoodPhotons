@@ -14,6 +14,7 @@
 #include "camera.h"
 #include "render.h"
 #include "lights.h"
+#include "mesh.h"
 
 // Resolve a -light name to an emission SPD. "bbNNNN" means a Planckian at NNNN K
 // (e.g. bb3200). Unknown names fall back to a 6500 K blackbody.
@@ -80,7 +81,8 @@ static Scene buildPrism(int res) {
 }
 
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
-static Scene buildCornell(int res, char mode, const Spectrum& lightSpd) {
+static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
+                          const char* meshPath = nullptr, double meshScale = 1.0) {
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
@@ -89,6 +91,7 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd) {
     light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
     Material glass; glass.type = MatType::Dielectric;
     glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
+    Material mesh;  mesh.reflect  = whiteWall(0.8);              s.mats.push_back(mesh);  // 5 (diffuse)
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);            // floor
     addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);            // ceiling
@@ -102,10 +105,15 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd) {
     const double lx0 = 0.35, lx1 = 0.65, lz0 = 0.35, lz1 = 0.65, ly = 0.999;
     addQuad(s, {lx0,ly,lz0},{lx1,ly,lz0},{lx1,ly,lz1},{lx0,ly,lz1}, 3);
 
-    // Dispersive glass sphere -> casts a spectral caustic on the floor.
-    s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, 4});
+    // A loaded mesh (diffuse) replaces the glass sphere when -mesh is given;
+    // otherwise the dispersive glass sphere casts a spectral caustic on the floor.
+    if (meshPath && meshPath[0]) {
+        loadObj(s, meshPath, /*mat*/5, /*translate*/{0.5, 0.4, 0.5}, meshScale);
+    } else {
+        s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, 4});
+    }
 
-    s.finalizeTris();
+    s.build();
 
     if (mode == 'A') {
         s.sensor.origin = {0,0,1}; s.sensor.uAxis = {1,0,0}; s.sensor.vAxis = {0,1,0};
@@ -244,6 +252,8 @@ int main(int argc, char** argv) {
     const char* lightName = "bb6500";
     double apertureR = 0.02;  // mode C aperture radius (scene units)
     bool checkBvhOnly = false;
+    const char* meshPath = nullptr;
+    double meshScale = 1.0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -254,6 +264,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
         else if (!std::strcmp(argv[i], "-aperture") && i + 1 < argc) apertureR = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
+        else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
+        else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
     }
     if (nThreads < 1) nThreads = 1;
     bool prism     = !std::strcmp(sceneName, "prism");
@@ -263,9 +275,16 @@ int main(int argc, char** argv) {
 
     Scene scene = prism     ? buildPrism(res)
                 : materials ? buildMaterials(res, resolveLight(lightName))
-                            : buildCornell(res, mode, resolveLight(lightName));
+                            : buildCornell(res, mode, resolveLight(lightName), meshPath, meshScale);
 
-    if (checkBvhOnly) return checkBvh(scene, 2'000'000) == 0 ? 0 : 1;
+    if (checkBvhOnly) {
+        // Bound the linear-reference work (~O(rays * prims)) so the self-test
+        // stays fast even for big meshes: ~5e8 primitive tests, clamped.
+        long long prims = (long long)scene.tris.size() + (long long)scene.spheres.size();
+        long long rays = 500'000'000LL / (prims > 0 ? prims : 1);
+        rays = std::clamp(rays, 20'000LL, 2'000'000LL);
+        return checkBvh(scene, rays) == 0 ? 0 : 1;
+    }
     // mode A: contact sensor (no camera). mode B: connect/splat. mode C:
     // finite-aperture forward catch (perspective, pure forward, supports mirrors).
     const bool useCamera    = (mode == 'B' || mode == 'C');

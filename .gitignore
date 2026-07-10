@@ -14,6 +14,9 @@
 .vscode/
 *.user
 
+# Agent runtime
+.claude/
+
 # OS
 Thumbs.db
 Desktop.ini
