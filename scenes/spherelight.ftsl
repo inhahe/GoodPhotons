@@ -1,0 +1,36 @@
+# Sphere area light — a glowing ball hung near the ceiling of a diffuse Cornell
+# box. Exercises the Phase 3c spherical emitter (uniform surface sampling with a
+# per-point outward normal) in both the forward tracer and the backward reference.
+# All surfaces are diffuse so mode V (forward-vs-backward) should agree tightly.
+#
+#   ftrace -in scenes/spherelight.ftsl -mode V -n 4000000
+#   ftrace -in scenes/spherelight.ftsl -n 40000000 -o spherelight.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- spherical area light (blackbody 6500 K) ------------------------------
+light sphere {
+    center 0.5 0.75 0.5   radius 0.12
+    spd preset:bb6500
+}
+
+# --- camera ---------------------------------------------------------------
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

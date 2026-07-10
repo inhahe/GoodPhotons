@@ -51,14 +51,15 @@ struct BackwardRenderer {
         for (const auto& em : scene.emitters) {
             if (em.collimated) continue;                  // beams aren't area-samplable
             double u1 = rng.uniform(), u2 = rng.uniform();
-            Vec3 y = em.origin + em.u * u1 + em.v * u2;
+            Vec3 y, nLight;
+            em.samplePoint(u1, u2, y, nLight);            // quad or sphere surface point
             Vec3 toL = y - h.p;
             double dist2 = dot(toL, toL);
             double dist = std::sqrt(dist2);
             Vec3 wi = toL / dist;
             double cosSurf = dot(h.n, wi);
             if (cosSurf <= 0) continue;
-            double cosLight = dot(em.normal, -wi);        // light is one-sided
+            double cosLight = dot(nLight, -wi);           // light is one-sided
             if (cosLight <= 0) continue;
             if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
             double f = rho / PI;                          // Lambertian BRDF
@@ -83,12 +84,13 @@ struct BackwardRenderer {
         for (const auto& em : scene.emitters) {
             if (em.collimated) continue;
             double u1 = rng.uniform(), u2 = rng.uniform();
-            Vec3 y = em.origin + em.u * u1 + em.v * u2;
+            Vec3 y, nLight;
+            em.samplePoint(u1, u2, y, nLight);            // quad or sphere surface point
             Vec3 toL = y - p;
             double dist2 = dot(toL, toL);
             double dist = std::sqrt(dist2);
             Vec3 wi = toL / dist;
-            double cosLight = dot(em.normal, -wi);        // light is one-sided
+            double cosLight = dot(nLight, -wi);           // light is one-sided
             if (cosLight <= 0) continue;
             if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
             double phase  = hgPhase(dot(wIn, wi), scene.medium.g);

@@ -144,20 +144,48 @@ struct Sensor {
     void alloc() { film.alloc(); }
 };
 
-// A single emitter. An area light is a quad (origin + s*u + t*v, s,t in [0,1])
-// with one-sided Lambertian emission along `normal`. A collimated emitter fires
-// every photon along `beamDir` from that same quad (the prism demo). Each emitter
-// carries its own SPD; `power` = emitIntegral * area * PI is the emitter's total
-// emitted power and doubles as the selection weight for the power-weighted CDF.
+// Emitter surface shape. A Quad is the rectangle origin + s*u + t*v (s,t in
+// [0,1]) with one-sided Lambertian emission along `normal`. A Sphere is a solid
+// glowing ball of radius `radius` centred at `origin`, emitting Lambertian from
+// every surface point about that point's outward normal (so exactly the
+// hemisphere facing a receiver contributes — handled by the per-sample normal).
+enum class EmitterShape { Quad, Sphere };
+
+// A single emitter. Each carries its own SPD; `power` = emitIntegral * area * PI
+// is the emitter's total emitted power and doubles as the selection weight for the
+// power-weighted CDF. For a collimated Quad every photon fires along `beamDir`
+// from that quad (the prism demo). `area` is the full emitting surface area
+// (quad: |u x v|; sphere: 4*PI*radius^2), so the Lambertian power law holds for
+// both shapes unchanged.
 struct Emitter {
     Vec3 origin, u, v, normal;
     double area = 0.0;
+    EmitterShape shape = EmitterShape::Quad;
+    double radius = 0.0;      // sphere radius (Sphere only)
     bool collimated = false;
     Vec3 beamDir{1, 0, 0};
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
     double power = 0.0;       // emitIntegral * area * PI (selection weight)
+
+    // Sample a surface point `y` and its outward unit normal `nOut` from two
+    // uniforms. Quad: the bilinear point with the constant face normal (identical
+    // draws to the pre-sphere engine, so quad scenes stay bit-identical). Sphere:
+    // a uniformly-distributed surface point (pdf = 1/area for both shapes).
+    void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut) const {
+        if (shape == EmitterShape::Sphere) {
+            double z = 1.0 - 2.0 * u1;                 // cos(theta) uniform in [-1,1]
+            double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+            double phi = 2.0 * PI * u2;
+            Vec3 d{r * std::cos(phi), r * std::sin(phi), z};
+            nOut = d;                                  // unit outward normal
+            y = origin + d * radius;
+        } else {
+            y = origin + u * u1 + v * u2;
+            nOut = normal;
+        }
+    }
 };
 
 struct Scene {
@@ -189,6 +217,17 @@ struct Scene {
         Emitter e;
         e.origin = o; e.u = U; e.v = V; e.normal = n; e.area = area;
         e.collimated = collimated; e.beamDir = beamDir;
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
+    // Register a spherical area light: a glowing ball of radius r at center c.
+    // area = 4*PI*r^2 feeds the same power law (power = emitIntegral*area*PI) and
+    // the same 1/area point-sampling pdf as a quad. u/v/normal are unused.
+    void addSphereLight(const Vec3& c, double r, const Spectrum& spd, double stepNm) {
+        Emitter e;
+        e.origin = c; e.radius = r; e.area = 4.0 * PI * r * r;
+        e.shape = EmitterShape::Sphere;
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
     }

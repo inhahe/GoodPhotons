@@ -110,7 +110,7 @@ Top-level block types:
 | `quad`       | 0+         | Rectangle (two triangles) — walls, panels           |
 | `triangle`   | 0+         | Single triangle                                     |
 | `mesh`       | 0+         | OBJ instance with transform                         |
-| `light`      | 1+         | Emitter (area or collimated)                        |
+| `light`      | 1+         | Emitter (area, sphere, or collimated)               |
 | `medium`     | 0 or 1     | Global homogeneous fog                              |
 | `camera`     | 1+         | Viewpoint + film + measurement model                |
 | `render`     | 0 or 1     | Optional render controls (overridable by CLI)       |
@@ -353,7 +353,8 @@ mesh { file "teapot.obj" material brushed
 
 The scene supports **any number of emitters** (Phase 2b). Each `light` block adds
 one `Emitter` (`src/scene.h`): a rectangular area light with a spectral power
-distribution, or a collimated beam (prism/grating demos). `Scene::emitters` holds
+distribution, a **spherical area light** (a glowing ball, Phase 3c), or a
+collimated beam (prism/grating demos). `Scene::emitters` holds
 the list; `finalizeEmitters()` computes each emitter's `power = emitIntegral *
 area * PI`, a power-weighted selection CDF (`emitterCdf`/`totalPower`), and a
 combined wavelength sampler (`emitSampler`) for the backward reference. The
@@ -376,7 +377,24 @@ light collimated {
     dir 1 0 0
     spd preset:sun
 }
+
+light sphere {                     # Phase 3c: a glowing ball
+    center 0.5 0.75 0.5   radius 0.12
+    spd preset:bb6500
+}
 ```
+
+A `light sphere` registers a spherical `Emitter` (`shape = EmitterShape::Sphere`,
+`area = 4·π·r²`) and also drops an emissive sphere into the geometry so photons
+that strike it are absorbed and it is visible in the photon-catch camera modes
+(mirroring how `light area` adds its emissive quad). Both the forward tracer and
+the backward reference sample a **uniform point on the sphere surface** and use
+that point's outward normal for the one-sided Lambertian cosine — so exactly the
+hemisphere facing the receiver contributes, and the `1/area` point pdf and the
+`power = emitIntegral · area · π` power law are unchanged from the quad case.
+Sampling shares `Emitter::samplePoint()` (quad draws are byte-for-byte identical,
+so existing quad scenes stay bit-identical). Validated by `scenes/spherelight.ftsl`
+(mode V: forward agrees with backward; CPU==GPU energy).
 
 ### 5.1 Built-in illuminant SPDs (`preset:<name>`)
 
@@ -401,15 +419,16 @@ Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 - **Multiple / typed lights.** **[done — Phase 2b]** Any number of `light` blocks
   accumulate; the forward tracer uses a power-weighted selection CDF in the photon
   spawn path (CPU and CUDA), and the backward reference sums NEE over all emitters.
-  Typed shapes (sphere/spot/env) are still future — see below.
+  Sphere area lights are done (Phase 3c); spot/env are still future — see below.
 - **Absolute power / units.** **[needs engine work]** Today emission is normalized by the SPD integral
   and the light area — good enough for relative imagery, but there is no
   radiometric "this bulb is 800 lumens / 10 W". A `power <watts>` (radiant) or
   `luminous <lm>` key is the place to add physically-absolute output. Until the
   engine tracks absolute units this is documentation-only.
-- **Other shapes.** Sphere/point/spot/environment(HDRI) emitters are all
-  future; the `light <type>` tag leaves room (`light sphere { … }`,
-  `light env { file "sky.hdr" }`).
+- **Other shapes.** Sphere area lights are **[done — Phase 3c]** (`light sphere
+  { center … radius … }`). Spot/point/environment(HDRI) emitters are still future;
+  the `light <type>` tag leaves room (`light spot { … }`, `light env { file
+  "sky.hdr" }`).
 
 ---
 

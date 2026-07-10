@@ -224,8 +224,9 @@ struct Renderer {
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 origin = em.origin + em.u * u1 + em.v * u2;
-        Vec3 dir = em.collimated ? em.beamDir : cosineHemisphere(em.normal, rng);
+        Vec3 origin, emitN;
+        em.samplePoint(u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+        Vec3 dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         double pdfL = 0.0;
         double lambda = em.spd.sample(rng, pdfL);
         if (pdfL <= 0) return;
@@ -238,7 +239,7 @@ struct Renderer {
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
         if (cam && camFilm && !forwardCatch)
-            connect(scene, *cam, *camFilm, origin, em.normal, lambda, beta, 1.0);
+            connect(scene, *cam, *camFilm, origin, emitN, lambda, beta, 1.0);
 
         Ray ray{origin + dir * 1e-6, dir};
 

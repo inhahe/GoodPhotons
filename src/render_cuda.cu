@@ -160,9 +160,28 @@ struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
+    int    shape;              // 0 = quad, 1 = sphere (mirrors host EmitterShape)
+    double radius;             // sphere radius (shape==1)
     int    cdfOffset, cdfN;
     double cdfStep;
 };
+
+// Sample a surface point + outward normal on an emitter (mirrors host
+// Emitter::samplePoint). Quad draws are unchanged, so quad scenes stay parity.
+__device__ static void emitterSamplePoint(const DEmitter& em, double u1, double u2,
+                                          DVec3& y, DVec3& nOut) {
+    if (em.shape == 1) {
+        double z = 1.0 - 2.0 * u1;
+        double r = sqrt(fmax(0.0, 1.0 - z * z));
+        double phi = 2.0 * 3.14159265358979323846 * u2;
+        DVec3 d{(Real)(r * cos(phi)), (Real)(r * sin(phi)), (Real)z};
+        nOut = d;
+        y = em.origin + d * (Real)em.radius;
+    } else {
+        y = em.origin + em.u * (Real)u1 + em.v * (Real)u2;
+        nOut = em.normal;
+    }
+}
 
 struct DScene {
     const DTri*      tris;  int nTris;
@@ -626,8 +645,9 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter em = sc.emitters[ei];
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 origin = em.origin + em.u * u1 + em.v * u2;
-        DVec3 dir = em.collimated ? em.beamDir : cosineHemisphere(em.normal, rng);
+        DVec3 origin, emitN;
+        emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+        DVec3 dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         Real pdfL = 0;
         Real lambda = sampleLambda(sc, em, rng, pdfL);
         if (pdfL <= 0) continue;
@@ -637,7 +657,7 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         // Model B: connect the emitter itself to the pinhole (makes the source
         // visible). Modes A/C instead catch photons that physically arrive.
         if (camMode == CAM_B)
-            connect(sc, cam, film, origin, em.normal, lambda, beta, (Real)1);
+            connect(sc, cam, film, origin, emitN, lambda, beta, (Real)1);
 
         DVec3 ro = origin + dir * RAY_EPS, rd = dir;
         bool done = false;
@@ -870,6 +890,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
+        de.shape = (e.shape == EmitterShape::Sphere) ? 1 : 0;
+        de.radius = e.radius;
         de.cdfOffset = (int)cdfAll.size();
         de.cdfN = (int)e.spd.cdf.size();
         de.cdfStep = e.spd.step;

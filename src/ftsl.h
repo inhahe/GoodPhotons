@@ -16,6 +16,7 @@
 //   mesh "name" { file "p.obj"  material name  translate x y z  rotate x y z  scale x y z }
 //   light area       { origin ...  u ...  v ...  normal ...  spd <spectrum-expr> }
 //   light collimated { dir x y z  spd <spectrum-expr> }   # repeatable: N emitters
+//   light sphere     { center x y z  radius r  spd <spectrum-expr> }  # glowing ball
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
 //                   film { res W H } }
@@ -669,6 +670,18 @@ private:
             double w = Len(0.03);
             L.scene.addAreaLight(P(o), t * w, bt * w, beam, w * w, spd, binWidth_,
                                  /*collimated*/true, beam);
+            return true;
+        }
+        if (b.subtype == "sphere") {
+            // Spherical area light: a glowing ball. Also add an emissive sphere to
+            // geometry so photons that strike it are absorbed and it is visible in
+            // the photon-catch camera modes (mirrors the area-light quad below).
+            Vec3 c{0.5, 0.7, 0.5}; vec3Of(b, "center", c);
+            double rad = Len(dblOf(b, "radius", 0.1));
+            Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+            int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+            L.scene.spheres.push_back(Sphere{P(c), rad, id});
+            L.scene.addSphereLight(P(c), rad, spd, binWidth_);
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so
