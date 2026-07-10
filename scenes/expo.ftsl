@@ -1,0 +1,58 @@
+# Physical-film / exposure validation scene (Phase 3a). One diffuse Cornell box,
+# three cameras that differ ONLY in their film exposure controls, so the images
+# can be compared directly:
+#
+#   ftrace -in scenes/expo.ftsl -n 20000000   # -> out_iso100 / out_iso200 / out_fstop
+#
+# - "iso100": manual exposure lock at ISO 100 (multiplier 1.0). A perfect diffuse
+#   reflector maps to display 1.0; the whole frame is fixed, not auto-exposed.
+# - "iso200": same view, ISO 200 -> multiplier 2.0 -> exactly twice as bright.
+# - "fstop":  mode C thin-lens catch with f/2.8 on a 36x24 full-frame sensor, so
+#   the aperture radius is derived physically (focal/(2N)) for real depth of field.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "grey"  { type diffuse reflect rgb 0.6 0.6 0.6 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.30 0.4   radius 0.25   material grey }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# Locked exposure at ISO 100 (multiplier 1.0).
+camera "iso100" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 192 192   iso 100 }
+}
+
+# Same view, ISO 200 -> the film is exactly 2x brighter than iso100.
+camera "iso200" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 192 192   iso 200 }
+}
+
+# Physical f-stop: f/2.8 on a 36x24mm sensor sets the aperture radius from the
+# derived focal length, giving real depth of field in the thin-lens catch (mode C).
+camera "fstop" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    focus 2.2
+    fstop 2.8
+    mode C
+    film { res 192 192   size 36 24 }
+}

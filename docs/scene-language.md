@@ -23,12 +23,15 @@
 > the forward tracer, backward reference, and CUDA kernel; validated by
 > `scenes/mixmat.ftsl` under mode V. Phase 3a (partial) is done: any number of named
 > `camera` blocks render one image each (per-camera film resolution + mode), with
-> `-camera <name>` selection, validated by `scenes/twocam.ftsl`; and a `camera_path`
-> block expands into keyframe-interpolated frame cameras (`scenes/dolly.ftsl`).
+> `-camera <name>` selection, validated by `scenes/twocam.ftsl`; a `camera_path`
+> block expands into keyframe-interpolated frame cameras (`scenes/dolly.ftsl`); and
+> physical film `size` (mm) → focal length, `fstop` → aperture radius, plus relative
+> exposure compensation via `iso`/`shutter`/`exposure` (`scenes/expo.ftsl`).
 > The still-unimplemented
-> pieces (configurable spectral *range*, absolute light power/units, the full physical
-> `layered` material, the shared multi-camera mode-B pass + physical
-> film size/f-stop/ISO, textures/UVs, extra light shapes) remain tagged
+> pieces (configurable spectral *range*, absolute light power/units — which also
+> gates absolute-EV film sensitivity — the full physical `layered` material, the
+> shared multi-camera mode-B pass, non-square films, textures/UVs, extra light
+> shapes) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -483,34 +486,47 @@ camera "hero" {
 
     aperture 0.02              # aperture radius (scene units); 0 ⇒ pinhole-ish
     focus    3.0               # focus distance ⇒ thin-lens focal length
+    fstop    2.8               # f-number ⇒ apertureR = focal/(2N) (overrides aperture)
     mode     B                 # A | B | C  (measurement model, §8.2)
 
     film {
         res  512 512           # output pixels
-        # size 36 24           # PROPOSED physical sensor size (mm) — see §8.1
-        # iso  100             # PROPOSED film sensitivity — see §8.1
+        size 36 24             # physical sensor size (mm) — §8.1
+        iso  100               # exposure compensation (relative) — §8.1
     }
 }
 ```
 
 Maps onto `Camera` (`src/camera.h`) via `lookAt(eye, target, up, fovYDeg, rx, ry)`
 and `setFocus(focus)`; `aperture` → `apertureR`; `mode` picks the forward
-measurement model. **[maps 1:1]**, except the commented film fields.
+measurement model. **[maps 1:1]**, plus the physical-film fields below.
 
 ### 8.1 Film — present vs. proposed
 
-- `res W H` — output resolution. **[maps 1:1]** (`Film::resX/resY`).
-- `size <w> <h>` (mm) — physical sensor dimensions. **[needs engine work]**: the
-  camera today derives the image plane purely from `fov_y` + aspect; a physical
-  film size (35 mm "full frame", medium/large format) would let f-stop and
-  circle-of-confusion be *physically* meaningful instead of unit-relative. This
-  is the todo item about "film dimensions (33mm, medium format, …)".
-- `iso` / sensitivity, spectral response curve — **[needs engine work]**: the
-  film accumulates linear XYZ; a sensitivity/response model (and per-camera
-  exposure) would live here. Todo item "film sensitivity".
-- **f-stop authoring.** Photographers set an f-number, not an aperture radius.
-  `fstop 2.8` ⇒ `apertureR = focalLength / (2·N)`. **[needs engine work]** (a
-  load-time conversion once physical focal length / film size exist).
+- `res W H` — output resolution. **[maps 1:1]** (`Film::resX/resY`). *Note: the
+  forward/backward tracers currently allocate a **square** film, so only the first
+  value is used; non-square sensors are a follow-up.*
+- `size <w> <h>` (mm) — physical sensor dimensions. **[done — Phase 3a]**: the
+  focal length is derived from the film **height** and `fov_y`
+  (`f = filmH / (2·tan(fov_y/2))`, in metres) and used for f-stop → aperture. A
+  35 mm "full frame" is `size 36 24`. *(Because the film is square today the width
+  is not yet used for a true horizontal fov; when unspecified a 24 mm full-frame
+  height is assumed wherever a physical length is needed.)*
+- **f-stop authoring** — **[done — Phase 3a]**: `fstop 2.8` ⇒
+  `apertureR = focal / (2·N)` at load time (overrides any `aperture` radius), so
+  depth of field in the finite-aperture catch modes (A/C) is physically meaningful
+  instead of unit-relative.
+- `iso` / `shutter` / `exposure` — **[done (relative) — Phase 3a]**: the film's
+  radiometric scale is not absolute, so images are always auto-exposed (99th-
+  percentile anchor). These act as an exposure **compensation** on top of that
+  anchor: `comp = exposure · (iso/100) · shutter` (each factor defaults to 1), e.g.
+  `iso 200` is exactly one stop brighter than `iso 100`. Aperture is deliberately
+  *not* folded in (in A/C a smaller aperture already darkens the image physically;
+  in B the aperture is virtual). **True absolute EV / a physical sensitivity+
+  response model still needs engine work** — it depends on absolute light power
+  (watts/lumens), which is a separate deferred feature (see §7 / known-issues). A
+  fixed exposure *lock* across `camera_path` frames (compute the anchor once, reuse
+  it) is a natural follow-up on top of this.
 
 ### 8.2 Measurement model (`mode`)
 
@@ -790,11 +806,13 @@ designed to grow into.
 
 **Phase 3 — larger features**
 10. Multiple cameras / `camera_path`; per-camera films; physical film size +
-    f-stop + sensitivity. **[partial — Phase 3a: multiple named cameras + `-camera`
-    selection + per-camera film resolution + per-camera mode done (`scenes/twocam.ftsl`);
-    `camera_path` keyframe interpolation done (`scenes/dolly.ftsl`);
-    shared mode-B multi-camera pass, physical film size, f-stop, ISO
-    still needs engine work.]**
+    f-stop + sensitivity. **[mostly done — Phase 3a: multiple named cameras +
+    `-camera` selection + per-camera film resolution + per-camera mode
+    (`scenes/twocam.ftsl`); `camera_path` keyframe interpolation
+    (`scenes/dolly.ftsl`); physical film `size` (mm) → focal length, `fstop` →
+    aperture radius, and relative exposure compensation via `iso`/`shutter`/
+    `exposure` (`scenes/expo.ftsl`). Remaining: shared mode-B multi-camera pass,
+    non-square films, and absolute-EV/sensitivity (needs absolute light power).]**
 11. UVs + spectral/RGB textures; per-face materials from OBJ `usemtl`.
 12. Additional light shapes (sphere/spot/HDRI environment).
 

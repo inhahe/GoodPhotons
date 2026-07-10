@@ -24,21 +24,38 @@ as practical; this file is the fallback for what can't be addressed immediately.
   multi-camera feature (correct, just not yet shared) could land validated.
 - **Status:** OPEN (acceptable) — multi-camera done 2026-07-10; shared pass deferred.
 
-### Physical film size, f-stop, and ISO not implemented
-- **What:** the spec (§8.1/§8.3) proposes a physical film `size <w> <h>` (mm),
-  f-stop authoring (`fstop N` → aperture radius via focal length), and film
-  `iso`/sensitivity. None are built; the camera still derives its image plane from
-  `fov_y` + aspect and takes an `aperture` radius directly.
-- **Proper fix (future):** add physical focal length from film size + fov, convert
-  `fstop` → `apertureR = f/(2N)` at load time, and apply `iso` as a per-camera
-  exposure scale in the film write.
+### Absolute-EV film sensitivity, non-square films, shared multi-camera pass
+- **What (remaining):** three camera/film pieces are still open:
+  1. **Absolute EV / physical sensitivity.** `iso`/`shutter`/`exposure` are wired
+     but act as a *relative* exposure **compensation** on top of the per-image
+     auto-exposure (the film's radiometric scale is arbitrary). A true absolute
+     exposure (a given ISO+shutter+f-number yielding a physically-determined
+     brightness) needs **absolute light power** (watts/lumens) on emitters, which is
+     itself deferred (§7). A cheaper intermediate win: an exposure **lock** across
+     `camera_path` frames — compute the auto anchor once and reuse it so a dolly
+     doesn't flicker frame-to-frame.
+  2. **Non-square films.** `film { res W H }` only uses the first value; the
+     forward/backward tracers (and CUDA) allocate a square film. Non-square sensors
+     (and a true horizontal fov from film **width**) need the tracers to carry
+     resX≠resY.
+  3. **Shared multi-camera mode-B pass** (already logged above under the multi-camera
+     entry) — one photon trace splatting to every camera pupil.
+- **Proper fix:** (1) add absolute emitter power + a sensitometric film model; add a
+  per-`camera_path` exposure-lock flag as the near-term step. (2) thread resX/resY
+  through `renderForward`/`renderBackward`/CUDA and `writePPM`. (3) see multi-camera.
 - **Status:** OPEN (design captured) — logged 2026-07-10.
-- **Done (2026-07-10, Phase 3a):** `camera_path` keyframed motion. A `camera_path`
-  block expands at load time into a sequence of `CamSpec` frames with piecewise-linear
-  `eye`/`look_at` interpolation between sorted `key` control points; the multi-camera
-  loop in `main.cpp` renders the generated list with frame-numbered output names.
-  Grammar is numbers-only (`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`). Validated by
-  `scenes/dolly.ftsl`.
+- **Done (2026-07-10, Phase 3a):**
+  - `camera_path` keyframed motion — expands at load time into a sequence of
+    `CamSpec` frames with piecewise-linear `eye`/`look_at` interpolation between
+    sorted `key` control points; the multi-camera loop renders the generated list
+    with frame-numbered output names. Grammar is numbers-only
+    (`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`). Validated by `scenes/dolly.ftsl`.
+  - Physical film `size <w> <h>` (mm) → focal length `f = filmH/(2·tan(fov_y/2))`
+    (metres); `fstop N` → `apertureR = f/(2N)` at load time (overrides `aperture`),
+    giving physically-meaningful DOF in modes A/C. `iso`/`shutter`/`exposure` →
+    relative exposure compensation `comp = exposure·(iso/100)·shutter` applied over
+    the auto-exposure anchor in `writePPM`. Validated by `scenes/expo.ftsl` (ISO 200
+    is exactly 2.0× ISO 100 in linear space).
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

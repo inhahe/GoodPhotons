@@ -642,7 +642,16 @@ static int checkUpsample() {
     return pass ? 0 : 1;
 }
 
-static void writePPM(const char* path, const Film& f, double N) {
+// The film accumulates radiance in an arbitrary (non-absolute) radiometric scale
+// that depends on photon count, light power, etc., so the image is always anchored
+// by an auto-exposure that maps the 99th luminance percentile to ~0.9. `expComp`
+// is the camera's photographic exposure *compensation* (from iso/shutter/exposure,
+// with 1.0 = neutral): the final exposure is auto * expComp, so e.g. ISO 200
+// (expComp 2.0) is exactly one stop brighter than ISO 100. This is a *relative*
+// control — true absolute EV needs absolute light power (watts/lumens), which is a
+// separate deferred feature (see docs §8.1 / known-issues). expComp <= 0 means
+// "not authored" -> neutral auto-exposure.
+static void writePPM(const char* path, const Film& f, double N, double expComp = 0.0) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -653,7 +662,8 @@ static void writePPM(const char* path, const Film& f, double N) {
     }
     std::vector<double> sorted = lum; std::sort(sorted.begin(), sorted.end());
     double p99 = sorted[(size_t)(0.99 * (sorted.size() - 1))];
-    double exposure = (p99 > 0) ? 0.9 / p99 : 1.0;
+    double eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
+    double exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
 
     std::vector<uint8_t> img((size_t)W * H * 3);
     for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
@@ -667,7 +677,11 @@ static void writePPM(const char* path, const Film& f, double N) {
     std::ofstream fo(path, std::ios::binary);
     fo << "P6\n" << W << ' ' << H << "\n255\n";
     fo.write((const char*)img.data(), (std::streamsize)img.size());
-    std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
+    if (expComp > 0.0)
+        std::printf("wrote %s (%dx%d), exposure=%.3g (auto %.3g x %.3gEV-comp)\n",
+                    path, W, H, exposure, eAuto, expComp);
+    else
+        std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
 }
 
 // Deterministic, noise-free visualisation of the thin-film structural colour: a
@@ -901,7 +915,8 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
 static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, long long spp, int nThreads,
                      const char* device, bool diffraction,
-                     const char* lightLabel, const std::string& outPath) {
+                     const char* lightLabel, const std::string& outPath,
+                     double manualExposure = 0.0) {
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -950,7 +965,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
                     mode, spp, res, res, nThreads, lightLabel);
         Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
-        if (mode == 'R') { writePPM(outPath.c_str(), ref, (double)spp); return 0; }
+        if (mode == 'R') { writePPM(outPath.c_str(), ref, (double)spp, manualExposure); return 0; }
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -972,7 +987,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, res, nThreads, lightLabel);
         Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction);
-        writePPM(outPath.c_str(), comp, 1.0);
+        writePPM(outPath.c_str(), comp, 1.0, manualExposure);
         return 0;
     }
 
@@ -984,7 +999,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                 e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                 e.residual / e.emitted, tot / e.emitted);
-    writePPM(outPath.c_str(), out_film, (double)N);
+    writePPM(outPath.c_str(), out_film, (double)N, manualExposure);
     return 0;
 }
 
@@ -1146,7 +1161,7 @@ int main(int argc, char** argv) {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
-    struct RenderCam { std::string name; Camera cam; char mode; int res; };
+    struct RenderCam { std::string name; Camera cam; char mode; int res; double exposure; };
     std::vector<RenderCam> toRender;
 
     if (fromFtsl && !ftslScene.cameras.empty()) {
@@ -1173,7 +1188,7 @@ int main(int argc, char** argv) {
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cres, cres);
             c.apertureR = cs->aperture;
             c.setFocus(cs->focus);
-            toRender.push_back({cs->name, c, effMode(cs->mode), cres});
+            toRender.push_back({cs->name, c, effMode(cs->mode), cres, cs->exposureMul});
         }
     } else {
         // Built-in scene: one camera. mode A needs no camera frame (a default Camera
@@ -1186,7 +1201,7 @@ int main(int argc, char** argv) {
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // mode C thin lens (0 = camera obscura, no focus plane)
         }
-        toRender.push_back({"", c, mode, res});
+        toRender.push_back({"", c, mode, res, 0.0});
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file
@@ -1205,7 +1220,7 @@ int main(int argc, char** argv) {
             std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
                         rc.name.c_str(), rc.mode, rc.res, rc.res, outFor(rc.name).c_str());
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
-                           device, diffraction, lightLabel, outFor(rc.name));
+                           device, diffraction, lightLabel, outFor(rc.name), rc.exposure);
         if (rv != 0) return rv;
     }
     return 0;

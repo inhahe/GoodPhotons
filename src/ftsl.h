@@ -233,6 +233,26 @@ struct CamSpec {
     double fov = 40.0, aperture = 0.02, focus = 0.0;
     char   mode = 0;             // 0 = not specified -> inherit global
     int    res  = -1;            // -1 = not specified -> inherit global
+
+    // Physical film + photographic exposure (Phase 3a). filmW/H are the physical
+    // sensor dimensions in millimetres (0 = unspecified -> 36x24 "full frame"
+    // default is assumed only where a physical size is actually needed, e.g. to
+    // turn an f-number into an aperture radius). `focal` is the derived focal
+    // length in metres (internal units), from filmH + fov_y.
+    double filmW_mm = 0.0, filmH_mm = 0.0, focal = 0.0;
+    // Photographic exposure controls. The film's radiometric scale is not absolute,
+    // so images are always auto-exposed (99th-percentile anchor); these act as an
+    // exposure *compensation* on top of that anchor:
+    //   comp = exposure * (iso/100) * shutter    (each factor defaults to 1)
+    // e.g. ISO 200 -> comp 2.0 -> one stop brighter than ISO 100. True absolute EV
+    // needs absolute light power (a separate deferred feature). `exposure <= 0` here
+    // means "not authored". Aperture is deliberately NOT folded into comp: in the
+    // physical catch modes (A/C) a smaller aperture already darkens the image by
+    // passing fewer photons, and in the splat mode (B) the aperture is virtual, so
+    // an extra f-number term would double-count / be an artifact. See docs §8.1.
+    double iso = 0.0, shutter = 0.0, exposure = 0.0;
+    // Resolved exposure compensation (<= 0 => neutral auto-expose). Filled at load.
+    double exposureMul = 0.0;
 };
 
 struct Loaded {
@@ -617,6 +637,44 @@ private:
         return true;
     }
 
+    // Read the film sub-block + photographic exposure/f-stop controls shared by
+    // `camera` and `camera_path`, and resolve the derived focal length, f-stop ->
+    // aperture radius, and manual exposure multiplier. `cs.fov` must already be set.
+    void readFilmExposure(const Block& b, CamSpec& cs) {
+        const Stmt* film = find(b, "film");
+        if (film && film->val.block) {
+            const Block& fb = *film->val.block;
+            const Stmt* r = find(fb, "res");
+            if (r && !r->val.words.empty()) cs.res = (int)num(r->val.words[0]);
+            const Stmt* sz = find(fb, "size");     // physical sensor, millimetres
+            if (sz && sz->val.words.size() >= 2) {
+                cs.filmW_mm = num(sz->val.words[0]);
+                cs.filmH_mm = num(sz->val.words[1]);
+            }
+            cs.iso      = dblOf(fb, "iso", 0.0);
+            cs.shutter  = dblOf(fb, "shutter", 0.0);
+            cs.exposure = dblOf(fb, "exposure", 0.0);
+        }
+        // Focal length (metres) from the vertical fov and physical film height.
+        // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a
+        // 35mm full-frame 24mm height when no physical size is authored (only used
+        // where a real length is needed, i.e. f-stop -> aperture).
+        double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
+        double th  = std::tan(0.5 * cs.fov * 3.141592653589793 / 180.0);
+        cs.focal = (th > 1e-9) ? (hmm / 1000.0) / (2.0 * th) : 0.0;
+        // f-stop authoring: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides
+        // any `aperture` radius. Aperture radius is an internal (metre) length.
+        double fstop = dblOf(b, "fstop", 0.0);
+        if (fstop > 0.0 && cs.focal > 0.0) cs.aperture = cs.focal / (2.0 * fstop);
+        // Manual exposure multiplier (see CamSpec). Active iff any control authored.
+        if (cs.exposure > 0.0 || cs.iso > 0.0 || cs.shutter > 0.0) {
+            double base = (cs.exposure > 0.0) ? cs.exposure : 1.0;
+            double isoF = (cs.iso     > 0.0) ? cs.iso / 100.0 : 1.0;
+            double shF  = (cs.shutter > 0.0) ? cs.shutter     : 1.0;
+            cs.exposureMul = base * isoF * shF;
+        }
+    }
+
     // ---- camera ----
     bool addCamera(const Block& b, Loaded& L) {
         CamSpec cs;
@@ -626,11 +684,7 @@ private:
         cs.fov = dblOf(b, "fov_y", 40.0);
         cs.aperture = Len(dblOf(b, "aperture", 0.02));
         cs.focus = Len(dblOf(b, "focus", 0.0));
-        const Stmt* film = find(b, "film");
-        if (film && film->val.block) {
-            const Stmt* r = find(*film->val.block, "res");
-            if (r && !r->val.words.empty()) cs.res = (int)num(r->val.words[0]);
-        }
+        readFilmExposure(b, cs);   // film{res,size,iso,shutter,exposure}, fstop
         std::string md = strOf(b, "mode");
         if (!md.empty()) cs.mode = md[0];
         L.cameras.push_back(cs);
@@ -668,11 +722,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
-        const Stmt* film = find(b, "film");
-        if (film && film->val.block) {
-            const Stmt* r = find(*film->val.block, "res");
-            if (r && !r->val.words.empty()) shared.res = (int)num(r->val.words[0]);
-        }
+        readFilmExposure(b, shared);   // film{res,size,iso,shutter,exposure}, fstop
         int frames = (int)dblOf(b, "frames", 0.0);
         if (frames < 1) { fail("camera_path '" + base + "' needs frames >= 1"); return false; }
 
