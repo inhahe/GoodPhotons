@@ -1,15 +1,24 @@
 # Scene Description Language (FTSL) — Design Spec
 
-> **Status: DESIGN PROPOSAL, not yet implemented.** As of this writing the
-> renderer has **no** scene file format. Scenes are hard-coded C++ builders
-> (`buildCornell`, `buildPrism`, `buildGrating`, `buildMaterials` in
-> `src/main.cpp`) selected with `-scene <name>`, and tuned only through CLI
-> flags; `-mesh file.obj` just swaps one OBJ mesh in for the Cornell sphere.
-> That is fine for developing the physics but useless for describing arbitrary
-> scenes. This document designs the language we need. Every construct below is
-> annotated **[maps 1:1]** (a loader would just fill an existing struct) or
-> **[needs engine work]** (the renderer doesn't support it yet), so the spec
-> doubles as an implementation checklist.
+> **Status: Phase 1 IMPLEMENTED; Phases 2–3 still design proposal.** The loader
+> lives in `src/ftsl.h` and is wired to the `-in <file.ftsl>` CLI flag. It parses
+> the block format below, evaluates spectrum expressions (constant, `blackbody`,
+> `gaussian`, `shortpass`, `ior`, `rgb`, `whitewall`/`redwall`/`greenwall`,
+> `glass:`, `preset:`, `spectrum:` refs, and `table { }`), builds materials
+> (all eight `MatType`s), geometry (`sphere`/`quad`/`triangle`/`mesh` with full
+> translate+rotate+non-uniform-scale transforms), one `light` (area or
+> collimated), a `medium`, a `camera`, and a `render` block (overridable by CLI).
+> `scenes/cornell.ftsl` reproduces the hard-coded `buildCornell` **bit-for-bit**.
+> The still-unimplemented pieces (units scaling, multiple lights, RGB upsampling
+> quality, layered materials, multi-camera/paths, textures/UVs, extra light
+> shapes) remain tagged **[needs engine work]** below. Alongside them, constructs
+> the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
+> implementation checklist (§11).
+>
+> Before Phase 1 the renderer had **no** scene file format — scenes were the
+> hard-coded C++ builders (`buildCornell`, `buildPrism`, `buildGrating`,
+> `buildMaterials` in `src/main.cpp`) selected with `-scene <name>`. Those still
+> exist and work; `-in` is the data-driven alternative.
 
 ---
 

@@ -35,6 +35,7 @@
 #include "backward.h"
 #include "lights.h"
 #include "mesh.h"
+#include "ftsl.h"
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
 #endif
@@ -885,6 +886,31 @@ int main(int argc, char** argv) {
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
+
+    // --- FTSL scene file (-in <file>) --------------------------------------
+    // Load the scene from a file *before* parsing the rest of argv, so any explicit
+    // CLI flag (-n, -r, -mode, -device, -o) still overrides what the file's
+    // render {} block specified. Pre-scan for -in only; the full parse follows.
+    const char* inFile = nullptr;
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
+    ftsl::Loaded ftslScene;
+    bool fromFtsl = false;
+    if (inFile) {
+        std::string ferr;
+        if (!ftsl::load(inFile, ftslScene, ferr)) {
+            std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
+            return 1;
+        }
+        fromFtsl = true;
+        std::printf("[ftsl] loaded scene from %s\n", inFile);
+        if (ftslScene.photons >= 0)       N = ftslScene.photons;
+        if (ftslScene.res > 0)            res = ftslScene.res;
+        if (ftslScene.mode)               mode = ftslScene.mode;
+        if (!ftslScene.device.empty())    device = ftslScene.device.c_str();
+        if (!ftslScene.out.empty())       out = ftslScene.out.c_str();
+    }
+
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -918,6 +944,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-nodiffraction")) diffraction = false;
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
+        else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
     if (nThreads < 1) nThreads = 1;
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
@@ -938,7 +965,8 @@ int main(int argc, char** argv) {
     // all-diffuse scene so the known model-B specular limitation doesn't pollute
     // the comparison — use a diffuse sphere when no mesh is supplied.
     const bool refMode = (mode == 'R' || mode == 'V');
-    Scene scene = prism     ? buildPrism(res)
+    Scene scene = fromFtsl  ? std::move(ftslScene.scene)
+                : prism     ? buildPrism(res)
                 : grating   ? buildGrating(res, diffraction)
                 : materials ? buildMaterials(res, resolveLight(lightName))
                             : buildCornell(res, mode, resolveLight(lightName),
@@ -1017,7 +1045,14 @@ int main(int argc, char** argv) {
 #endif
     }
     Camera cam;
-    if (useCamera) {
+    if (fromFtsl && ftslScene.hasCamera) {
+        // Build at the final `res` (honouring a CLI -r override) so the camera film
+        // matches the output film renderForward allocates.
+        cam.lookAt(ftslScene.camEye, ftslScene.camLook, ftslScene.camUp,
+                   ftslScene.camFov, res, res);
+        cam.apertureR = ftslScene.camAperture;
+        cam.setFocus(ftslScene.camFocus);
+    } else if (useCamera) {
         if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
         else       cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
         cam.apertureR = apertureR;

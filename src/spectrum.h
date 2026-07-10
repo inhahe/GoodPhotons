@@ -5,6 +5,8 @@
 #include <functional>
 #include <vector>
 #include <cmath>
+#include <algorithm>
+#include <utility>
 #include "color.h"
 #include "rng.h"
 
@@ -62,6 +64,45 @@ inline Spectrum iorBK7()  { return sellmeier(1.03961212, 0.231792344, 1.01046945
 inline Spectrum iorSF10() { return sellmeier(1.62153902, 0.256287842, 1.64447552,
                                              0.0122241457, 0.0595736775, 147.468793); }
 inline Spectrum iorConstant(double n) { return [n](double) { return n; }; }
+
+// Piecewise-linear measured curve from (wavelength nm, value) pairs. The pairs are
+// sorted by wavelength at build time; sampling clamps to the endpoints outside the
+// measured range and linearly interpolates within. This is the ingestion point for
+// measured reflectance/SPD data (FTSL `table { 400:0.05 450:0.12 ... }`).
+inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) {
+    std::sort(pairs.begin(), pairs.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return [pairs](double w) -> double {
+        if (pairs.empty()) return 0.0;
+        if (w <= pairs.front().first) return pairs.front().second;
+        if (w >= pairs.back().first)  return pairs.back().second;
+        // Binary search for the bracketing interval.
+        size_t lo = 0, hi = pairs.size() - 1;
+        while (lo + 1 < hi) {
+            size_t mid = (lo + hi) / 2;
+            (pairs[mid].first <= w ? lo : hi) = mid;
+        }
+        double w0 = pairs[lo].first, w1 = pairs[lo + 1].first;
+        double v0 = pairs[lo].second, v1 = pairs[lo + 1].second;
+        double f = (w1 > w0) ? (w - w0) / (w1 - w0) : 0.0;
+        return v0 + (v1 - v0) * f;
+    };
+}
+
+// Upsample a linear-sRGB triple to a smooth reflectance spectrum in [0,1].
+// PLACEHOLDER (Phase 2c will replace with a proper Jakob-Hanika / Scott Burns
+// upsampler that round-trips sRGB exactly). This three-lobe blend is only good
+// enough to keep `rgb r g b` usable; for physically-exact wall colours prefer the
+// dedicated builders (redWall/greenWall) or a measured `table { }`.
+inline Spectrum rgbToReflectance(double r, double g, double b) {
+    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    return [=](double w) {
+        auto bump = [](double x, double mu, double s) { double t = (x - mu) / s; return std::exp(-0.5 * t * t); };
+        double B = bump(w, 450.0, 55.0), G = bump(w, 550.0, 55.0), R = bump(w, 620.0, 55.0);
+        double v = r * R + g * G + b * B;
+        return std::clamp(v, 0.0, 1.0);
+    };
+}
 
 // --- Emission importance sampling ------------------------------------------
 // Precomputes a CDF over [LAMBDA_MIN, LAMBDA_MAX] to sample lambda ~ SPD, and
