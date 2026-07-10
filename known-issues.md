@@ -3,6 +3,25 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Limitations (by design, tracked for future work)
+
+### Backward reference tracer cannot validate fluorescence
+- **What:** `src/backward.h` has no Fluorescent case — a fluorescent material
+  falls through to the Diffuse branch, so modes R (reference) and V (validate)
+  would silently mis-render `-scene fluoro`.
+- **Why:** Backward tracing a wavelength-shifting material requires the full
+  bispectral reradiation matrix (integrate the camera-side path over all possible
+  input wavelengths for each output wavelength). Forward single-wavelength tracing
+  handles fluorescence trivially (sample lambda' ~ emission SPD, M/pdf cancels).
+- **Mitigation in place:** `-scene fluoro` is a forward-only (model A/B/C) scene;
+  it is never selected in refMode. Fluorescence correctness is instead validated
+  deterministically by `-checkfluoro` (emission-sampler mean, epsilon*Q branch
+  fraction, Stokes shift). Energy conservation holds (`sum/emitted=1.000000`).
+- **Proper fix (future):** implement a bispectral backward estimator (reradiation
+  matrix / Mojzik-style hero-wavelength reweighting) if we ever want R/V to cover
+  fluorescent scenes. Not needed for the forward tracer's own correctness.
+- **Status:** OPEN (acceptable) — logged 2026-07-10.
+
 ## Performance
 
 ### RESOLVED: Diffuse-mesh renders were ~60× slower per photon (degenerate BVH)

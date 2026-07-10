@@ -33,6 +33,37 @@ inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
     return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + mdir * cosT);
 }
 
+// --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --
+// A fluorescent surface has two competing channels: elastic diffuse reflection
+// (albedo rho, wavelength preserved) and dye excitation (prob aEff = min(eps,
+// 1-rho) so the channels never exceed unity, preserving energy). Excited photons
+// re-radiate with probability Q at a Stokes-shifted wavelength drawn from M.
+inline void fluoroWeights(const Material& m, double lambda, double& rho, double& aEff) {
+    rho = clamp01(m.reflect(lambda));
+    double eps = clamp01(m.fluoAbsorb(lambda));
+    aEff = std::min(eps, std::max(0.0, 1.0 - rho));
+}
+
+enum class FluoroEvent { Elastic, Reemit, Absorb };
+struct FluoroResult { FluoroEvent event; double lambdaOut; };
+
+// Stochastically resolve a fluorescent interaction for an incoming photon at
+// lambdaIn. Elastic -> reflect at lambdaIn; Reemit -> re-radiate at lambdaOut~M;
+// Absorb -> photon lost (dye heat / non-excited fraction). Throughput weight is
+// unchanged in all surviving branches (the branch probabilities carry the
+// reradiation efficiency, and M/pdf cancels for the sampled lambdaOut).
+inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rng) {
+    double rho, aEff; fluoroWeights(m, lambdaIn, rho, aEff);
+    double u = rng.uniform();
+    if (u < rho)          return {FluoroEvent::Elastic, lambdaIn};
+    if (u < rho + aEff) {
+        if (rng.uniform() >= m.fluoYield) return {FluoroEvent::Absorb, 0.0};
+        double pf; double lp = m.fluoEmitSampler.sample(rng, pf);
+        return {FluoroEvent::Reemit, lp};
+    }
+    return {FluoroEvent::Absorb, 0.0};
+}
+
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
@@ -154,6 +185,25 @@ struct Renderer {
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; } // below surface
                     ray = Ray{h.p + h.n * 1e-6, o};
                     continue;
+                }
+                case MatType::Fluorescent: {
+                    double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
+                    // Model-B connections: the elastic channel splats at the
+                    // incoming lambda; the fluorescent channel samples one
+                    // lambda' ~ M and splats the glow (albedo aEff*Q) with the
+                    // camera-response evaluated at lambda' (Stokes-shifted colour).
+                    if (cam && camFilm && !forwardCatch) {
+                        connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
+                        if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
+                            double pf; double lp = m.fluoEmitSampler.sample(rng, pf);
+                            connect(scene, *cam, *camFilm, h.p, h.n, lp, beta, aEff * m.fluoYield);
+                        }
+                    }
+                    FluoroResult fr = fluoroInteract(m, lambda, rng);
+                    if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return; }
+                    lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
+                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
+                    continue;                           // beta unchanged (see above)
                 }
                 case MatType::Diffuse:
                 default: {

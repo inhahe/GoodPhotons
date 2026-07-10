@@ -84,7 +84,7 @@ static Scene buildPrism(int res) {
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
 static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
                           const char* meshPath = nullptr, double meshScale = 1.0,
-                          bool diffuseSphere = false) {
+                          bool diffuseSphere = false, bool fluoroSphere = false) {
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
@@ -94,6 +94,7 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     Material glass; glass.type = MatType::Dielectric;
     glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
     Material mesh;  mesh.reflect  = whiteWall(0.8);              s.mats.push_back(mesh);  // 5 (diffuse)
+    s.mats.push_back(makeFluoroMaterial());                                              // 6 (fluorescent)
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);            // floor
     addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);            // ceiling
@@ -112,10 +113,11 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     if (meshPath && meshPath[0]) {
         loadObj(s, meshPath, /*mat*/5, /*translate*/{0.5, 0.4, 0.5}, meshScale);
     } else {
-        // Diffuse sphere (mat 5) for the reference/validation modes so there is no
-        // specular black-glass mismatch; the dispersive glass sphere (mat 4)
-        // otherwise casts a spectral caustic on the floor.
-        s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, diffuseSphere ? 5 : 4});
+        // Sphere material: fluorescent (6) for the fluoro demo; diffuse (5) for the
+        // reference/validation modes so there is no specular black-glass mismatch;
+        // otherwise the dispersive glass sphere (4) casts a spectral caustic.
+        int sphMat = fluoroSphere ? 6 : (diffuseSphere ? 5 : 4);
+        s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, sphMat});
     }
 
     s.build();
@@ -303,6 +305,59 @@ static void bvhStats(const Scene& scene, long long rays) {
                 (double)totNodes / rays, (double)totLeaf / rays, 100.0 * hits / rays);
 }
 
+// Deterministic fluorescence self-test. Forward fluorescence has no analytic image
+// to compare against, so instead we validate the reradiation primitives directly:
+//   (a) the emission sampler is unbiased  -> its mean lambda matches the SPD's;
+//   (b) the branch probabilities are correct -> the re-emission fraction at a
+//       strongly-excited input wavelength equals epsilon*Q (= aEff*Q);
+//   (c) the Stokes shift is physical -> re-emitted lambda' is longer than the
+//       excitation lambda and centred on the emission band.
+// It exercises the same fluoroInteract()/fluoEmitSampler used by the renderer, so a
+// bug in the transport math surfaces here without needing a full render.
+static int checkFluoro() {
+    Material m = makeFluoroMaterial();
+
+    // (a) Analytic emission mean vs Monte-Carlo sampler mean.
+    double num = 0, den = 0;
+    for (double w = LAMBDA_MIN; w <= LAMBDA_MAX; w += 0.5) {
+        double v = std::max(0.0, m.fluoEmit(w)); num += v * w; den += v;
+    }
+    double meanAnalytic = num / den;
+    Pcg32 rng; rng.seed(0xF10E5Cu, 0x1234u);
+    const long long Ns = 4'000'000;
+    double sMean = 0; for (long long i = 0; i < Ns; ++i) { double pf; sMean += m.fluoEmitSampler.sample(rng, pf); }
+    sMean /= Ns;
+
+    // (b,c) Branch statistics at a strongly-excited input wavelength.
+    const double lin = 450.0;                 // blue excitation
+    double rho, aEff; fluoroWeights(m, lin, rho, aEff);
+    double expectFrac = aEff * m.fluoYield;
+    long long reemit = 0, elastic = 0, absorb = 0; double meanOut = 0;
+    const long long Nt = 4'000'000;
+    for (long long i = 0; i < Nt; ++i) {
+        FluoroResult r = fluoroInteract(m, lin, rng);
+        if      (r.event == FluoroEvent::Reemit)  { ++reemit; meanOut += r.lambdaOut; }
+        else if (r.event == FluoroEvent::Elastic) ++elastic;
+        else                                       ++absorb;
+    }
+    double frac = (double)reemit / Nt;
+    double moOut = reemit ? meanOut / reemit : 0.0;
+
+    bool passA = std::fabs(sMean - meanAnalytic) < 1.0;
+    bool passB = std::fabs(frac - expectFrac) < 0.005;
+    bool passC = (moOut > lin) && std::fabs(moOut - meanAnalytic) < 1.5;
+    bool pass = passA && passB && passC;
+
+    std::printf("[checkfluoro] emission mean: sampler=%.2f analytic=%.2f nm  (%s)\n",
+                sMean, meanAnalytic, passA ? "ok" : "BAD");
+    std::printf("[checkfluoro] reemit fraction @%.0fnm: measured=%.4f expected(eps*Q)=%.4f  (%s)\n",
+                lin, frac, expectFrac, passB ? "ok" : "BAD");
+    std::printf("[checkfluoro] Stokes shift: in=%.0f -> out_mean=%.2f nm (elastic=%.3f absorb=%.3f)  (%s)\n",
+                lin, moOut, (double)elastic / Nt, (double)absorb / Nt, passC ? "ok" : "BAD");
+    std::printf("[checkfluoro] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -421,6 +476,7 @@ int main(int argc, char** argv) {
     bool checkBvhOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
+    bool checkFluoroOnly = false;
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
@@ -437,14 +493,17 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
     }
     if (nThreads < 1) nThreads = 1;
-    if (checkLensOnly) return checkLens();   // deterministic, no scene needed
+    if (checkLensOnly)   return checkLens();     // deterministic, no scene needed
+    if (checkFluoroOnly) return checkFluoro();   // deterministic, no scene needed
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
+    bool fluoro    = !std::strcmp(sceneName, "fluoro");
 
     selfTestColor();
 
@@ -454,8 +513,9 @@ int main(int argc, char** argv) {
     const bool refMode = (mode == 'R' || mode == 'V');
     Scene scene = prism     ? buildPrism(res)
                 : materials ? buildMaterials(res, resolveLight(lightName))
-                            : buildCornell(res, mode, resolveLight(lightName), meshPath,
-                                           meshScale, /*diffuseSphere*/refMode);
+                            : buildCornell(res, mode, resolveLight(lightName),
+                                           fluoro ? nullptr : meshPath, meshScale,
+                                           /*diffuseSphere*/refMode, /*fluoroSphere*/fluoro);
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test

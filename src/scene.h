@@ -6,18 +6,44 @@
 #include "spectrum.h"
 #include "scene_film.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent };
 
 struct Material {
     MatType type = MatType::Diffuse;
     // reflect means: diffuse albedo / mirror tint / glossy tint / half-mirror
-    // reflect-probability, depending on type.
+    // reflect-probability, depending on type. For Fluorescent it is the elastic
+    // (wavelength-preserving) diffuse albedo.
     Spectrum reflect = constantSpectrum(0.5);
     Spectrum emit    = constantSpectrum(0.0); // emitted radiance vs lambda
     Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
     double roughness = 0.1;                    // glossy lobe width [0,1]
     bool isLight = false;
+
+    // --- Fluorescence (MatType::Fluorescent) --------------------------------
+    // A photon at lambda excites the dye with probability fluoAbsorb(lambda); the
+    // dye then re-radiates (quantum yield fluoYield) at a Stokes-shifted lambda'
+    // drawn from the normalized emission SPD fluoEmit. Single-wavelength forward
+    // tracing handles this naturally: sample lambda' ~ fluoEmit and the M/pdf
+    // ratio cancels, so the throughput weight is just the branch probability.
+    Spectrum fluoAbsorb = constantSpectrum(0.0);  // excitation prob epsilon(lambda)
+    Spectrum fluoEmit   = constantSpectrum(0.0);  // emission SPD M(lambda') (shape)
+    EmissionSampler fluoEmitSampler;              // built from fluoEmit
+    double fluoYield = 1.0;                        // quantum yield Q in [0,1]
 };
+
+// A classic "green highlighter" fluorophore: absorbs blue/violet strongly, glows
+// green (~560 nm). Shared by the fluoro demo scene and the -checkfluoro self-test
+// so both exercise the exact same material definition (single source of truth).
+inline Material makeFluoroMaterial() {
+    Material f;
+    f.type = MatType::Fluorescent;
+    f.reflect     = constantSpectrum(0.05);         // small elastic base reflectance
+    f.fluoAbsorb  = shortPass(480.0, 0.06, 0.85);   // excite below ~480 nm
+    f.fluoEmit    = gaussianBand(560.0, 25.0, 1.0); // emit green-yellow
+    f.fluoEmitSampler.build(f.fluoEmit, 1.0);
+    f.fluoYield   = 0.9;
+    return f;
+}
 
 // A flat rectangular contact sensor (model A) spanning origin + s*uAxis + t*vAxis.
 struct Sensor {

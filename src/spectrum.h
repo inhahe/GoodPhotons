@@ -32,6 +32,19 @@ inline Spectrum greenWall() {
     return [](double w) { double t = (w - 550.0) / 45.0; return 0.05 + 0.70 * std::exp(-0.5 * t * t); };
 }
 
+// A Gaussian band centred at `center` nm with std-dev `sigma`, peak `amp`. Used
+// for fluorescent emission spectra (the re-radiated glow) and other smooth bands.
+inline Spectrum gaussianBand(double center, double sigma, double amp = 1.0) {
+    return [=](double w) { double t = (w - center) / sigma; return amp * std::exp(-0.5 * t * t); };
+}
+
+// A logistic roll-off high below `edge` nm and low above it (slope>0), scaled by
+// `amp`. Used for fluorescent excitation/absorption: short wavelengths (blue/UV)
+// excite the dye, long wavelengths pass through it.
+inline Spectrum shortPass(double edge, double slope, double amp = 1.0) {
+    return [=](double w) { return amp / (1.0 + std::exp((w - edge) * slope)); };
+}
+
 // --- Dispersion: wavelength-dependent index of refraction -------------------
 // Sellmeier equation: n^2(l) = 1 + sum_i Bi*l^2 / (l^2 - Ci), with l in micrometres.
 // Single-wavelength photons make this "free" dispersion — each lambda bends by its

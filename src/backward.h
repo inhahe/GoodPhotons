@@ -19,6 +19,11 @@
 //   Glossy     : power-cosine lobe around the mirror dir, RR on reflectance.
 //   HalfMirror : stochastic reflect/transmit, lossless.
 //   Dielectric : Fresnel-weighted reflect/refract, lossless.
+// NOTE: Fluorescence is intentionally NOT supported here — backward tracing a
+// wavelength-shifting material needs the full bispectral reradiation matrix,
+// whereas forward single-wavelength tracing handles it trivially. A Fluorescent
+// material falls through to the Diffuse case below, so fluoro scenes must not be
+// used with modes R/V (the forward-tracer's -scene fluoro is model A/B/C only).
 // Emission is added only when a light is reached via the camera ray or a
 // specular/near-specular bounce; diffuse arrivals are covered by NEE (no double
 // counting).
