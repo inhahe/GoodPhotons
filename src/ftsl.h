@@ -223,10 +223,25 @@ inline double dblOf(const Block& b, const char* key, double dflt) {
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
+// One authored camera. The Camera itself is built in main at the final resolution,
+// so a CLI -r override stays consistent with the output film size. `res` is the
+// camera's own film resolution (-1 = inherit the global/CLI res); `mode` is the
+// per-camera measurement model (0 = inherit the global/CLI mode).
+struct CamSpec {
+    std::string name;
+    Vec3   eye{0, 1, 3}, look{0, 1, 0}, up{0, 1, 0};
+    double fov = 40.0, aperture = 0.02, focus = 0.0;
+    char   mode = 0;             // 0 = not specified -> inherit global
+    int    res  = -1;            // -1 = not specified -> inherit global
+};
+
 struct Loaded {
     Scene scene;
-    // Camera parameters (the Camera itself is built in main at the final resolution,
-    // so a CLI -r override stays consistent with the output film size).
+    // All authored cameras, in file order. Phase 3a: any number of `camera` blocks
+    // accumulate; main renders the CLI-selected one, or all of them.
+    std::vector<CamSpec> cameras;
+    // Mirror of the FIRST camera (kept so the pre-Phase-3a single-camera code paths
+    // and defaults keep working unchanged).
     bool hasCamera = false;
     Vec3 camEye{0, 1, 3}, camLook{0, 1, 0}, camUp{0, 1, 0};
     double camFov = 40.0, camAperture = 0.02, camFocus = 0.0;
@@ -603,20 +618,31 @@ private:
 
     // ---- camera ----
     bool addCamera(const Block& b, Loaded& L) {
-        if (L.hasCamera) return true;   // Phase 1: first camera wins (multi-cam is Phase 3a)
-        vec3Of(b, "eye", L.camEye); vec3Of(b, "look_at", L.camLook); vec3Of(b, "up", L.camUp);
-        L.camEye = P(L.camEye); L.camLook = P(L.camLook);   // up is a direction: unscaled
-        L.camFov = dblOf(b, "fov_y", 40.0);
-        L.camAperture = Len(dblOf(b, "aperture", 0.02));
-        L.camFocus = Len(dblOf(b, "focus", 0.0));
+        CamSpec cs;
+        cs.name = b.name.empty() ? ("cam" + std::to_string(L.cameras.size())) : b.name;
+        vec3Of(b, "eye", cs.eye); vec3Of(b, "look_at", cs.look); vec3Of(b, "up", cs.up);
+        cs.eye = P(cs.eye); cs.look = P(cs.look);   // up is a direction: unscaled
+        cs.fov = dblOf(b, "fov_y", 40.0);
+        cs.aperture = Len(dblOf(b, "aperture", 0.02));
+        cs.focus = Len(dblOf(b, "focus", 0.0));
         const Stmt* film = find(b, "film");
         if (film && film->val.block) {
             const Stmt* r = find(*film->val.block, "res");
-            if (r && !r->val.words.empty()) L.res = (int)num(r->val.words[0]);
+            if (r && !r->val.words.empty()) cs.res = (int)num(r->val.words[0]);
         }
         std::string md = strOf(b, "mode");
-        if (!md.empty()) L.mode = md[0];
-        L.hasCamera = true;
+        if (!md.empty()) cs.mode = md[0];
+        L.cameras.push_back(cs);
+
+        // Mirror the first camera into the flat fields + global mode/res (defaults
+        // that the rest of the loader and CLI-override logic still read).
+        if (!L.hasCamera) {
+            L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
+            L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
+            if (cs.mode) L.mode = cs.mode;
+            if (cs.res > 0) L.res = cs.res;
+            L.hasCamera = true;
+        }
         return true;
     }
 

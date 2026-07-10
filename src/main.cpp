@@ -893,6 +893,101 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
                 : "review: residual above 5% — increase -n/-spp (if firefly-dominated) or investigate transport.");
 }
 
+// Render one camera into `outPath`. Resolves the -device request for THIS mode,
+// runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
+// and writes the result. Factored out of main so any number of cameras (Phase 3a
+// multi-camera) share exactly one render path. `res` is the camera's own film
+// resolution; `cam` must already be built at that resolution.
+static int runRender(const Scene& scene, const Camera& cam, char mode,
+                     long long N, int res, long long spp, int nThreads,
+                     const char* device, bool diffraction,
+                     const char* lightLabel, const std::string& outPath) {
+    const bool refMode      = (mode == 'R' || mode == 'V');
+    const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
+    const bool forwardCatch = (mode == 'C');
+
+    // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
+    // covers the forward light trace (models A/B/C, and the forward pass of mode V);
+    // the backward tracer (mode R, the mode-P camera-side layer) and fluorescent
+    // scenes always run on the CPU.
+    const bool gpuForwardMode = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V');
+    const bool wantGpu  = !std::strcmp(device, "gpu");
+    const bool wantAuto = !std::strcmp(device, "auto");
+    bool useGpu = false;
+    if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
+        std::fprintf(stderr, "[device] unknown -device '%s'; using CPU "
+                             "(valid: auto|cpu|gpu)\n", device);
+    if (wantGpu || wantAuto) {
+#ifdef HAVE_CUDA
+        if (!cudaAvailable()) {
+            if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
+            else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
+        } else if (!gpuForwardMode) {
+            const char* why = (mode == 'R') ? "backward reference - no forward GPU pass"
+                                            : "camera-side composite - CPU-only path";
+            if (wantGpu) std::fprintf(stderr,
+                "[device] GPU can't accelerate this render: %s; using CPU\n", why);
+            else         std::printf("[device] auto -> CPU (%s)\n", why);
+        } else if (!cudaForwardSupported(scene)) {
+            if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
+                                              "material (fluorescent); using CPU\n");
+            else         std::printf("[device] auto -> CPU (fluorescent scene "
+                                     "unsupported on GPU)\n");
+        } else {
+            useGpu = true;
+            std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
+                        cudaDeviceName());
+        }
+#else
+        if (wantGpu)
+            std::fprintf(stderr, "[device] built without CUDA; using CPU "
+                                 "(reconfigure with a CUDA toolkit for -device gpu)\n");
+#endif
+    }
+
+    // --- Backward reference (mode R) and validation (mode V) ---
+    if (refMode) {
+        std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
+                    mode, spp, res, res, nThreads, lightLabel);
+        Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+        if (mode == 'R') { writePPM(outPath.c_str(), ref, (double)spp); return 0; }
+
+        std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
+        EnergyReport e;
+        Film fwd = renderForward(scene, &cam, res, N, nThreads,
+                                 /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
+        double tot = e.absorbed + e.sensor + e.escaped + e.residual;
+        std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                    e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
+                    e.residual / e.emitted, tot / e.emitted);
+        compareFilms(fwd, N, ref, spp);
+        writePPM("validate_forward.ppm", fwd, (double)N);
+        writePPM("validate_backward.ppm", ref, (double)spp);
+        return 0;
+    }
+
+    // --- Forward + camera-side composite (mode P) ---
+    if (mode == 'P') {
+        std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
+                    "at %dx%d on %d threads (light=%s) ...\n",
+                    N, spp, res, res, nThreads, lightLabel);
+        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction);
+        writePPM(outPath.c_str(), comp, 1.0);
+        return 0;
+    }
+
+    std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
+                mode, N, res, res, nThreads, lightLabel);
+    EnergyReport e;
+    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction, useGpu);
+    double tot = e.absorbed + e.sensor + e.escaped + e.residual;
+    std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
+                e.residual / e.emitted, tot / e.emitted);
+    writePPM(outPath.c_str(), out_film, (double)N);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     long long N = 2'000'000;
     int res = 256;
@@ -923,6 +1018,9 @@ int main(int argc, char** argv) {
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
+    const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
+    bool modeFromCli = false;     // did the CLI force a global -mode? (else per-camera)
+    bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
     // Load the scene from a file *before* parsing the rest of argv, so any explicit
@@ -950,9 +1048,10 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
-        else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) { res = std::atoi(argv[++i]); resFromCli = true; }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
-        else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) mode = argv[++i][0];
+        else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
@@ -1038,109 +1137,76 @@ int main(int argc, char** argv) {
         return checkBvh(scene, rays) == 0 ? 0 : 1;
     }
     if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
-    // mode A: contact sensor (no camera). mode B: connect/splat. mode C: finite-
-    // aperture forward catch. mode R: backward reference. mode V: validate B vs R.
-    const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
-    const bool forwardCatch = (mode == 'C');
+    // Build the list of cameras to render. FTSL scenes may declare several; a
+    // built-in scene has exactly one. Each render camera carries its own effective
+    // mode and film resolution (per-camera FTSL values, unless a CLI -mode/-r forces
+    // them globally). All cameras share the single already-built scene.
+    const char* lightLabel = (prism || grating) ? "beam" : lightName;
+    auto effMode = [&](char camMode) -> char {
+        if (modeFromCli) return mode;         // CLI -mode forces every camera
+        return camMode ? camMode : mode;      // else per-camera, else the global default
+    };
+    struct RenderCam { std::string name; Camera cam; char mode; int res; };
+    std::vector<RenderCam> toRender;
 
-    // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
-    // covers the forward light trace (models A/B/C, and the forward pass of mode V);
-    // the backward tracer (mode R, the mode-P camera-side layer) and fluorescent
-    // scenes always run on the CPU. 'auto' picks the GPU only when it can actually
-    // help this render and prints the reason; 'gpu' forces it and warns on fallback.
-    const bool gpuForwardMode = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V');
-    const bool wantGpu  = !std::strcmp(device, "gpu");
-    const bool wantAuto = !std::strcmp(device, "auto");
-    bool useGpu = false;
-    if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
-        std::fprintf(stderr, "[device] unknown -device '%s'; using CPU "
-                             "(valid: auto|cpu|gpu)\n", device);
-    if (wantGpu || wantAuto) {
-#ifdef HAVE_CUDA
-        if (!cudaAvailable()) {
-            if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
-            else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
-        } else if (!gpuForwardMode) {
-            const char* why = (mode == 'R') ? "backward reference - no forward GPU pass"
-                                            : "camera-side composite - CPU-only path";
-            if (wantGpu) std::fprintf(stderr,
-                "[device] GPU can't accelerate this render: %s; using CPU\n", why);
-            else         std::printf("[device] auto -> CPU (%s)\n", why);
-        } else if (!cudaForwardSupported(scene)) {
-            if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
-                                              "material (fluorescent); using CPU\n");
-            else         std::printf("[device] auto -> CPU (fluorescent scene "
-                                     "unsupported on GPU)\n");
+    if (fromFtsl && !ftslScene.cameras.empty()) {
+        // Select which cameras to render: `-camera <name>` picks one; `-camera all`
+        // (or, by default, more than one declared) renders every camera; a single
+        // declared camera renders it.
+        std::vector<const ftsl::CamSpec*> sel;
+        if (cameraSel && std::strcmp(cameraSel, "all") != 0) {
+            for (const auto& cs : ftslScene.cameras)
+                if (cs.name == cameraSel) sel.push_back(&cs);
+            if (sel.empty()) {
+                std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
+                for (const auto& cs : ftslScene.cameras)
+                    std::fprintf(stderr, " %s", cs.name.c_str());
+                std::fprintf(stderr, ")\n");
+                return 1;
+            }
         } else {
-            useGpu = true;
-            std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
-                        cudaDeviceName());
+            for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
         }
-#else
-        if (wantGpu)
-            std::fprintf(stderr, "[device] built without CUDA; using CPU "
-                                 "(reconfigure with a CUDA toolkit for -device gpu)\n");
-        // 'auto' silently uses the CPU in a CPU-only build.
-#endif
-    }
-    Camera cam;
-    if (fromFtsl && ftslScene.hasCamera) {
-        // Build at the final `res` (honouring a CLI -r override) so the camera film
-        // matches the output film renderForward allocates.
-        cam.lookAt(ftslScene.camEye, ftslScene.camLook, ftslScene.camUp,
-                   ftslScene.camFov, res, res);
-        cam.apertureR = ftslScene.camAperture;
-        cam.setFocus(ftslScene.camFocus);
-    } else if (useCamera) {
-        if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
-        else       cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
-        cam.apertureR = apertureR;
-        cam.setFocus(focusDist);   // mode C thin lens (0 = camera obscura, no focus plane)
-    }
-
-    // --- Backward reference (mode R) and validation (mode V) ---
-    if (refMode) {
-        std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
-                    mode, spp, res, res, nThreads, lightName);
-        Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
-        if (mode == 'R') { writePPM(out, ref, (double)spp); return 0; }
-
-        // mode V: also run the forward light tracer (model B) and compare.
-        std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
-        EnergyReport e;
-        Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                                 /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
-        double tot = e.absorbed + e.sensor + e.escaped + e.residual;
-        std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
-                    e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
-                    e.residual / e.emitted, tot / e.emitted);
-        compareFilms(fwd, N, ref, spp);
-        writePPM("validate_forward.ppm", fwd, (double)N);
-        writePPM("validate_backward.ppm", ref, (double)spp);
-        return 0;
+        for (const ftsl::CamSpec* cs : sel) {
+            int cres = resFromCli ? res : (cs->res > 0 ? cs->res : res);
+            Camera c;
+            c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cres, cres);
+            c.apertureR = cs->aperture;
+            c.setFocus(cs->focus);
+            toRender.push_back({cs->name, c, effMode(cs->mode), cres});
+        }
+    } else {
+        // Built-in scene: one camera. mode A needs no camera frame (a default Camera
+        // is passed and its frame is unused; the sensor plane is baked from scene).
+        const bool useCamera = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
+        Camera c;
+        if (useCamera) {
+            if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
+            else       c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
+            c.apertureR = apertureR;
+            c.setFocus(focusDist);   // mode C thin lens (0 = camera obscura, no focus plane)
+        }
+        toRender.push_back({"", c, mode, res});
     }
 
-    // --- Forward + camera-side composite (mode P) ---
-    if (mode == 'P') {
-        std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
-                    "at %dx%d on %d threads (light=%s) ...\n",
-                    N, spp, res, res, nThreads, lightName);
-        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction);
-        writePPM(out, comp, 1.0);
-        return 0;
+    // Output naming: a single camera writes to `out`; several cameras write one file
+    // each, inserting `_<name>` before the extension (so out=r.ppm -> r_hero.ppm).
+    auto outFor = [&](const std::string& name) -> std::string {
+        if (toRender.size() <= 1 || name.empty()) return out;
+        std::string base = out;
+        auto dot = base.find_last_of('.');
+        std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
+        std::string ext  = (dot == std::string::npos) ? std::string(".ppm") : base.substr(dot);
+        return stem + "_" + name + ext;
+    };
+
+    for (const RenderCam& rc : toRender) {
+        if (toRender.size() > 1)
+            std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
+                        rc.name.c_str(), rc.mode, rc.res, rc.res, outFor(rc.name).c_str());
+        int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
+                           device, diffraction, lightLabel, outFor(rc.name));
+        if (rv != 0) return rv;
     }
-
-    std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
-                mode, N, res, res, nThreads, (prism || grating) ? "beam" : lightName);
-
-    EnergyReport e;
-    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction, useGpu);
-
-    double tot = e.absorbed + e.sensor + e.escaped + e.residual;
-    std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
-                e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
-                e.residual / e.emitted, tot / e.emitted);
-
-    writePPM(out, out_film, (double)N);
     return 0;
 }

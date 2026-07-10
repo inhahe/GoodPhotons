@@ -21,9 +21,12 @@
 > mode V. Phase 2d is done: the `type mix` material stochastically picks among
 > named child materials per photon (weights sum ≤ 1, remainder absorbs), shared by
 > the forward tracer, backward reference, and CUDA kernel; validated by
-> `scenes/mixmat.ftsl` under mode V. The still-unimplemented pieces (configurable
-> spectral *range*, absolute light power/units, the full physical `layered`
-> material, multi-camera/paths, textures/UVs, extra light shapes) remain tagged
+> `scenes/mixmat.ftsl` under mode V. Phase 3a (partial) is done: any number of named
+> `camera` blocks render one image each (per-camera film resolution + mode), with
+> `-camera <name>` selection, validated by `scenes/twocam.ftsl`. The still-unimplemented
+> pieces (configurable spectral *range*, absolute light power/units, the full physical
+> `layered` material, the shared multi-camera mode-B pass + `camera_path` + physical
+> film size/f-stop/ISO, textures/UVs, extra light shapes) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -518,11 +521,31 @@ measurement model. **[maps 1:1]**, except the commented film fields.
 (Modes R/V/P are reference/validation/composite tooling, not scene-facing;
 they stay CLI-only.)
 
-### 8.3 Multiple cameras & camera paths **[needs engine work]**
+### 8.3 Multiple cameras & camera paths
 
-The wishlist wants "many cameras at once (possibly along a path)… same render
-for efficiency". The format supports it by allowing multiple named `camera`
-blocks (render all, or `-camera hero`); and a `camera_path` for motion:
+**Multiple named cameras are implemented** (Phase 3a). Any number of `camera`
+blocks accumulate; one render invocation produces one image per camera. Selection:
+
+- default (no `-camera`): render **every** declared camera;
+- `-camera <name>`: render just that one (errors listing the available names if
+  unknown);
+- `-camera all`: explicit "render every camera".
+
+Each camera has its own **film resolution** (`film { res W H }`) and its own
+measurement `mode` (`A`/`B`/`C`), used unless a CLI `-r`/`-mode` forces the value
+globally. With several cameras the output filename gets a `_<name>` suffix before
+the extension (`-o out.ppm` → `out_hero.ppm`, `out_side.ppm`); a single camera
+writes straight to `-o`. Validated by `scenes/twocam.ftsl` (a hero 256² view + an
+oblique 192² view of one Cornell box; both energy-conserve).
+
+**Current limitation (optimization, not correctness):** the cameras are rendered
+as **independent forward passes** today, each re-tracing the photon set. The spec's
+"same render for efficiency" — a *single shared mode-B photon pass* that connects
+every diffuse bounce to all cameras' pupils at once — is a natural future extension
+of `connect()` (photons are camera-independent until the splat) and is logged in
+known-issues. `camera_path` (below) is also **[needs engine work]**.
+
+A `camera_path` for motion:
 
 ```
 # PROPOSED (not yet supported):
@@ -750,7 +773,10 @@ designed to grow into.
 
 **Phase 3 — larger features**
 10. Multiple cameras / `camera_path`; per-camera films; physical film size +
-    f-stop + sensitivity.
+    f-stop + sensitivity. **[partial — Phase 3a: multiple named cameras + `-camera`
+    selection + per-camera film resolution + per-camera mode done (`scenes/twocam.ftsl`);
+    shared mode-B multi-camera pass, `camera_path`, physical film size, f-stop, ISO
+    still needs engine work.]**
 11. UVs + spectral/RGB textures; per-face materials from OBJ `usemtl`.
 12. Additional light shapes (sphere/spot/HDRI environment).
 

@@ -5,6 +5,37 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Limitations (by design, tracked for future work)
 
+### Multi-camera renders re-trace photons per camera (no shared pass yet)
+- **What:** Phase 3a implements multiple named `camera` blocks: one render
+  invocation emits one image per camera (`scenes/twocam.ftsl`), with `-camera
+  <name>` selection and per-camera film resolution + mode. But each camera is a
+  **separate forward pass** — the photon set is re-traced from scratch for every
+  camera (`runRender` is called in a loop in `src/main.cpp`).
+- **Why it matters:** the wishlist's framing is "many cameras at once… *same
+  render for efficiency*". For N cameras this is N× the photon work instead of 1×.
+- **Proper fix (future):** a single **shared mode-B photon pass** that connects
+  each diffuse/emitter vertex to *every* camera's pupil at once. Photons are
+  camera-independent until the `connect()` splat, so `tracePhoton` would take a
+  list of (Camera, Film) targets and call `connect`/`connectVolume` once per
+  camera per vertex; per-thread films become per-thread × per-camera. Modes A/C
+  (contact-sensor / thin-lens forward catch) are inherently per-camera and would
+  stay single-camera or need their own catch loop; the CUDA kernel would also need
+  the camera list (currently one `DCamera`). Scoped as a follow-up so the initial
+  multi-camera feature (correct, just not yet shared) could land validated.
+- **Status:** OPEN (acceptable) — multi-camera done 2026-07-10; shared pass deferred.
+
+### `camera_path`, physical film size, f-stop, and ISO not implemented
+- **What:** the spec (§8.1/§8.3) proposes `camera_path` keyframed motion, a physical
+  film `size <w> <h>` (mm), f-stop authoring (`fstop N` → aperture radius via focal
+  length), and film `iso`/sensitivity. None are built; the camera still derives its
+  image plane from `fov_y` + aspect and takes an `aperture` radius directly.
+- **Proper fix (future):** add physical focal length from film size + fov, convert
+  `fstop` → `apertureR = f/(2N)` at load time, apply `iso` as a per-camera exposure
+  scale in the film write, and expand a `camera_path` into a sequence of `CamSpec`
+  frames (the multi-camera loop in `main.cpp` already renders a list, so a path is
+  just a generated `CamSpec` list + frame-numbered output names).
+- **Status:** OPEN (design captured) — logged 2026-07-10.
+
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
   child materials, weights ≤ 1, remainder absorbs) is implemented and validated
