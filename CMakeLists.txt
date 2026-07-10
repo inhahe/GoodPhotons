@@ -50,8 +50,21 @@ if(CMAKE_CUDA_COMPILER)
     set(FTRACE_CUDA_ARCH "native" CACHE STRING
         "CUDA architectures to build (native | all-major | all | semicolon list)")
 
+    # Device transport precision. Consumer GeForce GPUs run FP64 at ~1/64 the FP32
+    # rate, so by default the megakernel computes geometry/BRDF/spectral math in
+    # float and accumulates the film/energy in double (mixed precision). Set OFF for
+    # a full-FP64 device path (bit-closer to the CPU reference, far slower on GeForce;
+    # useful on datacenter cards or for precision debugging). The CPU renderer is
+    # always double and remains the ground-truth regardless of this switch.
+    option(FTRACE_GPU_FP32 "Compute GPU transport in float (mixed precision)" ON)
+
     target_sources(ftrace PRIVATE src/render_cuda.cu)
     target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
+    if(FTRACE_GPU_FP32)
+        target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=1)
+    else()
+        target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=0)
+    endif()
     set_target_properties(ftrace PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_ARCHITECTURES "${FTRACE_CUDA_ARCH}")
@@ -62,7 +75,8 @@ if(CMAKE_CUDA_COMPILER)
         target_link_options(ftrace PRIVATE /NODEFAULTLIB:LIBCMT)
     endif()
     message(STATUS "CUDA backend enabled (FTRACE_CUDA_ARCH=${FTRACE_CUDA_ARCH}; "
-                   "use -DFTRACE_CUDA_ARCH=all-major for a portable fat binary)")
+                   "use -DFTRACE_CUDA_ARCH=all-major for a portable fat binary; "
+                   "FTRACE_GPU_FP32=${FTRACE_GPU_FP32})")
 else()
     message(STATUS "CUDA not found; building CPU-only (-device gpu unavailable)")
 endif()
