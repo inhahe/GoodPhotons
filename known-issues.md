@@ -90,12 +90,78 @@ as practical; this file is the fallback for what can't be addressed immediately.
   Smooth reflectances/Sellmeier indices make this accurate to within MC noise; a
   pathologically spiky spectrum would need a finer table. CIE CMFs are ported
   analytically (no table).
+- **Precision (mixed FP32/FP64, default float transport):** consumer GeForce GPUs run
+  FP64 at ~1/64 the FP32 rate, so the megakernel computes all geometry/BRDF/spectral
+  transport in a compile-time `Real` scalar (`float` by default) while accumulating the
+  film and energy in `double` (`atomicAdd` on `double*`). Build with
+  `-DFTRACE_GPU_FP32=OFF` for a full-FP64 device path (bit-closer to the CPU, far slower
+  on GeForce; sensible on datacenter cards or for precision debugging). The CPU renderer
+  is always `double` and remains the ground-truth. Float-safe self-intersection epsilons
+  (`RAY_EPS=1e-4`, `DET_EPS=1e-6`) replace the FP64 `1e-6`/`1e-9`. **FP32 validated vs
+  FP64 CPU (Cornell, RTX 4090):** energy conserves exactly (`sum/emitted=1.000000`,
+  residual=0 on A/B/C/V — no self-intersection leak from the float epsilons); fractions
+  converge to 4 sig figs (mode A sensor 0.3298 vs 0.3301, mode C 0.0059 vs 0.0058); mode
+  V PASSES (bulk RMSE 2.89%, firefly-dominated); ~14× faster than FP64 (400M @256² in
+  0.76s vs 10.9s). The DVec3 3-arg ctor deliberately keeps `double` params so host
+  brace-init from `double` Scene coords is a widening (legal) conversion, never
+  narrowing; spectral/CDF tables stay `double` (host-baked, tiny, cached).
+- **Portable build (multi-arch) + HIP-ready:** `-DFTRACE_CUDA_ARCH=` selects the device
+  arch set — `native` (default; the local GPU only, fast builds), `all-major` (a
+  redistributable fat binary: one cubin per major arch + forward-compatible PTX so newer
+  GPUs JIT at load), `all`, or an explicit `"75;86;89"` list. The device kernel is
+  written in the portable CUDA/HIP subset (`__global__`/`__device__`, grid-stride, double
+  `atomicAdd`, `<<<>>>` launches); the only vendor-specific surface — the host runtime API
+  (device query, malloc/memcpy/memset/free, error strings, synchronize) — is isolated
+  behind a compat block at the top of `render_cuda.cu` that maps `cuda*` → `hip*` under
+  `-DFTRACE_USE_HIP`/`__HIP_PLATFORM_AMD__`. Porting to AMD ROCm is therefore a
+  build-system change (compile this one file with `hipcc`), not a code rewrite. **CUDA is
+  the supported GPU backend today; HIP is a near-drop-in future target (untested — no AMD
+  hardware here).**
 - **Proper fix (future):** port the backward tracer (modes R and the mode-P
   camera-side layer) to CUDA if those paths ever become the bottleneck; add a device
   fluorescence path (bake `fluoEmitSampler`'s CDF) to lift the fluoro restriction.
-- **Status:** OPEN (acceptable) — logged 2026-07-10; A/C added same day. Requires a
-  CUDA toolkit at configure time; without one the project builds CPU-only and
-  `-device gpu` warns and uses the CPU.
+- **Status:** OPEN (acceptable) — logged 2026-07-10; A/C, mixed-precision FP32, portable
+  multi-arch build, and the HIP compat layer added same day. Requires a CUDA toolkit at
+  configure time; without one the project builds CPU-only and `-device gpu` warns and
+  uses the CPU.
+
+### GPU scaling path (future): megakernel vs. wavefront
+- **Context:** the current GPU backend is a **megakernel** — one `kTrace` launch where
+  each thread runs an entire photon path (emit → bounce loop → connect/catch/deposit)
+  start to finish. This is the right choice for *this* renderer today: an RTX 4090 has
+  huge register/occupancy headroom, the Cornell-class scenes are shallow, and a single
+  kernel keeps all state in registers with no round-trips to global memory. It already
+  hits ~500M+ photons/s in FP32.
+- **The known limitation (thread divergence):** in a megakernel, threads in a warp that
+  take different material branches (a dielectric refraction next to a diffuse bounce next
+  to a grating), or that terminate after wildly different path lengths, **serialize** —
+  the warp runs at the speed of its slowest/most-divergent lane, and finished lanes sit
+  idle while others keep bouncing. The megakernel also carries the register footprint of
+  *every* material's code path in *every* thread, capping occupancy. Both effects get
+  worse as scenes gain more material variety and deeper paths, and they bite harder on
+  smaller GPUs (fewer SMs / less latency-hiding to absorb the idle lanes).
+- **The alternative (wavefront / path-regeneration):** split the tracer into stages —
+  generate, extend (intersect), shade-per-material, connect — each its own kernel, with
+  photon state held in global "ray queues" between stages. A **sort/compaction by
+  material** before the shade stage makes each shading kernel branch-coherent (every
+  thread in a warp runs the same BSDF), and terminated paths are **compacted out** so
+  every thread always has live work (path regeneration keeps the SIMD lanes full). This
+  is how production GPU renderers (PBRT-v4's `wavefront`, OptiX path guiding) scale to
+  many-material, deep-path scenes. The cost: extra global-memory bandwidth for the queues
+  and more kernel-launch overhead, which is why it's *not* a win for shallow, uniform
+  scenes on a big GPU (the megakernel's register-resident state wins there).
+- **Re: "wavefront helps divergent scenes AND small GPUs" (todo.txt question):** it's
+  *both*, and they're related. (1) *Divergent scenes* — many materials and/or highly
+  variable path lengths — benefit from the per-material sort (kills branch divergence) and
+  compaction (kills path-length divergence). (2) *Small GPUs* benefit because they have
+  less occupancy/latency-hiding headroom to paper over idle lanes and high per-thread
+  register pressure, so keeping warps coherent and full matters more there. A big GPU on a
+  shallow uniform scene (our current case) is the one regime where the megakernel clearly
+  wins, which is why we ship it first.
+- **Decision:** keep the megakernel as the default and recommended path for the scenes
+  this renderer targets. Add a wavefront backend only if/when profiling on a genuinely
+  material-diverse, deep-path scene (or a small GPU) shows the megakernel is
+  divergence-bound. Documented here so the scaling path is on record; no code owed now.
 
 ## Performance
 

@@ -12,7 +12,39 @@
 // same per-material interaction, same fog free-flight, same model-B connect), so
 // at convergence the GPU image matches the CPU image up to Monte-Carlo noise.
 
-#include <cuda_runtime.h>
+// ---------------------------------------------------------------------------
+// GPU runtime abstraction (CUDA today, HIP-ready for AMD).
+//
+// Everything below the launch site is written in the portable subset of the
+// CUDA/HIP device language: __global__/__device__ kernels, grid-stride loops,
+// double atomicAdd, and triple-chevron <<<>>> launches all exist verbatim in
+// HIP. The ONLY vendor-specific surface is the host RUNTIME API (device query,
+// malloc/memcpy/memset/free, error strings, synchronize). We isolate that here:
+// building with -DFTRACE_USE_HIP (or under hipcc, which defines
+// __HIP_PLATFORM_AMD__) includes the HIP runtime and maps the cuda* symbols we
+// use onto their hip* equivalents, which are 1:1 in name and signature. Under
+// nvcc nothing changes. Porting to ROCm is therefore a build-system change
+// (compile this file with hipcc, define FTRACE_USE_HIP) — not a code rewrite.
+#if defined(FTRACE_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+  #include <hip/hip_runtime.h>
+  #define cudaError_t             hipError_t
+  #define cudaSuccess             hipSuccess
+  #define cudaGetDeviceCount      hipGetDeviceCount
+  #define cudaGetDeviceProperties hipGetDeviceProperties
+  #define cudaDeviceProp          hipDeviceProp_t
+  #define cudaMalloc              hipMalloc
+  #define cudaMemcpy              hipMemcpy
+  #define cudaMemcpyHostToDevice  hipMemcpyHostToDevice
+  #define cudaMemcpyDeviceToHost  hipMemcpyDeviceToHost
+  #define cudaMemset              hipMemset
+  #define cudaFree                hipFree
+  #define cudaGetLastError        hipGetLastError
+  #define cudaDeviceSynchronize   hipDeviceSynchronize
+  #define cudaGetErrorString      hipGetErrorString
+#else
+  #include <cuda_runtime.h>
+#endif
+
 #include <cstdio>
 #include <cstring>
 #include <vector>
