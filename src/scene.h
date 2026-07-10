@@ -7,7 +7,7 @@
 #include "spectrum.h"
 #include "scene_film.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm };
 
 struct Material {
     MatType type = MatType::Diffuse;
@@ -19,6 +19,15 @@ struct Material {
     Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
     double roughness = 0.1;                    // glossy lobe width [0,1]
     bool isLight = false;
+
+    // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
+    // A thin dielectric coating of index filmIor and thickness filmThickness (in
+    // nanometres) over a dielectric substrate whose index is `ior`. Interference
+    // between the two coating interfaces yields an angle/wavelength-dependent
+    // reflectance (structural colour). Transport is lossless specular reflect-or-
+    // refract, exactly like Dielectric (so the backward tracer handles it too).
+    double filmIor = 1.30;                      // coating refractive index n1
+    double filmThickness = 300.0;              // coating thickness in nanometres
 
     // --- Fluorescence (MatType::Fluorescent) --------------------------------
     // A photon at lambda excites the dye with probability fluoAbsorb(lambda); the

@@ -84,7 +84,9 @@ static Scene buildPrism(int res) {
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
 static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
                           const char* meshPath = nullptr, double meshScale = 1.0,
-                          bool diffuseSphere = false, bool fluoroSphere = false) {
+                          bool diffuseSphere = false, bool fluoroSphere = false,
+                          bool thinFilmSphere = false,
+                          double filmThickness = 300.0, double filmIor = 1.30) {
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
@@ -95,6 +97,10 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
     Material mesh;  mesh.reflect  = whiteWall(0.8);              s.mats.push_back(mesh);  // 5 (diffuse)
     s.mats.push_back(makeFluoroMaterial());                                              // 6 (fluorescent)
+    Material film;  film.type = MatType::ThinFilm;
+    film.ior = iorConstant(1.5);                // dispersion-free glass-like substrate
+    film.filmIor = filmIor; film.filmThickness = filmThickness;
+    s.mats.push_back(film);                                                              // 7 (thin film)
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);            // floor
     addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);            // ceiling
@@ -113,10 +119,11 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     if (meshPath && meshPath[0]) {
         loadObj(s, meshPath, /*mat*/5, /*translate*/{0.5, 0.4, 0.5}, meshScale);
     } else {
-        // Sphere material: fluorescent (6) for the fluoro demo; diffuse (5) for the
-        // reference/validation modes so there is no specular black-glass mismatch;
-        // otherwise the dispersive glass sphere (4) casts a spectral caustic.
-        int sphMat = fluoroSphere ? 6 : (diffuseSphere ? 5 : 4);
+        // Sphere material: thin-film (7) for the iridescent demo; fluorescent (6)
+        // for the fluoro demo; diffuse (5) for the reference/validation modes so
+        // there is no specular black-glass mismatch; otherwise the dispersive
+        // glass sphere (4) casts a spectral caustic.
+        int sphMat = thinFilmSphere ? 7 : (fluoroSphere ? 6 : (diffuseSphere ? 5 : 4));
         s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, sphMat});
     }
 
@@ -397,6 +404,58 @@ static int checkFog() {
     return pass ? 0 : 1;
 }
 
+// Deterministic thin-film / iridescence self-test. Validates the interference
+// reflectance against closed-form expectations, each independent of the renderer:
+//   (a) R stays physically bounded in [0,1] across a wide angle/wavelength sweep;
+//   (b) at normal incidence R matches the hand-computed two-beam expression;
+//   (c) R is periodic in the interference phase (equal at phi and phi+2pi), the
+//       signature of true interference;
+//   (d) R varies with wavelength (max-min gap) -> the surface is actually
+//       iridescent, not a flat reflector.
+static int checkThinFilm() {
+    const double n0 = 1.0, n1 = 1.30, n2 = 1.50, d = 300.0;
+
+    // (a) reflectance in range across the visible band and all incidence angles.
+    bool inRange = true; double rmin = 1e9, rmax = -1e9;
+    for (double lam = 380.0; lam <= 720.0; lam += 2.0)
+        for (double ci = 0.05; ci <= 1.0; ci += 0.05) {
+            double R = thinFilmReflectance(n0, n1, n2, d, ci, lam);
+            if (R < -1e-9 || R > 1.0 + 1e-9) inRange = false;
+            rmin = std::min(rmin, R); rmax = std::max(rmax, R);
+        }
+    bool passA = inRange;
+
+    // (b) normal incidence matches the closed-form two-beam reflectance.
+    double r01 = (n0 - n1) / (n0 + n1), r12 = (n1 - n2) / (n1 + n2);
+    double lam0 = 550.0, phi0 = 4.0 * PI * n1 * d / lam0;
+    double Ranalytic = clamp01(r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * std::cos(phi0));
+    double Rcode = thinFilmReflectance(n0, n1, n2, d, 1.0, lam0);
+    bool passB = std::fabs(Ranalytic - Rcode) < 1e-9;
+
+    // (c) periodicity in phase: pick two wavelengths whose phase differs by 2*pi
+    //     (phi = 4*pi*n1*d/lambda at normal incidence -> lambda = 4*pi*n1*d/phi).
+    double phiA = 6.0, phiB = phiA + 2.0 * PI;
+    double lamA = 4.0 * PI * n1 * d / phiA, lamB = 4.0 * PI * n1 * d / phiB;
+    double RA = thinFilmReflectance(n0, n1, n2, d, 1.0, lamA);
+    double RB = thinFilmReflectance(n0, n1, n2, d, 1.0, lamB);
+    bool passC = std::fabs(RA - RB) < 1e-9;
+
+    // (d) the film is genuinely iridescent: reflectance varies with wavelength.
+    bool passD = (rmax - rmin) > 0.02;
+
+    bool pass = passA && passB && passC && passD;
+    std::printf("[checkthinfilm] reflectance range over sweep: [%.4f, %.4f]  (%s)\n",
+                rmin, rmax, passA ? "in [0,1]" : "OUT OF RANGE");
+    std::printf("[checkthinfilm] normal-incidence R: code=%.6f analytic=%.6f  (%s)\n",
+                Rcode, Ranalytic, passB ? "ok" : "BAD");
+    std::printf("[checkthinfilm] phase periodicity: R(phi)=%.6f R(phi+2pi)=%.6f  (%s)\n",
+                RA, RB, passC ? "ok" : "BAD");
+    std::printf("[checkthinfilm] iridescence (max-min R)=%.4f  (%s)\n",
+                rmax - rmin, passD ? "ok" : "BAD");
+    std::printf("[checkthinfilm] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -423,6 +482,37 @@ static void writePPM(const char* path, const Film& f, double N) {
     fo << "P6\n" << W << ' ' << H << "\n255\n";
     fo.write((const char*)img.data(), (std::streamsize)img.size());
     std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
+}
+
+// Deterministic, noise-free visualisation of the thin-film structural colour: a
+// swatch whose rows sweep coating thickness (dMin..dMax nm) and whose columns
+// sweep incidence angle (0..~85 deg). Each cell integrates the interference
+// reflectance R(lambda) against the CIE curves under a flat (equal-energy)
+// illuminant, so the pixel colour is exactly the colour the coating reflects at
+// that thickness/angle. Reuses thinFilmReflectance -> a single source of truth
+// with the renderer, and makes the iridescent colour bands unmistakable without
+// the Monte-Carlo noise of a forward-catch render.
+static void thinFilmSwatch(double n1, double n2) {
+    const int W = 512, H = 256;
+    const double dMin = 100.0, dMax = 800.0, thetaMax = 85.0 * PI / 180.0;
+    Film f; f.resX = W; f.resY = H; f.alloc();
+    for (int y = 0; y < H; ++y) {
+        double d = dMin + (dMax - dMin) * (y + 0.5) / H;             // thickness (row)
+        for (int x = 0; x < W; ++x) {
+            double cosI = std::cos(thetaMax * (x + 0.5) / W);        // angle (column)
+            Vec3 xyz{};
+            for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {
+                double R = thinFilmReflectance(1.0, n1, n2, d, cosI, lam);
+                xyz += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * R;    // flat illuminant
+            }
+            f.add(x, y, xyz);
+        }
+    }
+    // N=1: writePPM's 1/(N*cieYIntegral) makes a perfect (R=1) reflector map to
+    // white, so the swatch colours are physical reflectances (up to auto-exposure).
+    writePPM("thinfilm_swatch.ppm", f, 1.0);
+    std::printf("[thinfilm] swatch n1=%.2f n2=%.2f: rows=thickness %.0f-%.0fnm, cols=angle 0-85deg\n",
+                n1, n2, dMin, dMax);
 }
 
 // Forward photon trace (models A/B/C) into a merged film. Accumulates the energy
@@ -545,6 +635,10 @@ int main(int argc, char** argv) {
     double fogG = 0.0;        // Henyey-Greenstein anisotropy
     bool fogRayleigh = false; // wavelength-dependent scattering ~1/lambda^4
     bool checkFogOnly = false;
+    double filmThickness = 300.0; // thin-film coating thickness (nm) for -scene iridescent
+    double filmIor = 1.30;        // thin-film coating refractive index
+    bool checkThinFilmOnly = false;
+    bool thinFilmSwatchOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -567,14 +661,21 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-fogg") && i + 1 < argc) fogG = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fograyleigh")) fogRayleigh = true;
         else if (!std::strcmp(argv[i], "-checkfog")) checkFogOnly = true;
+        else if (!std::strcmp(argv[i], "-filmthickness") && i + 1 < argc) filmThickness = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-filmior") && i + 1 < argc) filmIor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-checkthinfilm")) checkThinFilmOnly = true;
+        else if (!std::strcmp(argv[i], "-thinfilmswatch")) thinFilmSwatchOnly = true;
     }
     if (nThreads < 1) nThreads = 1;
-    if (checkLensOnly)   return checkLens();     // deterministic, no scene needed
-    if (checkFluoroOnly) return checkFluoro();   // deterministic, no scene needed
-    if (checkFogOnly)    return checkFog();      // deterministic, no scene needed
+    if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
+    if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
+    if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
+    if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
+    if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");
+    bool iridescent = !std::strcmp(sceneName, "iridescent");
 
     selfTestColor();
 
@@ -586,7 +687,8 @@ int main(int argc, char** argv) {
                 : materials ? buildMaterials(res, resolveLight(lightName))
                             : buildCornell(res, mode, resolveLight(lightName),
                                            fluoro ? nullptr : meshPath, meshScale,
-                                           /*diffuseSphere*/refMode, /*fluoroSphere*/fluoro);
+                                           /*diffuseSphere*/refMode, /*fluoroSphere*/fluoro,
+                                           /*thinFilmSphere*/iridescent, filmThickness, filmIor);
 
     // Optional global fog / participating medium (-fog sigma_t). With -fograyleigh
     // the scattering coefficient varies as (550/lambda)^4, so short wavelengths

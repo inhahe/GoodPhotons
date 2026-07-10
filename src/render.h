@@ -92,6 +92,55 @@ inline Vec3 sampleHG(const Vec3& wi, double g, Pcg32& rng) {
     return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + wi * cosT);
 }
 
+// --- Thin-film interference reflectance (iridescence) ------------------------
+// A thin dielectric film (index n1, thickness d nanometres) coats a substrate of
+// index n2, with incident medium n0. The beams reflected off the top (n0|n1) and
+// bottom (n1|n2) interfaces interfere; the round-trip optical-path phase
+//   phi = 4*pi*n1*d*cos(theta1) / lambda
+// makes the reflectance oscillate with wavelength AND angle -> structural colour
+// (soap bubbles, oil slicks, beetle shells, anodised metal). Returns the
+// unpolarised power reflectance R(lambda, theta) in [0,1]; the transmitted
+// fraction is 1-R, so the film is lossless. cosI is cos of the incidence angle in
+// n0; d and lambda must share units (nanometres here).
+//
+// STAGE 1 (iridescence) uses the two-beam (first-order) interference of the two
+// front reflections, polarisation-averaged. This reproduces the colour shift
+// correctly. The exact Airy multiple-beam summation is a drop-in refinement (the
+// thin-film-interference milestone): divide each per-polarisation reflectance by
+// (1 + r01^2 r12^2 + 2 r01 r12 cos phi), which sharpens the higher-order fringes
+// and keeps R physically bounded without clamping.
+inline double thinFilmReflectance(double n0, double n1, double n2, double d,
+                                  double cosI, double lambda) {
+    cosI = clamp01(std::fabs(cosI));
+    double sin0_2 = std::max(0.0, 1.0 - cosI * cosI);
+    // Snell into the film: sin(theta1) = (n0/n1) sin(theta0).
+    double sin1_2 = (n0 * n0) / (n1 * n1) * sin0_2;
+    if (sin1_2 >= 1.0) return 1.0;                       // (n1>=n0 so this won't fire)
+    double cos1 = std::sqrt(1.0 - sin1_2);
+    // Snell into the substrate: sin(theta2) = (n0/n2) sin(theta0).
+    double sin2_2 = (n0 * n0) / (n2 * n2) * sin0_2;
+    bool tir = sin2_2 >= 1.0;                            // TIR at the n1|n2 interface
+    double cos2 = tir ? 0.0 : std::sqrt(1.0 - sin2_2);
+    // Fresnel amplitude reflection coefficients (s- and p-polarised) at each face.
+    auto rS = [](double na, double ca, double nb, double cb) {
+        return (na * ca - nb * cb) / (na * ca + nb * cb);
+    };
+    auto rP = [](double na, double ca, double nb, double cb) {
+        return (nb * ca - na * cb) / (nb * ca + na * cb);
+    };
+    double r01s = rS(n0, cosI, n1, cos1), r01p = rP(n0, cosI, n1, cos1);
+    double r12s = tir ? 1.0 : rS(n1, cos1, n2, cos2);   // |r|=1 amplitude on TIR
+    double r12p = tir ? 1.0 : rP(n1, cos1, n2, cos2);
+    double phi  = (4.0 * PI * n1 * d * cos1) / lambda;   // interference phase
+    double cphi = std::cos(phi);
+    // Two-beam interference reflectance per polarisation (STAGE 1). STAGE 2 will
+    // divide by (1 + r01*r01*r12*r12 + 2*r01*r12*cphi) for the exact Airy result.
+    auto Rpol = [&](double r01, double r12) {
+        return clamp01(r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * cphi);
+    };
+    return 0.5 * (Rpol(r01s, r12s) + Rpol(r01p, r12p));
+}
+
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
@@ -235,6 +284,12 @@ struct Renderer {
                     ray = refractOrReflect(m, h, ray.d, lambda, rng);
                     continue;                       // lossless; beta unchanged
                 }
+                case MatType::ThinFilm: {
+                    // Iridescent coated dielectric: specular reflect-or-refract
+                    // with a thin-film interference reflectance (structural colour).
+                    ray = thinFilmInterface(m, h, ray.d, lambda, rng);
+                    continue;                       // lossless; beta unchanged
+                }
                 case MatType::Mirror: {
                     double r = clamp01(m.reflect(lambda));
                     // Russian roulette: absorb with prob (1-r), else reflect with
@@ -319,6 +374,41 @@ struct Renderer {
             double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
             double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
             double R = 0.5 * (rs * rs + rp * rp);
+            if (rng.uniform() < R) outDir = reflect(d, nl);
+            else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+        }
+        outDir = normalize(outDir);
+        return Ray{h.p + outDir * 1e-6, outDir};
+    }
+
+    // Thin-film-coated dielectric interface (iridescence). Structurally identical
+    // to refractOrReflect (specular reflect-or-refract into the substrate index),
+    // but the reflection probability is the thin-film interference reflectance
+    // R(lambda, theta) rather than the single-interface Fresnel R. Lossless:
+    // reflect with prob R, else refract into the substrate. Because it is purely
+    // specular it needs no camera connection and the backward tracer handles it
+    // exactly like Dielectric (so modes R/V remain valid).
+    Ray thinFilmInterface(const Material& m, const Hit& h, const Vec3& d,
+                          double lambda, Pcg32& rng) const {
+        double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
+        double nf = m.filmIor;                  // coating film index
+        bool entering = dot(d, h.ng) < 0.0;
+        Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
+        double nA = entering ? 1.0 : ns;        // incidence-side medium
+        double nB = entering ? ns : 1.0;        // transmission-side medium
+        double eta = nA / nB;
+        double cosI = -dot(d, nl);              // > 0
+        double sin2t = eta * eta * (1.0 - cosI * cosI);
+
+        Vec3 outDir;
+        if (sin2t > 1.0) {
+            outDir = reflect(d, nl);            // total internal reflection
+        } else {
+            double cosT = std::sqrt(1.0 - sin2t);
+            // Interference reflectance for the actual stack traversed this hit:
+            // incidence medium nA, coating nf, transmission medium nB. Reciprocal,
+            // so entering and exiting rays see the same R (energy consistent).
+            double R = thinFilmReflectance(nA, nf, nB, m.filmThickness, cosI, lambda);
             if (rng.uniform() < R) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }

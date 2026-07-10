@@ -131,6 +131,14 @@ struct BackwardRenderer {
                     specularArrival = true;
                     break;
                 }
+                case MatType::ThinFilm: {
+                    // Iridescent coated dielectric: specular reflect-or-refract,
+                    // same delta-BSDF handling as Dielectric (reflectance carries
+                    // the thin-film interference colour).
+                    ray = mats.thinFilmInterface(m, h, ray.d, lambda, rng);
+                    specularArrival = true;
+                    break;
+                }
                 case MatType::Mirror: {
                     double r = clamp01(m.reflect(lambda));
                     if (rng.uniform() >= r) return L;      // RR absorb
