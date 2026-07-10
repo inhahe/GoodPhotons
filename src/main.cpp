@@ -13,6 +13,27 @@
 #include "scene.h"
 #include "camera.h"
 #include "render.h"
+#include "lights.h"
+
+// Resolve a -light name to an emission SPD. "bbNNNN" means a Planckian at NNNN K
+// (e.g. bb3200). Unknown names fall back to a 6500 K blackbody.
+static Spectrum resolveLight(const char* name) {
+    if (!name) return blackbody(6500.0);
+    if (!std::strncmp(name, "bb", 2) && name[2]) {
+        double k = std::atof(name + 2);
+        if (k > 0) return blackbody(k);
+    }
+    if (!std::strcmp(name, "sun"))          return sunlight();
+    if (!std::strcmp(name, "daylight") ||
+        !std::strcmp(name, "d65"))          return daylight(6504.0);
+    if (!std::strcmp(name, "a") ||
+        !std::strcmp(name, "incandescent")) return illuminantA();
+    if (!std::strcmp(name, "led"))          return ledWhite(0.3);
+    if (!std::strcmp(name, "led-warm"))     return ledWhite(1.0);
+    if (!std::strcmp(name, "fluorescent") ||
+        !std::strcmp(name, "cfl"))          return fluorescent();
+    return blackbody(6500.0);
+}
 
 static void addQuad(Scene& s, Vec3 a, Vec3 b, Vec3 c, Vec3 d, int mat, int sensorId = -1) {
     s.tris.push_back(Tri{a, b, c, mat, sensorId, {}});
@@ -59,13 +80,13 @@ static Scene buildPrism(int res) {
 }
 
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
-static Scene buildCornell(int res, char mode) {
+static Scene buildCornell(int res, char mode, const Spectrum& lightSpd) {
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
     Material green; green.reflect = greenWall();                 s.mats.push_back(green); // 2
     Material light; light.reflect = constantSpectrum(0.0);
-    light.emit = blackbody(6500.0); light.isLight = true;        s.mats.push_back(light); // 3
+    light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
     Material glass; glass.type = MatType::Dielectric;
     glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
 
@@ -146,6 +167,7 @@ int main(int argc, char** argv) {
     int nThreads = (int)std::thread::hardware_concurrency();
     const char* out = "cornell.ppm";
     const char* sceneName = "cornell";
+    const char* lightName = "bb6500";
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -153,13 +175,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) mode = argv[++i][0];
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
+        else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
     }
     if (nThreads < 1) nThreads = 1;
     bool prism = !std::strcmp(sceneName, "prism");
 
     selfTestColor();
 
-    Scene scene = prism ? buildPrism(res) : buildCornell(res, mode);
+    Scene scene = prism ? buildPrism(res) : buildCornell(res, mode, resolveLight(lightName));
     Camera cam;
     if (mode == 'B') {
         if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
@@ -167,8 +190,8 @@ int main(int argc, char** argv) {
     }
     const bool modeB = (mode == 'B');
 
-    std::printf("mode %c: tracing %lld photons at %dx%d on %d threads ...\n",
-                mode, N, res, res, nThreads);
+    std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
+                mode, N, res, res, nThreads, prism ? "beam" : lightName);
 
     // Per-thread films + energy reports, merged after. Each thread gets a
     // distinct RNG stream so photons are independent.

@@ -5,13 +5,16 @@
 #include "spectrum.h"
 #include "scene_film.h"
 
-enum class MatType { Diffuse, Dielectric };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy };
 
 struct Material {
     MatType type = MatType::Diffuse;
-    Spectrum reflect = constantSpectrum(0.5); // diffuse albedo vs lambda
+    // reflect means: diffuse albedo / mirror tint / glossy tint / half-mirror
+    // reflect-probability, depending on type.
+    Spectrum reflect = constantSpectrum(0.5);
     Spectrum emit    = constantSpectrum(0.0); // emitted radiance vs lambda
     Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
+    double roughness = 0.1;                    // glossy lobe width [0,1]
     bool isLight = false;
 };
 

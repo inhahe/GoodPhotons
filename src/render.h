@@ -18,6 +18,21 @@ struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
 };
 
+inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+
+// Power-cosine lobe around a mirror direction (rough specular). roughness in
+// [0,1]: 0 -> sharp mirror, 1 -> broad. Returns a sampled reflection direction.
+inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
+    double rr = roughness < 1e-3 ? 1e-3 : roughness;
+    double e = 2.0 / (rr * rr) - 2.0; if (e < 0) e = 0;
+    double u1 = rng.uniform(), u2 = rng.uniform();
+    double cosT = std::pow(u1, 1.0 / (e + 1.0));
+    double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
+    double phi = 2.0 * PI * u2;
+    Vec3 t, b; onb(mdir, t, b);
+    return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + mdir * cosT);
+}
+
 struct Renderer {
     int maxBounce = 32;
     double betaCutoff = 1e-6;
@@ -88,20 +103,51 @@ struct Renderer {
             }
 
             const Material& m = scene.mats[h.matId];
-
-            if (m.type == MatType::Dielectric) {
-                // Specular: no camera connection (delta BSDF, zero connection pdf).
-                ray = refractOrReflect(m, h, ray.d, lambda, rng);
-                continue; // lossless; beta unchanged, energy still conserved
+            // Specular/glossy vertices skip the camera connection (delta or
+            // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
+            switch (m.type) {
+                case MatType::Dielectric: {
+                    ray = refractOrReflect(m, h, ray.d, lambda, rng);
+                    continue;                       // lossless; beta unchanged
+                }
+                case MatType::Mirror: {
+                    double r = clamp01(m.reflect(lambda));
+                    e.absorbed += beta * (1.0 - r); beta *= r;
+                    if (beta < betaCutoff) return;
+                    Vec3 o = reflect(ray.d, h.n);
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    continue;
+                }
+                case MatType::HalfMirror: {
+                    double r = clamp01(m.reflect(lambda)); // reflect probability
+                    if (rng.uniform() < r) {
+                        Vec3 o = reflect(ray.d, h.n);
+                        ray = Ray{h.p + h.n * 1e-6, o};
+                    } else {
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight
+                    }
+                    continue;                       // lossless split
+                }
+                case MatType::Glossy: {
+                    double r = clamp01(m.reflect(lambda));
+                    e.absorbed += beta * (1.0 - r); beta *= r;
+                    if (beta < betaCutoff) return;
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), m.roughness, rng);
+                    if (dot(o, h.n) <= 0) { e.absorbed += beta; return; } // below surface
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    continue;
+                }
+                case MatType::Diffuse:
+                default: {
+                    double rho = clamp01(m.reflect(lambda));
+                    if (cam && camFilm) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
+                    e.absorbed += beta * (1.0 - rho);
+                    beta *= rho;
+                    if (beta < betaCutoff) return;
+                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
+                    continue;
+                }
             }
-
-            // Diffuse.
-            double rho = std::min(std::max(m.reflect(lambda), 0.0), 1.0);
-            if (cam && camFilm) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
-            e.absorbed += beta * (1.0 - rho);
-            beta *= rho;
-            if (beta < betaCutoff) return;
-            ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
         }
         e.residual += beta;
     }
