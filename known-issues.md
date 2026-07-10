@@ -110,15 +110,62 @@ as practical; this file is the fallback for what can't be addressed immediately.
     per-emitter `geomWeight()` (area·PI for surfaces, spotOmega for spots); the
     area/sphere branch keeps the exact `emitIntegral·area·PI` expression so those
     renders stay bit-identical (verified: cornell FTSL==C++==pre-3c hash).
+- **Constant environment done (2026-07-10, increment 1a):** `light env { spd … }`
+  registers a uniform infinite emitter (`shape = EmitterShape::Env`,
+  `geomWeight = envGeom = 4·π²·R²` with `R` the scene bounding-sphere radius set in
+  `Scene::build()` from the BVH root AABB). Forward emission spawns each photon from
+  a disk of radius `R` perpendicular to a uniformly-sampled sphere direction (joint
+  pdf `1/envGeom` → exactly analog `beta = emitIntegral·envGeom`); backward adds
+  `L(λ)·invPdfλ` on ray-miss; a per-pixel background pass (`addEnvBackground`) supplies
+  the directly-viewed sky in forward mode B. Validated by `scenes/envlight.ftsl`
+  (mode V: forward converges to backward on a **unit** radiance scale — best-fit
+  s→1). Constant env is **CPU-only** (`cudaForwardSupported()` returns false when
+  `envIndex ≥ 0`; auto-falls back); GPU env is increment 1b.
+  - **Absolute-radiance We fix (same change):** the model-B pinhole importance was
+    normalizing by the *whole* image-plane area (`imagePlaneArea()`), making the
+    forward tracer measure `radiance / (resX·resY)` — an arbitrary global constant
+    that modes V/P best-fit away and auto-exposure hid. This blocked compositing the
+    (true-radiance) env background with the (scaled) photon surface illumination.
+    Fixed by normalizing by the **per-pixel** image-plane area
+    (`Camera::pixelPlaneArea() = imagePlaneArea()/(resX·resY)`) in `connect()` /
+    `connectVolume()` on **both** CPU (`render.h`) and GPU (`render_cuda.cu`). Now
+    forward measures absolute radiance (mode V/P best-fit s → ~1). Displayed outputs
+    are unchanged (a global scale is invisible after auto-exposure; mode-P
+    `fwd·invF/s` and mode-V RMSE are scale-invariant); verified cornell mode V still
+    PASSes (s 5.8e-5 → 0.98) and CPU==GPU film scale holds.
+  - **Forward env is high-variance (acceptable limitation):** the env photon
+    emission is isotropic over 4π, so in an open scene the vast majority of photons
+    escape without hitting geometry (~87% on `envlight.ftsl`). Combined with
+    single-wavelength spectral spikes, forward mode-B env images are heavily
+    chromatic-noisy and need large `-n` to converge (mode V RMSE falls as 1/√N with
+    s≈1 — variance, not bias: 58%@8M → 27%@60M). Clean env images come from the
+    **backward** reference (mode R). A future variance reduction would importance-sample
+    the emission toward the actual geometry (not just the bounding sphere) and/or
+    trace multiple wavelengths per photon (hero-wavelength); deferred.
+  - **Mode P + env: no sky background (minor gap).** The directly-viewed sky is
+    supplied by `addEnvBackground()`, which is wired into modes B and V but *not*
+    into `renderComposite()` (mode P). An env scene rendered in mode P therefore
+    shows the environment illumination on surfaces but a black background on the
+    forward-side (diffuse) pixels. Mode P targets specular scenes (its whole purpose
+    is the camera-side layer for S* paths), so env + mode P is niche; the proper fix
+    (add the background to the composite's forward layer, mindful of the best-fit
+    `s` interaction — now easy since the We fix makes s≈1) is deferred.
 - **Deferred (still future):**
-  1. **HDRI / environment lighting** — an image-based infinite emitter (`light env
-     { file "sky.hdr"  rotate deg }`). This is the one Phase 3c item not yet built:
-     unlike the finite point/area/sphere/spot emitters, an environment illuminates
-     from infinity, so it needs a new transport path rather than an extra
-     `EmitterShape`. The `.hdr` loader already exists (stb float path in
+  1. **Image-based HDRI environment** — an image-based infinite emitter (`light env
+     { file "sky.hdr"  rotate deg }`) on top of the constant-env plumbing now in
+     place. Remaining work is the directional structure: a 2D luminance CDF over the
+     lat-long map (marginal rows × conditional columns, `sin θ` weighted) for
+     importance-sampled emission/NEE, per-texel Jakob-Hanika spectral upsampling of
+     the RGB map, and the GPU port of the sampler. The `.hdr` loader already exists
+     (stb float path in
      `src/texture.h`), and the Jakob-Hanika RGB→reflectance upsampler
-     (`src/upsample.h`) gives the per-direction spectral emission. **Concrete plan
-     (each sub-step independently buildable + validatable):**
+     (`src/upsample.h`) gives the per-direction spectral emission. **Progress
+     (increment 1a, 2026-07-10):** steps 1 (bounding sphere), 3 (backward ray-miss
+     term — NEE not needed for a constant env), 4 (forward emission — analog uniform
+     variant, no importance sampling yet) and 5 (mode-B background) are DONE for the
+     **constant** env; step 2 (2D CDF + per-texel JH), step 6 (CUDA), and the
+     image-based part of step 7 remain. **Concrete plan (each sub-step independently
+     buildable + validatable):**
      1. *Scene bounding sphere.* Add `Vec3 sceneCenter; double sceneRadius;`
         computed in `Scene::build()` from the BVH root AABB (`center`, `0.5·diag`).
         The env disk/emission and the "to infinity" shadow-ray length key off this.
@@ -163,10 +210,10 @@ as practical; this file is the fallback for what can't be addressed immediately.
      cone then reweights by falloff, so photons in the dark penumbra edge carry
      small weights (mild variance). Exact CDF sampling of the smoothstep band would
      be lower-variance but needs a quartic inverse; uniform+reweight is correct.
-- **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; HDRI environment
-  deferred with a concrete 7-step plan above (start with a constant-colour env to
-  land the transport plumbing, then add the image-based 2D CDF); sphere/spot
-  importance-sampling also deferred.
+- **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; **constant
+  environment (`light env { spd … }`) done 2026-07-10 (increment 1a)** incl. the
+  absolute-radiance We fix; image-based HDRI (2D CDF + per-texel JH) and GPU env
+  deferred (see the plan above); sphere/spot importance-sampling also deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

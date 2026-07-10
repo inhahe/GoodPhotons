@@ -211,6 +211,12 @@ struct DCamera {
     int    resX, resY;
     double apertureR, filmDist, lensF;   // model C finite aperture / thin lens
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
+    // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
+    // pinhole importance normalises by a single pixel's area (see camera.h). This
+    // makes the GPU forward tracer measure absolute radiance, matching the CPU path.
+    HD double pixelPlaneArea() const {
+        return imagePlaneArea() / ((double)resX * (double)resY);
+    }
     HD bool project(const DVec3& p, int& px, int& py, Real& cosCam, Real& dist2) const {
         DVec3 d = p - eye;
         Real cz = dot(d, w);
@@ -596,7 +602,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real f = rho / (Real)DPI;
     Real G = cosSurf * cosCam / dist2;
-    Real We = (Real)1 / ((Real)cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
+    Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
     Real contrib = beta * f * G * We;
     if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
     filmAdd(film, cam.resX, px, py, lambda, contrib);
@@ -612,7 +618,7 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
     Real ph = hgPhase(dot(wIn, wdir), (Real)sc.medium.g);
     Real Lambda = medAlbedo(sc.medium, lambda);
     Real G = cosCam / dist2;
-    Real We = (Real)1 / ((Real)cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
+    Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
     Real contrib = beta * Lambda * ph * G * We;
     contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
     filmAdd(film, cam.resX, px, py, lambda, contrib);
@@ -831,6 +837,9 @@ bool cudaForwardSupported(const Scene& scene) {
     };
     for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
+    // Environment lighting (disk photon emission + directly-viewed background) is
+    // not ported to the device kernel yet — env scenes fall back to the CPU tracer.
+    if (scene.envIndex >= 0) return false;
     return true;
 }
 

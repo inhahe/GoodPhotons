@@ -416,6 +416,36 @@ Sampling shares `Emitter::samplePoint()` (quad draws are byte-for-byte identical
 so existing quad scenes stay bit-identical). Validated by `scenes/spherelight.ftsl`
 (mode V: forward agrees with backward; CPU==GPU energy).
 
+```
+light env { spd 0.5 }              # Phase 3c: uniform infinite environment
+```
+
+A `light env` registers an **infinite constant environment** (`shape =
+EmitterShape::Env`): a uniform radiance `L(λ) = spd(λ)` arriving from every
+direction, with no local position. It illuminates open scenes with a flat "sky" and
+is visible directly in the background where the camera sees past all geometry. Its
+geometric weight is `envGeom = 4·π²·R²` (with `R` the scene bounding-sphere radius),
+so `power = emitIntegral · envGeom` — exactly the flux a uniform environment injects
+through the bounding sphere. The forward tracer spawns each photon by sampling a
+direction uniformly on the sphere (pdf `1/4π`) and an entry point on a disk of radius
+`R` perpendicular to that direction (pdf `1/πR²`); the joint `1/(4π²R²) = 1/envGeom`
+makes the spawn exactly analog (no reweight). The backward reference adds
+`L(λ)·invPdfλ` on any ray that escapes the geometry. Because the forward emission is
+isotropic and most photons miss an open scene, forward (mode B) env images are
+**high-variance** (chromatic noise) and need large `-n`; the backward reference
+(mode R) is clean. Validated by `scenes/envlight.ftsl` (mode V: forward converges to
+the backward reference on a unit radiance scale). Constant env is CPU-only for now
+(GPU falls back automatically); image-based HDRI (`light env { file "sky.hdr" }`) is
+the next step.
+
+> **Absolute-radiance camera convention.** The model-B forward light tracer now
+> measures **absolute radiance** — a pixel viewing radiance `L` reads `L` (the
+> pinhole importance normalizes by the *per-pixel* image-plane area, not the whole
+> plane). This is what lets the directly-viewed environment background composite
+> with the photon-traced surface illumination on one consistent scale, and it makes
+> the mode-V / mode-P best-fit scale land at ~1 instead of an arbitrary constant.
+> Auto-exposed outputs are unchanged (a global scale is invisible after exposure).
+
 ### 5.1 Built-in illuminant SPDs (`preset:<name>`)
 
 All resolve through the existing `-light` presets (`src/lights.h`,
@@ -439,17 +469,19 @@ Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 - **Multiple / typed lights.** **[done — Phase 2b]** Any number of `light` blocks
   accumulate; the forward tracer uses a power-weighted selection CDF in the photon
   spawn path (CPU and CUDA), and the backward reference sums NEE over all emitters.
-  Sphere area lights and spotlights are done (Phase 3c); env (HDRI) is still
-  future — see below.
+  Sphere area lights, spotlights, and a uniform constant environment are done
+  (Phase 3c); image-based HDRI environments are still future — see below.
 - **Absolute power / units.** **[needs engine work]** Today emission is normalized by the SPD integral
   and the light area — good enough for relative imagery, but there is no
   radiometric "this bulb is 800 lumens / 10 W". A `power <watts>` (radiant) or
   `luminous <lm>` key is the place to add physically-absolute output. Until the
   engine tracks absolute units this is documentation-only.
 - **Other shapes.** Sphere area lights **[done — Phase 3c]** (`light sphere {
-  center … radius … }`) and point spotlights **[done — Phase 3c]** (`light spot {
-  dir … inner_angle … outer_angle … }`). Environment (HDRI) lighting is still
-  future; the `light <type>` tag leaves room (`light env { file "sky.hdr" }`).
+  center … radius … }`), point spotlights **[done — Phase 3c]** (`light spot {
+  dir … inner_angle … outer_angle … }`), and a uniform constant environment
+  **[done — Phase 3c]** (`light env { spd … }`). Image-based HDRI environments
+  (`light env { file "sky.hdr" }` with a 2D CDF + spectral upsampling) are the
+  next step.
 
 ---
 

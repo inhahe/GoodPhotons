@@ -172,7 +172,14 @@ struct BackwardRenderer {
                 }
             }
 
-            if (!h.valid) return L;
+            // Ray escaped the scene: pick up the constant environment radiance (0 if
+            // no env light). Added unconditionally (no env NEE yet), the same
+            // spdFn*invPdfLambda form as surface emission, so forward and backward
+            // agree on env illumination and directly-viewed background by construction.
+            if (!h.valid) {
+                L += thr * scene.envRadiance(lambda) * invPdfLambda;
+                return L;
+            }
             const Material* mp = &scene.mats[h.matId];
             // Stochastic mix: resolve to a child material (or terminate on the
             // leftover absorption slice) before the switch, mirroring the forward

@@ -63,6 +63,17 @@ struct Camera {
     // Camera importance normaliser: image-plane area at unit distance.
     double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
 
+    // Per-pixel image-plane area at unit distance. The model-B connect() splats a
+    // photon's contribution into a single pixel, so the pinhole importance must be
+    // normalised by the area of ONE pixel on the image plane (imagePlaneArea /
+    // pixel-count), not the whole plane. Using this makes the forward light tracer
+    // measure ABSOLUTE radiance (pixel == L), so it agrees with the backward
+    // reference on a unit scale (mode V/P best-fit -> ~1) and the directly-viewed
+    // environment background composites without any ad-hoc rescale.
+    double pixelPlaneArea() const {
+        return imagePlaneArea() / ((double)film.resX * (double)film.resY);
+    }
+
     // Generate a pinhole ray through raster pixel (px,py) with in-pixel jitter
     // (jx,jy in [0,1)). Exact inverse of project(): sx,sy are the [-1,1] view
     // coordinates project() would recover. Used by the backward reference tracer.

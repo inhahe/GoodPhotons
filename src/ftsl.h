@@ -18,6 +18,7 @@
 //   light collimated { dir x y z  spd <spectrum-expr> }   # repeatable: N emitters
 //   light sphere     { center x y z  radius r  spd <spectrum-expr> }  # glowing ball
 //   light spot       { origin x y z  dir x y z  inner_angle d  outer_angle d  spd … }
+//   light env        { spd <spectrum-expr> }   # constant infinite environment
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
 //                   film { res W H } }
@@ -696,6 +697,13 @@ private:
             const double d2r = PI / 180.0;
             double cosInner = std::cos(inner * d2r), cosOuter = std::cos(outer * d2r);
             L.scene.addSpotLight(P(o), normalize(dir), cosInner, cosOuter, spd, binWidth_);
+            return true;
+        }
+        if (b.subtype == "env") {
+            // Constant environment: uniform radiance `spd` from every direction (an
+            // infinitely-distant sphere). No geometry; sized by the scene bounds in
+            // Scene::build(). Illuminates open scenes and shows as the background.
+            L.scene.addEnvLight(spd, binWidth_);
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so

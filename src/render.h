@@ -165,7 +165,8 @@ struct Renderer {
     // Model B: connect a surface vertex to the pinhole and splat onto the film.
     // f = rho/pi (Lambertian). Contribution = beta * f * G * We, with
     //   G  = cosSurf * cosCam / dist^2   (geometry term)
-    //   We = 1 / (A * cosCam^4)          (pinhole importance, A = image-plane area)
+    //   We = 1 / (A_pix * cosCam^4)      (pinhole importance, A_pix = per-pixel
+    //                                     image-plane area -> absolute radiance)
     void connect(const Scene& scene, const Camera& cam, Film& film,
                  const Vec3& p, const Vec3& n, double lambda, double beta, double rho) const {
         Vec3 toCam = cam.eye - p;
@@ -179,7 +180,7 @@ struct Renderer {
 
         double f = rho / PI;
         double G = cosSurf * cosCam / dist2;
-        double We = 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
+        double We = 1.0 / (cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
         double contrib = beta * f * G * We;
         // Beer-Lambert attenuation of the shadow ray through a global fog.
         if (scene.medium.enabled)
@@ -204,7 +205,7 @@ struct Renderer {
         double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
         double Lambda = scene.medium.albedo(lambda);
         double G = cosCam / dist2;
-        double We = 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
+        double We = 1.0 / (cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
         double contrib = beta * Lambda * ph * G * We;
         contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);   // fog transmittance
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
@@ -239,6 +240,24 @@ struct Renderer {
             emitN = em.beamDir;
             double omegaOuter = 2.0 * PI * (1.0 - em.spotCosOuter);
             spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
+        } else if (em.shape == EmitterShape::Env) {
+            // Infinite constant environment. Sample the incoming photon direction
+            // `dir` uniformly on the sphere (pdf 1/4pi) and its entry point on a
+            // disk of radius R perpendicular to `dir`, centered on the scene and
+            // pushed upstream so the photon starts just outside the bounding sphere
+            // (disk pdf 1/(pi R^2)). The joint pdf 1/(4pi^2 R^2) = 1/envGeom, so the
+            // per-photon power beta = emitIntegral*envGeom is exactly analog — no
+            // reweight (spotW stays 1). Photons that miss the geometry escape.
+            double z = 1.0 - 2.0 * u1;
+            double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
+            double phi = 2.0 * PI * u2;
+            dir = Vec3{sr * std::cos(phi), sr * std::sin(phi), z};
+            Vec3 t, b; onb(dir, t, b);
+            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double pd = 2.0 * PI * rng.uniform();
+            Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
+            origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
+            emitN = dir;
         } else {
             em.samplePoint(u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
@@ -257,7 +276,8 @@ struct Renderer {
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
         // A spot is a point light with no projected area, so it has no such direct
         // term (its cone illuminates surfaces, which then connect to the camera).
-        if (cam && camFilm && !forwardCatch && em.shape != EmitterShape::Spot)
+        if (cam && camFilm && !forwardCatch &&
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env)
             connect(scene, *cam, *camFilm, origin, emitN, lambda, beta, 1.0);
 
         Ray ray{origin + dir * 1e-6, dir};

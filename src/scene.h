@@ -153,7 +153,12 @@ struct Sensor {
 // a smoothstep penumbra between the inner and outer half-angles (spotCosInner /
 // spotCosOuter); it has no surface area, so its "geometric weight" is the
 // falloff-weighted solid angle spotOmega instead of area*PI.
-enum class EmitterShape { Quad, Sphere, Spot };
+// An Env is an infinitely-distant environment: a constant radiance L_env(lambda)
+// arriving from every direction. Its "geometric weight" is the emitted-power
+// phase-space volume 4*PI^2*R^2 (R = scene bounding radius), so total power =
+// emitIntegral*4*PI^2*R^2; forward photons are emitted from a disk of radius R on
+// the bounding sphere and the backward tracer picks it up on ray misses.
+enum class EmitterShape { Quad, Sphere, Spot, Env };
 
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
@@ -178,6 +183,7 @@ struct Emitter {
     Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
     double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
     double spotOmega = 0.0;   // spot falloff-weighted solid angle = PI*(2-ci-co)
+    double envGeom = 0.0;     // env phase-space weight 4*PI^2*R^2 (Env; set in build())
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
@@ -187,7 +193,9 @@ struct Emitter {
     // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
     // spot. (Area/sphere keep the exact area*PI expression for bit-identity.)
     double geomWeight() const {
-        return (shape == EmitterShape::Spot) ? spotOmega : area * PI;
+        if (shape == EmitterShape::Spot) return spotOmega;
+        if (shape == EmitterShape::Env)  return envGeom;
+        return area * PI;
     }
 
     // Sample a surface point `y` and its outward unit normal `nOut` from two
@@ -231,6 +239,22 @@ struct Scene {
     EmissionSampler emitSampler;
     double emitG = 0.0;
 
+    // Environment lighting (constant infinite-radiance emitter). envIndex is the
+    // index into `emitters` of the single Env emitter (or -1 if none). The scene
+    // bounding sphere (sceneCenter, sceneRadius, from the BVH root) sizes forward
+    // env photon emission; envXYZ = integral of L_env(lambda)*CIE(lambda) dlambda
+    // is the directly-viewed background colour (used by the forward background pass
+    // — see main.cpp — and normalised the same way as connect()'s splats).
+    int envIndex = -1;
+    Vec3 sceneCenter{0, 0, 0};
+    double sceneRadius = 0.0;
+    Vec3 envXYZ{0, 0, 0};
+
+    // Constant environment radiance at wavelength lambda (0 if no env emitter).
+    double envRadiance(double lambda) const {
+        return (envIndex >= 0) ? emitters[envIndex].spdFn(lambda) : 0.0;
+    }
+
     // Register one area (or collimated) light. Terse helper for the C++ builders
     // and the FTSL loader; call finalizeEmitters() (via build()) afterwards.
     void addAreaLight(const Vec3& o, const Vec3& U, const Vec3& V, const Vec3& n,
@@ -269,6 +293,19 @@ struct Scene {
         emitters.push_back(std::move(e));
     }
 
+    // Register a constant environment light: uniform radiance `spd` arriving from
+    // every direction (an infinitely-distant sphere). geomWeight (envGeom) and the
+    // background colour (envXYZ) depend on the scene bounds, so they are filled in
+    // by build() once the BVH exists. Only one env emitter is supported (the last
+    // one registered wins envIndex).
+    void addEnvLight(const Spectrum& spd, double stepNm) {
+        Emitter e;
+        e.shape = EmitterShape::Env;
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        envIndex = (int)emitters.size();
+        emitters.push_back(std::move(e));
+    }
+
     // Compute per-emitter power, the selection CDF, and the combined backward
     // wavelength sampler. Idempotent; called by build().
     void finalizeEmitters(double stepNm = 1.0) {
@@ -277,8 +314,11 @@ struct Scene {
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
             // scenes stay bit-identical; a spot uses its solid-angle weight.
-            emitters[i].power = (emitters[i].shape == EmitterShape::Spot)
-                ? emitters[i].emitIntegral * emitters[i].spotOmega
+            emitters[i].power =
+                (emitters[i].shape == EmitterShape::Spot)
+                    ? emitters[i].emitIntegral * emitters[i].spotOmega
+                : (emitters[i].shape == EmitterShape::Env)
+                    ? emitters[i].emitIntegral * emitters[i].envGeom
                 : emitters[i].emitIntegral * emitters[i].area * PI;
             totalPower += emitters[i].power;
             emitterCdf[i] = totalPower;
@@ -323,6 +363,23 @@ struct Scene {
     void build() {
         for (auto& t : tris) t.finalize();
         buildBvh();
+        // Scene bounding sphere from the BVH root AABB: center = box center, radius
+        // = half the box diagonal (the box circumradius, guaranteed to enclose all
+        // geometry). Sizes forward environment photon emission (disk radius) and
+        // the env phase-space weight envGeom = 4*PI^2*R^2.
+        if (!bvh.nodes.empty()) {
+            const Aabb& b = bvh.nodes[0].box;
+            sceneCenter = b.center();
+            sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
+        }
+        if (envIndex >= 0) {
+            emitters[envIndex].envGeom = 4.0 * PI * PI * sceneRadius * sceneRadius;
+            // Directly-viewed background colour: integral of L_env(lambda)*CIE dlambda.
+            envXYZ = Vec3{0, 0, 0};
+            for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
+                envXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam))
+                          * emitters[envIndex].spdFn(lam);
+        }
         finalizeEmitters();
     }
     void finalizeTris() { build(); }   // kept for existing call sites

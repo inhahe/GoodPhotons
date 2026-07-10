@@ -715,6 +715,24 @@ static void thinFilmSwatch(double n1, double n2) {
                 n1, n2, dMin, dMax);
 }
 
+// Add the directly-viewed environment background to a forward (model-B) film. For
+// each pixel whose pixel-center camera ray escapes all geometry, deposit N*envXYZ,
+// so that after writePPM's 1/(N*cieYIntegral) normalisation the pixel shows the
+// environment radiance in XYZ — matching the backward tracer's ray-miss term (which
+// adds L_env*invPdfLambda). Forward photons carry the env *illumination* of
+// surfaces; this pass supplies the *direct view* of the sky behind the geometry.
+// No-op unless the scene has an env light. Silhouette pixels are classified by the
+// pixel center (a sub-pixel edge approximation, like mode P's classifier).
+static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
+    if (scene.envIndex < 0) return;
+    for (int py = 0; py < film.resY; ++py)
+        for (int px = 0; px < film.resX; ++px) {
+            Ray r = cam.genRay(px, py, 0.5, 0.5);
+            Hit h = scene.closestHit(r);
+            if (!h.valid) film.add(px, py, scene.envXYZ * (double)N);
+        }
+}
+
 // Forward photon trace (models A/B/C) into a merged film. Accumulates the energy
 // report across threads. Factored out so mode V can reuse it alongside the
 // backward reference.
@@ -945,10 +963,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
             if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
-                                              "material (fluorescent, textured, or "
-                                              "oversized mix); using CPU\n");
-            else         std::printf("[device] auto -> CPU (GPU-unsupported material: "
-                                     "fluorescent, textured, or oversized mix)\n");
+                                              "feature (fluorescent, textured, or "
+                                              "oversized-mix material, or an environment "
+                                              "light); using CPU\n");
+            else         std::printf("[device] auto -> CPU (GPU-unsupported feature: "
+                                     "fluorescent, textured, or oversized-mix material, "
+                                     "or an environment light)\n");
         } else {
             useGpu = true;
             std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
@@ -972,6 +992,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         EnergyReport e;
         Film fwd = renderForward(scene, &cam, res, N, nThreads,
                                  /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
+        addEnvBackground(fwd, scene, cam, N);   // directly-viewed sky (env scenes)
         double tot = e.absorbed + e.sensor + e.escaped + e.residual;
         std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                     e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
@@ -996,6 +1017,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 mode, N, res, res, nThreads, lightLabel);
     EnergyReport e;
     Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction, useGpu);
+    if (useCamera && !forwardCatch) addEnvBackground(out_film, scene, cam, N); // sky (env scenes)
     double tot = e.absorbed + e.sensor + e.escaped + e.residual;
     std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                 e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
