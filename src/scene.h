@@ -2,6 +2,7 @@
 #pragma once
 #include <vector>
 #include "geometry.h"
+#include "bvh.h"
 #include "spectrum.h"
 #include "scene_film.h"
 
@@ -41,12 +42,40 @@ struct Scene {
     bool collimated = false;
     Vec3 beamDir{1, 0, 0};
 
-    void finalizeTris() { for (auto& t : tris) t.finalize(); }
+    Bvh bvh;   // acceleration structure over tris (0..nTris) then spheres.
+
+    // Finalize triangle normals and build the BVH. Call after all geometry is
+    // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
+    void build() {
+        for (auto& t : tris) t.finalize();
+        buildBvh();
+    }
+    void finalizeTris() { build(); }   // kept for existing call sites
+
+    void buildBvh() {
+        const double pad = 1e-6;       // avoid zero-thickness slabs on flat prims
+        std::vector<Aabb> boxes;
+        boxes.reserve(tris.size() + spheres.size());
+        for (const auto& t : tris) {
+            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+            b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
+            boxes.push_back(b);
+        }
+        for (const auto& s : spheres) {
+            Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
+            boxes.push_back(b);
+        }
+        bvh.build(boxes);
+    }
 
     Hit closestHit(const Ray& r, double tmin = 1e-6) const {
         Hit h;
-        for (const auto& t : tris)    intersectTri(r, t, tmin, h);
-        for (const auto& s : spheres) intersectSphere(r, s, tmin, h);
+        double tMax = DBL_MAX;
+        const size_t nT = tris.size();
+        bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
+            if (prim < (int)nT) { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
+            else                { if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
+        });
         return h;
     }
 
@@ -57,9 +86,19 @@ struct Scene {
     // onto diffuse surfaces still render, since those diffuse vertices connect.
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
         Ray r{o, dir};
-        Hit h; h.t = maxDist - tmin;
-        for (const auto& t : tris)    if (intersectTri(r, t, tmin, h)) return true;
-        for (const auto& s : spheres) if (intersectSphere(r, s, tmin, h)) return true;
-        return false;
+        const size_t nT = tris.size();
+        return bvh.traverseAny(r, tmin, maxDist - tmin, [&](int prim) {
+            Hit h; h.t = maxDist - tmin;
+            if (prim < (int)nT) return intersectTri(r, tris[prim], tmin, h);
+            return intersectSphere(r, spheres[prim - nT], tmin, h);
+        });
+    }
+
+    // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
+    Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
+        Hit h;
+        for (const auto& t : tris)    intersectTri(r, t, tmin, h);
+        for (const auto& s : spheres) intersectSphere(r, s, tmin, h);
+        return h;
     }
 };

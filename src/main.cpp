@@ -181,6 +181,31 @@ static void selfTestColor() {
                 xyz.x, xyz.y, xyz.z, xyz.y, lin.x, lin.y, lin.z);
 }
 
+// Fire random rays through the scene and assert the BVH agrees with the linear
+// scan (same hit distance, material, sensor). Guards against BVH build/traversal
+// bugs that would silently corrupt the image.
+static int checkBvh(const Scene& scene, long long rays) {
+    Pcg32 rng; rng.seed(1234567u, 0xABCDEFu);
+    int mismatches = 0;
+    for (long long i = 0; i < rays; ++i) {
+        // Random ray: origin in a box around the scene, random direction.
+        Vec3 o{rng.uniform() * 3 - 1, rng.uniform() * 3 - 1, rng.uniform() * 3 - 1};
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        Vec3 d = normalize(Vec3{rr * std::cos(phi), rr * std::sin(phi), z});
+        Ray r{o, d};
+        Hit a = scene.closestHit(r);
+        Hit b = scene.closestHitLinear(r);
+        bool ok = (a.valid == b.valid) &&
+                  (!a.valid || (std::fabs(a.t - b.t) < 1e-7 &&
+                                a.matId == b.matId && a.sensorId == b.sensorId));
+        if (!ok) ++mismatches;
+    }
+    std::printf("[checkbvh] %lld rays, %d mismatches -> %s\n",
+                rays, mismatches, mismatches == 0 ? "PASS" : "FAIL");
+    return mismatches;
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -218,6 +243,7 @@ int main(int argc, char** argv) {
     const char* sceneName = "cornell";
     const char* lightName = "bb6500";
     double apertureR = 0.02;  // mode C aperture radius (scene units)
+    bool checkBvhOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -227,6 +253,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
         else if (!std::strcmp(argv[i], "-aperture") && i + 1 < argc) apertureR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
     }
     if (nThreads < 1) nThreads = 1;
     bool prism     = !std::strcmp(sceneName, "prism");
@@ -237,6 +264,8 @@ int main(int argc, char** argv) {
     Scene scene = prism     ? buildPrism(res)
                 : materials ? buildMaterials(res, resolveLight(lightName))
                             : buildCornell(res, mode, resolveLight(lightName));
+
+    if (checkBvhOnly) return checkBvh(scene, 2'000'000) == 0 ? 0 : 1;
     // mode A: contact sensor (no camera). mode B: connect/splat. mode C:
     // finite-aperture forward catch (perspective, pure forward, supports mirrors).
     const bool useCamera    = (mode == 'B' || mode == 'C');
