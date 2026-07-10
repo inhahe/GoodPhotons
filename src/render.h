@@ -69,6 +69,11 @@ struct Renderer {
         double beta = scene.lightEmitIntegral * scene.lightArea * PI;
         e.emitted += beta;
 
+        // Direct light -> camera: makes the source itself visible. The Lambertian
+        // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
+        if (cam && camFilm)
+            connect(scene, *cam, *camFilm, origin, scene.lightNormal, lambda, beta, 1.0);
+
         Ray ray{origin + dir * 1e-6, dir};
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {

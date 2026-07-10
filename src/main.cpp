@@ -9,6 +9,7 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include <thread>
 #include "scene.h"
 #include "camera.h"
 #include "render.h"
@@ -98,13 +99,16 @@ int main(int argc, char** argv) {
     long long N = 2'000'000;
     int res = 256;
     char mode = 'B';
+    int nThreads = (int)std::thread::hardware_concurrency();
     const char* out = "cornell.ppm";
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) mode = argv[++i][0];
+        else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
     }
+    if (nThreads < 1) nThreads = 1;
 
     selfTestColor();
 
@@ -112,20 +116,40 @@ int main(int argc, char** argv) {
     Camera cam;
     if (mode == 'B')
         cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
+    const bool modeB = (mode == 'B');
 
-    Renderer r;
-    Pcg32 rng; rng.seed(1u, 0x1234u);
+    std::printf("mode %c: tracing %lld photons at %dx%d on %d threads ...\n",
+                mode, N, res, res, nThreads);
+
+    // Per-thread films + energy reports, merged after. Each thread gets a
+    // distinct RNG stream so photons are independent.
+    std::vector<Film> films(nThreads);
+    std::vector<EnergyReport> reports(nThreads);
+    for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
+
+    auto worker = [&](int tid) {
+        Renderer r;
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
+        long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
+        Film* sensorFilm = modeB ? nullptr : &films[tid];
+        Camera* camPtr   = modeB ? &cam : nullptr;
+        Film* camFilm    = modeB ? &films[tid] : nullptr;
+        for (long long i = lo; i < hi; ++i)
+            r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
+    };
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+
+    // Merge.
+    Film out_film; out_film.resX = res; out_film.resY = res; out_film.alloc();
     EnergyReport e;
-
-    std::printf("mode %c: tracing %lld photons at %dx%d ...\n", mode, N, res, res);
-    Film* sensorFilm = (mode == 'A') ? &scene.sensor.film : nullptr;
-    Camera* camPtr   = (mode == 'B') ? &cam : nullptr;
-    Film* camFilm    = (mode == 'B') ? &cam.film : nullptr;
-
-    long long tick = std::max<long long>(1, N / 10);
-    for (long long i = 0; i < N; ++i) {
-        r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, e);
-        if ((i + 1) % tick == 0) std::printf("  %lld%%\n", (i + 1) * 100 / N);
+    for (int t = 0; t < nThreads; ++t) {
+        out_film.merge(films[t]);
+        e.emitted += reports[t].emitted; e.absorbed += reports[t].absorbed;
+        e.sensor += reports[t].sensor;   e.escaped += reports[t].escaped;
+        e.residual += reports[t].residual;
     }
 
     double tot = e.absorbed + e.sensor + e.escaped + e.residual;
@@ -133,6 +157,6 @@ int main(int argc, char** argv) {
                 e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                 e.residual / e.emitted, tot / e.emitted);
 
-    writePPM(out, (mode == 'A') ? scene.sensor.film : cam.film, (double)N);
+    writePPM(out, out_film, (double)N);
     return 0;
 }
