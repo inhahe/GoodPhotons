@@ -219,6 +219,64 @@ static int checkBvh(const Scene& scene, long long rays) {
     return mismatches;
 }
 
+// Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
+// inefficient to validate the lens by rendering, so instead we fire rays from a
+// fixed scene point through many aperture positions and measure the circle of
+// confusion (pixel spread) on the film. A correct thin lens collapses the CoC to
+// ~0 for a point at the focus distance and spreads it for off-focus points; the
+// in-focus image must also land where the pinhole project() puts it.
+static int checkLens() {
+    const int res = 256;
+    Camera cam;
+    cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
+    cam.apertureR = 0.15;
+    const double focusDist = 2.2;      // focus plane == box centre (z = 0.5)
+    cam.setFocus(focusDist);
+    Pcg32 rng; rng.seed(99u, 7u);
+
+    // Fire rays from X through many aperture disc samples; return the film pixel
+    // bounding-box spread (max CoC in x/y), catch count, and mean pixel.
+    auto measure = [&](const Vec3& X, int& spread, double& mx, double& my, int& caught) {
+        int minx = 1 << 30, maxx = -(1 << 30), miny = 1 << 30, maxy = -(1 << 30);
+        long long sx = 0, sy = 0; caught = 0;
+        for (int k = 0; k < 40000; ++k) {
+            double rr = cam.apertureR * std::sqrt(rng.uniform());
+            double a = 2 * PI * rng.uniform();
+            Vec3 P = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+            Vec3 d = normalize(P - X);
+            int px, py;
+            if (!cam.catchPhoton(Ray{X, d}, 1e30, px, py)) continue;
+            ++caught;
+            minx = std::min(minx, px); maxx = std::max(maxx, px);
+            miny = std::min(miny, py); maxy = std::max(maxy, py);
+            sx += px; sy += py;
+        }
+        spread = std::max(maxx - minx, maxy - miny);
+        mx = caught ? (double)sx / caught : -1; my = caught ? (double)sy / caught : -1;
+    };
+
+    // On-axis point exactly on the focus plane -> sharp (CoC ~ 0), at film centre.
+    Vec3 Xfocus = cam.eye + cam.w * focusDist;
+    int sF, cF; double mxF, myF; measure(Xfocus, sF, mxF, myF, cF);
+    // A point well in front of the focus plane -> defocused (large CoC).
+    Vec3 Xnear = cam.eye + cam.w * (focusDist * 0.5);
+    int sN, cN; double mxN, myN; measure(Xnear, sN, mxN, myN, cN);
+    // Off-axis focus-plane point must image where the pinhole projection predicts.
+    Vec3 Xoff = cam.eye + cam.w * focusDist + cam.u * 0.25 + cam.v * (-0.15);
+    int sO, cO; double mxO, myO; measure(Xoff, sO, mxO, myO, cO);
+    int ppx, ppy; double cc, d2;
+    bool proj = cam.project(Xoff, ppx, ppy, cc, d2);
+    double projErr = proj ? std::max(std::fabs(mxO - ppx), std::fabs(myO - ppy)) : 1e9;
+
+    std::printf("[checklens] focus CoC=%dpx (caught %d), defocus CoC=%dpx (caught %d)\n",
+                sF, cF, sN, cN);
+    std::printf("[checklens] off-axis focus mean=(%.1f,%.1f) vs pinhole project=(%d,%d) err=%.1fpx\n",
+                mxO, myO, ppx, ppy, projErr);
+    bool pass = (cF > 0 && cN > 0 && cO > 0) && (sF <= 1) && (sN >= 8) && (projErr <= 1.5);
+    std::printf("[checklens] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 // Fire random rays and report average BVH work per ray (nodes visited, leaf
 // primitive tests). Confirms tree quality independent of image correctness.
 static void bvhStats(const Scene& scene, long long rays) {
@@ -359,8 +417,10 @@ int main(int argc, char** argv) {
     const char* sceneName = "cornell";
     const char* lightName = "bb6500";
     double apertureR = 0.02;  // mode C aperture radius (scene units)
+    double focusDist = 0.0;   // mode C thin-lens focus distance (0 = no lens)
     bool checkBvhOnly = false;
     bool bvhStatsOnly = false;
+    bool checkLensOnly = false;
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
@@ -373,13 +433,16 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
         else if (!std::strcmp(argv[i], "-aperture") && i + 1 < argc) apertureR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-focus") && i + 1 < argc) focusDist = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
+        else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
     }
     if (nThreads < 1) nThreads = 1;
+    if (checkLensOnly) return checkLens();   // deterministic, no scene needed
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
 
@@ -412,6 +475,7 @@ int main(int argc, char** argv) {
         if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
         else       cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
         cam.apertureR = apertureR;
+        cam.setFocus(focusDist);   // mode C thin lens (0 = camera obscura, no focus plane)
     }
 
     // --- Backward reference (mode R) and validation (mode V) ---
