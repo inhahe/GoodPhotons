@@ -434,9 +434,11 @@ makes the spawn exactly analog (no reweight). The backward reference adds
 isotropic and most photons miss an open scene, forward (mode B) env images are
 **high-variance** (chromatic noise) and need large `-n`; the backward reference
 (mode R) is clean. Validated by `scenes/envlight.ftsl` (mode V: forward converges to
-the backward reference on a unit radiance scale). Constant env is CPU-only for now
-(GPU falls back automatically); image-based HDRI (`light env { file "sky.hdr" }`) is
-the next step.
+the backward reference on a unit radiance scale; CPU and GPU energy agree). The
+constant environment runs on the **GPU** forward tracer as well (the device kernel
+emits env photons from the bounding sphere and the directly-viewed sky is added by
+the backend-agnostic background pass); image-based HDRI (`light env { file
+"sky.hdr" }`) is the next step.
 
 > **Absolute-radiance camera convention.** The model-B forward light tracer now
 > measures **absolute radiance** — a pixel viewing radiance `L` reads `L` (the

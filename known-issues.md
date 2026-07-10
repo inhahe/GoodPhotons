@@ -119,8 +119,14 @@ as practical; this file is the fallback for what can't be addressed immediately.
   `L(λ)·invPdfλ` on ray-miss; a per-pixel background pass (`addEnvBackground`) supplies
   the directly-viewed sky in forward mode B. Validated by `scenes/envlight.ftsl`
   (mode V: forward converges to backward on a **unit** radiance scale — best-fit
-  s→1). Constant env is **CPU-only** (`cudaForwardSupported()` returns false when
-  `envIndex ≥ 0`; auto-falls back); GPU env is increment 1b.
+  s→1).
+- **GPU constant env done (2026-07-10, increment 1b):** the device forward kernel
+  now emits env photons (`DEmitter::shape == 3`) from the scene bounding sphere
+  (`DScene::sceneCenter`/`sceneRadius`) exactly like the CPU path, and the
+  directly-viewed sky is added by the backend-agnostic `addEnvBackground()` pass in
+  `main.cpp` — so `cudaForwardSupported()` no longer rejects `envIndex ≥ 0` and env
+  scenes run on the GPU. Verified CPU==GPU on `envlight.ftsl` mode V (both best-fit
+  s≈0.97, absorbed≈0.129, RMSE≈58% at 8M — deltas are independent RNG streams).
   - **Absolute-radiance We fix (same change):** the model-B pinhole importance was
     normalizing by the *whole* image-plane area (`imagePlaneArea()`), making the
     forward tracer measure `radiance / (resX·resY)` — an arbitrary global constant
@@ -160,11 +166,13 @@ as practical; this file is the fallback for what can't be addressed immediately.
      (stb float path in
      `src/texture.h`), and the Jakob-Hanika RGB→reflectance upsampler
      (`src/upsample.h`) gives the per-direction spectral emission. **Progress
-     (increment 1a, 2026-07-10):** steps 1 (bounding sphere), 3 (backward ray-miss
-     term — NEE not needed for a constant env), 4 (forward emission — analog uniform
-     variant, no importance sampling yet) and 5 (mode-B background) are DONE for the
-     **constant** env; step 2 (2D CDF + per-texel JH), step 6 (CUDA), and the
-     image-based part of step 7 remain. **Concrete plan (each sub-step independently
+     (increments 1a+1b, 2026-07-10):** steps 1 (bounding sphere), 3 (backward
+     ray-miss term — NEE not needed for a constant env), 4 (forward emission — analog
+     uniform variant, no importance sampling yet), 5 (mode-B background), and 6 (CUDA
+     env emission — the disk-emission branch is on-device; the mode-B background pass
+     is backend-agnostic) are DONE for the **constant** env; step 2 (2D CDF + per-texel
+     JH) and the image-based part of step 7 remain. **Concrete plan (each sub-step
+     independently
      buildable + validatable):**
      1. *Scene bounding sphere.* Add `Vec3 sceneCenter; double sceneRadius;`
         computed in `Scene::build()` from the BVH root AABB (`center`, `0.5·diag`).
@@ -211,9 +219,10 @@ as practical; this file is the fallback for what can't be addressed immediately.
      small weights (mild variance). Exact CDF sampling of the smoothstep band would
      be lower-variance but needs a quartic inverse; uniform+reweight is correct.
 - **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; **constant
-  environment (`light env { spd … }`) done 2026-07-10 (increment 1a)** incl. the
-  absolute-radiance We fix; image-based HDRI (2D CDF + per-texel JH) and GPU env
-  deferred (see the plan above); sphere/spot importance-sampling also deferred.
+  environment (`light env { spd … }`) done 2026-07-10 (increments 1a CPU + 1b GPU)**
+  incl. the absolute-radiance We fix and on-device env emission; image-based HDRI (2D
+  CDF + per-texel JH) deferred (see the plan above); sphere/spot importance-sampling
+  also deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

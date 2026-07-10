@@ -160,7 +160,7 @@ struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
-    int    shape;              // 0 = quad, 1 = sphere, 2 = spot (mirrors EmitterShape)
+    int    shape;              // 0 = quad, 1 = sphere, 2 = spot, 3 = env (mirrors EmitterShape)
     double radius;             // sphere radius (shape==1)
     double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
     int    cdfOffset, cdfN;
@@ -203,6 +203,8 @@ struct DScene {
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     DMedium medium;
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
+    DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
+    double sceneRadius;              // env (shape==3): bounding-sphere radius
 };
 
 struct DCamera {
@@ -674,6 +676,23 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             emitN = em.beamDir;
             double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
             spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
+        } else if (em.shape == 3) {
+            // Infinite constant environment (mirrors CPU render.h). Sample the photon
+            // direction uniformly on the sphere (pdf 1/4pi) and its entry point on a
+            // disk of radius R perpendicular to `dir`, centered on the scene and pushed
+            // upstream so it starts just outside the bounding sphere (disk pdf 1/(pi R^2)).
+            // Joint pdf 1/(4pi^2 R^2) = 1/envGeom, so beta = emitIntegral*envGeom is
+            // exactly analog (spotW stays 1). Photons missing the geometry escape.
+            double z = 1.0 - 2.0 * (double)u1;
+            double sr = sqrt(fmax(0.0, 1.0 - z * z));
+            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+            dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+            DVec3 t, b; onb(dir, t, b);
+            double rd = sc.sceneRadius * sqrt((double)rng.uniform());
+            double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+            DVec3 disk = t * (Real)(rd * cos(pd)) + b * (Real)(rd * sin(pd));
+            origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
+            emitN = dir;
         } else {
             emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
@@ -688,7 +707,7 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         // Model B: connect the emitter itself to the pinhole (makes the source
         // visible). Modes A/C instead catch photons that physically arrive. A spot
         // is a point light with no projected area, so it has no direct term.
-        if (camMode == CAM_B && em.shape != 2)
+        if (camMode == CAM_B && em.shape != 2 && em.shape != 3)
             connect(sc, cam, film, origin, emitN, lambda, beta, (Real)1);
 
         DVec3 ro = origin + dir * RAY_EPS, rd = dir;
@@ -837,9 +856,10 @@ bool cudaForwardSupported(const Scene& scene) {
     };
     for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
-    // Environment lighting (disk photon emission + directly-viewed background) is
-    // not ported to the device kernel yet — env scenes fall back to the CPU tracer.
-    if (scene.envIndex >= 0) return false;
+    // Environment lighting: the device kernel now emits env photons from the scene
+    // bounding sphere (shape==3), and the directly-viewed background sky is added by
+    // the backend-agnostic addEnvBackground() pass in main.cpp — so env scenes run
+    // on the GPU just like local-light scenes.
     return true;
 }
 
@@ -926,7 +946,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
         de.shape = (e.shape == EmitterShape::Sphere) ? 1
-                 : (e.shape == EmitterShape::Spot)   ? 2 : 0;
+                 : (e.shape == EmitterShape::Spot)   ? 2
+                 : (e.shape == EmitterShape::Env)    ? 3 : 0;
         de.radius = e.radius;
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
@@ -957,6 +978,9 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
+    // Env bounding sphere (shape==3 disk emission). Harmless when no env light.
+    sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
+    sc.sceneRadius = scene.sceneRadius;
 
     DCamera dc;
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
