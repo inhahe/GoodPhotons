@@ -122,6 +122,55 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd) {
     return s;
 }
 
+// Cornell box (model-B only) with the reflective material types side by side:
+// a near-perfect mirror, a rough glossy metal, and a half-mirror (beamsplitter).
+// All three are specular, so under pure light tracing (model B) they appear BLACK
+// from the camera: a specular vertex has zero probability of connecting to the
+// pinhole (the SDS limitation, same as the glass sphere in the Cornell scene).
+// The physics is still exercised — photons reflect off them and illuminate the
+// diffuse walls, and energy conserves — but seeing the spheres' mirrored image
+// directly requires the future camera-side ray path (or model A's contact catch).
+static Scene buildMaterials(int res, const Spectrum& lightSpd) {
+    (void)res;
+    Scene s;
+    Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
+    Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
+    Material green; green.reflect = greenWall();                 s.mats.push_back(green); // 2
+    Material light; light.reflect = constantSpectrum(0.0);
+    light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
+    Material mirror; mirror.type = MatType::Mirror;
+    mirror.reflect = constantSpectrum(0.95);                     s.mats.push_back(mirror);// 4
+    Material glossy; glossy.type = MatType::Glossy;
+    glossy.reflect = constantSpectrum(0.9); glossy.roughness = 0.25;
+                                                                 s.mats.push_back(glossy);// 5
+    Material half; half.type = MatType::HalfMirror;
+    half.reflect = constantSpectrum(0.5);                        s.mats.push_back(half);  // 6
+
+    addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);            // floor
+    addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);            // ceiling
+    addQuad(s, {0,0,0},{0,1,0},{1,1,0},{1,0,0}, 0);            // back
+    addQuad(s, {0,0,0},{0,0,1},{0,1,1},{0,1,0}, 1);            // left (red)
+    addQuad(s, {1,0,0},{1,1,0},{1,1,1},{1,0,1}, 2);            // right (green)
+
+    const double lx0 = 0.35, lx1 = 0.65, lz0 = 0.35, lz1 = 0.65, ly = 0.999;
+    addQuad(s, {lx0,ly,lz0},{lx1,ly,lz0},{lx1,ly,lz1},{lx0,ly,lz1}, 3);
+
+    s.spheres.push_back(Sphere{{0.26, 0.20, 0.35}, 0.18, 4}); // mirror
+    s.spheres.push_back(Sphere{{0.74, 0.20, 0.35}, 0.18, 5}); // glossy
+    s.spheres.push_back(Sphere{{0.50, 0.22, 0.68}, 0.20, 6}); // half-mirror
+
+    s.finalizeTris();
+
+    s.lightOrigin = {lx0, ly, lz0};
+    s.lightU = {lx1 - lx0, 0, 0};
+    s.lightV = {0, 0, lz1 - lz0};
+    s.lightNormal = {0, -1, 0};
+    s.lightArea = (lx1 - lx0) * (lz1 - lz0);
+    s.lightSpd.build(s.mats[3].emit, 1.0);
+    s.lightEmitIntegral = s.lightSpd.integral;
+    return s;
+}
+
 static void selfTestColor() {
     Vec3 xyz{};
     for (double w = LAMBDA_MIN; w <= LAMBDA_MAX; w += 1.0)
@@ -178,11 +227,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
     }
     if (nThreads < 1) nThreads = 1;
-    bool prism = !std::strcmp(sceneName, "prism");
+    bool prism     = !std::strcmp(sceneName, "prism");
+    bool materials = !std::strcmp(sceneName, "materials");
 
     selfTestColor();
 
-    Scene scene = prism ? buildPrism(res) : buildCornell(res, mode, resolveLight(lightName));
+    Scene scene = prism     ? buildPrism(res)
+                : materials ? buildMaterials(res, resolveLight(lightName))
+                            : buildCornell(res, mode, resolveLight(lightName));
     Camera cam;
     if (mode == 'B') {
         if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
