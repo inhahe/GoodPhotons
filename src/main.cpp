@@ -217,6 +217,7 @@ int main(int argc, char** argv) {
     const char* out = "cornell.ppm";
     const char* sceneName = "cornell";
     const char* lightName = "bb6500";
+    double apertureR = 0.02;  // mode C aperture radius (scene units)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -225,6 +226,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
+        else if (!std::strcmp(argv[i], "-aperture") && i + 1 < argc) apertureR = std::atof(argv[++i]);
     }
     if (nThreads < 1) nThreads = 1;
     bool prism     = !std::strcmp(sceneName, "prism");
@@ -235,12 +237,16 @@ int main(int argc, char** argv) {
     Scene scene = prism     ? buildPrism(res)
                 : materials ? buildMaterials(res, resolveLight(lightName))
                             : buildCornell(res, mode, resolveLight(lightName));
+    // mode A: contact sensor (no camera). mode B: connect/splat. mode C:
+    // finite-aperture forward catch (perspective, pure forward, supports mirrors).
+    const bool useCamera    = (mode == 'B' || mode == 'C');
+    const bool forwardCatch = (mode == 'C');
     Camera cam;
-    if (mode == 'B') {
+    if (useCamera) {
         if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
         else       cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
+        cam.apertureR = apertureR;
     }
-    const bool modeB = (mode == 'B');
 
     std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
                 mode, N, res, res, nThreads, prism ? "beam" : lightName);
@@ -252,12 +258,13 @@ int main(int argc, char** argv) {
     for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
 
     auto worker = [&](int tid) {
-        Renderer r;
+        Renderer r; r.forwardCatch = forwardCatch;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
-        Film* sensorFilm = modeB ? nullptr : &films[tid];
-        Camera* camPtr   = modeB ? &cam : nullptr;
-        Film* camFilm    = modeB ? &films[tid] : nullptr;
+        // mode A writes the in-scene contact sensor; B/C write the camera film.
+        Film* sensorFilm = useCamera ? nullptr : &films[tid];
+        Camera* camPtr   = useCamera ? &cam : nullptr;
+        Film* camFilm    = useCamera ? &films[tid] : nullptr;
         for (long long i = lo; i < hi; ++i)
             r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
     };

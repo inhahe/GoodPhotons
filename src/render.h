@@ -36,6 +36,8 @@ inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
 struct Renderer {
     int maxBounce = 32;
     double betaCutoff = 1e-6;
+    bool forwardCatch = false;   // model A perspective: catch photons at the aperture,
+                                 // no connect/splat (photons must physically fly in).
 
     // Model A: map a contact-sensor hit to a pixel and deposit.
     void deposit(const Sensor& s, Film& film, const Vec3& p, double lambda, double beta) const {
@@ -87,13 +89,28 @@ struct Renderer {
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
-        if (cam && camFilm)
+        // (Skipped in forward-catch mode; there the aperture test below handles it.)
+        if (cam && camFilm && !forwardCatch)
             connect(scene, *cam, *camFilm, origin, scene.lightNormal, lambda, beta, 1.0);
 
         Ray ray{origin + dir * 1e-6, dir};
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             Hit h = scene.closestHit(ray);
+
+            // Model A perspective catch: if the photon flies through the aperture
+            // (nearer than any surface), it lands on the film. Supports mirrors,
+            // glass, everything — pure forward physics, no connection.
+            if (forwardCatch && cam && camFilm) {
+                double hitDist = h.valid ? h.t : 1e30;
+                int px, py;
+                if (cam->catchPhoton(ray, hitDist, px, py)) {
+                    camFilm->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
+                    e.sensor += beta;
+                    return;
+                }
+            }
+
             if (!h.valid) { e.escaped += beta; return; }
 
             if (h.sensorId >= 0) {
@@ -140,7 +157,7 @@ struct Renderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(m.reflect(lambda));
-                    if (cam && camFilm) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
+                    if (cam && camFilm && !forwardCatch) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
                     e.absorbed += beta * (1.0 - rho);
                     beta *= rho;
                     if (beta < betaCutoff) return;
