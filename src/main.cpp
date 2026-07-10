@@ -214,6 +214,32 @@ static int checkBvh(const Scene& scene, long long rays) {
     return mismatches;
 }
 
+// Fire random rays and report average BVH work per ray (nodes visited, leaf
+// primitive tests). Confirms tree quality independent of image correctness.
+static void bvhStats(const Scene& scene, long long rays) {
+    Pcg32 rng; rng.seed(2468013u, 0x13579u);
+    long long totNodes = 0, totLeaf = 0, hits = 0;
+    for (long long i = 0; i < rays; ++i) {
+        Vec3 o{rng.uniform() * 3 - 1, rng.uniform() * 3 - 1, rng.uniform() * 3 - 1};
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        Vec3 d = normalize(Vec3{rr * std::cos(phi), rr * std::sin(phi), z});
+        TraversalStats st;
+        Hit h = scene.closestHit(Ray{o, d}, 1e-6, &st);
+        totNodes += st.nodeVisits; totLeaf += st.leafTests; if (h.valid) ++hits;
+    }
+    long long prims = (long long)scene.tris.size() + (long long)scene.spheres.size();
+    // Leaf-size histogram to gauge tree balance.
+    long long leaves = 0, maxLeaf = 0, primsInLeaves = 0;
+    for (const auto& nd : scene.bvh.nodes)
+        if (nd.isLeaf()) { ++leaves; primsInLeaves += nd.count; maxLeaf = std::max<long long>(maxLeaf, nd.count); }
+    std::printf("[bvhstats] %lld prims, %lld nodes, %lld leaves (max %lld, avg %.1f prims/leaf)\n",
+                prims, (long long)scene.bvh.nodes.size(), leaves, maxLeaf,
+                leaves ? (double)primsInLeaves / leaves : 0.0);
+    std::printf("[bvhstats] per ray: %.1f nodes, %.1f leaf-tests, %.1f%% hit\n",
+                (double)totNodes / rays, (double)totLeaf / rays, 100.0 * hits / rays);
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -252,6 +278,7 @@ int main(int argc, char** argv) {
     const char* lightName = "bb6500";
     double apertureR = 0.02;  // mode C aperture radius (scene units)
     bool checkBvhOnly = false;
+    bool bvhStatsOnly = false;
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     for (int i = 1; i < argc; ++i) {
@@ -264,6 +291,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
         else if (!std::strcmp(argv[i], "-aperture") && i + 1 < argc) apertureR = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
+        else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
     }
@@ -285,6 +313,7 @@ int main(int argc, char** argv) {
         rays = std::clamp(rays, 20'000LL, 2'000'000LL);
         return checkBvh(scene, rays) == 0 ? 0 : 1;
     }
+    if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
     // mode A: contact sensor (no camera). mode B: connect/splat. mode C:
     // finite-aperture forward catch (perspective, pure forward, supports mirrors).
     const bool useCamera    = (mode == 'B' || mode == 'C');

@@ -5,6 +5,9 @@
 *.exr
 *.png
 
+# Generated meshes (regenerate with tools/make_mesh.py)
+*.obj
+
 # Checkpoints / render state
 *.ckpt
 /renders/

@@ -57,6 +57,10 @@ struct BvhNode {
     bool isLeaf() const { return count > 0; }
 };
 
+// Diagnostic counters for a single traversal (see -bvhstats). Optional; passing
+// nullptr keeps the hot path branch-free in normal renders.
+struct TraversalStats { long long nodeVisits = 0; long long leafTests = 0; };
+
 struct Bvh {
     std::vector<BvhNode> nodes;
     std::vector<int> primIdx;    // permutation of [0, nPrims)
@@ -119,17 +123,32 @@ struct Bvh {
             double cost = lC * lAcc.area() + rightCount[b + 1] * rightArea[b + 1];
             if (cost < bestCost) { bestCost = cost; bestSplit = b; }
         }
-        double leafCost = count * bounds.area();
-        if (bestSplit < 0 || bestCost >= leafCost) { makeLeaf(); return nodeIdx; }
-
-        // Partition primitives around the best split plane.
-        auto mid = std::partition(bp.begin() + start, bp.begin() + end, [&](const BuildPrim& p) {
-            int b = (int)((vget(p.centroid, axis) - cLo) * scale);
-            if (b < 0) b = 0; if (b >= NUM_BINS) b = NUM_BINS - 1;
-            return b <= bestSplit;
-        });
-        int midIdx = (int)(mid - bp.begin());
-        if (midIdx == start || midIdx == end) midIdx = (start + end) / 2; // safety
+        // Split down to LEAF_SIZE regardless of whether the SAH split "improves"
+        // on the leaf cost. Object-SAH on ring-like shapes (e.g. a torus) hits a
+        // top-level pathology: splitting the ring through its center yields two
+        // C-shaped halves whose AABBs each nearly equal the whole box, so every
+        // split's cost ~ the leaf cost. A "split only if it lowers SAH" test would
+        // then give up immediately and leave enormous leaves (measured: one 9334-
+        // primitive leaf). Instead use SAH only to CHOOSE the plane and fall back
+        // to a median split so recursion always makes progress.
+        int midIdx = start;
+        if (bestSplit >= 0) {
+            auto mid = std::partition(bp.begin() + start, bp.begin() + end, [&](const BuildPrim& p) {
+                int b = (int)((vget(p.centroid, axis) - cLo) * scale);
+                if (b < 0) b = 0; if (b >= NUM_BINS) b = NUM_BINS - 1;
+                return b <= bestSplit;
+            });
+            midIdx = (int)(mid - bp.begin());
+        }
+        if (midIdx == start || midIdx == end) {
+            // No usable SAH split (or a degenerate partition): median-split by
+            // centroid along the chosen axis.
+            midIdx = (start + end) / 2;
+            std::nth_element(bp.begin() + start, bp.begin() + midIdx, bp.begin() + end,
+                             [&](const BuildPrim& a, const BuildPrim& b) {
+                                 return vget(a.centroid, axis) < vget(b.centroid, axis);
+                             });
+        }
 
         int l = buildRecursive(bp, start, midIdx);
         int r = buildRecursive(bp, midIdx, end);
@@ -142,19 +161,34 @@ struct Bvh {
     // Nearest-hit traversal. leafTest(primIndex, tMax&) intersects the primitive
     // and, on a closer hit, updates tMax (used to prune farther nodes).
     template <class LeafFn>
-    void traverseClosest(const Ray& r, double tmin, double& tMax, LeafFn&& leafTest) const {
+    void traverseClosest(const Ray& r, double tmin, double& tMax, LeafFn&& leafTest,
+                         TraversalStats* stats = nullptr) const {
         if (nodes.empty()) return;
         Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
         int stack[64]; int sp = 0; stack[sp++] = 0;
         while (sp) {
             const BvhNode& n = nodes[stack[--sp]];
             double tEnter;
+            if (stats) stats->nodeVisits++;
             if (!n.box.hit(r, invD, tmin, tMax, tEnter)) continue;
             if (n.isLeaf()) {
+                if (stats) stats->leafTests += n.count;
                 for (int i = 0; i < n.count; ++i) leafTest(primIdx[n.first + i], tMax);
             } else {
-                stack[sp++] = n.left;
-                stack[sp++] = n.right;
+                // Front-to-back: cull children against the current tMax at push
+                // time and descend the nearer child first (push far, then near),
+                // so a near hit tightens tMax before the far subtree is visited.
+                double tL, tR;
+                bool hL = nodes[n.left].box.hit(r, invD, tmin, tMax, tL);
+                bool hR = nodes[n.right].box.hit(r, invD, tmin, tMax, tR);
+                if (hL && hR) {
+                    if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
+                    else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
+                } else if (hL) {
+                    stack[sp++] = n.left;
+                } else if (hR) {
+                    stack[sp++] = n.right;
+                }
             }
         }
     }
@@ -173,8 +207,9 @@ struct Bvh {
             if (n.isLeaf()) {
                 for (int i = 0; i < n.count; ++i) if (leafHit(primIdx[n.first + i])) return true;
             } else {
-                stack[sp++] = n.left;
-                stack[sp++] = n.right;
+                double tc;
+                if (nodes[n.left].box.hit(r, invD, tmin, tMax, tc))  stack[sp++] = n.left;
+                if (nodes[n.right].box.hit(r, invD, tmin, tMax, tc)) stack[sp++] = n.right;
             }
         }
         return false;

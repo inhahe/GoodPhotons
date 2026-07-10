@@ -34,8 +34,8 @@ inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
 }
 
 struct Renderer {
-    int maxBounce = 32;
-    double betaCutoff = 1e-6;
+    int maxBounce = 32;          // hard safety cap; Russian roulette normally
+                                 // terminates paths well before this.
     bool forwardCatch = false;   // model A perspective: catch photons at the aperture,
                                  // no connect/splat (photons must physically fly in).
 
@@ -129,8 +129,9 @@ struct Renderer {
                 }
                 case MatType::Mirror: {
                     double r = clamp01(m.reflect(lambda));
-                    e.absorbed += beta * (1.0 - r); beta *= r;
-                    if (beta < betaCutoff) return;
+                    // Russian roulette: absorb with prob (1-r), else reflect with
+                    // beta unchanged. Unbiased and caps path length naturally.
+                    if (rng.uniform() >= r) { e.absorbed += beta; return; }
                     Vec3 o = reflect(ray.d, h.n);
                     ray = Ray{h.p + h.n * 1e-6, o};
                     continue;
@@ -147,8 +148,8 @@ struct Renderer {
                 }
                 case MatType::Glossy: {
                     double r = clamp01(m.reflect(lambda));
-                    e.absorbed += beta * (1.0 - r); beta *= r;
-                    if (beta < betaCutoff) return;
+                    // Russian roulette on reflectance (see Mirror).
+                    if (rng.uniform() >= r) { e.absorbed += beta; return; }
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), m.roughness, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; } // below surface
                     ray = Ray{h.p + h.n * 1e-6, o};
@@ -158,9 +159,10 @@ struct Renderer {
                 default: {
                     double rho = clamp01(m.reflect(lambda));
                     if (cam && camFilm && !forwardCatch) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
-                    e.absorbed += beta * (1.0 - rho);
-                    beta *= rho;
-                    if (beta < betaCutoff) return;
+                    // Russian roulette: absorb with prob (1-rho), else scatter
+                    // with beta unchanged. Unbiased; average path length ~1/(1-rho)
+                    // bounces instead of running to the maxBounce cap.
+                    if (rng.uniform() >= rho) { e.absorbed += beta; return; }
                     ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
                     continue;
                 }

@@ -68,14 +68,14 @@ struct Scene {
         bvh.build(boxes);
     }
 
-    Hit closestHit(const Ray& r, double tmin = 1e-6) const {
+    Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr) const {
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
             if (prim < (int)nT) { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
             else                { if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
-        });
+        }, stats);
         return h;
     }
 
