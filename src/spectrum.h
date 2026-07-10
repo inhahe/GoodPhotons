@@ -32,6 +32,24 @@ inline Spectrum greenWall() {
     return [](double w) { double t = (w - 550.0) / 45.0; return 0.05 + 0.70 * std::exp(-0.5 * t * t); };
 }
 
+// --- Dispersion: wavelength-dependent index of refraction -------------------
+// Sellmeier equation: n^2(l) = 1 + sum_i Bi*l^2 / (l^2 - Ci), with l in micrometres.
+// Single-wavelength photons make this "free" dispersion — each lambda bends by its
+// own n, so a glass object separates colours with no special-casing.
+inline Spectrum sellmeier(double B1, double B2, double B3, double C1, double C2, double C3) {
+    return [=](double lambdaNm) {
+        double l2 = (lambdaNm * 1e-3) * (lambdaNm * 1e-3); // um^2
+        double n2 = 1.0 + B1 * l2 / (l2 - C1) + B2 * l2 / (l2 - C2) + B3 * l2 / (l2 - C3);
+        return std::sqrt(n2 > 1.0 ? n2 : 1.0);
+    };
+}
+// Common optical glasses.
+inline Spectrum iorBK7()  { return sellmeier(1.03961212, 0.231792344, 1.01046945,
+                                             0.00600069867, 0.0200179144, 103.560653); }
+inline Spectrum iorSF10() { return sellmeier(1.62153902, 0.256287842, 1.64447552,
+                                             0.0122241457, 0.0595736775, 147.468793); }
+inline Spectrum iorConstant(double n) { return [n](double) { return n; }; }
+
 // --- Emission importance sampling ------------------------------------------
 // Precomputes a CDF over [LAMBDA_MIN, LAMBDA_MAX] to sample lambda ~ SPD, and
 // exposes the integral so photon weights stay physically consistent.

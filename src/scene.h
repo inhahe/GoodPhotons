@@ -5,9 +5,13 @@
 #include "spectrum.h"
 #include "scene_film.h"
 
+enum class MatType { Diffuse, Dielectric };
+
 struct Material {
+    MatType type = MatType::Diffuse;
     Spectrum reflect = constantSpectrum(0.5); // diffuse albedo vs lambda
     Spectrum emit    = constantSpectrum(0.0); // emitted radiance vs lambda
+    Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
     bool isLight = false;
 };
 
@@ -20,6 +24,7 @@ struct Sensor {
 
 struct Scene {
     std::vector<Tri> tris;
+    std::vector<Sphere> spheres;
     std::vector<Material> mats;
     Sensor sensor;
 
@@ -29,22 +34,29 @@ struct Scene {
     EmissionSampler lightSpd;
     double lightEmitIntegral = 0.0;
 
+    // Collimated-beam mode: all photons travel along beamDir (for the prism demo).
+    bool collimated = false;
+    Vec3 beamDir{1, 0, 0};
+
     void finalizeTris() { for (auto& t : tris) t.finalize(); }
 
     Hit closestHit(const Ray& r, double tmin = 1e-6) const {
         Hit h;
-        for (int i = 0; i < (int)tris.size(); ++i)
-            if (intersectTri(r, tris[i], tmin, h)) h.tri = i;
+        for (const auto& t : tris)    intersectTri(r, t, tmin, h);
+        for (const auto& s : spheres) intersectSphere(r, s, tmin, h);
         return h;
     }
 
     // Is anything blocking the segment from o toward dir, before maxDist?
     // Used by model-B camera connections (shadow ray to the pinhole).
+    // NOTE: dielectrics block connections (can't connect through specular) — the
+    // SDS limitation. Glass therefore appears dark in model B; caustics it casts
+    // onto diffuse surfaces still render, since those diffuse vertices connect.
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
         Ray r{o, dir};
         Hit h; h.t = maxDist - tmin;
-        for (int i = 0; i < (int)tris.size(); ++i)
-            if (intersectTri(r, tris[i], tmin, h)) return true;
+        for (const auto& t : tris)    if (intersectTri(r, t, tmin, h)) return true;
+        for (const auto& s : spheres) if (intersectSphere(r, s, tmin, h)) return true;
         return false;
     }
 };

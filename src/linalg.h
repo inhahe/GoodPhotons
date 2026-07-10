@@ -22,6 +22,9 @@ inline Vec3 cross(const Vec3& a, const Vec3& b) {
 inline double length(const Vec3& a) { return std::sqrt(dot(a, a)); }
 inline Vec3 normalize(const Vec3& a) { return a / length(a); }
 
+// Mirror reflection of incident direction d about unit normal n.
+inline Vec3 reflect(const Vec3& d, const Vec3& n) { return d - n * (2.0 * dot(d, n)); }
+
 // Orthonormal basis around unit normal n (Duff et al. 2017, branchless).
 inline void onb(const Vec3& n, Vec3& t, Vec3& b) {
     double sign = std::copysign(1.0, n.z);

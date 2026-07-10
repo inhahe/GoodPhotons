@@ -18,6 +18,45 @@ static void addQuad(Scene& s, Vec3 a, Vec3 b, Vec3 c, Vec3 d, int mat, int senso
     s.tris.push_back(Tri{a, b, c, mat, sensorId, {}});
     s.tris.push_back(Tri{a, c, d, mat, sensorId, {}});
 }
+static void addTri(Scene& s, Vec3 a, Vec3 b, Vec3 c, int mat) {
+    s.tris.push_back(Tri{a, b, c, mat, -1, {}});
+}
+
+// White box + dispersive glass prism + collimated white beam -> rainbow on the floor.
+static Scene buildPrism(int res) {
+    (void)res; // geometry is resolution-independent; camera res set by caller
+    Scene s;
+    Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
+    Material glass; glass.type = MatType::Dielectric;
+    glass.ior = iorSF10();                                       s.mats.push_back(glass); // 1
+
+    addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);   // floor
+    addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);   // ceiling
+    addQuad(s, {0,0,0},{0,1,0},{1,1,0},{1,0,0}, 0);   // back
+    addQuad(s, {0,0,0},{0,0,1},{0,1,1},{0,1,0}, 0);   // left
+    addQuad(s, {1,0,0},{1,1,0},{1,1,1},{1,0,1}, 0);   // right
+
+    // Equilateral-ish triangular prism, apex up, axis along z.
+    Vec3 T0{0.5,0.75,0.35}, L0{0.30,0.35,0.35}, R0{0.70,0.35,0.35};
+    Vec3 T1{0.5,0.75,0.65}, L1{0.30,0.35,0.65}, R1{0.70,0.35,0.65};
+    addTri(s, T0,L0,R0, 1); addTri(s, T1,R1,L1, 1);   // caps
+    addQuad(s, L0,T0,T1,L1, 1);                        // left face
+    addQuad(s, T0,R0,R1,T1, 1);                        // right face
+    addQuad(s, R0,L0,L1,R1, 1);                        // bottom face
+    s.finalizeTris();
+
+    // Collimated white beam entering the left face, travelling +x.
+    s.collimated = true;
+    s.beamDir = {1, 0, 0};
+    s.lightOrigin = {0.05, 0.54, 0.49};
+    s.lightU = {0, 0.03, 0};      // thin pencil cross-section
+    s.lightV = {0, 0, 0.03};
+    s.lightNormal = {1, 0, 0};
+    s.lightArea = 0.03 * 0.03;
+    s.lightSpd.build(constantSpectrum(1.0), 1.0); // equal-energy -> even rainbow
+    s.lightEmitIntegral = s.lightSpd.integral;
+    return s;
+}
 
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
 static Scene buildCornell(int res, char mode) {
@@ -27,6 +66,8 @@ static Scene buildCornell(int res, char mode) {
     Material green; green.reflect = greenWall();                 s.mats.push_back(green); // 2
     Material light; light.reflect = constantSpectrum(0.0);
     light.emit = blackbody(6500.0); light.isLight = true;        s.mats.push_back(light); // 3
+    Material glass; glass.type = MatType::Dielectric;
+    glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);            // floor
     addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);            // ceiling
@@ -39,6 +80,9 @@ static Scene buildCornell(int res, char mode) {
 
     const double lx0 = 0.35, lx1 = 0.65, lz0 = 0.35, lz1 = 0.65, ly = 0.999;
     addQuad(s, {lx0,ly,lz0},{lx1,ly,lz0},{lx1,ly,lz1},{lx0,ly,lz1}, 3);
+
+    // Dispersive glass sphere -> casts a spectral caustic on the floor.
+    s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, 4});
 
     s.finalizeTris();
 
@@ -101,21 +145,26 @@ int main(int argc, char** argv) {
     char mode = 'B';
     int nThreads = (int)std::thread::hardware_concurrency();
     const char* out = "cornell.ppm";
+    const char* sceneName = "cornell";
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) mode = argv[++i][0];
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
     }
     if (nThreads < 1) nThreads = 1;
+    bool prism = !std::strcmp(sceneName, "prism");
 
     selfTestColor();
 
-    Scene scene = buildCornell(res, mode);
+    Scene scene = prism ? buildPrism(res) : buildCornell(res, mode);
     Camera cam;
-    if (mode == 'B')
-        cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
+    if (mode == 'B') {
+        if (prism) cam.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
+        else       cam.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
+    }
     const bool modeB = (mode == 'B');
 
     std::printf("mode %c: tracing %lld photons at %dx%d on %d threads ...\n",
