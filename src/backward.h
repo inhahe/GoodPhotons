@@ -40,30 +40,36 @@ struct BackwardRenderer {
     int maxBounce = 32;
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
 
-    // Next-event estimation: connect a surface vertex to a uniformly-sampled
-    // point on the area light. Returns the spectral-weighted radiance estimate.
-    // emitW is the emitted radiance carried per sampled wavelength (= the light's
-    // SPD integral, since lambda ~ SPD/integral makes Le/pdf constant — identical
-    // to the forward tracer's photon weight convention).
-    double neeLight(const Scene& scene, const Hit& h, double rho, double emitW,
+    // Next-event estimation: connect a surface vertex to each area emitter (the
+    // integral splits by light, summed unbiasedly). `invPdfLambda` = emitG/g(lambda)
+    // is the reciprocal of the sampled-wavelength pdf; multiplied by an emitter's
+    // SPD(lambda) it yields that emitter's Le/pdf weight (= its SPD integral for a
+    // single light, matching the forward tracer's photon-weight convention).
+    double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng) const {
-        double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 y = scene.lightOrigin + scene.lightU * u1 + scene.lightV * u2;
-        Vec3 toL = y - h.p;
-        double dist2 = dot(toL, toL);
-        double dist = std::sqrt(dist2);
-        Vec3 wi = toL / dist;
-        double cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0) return 0.0;
-        double cosLight = dot(scene.lightNormal, -wi);   // light is one-sided
-        if (cosLight <= 0) return 0.0;
-        if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) return 0.0;
-        double f = rho / PI;                              // Lambertian BRDF
-        double G = cosSurf * cosLight / dist2;            // geometry term
-        double contrib = f * emitW * G * scene.lightArea; // pdf_area = 1/area
-        if (scene.medium.enabled)                         // Beer-Lambert on the shadow ray
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
-        return contrib;
+        double total = 0.0;
+        for (const auto& em : scene.emitters) {
+            if (em.collimated) continue;                  // beams aren't area-samplable
+            double u1 = rng.uniform(), u2 = rng.uniform();
+            Vec3 y = em.origin + em.u * u1 + em.v * u2;
+            Vec3 toL = y - h.p;
+            double dist2 = dot(toL, toL);
+            double dist = std::sqrt(dist2);
+            Vec3 wi = toL / dist;
+            double cosSurf = dot(h.n, wi);
+            if (cosSurf <= 0) continue;
+            double cosLight = dot(em.normal, -wi);        // light is one-sided
+            if (cosLight <= 0) continue;
+            if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+            double f = rho / PI;                          // Lambertian BRDF
+            double G = cosSurf * cosLight / dist2;        // geometry term
+            double emitW = em.spdFn(lambda) * invPdfLambda;   // Le(lambda)/pdf_lambda
+            double contrib = f * emitW * G * em.area;     // pdf_area = 1/area
+            if (scene.medium.enabled)                     // Beer-Lambert on the shadow ray
+                contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+            total += contrib;
+        }
+        return total;
     }
 
     // Volume next-event estimation: connect a fog scattering vertex `p` (photon
@@ -72,25 +78,33 @@ struct BackwardRenderer {
     // Greenstein phase function; the shadow ray carries fog transmittance. This is
     // the backward mirror of the forward tracer's connectVolume().
     double neeVolume(const Scene& scene, const Vec3& p, const Vec3& wIn,
-                     double lambda, double emitW, Pcg32& rng) const {
-        double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 y = scene.lightOrigin + scene.lightU * u1 + scene.lightV * u2;
-        Vec3 toL = y - p;
-        double dist2 = dot(toL, toL);
-        double dist = std::sqrt(dist2);
-        Vec3 wi = toL / dist;
-        double cosLight = dot(scene.lightNormal, -wi);    // light is one-sided
-        if (cosLight <= 0) return 0.0;
-        if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) return 0.0;
-        double phase  = hgPhase(dot(wIn, wi), scene.medium.g);
-        double albedo = scene.medium.albedo(lambda);
-        double G = cosLight / dist2;                       // no surface cosine at a volume vertex
-        double T = std::exp(-scene.medium.sigmaT(lambda) * dist);
-        return albedo * phase * emitW * G * scene.lightArea * T;
+                     double lambda, double invPdfLambda, Pcg32& rng) const {
+        double total = 0.0;
+        for (const auto& em : scene.emitters) {
+            if (em.collimated) continue;
+            double u1 = rng.uniform(), u2 = rng.uniform();
+            Vec3 y = em.origin + em.u * u1 + em.v * u2;
+            Vec3 toL = y - p;
+            double dist2 = dot(toL, toL);
+            double dist = std::sqrt(dist2);
+            Vec3 wi = toL / dist;
+            double cosLight = dot(em.normal, -wi);        // light is one-sided
+            if (cosLight <= 0) continue;
+            if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+            double phase  = hgPhase(dot(wIn, wi), scene.medium.g);
+            double albedo = scene.medium.albedo(lambda);
+            double G = cosLight / dist2;                   // no surface cosine at a volume vertex
+            double T = std::exp(-scene.medium.sigmaT(lambda) * dist);
+            double emitW = em.spdFn(lambda) * invPdfLambda;
+            total += albedo * phase * emitW * G * em.area * T;
+        }
+        return total;
     }
 
     // Estimate spectral-weighted radiance for a single wavelength along `ray`.
-    double radiance(const Scene& scene, Ray ray, double lambda, double emitW,
+    // `invPdfLambda` = emitG/g(lambda), the reciprocal of the sampled-wavelength
+    // pdf; an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
+    double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
                     Pcg32& rng) const {
         double L = 0.0, thr = 1.0;
         bool specularArrival = true;   // camera ray may see the light directly
@@ -111,7 +125,7 @@ struct BackwardRenderer {
                     double tMed = -std::log(1.0 - rng.uniform()) / st;
                     if (tMed < dSurf) {
                         Vec3 p = ray.o + ray.d * tMed;
-                        L += thr * neeVolume(scene, p, ray.d, lambda, emitW, rng);
+                        L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
                         if (rng.uniform() >= scene.medium.albedo(lambda)) return L; // absorbed
                         ray = Ray{p, sampleHG(ray.d, scene.medium.g, rng)};
                         specularArrival = false;   // phase-NEE covered the direct light
@@ -124,8 +138,10 @@ struct BackwardRenderer {
             const Material& m = scene.mats[h.matId];
 
             // Emission (add only on specular/camera arrival; NEE covers diffuse).
+            // The surface's own emitted radiance Le=m.emit(lambda), weighted by the
+            // reciprocal wavelength pdf (= its SPD integral for a single light).
             if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0)
-                L += thr * emitW;
+                L += thr * m.emit(lambda) * invPdfLambda;
 
             switch (m.type) {
                 case MatType::Dielectric: {
@@ -179,7 +195,7 @@ struct BackwardRenderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(m.reflect(lambda));
-                    L += thr * neeLight(scene, h, rho, emitW, lambda, rng);
+                    L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng);
                     // Russian roulette on the albedo (throughput unchanged on
                     // survival) — matches the forward tracer's diffuse handling.
                     if (rng.uniform() >= rho) return L;
@@ -197,15 +213,16 @@ struct BackwardRenderer {
     // the pixel rows [y0, y1) — the caller partitions rows across threads.
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
                     int y0, int y1, long long spp, Pcg32& rng) const {
-        const double emitW = scene.lightEmitIntegral;   // constant per-lambda weight
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 for (long long s = 0; s < spp; ++s) {
+                    // Sample lambda from the combined emission distribution g(lambda).
                     double pdf = 0.0;
-                    double lambda = scene.lightSpd.sample(rng, pdf);
+                    double lambda = scene.emitSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
+                    double invPdfLambda = scene.invPdfLambda(lambda); // exact emitG/g(lambda)
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
-                    double L = radiance(scene, ray, lambda, emitW, rng);
+                    double L = radiance(scene, ray, lambda, invPdfLambda, rng);
                     film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * L);
                 }
             }

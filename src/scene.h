@@ -112,6 +112,22 @@ struct Sensor {
     void alloc() { film.alloc(); }
 };
 
+// A single emitter. An area light is a quad (origin + s*u + t*v, s,t in [0,1])
+// with one-sided Lambertian emission along `normal`. A collimated emitter fires
+// every photon along `beamDir` from that same quad (the prism demo). Each emitter
+// carries its own SPD; `power` = emitIntegral * area * PI is the emitter's total
+// emitted power and doubles as the selection weight for the power-weighted CDF.
+struct Emitter {
+    Vec3 origin, u, v, normal;
+    double area = 0.0;
+    bool collimated = false;
+    Vec3 beamDir{1, 0, 0};
+    EmissionSampler spd;      // for forward per-emitter lambda importance sampling
+    Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
+    double emitIntegral = 0.0;
+    double power = 0.0;       // emitIntegral * area * PI (selection weight)
+};
+
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
@@ -119,15 +135,73 @@ struct Scene {
     Sensor sensor;
     Medium medium;   // optional global fog / participating medium (disabled by default)
 
-    // Area light: a quad (two tris) with uniform emission. Cached for sampling.
-    Vec3 lightOrigin, lightU, lightV, lightNormal;
-    double lightArea = 0.0;
-    EmissionSampler lightSpd;
-    double lightEmitIntegral = 0.0;
+    // Emitters. Forward tracing selects one per photon with probability
+    // proportional to power (so every photon carries beta = totalPower, keeping
+    // the estimator unbiased); backward tracing samples wavelengths from the
+    // combined emission distribution and sums NEE over all emitters.
+    std::vector<Emitter> emitters;
+    std::vector<double> emitterCdf;   // cumulative power, normalised to [0,1]
+    double totalPower = 0.0;
+    // Combined emission wavelength sampler over g(lambda)=sum_k area_k*PI*SPD_k,
+    // with emitG = its integral. invPdfLambda(lambda) = emitG / g(lambda) is the
+    // per-lambda weight the backward reference needs (see backward.h).
+    EmissionSampler emitSampler;
+    double emitG = 0.0;
 
-    // Collimated-beam mode: all photons travel along beamDir (for the prism demo).
-    bool collimated = false;
-    Vec3 beamDir{1, 0, 0};
+    // Register one area (or collimated) light. Terse helper for the C++ builders
+    // and the FTSL loader; call finalizeEmitters() (via build()) afterwards.
+    void addAreaLight(const Vec3& o, const Vec3& U, const Vec3& V, const Vec3& n,
+                      double area, const Spectrum& spd, double stepNm,
+                      bool collimated = false, const Vec3& beamDir = {1, 0, 0}) {
+        Emitter e;
+        e.origin = o; e.u = U; e.v = V; e.normal = n; e.area = area;
+        e.collimated = collimated; e.beamDir = beamDir;
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
+    // Compute per-emitter power, the selection CDF, and the combined backward
+    // wavelength sampler. Idempotent; called by build().
+    void finalizeEmitters(double stepNm = 1.0) {
+        totalPower = 0.0;
+        emitterCdf.assign(emitters.size(), 0.0);
+        for (size_t i = 0; i < emitters.size(); ++i) {
+            emitters[i].power = emitters[i].emitIntegral * emitters[i].area * PI;
+            totalPower += emitters[i].power;
+            emitterCdf[i] = totalPower;
+        }
+        if (totalPower > 0) for (auto& c : emitterCdf) c /= totalPower;
+        // Combined g(lambda) = sum_k area_k*PI*SPD_k(lambda); by value capture.
+        std::vector<std::pair<double, Spectrum>> parts;
+        for (const auto& e : emitters) parts.push_back({e.area * PI, e.spdFn});
+        Spectrum g = [parts](double w) {
+            double s = 0.0; for (const auto& p : parts) s += p.first * p.second(w); return s;
+        };
+        emitSampler.build(g, stepNm);
+        emitG = emitSampler.integral;
+    }
+
+    // Select an emitter index for the power-weighted CDF. For a single emitter
+    // this consumes no randomness (index 0), preserving the RNG stream so
+    // single-light scenes render bit-identically to the pre-multi-light engine.
+    int selectEmitter(Pcg32& rng) const {
+        if (emitters.size() <= 1) return 0;
+        double u = rng.uniform();
+        int lo = 0, hi = (int)emitterCdf.size() - 1;
+        while (lo < hi) { int mid = (lo + hi) / 2; if (emitterCdf[mid] < u) lo = mid + 1; else hi = mid; }
+        return lo;
+    }
+
+    // Per-lambda weight for the backward reference: emitG / g(lambda), i.e. the
+    // reciprocal of the sampled wavelength pdf. Reduces to a single light's
+    // emitIntegral once multiplied by that light's SPD(lambda).
+    double invPdfLambda(double lambda) const {
+        // reconstruct g(lambda) = emitG * pdf; but we stored the sampler, so
+        // recompute g directly from emitters (cheap: few evaluations).
+        double g = 0.0;
+        for (const auto& e : emitters) g += e.area * PI * e.spdFn(lambda);
+        return (g > 0.0) ? emitG / g : 0.0;
+    }
 
     Bvh bvh;   // acceleration structure over tris (0..nTris) then spheres.
 
@@ -136,6 +210,7 @@ struct Scene {
     void build() {
         for (auto& t : tris) t.finalize();
         buildBvh();
+        finalizeEmitters();
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 

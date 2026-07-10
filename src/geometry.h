@@ -5,6 +5,8 @@
 #include <cfloat>
 #include "linalg.h"
 
+constexpr double PI = 3.141592653589793;
+
 struct Ray { Vec3 o, d; };
 
 struct Tri {

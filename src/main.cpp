@@ -89,18 +89,13 @@ static Scene buildPrism(int res) {
     addQuad(s, L0,T0,T1,L1, 1);                        // left face
     addQuad(s, T0,R0,R1,T1, 1);                        // right face
     addQuad(s, R0,L0,L1,R1, 1);                        // bottom face
-    s.finalizeTris();
 
-    // Collimated white beam entering the left face, travelling +x.
-    s.collimated = true;
-    s.beamDir = {1, 0, 0};
-    s.lightOrigin = {0.05, 0.54, 0.49};
-    s.lightU = {0, 0.03, 0};      // thin pencil cross-section
-    s.lightV = {0, 0, 0.03};
-    s.lightNormal = {1, 0, 0};
-    s.lightArea = 0.03 * 0.03;
-    s.lightSpd.build(constantSpectrum(1.0), 1.0); // equal-energy -> even rainbow
-    s.lightEmitIntegral = s.lightSpd.integral;
+    // Collimated white beam entering the left face, travelling +x. Equal-energy
+    // SPD -> even rainbow. Thin 3cm pencil cross-section.
+    s.addAreaLight(/*origin*/{0.05, 0.54, 0.49}, /*u*/{0, 0.03, 0}, /*v*/{0, 0, 0.03},
+                   /*normal*/{1, 0, 0}, /*area*/0.03 * 0.03, constantSpectrum(1.0), 1.0,
+                   /*collimated*/true, /*beamDir*/{1, 0, 0});
+    s.finalizeTris();
     return s;
 }
 
@@ -131,18 +126,13 @@ static Scene buildGrating(int res, bool diffraction) {
     // Grating patch on the back wall (z ~ 0), facing into the room (+z). Sits just
     // in front of the wall so it is the first surface the beam meets.
     addQuad(s, {0.3,0.3,0.002},{0.7,0.3,0.002},{0.7,0.7,0.002},{0.3,0.7,0.002}, 1);
-    s.finalizeTris();
 
-    // Collimated white beam entering from the front, travelling -z into the grating.
-    s.collimated = true;
-    s.beamDir = {0, 0, -1};
-    s.lightOrigin = {0.485, 0.485, 0.95};
-    s.lightU = {0.03, 0, 0};      // thin pencil cross-section
-    s.lightV = {0, 0.03, 0};
-    s.lightNormal = {0, 0, -1};
-    s.lightArea = 0.03 * 0.03;
-    s.lightSpd.build(constantSpectrum(1.0), 1.0); // equal-energy -> even rainbow
-    s.lightEmitIntegral = s.lightSpd.integral;
+    // Collimated white beam entering from the front, travelling -z into the
+    // grating. Equal-energy SPD -> even rainbow. Thin 3cm pencil cross-section.
+    s.addAreaLight(/*origin*/{0.485, 0.485, 0.95}, /*u*/{0.03, 0, 0}, /*v*/{0, 0.03, 0},
+                   /*normal*/{0, 0, -1}, /*area*/0.03 * 0.03, constantSpectrum(1.0), 1.0,
+                   /*collimated*/true, /*beamDir*/{0, 0, -1});
+    s.finalizeTris();
     return s;
 }
 
@@ -192,20 +182,14 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
         s.spheres.push_back(Sphere{{0.5, 0.32, 0.4}, 0.25, sphMat});
     }
 
+    s.addAreaLight(/*origin*/{lx0, ly, lz0}, /*u*/{lx1 - lx0, 0, 0}, /*v*/{0, 0, lz1 - lz0},
+                   /*normal*/{0, -1, 0}, /*area*/(lx1 - lx0) * (lz1 - lz0), s.mats[3].emit, 1.0);
     s.build();
 
     if (mode == 'A') {
         s.sensor.origin = {0,0,1}; s.sensor.uAxis = {1,0,0}; s.sensor.vAxis = {0,1,0};
         s.sensor.film.resX = res; s.sensor.film.resY = res; s.sensor.alloc();
     }
-
-    s.lightOrigin = {lx0, ly, lz0};
-    s.lightU = {lx1 - lx0, 0, 0};
-    s.lightV = {0, 0, lz1 - lz0};
-    s.lightNormal = {0, -1, 0};
-    s.lightArea = (lx1 - lx0) * (lz1 - lz0);
-    s.lightSpd.build(s.mats[3].emit, 1.0);
-    s.lightEmitIntegral = s.lightSpd.integral;
     return s;
 }
 
@@ -246,15 +230,9 @@ static Scene buildMaterials(int res, const Spectrum& lightSpd) {
     s.spheres.push_back(Sphere{{0.74, 0.20, 0.35}, 0.18, 5}); // glossy
     s.spheres.push_back(Sphere{{0.50, 0.22, 0.68}, 0.20, 6}); // half-mirror
 
+    s.addAreaLight(/*origin*/{lx0, ly, lz0}, /*u*/{lx1 - lx0, 0, 0}, /*v*/{0, 0, lz1 - lz0},
+                   /*normal*/{0, -1, 0}, /*area*/(lx1 - lx0) * (lz1 - lz0), s.mats[3].emit, 1.0);
     s.finalizeTris();
-
-    s.lightOrigin = {lx0, ly, lz0};
-    s.lightU = {lx1 - lx0, 0, 0};
-    s.lightV = {0, 0, lz1 - lz0};
-    s.lightNormal = {0, -1, 0};
-    s.lightArea = (lx1 - lx0) * (lz1 - lz0);
-    s.lightSpd.build(s.mats[3].emit, 1.0);
-    s.lightEmitIntegral = s.lightSpd.integral;
     return s;
 }
 

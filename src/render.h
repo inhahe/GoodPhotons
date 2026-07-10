@@ -12,8 +12,6 @@
 #include "scene.h"
 #include "camera.h"
 
-constexpr double PI = 3.141592653589793;
-
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
 };
@@ -217,22 +215,30 @@ struct Renderer {
     void tracePhoton(const Scene& scene, const Camera* cam, Film* sensorFilm,
                      Film* camFilm, Pcg32& rng, EnergyReport& e) const {
         // --- Emission ---
+        // Power-weighted emitter selection: photon selects emitter k with prob
+        // power_k/totalPower and carries beta = totalPower, so E[beta over the
+        // selection] reproduces each emitter's true power (unbiased). For a single
+        // emitter selectEmitter() draws no randomness, keeping the RNG stream (and
+        // thus the image) bit-identical to the pre-multi-light engine.
+        if (scene.emitters.empty()) return;
+        int ei = scene.selectEmitter(rng);
+        const Emitter& em = scene.emitters[ei];
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 origin = scene.lightOrigin + scene.lightU * u1 + scene.lightV * u2;
-        Vec3 dir = scene.collimated ? scene.beamDir
-                                    : cosineHemisphere(scene.lightNormal, rng);
+        Vec3 origin = em.origin + em.u * u1 + em.v * u2;
+        Vec3 dir = em.collimated ? em.beamDir : cosineHemisphere(em.normal, rng);
         double pdfL = 0.0;
-        double lambda = scene.lightSpd.sample(rng, pdfL);
+        double lambda = em.spd.sample(rng, pdfL);
         if (pdfL <= 0) return;
-        // Constant weight because we importance-sample p(lambda)=Le/integral.
-        double beta = scene.lightEmitIntegral * scene.lightArea * PI;
+        // Single emitter: beta = its own power (== old lightEmitIntegral*area*PI).
+        // Multiple: beta = totalPower (see selection note above).
+        double beta = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
         e.emitted += beta;
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
         if (cam && camFilm && !forwardCatch)
-            connect(scene, *cam, *camFilm, origin, scene.lightNormal, lambda, beta, 1.0);
+            connect(scene, *cam, *camFilm, origin, em.normal, lambda, beta, 1.0);
 
         Ray ray{origin + dir * 1e-6, dir};
 

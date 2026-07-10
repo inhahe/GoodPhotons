@@ -145,15 +145,25 @@ struct DMedium {
     double g;
 };
 
+// One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
+// wavelength CDF slice inside the flattened lightCdfAll buffer.
+struct DEmitter {
+    DVec3  origin, u, v, normal, beamDir;
+    double area, power;
+    int    collimated;
+    int    cdfOffset, cdfN;
+    double cdfStep;
+};
+
 struct DScene {
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
     const DMaterial* mats;
     const DNode*     nodes; const int* primIdx; int nNodes;
-    DVec3  lightOrigin, lightU, lightV, lightNormal;
-    double lightArea, lightEmitIntegral;
-    int    collimated; DVec3 beamDir;
-    const double* lightCdf; int lightCdfN; double lightStep;
+    const DEmitter*  emitters; int nEmitters;
+    const double*    emitCdf;       // size nEmitters, cumulative power, normalised
+    double           totalPower;
+    const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     DMedium medium;
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
 };
@@ -573,15 +583,24 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
 
 // ============================ megakernel ============================
 
-__device__ static Real sampleLambda(const DScene& sc, DRng& rng, Real& pdf) {
+__device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
     // CDF search stays in double (host-baked table); the returned wavelength/pdf are Real.
     double u = (double)rng.uniform();
-    int lo = 0, hi = sc.lightCdfN - 1;
-    while (lo + 1 < hi) { int mid = (lo + hi) / 2; if (sc.lightCdf[mid] <= u) lo = mid; else hi = mid; }
-    double c0 = sc.lightCdf[lo], c1 = sc.lightCdf[lo + 1];
+    const double* cdf = sc.lightCdfAll + em.cdfOffset;
+    int lo = 0, hi = em.cdfN - 1;
+    while (lo + 1 < hi) { int mid = (lo + hi) / 2; if (cdf[mid] <= u) lo = mid; else hi = mid; }
+    double c0 = cdf[lo], c1 = cdf[lo + 1];
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
-    pdf = (Real)((c1 - c0) / sc.lightStep);
-    return (Real)(DLMIN + (lo + frac) * sc.lightStep);
+    pdf = (Real)((c1 - c0) / em.cdfStep);
+    return (Real)(DLMIN + (lo + frac) * em.cdfStep);
+}
+
+// Power-weighted emitter selection (mirrors Scene::selectEmitter). Single
+// emitter consumes no randomness, preserving the RNG stream for parity with CPU.
+__device__ static int selectEmitter(const DScene& sc, double u) {
+    int lo = 0, hi = sc.nEmitters - 1;
+    while (lo < hi) { int mid = (lo + hi) / 2; if (sc.emitCdf[mid] < u) lo = mid + 1; else hi = mid; }
+    return lo;
 }
 
 __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
@@ -594,19 +613,22 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
+        // Power-weighted emitter selection (single emitter draws no randomness).
+        int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+        const DEmitter em = sc.emitters[ei];
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 origin = sc.lightOrigin + sc.lightU * u1 + sc.lightV * u2;
-        DVec3 dir = sc.collimated ? sc.beamDir : cosineHemisphere(sc.lightNormal, rng);
+        DVec3 origin = em.origin + em.u * u1 + em.v * u2;
+        DVec3 dir = em.collimated ? em.beamDir : cosineHemisphere(em.normal, rng);
         Real pdfL = 0;
-        Real lambda = sampleLambda(sc, rng, pdfL);
+        Real lambda = sampleLambda(sc, em, rng, pdfL);
         if (pdfL <= 0) continue;
-        Real beta = (Real)(sc.lightEmitIntegral * sc.lightArea * DPI);
+        Real beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
         eEmitted += beta;
 
         // Model B: connect the emitter itself to the pinhole (makes the source
         // visible). Modes A/C instead catch photons that physically arrive.
         if (camMode == CAM_B)
-            connect(sc, cam, film, origin, sc.lightNormal, lambda, beta, (Real)1);
+            connect(sc, cam, film, origin, em.normal, lambda, beta, (Real)1);
 
         DVec3 ro = origin + dir * RAY_EPS, rd = dir;
         bool done = false;
@@ -793,23 +815,39 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     DNode*     d_nodes = nodes.empty() ? nullptr : uploadVec(nodes);
     int*       d_prim = primIdx.empty() ? nullptr : uploadVec(primIdx);
     DMaterial* d_mats = mats.empty() ? nullptr : uploadVec(mats);
-    std::vector<double> cdf = scene.lightSpd.cdf;
-    double* d_cdf = cdf.empty() ? nullptr : uploadVec(cdf);
+
+    // Emitters: build a DEmitter array + a flattened wavelength-CDF buffer, plus
+    // the normalised power selection CDF.
+    std::vector<DEmitter> dems;
+    std::vector<double> cdfAll;
+    for (const auto& e : scene.emitters) {
+        DEmitter de;
+        de.origin  = {e.origin.x, e.origin.y, e.origin.z};
+        de.u       = {e.u.x, e.u.y, e.u.z};
+        de.v       = {e.v.x, e.v.y, e.v.z};
+        de.normal  = {e.normal.x, e.normal.y, e.normal.z};
+        de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
+        de.area = e.area; de.power = e.power;
+        de.collimated = e.collimated ? 1 : 0;
+        de.cdfOffset = (int)cdfAll.size();
+        de.cdfN = (int)e.spd.cdf.size();
+        de.cdfStep = e.spd.step;
+        cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
+        dems.push_back(de);
+    }
+    std::vector<double> emitCdf = scene.emitterCdf;
+    DEmitter* d_ems     = dems.empty()    ? nullptr : uploadVec(dems);
+    double*   d_cdfAll  = cdfAll.empty()  ? nullptr : uploadVec(cdfAll);
+    double*   d_emitCdf = emitCdf.empty() ? nullptr : uploadVec(emitCdf);
 
     DScene sc;
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
-    sc.lightOrigin = {scene.lightOrigin.x, scene.lightOrigin.y, scene.lightOrigin.z};
-    sc.lightU = {scene.lightU.x, scene.lightU.y, scene.lightU.z};
-    sc.lightV = {scene.lightV.x, scene.lightV.y, scene.lightV.z};
-    sc.lightNormal = {scene.lightNormal.x, scene.lightNormal.y, scene.lightNormal.z};
-    sc.lightArea = scene.lightArea;
-    sc.lightEmitIntegral = scene.lightEmitIntegral;
-    sc.collimated = scene.collimated ? 1 : 0;
-    sc.beamDir = {scene.beamDir.x, scene.beamDir.y, scene.beamDir.z};
-    sc.lightCdf = d_cdf; sc.lightCdfN = (int)cdf.size(); sc.lightStep = scene.lightSpd.step;
+    sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
+    sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
+    sc.lightCdfAll = d_cdfAll;
     sc.medium.enabled = scene.medium.enabled ? 1 : 0;
     sc.medium.g = scene.medium.g;
     bakeSpec(scene.medium.sigma_a, sc.medium.sigma_a);
@@ -860,6 +898,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     eOut.residual += energy[4];
 
     cudaFree(d_tris); cudaFree(d_sph); cudaFree(d_nodes); cudaFree(d_prim);
-    cudaFree(d_mats); cudaFree(d_cdf); cudaFree(d_film); cudaFree(d_energy);
+    cudaFree(d_mats); cudaFree(d_ems); cudaFree(d_cdfAll); cudaFree(d_emitCdf);
+    cudaFree(d_film); cudaFree(d_energy);
     return out;
 }

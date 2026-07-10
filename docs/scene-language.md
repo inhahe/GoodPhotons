@@ -6,17 +6,20 @@
 > `gaussian`, `shortpass`, `ior`, `rgb`, `whitewall`/`redwall`/`greenwall`,
 > `glass:`, `preset:`, `spectrum:` refs, and `table { }`), builds materials
 > (all eight `MatType`s), geometry (`sphere`/`quad`/`triangle`/`mesh` with full
-> translate+rotate+non-uniform-scale transforms), one `light` (area or
-> collimated), a `medium`, a `camera`, and a `render` block (overridable by CLI).
+> translate+rotate+non-uniform-scale transforms), any number of `light` blocks
+> (area or collimated), a `medium`, a `camera`, and a `render` block (overridable by CLI).
 > `scenes/cornell.ftsl` reproduces the hard-coded `buildCornell` **bit-for-bit**.
 > Phase 2a is also done: the `scene { units … }` length unit
 > (meters/centimeters/millimeters/inches/feet) is scaled to internal metres at
 > load time, so a scene authored in any unit renders identically. Phase 2c is
 > done too: `rgb r g b` now upsamples through a **Jakob-Hanika 2019** sigmoid
 > fit (`src/upsample.h`) that round-trips linear sRGB under D65 to <1e-3 for
-> unsaturated colours (validated by `ftrace -checkupsample`). The
-> still-unimplemented pieces (configurable spectral *range*, multiple lights,
-> layered materials, multi-camera/paths, textures/UVs, extra
+> unsaturated colours (validated by `ftrace -checkupsample`). Phase 2b is done:
+> the engine now supports **multiple emitters** (any number of `light` blocks)
+> with a power-weighted selection CDF in the forward tracer (CPU + CUDA) and an
+> emitter-summing backward reference; validated by `scenes/twolight.ftsl` under
+> mode V. The still-unimplemented pieces (configurable spectral *range*, absolute
+> light power/units, layered materials, multi-camera/paths, textures/UVs, extra
 > light shapes) remain tagged **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -295,10 +298,19 @@ mesh { file "teapot.obj" material brushed
 
 ## 5. Lights
 
-The scene has **one emitter today** — a rectangular area light with a spectral
-power distribution, or a collimated beam (prism/grating demos). The
-`Scene` fields are `lightOrigin/U/V/normal`, `lightArea`, `lightSpd`
-(an `EmissionSampler` CDF), `lightEmitIntegral`, and `collimated`/`beamDir`.
+The scene supports **any number of emitters** (Phase 2b). Each `light` block adds
+one `Emitter` (`src/scene.h`): a rectangular area light with a spectral power
+distribution, or a collimated beam (prism/grating demos). `Scene::emitters` holds
+the list; `finalizeEmitters()` computes each emitter's `power = emitIntegral *
+area * PI`, a power-weighted selection CDF (`emitterCdf`/`totalPower`), and a
+combined wavelength sampler (`emitSampler`) for the backward reference. The
+forward tracer selects one emitter per photon proportional to power (so every
+photon carries `beta = totalPower`, keeping the estimator unbiased); a single
+emitter draws no selection randomness, so single-light scenes render
+bit-identically to the pre-multi-light engine. The backward reference sums
+next-event estimation over all emitters. Multiple lights are validated by
+`scenes/twolight.ftsl` (mode V: forward agrees with backward, energy conserves,
+CPU==GPU).
 
 ```
 light area {
@@ -331,14 +343,13 @@ All resolve through the existing `-light` presets (`src/lights.h`,
 Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 `spd table { … }`).
 
-### 5.2 Open design points for lights **[needs engine work]**
+### 5.2 Open design points for lights
 
-- **Multiple / typed lights.** The engine currently supports exactly one area
-  light (photon emission samples one quad). Supporting `light` blocks *plural*
-  requires: a list of emitters + a light-selection CDF (pick which light to emit
-  from, weighted by power) in the photon spawn path. The format already allows
-  multiple `light` blocks; the engine must catch up.
-- **Absolute power / units.** Today emission is normalized by the SPD integral
+- **Multiple / typed lights.** **[done — Phase 2b]** Any number of `light` blocks
+  accumulate; the forward tracer uses a power-weighted selection CDF in the photon
+  spawn path (CPU and CUDA), and the backward reference sums NEE over all emitters.
+  Typed shapes (sphere/spot/env) are still future — see below.
+- **Absolute power / units.** **[needs engine work]** Today emission is normalized by the SPD integral
   and the light area — good enough for relative imagery, but there is no
   radiometric "this bulb is 800 lumens / 10 W". A `power <watts>` (radiant) or
   `luminous <lm>` key is the place to add physically-absolute output. Until the
@@ -704,7 +715,7 @@ designed to grow into.
 
 **Phase 2 — near-term engine features the format already anticipates**
 6. `units` scaling + configurable `spectral` range.
-7. Multiple lights (emitter list + power-weighted selection CDF).
+7. Multiple lights (emitter list + power-weighted selection CDF). **[done — Phase 2b; `scenes/twolight.ftsl`]**
 8. RGB→reflectance upsampler (unlocks `rgb` spectra and later textures). **[done — `src/upsample.h`, Jakob-Hanika sigmoid fit, `-checkupsample`]**
 9. `mix`/layered materials (generalize `halfmirror`).
 

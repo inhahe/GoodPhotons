@@ -14,7 +14,7 @@
 //   triangle { v0 x y z  v1 x y z  v2 x y z  material name }
 //   mesh "name" { file "p.obj"  material name  translate x y z  rotate x y z  scale x y z }
 //   light area       { origin ...  u ...  v ...  normal ...  spd <spectrum-expr> }
-//   light collimated { dir x y z  spd <spectrum-expr> }
+//   light collimated { dir x y z  spd <spectrum-expr> }   # repeatable: N emitters
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
 //                   film { res W H } }
@@ -296,17 +296,16 @@ public:
         }
         if (!haveLight) { fail("scene has no 'light' block"); return false; }
 
+        // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
+        // built in addLight; finalizeEmitters computes powers, the selection CDF,
+        // and the combined backward wavelength sampler).
         L.scene.build();
-        // Emission CDF for the area/collimated light set above.
-        L.scene.lightSpd.build(lightSpd_, binWidth_);
-        L.scene.lightEmitIntegral = L.scene.lightSpd.integral;
         return true;
     }
 
 private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
-    Spectrum lightSpd_ = constantSpectrum(1.0);
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
 
@@ -501,23 +500,20 @@ private:
     }
 
     // ---- lights ----
+    // Each `light` block registers one Emitter. Multiple light blocks accumulate;
+    // the forward tracer selects among them power-weighted and the backward
+    // reference sums over them (see scene.h / render.h / backward.h).
     bool addLight(const Block& b, Loaded& L) {
         Spectrum spd = spectrumParam(b, "spd", blackbody(6500.0));
-        lightSpd_ = spd;
         if (b.subtype == "collimated") {
             Vec3 dir{0, 0, -1}; vec3Of(b, "dir", dir);
-            L.scene.collimated = true;
-            L.scene.beamDir = normalize(dir);
-            // A thin pencil cross-section at the given origin (or a default).
+            Vec3 beam = normalize(dir);
+            // A thin pencil cross-section at the given origin (3 cm pencil).
             Vec3 o{0.5, 0.5, 0.95}; vec3Of(b, "origin", o);
-            L.scene.lightOrigin = P(o);
-            // Build a small cross-section perpendicular to the beam (3 cm pencil).
-            Vec3 t, bt; onb(L.scene.beamDir, t, bt);
+            Vec3 t, bt; onb(beam, t, bt);
             double w = Len(0.03);
-            L.scene.lightU = t * w;
-            L.scene.lightV = bt * w;
-            L.scene.lightNormal = L.scene.beamDir;
-            L.scene.lightArea = w * w;
+            L.scene.addAreaLight(P(o), t * w, bt * w, beam, w * w, spd, binWidth_,
+                                 /*collimated*/true, beam);
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so
@@ -531,11 +527,7 @@ private:
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
         L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
-        L.scene.lightOrigin = os;
-        L.scene.lightU = us;
-        L.scene.lightV = vs;
-        L.scene.lightNormal = normalize(nrm);
-        L.scene.lightArea = length(cross(us, vs));
+        L.scene.addAreaLight(os, us, vs, normalize(nrm), length(cross(us, vs)), spd, binWidth_);
         return true;
     }
 
