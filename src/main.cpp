@@ -10,11 +10,17 @@
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
-// -device cpu|gpu selects the backend. gpu runs the model-B forward light trace
-// (mode B, and the forward pass of mode V) as a CUDA megakernel on the GPU; it
-// falls back to the CPU for modes A/C/R, the mode-P camera-side layer, and
-// fluorescent scenes. Requires a CUDA toolkit at build time (see CMakeLists.txt);
-// without one the renderer is CPU-only and -device gpu warns and uses the CPU.
+// -device auto|cpu|gpu selects the backend (default auto):
+//   auto — use the GPU when a supported CUDA device is present and the render is a
+//          forward trace the GPU handles (models A/B/C on a non-fluorescent scene);
+//          otherwise use the CPU. Prints which it chose and why. Recommended.
+//   gpu  — force the GPU; warns and falls back to the CPU if it can't be used.
+//   cpu  — force the CPU (deterministic; used for reference/validation baselines).
+// The GPU runs the forward light trace (models A/B/C, and the forward pass of mode
+// V) as a CUDA megakernel; it falls back to the CPU for the backward tracer (mode R,
+// the mode-P camera-side layer) and fluorescent scenes. The CUDA backend is optional
+// at build time (see CMakeLists.txt / FTRACE_CUDA_ARCH); without a CUDA toolkit the
+// renderer is CPU-only and -device gpu/auto use the CPU.
 
 #include <cstdio>
 #include <cstdlib>
@@ -878,7 +884,7 @@ int main(int argc, char** argv) {
     bool thinFilmSwatchOnly = false;
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
-    const char* device = "cpu";   // -device cpu|gpu (GPU = CUDA model-B light tracer)
+    const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -970,21 +976,44 @@ int main(int argc, char** argv) {
     const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
     const bool forwardCatch = (mode == 'C');
 
-    // Resolve the -device request to an actual GPU-usable flag. The GPU path covers
-    // the three forward camera models A/B/C (mode B is also the forward pass of modes
-    // V/P); it falls back to the CPU for mode R (backward) and unsupported scenes.
+    // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
+    // covers the forward light trace (models A/B/C, and the forward pass of mode V);
+    // the backward tracer (mode R, the mode-P camera-side layer) and fluorescent
+    // scenes always run on the CPU. 'auto' picks the GPU only when it can actually
+    // help this render and prints the reason; 'gpu' forces it and warns on fallback.
+    const bool gpuForwardMode = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V');
+    const bool wantGpu  = !std::strcmp(device, "gpu");
+    const bool wantAuto = !std::strcmp(device, "auto");
     bool useGpu = false;
-    if (!std::strcmp(device, "gpu")) {
+    if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
+        std::fprintf(stderr, "[device] unknown -device '%s'; using CPU "
+                             "(valid: auto|cpu|gpu)\n", device);
+    if (wantGpu || wantAuto) {
 #ifdef HAVE_CUDA
-        if (!cudaAvailable())
-            std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
-        else if (!cudaForwardSupported(scene))
-            std::fprintf(stderr, "[device] scene has a GPU-unsupported material "
-                                 "(fluorescent); using CPU\n");
-        else { useGpu = true; std::printf("[device] GPU: %s\n", cudaDeviceName()); }
+        if (!cudaAvailable()) {
+            if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
+            else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
+        } else if (!gpuForwardMode) {
+            const char* why = (mode == 'R') ? "backward reference - no forward GPU pass"
+                                            : "camera-side composite - CPU-only path";
+            if (wantGpu) std::fprintf(stderr,
+                "[device] GPU can't accelerate this render: %s; using CPU\n", why);
+            else         std::printf("[device] auto -> CPU (%s)\n", why);
+        } else if (!cudaForwardSupported(scene)) {
+            if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
+                                              "material (fluorescent); using CPU\n");
+            else         std::printf("[device] auto -> CPU (fluorescent scene "
+                                     "unsupported on GPU)\n");
+        } else {
+            useGpu = true;
+            std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
+                        cudaDeviceName());
+        }
 #else
-        std::fprintf(stderr, "[device] built without CUDA; using CPU "
-                             "(reconfigure with a CUDA toolkit for -device gpu)\n");
+        if (wantGpu)
+            std::fprintf(stderr, "[device] built without CUDA; using CPU "
+                                 "(reconfigure with a CUDA toolkit for -device gpu)\n");
+        // 'auto' silently uses the CPU in a CPU-only build.
 #endif
     }
     Camera cam;
