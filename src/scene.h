@@ -7,7 +7,7 @@
 #include "spectrum.h"
 #include "scene_film.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -17,7 +17,7 @@ enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescen
 inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||
-           t == MatType::Glossy;
+           t == MatType::Glossy     || t == MatType::Grating;
 }
 
 struct Material {
@@ -39,6 +39,21 @@ struct Material {
     // refract, exactly like Dielectric (so the backward tracer handles it too).
     double filmIor = 1.30;                      // coating refractive index n1
     double filmThickness = 300.0;              // coating thickness in nanometres
+
+    // --- Diffraction grating (MatType::Grating) -----------------------------
+    // A reflective diffraction grating with groove period `grooveSpacing` (nm) and
+    // grooves running along `grooveDir` (world, projected into the surface plane).
+    // A photon of wavelength lambda is diffracted into one of the orders m in
+    // [-gratingMaxOrder, gratingMaxOrder], chosen stochastically by an idealised
+    // per-order efficiency; the outgoing direction obeys the EXACT vector grating
+    // equation  v_t = u_t + m*(lambda/grooveSpacing)*t_hat  (t_hat perpendicular to
+    // the grooves, in the surface). So the diffraction ANGLES are physically exact
+    // and wavelength-dependent (the rainbow), while the split of energy across
+    // orders is a model. m=0 is specular reflection, so with diffraction disabled
+    // the grating is a plain mirror. `reflect` is the overall grating reflectivity.
+    double grooveSpacing = 1000.0;             // groove period d in nanometres
+    Vec3   grooveDir = {1.0, 0.0, 0.0};        // groove direction (world), projected to surface
+    int    gratingMaxOrder = 3;                // highest |m| diffraction order considered
 
     // --- Fluorescence (MatType::Fluorescent) --------------------------------
     // A photon at lambda excites the dye with probability fluoAbsorb(lambda); the

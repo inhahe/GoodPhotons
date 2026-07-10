@@ -38,6 +38,7 @@
 
 struct BackwardRenderer {
     int maxBounce = 32;
+    bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
 
     // Next-event estimation: connect a surface vertex to a uniformly-sampled
     // point on the area light. Returns the spectral-weighted radiance estimate.
@@ -94,6 +95,7 @@ struct BackwardRenderer {
         double L = 0.0, thr = 1.0;
         bool specularArrival = true;   // camera ray may see the light directly
         Renderer mats;                 // shared material sampling (stateless)
+        mats.diffraction = diffraction; // grating order count follows the CLI toggle
 
         for (int b = 0; b < maxBounce; ++b) {
             Hit h = scene.closestHit(ray);
@@ -143,6 +145,18 @@ struct BackwardRenderer {
                     double r = clamp01(m.reflect(lambda));
                     if (rng.uniform() >= r) return L;      // RR absorb
                     ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                    specularArrival = true;
+                    break;
+                }
+                case MatType::Grating: {
+                    // The grating equation is reciprocal, so backward tracing reuses
+                    // the same diffraction (m <-> -m symmetric). Specular per order.
+                    double r = clamp01(m.reflect(lambda));
+                    if (rng.uniform() >= r) return L;      // RR absorb
+                    bool absorbedG;
+                    Ray nr = mats.gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
+                    if (absorbedG) return L;
+                    ray = nr;
                     specularArrival = true;
                     break;
                 }

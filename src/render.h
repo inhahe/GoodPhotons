@@ -151,6 +151,8 @@ struct Renderer {
                                  // terminates paths well before this.
     bool forwardCatch = false;   // model A perspective: catch photons at the aperture,
                                  // no connect/splat (photons must physically fly in).
+    bool diffraction = true;     // when false, MatType::Grating collapses to its m=0
+                                 // (specular) order — a plain mirror (CLI -diffraction).
 
     // Model A: map a contact-sensor hit to a pixel and deposit.
     void deposit(const Sensor& s, Film& film, const Vec3& p, double lambda, double beta) const {
@@ -304,6 +306,19 @@ struct Renderer {
                     ray = Ray{h.p + h.n * 1e-6, o};
                     continue;
                 }
+                case MatType::Grating: {
+                    // Diffraction grating: RR on the overall reflectivity, then
+                    // deflect into one stochastically-chosen order (exact grating
+                    // equation). Specular per order -> no camera connect (mode P /
+                    // the caustic on diffuse walls makes it visible).
+                    double r = clamp01(m.reflect(lambda));
+                    if (rng.uniform() >= r) { e.absorbed += beta; return; }
+                    bool absorbedG;
+                    Ray nr = gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
+                    if (absorbedG) { e.absorbed += beta; return; }
+                    ray = nr;
+                    continue;                       // beta unchanged on the chosen order
+                }
                 case MatType::HalfMirror: {
                     double r = clamp01(m.reflect(lambda)); // reflect probability
                     if (rng.uniform() < r) {
@@ -419,5 +434,45 @@ struct Renderer {
         }
         outDir = normalize(outDir);
         return Ray{h.p + outDir * 1e-6, outDir};
+    }
+
+    // Reflective diffraction grating. The exact vector grating equation preserves
+    // the tangential direction component along the grooves and shifts it by
+    // m*(lambda/d) along the in-surface dispersion axis t_hat (perpendicular to the
+    // grooves): v_t = u_t + m*(lambda/d)*t_hat, v_n = +sqrt(1-|v_t|^2) on the
+    // incidence side (reflection). One order m is drawn stochastically among the
+    // propagating orders (|v_t| < 1) with an idealised efficiency ~1/(1+|m|);
+    // evanescent orders are excluded and the remaining weights renormalised, so the
+    // reflected fraction is lossless (analog MC, beta unchanged). m=0 is specular.
+    // The equation is reciprocal (m <-> -m), so the backward tracer reuses it.
+    // Sets `absorbed` if no order propagates (degenerate grazing case).
+    Ray gratingDiffract(const Material& m, const Hit& h, const Vec3& din,
+                        double lambda, Pcg32& rng, bool& absorbed) const {
+        absorbed = false;
+        Vec3 nl = dot(din, h.ng) < 0.0 ? h.ng : -h.ng;      // incidence-side normal
+        // Groove direction projected into the surface; dispersion axis perpendicular.
+        Vec3 g = m.grooveDir - nl * dot(m.grooveDir, nl);
+        if (dot(g, g) < 1e-12)
+            g = std::fabs(nl.x) < 0.9 ? cross(nl, Vec3{1, 0, 0}) : cross(nl, Vec3{0, 1, 0});
+        g = normalize(g);
+        Vec3 t = normalize(cross(nl, g));                   // in-surface dispersion axis
+        Vec3 ut = din - nl * dot(din, nl);                  // tangential incident component
+
+        int M = diffraction ? std::max(0, std::min(m.gratingMaxOrder, 32)) : 0;
+        double lod = lambda / m.grooveSpacing;              // lambda / d (dimensionless)
+        int   ord[65]; double wgt[65]; int cnt = 0; double wsum = 0.0;
+        for (int mm = -M; mm <= M; ++mm) {
+            Vec3 a = ut + t * ((double)mm * lod);
+            if (dot(a, a) >= 1.0) continue;                 // evanescent -> excluded
+            double w = 1.0 / (1.0 + std::abs(mm));          // idealised efficiency
+            ord[cnt] = mm; wgt[cnt] = w; wsum += w; ++cnt;
+        }
+        if (cnt == 0 || wsum <= 0.0) { absorbed = true; return Ray{}; }
+        double xi = rng.uniform() * wsum, acc = 0.0; int pick = ord[cnt - 1];
+        for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+        Vec3 a = ut + t * ((double)pick * lod);
+        Vec3 v = a + nl * std::sqrt(std::max(0.0, 1.0 - dot(a, a)));
+        v = normalize(v);
+        return Ray{h.p + nl * 1e-6, v};
     }
 };

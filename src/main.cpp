@@ -88,6 +88,48 @@ static Scene buildPrism(int res) {
     return s;
 }
 
+// White box + reflective diffraction grating + collimated white beam -> a
+// diffracted spectrum fanned across the side walls. A collimated beam (like the
+// prism scene) is essential: under an area light every groove point is lit from
+// all directions and the orders overlap into white, so the dispersion only reads
+// cleanly for a single well-defined incidence. The beam strikes a grating patch on
+// the back wall; the 0th order retro-reflects (white) while the +/-1 orders fan in
+// +/-x by wavelength, painting symmetric rainbows on the left and right walls.
+static Scene buildGrating(int res, bool diffraction) {
+    (void)res;
+    Scene s;
+    Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
+    Material grating; grating.type = MatType::Grating;
+    grating.reflect = constantSpectrum(0.95);   // overall reflectivity
+    grating.grooveSpacing = 1000.0;             // 1 um period -> strong visible spread
+    grating.grooveDir = {0, 1, 0};              // vertical grooves -> horizontal dispersion (x)
+    grating.gratingMaxOrder = 3;
+    (void)diffraction;                          // toggled on the Renderer, not the material
+    s.mats.push_back(grating);                                                           // 1
+
+    addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);   // floor
+    addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);   // ceiling
+    addQuad(s, {0,0,0},{0,1,0},{1,1,0},{1,0,0}, 0);   // back (plain white border)
+    addQuad(s, {0,0,0},{0,0,1},{0,1,1},{0,1,0}, 0);   // left
+    addQuad(s, {1,0,0},{1,1,0},{1,1,1},{1,0,1}, 0);   // right
+    // Grating patch on the back wall (z ~ 0), facing into the room (+z). Sits just
+    // in front of the wall so it is the first surface the beam meets.
+    addQuad(s, {0.3,0.3,0.002},{0.7,0.3,0.002},{0.7,0.7,0.002},{0.3,0.7,0.002}, 1);
+    s.finalizeTris();
+
+    // Collimated white beam entering from the front, travelling -z into the grating.
+    s.collimated = true;
+    s.beamDir = {0, 0, -1};
+    s.lightOrigin = {0.485, 0.485, 0.95};
+    s.lightU = {0.03, 0, 0};      // thin pencil cross-section
+    s.lightV = {0, 0.03, 0};
+    s.lightNormal = {0, 0, -1};
+    s.lightArea = 0.03 * 0.03;
+    s.lightSpd.build(constantSpectrum(1.0), 1.0); // equal-energy -> even rainbow
+    s.lightEmitIntegral = s.lightSpd.integral;
+    return s;
+}
+
 // mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
 static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
                           const char* meshPath = nullptr, double meshScale = 1.0,
@@ -468,6 +510,86 @@ static int checkThinFilm() {
     return pass ? 0 : 1;
 }
 
+// Deterministic diffraction-grating self-test. Validates that gratingDiffract
+// obeys the exact vector grating equation, conserves the propagating-order set,
+// reduces to specular reflection at m=0 (and with diffraction disabled), and is
+// reciprocal. No scene / rendering needed — it probes the material sampler directly.
+static int checkGrating() {
+    Renderer r;
+    Material m; m.type = MatType::Grating; m.reflect = constantSpectrum(1.0);
+    m.grooveSpacing = 1000.0; m.grooveDir = {1, 0, 0}; m.gratingMaxOrder = 3;
+
+    // Flat grating with normal +y at the origin; a downward-and-forward incident ray.
+    Hit h; h.valid = true; h.p = {0, 0, 0}; h.ng = {0, 1, 0}; h.n = {0, 1, 0}; h.matId = 0;
+    Vec3 din = normalize(Vec3{0.30, -0.80, 0.10});
+    double lambda = 550.0;
+    Pcg32 rng; rng.seed(42u, 7u);
+
+    // Reconstruct the surface frame exactly as gratingDiffract does, to recover m.
+    Vec3 nl = {0, 1, 0};
+    Vec3 g  = normalize(Vec3{1, 0, 0});
+    Vec3 t  = normalize(cross(nl, g));
+    Vec3 ut = din - nl * dot(din, nl);
+    double lod = lambda / m.grooveSpacing;
+
+    // (a) diffraction OFF collapses to specular reflection (m=0 only).
+    r.diffraction = false;
+    bool ab; Ray r0 = r.gratingDiffract(m, h, din, lambda, rng, ab);
+    Vec3 spec = normalize(reflect(din, nl));
+    bool passA = !ab && length(r0.d - spec) < 1e-9;
+
+    // Expected propagating-order set: |ut + m*(lambda/d)*t| < 1.
+    bool expSeen[7] = {false};
+    for (int mi = -3; mi <= 3; ++mi) { Vec3 a = ut + t * (mi * lod); if (dot(a, a) < 1.0) expSeen[mi + 3] = true; }
+
+    // (b) every sampled order obeys the grating equation (integer m in range, unit
+    //     outgoing vector on the incidence side); (c) exactly the propagating set is
+    //     produced (coverage, and no evanescent order ever appears).
+    r.diffraction = true;
+    bool orderSeen[7] = {false};
+    bool eqOK = true, unitOK = true, sideOK = true;
+    const int Ns = 300000;
+    for (int i = 0; i < Ns; ++i) {
+        bool a2; Ray v = r.gratingDiffract(m, h, din, lambda, rng, a2);
+        if (a2) continue;
+        Vec3 vt = v.d - nl * dot(v.d, nl);
+        double mrec = dot(vt - ut, t) / lod;
+        int mi = (int)std::lround(mrec);
+        if (std::fabs(mrec - (double)mi) > 1e-6) eqOK = false;
+        if (mi < -3 || mi > 3) { eqOK = false; continue; }
+        orderSeen[mi + 3] = true;
+        if (std::fabs(length(v.d) - 1.0) > 1e-9) unitOK = false;
+        if (dot(v.d, nl) <= 0.0) sideOK = false;
+    }
+    bool passB = eqOK && unitOK && sideOK;
+    bool passC = true;
+    for (int k = 0; k < 7; ++k) if (orderSeen[k] != expSeen[k]) passC = false;
+
+    // (d) reciprocity: reversing the m=+1 outgoing ray reproduces the incident
+    //     direction via the SAME order (the equation's difference term is sign-stable
+    //     under direction reversal, so u<->v swap uses m, not -m).
+    bool passD = true;
+    Vec3 a1 = ut + t * lod;
+    if (dot(a1, a1) < 1.0) {
+        Vec3 v1  = normalize(a1 + nl * std::sqrt(1.0 - dot(a1, a1)));
+        Vec3 rin = -v1;
+        Vec3 rut = rin - nl * dot(rin, nl);
+        Vec3 ra  = rut + t * lod;
+        Vec3 rv  = normalize(ra + nl * std::sqrt(std::max(0.0, 1.0 - dot(ra, ra))));
+        passD = length(rv - (-din)) < 1e-9;
+    }
+
+    bool pass = passA && passB && passC && passD;
+    int nExp = 0; for (int k = 0; k < 7; ++k) nExp += expSeen[k];
+    std::printf("[checkgrating] diffraction-off = specular reflection  (%s)\n", passA ? "ok" : "BAD");
+    std::printf("[checkgrating] grating equation (integer orders, unit dirs)  (%s)\n", passB ? "ok" : "BAD");
+    std::printf("[checkgrating] propagating orders produced=%d expected=%d  (%s)\n",
+                [&]{int c=0;for(int k=0;k<7;++k)c+=orderSeen[k];return c;}(), nExp, passC ? "ok" : "BAD");
+    std::printf("[checkgrating] reciprocity (reverse ray -> incident)  (%s)\n", passD ? "ok" : "BAD");
+    std::printf("[checkgrating] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 static void writePPM(const char* path, const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
@@ -531,13 +653,14 @@ static void thinFilmSwatch(double n1, double n2) {
 // report across threads. Factored out so mode V can reuse it alongside the
 // backward reference.
 static Film renderForward(const Scene& scene, const Camera* cam, int res, long long N,
-                          int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut) {
+                          int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut,
+                          bool diffraction = true) {
     std::vector<Film> films(nThreads);
     std::vector<EnergyReport> reports(nThreads);
     for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
 
     auto worker = [&](int tid) {
-        Renderer r; r.forwardCatch = forwardCatch;
+        Renderer r; r.forwardCatch = forwardCatch; r.diffraction = diffraction;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         Film* sensorFilm = useCamera ? nullptr : &films[tid];
@@ -562,10 +685,10 @@ static Film renderForward(const Scene& scene, const Camera* cam, int res, long l
 // Backward reference: `spp` samples per pixel, threads render disjoint row bands
 // of a shared film (no shared-pixel writes, so no race).
 static Film renderBackward(const Scene& scene, const Camera& cam, int res,
-                           long long spp, int nThreads) {
+                           long long spp, int nThreads, bool diffraction = true) {
     Film out; out.resX = res; out.resY = res; out.alloc();
     auto worker = [&](int tid) {
-        BackwardRenderer br;
+        BackwardRenderer br; br.diffraction = diffraction;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7, 0xD1B54A32D192ED03ULL ^ (uint64_t)tid);
         int y0 = res * tid / nThreads, y1 = res * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, rng);
@@ -599,11 +722,11 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int res,
 // same caveat as modes R/V. Classification uses the pixel-centre camera ray, so
 // silhouette pixels are assigned wholesale to one side (a sub-pixel edge approx).
 static Film renderComposite(const Scene& scene, const Camera& cam, int res,
-                            long long N, long long spp, int nThreads) {
+                            long long N, long long spp, int nThreads, bool diffraction = true) {
     EnergyReport e;
     Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                             /*forwardCatch*/false, /*useCamera*/true, e);
-    Film ref = renderBackward(scene, cam, res, spp, nThreads);
+                             /*forwardCatch*/false, /*useCamera*/true, e, diffraction);
+    Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
 
     // Classify each pixel by its first camera-ray hit. specular-side pixels take
@@ -731,6 +854,8 @@ int main(int argc, char** argv) {
     double filmIor = 1.30;        // thin-film coating refractive index
     bool checkThinFilmOnly = false;
     bool thinFilmSwatchOnly = false;
+    bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
+    bool checkGratingOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) res = std::atoi(argv[++i]);
@@ -757,6 +882,12 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-filmior") && i + 1 < argc) filmIor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkthinfilm")) checkThinFilmOnly = true;
         else if (!std::strcmp(argv[i], "-thinfilmswatch")) thinFilmSwatchOnly = true;
+        else if (!std::strcmp(argv[i], "-diffraction") && i + 1 < argc) {
+            const char* v = argv[++i];
+            diffraction = !(std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0);
+        }
+        else if (!std::strcmp(argv[i], "-nodiffraction")) diffraction = false;
+        else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
     }
     if (nThreads < 1) nThreads = 1;
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
@@ -764,10 +895,12 @@ int main(int argc, char** argv) {
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
+    if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");
     bool iridescent = !std::strcmp(sceneName, "iridescent");
+    bool grating    = !std::strcmp(sceneName, "grating");
 
     selfTestColor();
 
@@ -776,6 +909,7 @@ int main(int argc, char** argv) {
     // the comparison — use a diffuse sphere when no mesh is supplied.
     const bool refMode = (mode == 'R' || mode == 'V');
     Scene scene = prism     ? buildPrism(res)
+                : grating   ? buildGrating(res, diffraction)
                 : materials ? buildMaterials(res, resolveLight(lightName))
                             : buildCornell(res, mode, resolveLight(lightName),
                                            fluoro ? nullptr : meshPath, meshScale,
@@ -823,14 +957,14 @@ int main(int argc, char** argv) {
     if (refMode) {
         std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
                     mode, spp, res, res, nThreads, lightName);
-        Film ref = renderBackward(scene, cam, res, spp, nThreads);
+        Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
         if (mode == 'R') { writePPM(out, ref, (double)spp); return 0; }
 
         // mode V: also run the forward light tracer (model B) and compare.
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
         Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                                 /*forwardCatch*/false, /*useCamera*/true, e);
+                                 /*forwardCatch*/false, /*useCamera*/true, e, diffraction);
         double tot = e.absorbed + e.sensor + e.escaped + e.residual;
         std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                     e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
@@ -846,16 +980,16 @@ int main(int argc, char** argv) {
         std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, res, nThreads, lightName);
-        Film comp = renderComposite(scene, cam, res, N, spp, nThreads);
+        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction);
         writePPM(out, comp, 1.0);
         return 0;
     }
 
     std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
-                mode, N, res, res, nThreads, prism ? "beam" : lightName);
+                mode, N, res, res, nThreads, (prism || grating) ? "beam" : lightName);
 
     EnergyReport e;
-    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e);
+    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction);
 
     double tot = e.absorbed + e.sensor + e.escaped + e.residual;
     std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
