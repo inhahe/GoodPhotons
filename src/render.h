@@ -103,12 +103,14 @@ inline Vec3 sampleHG(const Vec3& wi, double g, Pcg32& rng) {
 // fraction is 1-R, so the film is lossless. cosI is cos of the incidence angle in
 // n0; d and lambda must share units (nanometres here).
 //
-// STAGE 1 (iridescence) uses the two-beam (first-order) interference of the two
-// front reflections, polarisation-averaged. This reproduces the colour shift
-// correctly. The exact Airy multiple-beam summation is a drop-in refinement (the
-// thin-film-interference milestone): divide each per-polarisation reflectance by
-// (1 + r01^2 r12^2 + 2 r01 r12 cos phi), which sharpens the higher-order fringes
-// and keeps R physically bounded without clamping.
+// This is the exact Airy multiple-beam reflectance for a lossless single film:
+// the full geometric sum over every internal round trip between the two
+// interfaces, evaluated per polarisation (s and p) and averaged. It is correct at
+// every thickness and angle and is naturally bounded in [0,1]. (The earlier
+// two-beam form kept only the first two reflected beams; the Airy denominator
+// below restores the higher-order beams, sharpening the fringes.) A metallic or
+// absorbing substrate would use a complex n2 in the r12 Fresnel terms; here n2 is
+// a real dielectric index.
 inline double thinFilmReflectance(double n0, double n1, double n2, double d,
                                   double cosI, double lambda) {
     cosI = clamp01(std::fabs(cosI));
@@ -133,10 +135,13 @@ inline double thinFilmReflectance(double n0, double n1, double n2, double d,
     double r12p = tir ? 1.0 : rP(n1, cos1, n2, cos2);
     double phi  = (4.0 * PI * n1 * d * cos1) / lambda;   // interference phase
     double cphi = std::cos(phi);
-    // Two-beam interference reflectance per polarisation (STAGE 1). STAGE 2 will
-    // divide by (1 + r01*r01*r12*r12 + 2*r01*r12*cphi) for the exact Airy result.
+    // Exact Airy multiple-beam power reflectance per polarisation: the geometric
+    // sum over all internal round trips. num is the two-beam result; the den term
+    // adds the higher-order beams and keeps R in [0,1] without clamping.
     auto Rpol = [&](double r01, double r12) {
-        return clamp01(r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * cphi);
+        double num = r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * cphi;
+        double den = 1.0 + r01 * r01 * r12 * r12 + 2.0 * r01 * r12 * cphi;
+        return clamp01(den > 1e-12 ? num / den : num);
     };
     return 0.5 * (Rpol(r01s, r12s) + Rpol(r01p, r12p));
 }

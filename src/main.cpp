@@ -425,10 +425,15 @@ static int checkThinFilm() {
         }
     bool passA = inRange;
 
-    // (b) normal incidence matches the closed-form two-beam reflectance.
+    // (b) normal incidence matches the closed-form Airy (multiple-beam)
+    //     reflectance R = (r01^2+r12^2+2 r01 r12 cos phi) /
+    //                     (1+r01^2 r12^2+2 r01 r12 cos phi).
     double r01 = (n0 - n1) / (n0 + n1), r12 = (n1 - n2) / (n1 + n2);
     double lam0 = 550.0, phi0 = 4.0 * PI * n1 * d / lam0;
-    double Ranalytic = clamp01(r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * std::cos(phi0));
+    double cphi0 = std::cos(phi0);
+    double num0 = r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * cphi0;
+    double den0 = 1.0 + r01 * r01 * r12 * r12 + 2.0 * r01 * r12 * cphi0;
+    double Ranalytic = clamp01(num0 / den0);
     double Rcode = thinFilmReflectance(n0, n1, n2, d, 1.0, lam0);
     bool passB = std::fabs(Ranalytic - Rcode) < 1e-9;
 
