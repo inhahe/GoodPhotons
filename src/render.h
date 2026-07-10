@@ -1,9 +1,18 @@
-// Forward photon tracing: emit from the light, bounce diffusely, deposit on the
-// contact sensor (camera model A, no lens). Deterministic energy bookkeeping
-// (no Russian roulette yet) so we can verify conservation.
+// Forward photon tracing.
+//   Model A: photon physically lands on a contact sensor -> deposit, terminate.
+//   Model B: at every surface vertex, connect to the camera pinhole and splat.
+// Both can share a scene; typically A uses a sensor wall, B leaves it open.
+//
+// Energy bookkeeping (absorbed/escaped/residual) tracks the PHOTON's own energy
+// only. Model-B splats are side-channel measurements and are intentionally NOT
+// counted as energy sinks, so the conservation test stays valid in both modes.
 #pragma once
 #include <cstdint>
+#include <algorithm>
 #include "scene.h"
+#include "camera.h"
+
+constexpr double PI = 3.141592653589793;
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -13,20 +22,42 @@ struct Renderer {
     int maxBounce = 32;
     double betaCutoff = 1e-6;
 
-    // Map a sensor-plane hit point to a pixel; deposit XYZ contribution.
-    void deposit(Sensor& s, const Vec3& p, double lambda, double beta) const {
+    // Model A: map a contact-sensor hit to a pixel and deposit.
+    void deposit(const Sensor& s, Film& film, const Vec3& p, double lambda, double beta) const {
         Vec3 rel = p - s.origin;
         double uu = dot(rel, s.uAxis) / dot(s.uAxis, s.uAxis);
         double vv = dot(rel, s.vAxis) / dot(s.vAxis, s.vAxis);
         if (uu < 0 || uu >= 1 || vv < 0 || vv >= 1) return;
-        int px = (int)(uu * s.resX), py = (int)(vv * s.resY);
-        size_t idx = (size_t)py * s.resX + px;
-        s.xyz[idx] += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta;
-        s.hits[idx] += 1.0;
+        int px = (int)(uu * film.resX), py = (int)(vv * film.resY);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
     }
 
-    // Trace a single photon. Accumulates into scene.sensor and the energy report.
-    void tracePhoton(Scene& scene, Pcg32& rng, EnergyReport& e) const {
+    // Model B: connect a surface vertex to the pinhole and splat onto the film.
+    // f = rho/pi (Lambertian). Contribution = beta * f * G * We, with
+    //   G  = cosSurf * cosCam / dist^2   (geometry term)
+    //   We = 1 / (A * cosCam^4)          (pinhole importance, A = image-plane area)
+    void connect(const Scene& scene, const Camera& cam, Film& film,
+                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho) const {
+        Vec3 toCam = cam.eye - p;
+        double dist = length(toCam);
+        Vec3 wdir = toCam / dist;
+        double cosSurf = dot(n, wdir);
+        if (cosSurf <= 0) return;                       // camera behind surface
+        int px, py; double cosCam, dist2;
+        if (!cam.project(p, px, py, cosCam, dist2)) return;
+        if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
+
+        double f = rho / PI;
+        double G = cosSurf * cosCam / dist2;
+        double We = 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam * cosCam);
+        double contrib = beta * f * G * We;
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Trace a single photon. sensorFilm (model A) and/or cam+camFilm (model B)
+    // may be null; the caller supplies per-thread films for parallel runs.
+    void tracePhoton(const Scene& scene, const Camera* cam, Film* sensorFilm,
+                     Film* camFilm, Pcg32& rng, EnergyReport& e) const {
         // --- Emission ---
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 origin = scene.lightOrigin + scene.lightU * u1 + scene.lightV * u2;
@@ -34,36 +65,35 @@ struct Renderer {
         double pdfL = 0.0;
         double lambda = scene.lightSpd.sample(rng, pdfL);
         if (pdfL <= 0) return;
-        // Photon weight so the ensemble reconstructs emitted flux:
-        //   w = Le(lambda) * A * pi / p(lambda).
-        // We importance-sample p(lambda) = Le(lambda)/integral, so Le/p = integral,
-        // giving a constant weight independent of the sampled wavelength.
-        double beta = scene.lightEmitIntegral * scene.lightArea * 3.141592653589793;
+        // Constant weight because we importance-sample p(lambda)=Le/integral.
+        double beta = scene.lightEmitIntegral * scene.lightArea * PI;
         e.emitted += beta;
 
         Ray ray{origin + dir * 1e-6, dir};
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             Hit h = scene.closestHit(ray);
-            if (h.tri < 0) { e.escaped += beta; return; } // left the scene
+            if (h.tri < 0) { e.escaped += beta; return; }
 
             const Tri& tri = scene.tris[h.tri];
             if (tri.sensorId >= 0) {
-                deposit(scene.sensor, h.p, lambda, beta);
+                if (sensorFilm) deposit(scene.sensor, *sensorFilm, h.p, lambda, beta);
                 e.sensor += beta;
                 return;
             }
 
             double rho = scene.mats[tri.matId].reflect(lambda);
             rho = std::min(std::max(rho, 0.0), 1.0);
-            e.absorbed += beta * (1.0 - rho);   // absorbed fraction stays here
+
+            if (cam && camFilm) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
+
+            e.absorbed += beta * (1.0 - rho);
             beta *= rho;
-            if (beta < betaCutoff) { return; }
+            if (beta < betaCutoff) return;
 
             Vec3 ns = h.n;
-            Vec3 newDir = cosineHemisphere(ns, rng);
-            ray = Ray{h.p + ns * 1e-6, newDir};
+            ray = Ray{h.p + ns * 1e-6, cosineHemisphere(ns, rng)};
         }
-        e.residual += beta; // hit bounce cap still carrying energy
+        e.residual += beta;
     }
 };

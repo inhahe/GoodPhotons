@@ -3,6 +3,7 @@
 #include <vector>
 #include "geometry.h"
 #include "spectrum.h"
+#include "scene_film.h"
 
 struct Material {
     Spectrum reflect = constantSpectrum(0.5); // diffuse albedo vs lambda
@@ -10,13 +11,11 @@ struct Material {
     bool isLight = false;
 };
 
-// A flat rectangular sensor spanning origin + s*uAxis + t*vAxis, s,t in [0,1].
+// A flat rectangular contact sensor (model A) spanning origin + s*uAxis + t*vAxis.
 struct Sensor {
     Vec3 origin, uAxis, vAxis; // uAxis/vAxis are full edge vectors
-    int resX = 256, resY = 256;
-    std::vector<Vec3> xyz;     // accumulated XYZ per pixel
-    std::vector<double> hits;  // photon hits per pixel (diagnostics)
-    void alloc() { xyz.assign((size_t)resX * resY, {}); hits.assign((size_t)resX * resY, 0.0); }
+    Film film;
+    void alloc() { film.alloc(); }
 };
 
 struct Scene {
@@ -37,5 +36,15 @@ struct Scene {
         for (int i = 0; i < (int)tris.size(); ++i)
             if (intersectTri(r, tris[i], tmin, h)) h.tri = i;
         return h;
+    }
+
+    // Is anything blocking the segment from o toward dir, before maxDist?
+    // Used by model-B camera connections (shadow ray to the pinhole).
+    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+        Ray r{o, dir};
+        Hit h; h.t = maxDist - tmin;
+        for (int i = 0; i < (int)tris.size(); ++i)
+            if (intersectTri(r, tris[i], tmin, h)) return true;
+        return false;
     }
 };
