@@ -1,0 +1,19 @@
+# Build output
+/build/
+/out/
+*.ppm
+*.exr
+*.png
+
+# Checkpoints / render state
+*.ckpt
+/renders/
+
+# Editor / IDE
+.vs/
+.vscode/
+*.user
+
+# OS
+Thumbs.db
+Desktop.ini
