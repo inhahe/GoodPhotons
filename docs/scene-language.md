@@ -23,9 +23,11 @@
 > the forward tracer, backward reference, and CUDA kernel; validated by
 > `scenes/mixmat.ftsl` under mode V. Phase 3a (partial) is done: any number of named
 > `camera` blocks render one image each (per-camera film resolution + mode), with
-> `-camera <name>` selection, validated by `scenes/twocam.ftsl`. The still-unimplemented
+> `-camera <name>` selection, validated by `scenes/twocam.ftsl`; and a `camera_path`
+> block expands into keyframe-interpolated frame cameras (`scenes/dolly.ftsl`).
+> The still-unimplemented
 > pieces (configurable spectral *range*, absolute light power/units, the full physical
-> `layered` material, the shared multi-camera mode-B pass + `camera_path` + physical
+> `layered` material, the shared multi-camera mode-B pass + physical
 > film size/f-stop/ISO, textures/UVs, extra light shapes) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
@@ -543,24 +545,39 @@ as **independent forward passes** today, each re-tracing the photon set. The spe
 "same render for efficiency" — a *single shared mode-B photon pass* that connects
 every diffuse bounce to all cameras' pupils at once — is a natural future extension
 of `connect()` (photons are camera-independent until the splat) and is logged in
-known-issues. `camera_path` (below) is also **[needs engine work]**.
+known-issues.
 
-A `camera_path` for motion:
+A `camera_path` for motion **[done — Phase 3a; `scenes/dolly.ftsl`]**:
 
 ```
-# PROPOSED (not yet supported):
 camera_path "dolly" {
-    look_at 0 1 0   up 0 1 0   fov_y 40   mode B
-    key t=0.0  eye 0 1 4
-    key t=0.5  eye 2 1 3
-    key t=1.0  eye 3 1 0
-    frames 60
+    look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film   { res 128 128 }
+    frames 5
+    key 0.0   0.5 0.5 2.0            # key <t> <ex> <ey> <ez>
+    key 1.0   0.5 0.5 3.6            #   optional trailing <lx> <ly> <lz> per-key look_at
 }
 ```
 
-The engine would need per-camera films and, for a shared photon pass, connect
-each diffuse bounce to *every* camera's pupil (mode B) — a natural extension of
-the existing `connect()` since photons are camera-independent until the splat.
+A `camera_path` block expands, at load time, into `frames` ordinary named cameras
+(`dolly0`, `dolly1`, … — the base name plus a zero-padded index), each an
+independent forward pass just like a hand-written `camera` block. The `key`
+statements give sampled `(t, eye)` control points (with an optional per-key
+`look_at`); `t` is an arbitrary monotonic parameter (the keys are sorted by `t`).
+For each of the `frames` output frames the parameter is stepped uniformly from the
+first key's `t` to the last, and `eye`/`look_at` are **piecewise-linearly**
+interpolated between the bracketing keys. The shared block-level `look_at`, `up`,
+`fov_y`, `mode`, `aperture`, `focus`, and `film { res }` apply to every frame.
+`-camera dolly2` selects a single frame. The grammar is deliberately *numbers-only*
+(`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`) because the FTSL statement splitter
+breaks a statement on the next bareword, so inline keywords like `eye`/`t=` inside
+a one-line `key` are not available.
+
+For a shared photon pass (a future optimization), the engine would connect each
+diffuse bounce to *every* frame/camera's pupil (mode B) in one trace — a natural
+extension of the existing `connect()` since photons are camera-independent until
+the splat.
 
 ---
 
@@ -775,7 +792,8 @@ designed to grow into.
 10. Multiple cameras / `camera_path`; per-camera films; physical film size +
     f-stop + sensitivity. **[partial — Phase 3a: multiple named cameras + `-camera`
     selection + per-camera film resolution + per-camera mode done (`scenes/twocam.ftsl`);
-    shared mode-B multi-camera pass, `camera_path`, physical film size, f-stop, ISO
+    `camera_path` keyframe interpolation done (`scenes/dolly.ftsl`);
+    shared mode-B multi-camera pass, physical film size, f-stop, ISO
     still needs engine work.]**
 11. UVs + spectral/RGB textures; per-face materials from OBJ `usemtl`.
 12. Additional light shapes (sphere/spot/HDRI environment).

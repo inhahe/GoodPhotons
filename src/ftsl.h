@@ -314,6 +314,7 @@ public:
             else if (b.type == "light")    { if (!addLight(b, L)) return false; haveLight = true; }
             else if (b.type == "medium")   { if (!addMedium(b, L)) return false; }
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
+            else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
@@ -642,6 +643,79 @@ private:
             if (cs.mode) L.mode = cs.mode;
             if (cs.res > 0) L.res = cs.res;
             L.hasCamera = true;
+        }
+        return true;
+    }
+
+    // A `camera_path` expands into a sequence of CamSpec frames sharing look_at/up/
+    // fov_y/mode/aperture/focus/film, with the eye (and optionally look_at) linearly
+    // interpolated across keyframes. Grammar (numbers only, so the parser keeps each
+    // key on one statement):
+    //   camera_path "dolly" {
+    //       look_at 0 1 0   up 0 1 0   fov_y 40   mode B   frames 60
+    //       film { res 256 256 }
+    //       key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]   # >= 2 keys, t in [0,1]
+    //       ...
+    //   }
+    // Frame i (0..frames-1) samples t = i/(frames-1); its output name is
+    // "<path><i>" (zero-padded), so the multi-camera loop writes one file per frame.
+    bool addCameraPath(const Block& b, Loaded& L) {
+        std::string base = b.name.empty() ? ("path" + std::to_string(L.cameras.size())) : b.name;
+        CamSpec shared;
+        vec3Of(b, "look_at", shared.look); vec3Of(b, "up", shared.up);
+        shared.look = P(shared.look);
+        shared.fov = dblOf(b, "fov_y", 40.0);
+        shared.aperture = Len(dblOf(b, "aperture", 0.02));
+        shared.focus = Len(dblOf(b, "focus", 0.0));
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        const Stmt* film = find(b, "film");
+        if (film && film->val.block) {
+            const Stmt* r = find(*film->val.block, "res");
+            if (r && !r->val.words.empty()) shared.res = (int)num(r->val.words[0]);
+        }
+        int frames = (int)dblOf(b, "frames", 0.0);
+        if (frames < 1) { fail("camera_path '" + base + "' needs frames >= 1"); return false; }
+
+        // Collect keyframes (t, eye, optional look_at), sorted by t.
+        struct Key { double t; Vec3 eye, look; bool hasLook; };
+        std::vector<Key> keys;
+        for (const auto& s : b.stmts) {
+            if (s.key != "key") continue;
+            const auto& w = s.val.words;
+            if (w.size() < 4) { fail("camera_path key needs: t ex ey ez [lx ly lz]"); return false; }
+            Key k;
+            k.t = num(w[0]);
+            k.eye = P(Vec3{num(w[1]), num(w[2]), num(w[3])});
+            k.hasLook = (w.size() >= 7);
+            k.look = k.hasLook ? P(Vec3{num(w[4]), num(w[5]), num(w[6])}) : shared.look;
+            keys.push_back(k);
+        }
+        if (keys.size() < 2) { fail("camera_path '" + base + "' needs >= 2 keys"); return false; }
+        std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b2){ return a.t < b2.t; });
+
+        int pad = 1; for (int f = frames - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
+        for (int i = 0; i < frames; ++i) {
+            double t = (frames == 1) ? keys.front().t : keys.front().t +
+                       (keys.back().t - keys.front().t) * ((double)i / (frames - 1));
+            // Piecewise-linear lookup of the bracketing keyframes for this t.
+            const Key* a = &keys.front(); const Key* c = &keys.back();
+            for (size_t j = 0 ; j + 1 < keys.size(); ++j)
+                if (t >= keys[j].t && t <= keys[j + 1].t) { a = &keys[j]; c = &keys[j + 1]; break; }
+            double span = c->t - a->t;
+            double f = (span > 1e-12) ? (t - a->t) / span : 0.0;
+            CamSpec cs = shared;
+            cs.eye  = a->eye  + (c->eye  - a->eye)  * f;
+            cs.look = a->look + (c->look - a->look) * f;
+            char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
+            cs.name = base + num5;
+            L.cameras.push_back(cs);
+            if (!L.hasCamera) {
+                L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
+                L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
+                if (cs.mode) L.mode = cs.mode;
+                if (cs.res > 0) L.res = cs.res;
+                L.hasCamera = true;
+            }
         }
         return true;
     }

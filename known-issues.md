@@ -24,17 +24,21 @@ as practical; this file is the fallback for what can't be addressed immediately.
   multi-camera feature (correct, just not yet shared) could land validated.
 - **Status:** OPEN (acceptable) — multi-camera done 2026-07-10; shared pass deferred.
 
-### `camera_path`, physical film size, f-stop, and ISO not implemented
-- **What:** the spec (§8.1/§8.3) proposes `camera_path` keyframed motion, a physical
-  film `size <w> <h>` (mm), f-stop authoring (`fstop N` → aperture radius via focal
-  length), and film `iso`/sensitivity. None are built; the camera still derives its
-  image plane from `fov_y` + aspect and takes an `aperture` radius directly.
+### Physical film size, f-stop, and ISO not implemented
+- **What:** the spec (§8.1/§8.3) proposes a physical film `size <w> <h>` (mm),
+  f-stop authoring (`fstop N` → aperture radius via focal length), and film
+  `iso`/sensitivity. None are built; the camera still derives its image plane from
+  `fov_y` + aspect and takes an `aperture` radius directly.
 - **Proper fix (future):** add physical focal length from film size + fov, convert
-  `fstop` → `apertureR = f/(2N)` at load time, apply `iso` as a per-camera exposure
-  scale in the film write, and expand a `camera_path` into a sequence of `CamSpec`
-  frames (the multi-camera loop in `main.cpp` already renders a list, so a path is
-  just a generated `CamSpec` list + frame-numbered output names).
+  `fstop` → `apertureR = f/(2N)` at load time, and apply `iso` as a per-camera
+  exposure scale in the film write.
 - **Status:** OPEN (design captured) — logged 2026-07-10.
+- **Done (2026-07-10, Phase 3a):** `camera_path` keyframed motion. A `camera_path`
+  block expands at load time into a sequence of `CamSpec` frames with piecewise-linear
+  `eye`/`look_at` interpolation between sorted `key` control points; the multi-camera
+  loop in `main.cpp` renders the generated list with frame-numbered output names.
+  Grammar is numbers-only (`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`). Validated by
+  `scenes/dolly.ftsl`.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

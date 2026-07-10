@@ -1,0 +1,48 @@
+# Camera-path validation scene (Phase 3a). A single diffuse Cornell box is rendered
+# from a dolly move: the camera pulls straight back while keeping the box centered.
+# One render invocation emits one image per interpolated frame:
+#
+#   ftrace -in scenes/dolly.ftsl -n 20000000     # -> out_dolly0.ppm .. out_dolly4.ppm
+#   ftrace -in scenes/dolly.ftsl -camera dolly2  # -> just the middle frame
+#
+# The camera_path expands into `frames` named cameras (dolly0..dollyN-1) whose eye and
+# look_at are piecewise-linearly interpolated between the sorted `key` frames. Each is
+# an independent forward pass, exactly like a hand-written `camera` block.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- materials (all diffuse) ----------------------------------------------
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "grey"  { type diffuse reflect rgb 0.6 0.6 0.6 }
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.30 0.4   radius 0.25   material grey }
+
+# --- ceiling area light ----------------------------------------------------
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# --- dolly: pull straight back, 5 frames ----------------------------------
+# Shared look_at keeps the box centered; only `eye` is animated by the keys.
+# Grammar is numbers-only: `key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`.
+camera_path "dolly" {
+    look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film   { res 128 128 }
+    frames 5
+    key 0.0   0.5 0.5 2.0
+    key 1.0   0.5 0.5 3.6
+}
