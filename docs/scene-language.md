@@ -9,9 +9,12 @@
 > translate+rotate+non-uniform-scale transforms), one `light` (area or
 > collimated), a `medium`, a `camera`, and a `render` block (overridable by CLI).
 > `scenes/cornell.ftsl` reproduces the hard-coded `buildCornell` **bit-for-bit**.
-> The still-unimplemented pieces (units scaling, multiple lights, RGB upsampling
-> quality, layered materials, multi-camera/paths, textures/UVs, extra light
-> shapes) remain tagged **[needs engine work]** below. Alongside them, constructs
+> Phase 2a is also done: the `scene { units … }` length unit
+> (meters/centimeters/millimeters/inches/feet) is scaled to internal metres at
+> load time, so a scene authored in any unit renders identically. The
+> still-unimplemented pieces (configurable spectral *range*, multiple lights, RGB
+> upsampling quality, layered materials, multi-camera/paths, textures/UVs, extra
+> light shapes) remain tagged **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
 >
@@ -403,17 +406,21 @@ scene {
 }
 ```
 
-`units meters | centimeters | millimeters` would scale coordinates, fog
-coefficients, and camera distances into a single internal unit (metres) at load
-time — so a scene authored in cm and one in m render identically. Wavelength /
-groove / film-thickness stay in nm regardless. This makes scale *explicit*
-without adding any per-object "scale" fudge factor. **[needs engine work]** —
-just a load-time multiply; the physics doesn't change.
+`units meters | centimeters | millimeters | inches | feet` scales coordinates,
+radii, camera distances (eye/look_at/aperture/focus), mesh transforms, light
+geometry, and fog coefficients (per-length, so divided by the factor) into a
+single internal unit (metres) at load time — so a scene authored in cm and one in
+m render identically. Wavelength / groove / film-thickness stay in nm regardless.
+This makes scale *explicit* without any per-object "scale" fudge factor.
+**[IMPLEMENTED, Phase 2a]** in `src/ftsl.h` (`Builder::L_`); validated: a
+×100 centimetre copy of `scenes/cornell.ftsl` renders bit-for-bit identical to
+the metre original.
 
-`spectral 360 830 1` mirrors the hard-coded `[360,830]` nm range and the 1 nm
-`EmissionSampler` step; exposing it lets a UV-fluorescence or IR study widen the
-band. **[needs engine work]** to thread the bounds through `color.h`/`spectrum.h`
-(currently compile-time constants).
+`spectral 360 830 1` mirrors the hard-coded `[360,830]` nm range and the
+`EmissionSampler` step. The **bin width** (third number) is applied to the
+emission sampler today; **widening the range** is still **[needs engine work]**
+(the `[360,830]` bounds are compile-time constants in `color.h`/`spectrum.h`),
+so a non-default range prints a warning and is clamped to the engine range.
 
 ---
 

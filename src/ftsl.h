@@ -240,6 +240,30 @@ public:
     std::string err;
 
     bool build(const std::vector<Block>& blocks, Loaded& L) {
+        // Pass 0: global scene settings — the length unit and spectral range. All
+        // authored lengths are scaled to the internal unit (metres) at load time,
+        // so a scene authored in cm and one in m render identically.
+        for (const auto& b : blocks) {
+            if (b.type != "scene") continue;
+            std::string u = strOf(b, "units", "meters");
+            if      (u == "meters" || u == "metres" || u == "m")        L_ = 1.0;
+            else if (u == "centimeters" || u == "cm")                   L_ = 0.01;
+            else if (u == "millimeters" || u == "mm")                   L_ = 0.001;
+            else if (u == "inches" || u == "in")                        L_ = 0.0254;
+            else if (u == "feet" || u == "ft")                          L_ = 0.3048;
+            else { fail("unknown units '" + u + "' (meters|centimeters|millimeters|inches|feet)"); return false; }
+            const Stmt* sp = find(b, "spectral");
+            if (sp && sp->val.words.size() >= 3) {
+                double lo = num(sp->val.words[0]), hi = num(sp->val.words[1]);
+                binWidth_ = num(sp->val.words[2]);
+                if (binWidth_ <= 0) binWidth_ = 1.0;
+                if (lo != LAMBDA_MIN || hi != LAMBDA_MAX)
+                    std::fprintf(stderr, "[ftsl] warning: spectral range %g..%g nm requested but the "
+                                 "engine range is fixed at %g..%g nm (widening is not yet supported); "
+                                 "only the bin width (%g nm) is applied.\n", lo, hi, LAMBDA_MIN, LAMBDA_MAX, binWidth_);
+            }
+        }
+
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
         for (const auto& b : blocks)
             if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
@@ -273,7 +297,7 @@ public:
 
         L.scene.build();
         // Emission CDF for the area/collimated light set above.
-        L.scene.lightSpd.build(lightSpd_, 1.0);
+        L.scene.lightSpd.build(lightSpd_, binWidth_);
         L.scene.lightEmitIntegral = L.scene.lightSpd.integral;
         return true;
     }
@@ -282,6 +306,12 @@ private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
     Spectrum lightSpd_ = constantSpectrum(1.0);
+    double L_ = 1.0;              // authored length -> internal metres
+    double binWidth_ = 1.0;      // spectral sampling bin width (nm)
+
+    // Scale an authored position/length into internal (metre) units.
+    Vec3 P(const Vec3& v) const { return v * L_; }
+    double Len(double d) const { return d * L_; }
 
     void fail(const std::string& m) { if (err.empty()) err = m; }
 
@@ -420,7 +450,7 @@ private:
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("sphere needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        L.scene.spheres.push_back(Sphere{c, r, id});
+        L.scene.spheres.push_back(Sphere{P(c), Len(r), id});
         return true;
     }
     bool addQuad(const Block& b, Loaded& L) {
@@ -429,7 +459,7 @@ private:
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("quad needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        Vec3 a = o, bb = o + u, cc = o + u + v, dd = o + v;
+        Vec3 a = P(o), bb = P(o + u), cc = P(o + u + v), dd = P(o + v);
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
         L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
         return true;
@@ -440,7 +470,7 @@ private:
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("triangle needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        L.scene.tris.push_back(Tri{v0, v1, v2, id, -1, {}});
+        L.scene.tris.push_back(Tri{P(v0), P(v1), P(v2), id, -1, {}});
         return true;
     }
     bool addMesh(const Block& b, Loaded& L) {
@@ -461,6 +491,10 @@ private:
                 double k = num(sc->val.words[0]); xf.scale = {k, k, k};
             }
         }
+        // Fold the unit scale into the transform: both the scaled local verts and the
+        // translation live in authored units, so multiply both by L_ to reach metres.
+        xf.scale = xf.scale * L_;
+        xf.translate = xf.translate * L_;
         loadObj(L.scene, file.c_str(), id, xf);
         return true;
     }
@@ -475,13 +509,14 @@ private:
             L.scene.beamDir = normalize(dir);
             // A thin pencil cross-section at the given origin (or a default).
             Vec3 o{0.5, 0.5, 0.95}; vec3Of(b, "origin", o);
-            L.scene.lightOrigin = o;
-            // Build a small cross-section perpendicular to the beam.
+            L.scene.lightOrigin = P(o);
+            // Build a small cross-section perpendicular to the beam (3 cm pencil).
             Vec3 t, bt; onb(L.scene.beamDir, t, bt);
-            L.scene.lightU = t * 0.03;
-            L.scene.lightV = bt * 0.03;
+            double w = Len(0.03);
+            L.scene.lightU = t * w;
+            L.scene.lightV = bt * w;
             L.scene.lightNormal = L.scene.beamDir;
-            L.scene.lightArea = 0.03 * 0.03;
+            L.scene.lightArea = w * w;
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so
@@ -489,16 +524,17 @@ private:
         Vec3 o{0, 1, 0}, u{1, 0, 0}, v{0, 0, 1}, nrm{0, -1, 0};
         vec3Of(b, "origin", o); vec3Of(b, "u", u); vec3Of(b, "v", v);
         if (!vec3Of(b, "normal", nrm)) nrm = normalize(cross(u, v));
+        Vec3 os = P(o), us = u * L_, vs = v * L_;
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
-        Vec3 a = o, bb = o + u, cc = o + u + v, dd = o + v;
+        Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
         L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
-        L.scene.lightOrigin = o;
-        L.scene.lightU = u;
-        L.scene.lightV = v;
-        L.scene.lightNormal = nrm;
-        L.scene.lightArea = length(cross(u, v));
+        L.scene.lightOrigin = os;
+        L.scene.lightU = us;
+        L.scene.lightV = vs;
+        L.scene.lightNormal = normalize(nrm);
+        L.scene.lightArea = length(cross(us, vs));
         return true;
     }
 
@@ -507,13 +543,18 @@ private:
         L.scene.medium.enabled = true;
         L.scene.medium.g = dblOf(b, "g", 0.0);
         bool rayleigh = strOf(b, "rayleigh") == "true" || strOf(b, "rayleigh") == "1";
+        // Extinction coefficients are per-length (1/authored-unit); divide by L_ to
+        // convert to the internal 1/metre so fog reads the same regardless of unit.
+        const double invL = 1.0 / L_;
         const Stmt* sa = find(b, "sigma_a");
         const Stmt* ss = find(b, "sigma_s");
         if (sa || ss) {
-            L.scene.medium.sigma_a = sa ? evalSpectrum(sa->val) : constantSpectrum(0.0);
-            L.scene.medium.sigma_s = ss ? evalSpectrum(ss->val) : constantSpectrum(0.0);
+            Spectrum a = sa ? evalSpectrum(sa->val) : constantSpectrum(0.0);
+            Spectrum s = ss ? evalSpectrum(ss->val) : constantSpectrum(0.0);
+            L.scene.medium.sigma_a = [a, invL](double w) { return a(w) * invL; };
+            L.scene.medium.sigma_s = [s, invL](double w) { return s(w) * invL; };
         } else {
-            double sigmaT = dblOf(b, "sigma_t", 0.0);
+            double sigmaT = dblOf(b, "sigma_t", 0.0) * invL;
             double albedo = dblOf(b, "albedo", 0.9);
             double s_s = albedo * sigmaT, s_a = (1.0 - albedo) * sigmaT;
             if (rayleigh) {
@@ -531,9 +572,10 @@ private:
     bool addCamera(const Block& b, Loaded& L) {
         if (L.hasCamera) return true;   // Phase 1: first camera wins (multi-cam is Phase 3a)
         vec3Of(b, "eye", L.camEye); vec3Of(b, "look_at", L.camLook); vec3Of(b, "up", L.camUp);
+        L.camEye = P(L.camEye); L.camLook = P(L.camLook);   // up is a direction: unscaled
         L.camFov = dblOf(b, "fov_y", 40.0);
-        L.camAperture = dblOf(b, "aperture", 0.02);
-        L.camFocus = dblOf(b, "focus", 0.0);
+        L.camAperture = Len(dblOf(b, "aperture", 0.02));
+        L.camFocus = Len(dblOf(b, "focus", 0.0));
         const Stmt* film = find(b, "film");
         if (film && film->val.block) {
             const Stmt* r = find(*film->val.block, "res");
