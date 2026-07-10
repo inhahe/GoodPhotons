@@ -5,11 +5,13 @@
 // a physical reflectance spectrum at any wavelength without a per-hit fit. It is
 // sampled at a surface (u,v) with a wrap mode and nearest/bilinear filtering.
 //
-// The loader is deliberately dependency-free and supports the formats the project
-// can already produce (PPM P6/P3, 8-bit sRGB or linear) plus PFM (Pf/PF float,
-// always linear). PNG/JPG via stb_image is a drop-in follow-up (see known-issues):
-// only Texture::load() needs to learn the new magic bytes; everything downstream
-// (sampling, coefficient precompute, the render/backward/ftsl plumbing) is shared.
+// The loader has a small built-in path for the formats the project itself produces
+// (PPM P6/P3, 8-bit sRGB or linear; PFM Pf/PF float, always linear) and defers every
+// other format to the vendored stb_image (PNG/JPG/BMP/TGA + Radiance .hdr). To keep
+// the 8k-line stb header out of every TU (especially nvcc), we forward-declare just
+// the handful of stbi_* functions we call here; the implementation is compiled once
+// in src/stb_image_impl.cpp. Everything downstream (sampling, coefficient precompute,
+// the render/backward/ftsl plumbing) is format-agnostic.
 #pragma once
 #include <cstdio>
 #include <cstdint>
@@ -24,6 +26,16 @@
 #include "linalg.h"
 #include "color.h"
 #include "upsample.h"
+
+// stb_image API (implementation lives in src/stb_image_impl.cpp). Declared here so
+// this header stays light and CUDA never parses the full stb_image.h.
+extern "C" {
+    unsigned char* stbi_load(const char* filename, int* x, int* y, int* channels, int desired);
+    float*         stbi_loadf(const char* filename, int* x, int* y, int* channels, int desired);
+    void           stbi_image_free(void* retval_from_stbi_load);
+    int            stbi_is_hdr(const char* filename);
+    const char*    stbi_failure_reason(void);
+}
 
 enum class TexEncoding { sRGB, Linear };
 enum class TexFilter   { Nearest, Bilinear };
@@ -122,11 +134,11 @@ struct Texture {
         std::ifstream f(path, std::ios::binary);
         if (!f) { err = "cannot open texture file: " + path; return false; }
         char m0 = 0, m1 = 0; f.get(m0); f.get(m1);
+        // Our own PPM/PFM paths (also what the renderer writes); stb handles the rest.
         if (m0 == 'P' && (m1 == '6' || m1 == '3')) { f.seekg(0); return loadPPM(f, m1 == '6', err); }
         if (m0 == 'P' && (m1 == 'F' || m1 == 'f')) { f.seekg(0); return loadPFM(f, err); }
-        err = "unsupported texture format in " + path + " (magic '" +
-              std::string(1, m0) + std::string(1, m1) + "'); supported: PPM (P6/P3), PFM (PF/Pf)";
-        return false;
+        f.close();
+        return loadSTB(path, err);   // PNG / JPG / BMP / TGA / HDR via stb_image
     }
 
   private:
@@ -211,6 +223,34 @@ struct Texture {
                 rgb[(size_t)(h - 1 - y) * w + x] = c;
             }
         }
+        return true;
+    }
+
+    // PNG / JPG / BMP / TGA / HDR via stb_image (top-left origin, so no row flip).
+    // Radiance .hdr files are linear float; stbi_loadf returns them directly and we
+    // force `encoding` to Linear. LDR formats decode to 8-bit RGB and honour the
+    // authored `encoding` (srgb by default → linearized per texel via storeLinear).
+    bool loadSTB(const std::string& path, std::string& err) {
+        int n = 0;
+        if (stbi_is_hdr(path.c_str())) {
+            float* data = stbi_loadf(path.c_str(), &w, &h, &n, 3);
+            if (!data) { err = "stb_image: " + std::string(stbi_failure_reason() ?
+                                 stbi_failure_reason() : "load failed") + " (" + path + ")"; return false; }
+            encoding = TexEncoding::Linear;   // .hdr is scene-linear
+            rgb.assign((size_t)w * h, Vec3{0, 0, 0});
+            for (size_t i = 0; i < (size_t)w * h; ++i)
+                rgb[i] = Vec3{data[i * 3], data[i * 3 + 1], data[i * 3 + 2]};
+            stbi_image_free(data);
+            return true;
+        }
+        unsigned char* data = stbi_load(path.c_str(), &w, &h, &n, 3);
+        if (!data) { err = "stb_image: " + std::string(stbi_failure_reason() ?
+                             stbi_failure_reason() : "load failed") + " (" + path + ")"; return false; }
+        rgb.clear(); rgb.reserve((size_t)w * h);
+        const double inv = 1.0 / 255.0;
+        for (size_t i = 0; i < (size_t)w * h; ++i)
+            storeLinear(data[i * 3] * inv, data[i * 3 + 1] * inv, data[i * 3 + 2] * inv);
+        stbi_image_free(data);
         return true;
     }
 };

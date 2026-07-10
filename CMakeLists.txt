@@ -22,6 +22,7 @@ endif()
 
 add_executable(ftrace
     src/main.cpp
+    src/stb_image_impl.cpp   # compiles the vendored stb_image once (PNG/JPG/HDR textures)
 )
 target_include_directories(ftrace PRIVATE src)
 

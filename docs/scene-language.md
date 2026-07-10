@@ -36,9 +36,8 @@
 > tracer). The still-unimplemented
 > pieces (configurable spectral *range*, absolute light power/units — which also
 > gates absolute-EV film sensitivity — the full physical `layered` material, the
-> shared multi-camera mode-B pass, non-square films, PNG/JPG texture import
-> (stb_image), textures on non-albedo parameters, procedural UV projections, extra
-> light shapes) remain tagged
+> shared multi-camera mode-B pass, non-square films, textures on non-albedo
+> parameters, procedural UV projections, extra light shapes) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -621,30 +620,30 @@ distributed / without warp as possible, such as UV mapping)? can we also get
 skins with spectral envelopes somehow defined for their various colors?"*
 
 **Current state: base-color texturing works (Phase 3b).** A `texture` block loads
-a PPM/PFM image; `reflect texture:<name>` binds it to a `diffuse` material's albedo;
-per-vertex UVs flow through quads (auto corners) and OBJ meshes (`uv use_mesh` reads
-`vt`), barycentric-interpolated at the hit (`src/geometry.h`); and each texel is
+a PNG / JPG / BMP / TGA / HDR (via stb_image) or PPM / PFM (built-in) image;
+`reflect texture:<name>` binds it to a `diffuse` material's albedo; per-vertex UVs
+flow through quads (auto corners) and OBJ meshes (`uv use_mesh` reads `vt`),
+barycentric-interpolated at the hit (`src/geometry.h`); and each texel is
 Jakob-Hanika–upsampled to a reflectance spectrum at the sampled wavelength
 (`src/texture.h`). Validated by `scenes/textured.ftsl` (quad) and `scenes/uvmesh.ftsl`
-(mesh). **Still [needs engine work]:** PNG/JPG import (stb_image — only PPM/PFM
-load today), procedural UV projections (triplanar/planar/spherical/cylindrical —
-only `use_mesh` + quad corners exist), indexed-spectral palettes, and textures on
-non-albedo parameters (§9.4). Textured scenes run on the CPU (the CUDA kernel bakes
-a single reflect spectrum, so it defers to the CPU tracer). The section breaks into
-three pieces: **(9.1) importing the image, (9.2) mapping it onto geometry, (9.3)
-turning its colors into spectra.**
+(mesh). **Still [needs engine work]:** procedural UV projections
+(triplanar/planar/spherical/cylindrical — only `use_mesh` + quad corners exist),
+indexed-spectral palettes, and textures on non-albedo parameters (§9.4). Textured
+scenes run on the CPU (the CUDA kernel bakes a single reflect spectrum, so it defers
+to the CPU tracer). The section breaks into three pieces: **(9.1) importing the
+image, (9.2) mapping it onto geometry, (9.3) turning its colors into spectra.**
 
 ### 9.1 Importing a skin (the image)
 
 A `texture` block names an image and its sampling parameters. **Implemented now:**
-PPM (P6/P3) and PFM (PF/Pf float) via the dependency-free loader in `src/texture.h`.
-PNG/JPG (recommended: **stb_image**, a single public-domain header matching the
-project's "no external deps" style) is a drop-in follow-up — only `Texture::load()`
-needs the new magic bytes; sampling and coefficient precompute are shared.
+PNG / JPG / BMP / TGA and Radiance `.hdr` (via the vendored **stb_image**, a single
+public-domain header compiled once in `src/stb_image_impl.cpp`), plus PPM (P6/P3)
+and PFM (PF/Pf float) through the built-in loader (`src/texture.h`). The `load()`
+dispatch handles PPM/PFM itself and defers everything else to stb.
 
 ```
 texture "face_albedo" {
-    file     scenes/face_albedo.ppm
+    file     scenes/face_albedo.png
     encoding srgb            # srgb | linear  — how to decode the file  [implemented]
     filter   bilinear        # nearest | bilinear  (texel interpolation) [implemented]
     wrap     repeat          # repeat | clamp | mirror                   [implemented]
