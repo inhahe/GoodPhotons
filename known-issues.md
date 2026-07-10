@@ -88,32 +88,44 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
   2026-07-10; the four items above deferred.
 
-### Light shapes: sphere done, spot/HDRI environment deferred (Phase 3c partial)
-- **What (done 2026-07-10):** a **spherical area light** — `light sphere { center
-  x y z  radius r  spd <spectrum> }` — registers an `Emitter` with `shape =
-  EmitterShape::Sphere` and `area = 4·π·r²` (`src/scene.h`). Forward and backward
-  both call `Emitter::samplePoint()`, which uniformly samples a surface point and
-  its outward normal (quad draws are byte-identical, so quad scenes stay
-  bit-identical). CUDA mirrors it via `emitterSamplePoint` (`shape`/`radius` added
-  to `DEmitter`), so sphere-light scenes still run on the GPU. The FTSL loader also
-  drops an emissive sphere into the geometry (mirroring the area-light quad).
-  Validated by `scenes/spherelight.ftsl` (mode V PASS at 60M photons / 1024 spp;
-  CPU==GPU energy).
+### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
+- **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`
+  (`src/scene.h`), both routed through forward + backward + CUDA:
+  - **Spherical area light** — `light sphere { center x y z  radius r  spd … }` —
+    `shape = EmitterShape::Sphere`, `area = 4·π·r²`. Forward and backward both call
+    `Emitter::samplePoint()` (uniform surface point + outward normal; quad draws are
+    byte-identical so quad scenes stay bit-identical). The FTSL loader also drops an
+    emissive sphere into the geometry (mirroring the area-light quad). Validated by
+    `scenes/spherelight.ftsl` (mode V PASS at 60M photons / 1024 spp; CPU==GPU).
+  - **Point spotlight** — `light spot { origin … dir … inner_angle d  outer_angle d
+    spd … }` — `shape = EmitterShape::Spot`, a cone with a cubic-smoothstep
+    penumbra. Geometric weight is the falloff-weighted solid angle `spotOmega =
+    π·(2−cosᵢ−cosₒ)`, so `power = emitIntegral·spotOmega`, peak intensity/SPD = 1.
+    Forward samples a direction uniformly in the outer cone and reweights beta by
+    `falloff·Ω_outer/spotOmega`; backward connects straight to the light point with
+    a cone-falloff weight (`I(ω)·cosθ/d²`, no area/light-cosine). No emissive
+    geometry (a point). Validated by `scenes/spotlight.ftsl` (mode V PASS at 200M
+    photons / 4096 spp → 3.8% RMSE; CPU==GPU energy).
+  - `finalizeEmitters()` now keys the power law / combined wavelength sampler off a
+    per-emitter `geomWeight()` (area·PI for surfaces, spotOmega for spots); the
+    area/sphere branch keeps the exact `emitIntegral·area·PI` expression so those
+    renders stay bit-identical (verified: cornell FTSL==C++==pre-3c hash).
 - **Deferred (still future):**
-  1. **Spot light** — a cone-limited emitter (direction + inner/outer angle
-     falloff). Needs a new `EmitterShape`/direction-limited sampling in the forward
-     spawn, the backward NEE cosLight test, and CUDA.
-  2. **HDRI / environment lighting** — an image-based infinite emitter (`light env
+  1. **HDRI / environment lighting** — an image-based infinite emitter (`light env
      { file "sky.hdr" }`). Larger: an environment sampler (importance-sampled by
      luminance), escaped-ray environment lookup in forward + backward, and CUDA. The
      `.hdr` loader already exists (stb float path in `src/texture.h`).
-  3. **Sphere-light importance sampling.** The current sphere sampler is uniform
+  2. **Sphere-light importance sampling.** The current sphere sampler is uniform
      over the whole surface (half the samples face away → cosLight=0, wasted). The
      efficient fix is cone/solid-angle sampling of the visible cap toward the
      receiver (PBRT's `Sphere::Sample`), which would cut NEE variance substantially.
      Correct but noisier as-is; validation needed higher sample counts to converge.
-- **Status:** OPEN (acceptable) — sphere area light done 2026-07-10; spot + HDRI +
-  sphere importance-sampling deferred.
+  3. **Spot penumbra sampling.** The forward spot samples uniformly in the outer
+     cone then reweights by falloff, so photons in the dark penumbra edge carry
+     small weights (mild variance). Exact CDF sampling of the smoothstep band would
+     be lower-variance but needs a quartic inverse; uniform+reweight is correct.
+- **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; HDRI environment +
+  sphere/spot importance-sampling deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

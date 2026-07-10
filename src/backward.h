@@ -50,6 +50,26 @@ struct BackwardRenderer {
         double total = 0.0;
         for (const auto& em : scene.emitters) {
             if (em.collimated) continue;                  // beams aren't area-samplable
+            if (em.shape == EmitterShape::Spot) {
+                // Point spot: deterministic connect to the light point, weighted by
+                // the cone falloff toward the surface (peak intensity/SPD = 1).
+                Vec3 toL = em.origin - h.p;
+                double dist2 = dot(toL, toL);
+                double dist = std::sqrt(dist2);
+                Vec3 wi = toL / dist;
+                double cosSurf = dot(h.n, wi);
+                if (cosSurf <= 0) continue;
+                double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
+                if (fall <= 0) continue;
+                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                double f = rho / PI;
+                double emitW = em.spdFn(lambda) * invPdfLambda;
+                double contrib = f * emitW * fall * cosSurf / dist2;  // I(w)/dist^2
+                if (scene.medium.enabled)
+                    contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+                total += contrib;
+                continue;
+            }
             double u1 = rng.uniform(), u2 = rng.uniform();
             Vec3 y, nLight;
             em.samplePoint(u1, u2, y, nLight);            // quad or sphere surface point
@@ -83,6 +103,22 @@ struct BackwardRenderer {
         double total = 0.0;
         for (const auto& em : scene.emitters) {
             if (em.collimated) continue;
+            if (em.shape == EmitterShape::Spot) {
+                // Point spot at a volume vertex: no surface cosine, cone falloff only.
+                Vec3 toL = em.origin - p;
+                double dist2 = dot(toL, toL);
+                double dist = std::sqrt(dist2);
+                Vec3 wi = toL / dist;
+                double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
+                if (fall <= 0) continue;
+                if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+                double phase  = hgPhase(dot(wIn, wi), scene.medium.g);
+                double albedo = scene.medium.albedo(lambda);
+                double T = std::exp(-scene.medium.sigmaT(lambda) * dist);
+                double emitW = em.spdFn(lambda) * invPdfLambda;
+                total += albedo * phase * emitW * fall / dist2 * T;
+                continue;
+            }
             double u1 = rng.uniform(), u2 = rng.uniform();
             Vec3 y, nLight;
             em.samplePoint(u1, u2, y, nLight);            // quad or sphere surface point

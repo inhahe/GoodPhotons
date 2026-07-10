@@ -160,11 +160,20 @@ struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
-    int    shape;              // 0 = quad, 1 = sphere (mirrors host EmitterShape)
+    int    shape;              // 0 = quad, 1 = sphere, 2 = spot (mirrors EmitterShape)
     double radius;             // sphere radius (shape==1)
+    double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
     int    cdfOffset, cdfN;
     double cdfStep;
 };
+
+// Smoothstep spot falloff (mirrors host scene.h spotFalloff).
+__device__ static double spotFalloff(double ct, double cosInner, double cosOuter) {
+    if (ct >= cosInner) return 1.0;
+    if (ct <= cosOuter) return 0.0;
+    double t = (ct - cosOuter) / (cosInner - cosOuter);
+    return t * t * (3.0 - 2.0 * t);
+}
 
 // Sample a surface point + outward normal on an emitter (mirrors host
 // Emitter::samplePoint). Quad draws are unchanged, so quad scenes stay parity.
@@ -645,18 +654,35 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter em = sc.emitters[ei];
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 origin, emitN;
-        emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
-        DVec3 dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        DVec3 origin, emitN, dir;
+        Real spotW = (Real)1;                            // spot direction reweight (else 1)
+        if (em.shape == 2) {
+            // Point spot: uniform direction in the outer cone; reweight beta by
+            // falloff*(Omega_outer/Omega_eff) to match the smoothstep profile.
+            origin = em.origin;
+            double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
+            double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+            DVec3 t, b; onb(em.beamDir, t, b);
+            dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
+            emitN = em.beamDir;
+            double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
+            spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
+        } else {
+            emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+            dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        }
         Real pdfL = 0;
         Real lambda = sampleLambda(sc, em, rng, pdfL);
         if (pdfL <= 0) continue;
         Real beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
+        beta *= spotW;                                   // exactly 1 for non-spot
         eEmitted += beta;
 
         // Model B: connect the emitter itself to the pinhole (makes the source
-        // visible). Modes A/C instead catch photons that physically arrive.
-        if (camMode == CAM_B)
+        // visible). Modes A/C instead catch photons that physically arrive. A spot
+        // is a point light with no projected area, so it has no direct term.
+        if (camMode == CAM_B && em.shape != 2)
             connect(sc, cam, film, origin, emitN, lambda, beta, (Real)1);
 
         DVec3 ro = origin + dir * RAY_EPS, rd = dir;
@@ -890,8 +916,11 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
-        de.shape = (e.shape == EmitterShape::Sphere) ? 1 : 0;
+        de.shape = (e.shape == EmitterShape::Sphere) ? 1
+                 : (e.shape == EmitterShape::Spot)   ? 2 : 0;
         de.radius = e.radius;
+        de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
+        de.spotOmega = e.spotOmega;
         de.cdfOffset = (int)cdfAll.size();
         de.cdfN = (int)e.spd.cdf.size();
         de.cdfStep = e.spd.step;

@@ -149,30 +149,52 @@ struct Sensor {
 // glowing ball of radius `radius` centred at `origin`, emitting Lambertian from
 // every surface point about that point's outward normal (so exactly the
 // hemisphere facing a receiver contributes — handled by the per-sample normal).
-enum class EmitterShape { Quad, Sphere };
+// A Spot is a point at `origin` radiating only into a cone about `beamDir`, with
+// a smoothstep penumbra between the inner and outer half-angles (spotCosInner /
+// spotCosOuter); it has no surface area, so its "geometric weight" is the
+// falloff-weighted solid angle spotOmega instead of area*PI.
+enum class EmitterShape { Quad, Sphere, Spot };
 
-// A single emitter. Each carries its own SPD; `power` = emitIntegral * area * PI
+// Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
+// inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
+inline double spotFalloff(double ct, double cosInner, double cosOuter) {
+    if (ct >= cosInner) return 1.0;
+    if (ct <= cosOuter) return 0.0;
+    double t = (ct - cosOuter) / (cosInner - cosOuter);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// A single emitter. Each carries its own SPD; `power` = emitIntegral * geomWeight
 // is the emitter's total emitted power and doubles as the selection weight for the
-// power-weighted CDF. For a collimated Quad every photon fires along `beamDir`
-// from that quad (the prism demo). `area` is the full emitting surface area
-// (quad: |u x v|; sphere: 4*PI*radius^2), so the Lambertian power law holds for
-// both shapes unchanged.
+// power-weighted CDF. The geometric weight is area*PI for area/sphere lights and
+// the falloff-weighted solid angle spotOmega for a spot. For a collimated Quad
+// every photon fires along `beamDir` from that quad (the prism demo).
 struct Emitter {
     Vec3 origin, u, v, normal;
     double area = 0.0;
     EmitterShape shape = EmitterShape::Quad;
     double radius = 0.0;      // sphere radius (Sphere only)
     bool collimated = false;
-    Vec3 beamDir{1, 0, 0};
+    Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
+    double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
+    double spotOmega = 0.0;   // spot falloff-weighted solid angle = PI*(2-ci-co)
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
-    double power = 0.0;       // emitIntegral * area * PI (selection weight)
+    double power = 0.0;       // emitIntegral * geomWeight (selection weight)
+
+    // Per-emitter spectral/geometric weight fed into the combined backward
+    // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
+    // spot. (Area/sphere keep the exact area*PI expression for bit-identity.)
+    double geomWeight() const {
+        return (shape == EmitterShape::Spot) ? spotOmega : area * PI;
+    }
 
     // Sample a surface point `y` and its outward unit normal `nOut` from two
     // uniforms. Quad: the bilinear point with the constant face normal (identical
     // draws to the pre-sphere engine, so quad scenes stay bit-identical). Sphere:
-    // a uniformly-distributed surface point (pdf = 1/area for both shapes).
+    // a uniformly-distributed surface point (pdf = 1/area for both shapes). Not
+    // used for Spot (a point light — see the forward/backward spot paths).
     void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut) const {
         if (shape == EmitterShape::Sphere) {
             double z = 1.0 - 2.0 * u1;                 // cos(theta) uniform in [-1,1]
@@ -232,20 +254,39 @@ struct Scene {
         emitters.push_back(std::move(e));
     }
 
+    // Register a spotlight: a point at `pos` radiating into a cone about unit
+    // `axis`, cubic-smooth falloff between the inner and outer half-angles.
+    // geomWeight = spotOmega = PI*(2-cosInner-cosOuter) (the falloff-weighted solid
+    // angle), so power = emitIntegral*spotOmega and peak intensity per unit SPD = 1.
+    void addSpotLight(const Vec3& pos, const Vec3& axis, double cosInner,
+                      double cosOuter, const Spectrum& spd, double stepNm) {
+        Emitter e;
+        e.origin = pos; e.beamDir = normalize(axis);
+        e.shape = EmitterShape::Spot;
+        e.spotCosInner = cosInner; e.spotCosOuter = cosOuter;
+        e.spotOmega = PI * (2.0 - cosInner - cosOuter);
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
     // Compute per-emitter power, the selection CDF, and the combined backward
     // wavelength sampler. Idempotent; called by build().
     void finalizeEmitters(double stepNm = 1.0) {
         totalPower = 0.0;
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
-            emitters[i].power = emitters[i].emitIntegral * emitters[i].area * PI;
+            // Area/sphere keep the exact emitIntegral*area*PI expression so those
+            // scenes stay bit-identical; a spot uses its solid-angle weight.
+            emitters[i].power = (emitters[i].shape == EmitterShape::Spot)
+                ? emitters[i].emitIntegral * emitters[i].spotOmega
+                : emitters[i].emitIntegral * emitters[i].area * PI;
             totalPower += emitters[i].power;
             emitterCdf[i] = totalPower;
         }
         if (totalPower > 0) for (auto& c : emitterCdf) c /= totalPower;
-        // Combined g(lambda) = sum_k area_k*PI*SPD_k(lambda); by value capture.
+        // Combined g(lambda) = sum_k geomWeight_k*SPD_k(lambda); by value capture.
         std::vector<std::pair<double, Spectrum>> parts;
-        for (const auto& e : emitters) parts.push_back({e.area * PI, e.spdFn});
+        for (const auto& e : emitters) parts.push_back({e.geomWeight(), e.spdFn});
         Spectrum g = [parts](double w) {
             double s = 0.0; for (const auto& p : parts) s += p.first * p.second(w); return s;
         };
@@ -271,7 +312,7 @@ struct Scene {
         // reconstruct g(lambda) = emitG * pdf; but we stored the sampler, so
         // recompute g directly from emitters (cheap: few evaluations).
         double g = 0.0;
-        for (const auto& e : emitters) g += e.area * PI * e.spdFn(lambda);
+        for (const auto& e : emitters) g += e.geomWeight() * e.spdFn(lambda);
         return (g > 0.0) ? emitG / g : 0.0;
     }
 

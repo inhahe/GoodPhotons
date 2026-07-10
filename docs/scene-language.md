@@ -110,7 +110,7 @@ Top-level block types:
 | `quad`       | 0+         | Rectangle (two triangles) — walls, panels           |
 | `triangle`   | 0+         | Single triangle                                     |
 | `mesh`       | 0+         | OBJ instance with transform                         |
-| `light`      | 1+         | Emitter (area, sphere, or collimated)               |
+| `light`      | 1+         | Emitter (area, sphere, spot, or collimated)         |
 | `medium`     | 0 or 1     | Global homogeneous fog                              |
 | `camera`     | 1+         | Viewpoint + film + measurement model                |
 | `render`     | 0 or 1     | Optional render controls (overridable by CLI)       |
@@ -353,8 +353,9 @@ mesh { file "teapot.obj" material brushed
 
 The scene supports **any number of emitters** (Phase 2b). Each `light` block adds
 one `Emitter` (`src/scene.h`): a rectangular area light with a spectral power
-distribution, a **spherical area light** (a glowing ball, Phase 3c), or a
-collimated beam (prism/grating demos). `Scene::emitters` holds
+distribution, a **spherical area light** (a glowing ball, Phase 3c), a **point
+spotlight** (a cone with a soft penumbra, Phase 3c), or a collimated beam
+(prism/grating demos). `Scene::emitters` holds
 the list; `finalizeEmitters()` computes each emitter's `power = emitIntegral *
 area * PI`, a power-weighted selection CDF (`emitterCdf`/`totalPower`), and a
 combined wavelength sampler (`emitSampler`) for the backward reference. The
@@ -382,7 +383,26 @@ light sphere {                     # Phase 3c: a glowing ball
     center 0.5 0.75 0.5   radius 0.12
     spd preset:bb6500
 }
+
+light spot {                       # Phase 3c: a cone with a soft penumbra
+    origin 0.5 0.98 0.5   dir 0 -1 0
+    inner_angle 18   outer_angle 30   # half-angles in degrees
+    spd preset:bb6500
+}
 ```
+
+A `light spot` registers a **point** emitter (`shape = EmitterShape::Spot`) that
+radiates only into a cone about `dir`, with a cubic-smoothstep falloff between the
+inner and outer half-angles (a hard cone if they are equal). Because a point has
+no area, its geometric weight is the falloff-weighted solid angle `spotOmega =
+π·(2 − cos θᵢ − cos θₒ)`, so `power = emitIntegral · spotOmega` and the peak
+intensity per unit SPD is 1. The forward tracer samples a direction uniformly in
+the outer cone and reweights the photon by `falloff · Ω_outer / spotOmega`
+(analog MC); the backward reference connects each shading point straight to the
+light point and weights by the cone falloff toward that point (`I(ω)·cosθ/d²`,
+no area or light-side cosine). No emissive geometry is added — a point light is
+infinitely small, so it has no direct-view term. Validated by
+`scenes/spotlight.ftsl` (mode V: forward agrees with backward; CPU==GPU energy).
 
 A `light sphere` registers a spherical `Emitter` (`shape = EmitterShape::Sphere`,
 `area = 4·π·r²`) and also drops an emissive sphere into the geometry so photons
@@ -419,16 +439,17 @@ Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 - **Multiple / typed lights.** **[done — Phase 2b]** Any number of `light` blocks
   accumulate; the forward tracer uses a power-weighted selection CDF in the photon
   spawn path (CPU and CUDA), and the backward reference sums NEE over all emitters.
-  Sphere area lights are done (Phase 3c); spot/env are still future — see below.
+  Sphere area lights and spotlights are done (Phase 3c); env (HDRI) is still
+  future — see below.
 - **Absolute power / units.** **[needs engine work]** Today emission is normalized by the SPD integral
   and the light area — good enough for relative imagery, but there is no
   radiometric "this bulb is 800 lumens / 10 W". A `power <watts>` (radiant) or
   `luminous <lm>` key is the place to add physically-absolute output. Until the
   engine tracks absolute units this is documentation-only.
-- **Other shapes.** Sphere area lights are **[done — Phase 3c]** (`light sphere
-  { center … radius … }`). Spot/point/environment(HDRI) emitters are still future;
-  the `light <type>` tag leaves room (`light spot { … }`, `light env { file
-  "sky.hdr" }`).
+- **Other shapes.** Sphere area lights **[done — Phase 3c]** (`light sphere {
+  center … radius … }`) and point spotlights **[done — Phase 3c]** (`light spot {
+  dir … inner_angle … outer_angle … }`). Environment (HDRI) lighting is still
+  future; the `light <type>` tag leaves room (`light env { file "sky.hdr" }`).
 
 ---
 

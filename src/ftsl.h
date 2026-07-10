@@ -17,6 +17,7 @@
 //   light area       { origin ...  u ...  v ...  normal ...  spd <spectrum-expr> }
 //   light collimated { dir x y z  spd <spectrum-expr> }   # repeatable: N emitters
 //   light sphere     { center x y z  radius r  spd <spectrum-expr> }  # glowing ball
+//   light spot       { origin x y z  dir x y z  inner_angle d  outer_angle d  spd … }
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
 //                   film { res W H } }
@@ -682,6 +683,19 @@ private:
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
             L.scene.spheres.push_back(Sphere{P(c), rad, id});
             L.scene.addSphereLight(P(c), rad, spd, binWidth_);
+            return true;
+        }
+        if (b.subtype == "spot") {
+            // Point spotlight: a cone about `dir`, smoothstep penumbra between the
+            // inner and outer half-angles (degrees). No emissive geometry (a point).
+            Vec3 o{0.5, 0.99, 0.5}; vec3Of(b, "origin", o);
+            Vec3 dir{0, -1, 0}; vec3Of(b, "dir", dir);
+            double inner = dblOf(b, "inner_angle", 20.0);
+            double outer = dblOf(b, "outer_angle", 30.0);
+            if (outer < inner) outer = inner;            // outer cone must enclose inner
+            const double d2r = PI / 180.0;
+            double cosInner = std::cos(inner * d2r), cosOuter = std::cos(outer * d2r);
+            L.scene.addSpotLight(P(o), normalize(dir), cosInner, cosOuter, spd, binWidth_);
             return true;
         }
         // Default: rectangular area light. Also add the emissive quad to geometry so

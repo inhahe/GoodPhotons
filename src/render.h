@@ -224,21 +224,40 @@ struct Renderer {
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 origin, emitN;
-        em.samplePoint(u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
-        Vec3 dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        Vec3 origin, emitN, dir;
+        double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
+        if (em.shape == EmitterShape::Spot) {
+            // Point spot: sample a direction uniformly in the outer cone, then
+            // reweight beta by falloff*(Omega_outer/Omega_eff) so the emitted
+            // distribution matches the smoothstep intensity profile (analog MC).
+            origin = em.origin;
+            double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
+            double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+            double phi = 2.0 * PI * u2;
+            Vec3 t, b; onb(em.beamDir, t, b);
+            dir = t * (st * std::cos(phi)) + b * (st * std::sin(phi)) + em.beamDir * ct;
+            emitN = em.beamDir;
+            double omegaOuter = 2.0 * PI * (1.0 - em.spotCosOuter);
+            spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
+        } else {
+            em.samplePoint(u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+            dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        }
         double pdfL = 0.0;
         double lambda = em.spd.sample(rng, pdfL);
         if (pdfL <= 0) return;
         // Single emitter: beta = its own power (== old lightEmitIntegral*area*PI).
         // Multiple: beta = totalPower (see selection note above).
         double beta = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
+        beta *= spotW;   // exactly 1.0 for non-spot emitters (no bit change)
         e.emitted += beta;
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
         // emitter term is 1/pi, i.e. connect() with rho=1 using the light normal.
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
-        if (cam && camFilm && !forwardCatch)
+        // A spot is a point light with no projected area, so it has no such direct
+        // term (its cone illuminates surfaces, which then connect to the camera).
+        if (cam && camFilm && !forwardCatch && em.shape != EmitterShape::Spot)
             connect(scene, *cam, *camFilm, origin, emitN, lambda, beta, 1.0);
 
         Ray ray{origin + dir * 1e-6, dir};
