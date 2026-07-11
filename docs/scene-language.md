@@ -178,8 +178,24 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 > Sellmeier); the natural reflectances and iridescent recipes are representative,
 > not per-sample measurements (see known-issues.md). For full fidelity to a
 > specific dataset, the `table { }` form remains the ingestion point for published
-> data (e.g. RPMK/Vos pigment & metal reflectances, or refractiveindex.info); a
-> small CSV→`table` converter is still the recommended path.
+> data (e.g. RPMK/Vos pigment & metal reflectances, or refractiveindex.info).
+> Use `tools/csv_to_table.py` to convert a two-column CSV/TSV of
+> (wavelength, value) straight into a `table { }` block:
+>
+> ```
+> # a reflectance CSV (nm, value) -> a named spectrum block
+> python tools/csv_to_table.py gold_reflectance.csv -n gold_measured
+>
+> # refractiveindex.info export in micrometres, n is column 1 -> nm
+> python tools/csv_to_table.py bk7.csv --x-scale 1000 --y-col 1 -n bk7_ior
+>
+> # resample to a uniform 5 nm grid over the visible, clamp to [0,1]
+> python tools/csv_to_table.py leaf.csv --resample 5 --min 380 --max 780 --clamp01
+> ```
+>
+> It auto-detects the delimiter, skips headers/comments, sorts by wavelength, and
+> emits either a `spectrum "name" = table { … }` block or (with `--bare`) just the
+> `table { … }` expression to paste into any `<spectrum>` slot. stdlib only.
 
 ---
 
