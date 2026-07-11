@@ -63,3 +63,21 @@ bool cudaBdptSupported(const Scene& scene);
 // cudaBdptSupported(scene); otherwise returns an empty film.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int res,
                     long long spp, int maxDepth, bool diffraction);
+
+// True if this scene + camera can be rendered by the GPU backward reference megakernel
+// (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
+// v1 scope: no participating media, no environment light, only area/sphere/cylinder
+// Lambertian emitters (no spot/env/collimated), no fluorescence, and a lens no deeper
+// than the device cap (D_MAXLENS). Textured albedo IS supported. When false, the
+// caller must use the CPU backward tracer (which has no such restrictions).
+bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
+
+// GPU backward reference trace (mode R). Renders `spp` samples per pixel at the given
+// resolution and returns the film accumulated over spp (same convention as the CPU
+// renderBackward: writeFilm(film, spp) for display). Handles the physical lens exactly
+// as the CPU path (film + rear-pupil sample refracted through the glass stack, with the
+// cos^4*A/Z^2 radiometric weight). Requires cudaAvailable() && cudaBackwardSupported();
+// otherwise returns an empty film. The device RNG differs from the CPU, so the image is
+// an independent noise realization that agrees to within Monte-Carlo noise.
+Film renderBackwardCuda(const Scene& scene, const Camera& cam, int res,
+                        long long spp, bool diffraction);

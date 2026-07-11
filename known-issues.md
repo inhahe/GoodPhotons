@@ -146,8 +146,16 @@ as practical; this file is the fallback for what can't be addressed immediately.
   the first-cut symptom was a fully black image.
 - **Remaining gaps (OPEN, deferred):**
   1. **Backward-only.** No forward-catch (mode C-style) or forward-splat (A/B)
-     realistic-lens path yet, and **no GPU** support (mode R is CPU-only). A physical
-     lens always renders in mode R.
+     realistic-lens path yet. A physical lens always renders in mode R. **GPU: DONE**
+     (Plan A, 2026-07-11) — a dedicated GPU backward megakernel (GPU mode R) runs the
+     physical lens as a ray-generation front-end (`kBackward` in `render_cuda.cu`, the
+     lens bit-for-bit ported to `dGenLensRay`/`dLensTrace` with per-surface sensor-side
+     ior baked into a device table). `-device auto`/`gpu` selects it. v1 scope
+     (`cudaBackwardSupported`): no participating media, no environment light, no
+     spot/collimated emitters, no fluorescence (all fall back to the CPU backward
+     tracer), and ≤ `D_MAXLENS` (16) lens surfaces; textured albedo IS supported. The
+     device RNG differs from the CPU, so the image is an independent noise realization
+     that agrees to within Monte-Carlo noise.
   2. **Square film only.** The pipeline allocates a square film, so `genLensRay` maps
      the sensor width across the frame and derives the vertical half-extent from the
      output pixel aspect (square pixels, cropping the 3:2 sensor). A true non-square
@@ -156,8 +164,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
      reflect at each interface), **no enclosure/body geometry**, and the aperture is a
      circular clear-diameter clip (no shaped-iris bokeh).
   4. **Not in BDPT (mode D).** The lens branch lives in the mode-R renderer only.
-- **Status:** IMPLEMENTED (backward realistic camera, 2026-07-11). Supersedes the
-  analytical thin-lens for "arbitrary real camera" use; the gaps above are follow-ups.
+- **Status:** IMPLEMENTED (backward realistic camera, 2026-07-11; GPU backward
+  megakernel / Plan A, 2026-07-11). Supersedes the analytical thin-lens for "arbitrary
+  real camera" use; the remaining gaps above are follow-ups.
 
 #### Plan B — realistic lens on the camera subpath of BDPT (mode D) and composite (mode P), deferred
 - **Why it's wanted:** the physical lens currently rides on **pure mode R** (backward
@@ -184,9 +193,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
      fundamentally assumes a pinhole camera. Routing that forward pass through a physical
      lens is the ill-posed forward-through-lens problem again. So P does not cleanly
      extend to a realistic lens without solving the same inversion.
-- **Bottom line:** the clean, buildable step is **Plan A** — a dedicated GPU backward
-  megakernel (GPU mode R) with the lens as a ray-generation front-end (see gap #1
-  below/above). Plan B (D and P) is genuinely more general but only a *partial* caustic
+- **Bottom line:** the clean, buildable step was **Plan A** — a dedicated GPU backward
+  megakernel (GPU mode R) with the lens as a ray-generation front-end (**DONE**
+  2026-07-11; see gap #1 above). Plan B (D and P) is genuinely more general but only a *partial* caustic
   recovery for a much larger, more fragile implementation, and can't do the light→film
   splat through the glass at all. Captured here as future research work, not scheduled.
 

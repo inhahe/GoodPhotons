@@ -86,10 +86,10 @@ paths they can capture at all**.
 | `A` | Contact sensor | Pure forward photon catch on a front-wall sensor (no lens/optics) | CPU + GPU |
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
-| `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU |
+| `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU |
-| `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU |
+| `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -110,9 +110,13 @@ paths they can capture at all**.
   specifically want forward-simulated DoF.
 - **`R` — backward reference (unbiased, general).** Traces from the camera, so it
   renders **any** first-hit surface including specular, and is the **quiet, reliable
-  reference** for camera-visible lighting. It is CPU-only and gets **noisy on
-  caustics** (light focused through glass/water is hard to find backward). This mode
-  also drives the **physical multi-element lens** camera.
+  reference** for camera-visible lighting. GPU-accelerated (its own backward
+  megakernel, which also drives the **physical multi-element lens** camera on the
+  GPU). It gets **noisy on caustics** (light focused through glass/water is hard to
+  find backward). *GPU scope:* the megakernel covers area/sphere/cylinder Lambertian
+  lights and all the specular/textured materials; scenes using fog, environment
+  lights, spot/collimated lights, or fluorescence fall back to the CPU tracer
+  automatically.
 - **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
   check, not a production renderer (roughly twice the work).
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for
@@ -128,19 +132,23 @@ paths they can capture at all**.
   participating media, or spot & env lights** (use `B`/`P` or `R` for those).
 
 The **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are progressive and
-GPU-eligible, and **`D` has its own GPU BDPT megakernel**; brightness is
-photon-count-independent, so more photons only reduce graininess. The backward
-tracer (`R`, and the backward layer of `P`) is the only part with no GPU path.
+GPU-eligible, **`D` has its own GPU BDPT megakernel**, and **`R` (including the
+physical-lens camera) has its own GPU backward megakernel**; brightness is
+photon-count-independent, so more photons only reduce graininess. The backward layer
+of the `P` composite (and `V`'s backward reference, kept on the CPU as a stable
+ground truth) are the only parts still CPU-only.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
 - **`-device auto` (default, recommended).** Uses the GPU when a supported CUDA
   device is present *and* the render is one it can handle (forward modes
-  `A`/`B`/`C` on a non-fluorescent scene, or mode `D`'s BDPT megakernel); otherwise
-  the CPU. Prints its choice.
+  `A`/`B`/`C` on a non-fluorescent scene, mode `D`'s BDPT megakernel, or mode `R`'s
+  backward megakernel — including the physical-lens camera); otherwise the CPU.
+  Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
-  for the backward tracer (mode `R`, the mode-`P` camera layer) and for fluorescent
-  scenes. `cpu` is fully deterministic and is used for reference/validation
+  for the mode-`P` camera layer, for `R`/`D` scenes outside their GPU scope
+  (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
+  forward scenes. `cpu` is fully deterministic and is used for reference/validation
   baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
@@ -212,14 +220,18 @@ camera "real" {
 slower** option. It captures real optical behaviour the thin lens cannot
 (aberrations, distortion, field curvature, natural vignetting, dispersion-driven
 colour fringing, and aperture-shaped bokeh), but it traces every camera ray
-through the glass stack and is **backward-only (mode `R`, CPU)** — so it is
-markedly slower than the analytic thin lens and has no GPU path. Reach for the
-analytic lens/projection when you want speed and a clean ideal image, and the
-physical lens when you want a specific real objective's look.
+through the glass stack and is **backward-only (mode `R`)** — so it is more
+expensive per sample than the analytic thin lens. It **runs on the GPU** (mode
+`R`'s backward megakernel refracts each camera ray through the glass stack on the
+device), so within the GPU-supported scope it is still fast. Reach for the analytic
+lens/projection when you want speed and a clean ideal image, and the physical lens
+when you want a specific real objective's look.
 
-*Current limits:* the physical lens is backward-only (mode `R`, CPU), renders to a
+*Current limits:* the physical lens is backward-only (mode `R`), renders to a
 square film (the 3:2 sensor is cropped to the output frame), and does not model
-inter-element flare/ghosting or shaped-iris bokeh.
+inter-element flare/ghosting or shaped-iris bokeh. On the GPU it inherits mode
+`R`'s scope (no fog/env/spot/fluorescence, and at most 16 lens surfaces); outside
+that it falls back to the CPU tracer automatically.
 
 ---
 
@@ -375,5 +387,5 @@ deterministically.
 ## Known issues & roadmap
 
 Open limitations and technical debt are tracked in `known-issues.md` — including
-the physical-lens camera's remaining gaps (forward-catch / GPU / BDPT support,
-non-square film, inter-element flare) and the shared multi-camera pass.
+the physical-lens camera's remaining gaps (BDPT/composite support, non-square film,
+inter-element flare) and the shared multi-camera pass.

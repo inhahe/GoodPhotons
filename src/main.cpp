@@ -1329,6 +1329,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
+    const bool gpuBackwardMode = (mode == 'R');   // GPU backward reference megakernel (own check)
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
     const bool fisheyeCam = (cam.projection != CAM_RECTILINEAR);
@@ -1373,9 +1374,24 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
                             cudaDeviceName());
             }
+        } else if (gpuBackwardMode) {
+            // Mode R has its own GPU support check: the backward reference megakernel
+            // (with the physical mesh-lens as a ray-gen front-end) covers area/sphere/
+            // cylinder Lambertian lights and textured/specular materials, but not fog,
+            // env light, spot/collimated lights, or fluorescence (v1 scope).
+            if (!cudaBackwardSupported(scene, cam)) {
+                const char* why = "scene has a backward-GPU-unsupported feature "
+                                  "(fog, env light, spot/collimated light, fluorescence, "
+                                  "or a lens deeper than the device cap)";
+                if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+                else         std::printf("[device] auto -> CPU (%s)\n", why);
+            } else {
+                useGpu = true;
+                std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
+                            cudaDeviceName());
+            }
         } else if (!gpuForwardMode) {
-            const char* why = (mode == 'R') ? "backward reference - no forward GPU pass"
-                                            : "unsupported mode - CPU-only path";
+            const char* why = "unsupported mode - CPU-only path";
             if (wantGpu) std::fprintf(stderr,
                 "[device] GPU can't accelerate this render: %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
@@ -1410,9 +1426,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 
     // --- Backward reference (mode R) and validation (mode V) ---
     if (refMode) {
-        std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
-                    mode, spp, res, res, nThreads, lightLabel);
-        Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+        // Mode R can run on the GPU (backward reference megakernel, incl. the physical
+        // lens); mode V keeps its backward reference on the CPU as the stable ground
+        // truth while its forward cross-check pass uses the GPU (useGpu below).
+        const bool gpuBackward = (mode == 'R' && useGpu);
+        std::printf("mode %c: backward reference %lld spp at %dx%d on %s (light=%s) ...\n",
+                    mode, spp, res, res,
+                    gpuBackward ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
+                    lightLabel);
+        Film ref;
+#ifdef HAVE_CUDA
+        if (gpuBackward) ref = renderBackwardCuda(scene, cam, res, spp, diffraction);
+        else             ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+#else
+        ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+#endif
         if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure); return 0; }
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);

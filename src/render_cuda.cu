@@ -330,6 +330,45 @@ HD static inline double dProjRadiusDeriv(int proj, double th) {
         default:              { double c = cos(th);        return 1.0 / (c * c); }  // sec^2
     }
 }
+// r->theta inverse (device twin of camera.h projRadiusInv). Needed by the backward
+// tracer's dGenRay: unlike the forward path (which only SPLATS to the camera), mode R
+// GENERATES camera rays, so it must invert the projection map to place a film sample.
+HD static inline double dProjRadiusInv(int proj, double r) {
+    double x;
+    switch (proj) {
+        case CAM_EQUIDISTANT:   return r;
+        case CAM_EQUISOLID:     x = 0.5 * r; x = x < -1 ? -1 : (x > 1 ? 1 : x); return 2.0 * asin(x);
+        case CAM_STEREOGRAPHIC: return 2.0 * atan(0.5 * r);
+        case CAM_ORTHOGRAPHIC:  x = r; x = x < -1 ? -1 : (x > 1 ? 1 : x); return asin(x);
+        default:                return atan(r);              // CAM_RECTILINEAR
+    }
+}
+
+// Maximum refracting interfaces in a physical (mesh-lens) camera on the GPU. Lenses
+// with more surfaces fall back to the CPU backward tracer (cudaBackwardSupported).
+#define D_MAXLENS 16
+
+// One refracting interface of the physical lens (device twin of LensSurface). The
+// per-surface sensor-side index is baked into DLensSystem::iorAll (SPEC_N entries per
+// surface) so the std::function Spectrum never crosses the device barrier — the same
+// bake-to-table trick DMaterial uses. `zpos` is the cached vertex z (mm).
+struct DLensSurface {
+    double radius;      // signed radius of curvature (mm); 0 => planar
+    double thickness;   // axial gap to the next surface toward the sensor (mm)
+    double aperture;    // clear semi-diameter / stop radius (mm)
+    double zpos;        // cached vertex z (mm), sensor nominally at 0
+    int    isStop;
+};
+// Physical multi-element lens (device twin of LensSystem). Embedded by value in
+// DCamera; `iorAll` points at nSurf*SPEC_N baked sensor-side index tables uploaded by
+// buildUpload. Surfaces are stored front (scene, idx 0) -> rear (sensor, idx nSurf-1).
+struct DLensSystem {
+    int    nSurf;
+    double filmW_mm, filmH_mm;   // sensor size (mm)
+    double T, filmZ;             // total track (front vertex z) and sensor plane z (mm)
+    DLensSurface  surf[D_MAXLENS];
+    const double* iorAll;        // nSurf*SPEC_N sensor-side index tables (air baked as 1)
+};
 
 struct DCamera {
     DVec3  eye, u, v, w;
@@ -441,6 +480,11 @@ struct DCamera {
         if (dot(rho, rho) > (Real)(apertureR * apertureR)) return false;
         return lensImage(P, rd, px, py);
     }
+    // Physical multi-element (mesh-lens) camera. When hasLens is set the backward
+    // tracer (mode R) generates rays by refracting them from the film out through the
+    // real glass interfaces (dGenLensRay), superseding the pinhole/thin-lens model.
+    int         hasLens;
+    DLensSystem lens;
 };
 
 // ============================ device helpers ============================
@@ -1698,6 +1742,288 @@ __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
     return (g > 0.0) ? sc.emitG / g : 0.0;
 }
 
+// ======================= backward reference (GPU mode R) =====================
+// Device port of backward.h — the unidirectional reference tracer, now with the
+// physical (mesh-lens) camera as a ray-generation front-end. Reuses the shared BVH
+// (closestHit/occluded), the specular BSDFs (refractOrReflect / thinFilmInterface /
+// multilayerInterface / gratingDiffract), the diffuse reflectance (dDiffuseRho) and
+// the emitter sampler exactly, so materials agree with the CPU path by construction.
+// v1 scope (gated by cudaBackwardSupported): area/sphere/cylinder Lambertian lights
+// only, no fog/env/fluorescence/spot — which makes dInvPdfLambda exact and matches
+// the CPU reference up to Monte-Carlo noise (independent RNG realization).
+
+// Sensor-side index of surface j (air baked as 1); scene-side = sensor side of j-1.
+__device__ static Real dLensIorSensor(const DLensSystem& L, int j, Real lambda) {
+    return specLookup(L.iorAll + (size_t)j * SPEC_N, lambda);
+}
+__device__ static Real dLensIorScene(const DLensSystem& L, int j, Real lambda) {
+    return (j == 0) ? (Real)1 : dLensIorSensor(L, j - 1, lambda);
+}
+// Refract `d` at `n` (faced against d) with eta = n_in/n_out (port of refractDir).
+__device__ static bool dLensRefract(const DVec3& d, const DVec3& n, Real eta, DVec3& out) {
+    Real cosi = -dot(d, n);
+    Real k = (Real)1 - eta * eta * ((Real)1 - cosi * cosi);
+    if (k < 0) return false;                          // TIR -> blocked
+    out = normalize(d * eta + n * (eta * cosi - sqrt(k)));
+    return true;
+}
+// Intersect a lens-local ray with surface j; hitP + normal (against d). Clipped by the
+// clear aperture => false (vignetting). Port of LensSystem::hitSurface.
+__device__ static bool dLensHitSurface(const DLensSystem& L, int j, const DVec3& o,
+                                       const DVec3& d, DVec3& hitP, DVec3& nrm) {
+    double zv = L.surf[j].zpos, R = L.surf[j].radius, ap = L.surf[j].aperture;
+    if (R == 0.0) {                                   // planar (stop / flat)
+        if (fabs((double)d.z) < 1e-12) return false;
+        double t = (zv - (double)o.z) / (double)d.z;
+        if (t < 1e-9) return false;
+        hitP = o + d * (Real)t;
+        nrm = DVec3{0, 0, d.z > 0 ? -1.0 : 1.0};
+    } else {
+        DVec3 C{0, 0, zv + R};
+        DVec3 op = o - C;
+        Real b = dot(op, d);
+        Real c = dot(op, op) - (Real)(R * R);
+        Real disc = b * b - c;
+        if (disc < 0) return false;
+        Real sq = sqrt(disc);
+        Real t0 = -b - sq, t1 = -b + sq;
+        bool closer = (d.z > 0) ^ (R < 0);
+        Real t = closer ? fmin(t0, t1) : fmax(t0, t1);
+        if (t < (Real)1e-9) t = closer ? fmax(t0, t1) : fmin(t0, t1);
+        if (t < (Real)1e-9) return false;
+        hitP = o + d * t;
+        nrm = normalize(hitP - C);
+        if (dot(nrm, d) > 0) nrm = -nrm;
+    }
+    if ((double)hitP.x * (double)hitP.x + (double)hitP.y * (double)hitP.y > ap * ap)
+        return false;                                 // clipped by the clear aperture
+    return true;
+}
+// Trace a lens-local ray from the film out through every interface (sensor->scene;
+// the only order the camera-ray generator needs). Port of LensSystem::trace.
+__device__ static bool dLensTrace(const DLensSystem& L, const DVec3& o0, const DVec3& d0,
+                                  Real lambda, DVec3& outO, DVec3& outD) {
+    DVec3 o = o0, d = normalize(d0);
+    for (int j = L.nSurf - 1; j >= 0; --j) {
+        DVec3 hp, n;
+        if (!dLensHitSurface(L, j, o, d, hp, n)) return false;
+        o = hp;
+        if (L.surf[j].radius != 0.0) {
+            Real eta = dLensIorSensor(L, j, lambda) / dLensIorScene(L, j, lambda);
+            DVec3 nd;
+            if (!dLensRefract(d, n, eta, nd)) return false;
+            d = nd;
+        }
+    }
+    outO = o; outD = d;
+    return true;
+}
+// Generate a world-space camera ray through the physical lens (port of
+// Camera::genLensRay). Returns false on vignetting (element/stop clip or TIR); on
+// success `weight` is the radiometric importance cos^4*A_rear/Z^2.
+__device__ static bool dGenLensRay(const DCamera& cam, int px, int py, Real jx, Real jy,
+                                   Real u1, Real u2, Real lambda,
+                                   DVec3& oW, DVec3& dW, Real& weight) {
+    weight = 0;
+    const DLensSystem& L = cam.lens;
+    double sx = 2.0 * ((px + jx) / (double)cam.resX) - 1.0;
+    double sy = 2.0 * ((py + jy) / (double)cam.resY) - 1.0;
+    double halfW = 0.5 * L.filmW_mm;
+    double halfH = halfW * ((double)cam.resY / (double)cam.resX);
+    DVec3 pFilm{-sx * halfW, -sy * halfH, L.filmZ};
+    double rearAp = L.surf[L.nSurf - 1].aperture;
+    double rearZ  = L.surf[L.nSurf - 1].zpos;
+    double rr  = sqrt(u1 > 0 ? (double)u1 : 0.0) * rearAp;
+    double phi = 2.0 * DPI * (double)u2;
+    DVec3 pRear{rr * cos(phi), rr * sin(phi), rearZ};
+    DVec3 d0 = normalize(pRear - pFilm);
+    DVec3 oL, dL;
+    if (!dLensTrace(L, pFilm, d0, lambda, oL, dL)) return false;
+    Real cosT = d0.z;                                 // d0 unit; z = cos to axis
+    if (cosT <= 0) return false;
+    Real cos4 = (cosT * cosT) * (cosT * cosT);
+    double A = DPI * rearAp * rearAp;
+    double Z = rearZ - L.filmZ;
+    if (Z <= 1e-9) return false;
+    weight = (Real)((double)cos4 * A / (Z * Z));
+    // Lens-local (mm) -> world: front vertex plane pinned at eye, mm -> scene metres.
+    oW = cam.eye + (cam.u * oL.x + cam.v * oL.y) * (Real)1e-3
+                 + cam.w * (Real)(((double)oL.z - L.T) * 1e-3);
+    dW = normalize(cam.u * dL.x + cam.v * dL.y + cam.w * dL.z);
+    return true;
+}
+// Pinhole/fisheye camera ray for pixel (px,py) (port of Camera::genRay). Used by the
+// backward tracer when the camera has no physical lens.
+__device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real jy,
+                               DVec3& ro, DVec3& rd) {
+    double sx = 2.0 * ((px + jx) / (double)cam.resX) - 1.0;
+    double sy = 2.0 * ((py + jy) / (double)cam.resY) - 1.0;
+    ro = cam.eye;
+    if (cam.projection == CAM_RECTILINEAR) {
+        rd = normalize(cam.w + cam.u * (Real)(sx * cam.tanHalfX) + cam.v * (Real)(sy * cam.tanHalfY));
+        return;
+    }
+    double rho = sqrt(sx * sx + sy * sy);
+    if (rho < 1e-12) { rd = cam.w; return; }
+    double th = dProjRadiusInv(cam.projection, rho * cam.rEdge);
+    if (th > DPI) th = DPI;
+    DVec3 radial = (cam.u * (Real)sx + cam.v * (Real)sy) * (Real)(1.0 / rho);
+    rd = normalize(cam.w * (Real)cos(th) + radial * (Real)sin(th));
+}
+
+// Surface next-event estimation (port of backward.h neeLight, v1 scope). Uniform
+// area-measure connection to each area/sphere/cylinder emitter (device emitterSample-
+// Point matches the BDPT device path; unbiased, an independent noise realization vs
+// the CPU's sphere-cone / cylinder-arc importance sampling). spot/env/collimated are
+// gated to the CPU, so they're skipped here.
+__device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
+                                    double invPdfLambda, Real lambda, DRng& rng) {
+    double total = 0.0;
+    Real f = rho / (Real)DPI;                         // Lambertian BRDF
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 2 || em.shape == 3) continue;   // beams/spot/env
+        Real u1 = rng.uniform(), u2 = rng.uniform();
+        DVec3 y, nL;
+        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        DVec3 toL = y - h.p;
+        Real dist2 = dot(toL, toL);
+        Real dist = sqrt(dist2);
+        DVec3 wi = toL / dist;
+        Real cosSurf = dot(h.n, wi);
+        if (cosSurf <= 0) continue;
+        Real cosLight = dot(nL, -wi);                 // light is one-sided
+        if (cosLight <= 0) continue;
+        if (occluded(sc, h.p + h.n * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        Real G = cosSurf * cosLight / dist2;
+        double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        double contrib = (double)(f * G) * emitW * (double)em.area;
+        if (sc.medium.enabled) contrib *= exp(-(double)medSigmaT(sc.medium, lambda) * (double)dist);
+        total += contrib;
+    }
+    return total;
+}
+
+// Estimate spectral-weighted radiance for one wavelength along a camera ray (port of
+// backward.h radiance, v1 scope: no fog/env). Emission added only on specular/camera
+// arrival; diffuse arrivals are covered by NEE (no double counting).
+__device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
+                                    Real lambda, double invPdfLambda, DRng& rng) {
+    double L = 0.0, thr = 1.0;
+    bool specularArrival = true;                       // camera ray may see a light directly
+    const int maxBounce = 32;
+    for (int b = 0; b < maxBounce; ++b) {
+        DHit h = closestHit(sc, ro, rd);
+        if (!h.valid) return L;                        // escaped (no env in v1)
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {                       // resolve stochastic mix
+            Real u = rng.uniform(), acc = 0; int child = -1;
+            for (int k = 0; k < mp->mixCount; ++k) { acc += (Real)mp->mixWeight[k]; if (u < acc) { child = mp->mixChild[k]; break; } }
+            if (child < 0) return L;                    // absorbed
+            mp = &sc.mats[child]; matId = child;
+        }
+        // Emission on specular/camera arrival (NEE covers diffuse arrivals).
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
+            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
+
+        switch (mp->type) {
+            case D_DIELECTRIC: {
+                DVec3 nro, nrd; refractOrReflect(*mp, h, rd, lambda, rng, nro, nrd);
+                ro = nro; rd = nrd; specularArrival = true; break;
+            }
+            case D_THINFILM: {
+                DVec3 nro, nrd;
+                if (!thinFilmInterface(*mp, h, rd, lambda, rng, nro, nrd)) return L;
+                ro = nro; rd = nrd; specularArrival = true; break;
+            }
+            case D_MULTILAYER: {
+                DVec3 nro, nrd;
+                if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) return L;
+                ro = nro; rd = nrd; specularArrival = true; break;
+            }
+            case D_MIRROR: {
+                Real r = clamp01(specLookup(mp->reflect, lambda));
+                if (rng.uniform() >= r) return L;       // RR absorb
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
+            }
+            case D_GRATING: {
+                Real r = clamp01(specLookup(mp->reflect, lambda));
+                if (rng.uniform() >= r) return L;
+                DVec3 nro, nrd;
+                if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return L;
+                ro = nro; rd = nrd; specularArrival = true; break;
+            }
+            case D_HALFMIRROR: {
+                Real r = clamp01(specLookup(mp->reflect, lambda));
+                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else                   { ro = h.p + rd * RAY_EPS; }
+                specularArrival = true; break;
+            }
+            case D_GLOSSY: {
+                Real r = clamp01(specLookup(mp->reflect, lambda));
+                if (rng.uniform() >= r) return L;
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), (Real)mp->roughness, rng);
+                if (dot(o, h.n) <= 0) return L;
+                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
+            }
+            case D_DIFFUSE:
+            case D_FLUORESCENT:
+            default: {
+                Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
+                L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
+                if (rng.uniform() >= rho) return L;     // RR on albedo
+                DVec3 wOut = cosineHemisphere(h.n, rng);
+                ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+            }
+        }
+    }
+    return L;
+}
+
+// Backward reference megakernel (GPU mode R). Grid-strides over res*res*spp samples;
+// each samples a wavelength, generates a camera ray (physical lens or pinhole/fisheye),
+// estimates radiance, and accumulates cieXYZ * (L * lensWeight) into the film. The film
+// holds the SUM over spp (writeFilm divides by spp), matching renderForwardCuda.
+__global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
+                          long long totalSamples, long long spp, int res,
+                          int diffraction, unsigned long long seedBase) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    for (long long idx = g; idx < totalSamples; idx += G) {
+        DRng rng; rng.seed((unsigned long long)(idx * 2 + 1), seedBase ^ (unsigned long long)idx);
+        long long pix = idx / spp;
+        int px = (int)(pix % res);
+        int py = (int)(pix / res);
+
+        double pdf = 0.0;
+        Real lambda = dSampleSceneLambda(sc, rng, pdf);
+        if (pdf <= 0.0) continue;
+        double invPdfLambda = dInvPdfLambda(sc, lambda);
+
+        DVec3 ro, rd;
+        double wLens = 1.0;
+        if (cam.hasLens) {
+            Real jx = rng.uniform(), jy = rng.uniform();
+            Real u1 = rng.uniform(), u2 = rng.uniform();
+            Real wl = 0;
+            if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, lambda, ro, rd, wl)) continue;  // vignetted
+            wLens = (double)wl;
+        } else {
+            Real jx = rng.uniform(), jy = rng.uniform();
+            dGenRay(cam, px, py, jx, jy, ro, rd);
+        }
+        double Lval = bkRadiance(sc, diffraction, ro, rd, lambda, invPdfLambda, rng);
+        double w = Lval * wLens;
+        size_t o = ((size_t)py * res + px) * 3;
+        atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
+        atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
+        atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
+        if (hits) atomicAdd(&hits[(size_t)py * res + px], 1.0);
+    }
+}
+
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
 // until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
 __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int diffraction,
@@ -2352,6 +2678,35 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
     dc.resX = res; dc.resY = res;
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
     dc.projection = cam.projection; dc.halfFovY = cam.halfFovY; dc.rEdge = cam.rEdge;
+
+    // Physical multi-element lens (mesh-lens camera). Bake each surface's sensor-side
+    // index into an SPEC_N table (air => 1) so the std::function Spectrum stays host-
+    // side. Only used by the backward tracer (mode R); forward/BDPT kernels ignore it.
+    dc.hasLens = 0;
+    dc.lens.iorAll = nullptr;
+    if (cam.hasLens()) {
+        const LensSystem& L = *cam.lens;
+        int M = (int)L.surf.size();
+        if (M > 0 && M <= D_MAXLENS) {
+            dc.hasLens = 1;
+            dc.lens.nSurf = M;
+            dc.lens.filmW_mm = L.filmW_mm; dc.lens.filmH_mm = L.filmH_mm;
+            dc.lens.T = L.T; dc.lens.filmZ = L.filmZ;
+            std::vector<double> iorAll((size_t)M * SPEC_N);
+            for (int j = 0; j < M; ++j) {
+                dc.lens.surf[j].radius    = L.surf[j].radius;
+                dc.lens.surf[j].thickness = L.surf[j].thickness;
+                dc.lens.surf[j].aperture  = L.surf[j].aperture;
+                dc.lens.surf[j].zpos      = L.zpos[j];
+                dc.lens.surf[j].isStop    = L.surf[j].isStop ? 1 : 0;
+                for (int i = 0; i < SPEC_N; ++i) {
+                    double w = DLMIN + (double)i / (SPEC_N - 1) * (DLMAX - DLMIN);
+                    iorAll[(size_t)j * SPEC_N + i] = L.surf[j].ior ? L.surf[j].ior(w) : 1.0;
+                }
+            }
+            dc.lens.iorAll = (const double*)keep(uploadVec(iorAll));
+        }
+    }
 }
 
 // Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
@@ -2531,5 +2886,70 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int res,
 
     freeUpload(up);
     cudaFree(d_cam); cudaFree(d_splat);
+    return out;
+}
+
+// --------------------- backward reference (mode R) host ----------------------
+
+bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
+    // GPU mode R needs the same POD-bakeable materials as the forward path, plus the
+    // v1 backward scope: no participating media, no environment light, only area/
+    // sphere/cylinder Lambertian emitters (spot/env/collimated fall back to the CPU),
+    // and no fluorescence. Textured albedo IS supported (dDiffuseRho ports it). This
+    // keeps dInvPdfLambda exact (geomWeight = area*PI for every emitter).
+    if (!cudaForwardSupported(scene)) return false;
+    if (scene.medium.enabled) return false;
+    if (scene.envIndex >= 0)   return false;
+    auto usesFluoro = [&](int matId) {
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const Material& m = scene.mats[matId];
+        if (m.type == MatType::Fluorescent) return true;
+        if (m.type == MatType::Mix)
+            for (int c : m.mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size() &&
+                    scene.mats[c].type == MatType::Fluorescent) return true;
+        return false;
+    };
+    for (const auto& t : scene.tris)    if (usesFluoro(t.matId)) return false;
+    for (const auto& s : scene.spheres) if (usesFluoro(s.matId)) return false;
+    for (const auto& em : scene.emitters)
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
+            return false;
+    // A physical lens deeper than the device cap falls back to the CPU tracer.
+    if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
+    return true;
+}
+
+Film renderBackwardCuda(const Scene& scene, const Camera& cam, int res,
+                        long long spp, bool diffraction) {
+    using namespace gpu;
+    Film out; out.resX = res; out.resY = res; out.alloc();
+    if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
+
+    DUpload up;
+    buildUpload(scene, cam, res, up);
+
+    const size_t npix = (size_t)res * res;
+    double* d_film = nullptr; cudaMalloc(&d_film, npix * 3 * sizeof(double));
+    double* d_hits = nullptr; cudaMalloc(&d_hits, npix * sizeof(double));
+    cudaMemset(d_film, 0, npix * 3 * sizeof(double));
+    cudaMemset(d_hits, 0, npix * sizeof(double));
+
+    long long totalSamples = (long long)res * res * spp;
+    kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, spp, res,
+                             diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
+    cudaError_t kerr = cudaGetLastError();
+    if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
+    if (kerr != cudaSuccess)
+        std::fprintf(stderr, "[cuda] backward kernel error: %s\n", cudaGetErrorString(kerr));
+
+    std::vector<double> film(npix * 3);
+    cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < npix; ++i)   // SUM over spp; writeFilm divides by spp
+        out.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+
+    freeUpload(up);
+    cudaFree(d_film); cudaFree(d_hits);
     return out;
 }
