@@ -344,6 +344,46 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** OPEN (acceptable) — feature works and looks right; accuracy of the
   underlying numbers is the tracked debt.
 
+### Built-in material presets: metal reflectances coarse, natural reflectances & iridescent recipes are representative
+- **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
+  and recipes, plus expanded glasses in `src/spectrum.h`:
+  - **Metals** — `metal:Au|Ag|Cu|Al|Cr|brass` reflectance R(λ) (`metalGold()` etc.),
+    tabulated from published normal-incidence values.
+  - **Glasses/crystals** — `glass:` gained `silica`/`fused-silica`/`quartz`,
+    `sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`
+    (Sellmeier for glass/crystal, `cauchy()` fits for water/ice/plastics), unified
+    behind `resolveGlassIor()`.
+  - **Natural diffuse** — `reflectance:leaf|skin|skin-dark|snow|soil|brick|concrete`.
+  - **Whole-material recipes** — `material { preset <name> }` via
+    `resolveMaterialPreset()`: metals (glossy), glasses (dielectric), and iridescent
+    `soap-bubble`/`oil-slick`/`anodized-ti`/`morpho`/`beetle`/`nacre`.
+- **The honesty caveats (tech debt, not a bug):**
+  1. **Metal reflectances are hand-transcribed and coarsely sampled** from published
+     n,k (Johnson & Christy / Rakić); shapes/colours are correct (validated
+     2026-07-11: diffuse-lit spheres read gold/copper/salmon/neutral-silver
+     correctly) but individual samples are approximate, not a full-resolution
+     tabulation.
+  2. **The `reflectance:` natural curves are representative shapes, not a specific
+     measured sample** — a plausible "a leaf / some skin / snow," capturing the
+     characteristic features (chlorophyll dip + red-edge, haemoglobin W, flat snow),
+     hand-built rather than drawn from a spectral library. Skin/vegetation vary
+     enormously in reality.
+  3. **The iridescent recipes (`soap-bubble`, `oil-slick`, `anodized-ti`, `morpho`,
+     `beetle`, `nacre`) are physically-motivated film/stack *configurations*, not
+     measured spectra** — layer indices/thicknesses tuned to give the right colour
+     family, not matched to a specimen.
+- **Renderer note (not a preset bug):** metal/glass presets are *specular*, so they
+  show colour only through what they reflect/transmit. In a closed pinhole (mode B)
+  box with nothing bright around them they read near-black — expected forward-tracer
+  behaviour (same as the existing `mirror`/`glossy`/`dielectric` types); use mode A,
+  an environment light, or surrounding geometry to see them. Their reflectance data
+  is correct (verified by putting the same `metal:` spectra on a diffuse surface).
+- **Proper fix (future):** ingest real datasets (refractiveindex.info for n,k, a
+  spectral reflectance library for the diffuse curves) through the planned CSV→`table`
+  loader so these become verifiable data rather than transcribed/representative.
+- **Status:** OPEN (acceptable) — presets work, load on CPU==GPU, and render the
+  right colours; numeric provenance is the tracked debt.
+
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
   child materials, weights ≤ 1, remainder absorbs) is implemented and validated

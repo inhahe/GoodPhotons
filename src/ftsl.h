@@ -58,6 +58,7 @@
 #include "camera.h"
 #include "spectrum.h"
 #include "lights.h"
+#include "materials.h"
 #include "mesh.h"
 #include "upsample.h"
 
@@ -491,9 +492,21 @@ private:
         }
         if (h.rfind("glass:", 0) == 0) {
             std::string g = h.substr(6);
-            if (g == "BK7") return iorBK7();
-            if (g == "SF10") return iorSF10();
+            Spectrum ior;
+            if (resolveGlassIor(g, ior)) return ior;
             fail("unknown glass '" + g + "'"); return iorBK7();
+        }
+        if (h.rfind("metal:", 0) == 0) {
+            std::string mname = h.substr(6);
+            Spectrum r;
+            if (resolveMetalReflectance(mname, r)) return r;
+            fail("unknown metal '" + mname + "'"); return constantSpectrum(0.9);
+        }
+        if (h.rfind("reflectance:", 0) == 0) {
+            std::string rname = h.substr(12);
+            Spectrum r;
+            if (resolveNaturalReflectance(rname, r)) return r;
+            fail("unknown reflectance '" + rname + "'"); return constantSpectrum(0.5);
         }
         if (h.rfind("preset:", 0) == 0)  return resolvePreset(h.substr(7));
         if (h.rfind("spectrum:", 0) == 0) {
@@ -575,6 +588,19 @@ private:
     // ---- materials ----
     Material buildMaterial(const Block& b) {
         Material m;
+        // Built-in whole-material recipe: `preset <name>` fills a complete material
+        // (metal / glass / iridescent film). A few common knobs may still be
+        // overridden afterwards so a preset can be lightly retuned.
+        if (find(b, "preset")) {
+            std::string pname = strOf(b, "preset", "");
+            if (!resolveMaterialPreset(pname, m)) { fail("unknown material preset '" + pname + "'"); return m; }
+            if (find(b, "roughness"))      m.roughness     = dblOf(b, "roughness", m.roughness);
+            if (find(b, "film_ior"))       m.filmIor       = dblOf(b, "film_ior", m.filmIor);
+            if (find(b, "film_thickness")) m.filmThickness = dblOf(b, "film_thickness", m.filmThickness);
+            if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
+            if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
+            return m;
+        }
         std::string type = strOf(b, "type", "diffuse");
         if (type == "diffuse") {
             m.type = MatType::Diffuse;

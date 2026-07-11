@@ -134,12 +134,27 @@ declared once as a named `spectrum` block and referenced as `spectrum:name`.
 | `blackbody 6500`                       | Planck's law at 6500 K (normalized)                            | `blackbody` — **[maps 1:1]**   |
 | `gaussian center=550 sigma=40 amp=0.8` | Gaussian band (emission lines, fluorescence)                   | `gaussianBand` — **[maps 1:1]** |
 | `shortpass edge=500 slope=0.2 amp=1`   | Logistic high-pass (excitation filters)                        | `shortPass` — **[maps 1:1]**   |
-| `glass:BK7`, `glass:SF10`              | Named Sellmeier dispersion curve (refractive index)           | `iorBK7`, `iorSF10` — **[maps 1:1]** |
+| `glass:BK7`, `glass:diamond`, ...      | Named dispersion curve (refractive index) — see list below    | `resolveGlassIor`, `src/spectrum.h` — **[maps 1:1]** |
+| `metal:Au`, `metal:copper`, ...        | Named metal reflectance R(λ) from measured n,k                | `resolveMetalReflectance`, `src/materials.h` — **[maps 1:1]** |
+| `reflectance:leaf`, `reflectance:skin`, ... | Named natural diffuse reflectance (representative)        | `resolveNaturalReflectance`, `src/materials.h` — **[maps 1:1]** |
 | `ior 1.5`                              | Constant refractive index                                     | `iorConstant` — **[maps 1:1]** |
-| `table { 400:0.05 450:0.12 ... }`      | Piecewise-linear measured curve (λnm:value pairs)             | **[needs engine work]** — add a `tabulatedSpectrum(pairs)` builder (trivial: linear interp) |
+| `table { 400:0.05 450:0.12 ... }`      | Piecewise-linear measured curve (λnm:value pairs)             | `tabulatedSpectrum` — **[maps 1:1]** |
 | `rgb 0.63 0.06 0.05`                   | Convenience: upsample an sRGB triple to a smooth reflectance   | `rgbToReflectanceJH` (Jakob-Hanika sigmoid fit, `src/upsample.h`) — **[maps 1:1]**; validated by `-checkupsample` |
 | `spectrum:name`                        | Reference a named `spectrum` block                            | name resolution                |
 | `preset:D65`, `preset:led`, ...        | Named illuminant SPD (see §5)                                 | `src/lights.h` — **[maps 1:1]** |
+
+**`glass:<name>` dispersion curves** (refractive index vs λ, `src/spectrum.h`):
+`BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`, `sapphire`,
+`diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`. Sellmeier for
+the glasses/crystals, Cauchy fits for water/ice/plastics.
+
+**`metal:<name>` reflectances** (normal-incidence R(λ) from measured complex index,
+`src/materials.h`): `Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`,
+`Cr`/`chrome`, `brass`. Feed a `mirror`/`glossy` `reflect`.
+
+**`reflectance:<name>` natural diffuse curves** (representative spectral shapes, *not*
+a specific measured sample — see known-issues): `leaf`/`vegetation`, `skin`/`skin-light`,
+`skin-dark`, `snow`, `soil`/`dirt`, `brick`/`red-brick`, `concrete`.
 
 ### 2.2 Named spectrum blocks
 
@@ -156,11 +171,15 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 §2.1 or a `spectrum:name` reference.
 
 > **Note on measured material spectra** (todo item "can we find spectral
-> envelopes for any common materials?"): the `table { }` form is exactly the
-> ingestion point for published datasets (e.g. the RPMK / Vos-measured pigment
-> and metal reflectances, or the refractiveindex.info database). A small
-> converter tool could turn a CSV of λ,value into a `spectrum "..." = table {…}`
-> block. This is the recommended path for real material fidelity.
+> envelopes for any common materials?"): **partly done** — built-in `metal:<name>`
+> reflectances, an expanded `glass:<name>` dispersion set, `reflectance:<name>`
+> natural curves, and whole-material `preset`s (§3.1) now ship for common
+> materials. The metal reflectances and glass IORs are real measured data (n,k /
+> Sellmeier); the natural reflectances and iridescent recipes are representative,
+> not per-sample measurements (see known-issues.md). For full fidelity to a
+> specific dataset, the `table { }` form remains the ingestion point for published
+> data (e.g. RPMK/Vos pigment & metal reflectances, or refractiveindex.info); a
+> small CSV→`table` converter is still the recommended path.
 
 ---
 
@@ -201,6 +220,35 @@ material "glow"    { type fluorescent  absorb spectrum:excite  emit spectrum:emi
 | `grating`     | **diffraction** (vector grating eq.) | `reflect <spectrum>` → `reflect`; `groove_spacing <nm>` → `grooveSpacing`; `groove_dir x y z` → `grooveDir`; `max_order <int>` → `gratingMaxOrder`. |
 | `fluorescent` | **fluorescence** (wavelength shift) | `absorb <spectrum>` → `fluoAbsorb` (excitation ε(λ)); `emit <spectrum>` → `fluoEmit` (re-emission M(λ′), auto-baked into `fluoEmitSampler`); `yield <0..1>` → `fluoYield` (quantum yield Q); `reflect <spectrum>` → `reflect` (elastic base). |
 | `mix`         | **stochastic blend of materials** | `layer "<name>" <weight>` (repeatable) → `mixChildren`/`mixWeights`. Per photon, pick child `k` with prob `weight_k`; leftover `1 − Σweight` absorbs. Children are named non-mix materials. See §3.2. |
+
+#### Built-in material recipes (`preset <name>`)
+
+Instead of `type` + parameters, a material block may name a **built-in recipe** that
+fills a complete material (a `MatType` plus tuned parameters) for a common real-world
+substance — one keyword for a realistic gold, diamond, or soap film. A few knobs
+(`roughness`, `film_ior`, `film_thickness`, `reflect`, `ior`) may follow the preset to
+retune it. Recipes live in `src/materials.h` (`resolveMaterialPreset`).
+
+```
+material "ring"   { preset gold }                 # polished gold (glossy + measured reflectance)
+material "brushed"{ preset gold  roughness 0.4 }  # same, rougher
+material "gem"    { preset diamond }              # dielectric, n≈2.42 dispersion
+material "film"   { preset soap-bubble  film_thickness 300 }
+```
+
+| Preset name(s) | Expands to | Notes |
+|---|---|---|
+| `gold`, `silver`, `copper`, `aluminium`/`aluminum`, `chrome`, `brass` | `glossy` + `metal:<name>` reflectance, `roughness 0.05` | measured normal-incidence reflectance; **specular — reflects its surroundings, so it needs an environment/other geometry to look right (near-black in an empty pinhole box; use mode A or an env light)** |
+| `glass`, `crown`, `flint`, `water`, `diamond`, `sapphire`, `silica`/`fused-silica`/`quartz`, `acrylic`/`pmma`, `polycarbonate`/`pc`, `ice` | `dielectric` + `glass:<name>` IOR | real dispersion (Sellmeier/Cauchy); `glass` = BK7 crown |
+| `soap-bubble`/`bubble` | `thinfilm`, 1.33 film / 380 nm, transparent | classic reflected-only interference film |
+| `oil-slick`/`oil` | `thinfilm`, 1.47 film / 320 nm, absorbing substrate | opaque oil-on-asphalt sheen |
+| `anodized-ti`/`anodized-titanium` | `thinfilm`, TiO₂ 2.30 / 250 nm on Ti | anodised-metal structural colour |
+| `morpho` | `multilayer`, 6× chitin/air quarter-wave (blue) | Morpho butterfly |
+| `beetle`/`jewel-beetle` | `multilayer`, 6× high/low chitin (green) | jewel-beetle elytra |
+| `nacre`/`mother-of-pearl` | `multilayer`, aragonite/conchiolin platelets | pastel mother-of-pearl |
+
+Iridescent recipes are physically-motivated film/stack configurations, not measured
+spectra — override `film_thickness` (thinfilm) to shift the colour.
 
 ### 3.2 Combining effects on one surface — the `layered` material
 
