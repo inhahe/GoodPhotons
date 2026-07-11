@@ -123,19 +123,21 @@ paths they can capture at all**.
 - **`D` — BDPT (most general, slowest per sample).** One unbiased estimator that
   traces a light *and* a camera subpath and MIS-combines every connection, so it
   captures **specular-first pixels and diffuse caustics in a single pass** on the
-  absolute-radiance scale (no composite seam). *Cost:* highest cost per sample,
-  CPU-only, and it **does not support fluorescence, participating media, or spot &
-  env lights** (use `B`/`P` or `R` for those).
+  absolute-radiance scale (no composite seam). GPU-accelerated (its own megakernel).
+  *Cost:* highest cost per sample, and it **does not support fluorescence,
+  participating media, or spot & env lights** (use `B`/`P` or `R` for those).
 
-Only the **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are
-progressive and GPU-eligible; brightness is photon-count-independent, so more
-photons only reduce graininess.
+The **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are progressive and
+GPU-eligible, and **`D` has its own GPU BDPT megakernel**; brightness is
+photon-count-independent, so more photons only reduce graininess. The backward
+tracer (`R`, and the backward layer of `P`) is the only part with no GPU path.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
 - **`-device auto` (default, recommended).** Uses the GPU when a supported CUDA
-  device is present *and* the render is a forward trace it can handle (modes
-  `A`/`B`/`C` on a non-fluorescent scene); otherwise the CPU. Prints its choice.
+  device is present *and* the render is one it can handle (forward modes
+  `A`/`B`/`C` on a non-fluorescent scene, or mode `D`'s BDPT megakernel); otherwise
+  the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the backward tracer (mode `R`, the mode-`P` camera layer) and for fluorescent
   scenes. `cpu` is fully deterministic and is used for reference/validation

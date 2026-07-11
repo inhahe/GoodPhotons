@@ -10,9 +10,10 @@
 //   -mode D : bidirectional path tracing (BDPT) — one unbiased estimator that traces
 //             a light AND a camera subpath and MIS-combines every connection. Renders
 //             specular-first pixels directly (no composite seam) AND diffuse caustics
-//             in a single pass, on the absolute-radiance scale. CPU-only. Does not
-//             support fluorescence / participating media / spot & env lights (use B/P
-//             or R for those). See renderBdpt / bdpt.h.
+//             in a single pass, on the absolute-radiance scale. GPU-accelerated (its
+//             own BDPT megakernel; see renderBdptCuda). Does not support fluorescence /
+//             participating media / spot & env lights (use B/P or R for those). See
+//             renderBdpt / bdpt.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
@@ -23,8 +24,9 @@
 //   gpu  — force the GPU; warns and falls back to the CPU if it can't be used.
 //   cpu  — force the CPU (deterministic; used for reference/validation baselines).
 // The GPU runs the forward light trace (models A/B/C, and the forward pass of mode
-// V) as a CUDA megakernel; it falls back to the CPU for the backward tracer (mode R,
-// the mode-P camera-side layer) and fluorescent scenes. The CUDA backend is optional
+// V) as a CUDA megakernel, and mode D as its own BDPT megakernel; it falls back to
+// the CPU for the backward tracer (mode R, the mode-P camera-side layer) and
+// fluorescent scenes. The CUDA backend is optional
 // at build time (see CMakeLists.txt / FTRACE_CUDA_ARCH); without a CUDA toolkit the
 // renderer is CPU-only and -device gpu/auto use the CPU.
 //
