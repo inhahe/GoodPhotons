@@ -88,7 +88,7 @@ paths they can capture at all**.
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
-| `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU |
+| `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 
 ### Speed / accuracy / ability tradeoffs
@@ -122,8 +122,11 @@ paths they can capture at all**.
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for
   diffuse-first pixels and caustics, and a backward camera ray for
   specular/coated surfaces that `B` leaves black — a good "best of both" for scenes
-  that mix diffuse lighting with mirrors/coatings. *Cost:* CPU-only and more
-  expensive than plain `B`; there can be a subtle seam between the two layers.
+  that mix diffuse lighting with mirrors/coatings. Both layers are GPU-accelerated
+  (the forward layer via the `B` megakernel, the camera-side via `R`'s backward
+  megakernel) when the scene is within the backward-GPU scope; otherwise the
+  camera-side layer falls back to the CPU. *Cost:* more expensive than plain `B`;
+  there can be a subtle seam between the two layers.
 - **`D` — BDPT (most general, slowest per sample).** One unbiased estimator that
   traces a light *and* a camera subpath and MIS-combines every connection, so it
   captures **specular-first pixels and diffuse caustics in a single pass** on the
@@ -133,20 +136,22 @@ paths they can capture at all**.
 
 The **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are progressive and
 GPU-eligible, **`D` has its own GPU BDPT megakernel**, and **`R` (including the
-physical-lens camera) has its own GPU backward megakernel**; brightness is
-photon-count-independent, so more photons only reduce graininess. The backward layer
-of the `P` composite (and `V`'s backward reference, kept on the CPU as a stable
-ground truth) are the only parts still CPU-only.
+physical-lens camera) has its own GPU backward megakernel** — which the **`P`
+composite reuses for its camera-side layer**, so both of `P`'s layers run on the GPU
+when the scene is within the backward-GPU scope. Brightness is photon-count-
+independent, so more photons only reduce graininess. Outside that scope `P`'s
+camera-side layer, and `V`'s backward reference (kept on the CPU as a stable ground
+truth), remain CPU-only.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
 - **`-device auto` (default, recommended).** Uses the GPU when a supported CUDA
   device is present *and* the render is one it can handle (forward modes
-  `A`/`B`/`C` on a non-fluorescent scene, mode `D`'s BDPT megakernel, or mode `R`'s
-  backward megakernel — including the physical-lens camera); otherwise the CPU.
-  Prints its choice.
+  `A`/`B`/`C` on a non-fluorescent scene, mode `D`'s BDPT megakernel, mode `R`'s
+  backward megakernel — including the physical-lens camera — or both layers of the
+  mode-`P` composite); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
-  for the mode-`P` camera layer, for `R`/`D` scenes outside their GPU scope
+  for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
   (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
   forward scenes. `cpu` is fully deterministic and is used for reference/validation
   baselines.

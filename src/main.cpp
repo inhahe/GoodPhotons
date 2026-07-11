@@ -1085,13 +1085,23 @@ static Film renderComposite(const Scene& scene, const Camera& cam, int res,
                             long long N, long long spp, int nThreads, bool diffraction = true,
                             bool useGpu = false, bool wavefront = false) {
     EnergyReport e;
-    // Only the forward (model-B) layer can run on the GPU; the camera-side backward
-    // layer (renderBackward, below) is CPU-only. useGpu therefore accelerates just the
-    // forward half of the composite.
+    // Both layers can run on the GPU: the forward (model-B) layer via renderForward's
+    // useGpu path, and the camera-side backward layer via the mode-R backward megakernel
+    // (renderBackwardCuda) when the scene is within its v1 scope (no fog/env/spot/
+    // collimated/fluorescence). Outside that scope the backward layer falls back to CPU,
+    // so useGpu still accelerates at least the forward half.
     Film fwd = renderForward(scene, &cam, res, N, nThreads,
                              /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e,
                              diffraction, useGpu, /*seedBase*/0, wavefront);
-    Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+    Film ref;
+#ifdef HAVE_CUDA
+    if (useGpu && cudaBackwardSupported(scene, cam))
+        ref = renderBackwardCuda(scene, cam, res, spp, diffraction);
+    else
+        ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+#else
+    ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
+#endif
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
 
     // Classify each pixel by its first camera-ray hit. specular-side pixels take
@@ -1322,10 +1332,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
-    // the forward layer of the mode-P composite); the backward tracer (mode R, the
-    // mode-P camera-side layer) always runs on the CPU. Fisheye/panoramic lenses now
-    // run on the GPU too (the device camera's project()/pixelSolidAngle() port the
-    // analytic projection remap) for the pinhole-splat modes (B/V/P).
+    // the forward layer of the mode-P composite) AND the backward tracer (mode R, and
+    // the mode-P camera-side layer) when the scene is within the backward-GPU v1 scope
+    // (renderBackwardCuda / cudaBackwardSupported — no fog/env/spot/collimated/
+    // fluorescence); otherwise the backward layer falls back to the CPU. Mode V keeps
+    // its backward reference on the CPU by design. Fisheye/panoramic lenses run on the
+    // GPU too (the device camera's project()/pixelSolidAngle() port the analytic
+    // projection remap) for the pinhole-splat modes (B/V/P).
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
@@ -1404,9 +1417,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                      "material)\n");
         } else {
             useGpu = true;
+            const char* pSuffix = "";
+            if (mode == 'P')
+                pSuffix = cudaBackwardSupported(scene, cam)
+                        ? " (forward + camera-side layers)"
+                        : " (forward layer; camera-side stays CPU — outside backward-GPU scope)";
             std::printf("[device] %s -> GPU: %s%s\n", wantAuto ? "auto" : "gpu",
-                        cudaDeviceName(),
-                        mode == 'P' ? " (forward layer; camera-side stays CPU)" : "");
+                        cudaDeviceName(), pSuffix);
         }
 #else
         if (wantGpu)

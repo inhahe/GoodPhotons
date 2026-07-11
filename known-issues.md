@@ -611,9 +611,14 @@ as practical; this file is the fallback for what can't be addressed immediately.
   **hit counts** on-device (a `d_hits` buffer incremented in `filmAdd`, downloaded into
   `Film::hits`) — matching the CPU `Film::add`. This fixed a latent bug where the GPU
   never populated `hits`, so the progressive `~X% noise` graininess estimate (and the
-  new `-noise` stop) read a constant **0%** for any `-device gpu` render. It still falls
-  back to the CPU for mode R (backward reference) and the mode-P camera-side/backward
-  layer (no backward tracer on-device). **Fluorescence is now ported on-device (done
+  new `-noise` stop) read a constant **0%** for any `-device gpu` render. The backward
+  tracer is now on-device too: **mode R has its own GPU backward megakernel** (`kBackward`,
+  Plan A, 2026-07-11 — including the physical mesh-lens as a ray-gen front-end), and the
+  **mode-P composite reuses it for its camera-side layer** (`renderComposite` calls
+  `renderBackwardCuda` when `cudaBackwardSupported`), so both of P's layers run on the GPU
+  within the backward-GPU scope. Only scenes outside that scope (fog/env/spot/collimated/
+  fluorescence) — and mode V's backward reference, kept on the CPU by design as a stable
+  ground truth — still use the CPU backward tracer. **Fluorescence is now ported on-device (done
   2026-07-11):** each Fluorescent material bakes its excitation spectrum
   (`DMaterial.fluoAbsorb`) and emission-SPD CDF (a flat `fluoCdfAll` slice, per-material
   `fluoCdfOffset/N/step`); the `shadeStep` `D_FLUORESCENT` branch splats the elastic
@@ -683,9 +688,12 @@ as practical; this file is the fallback for what can't be addressed immediately.
   build-system change (compile this one file with `hipcc`), not a code rewrite. **CUDA is
   the supported GPU backend today; HIP is a near-drop-in future target (untested — no AMD
   hardware here).**
-- **Proper fix (future):** port the backward tracer (modes R and the mode-P
-  camera-side layer) to CUDA if those paths ever become the bottleneck. (The device
-  fluorescence path and textured-albedo path are done — see above.)
+- **Proper fix — DONE (2026-07-11):** the backward tracer is now ported to CUDA — mode R
+  has its own GPU backward megakernel (`kBackward`, including the physical-lens ray-gen
+  front-end), and the mode-P composite reuses it for its camera-side layer. (The device
+  fluorescence path and textured-albedo path are done too — see above.) Remaining CPU-only
+  backward work: scenes outside the backward-GPU scope (fog/env/spot/collimated/
+  fluorescence) and mode V's reference (kept on the CPU by design).
 - **Status:** OPEN (acceptable) — logged 2026-07-10; A/C, mixed-precision FP32, portable
   multi-arch build, and the HIP compat layer added same day. Requires a CUDA toolkit at
   configure time; without one the project builds CPU-only and `-device gpu` warns and
