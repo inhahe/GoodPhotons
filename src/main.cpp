@@ -1410,6 +1410,40 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     return true;
 }
 
+// Is anything in this scene outside BDPT's (mode D) transport scope? Returns a human
+// description of the first unsupported feature, or nullptr if the scene is fully BDPT-
+// renderable. BDPT here covers Lambertian/glossy scatter + quad/sphere area emission
+// only; fluorescence, participating media, spot/env/collimated lights and the layered
+// stack would silently drop their contribution, so the caller refuses (mode D) or
+// routes elsewhere (mode P with a lens falls back to mode R). Only materials actually
+// referenced by geometry are flagged (built-in palettes carry spare unused entries);
+// Mix children are expanded since a used Mix can pick e.g. a fluorescent child.
+static const char* bdptUnsupportedFeature(const Scene& scene) {
+    if (scene.medium.enabled) return "participating media (fog)";
+    std::vector<char> matUsed(scene.mats.size(), 0);
+    // Mark a material and (one level, since Mix children can't themselves be Mix) its
+    // Mix children, which a used Mix can pick at runtime.
+    auto markUsed = [&](int id) {
+        if (id < 0 || id >= (int)scene.mats.size() || matUsed[id]) return;
+        matUsed[id] = 1;
+        if (scene.mats[id].type == MatType::Mix)
+            for (int c : scene.mats[id].mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size()) matUsed[c] = 1;
+    };
+    for (const auto& tr : scene.tris) markUsed(tr.matId);
+    for (const auto& sp : scene.spheres) markUsed(sp.matId);
+    for (size_t i = 0; i < scene.mats.size(); ++i)
+        if (matUsed[i] && scene.mats[i].type == MatType::Fluorescent)
+            return "fluorescent materials";
+    for (size_t i = 0; i < scene.mats.size(); ++i)
+        if (matUsed[i] && scene.mats[i].type == MatType::Layered)
+            return "layered materials";
+    for (const auto& em : scene.emitters)
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
+            return "spot / environment / collimated lights";
+    return nullptr;
+}
+
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
 // runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
@@ -1486,11 +1520,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (gpuBdptMode) {
-            // Mode D has its own (stricter) GPU support check: BDPT scope only.
-            if (!cudaBdptSupported(scene)) {
-                const char* why = "scene has a BDPT-GPU-unsupported feature "
-                                  "(fluorescent/textured/oversized-mix material, fog, "
-                                  "or spot/env/collimated light)";
+            // Mode D has its own (stricter) GPU support check: BDPT scope only. The GPU
+            // BDPT megakernel generates pinhole camera rays, so a realistic lens on the
+            // camera subpath (Plan B) forces the CPU BDPT path.
+            if (!cudaBdptSupported(scene) || cam.hasLens()) {
+                const char* why = cam.hasLens()
+                    ? "a physical lens on the camera subpath (GPU BDPT is pinhole-only)"
+                    : "scene has a BDPT-GPU-unsupported feature "
+                      "(fluorescent/textured/oversized-mix material, fog, "
+                      "or spot/env/collimated light)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -1589,43 +1627,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 
     // --- Bidirectional path tracing (mode D) ---
     if (mode == 'D') {
-        // BDPT's connection strategies here cover Lambertian/glossy scatter and
-        // quad/sphere area emission only. Features outside that scope (fluorescence,
-        // participating media, spot/env/collimated lights) would silently drop their
-        // contribution, so refuse rather than render a subtly wrong image.
-        const char* unsupported = nullptr;
-        if (scene.medium.enabled) unsupported = "participating media (fog)";
-        // Only flag materials actually referenced by geometry (built-in palettes carry
-        // spare entries like an unused fluorescent material). Expand Mix children too,
-        // since a used Mix can pick a fluorescent child at runtime.
-        std::vector<char> matUsed(scene.mats.size(), 0);
-        auto markUsed = [&](int id) {
-            if (id < 0 || id >= (int)scene.mats.size() || matUsed[id]) return;
-            matUsed[id] = 1;
-            if (scene.mats[id].type == MatType::Mix)
-                for (int c : scene.mats[id].mixChildren)
-                    if (c >= 0 && c < (int)scene.mats.size()) matUsed[c] = 1;
-        };
-        for (const auto& tr : scene.tris) markUsed(tr.matId);
-        for (const auto& sp : scene.spheres) markUsed(sp.matId);
-        if (!unsupported)
-            for (size_t i = 0; i < scene.mats.size(); ++i)
-                if (matUsed[i] && scene.mats[i].type == MatType::Fluorescent) {
-                    unsupported = "fluorescent materials"; break;
-                }
-        // The physical layered stack (coat interface over a weighted body) has no BDPT
-        // vertex strategy yet — its randomWalk case would `default: terminate` and drop
-        // the surface silently, so refuse rather than render it black.
-        if (!unsupported)
-            for (size_t i = 0; i < scene.mats.size(); ++i)
-                if (matUsed[i] && scene.mats[i].type == MatType::Layered) {
-                    unsupported = "layered materials"; break;
-                }
-        for (const auto& em : scene.emitters)
-            if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated) {
-                unsupported = "spot / environment / collimated lights"; break;
-            }
-        if (unsupported) {
+        // Refuse scenes outside BDPT's transport scope rather than render a subtly wrong
+        // image (a realistic lens on the camera subpath IS supported — see bdpt.h).
+        if (const char* unsupported = bdptUnsupportedFeature(scene)) {
             std::fprintf(stderr, "[mode D] this scene uses %s, which BDPT (mode D) does not "
                                  "support; render it with mode B/P (forward) or mode R "
                                  "(backward) instead.\n", unsupported);
@@ -2038,15 +2042,48 @@ int main(int argc, char** argv) {
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
             char cmode = effMode(cs->mode);
             if (cs->lens) {
-                // Physical multi-element lens: the backward realistic-camera path traces
-                // rays from the film through the real glass, so it renders in mode R
-                // (the analytic pinhole/thin-lens modes A/B/C/P/D do not apply).
+                // Physical multi-element lens: the realistic-camera ray-gen (genLensRay)
+                // traces film->scene through the real glass. The analytic pinhole/thin-
+                // lens forward modes (A/B/C) and the pinhole-splat composite (P) can't
+                // form that image, so they render in mode R (backward realistic camera).
+                // Mode D keeps the lens on its camera subpath (Plan B): the backward lens
+                // ray still lights through the glass while forward light transport keeps
+                // its caustic efficiency (the light-image splat, t=1, is disabled).
+                // Mode P routes to that lens-aware BDPT, since P's forward pass splats to
+                // a pinhole and can't be pushed through the lens.
                 c.lens = cs->lens;
-                if (cmode != 'R') {
+                double flmm = cs->lens->focalLengthMM();
+                double fw = cs->lens->filmW_mm, fh = cs->lens->filmH_mm;
+                if (cmode == 'D') {
+                    std::printf("[camera] '%s' has a physical lens -> mode D (BDPT) with "
+                                "the lens on the camera subpath (Plan B; light-image splat "
+                                "disabled); f=%.1fmm, sensor %.1fx%.1fmm\n",
+                                cs->name.c_str(), flmm, fw, fh);
+                } else if (cmode == 'P') {
+                    // The composite's forward pass splats to a pinhole and can't be
+                    // pushed through the lens, so route to the lens-aware BDPT (mode D)
+                    // when the scene is within BDPT scope; otherwise (fog/fluorescence/
+                    // spot-env/layered) fall back to the backward realistic camera (R),
+                    // which supports those — matching the pre-Plan-B behavior.
+                    if (const char* why = bdptUnsupportedFeature(scene)) {
+                        std::printf("[camera] '%s' has a physical lens -> mode P falls back "
+                                    "to mode R (backward realistic camera): the composite "
+                                    "can't route its pinhole splat through the lens, and the "
+                                    "scene uses %s (outside lens-aware BDPT scope); "
+                                    "f=%.1fmm, sensor %.1fx%.1fmm\n",
+                                    cs->name.c_str(), why, flmm, fw, fh);
+                        cmode = 'R';
+                    } else {
+                        std::printf("[camera] '%s' has a physical lens -> mode P routes to "
+                                    "the lens-aware BDPT (mode D): the composite's pinhole-"
+                                    "splat forward pass can't form the lens image; f=%.1fmm, "
+                                    "sensor %.1fx%.1fmm\n", cs->name.c_str(), flmm, fw, fh);
+                        cmode = 'D';
+                    }
+                } else if (cmode != 'R') {
                     std::printf("[camera] '%s' has a physical lens -> rendering in mode R "
                                 "(backward realistic camera); f=%.1fmm, sensor %.1fx%.1fmm\n",
-                                cs->name.c_str(), cs->lens->focalLengthMM(),
-                                cs->lens->filmW_mm, cs->lens->filmH_mm);
+                                cs->name.c_str(), flmm, fw, fh);
                     cmode = 'R';
                 }
             }

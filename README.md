@@ -115,13 +115,15 @@ paths they can capture at all**.
   unapproximated forward-catch.
 - **`R` — backward reference (unbiased, general).** Traces from the camera, so it
   renders **any** first-hit surface including specular, and is the **quiet, reliable
-  reference** for camera-visible lighting. GPU-accelerated (its own backward
-  megakernel, which also drives the **physical multi-element lens** camera on the
-  GPU). It gets **noisy on caustics** (light focused through glass/water is hard to
-  find backward). *GPU scope:* the megakernel covers area/sphere/cylinder Lambertian
-  lights and all the specular/textured materials; scenes using fog, environment
-  lights, spot/collimated lights, or fluorescence fall back to the CPU tracer
-  automatically.
+  reference** for camera-visible lighting. It also renders **fluorescence** — the
+  backward tracer is bispectral, sampling a separate excitation wavelength and
+  reradiating with the material's emission colour (so `V` can validate the forward
+  fluorescent tracer). GPU-accelerated (its own backward megakernel, which also drives
+  the **physical multi-element lens** camera on the GPU). It gets **noisy on caustics**
+  (light focused through glass/water is hard to find backward). *GPU scope:* the
+  megakernel covers area/sphere/cylinder Lambertian lights and all the
+  specular/textured materials; scenes using fog, environment lights, spot/collimated
+  lights, or fluorescence fall back to the CPU tracer automatically.
 - **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
   check, not a production renderer (roughly twice the work).
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for
@@ -131,13 +133,20 @@ paths they can capture at all**.
   (the forward layer via the `B` megakernel, the camera-side via `R`'s backward
   megakernel) when the scene is within the backward-GPU scope; otherwise the
   camera-side layer falls back to the CPU. *Cost:* more expensive than plain `B`;
-  there can be a subtle seam between the two layers.
+  there can be a subtle seam between the two layers. With a **physical lens** the
+  pinhole-splat forward pass can't form the lens image, so `P` automatically routes
+  to the lens-aware BDPT (`D`) — or, if the scene is outside BDPT scope (fog / env /
+  spot / fluorescence), falls back to the backward realistic camera (`R`).
 - **`D` — BDPT (most general, slowest per sample).** One unbiased estimator that
   traces a light *and* a camera subpath and MIS-combines every connection, so it
   captures **specular-first pixels and diffuse caustics in a single pass** on the
   absolute-radiance scale (no composite seam). GPU-accelerated (its own megakernel).
-  *Cost:* highest cost per sample, and it **does not support fluorescence,
-  participating media, or spot & env lights** (use `B`/`P` or `R` for those).
+  It also supports the **physical (realistic) lens on its camera subpath** — the
+  camera ray is traced through the real glass while forward light transport keeps its
+  caustic efficiency (the light-image splat strategy is disabled, since a multi-element
+  lens has no closed-form sensor projection; this runs on the CPU). *Cost:* highest
+  cost per sample, and it **does not support fluorescence, participating media, or
+  spot & env lights** (use `B`/`P` or `R` for those).
 
 The **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are progressive and
 GPU-eligible, **`D` has its own GPU BDPT megakernel**, and **`R` (including the
@@ -202,8 +211,10 @@ glass interfaces plus an aperture stop. The backward tracer samples a film point
 and a point on the rear element and traces the ray *through the actual glass*
 (per-wavelength Snell refraction), so **depth of field, distortion, spherical &
 chromatic aberration, field curvature and vignetting all emerge from the
-geometry** — no thin-lens approximation. A physical lens automatically renders in
-mode `R`.
+geometry** — no thin-lens approximation. A physical lens renders in mode `R`
+(backward realistic camera) by default, or in mode `D` (BDPT with the lens on the
+camera subpath) when you want forward light transport's caustic efficiency through
+the glass; mode `P` routes to whichever of those fits the scene.
 
 ```ftsl
 camera "real" {
@@ -230,19 +241,22 @@ camera "real" {
 slower** option. It captures real optical behaviour the thin lens cannot
 (aberrations, distortion, field curvature, natural vignetting, dispersion-driven
 colour fringing, and aperture-shaped bokeh), but it traces every camera ray
-through the glass stack and is **backward-only (mode `R`)** — so it is more
-expensive per sample than the analytic thin lens. It **runs on the GPU** (mode
-`R`'s backward megakernel refracts each camera ray through the glass stack on the
-device), so within the GPU-supported scope it is still fast. Reach for the analytic
-lens/projection when you want speed and a clean ideal image, and the physical lens
-when you want a specific real objective's look.
+through the glass stack, so it is more expensive per sample than the analytic thin
+lens. In mode `R` it **runs on the GPU** (the backward megakernel refracts each
+camera ray through the glass stack on the device), so within the GPU-supported scope
+it is still fast; in mode `D` the lens rides on the BDPT camera subpath and runs on
+the CPU. Reach for the analytic lens/projection when you want speed and a clean ideal
+image, and the physical lens when you want a specific real objective's look.
 
-*Current limits:* the physical lens is backward-only (mode `R`); it maps the sensor
-across the film width, so a film whose aspect matches the sensor (e.g. `res 360 240`
-for a 3:2 sensor) covers it without cropping, while a mismatched aspect crops. It does
-not model inter-element flare/ghosting or shaped-iris bokeh. On the GPU it inherits mode
-`R`'s scope (no fog/env/spot/fluorescence, and at most 16 lens surfaces); outside
-that it falls back to the CPU tracer automatically.
+*Current limits:* the lens attaches to the **camera subpath** — mode `R` (backward),
+mode `D` (BDPT, keeping forward caustics but with the light-image splat disabled), or
+mode `P` (which routes to `D`/`R`). It maps the sensor across the film width, so a
+film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
+without cropping, while a mismatched aspect crops. It does not model inter-element
+flare/ghosting or shaped-iris bokeh. On the GPU (mode `R`) it inherits mode `R`'s
+scope (no fog/env/spot/fluorescence, and at most 16 lens surfaces); mode `D` with a
+lens runs on the CPU. Outside a mode's GPU scope it falls back to the CPU
+automatically.
 
 ---
 
@@ -442,5 +456,5 @@ deterministically.
 ## Known issues & roadmap
 
 Open limitations and technical debt are tracked in `known-issues.md` — including
-the physical-lens camera's remaining gaps (BDPT/composite support, inter-element
-flare) and the shared multi-camera pass.
+the physical-lens camera's remaining gaps (inter-element flare/ghosting,
+shaped-iris bokeh, GPU BDPT lens) and the shared multi-camera pass.
