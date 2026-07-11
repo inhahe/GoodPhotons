@@ -31,18 +31,29 @@ as practical; this file is the fallback for what can't be addressed immediately.
   camera (`runRender` is called in a loop in `src/main.cpp`).
 - **Why it matters:** the wishlist's framing is "many cameras at once… *same
   render for efficiency*". For N cameras this is N× the photon work instead of 1×.
-- **Proper fix (future):** a single **shared mode-B photon pass** that connects
-  each diffuse/emitter vertex to *every* camera's pupil at once. Photons are
-  camera-independent until the `connect()` splat, so `tracePhoton` would take a
-  list of (Camera, Film) targets and call `connect`/`connectVolume` once per
-  camera per vertex; per-thread films become per-thread × per-camera. Mode A
-  (finite-lens next-event splat) shares this structure and could join the shared
-  pass (connect to each camera's pupil per vertex); mode C (thin-lens forward
-  catch) is inherently per-camera and would stay single-camera or need its own
-  catch loop; the CUDA kernel would also need
-  the camera list (currently one `DCamera`). Scoped as a follow-up so the initial
-  multi-camera feature (correct, just not yet shared) could land validated.
-- **Status:** OPEN (acceptable) — multi-camera done 2026-07-10; shared pass deferred.
+- **CPU shared pass — DONE 2026-07-11.** `tracePhoton` now takes a list of
+  `CamTarget{Camera,Film}` and splats each diffuse/emitter/volume vertex to *every*
+  camera at once (`camSplatAll`/`camSplatVolumeAll`). Because model-B `connect()` draws
+  no RNG, adding cameras never perturbs the photon's RNG stream: the single-camera
+  overload is bit-identical to the old path, and an N-camera shared pass reproduces N
+  independent single-camera renders exactly. `renderForwardShared()` (src/main.cpp) runs
+  one CPU photon trace feeding one film per camera; the multi-camera loop groups the
+  eligible cameras (plain `-n`, model B, per-frame auto-exposure, CPU device) into that
+  single pass and renders the rest per-camera as before. **Validated:** `twocam.ftsl`
+  `-device cpu` shared vs. per-`-camera` solo renders are pixel-identical (max abs diff
+  0, both films). The fluoro reradiation λ' is sampled once (camera-independent), and
+  mode-A aperture RNG is drawn once, so those single-camera streams are preserved too.
+- **Remaining (deferred):** (1) **GPU shared pass** — the forward megakernel still
+  renders one camera per launch; it takes a single `DCamera`/film/`camMode`, so the
+  shared pass would need a `DCamera` array + N device film buffers threaded through
+  `emitPhoton`/`shadeStep`/`connect`. This is why the CPU shared pass only triggers when
+  the forward-GPU path *isn't* used (`-device cpu`, or a GPU-unsupported scene). (2)
+  **Mode A** (finite-lens splat) could join the shared pass but draws an aperture sample
+  per camera, so an N-camera mode-A trace perturbs the RNG stream — it would need its
+  own validation; mode C (forward catch) is inherently per-camera (a photon is consumed
+  by one aperture).
+- **Status:** OPEN (much reduced) — CPU shared pass done + validated; GPU shared pass
+  and mode-A sharing are the tracked remainder.
 
 ### Absolute-EV film sensitivity, non-square films, shared multi-camera pass
 - **What (remaining):** three camera/film pieces are still open:
@@ -92,16 +103,18 @@ as practical; this file is the fallback for what can't be addressed immediately.
      firefly-dominated top-1%), CPU vs GPU auto-exposure agree (4.68e-13 vs 4.62e-13),
      resume accumulates 1M→2M correctly, and the guard rejects a 200×120→200×140
      mismatch.
-  3. **Shared multi-camera mode-B pass** (already logged above under the multi-camera
-     entry) — one photon trace splatting to every camera pupil.
+  3. ~~**Shared multi-camera mode-B pass**~~ (CPU shared pass DONE 2026-07-11 — see the
+     multi-camera entry above; GPU shared pass still deferred) — one photon trace
+     splatting to every camera pupil.
 - **Proper fix:** (1) ~~add a per-`camera_path` exposure-lock flag~~ (DONE
   2026-07-11); ~~absolute emitter power + a sensitometric film model~~ (absolute
   power + fixed-gain exposure DONE 2026-07-11; full cd/m² sensitometry still open).
   (2) ~~thread resX/resY through `renderForward`/`renderBackward`/CUDA and
-  `writePPM`~~ (DONE 2026-07-11). (3) see multi-camera.
+  `writePPM`~~ (DONE 2026-07-11). (3) see multi-camera (CPU shared pass done).
 - **Status:** OPEN (design captured) — logged 2026-07-10; **exposure-lock done
   2026-07-11**, **non-square films done 2026-07-11**, **absolute-EV done
-  2026-07-11**; only the shared multi-camera pass remains.
+  2026-07-11**, **CPU shared multi-camera pass done 2026-07-11**; only the GPU shared
+  pass (and optional mode-A sharing) remains.
 - **Done (2026-07-10, Phase 3a):**
   - `camera_path` keyframed motion — expands at load time into a sequence of
     `CamSpec` frames with piecewise-linear `eye`/`look_at` interpolation between

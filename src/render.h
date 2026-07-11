@@ -237,6 +237,20 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
     return 0.5 * (solve(false) + solve(true));
 }
 
+// One camera + its film for the forward light-tracer's next-event splats. A photon
+// path is camera-independent until the connect() splat, so `tracePhoton` takes a list
+// of these and splats each diffuse/emitter/volume vertex to every target at once — one
+// shared photon pass feeding N images instead of re-tracing per camera. In model B
+// (pinhole splat) connect() draws no RNG, so adding cameras never perturbs the photon's
+// RNG stream: a single-target trace is bit-identical to the old one-camera path, and an
+// N-camera shared pass reproduces N independent single-camera renders exactly. Models A
+// (finite-lens aperture sample) and C (forward catch) draw RNG / consume the photon per
+// camera, so they stay single-target (nCam==1); the shared pass is model-B only.
+struct CamTarget {
+    const Camera* cam = nullptr;
+    Film*         film = nullptr;
+};
+
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
@@ -381,10 +395,40 @@ struct Renderer {
         else          connect(scene, cam, film, p, n, lambda, beta, rho);
     }
 
-    // Trace a single photon. sensorFilm (legacy contact sensor) and/or cam+camFilm
-    // may be null; the caller supplies per-thread films for parallel runs.
+    // Splat a surface vertex to every camera target. In model B (the shared-pass case)
+    // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
+    // exactly the old single-camera call (model A draws its aperture sample once here).
+    void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+                     const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
+        for (int c = 0; c < nCam; ++c)
+            if (cams[c].cam && cams[c].film)
+                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, lambda, beta, rho, rng);
+    }
+
+    // Volume (fog) analogue of camSplatAll.
+    void camSplatVolumeAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+                           const Vec3& wIn, double lambda, double beta, Pcg32& rng) const {
+        for (int c = 0; c < nCam; ++c)
+            if (cams[c].cam && cams[c].film) {
+                if (lensMode) connectLensVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
+                else          connectVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta);
+            }
+    }
+
+    // Back-compat single-camera entry point (sensorFilm XOR cam+camFilm, as before).
     void tracePhoton(const Scene& scene, const Camera* cam, Film* sensorFilm,
                      Film* camFilm, Pcg32& rng, EnergyReport& e) const {
+        CamTarget t{cam, camFilm};
+        int nCam = (cam && camFilm) ? 1 : 0;
+        tracePhoton(scene, &t, nCam, sensorFilm, rng, e);
+    }
+
+    // Trace a single photon, splatting each vertex to every camera in `cams` (nCam may
+    // be 0 for the legacy contact-sensor path, which uses sensorFilm instead). Models A
+    // and C require nCam<=1 (they draw RNG / consume the photon per camera); the
+    // multi-camera shared pass is model B only. The caller supplies per-thread films.
+    void tracePhoton(const Scene& scene, const CamTarget* cams, int nCam,
+                     Film* sensorFilm, Pcg32& rng, EnergyReport& e) const {
         // --- Emission ---
         // Power-weighted emitter selection: photon selects emitter k with prob
         // power_k/totalPower and carries beta = totalPower, so E[beta over the
@@ -462,9 +506,9 @@ struct Renderer {
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
         // A spot is a point light with no projected area, so it has no such direct
         // term (its cone illuminates surfaces, which then connect to the camera).
-        if (cam && camFilm && !forwardCatch &&
+        if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env)
-            camSplat(scene, *cam, *camFilm, origin, emitN, lambda, beta, 1.0, rng);
+            camSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
 
         Ray ray{origin + dir * 1e-6, dir};
 
@@ -489,20 +533,18 @@ struct Renderer {
 
             // Model A perspective catch: if the photon flies through the aperture
             // (nearer than the surface AND any fog collision), it lands on the film.
-            if (forwardCatch && cam && camFilm) {
+            if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
                 int px, py;
-                if (cam->catchPhoton(ray, dEvent, px, py)) {
-                    camFilm->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
+                if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
+                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
                     e.sensor += beta;
                     return;
                 }
             }
 
             if (mediumEvent) {
-                if (cam && camFilm && !forwardCatch) {
-                    if (lensMode) connectLensVolume(scene, *cam, *camFilm, mp, ray.d, lambda, beta, rng);
-                    else          connectVolume(scene, *cam, *camFilm, mp, ray.d, lambda, beta);
-                }
+                if (nCam > 0 && !forwardCatch)
+                    camSplatVolumeAll(scene, cams, nCam, mp, ray.d, lambda, beta, rng);
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
                 if (rng.uniform() >= scene.medium.albedo(lambda)) { e.absorbed += beta; return; }
                 ray = Ray{mp, sampleHG(ray.d, scene.medium.g, rng)};
@@ -600,11 +642,11 @@ struct Renderer {
                     // incoming lambda; the fluorescent channel samples one
                     // lambda' ~ M and splats the glow (albedo aEff*Q) with the
                     // camera-response evaluated at lambda' (Stokes-shifted colour).
-                    if (cam && camFilm && !forwardCatch) {
-                        camSplat(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho, rng);
+                    if (nCam > 0 && !forwardCatch) {
+                        camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
                         if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
-                            double pf; double lp = m.fluoEmitSampler.sample(rng, pf);
-                            camSplat(scene, *cam, *camFilm, h.p, h.n, lp, beta, aEff * m.fluoYield, rng);
+                            double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
+                            camSplatAll(scene, cams, nCam, h.p, h.n, lp, beta, aEff * m.fluoYield, rng);
                         }
                     }
                     FluoroResult fr = fluoroInteract(m, lambda, rng);
@@ -616,7 +658,7 @@ struct Renderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-                    if (cam && camFilm && !forwardCatch) camSplat(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho, rng);
+                    if (nCam > 0 && !forwardCatch) camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.

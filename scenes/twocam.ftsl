@@ -5,8 +5,10 @@
 #   ftrace -in scenes/twocam.ftsl -n 40000000          # -> both: out_hero.ppm, out_side.ppm
 #   ftrace -in scenes/twocam.ftsl -camera hero -o h.ppm # -> just the hero camera
 #
-# The scene is camera-independent, so both views are rendered from the same scene
-# (today as independent forward passes; a shared mode-B pass is a future optimization).
+# The scene is camera-independent, so both views come from the same scene. On the CPU
+# (-device cpu, or a scene the forward-GPU path can't accelerate) both mode-B cameras
+# are rendered by a single SHARED photon pass — one trace splatting to every camera at
+# once (1x photon work, not Nx). The GPU still renders one camera per launch for now.
 
 scene {
     units    meters

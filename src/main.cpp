@@ -1040,6 +1040,56 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     return out;
 }
 
+// Shared multi-camera forward pass (model B only). Traces ONE set of N photons and
+// splats every diffuse/emitter/volume vertex to *all* cameras at once, returning one
+// film per camera — the "many cameras for 1x photon work" win instead of re-tracing
+// per camera. Because model-B connect() draws no RNG, the per-thread RNG streams and
+// photon paths are identical to a single-camera renderForward, so camera c's film here
+// is bit-for-bit the same as an independent renderForward for camera c (validated).
+// CPU only for now; the GPU megakernel still renders one camera per launch (its
+// device kernel would need the DCamera array + N film buffers — tracked in
+// known-issues). Each camera keeps its own resolution/projection/exposure.
+static std::vector<Film> renderForwardShared(const Scene& scene,
+                                             const std::vector<Camera>& cams,
+                                             const std::vector<int>& resX,
+                                             const std::vector<int>& resY,
+                                             long long N, int nThreads,
+                                             EnergyReport& eOut, bool diffraction = true) {
+    int nc = (int)cams.size();
+    // Per-thread × per-camera films (each thread accumulates into its own copies to
+    // avoid shared-pixel races; merged per camera at the end).
+    std::vector<std::vector<Film>> films(nThreads, std::vector<Film>(nc));
+    std::vector<EnergyReport> reports(nThreads);
+    for (int t = 0; t < nThreads; ++t)
+        for (int c = 0; c < nc; ++c) { films[t][c].resX = resX[c]; films[t][c].resY = resY[c]; films[t][c].alloc(); }
+
+    auto worker = [&](int tid) {
+        Renderer r; r.forwardCatch = false; r.lensMode = false; r.diffraction = diffraction;
+        // Identical seeding to renderForward (seedBase 0) so each camera's shared film
+        // matches its standalone single-camera render bit-for-bit.
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
+        long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
+        std::vector<CamTarget> targets(nc);
+        for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
+        for (long long i = lo; i < hi; ++i)
+            r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+
+    std::vector<Film> out(nc);
+    for (int c = 0; c < nc; ++c) {
+        out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc();
+        for (int t = 0; t < nThreads; ++t) out[c].merge(films[t][c]);
+    }
+    for (auto& rp : reports) {
+        eOut.emitted += rp.emitted; eOut.absorbed += rp.absorbed; eOut.sensor += rp.sensor;
+        eOut.escaped += rp.escaped; eOut.residual += rp.residual;
+    }
+    return out;
+}
+
 // Backward reference: `spp` samples per pixel, threads render disjoint row bands
 // of a shared film (no shared-pixel writes, so no race).
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
@@ -2029,7 +2079,64 @@ int main(int argc, char** argv) {
     // The first frame in a group computes its anchor and stores it here; later frames
     // in the same group reuse it (no dolly flicker). A null anchor = per-frame auto.
     std::map<int, double> expAnchors;
-    for (const RenderCam& rc : toRender) {
+
+    // Shared multi-camera model-B pass. When several plain-`-n` model-B cameras render
+    // on the CPU (either -device cpu, or a scene the forward-GPU path can't accelerate),
+    // trace ONE photon set and splat it to all of them at once (renderForwardShared)
+    // instead of re-tracing per camera. This is the "many cameras for 1x photon work"
+    // win; it is CPU-only for now (the GPU megakernel still renders one camera per
+    // launch — tracked in known-issues), and applies only to per-frame-auto-exposed
+    // cameras (an exposure-locked camera_path is an animation, better left un-shared so
+    // its frames don't all carry the same fixed noise realisation).
+    bool sceneGpuForwardB = false;
+#ifdef HAVE_CUDA
+    {
+        const bool wantGpu  = !std::strcmp(device, "gpu");
+        const bool wantAuto = !std::strcmp(device, "auto");
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
+            sceneGpuForwardB = true;
+    }
+#endif
+    const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume ||
+                               wantCheckpointFlag || runForever || preview);
+    std::vector<int> sharedIdx, restIdx;
+    for (int i = 0; i < (int)toRender.size(); ++i) {
+        const RenderCam& rc = toRender[i];
+        bool eligible = (rc.mode == 'B') && (rc.expGroup < 0) && plainRender && !sceneGpuForwardB;
+        (eligible ? sharedIdx : restIdx).push_back(i);
+    }
+    if (sharedIdx.size() < 2) {                 // one (or zero) camera: nothing to share
+        restIdx.clear();
+        for (int i = 0; i < (int)toRender.size(); ++i) restIdx.push_back(i);
+        sharedIdx.clear();
+    }
+
+    if (!sharedIdx.empty()) {
+        std::vector<Camera> cams; std::vector<int> rxs, rys;
+        for (int i : sharedIdx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
+        std::printf("[camera] shared model-B pass: %zu cameras, %lld photons on %d CPU threads (light=%s) ...\n",
+                    cams.size(), N, nThreads, lightLabel);
+        EnergyReport e;
+        std::vector<Film> films = renderForwardShared(scene, cams, rxs, rys, N, nThreads, e, diffraction);
+        double tot = e.absorbed + e.sensor + e.escaped + e.residual;
+        if (e.emitted > 0.0)
+            std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                        e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
+                        e.residual / e.emitted, tot / e.emitted);
+        for (size_t k = 0; k < sharedIdx.size(); ++k) {
+            const RenderCam& rc = toRender[sharedIdx[k]];
+            Film disp = films[k];
+            addEnvBackground(disp, scene, rc.cam, N);     // directly-viewed sky (env scenes)
+            std::string op = outFor(rc.name);
+            if (toRender.size() > 1)
+                std::printf("[camera] '%s' (mode B, %dx%d) -> %s\n",
+                            rc.name.c_str(), rc.res, rc.resY, op.c_str());
+            writeFilm(op.c_str(), disp, (double)N, rc.exposure, false, nullptr, scene.absolute);
+        }
+    }
+
+    for (int i : restIdx) {
+        const RenderCam& rc = toRender[i];
         if (toRender.size() > 1)
             std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
                         rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str());
