@@ -341,7 +341,8 @@ public:
             else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
             else if (b.type == "triangle") { if (!addTriangle(b, L)) return false; }
             else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
-            else if (b.type == "light")    { if (!addLight(b, L)) return false; haveLight = true; }
+            else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
+            else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
             else if (b.type == "medium")   { if (!addMedium(b, L)) return false; }
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
             else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
@@ -605,22 +606,33 @@ private:
     }
 
     // ---- geometry ----
-    bool addSphere(const Block& b, Loaded& L) {
+    // Every geometry/light builder takes an authored-space affine `xf` (identity
+    // for top-level primitives; the composed transform of the enclosing `group`
+    // chain otherwise). Authored coordinates are transformed by `xf` FIRST, then
+    // P()/Len() fold in the unit scale (→ metres). With xf = identity the result
+    // is bit-identical to the pre-group path.
+    bool addSphere(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
         double r = dblOf(b, "radius", 1.0);
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("sphere needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        L.scene.spheres.push_back(Sphere{P(c), Len(r), id});
+        // A sphere stays a sphere only under translate + rotation + UNIFORM scale;
+        // a non-uniform scale would make it an ellipsoid the analytic primitive
+        // cannot represent (see known-issues.md — true instancing/quadrics).
+        bool nonUniform = false; double s = xf.uniformScale(nonUniform);
+        if (nonUniform) { fail("sphere under non-uniform scale would be an ellipsoid; use translate + uniform scale (or a mesh)"); return false; }
+        L.scene.spheres.push_back(Sphere{P(xf.apply(c)), Len(r) * s, id});
         return true;
     }
-    bool addQuad(const Block& b, Loaded& L) {
+    bool addQuad(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 o{0, 0, 0}, u{1, 0, 0}, v{0, 0, 1};
         vec3Of(b, "origin", o); vec3Of(b, "u", u); vec3Of(b, "v", v);
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("quad needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        Vec3 a = P(o), bb = P(o + u), cc = P(o + u + v), dd = P(o + v);
+        Vec3 a = P(xf.apply(o)), bb = P(xf.apply(o + u)),
+             cc = P(xf.apply(o + u + v)), dd = P(xf.apply(o + v));
         // UVs span the parallelogram: origin=(0,0), +u=(1,0), +v=(0,1). The two
         // triangles share the o and o+u+v corners; assign matching corner UVs so a
         // bound texture maps continuously across the quad.
@@ -632,37 +644,41 @@ private:
         L.scene.tris.push_back(t2);
         return true;
     }
-    bool addTriangle(const Block& b, Loaded& L) {
+    bool addTriangle(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 v0{0, 0, 0}, v1{1, 0, 0}, v2{0, 1, 0};
         vec3Of(b, "v0", v0); vec3Of(b, "v1", v1); vec3Of(b, "v2", v2);
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("triangle needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        L.scene.tris.push_back(Tri{P(v0), P(v1), P(v2), id, -1, {}});
+        L.scene.tris.push_back(Tri{P(xf.apply(v0)), P(xf.apply(v1)), P(xf.apply(v2)), id, -1, {}});
         return true;
     }
-    bool addMesh(const Block& b, Loaded& L) {
+    bool addMesh(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh needs a file"); return false; }
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("mesh needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        MeshXform xf;
-        vec3Of(b, "translate", xf.translate);
-        vec3Of(b, "rotate", xf.rotDeg);
+        MeshXform mx;
+        vec3Of(b, "translate", mx.translate);
+        vec3Of(b, "rotate", mx.rotDeg);
         // scale accepts a single uniform value or a vec3.
         const Stmt* sc = find(b, "scale");
         if (sc) {
             if (sc->val.words.size() >= 3)
-                xf.scale = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
+                mx.scale = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
             else if (!sc->val.words.empty()) {
-                double k = num(sc->val.words[0]); xf.scale = {k, k, k};
+                double k = num(sc->val.words[0]); mx.scale = {k, k, k};
             }
         }
-        // Fold the unit scale into the transform: both the scaled local verts and the
-        // translation live in authored units, so multiply both by L_ to reach metres.
-        xf.scale = xf.scale * L_;
-        xf.translate = xf.translate * L_;
+        // Compose the enclosing group's authored-space transform with the mesh's
+        // own local transform, then fold the unit scale into the OUTPUT so the
+        // baked verts land in metres (scaling an affine's linear part and
+        // translation by L_ scales its result by L_). With parentXf = identity
+        // this reproduces the old `scale*=L_; translate*=L_` path exactly.
+        Affine xf = parentXf.compose(mx.toAffine());
+        for (double& e : xf.m) e *= L_;
+        xf.t = xf.t * L_;
         // `uv use_mesh` reads texture coordinates from the OBJ's `vt` records (needed
         // for textured materials); the default keeps the Tri fallback UVs.
         bool loadUV = (strOf(b, "uv") == "use_mesh");
@@ -679,36 +695,79 @@ private:
         return true;
     }
 
+    // ---- group (transform hierarchy) ----
+    // A `group { translate .. rotate .. scale .. <child prims / nested groups> }`
+    // node. The group's own transform composes with its parent's (parent applied
+    // last: world = parentXf ∘ localXf), and every child primitive is baked into
+    // world space with that composed transform — so at render time the scene is
+    // still a flat list of world-space prims (no scene graph, no per-instance
+    // cost). Nested groups recurse; a light anywhere in the tree sets haveLight.
+    // See known-issues.md for the deferred true-instancing (shared-geometry) path.
+    bool addGroup(const Block& b, Loaded& L, const Affine& parentXf, bool& haveLight) {
+        Vec3 tr{0, 0, 0}, rot{0, 0, 0}, scl{1, 1, 1};
+        vec3Of(b, "translate", tr);
+        vec3Of(b, "rotate", rot);
+        const Stmt* sc = find(b, "scale");
+        if (sc) {
+            if (sc->val.words.size() >= 3)
+                scl = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
+            else if (!sc->val.words.empty()) {
+                double k = num(sc->val.words[0]); scl = {k, k, k};
+            }
+        }
+        Affine world = parentXf.compose(affineFromTRS(tr, rot, scl));
+        // Child primitives are nested brace blocks; the transform-only statements
+        // (translate/rotate/scale) carry no block and are skipped here.
+        for (const auto& s : b.stmts) {
+            const Block* cb = s.val.block.get();
+            if (!cb) continue;
+            if      (s.key == "sphere")   { if (!addSphere(*cb, L, world)) return false; }
+            else if (s.key == "quad")     { if (!addQuad(*cb, L, world)) return false; }
+            else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
+            else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
+            else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
+            else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, light, group)"); return false; }
+        }
+        return true;
+    }
+
     // ---- lights ----
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
-    bool addLight(const Block& b, Loaded& L) {
+    bool addLight(const Block& b, Loaded& L, const std::string& subtype,
+                  const Affine& xf = Affine::identity()) {
         Spectrum spd = spectrumParam(b, "spd", blackbody(6500.0));
-        if (b.subtype == "collimated") {
+        // Uniform scale of the enclosing group chain (spheres/pencils scale by it;
+        // a non-uniform scale is only meaningful for the flat quad/mesh emitters).
+        bool nonUniform = false; double s = xf.uniformScale(nonUniform);
+        if (subtype == "collimated") {
             Vec3 dir{0, 0, -1}; vec3Of(b, "dir", dir);
-            Vec3 beam = normalize(dir);
+            Vec3 beam = normalize(xf.applyDir(dir));
             // A thin pencil cross-section at the given origin (3 cm pencil).
             Vec3 o{0.5, 0.5, 0.95}; vec3Of(b, "origin", o);
             Vec3 t, bt; onb(beam, t, bt);
-            double w = Len(0.03);
-            L.scene.addAreaLight(P(o), t * w, bt * w, beam, w * w, spd, binWidth_,
+            double w = Len(0.03) * s;
+            L.scene.addAreaLight(P(xf.apply(o)), t * w, bt * w, beam, w * w, spd, binWidth_,
                                  /*collimated*/true, beam);
             return true;
         }
-        if (b.subtype == "sphere") {
+        if (subtype == "sphere") {
             // Spherical area light: a glowing ball. Also add an emissive sphere to
             // geometry so photons that strike it are absorbed and it is visible in
             // the photon-catch camera modes (mirrors the area-light quad below).
+            if (nonUniform) { fail("sphere light under non-uniform scale would be an ellipsoid; use uniform scale"); return false; }
             Vec3 c{0.5, 0.7, 0.5}; vec3Of(b, "center", c);
-            double rad = Len(dblOf(b, "radius", 0.1));
+            double rad = Len(dblOf(b, "radius", 0.1)) * s;
+            Vec3 cw = P(xf.apply(c));
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
-            L.scene.spheres.push_back(Sphere{P(c), rad, id});
-            L.scene.addSphereLight(P(c), rad, spd, binWidth_);
+            L.scene.spheres.push_back(Sphere{cw, rad, id});
+            L.scene.addSphereLight(cw, rad, spd, binWidth_);
             return true;
         }
-        if (b.subtype == "spot") {
+        if (subtype == "spot") {
             // Point spotlight: a cone about `dir`, smoothstep penumbra between the
             // inner and outer half-angles (degrees). No emissive geometry (a point).
             Vec3 o{0.5, 0.99, 0.5}; vec3Of(b, "origin", o);
@@ -718,10 +777,10 @@ private:
             if (outer < inner) outer = inner;            // outer cone must enclose inner
             const double d2r = PI / 180.0;
             double cosInner = std::cos(inner * d2r), cosOuter = std::cos(outer * d2r);
-            L.scene.addSpotLight(P(o), normalize(dir), cosInner, cosOuter, spd, binWidth_);
+            L.scene.addSpotLight(P(xf.apply(o)), normalize(xf.applyDir(dir)), cosInner, cosOuter, spd, binWidth_);
             return true;
         }
-        if (b.subtype == "env") {
+        if (subtype == "env") {
             // Environment light. With a `file` it is an image-based (lat-long) env:
             // each texel is upsampled to a physical emission spectrum and directions
             // are importance-sampled from the map's luminance. `rotate` spins the map
@@ -746,13 +805,19 @@ private:
         Vec3 o{0, 1, 0}, u{1, 0, 0}, v{0, 0, 1}, nrm{0, -1, 0};
         vec3Of(b, "origin", o); vec3Of(b, "u", u); vec3Of(b, "v", v);
         if (!vec3Of(b, "normal", nrm)) nrm = normalize(cross(u, v));
-        Vec3 os = P(o), us = u * L_, vs = v * L_;
+        // Transform origin as a point and the u/v edge vectors as directions, then
+        // fold in the unit scale. The emitter area is recomputed from the actual
+        // transformed edges (exact for any affine). The emission normal is the
+        // authored normal carried by the direction map (exact for rotation +
+        // uniform scale; see known-issues.md for the non-uniform-scale caveat).
+        Vec3 os = P(xf.apply(o)), us = xf.applyDir(u) * L_, vs = xf.applyDir(v) * L_;
+        Vec3 nw = normalize(xf.applyDir(nrm));
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
         L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
-        L.scene.addAreaLight(os, us, vs, normalize(nrm), length(cross(us, vs)), spd, binWidth_);
+        L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_);
         return true;
     }
 

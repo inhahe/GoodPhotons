@@ -33,3 +33,51 @@ inline void onb(const Vec3& n, Vec3& t, Vec3& b) {
     t = Vec3(1.0 + sign * n.x * n.x * a, sign * d, -sign * n.x);
     b = Vec3(d, sign + n.y * n.y * a, -n.y);
 }
+
+// A general affine map: world = M*p + t, with M a 3x3 linear part (row-major
+// m[0..8]) and t a translation. Unlike a scale+Euler+translate triple, an affine
+// is *closed under composition*, so it can represent an arbitrary nesting of
+// translate/rotate/scale nodes — i.e. a scene-graph group hierarchy that bakes
+// down to world-space primitives at load time. Points use apply(); directions
+// (which ignore translation) use applyDir().
+struct Affine {
+    double m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    Vec3 t{0, 0, 0};
+
+    static Affine identity() { return Affine{}; }
+
+    Vec3 apply(const Vec3& p) const {
+        return Vec3{m[0] * p.x + m[1] * p.y + m[2] * p.z + t.x,
+                    m[3] * p.x + m[4] * p.y + m[5] * p.z + t.y,
+                    m[6] * p.x + m[7] * p.y + m[8] * p.z + t.z};
+    }
+    Vec3 applyDir(const Vec3& v) const {
+        return Vec3{m[0] * v.x + m[1] * v.y + m[2] * v.z,
+                    m[3] * v.x + m[4] * v.y + m[5] * v.z,
+                    m[6] * v.x + m[7] * v.y + m[8] * v.z};
+    }
+    // this ∘ child: transform by `c` first, then by `*this` (i.e. parent.compose(child)).
+    Affine compose(const Affine& c) const {
+        Affine r;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                r.m[i * 3 + j] = m[i * 3 + 0] * c.m[0 * 3 + j] +
+                                 m[i * 3 + 1] * c.m[1 * 3 + j] +
+                                 m[i * 3 + 2] * c.m[2 * 3 + j];
+        r.t = apply(c.t);   // M*c.t + t
+        return r;
+    }
+    // Uniform-scale factor of the linear part (column norms; rotation preserves
+    // length so a column's norm is its axis scale). Sets `nonUniform` when the
+    // three axis scales differ beyond a small tolerance — the caller uses this to
+    // reject non-uniform scale on primitives that can't represent it (spheres).
+    double uniformScale(bool& nonUniform) const {
+        double sx = std::sqrt(m[0] * m[0] + m[3] * m[3] + m[6] * m[6]);
+        double sy = std::sqrt(m[1] * m[1] + m[4] * m[4] + m[7] * m[7]);
+        double sz = std::sqrt(m[2] * m[2] + m[5] * m[5] + m[8] * m[8]);
+        double mx = std::fmax(sx, std::fmax(sy, sz));
+        double mn = std::fmin(sx, std::fmin(sy, sz));
+        nonUniform = (mx - mn) > 1e-9 * (mx > 0 ? mx : 1.0);
+        return (sx + sy + sz) / 3.0;
+    }
+};

@@ -3,6 +3,25 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Open bugs
+
+### `-o foo.png` writes a PPM (P6), not a PNG — extension is ignored
+- **What:** `writePPM` (`src/main.cpp`) is the *only* image writer and always
+  emits binary PPM (P6) to the given path, regardless of the output extension.
+  So `ftrace -o group.png` produces a file that starts with `P6\n256 256\n255`
+  but is named `.png`.
+- **Why it matters:** anything that trusts the extension mis-handles the file.
+  Concretely this softlocked a Claude session: reading the mislabeled `.png`
+  sent it to the vision API as `image/png`; the API rejected the PPM bytes
+  (`Image format image/png not supported`), and the bad image stayed pinned in
+  the conversation, so *every* subsequent request 400'd until a fresh session.
+- **Workaround:** always render to `.ppm`; convert to a real PNG/JPEG before
+  viewing (e.g. `python -c "from PIL import Image; Image.open('x.ppm').save('x.png')"`).
+- **Proper fix:** honor the output extension — dispatch on it and write a real
+  PNG via the already-vendored stb_image_write (used for texture *import* today),
+  falling back to PPM for `.ppm`/unknown. Or at minimum reject a `.png`/`.jpg`
+  target with a clear error. Logged 2026-07-10.
+
 ## Limitations (by design, tracked for future work)
 
 ### Multi-camera renders re-trace photons per camera (no shared pass yet)
