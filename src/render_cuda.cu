@@ -138,7 +138,9 @@ struct DTexture {
     int w, h;
     int wrap;    // TexWrap:   0 Repeat, 1 Clamp, 2 Mirror
     int filter;  // TexFilter: 0 Nearest, 1 Bilinear
-    const double* coeff;   // 3*w*h Jakob-Hanika coefficients
+    const double* coeff;   // 3*w*h Jakob-Hanika coefficients (albedo maps)
+    const double* gray;    // w*h per-texel grayscale (mean linear RGB) for scalar maps
+                           // (roughness/film-thickness, §9.4) — dTexScalarAt twin
 };
 
 struct DMaterial {
@@ -156,6 +158,13 @@ struct DMaterial {
     // projection at this world-to-texture scale instead of the per-vertex (u,v).
     // Device twin of Material::triplanarScale (dTexReflTriplanar). 0 => use (u,v).
     double triplanarScale;
+    // Spatially-varying NON-albedo scalar params (spec §9.4), device twins of
+    // Material::roughnessTex / filmThicknessTex. >=0 => sample the texture's grayscale
+    // value (dTexScalarAt) at the hit (u,v); -1 => use the constant roughness /
+    // filmThickness. Honoured by the forward paths (megakernel + wavefront); the GPU
+    // BDPT kernel rejects such scenes (cudaBdptSupported) so they fall back to CPU.
+    int    roughnessTex;
+    int    filmThicknessTex;
     // Fluorescence (D_FLUORESCENT): fluoAbsorb is the baked excitation probability
     // epsilon(lambda); the dye re-radiates (quantum yield fluoYield) at a Stokes-
     // shifted lambda' drawn from the emission-SPD CDF slice [fluoCdfOffset,
@@ -858,16 +867,22 @@ __device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const
     ro = h.p + outDir * RAY_EPS; rd = outDir;
 }
 // Returns false if the photon is absorbed by an opaque (absorbing) substrate.
-__device__ static bool thinFilmInterface(const DMaterial& m, const DHit& h, const DVec3& d,
+// Forward decl: the per-hit thin-film thickness helper (definition with the other
+// texture samplers, below dTexScalarAt) is used here before its point of definition.
+__device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h);
+
+__device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, const DHit& h,
+                                          const DVec3& d,
                                           Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
     Real ns = specLookup(m.ior, lambda), nf = (Real)m.filmIor;
     Real ks = specLookup(m.substrateK, lambda);
+    Real thickness = dMatFilmThickness(sc, m, h);   // per-hit (map or constant)
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
     Real cosI = -dot(d, nl);
     if (ks > 0) {                                // opaque metal-backed film
         if (!entering) return false;             // inside absorbing substrate: absorbed
-        Real R = thinFilmReflectance((Real)1, nf, ns, ks, (Real)m.filmThickness, cosI, lambda);
+        Real R = thinFilmReflectance((Real)1, nf, ns, ks, thickness, cosI, lambda);
         if (rng.uniform() >= R) return false;    // transmitted -> absorbed
         DVec3 o = normalize(reflectv(d, nl));
         ro = h.p + o * RAY_EPS; rd = o;
@@ -880,7 +895,7 @@ __device__ static bool thinFilmInterface(const DMaterial& m, const DHit& h, cons
     if (sin2t > 1) outDir = reflectv(d, nl);
     else {
         Real cosT = sqrt((Real)1 - sin2t);
-        Real R = thinFilmReflectance(nA, nf, nB, (Real)0, (Real)m.filmThickness, cosI, lambda);
+        Real R = thinFilmReflectance(nA, nf, nB, (Real)0, thickness, cosI, lambda);
         if (rng.uniform() < R) outDir = reflectv(d, nl);
         else outDir = d * eta + nl * (eta * cosI - cosT);
     }
@@ -1145,6 +1160,38 @@ __device__ static Real dTexReflTriplanar(const DTexture& tx, const DVec3& p, con
     return (Real)r;
 }
 
+// Scalar (grayscale) texture sample at (u,v) — device twin of Texture::scalarAt.
+// Bilerps the per-texel `gray` array (mean linear RGB); used for non-albedo scalar
+// maps (roughness, film thickness, §9.4). v flipped so v=0 is the image bottom.
+__device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
+    if (!tx.gray) return 0.5;
+    if (tx.filter == 0) {   // Nearest
+        int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
+        int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
+        return tx.gray[(size_t)y * tx.w + x];
+    }
+    double tu = (double)u * tx.w - 0.5, tv = (1.0 - (double)v) * tx.h - 0.5;
+    double flx = floor(tu), fly = floor(tv);
+    double fx = tu - flx, fy = tv - fly;
+    int x0 = dWrapIndex((int)flx, tx.w, tx.wrap), x1 = dWrapIndex((int)flx + 1, tx.w, tx.wrap);
+    int y0 = dWrapIndex((int)fly, tx.h, tx.wrap), y1 = dWrapIndex((int)fly + 1, tx.h, tx.wrap);
+    double a = tx.gray[(size_t)y0 * tx.w + x0] * (1 - fx) + tx.gray[(size_t)y0 * tx.w + x1] * fx;
+    double b = tx.gray[(size_t)y1 * tx.w + x0] * (1 - fx) + tx.gray[(size_t)y1 * tx.w + x1] * fx;
+    return a * (1 - fy) + b * fy;
+}
+
+// Per-hit glossy roughness / thin-film thickness (device twins of materialRoughness
+// / materialFilmThickness): a bound scalar map's value at the hit, else the constant.
+__device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.roughnessTex >= 0) return (Real)dTexScalarAt(sc.textures[m.roughnessTex], h.u, h.v);
+    return (Real)m.roughness;
+}
+__device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.filmThicknessTex >= 0)
+        return (Real)(dTexScalarAt(sc.textures[m.filmThicknessTex], h.u, h.v) * m.filmThickness);
+    return (Real)m.filmThickness;
+}
+
 // Diffuse reflectance at a hit: texture-sampled when the material binds one, else
 // the constant baked reflect spectrum (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
@@ -1370,7 +1417,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
         DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_THINFILM) {
         DVec3 nro, nrd;
-        if (!thinFilmInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
+        if (!thinFilmInterface(sc, m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_MULTILAYER) {
         DVec3 nro, nrd;
@@ -1394,7 +1441,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     } else if (m.type == D_GLOSSY) {
         Real r = clamp01(specLookup(m.reflect, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 o = sampleGlossy(reflectv(rd, h.n), (Real)m.roughness, rng);
+        DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
     } else if (m.type == D_FLUORESCENT) {
@@ -1961,7 +2008,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             }
             case D_THINFILM: {
                 DVec3 nro, nrd;
-                if (!thinFilmInterface(*mp, h, rd, lambda, rng, nro, nrd)) return L;
+                if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) return L;
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_MULTILAYER: {
@@ -1990,7 +2037,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             case D_GLOSSY: {
                 Real r = clamp01(specLookup(mp->reflect, lambda));
                 if (rng.uniform() >= r) return L;
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), (Real)mp->roughness, rng);
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                 if (dot(o, h.n) <= 0) return L;
                 ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
             }
@@ -2123,7 +2170,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_THINFILM: {
                 DVec3 nro, nrd;
-                if (!thinFilmInterface(*mp, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+                if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
                 wi = nrd; betaFactor = 1.0; delta = 1;
                 break;
             }
@@ -2558,6 +2605,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         }
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
+        d.roughnessTex = m.roughnessTex;
+        d.filmThicknessTex = m.filmThicknessTex;
         d.layerCount = (int)m.layerN.size();
         if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;
         for (int k = 0; k < d.layerCount; ++k) {
@@ -2665,6 +2714,17 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
             dt.coeff = (double*)keep(uploadVec(flat));
         } else {
             dt.coeff = nullptr;
+        }
+        // Per-texel grayscale (mean of the linear RGB) for scalar (non-albedo) maps.
+        // Bilerp of the means equals the mean of the bilerp, so this matches the host
+        // Texture::scalarAt exactly. Always uploaded (rgb is populated after load).
+        if (!tx.rgb.empty()) {
+            std::vector<double> g(tx.rgb.size());
+            for (size_t i = 0; i < tx.rgb.size(); ++i)
+                g[i] = (tx.rgb[i].x + tx.rgb[i].y + tx.rgb[i].z) * (1.0 / 3.0);
+            dt.gray = (double*)keep(uploadVec(g));
+        } else {
+            dt.gray = nullptr;
         }
         dtex.push_back(dt);
     }
@@ -2864,10 +2924,15 @@ bool cudaBdptSupported(const Scene& scene) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
         const Material& m = scene.mats[matId];
         if (m.reflectTex >= 0 || m.type == MatType::Fluorescent) return true;
+        // Non-albedo texture maps (roughness / film-thickness) drive the glossy/thin-film
+        // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
+        // which would bias MIS. Fall back to CPU BDPT (which threads the Hit through).
+        if (m.roughnessTex >= 0 || m.filmThicknessTex >= 0) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
-                    (scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent))
+                    (scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
+                     scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0))
                     return true;
         return false;
     };

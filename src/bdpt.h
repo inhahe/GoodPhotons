@@ -74,7 +74,8 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
         case MatType::Glossy: {
             if (cosWi <= 0 || cosWo <= 0) return 0.0;
             double r = clamp01(m.reflect(lambda));
-            double e = glossyExponent(m.roughness);
+            double e = glossyExponent(hitForTex ? materialRoughness(scene, m, *hitForTex)
+                                                : m.roughness);
             // Mirror direction of the outgoing ray about ns, as render.h forms it:
             // sampleGlossy lobes around reflect(rayDir, n) with rayDir = -wo.
             Vec3 mdir = reflect(wo * -1.0, ns);
@@ -90,7 +91,11 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // Directional pdf (solid angle) of sampling `wi` at a surface vertex given the
 // subpath arrived along `wo` (incoming ray dir = -wo). Matches render.h's sampling
 // densities. 0 for delta materials (handled separately) or unsupported hemispheres.
-inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi) {
+// `hitForTex` (with `scene`) supplies the per-hit roughness when a roughness map is
+// bound, so the density matches the sampling that used the same textured roughness —
+// essential for unbiased MIS. Pass nullptr where no hit UV is available (constant).
+inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
+                      const Scene& scene, const Hit* hitForTex) {
     double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
     switch (m.type) {
         case MatType::Diffuse:
@@ -100,7 +105,8 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
         }
         case MatType::Glossy: {
             if (cosWi <= 0 || cosWo <= 0) return 0.0;
-            double e = glossyExponent(m.roughness);
+            double e = glossyExponent(hitForTex ? materialRoughness(scene, m, *hitForTex)
+                                                : m.roughness);
             Vec3 mdir = reflect(wo * -1.0, ns);
             double cosLobe = dot(wi, mdir);
             if (cosLobe <= 0) return 0.0;
@@ -234,7 +240,6 @@ inline double vertexPdfLight(const Camera& /*cam*/, const Vertex& cur, const Ver
 
 inline double vertexPdf(const Scene& scene, const Camera& cam,
                         const Vertex* prev, const Vertex& cur, const Vertex& next) {
-    (void)scene;   // kept for signature symmetry with PBRT's Vertex::Pdf
     if (cur.type == VType::Light) return vertexPdfLight(cam, cur, next);
     Vec3 wn = next.p - cur.p;
     if (dot(wn, wn) == 0.0) return 0.0;
@@ -247,7 +252,7 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
         Vec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.0) return 0.0;
         wp = normalize(wp);
-        pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn);
+        pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn, scene, &cur.hit);
     }
     return convertDensity(pdfW, cur, next);
 }
@@ -309,19 +314,19 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = cosineHemisphere(cur.ns, rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
-                pdfW = bsdfPdf(*mp, cur.ns, wo, wi);
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo);
+                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, scene, &h);
                 betaFactor = rho;                     // f*cos/pdf = rho
                 if (rho <= 0) terminate = true;
                 break;
             }
             case MatType::Glossy: {
                 Vec3 mdir = reflect(ray.d, cur.ns);   // ray.d == -wo (incoming dir)
-                wi = sampleGlossy(mdir, mp->roughness, rng);
+                wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(mp->reflect(lambda));
-                pdfW = bsdfPdf(*mp, cur.ns, wo, wi);
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo);
+                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, scene, &h);
                 betaFactor = r;                       // f*cos/pdf = r
                 if (r <= 0 || pdfW <= 0) terminate = true;
                 break;
@@ -347,7 +352,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::ThinFilm: {
                 Ray nr;
-                if (!mats.thinFilmInterface(*mp, h, ray.d, lambda, rng, nr)) { terminate = true; break; }
+                if (!mats.thinFilmInterface(scene, *mp, h, ray.d, lambda, rng, nr)) { terminate = true; break; }
                 wi = nr.d; betaFactor = 1.0; delta = true;
                 break;
             }

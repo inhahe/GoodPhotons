@@ -256,8 +256,8 @@ Declared with `material "name" { type <type> … }`.
 | `dielectric` | Refractive glass with dispersion | `ior` (Sellmeier glass or constant) |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
-| `glossy` | Rough microfacet reflector | `reflect`, `roughness` |
-| `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `substrate_k` |
+| `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
+| `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k` |
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence | `reflect`, `absorb`, `emit`, `yield` |
@@ -351,9 +351,13 @@ hierarchies (baked to world space at load). Everything is accelerated by a BVH.
 repeat|clamp|mirror }` loads PNG / JPG / HDR / PPM / PFM images; bind one to a
 diffuse albedo with `reflect texture:<name>`. Each texel is Jakob–Hanika
 upsampled to a reflectance spectrum. UVs come from quad corners, OBJ `vt`
-(`uv use_mesh`), or a procedural `planar`/`spherical`/`cylindrical` projection
-(see Geometry). (Base-colour maps today; normal/roughness maps and triplanar
-blending are future work.)
+(`uv use_mesh`), a procedural `planar`/`spherical`/`cylindrical` projection, or
+per-hit `triplanar` box projection for un-UV'd meshes (see Geometry). Besides
+base-colour albedo, a texture can also drive a **scalar** parameter: a grayscale
+**roughness map** on `glossy` (`roughness texture:<name>`) or a **film-thickness
+map** on `thinfilm` (`film_thickness_map texture:<name>`, a 0..1 profile × the
+nominal `film_thickness`). All of these run on both the CPU and GPU forward paths;
+scalar maps on `mix`/`ior` and indexed-spectral palettes remain future work.
 
 ## Participating media / fog
 

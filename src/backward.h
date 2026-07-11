@@ -328,7 +328,7 @@ struct BackwardRenderer {
                     // thin-film interference colour). An absorbing substrate absorbs
                     // the transmitted fraction -> the path terminates here.
                     Ray nr;
-                    if (!mats.thinFilmInterface(m, h, ray.d, lambda, rng, nr)) return L;
+                    if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) return L;
                     ray = nr;
                     specularArrival = true;
                     break;
@@ -372,7 +372,7 @@ struct BackwardRenderer {
                 case MatType::Glossy: {
                     double r = clamp01(m.reflect(lambda));
                     if (rng.uniform() >= r) return L;
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), m.roughness, rng);
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                     if (dot(o, h.n) <= 0) return L;
                     ray = Ray{h.p + h.n * 1e-6, o};
                     specularArrival = true;

@@ -582,7 +582,7 @@ struct Renderer {
                     // thin-film interference reflectance (structural colour). With an
                     // absorbing substrate the transmitted fraction is absorbed here.
                     Ray nr;
-                    if (!thinFilmInterface(m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return; }
+                    if (!thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return; }
                     ray = nr;
                     continue;                       // lossless on survival; beta unchanged
                 }
@@ -631,7 +631,7 @@ struct Renderer {
                     double r = clamp01(m.reflect(lambda));
                     // Russian roulette on reflectance (see Mirror).
                     if (rng.uniform() >= r) { e.absorbed += beta; return; }
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), m.roughness, rng);
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; } // below surface
                     ray = Ray{h.p + h.n * 1e-6, o};
                     continue;
@@ -712,18 +712,19 @@ struct Renderer {
     //     from inside an opaque body is simply absorbed.
     // Returns false when the photon is absorbed (caller terminates the path); on
     // true, `out` is the continuation ray.
-    bool thinFilmInterface(const Material& m, const Hit& h, const Vec3& d,
+    bool thinFilmInterface(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
                            double lambda, Pcg32& rng, Ray& out) const {
         double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
         double nf = m.filmIor;                  // coating film index
         double ks = m.substrateK(lambda);       // substrate extinction (0 = transparent)
+        double thickness = materialFilmThickness(scene, m, h);  // per-hit (map or constant)
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
         double cosI = -dot(d, nl);              // > 0
 
         if (ks > 0.0) {                         // opaque metal-backed film
             if (!entering) return false;        // inside the absorbing substrate: absorbed
-            double R = thinFilmReflectance(1.0, nf, ns, ks, m.filmThickness, cosI, lambda);
+            double R = thinFilmReflectance(1.0, nf, ns, ks, thickness, cosI, lambda);
             if (rng.uniform() >= R) return false;               // transmitted -> absorbed
             Vec3 o = normalize(reflect(d, nl));
             out = Ray{h.p + o * 1e-6, o};
@@ -742,7 +743,7 @@ struct Renderer {
             // Interference reflectance for the actual stack traversed this hit:
             // incidence medium nA, coating nf, transmission medium nB. Reciprocal,
             // so entering and exiting rays see the same R (energy consistent).
-            double R = thinFilmReflectance(nA, nf, nB, 0.0, m.filmThickness, cosI, lambda);
+            double R = thinFilmReflectance(nA, nf, nB, 0.0, thickness, cosI, lambda);
             if (rng.uniform() < R) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }

@@ -1141,8 +1141,14 @@ Jakob-Hanika–upsampled to a reflectance spectrum at the sampled wavelength
 (mesh). Procedural UV projections (planar/spherical/cylindrical, baked into
 per-vertex UVs at load) and `triplanar` box projection (a per-hit blend on the
 material) are implemented on both CPU and GPU; validated by `scenes/triplanar.ftsl`.
-**Still [needs engine work]:** indexed-spectral palettes and textures on non-albedo
-parameters (§9.4). Textured albedo runs on both backends; the CUDA kernel ports the
+Textures on **non-albedo** scalar parameters — a **roughness map** on `glossy` and a
+**film-thickness map** on `thinfilm` (§9.4) — are implemented on both backends;
+validated by `scenes/scalarmap.ftsl` (CPU/GPU forward exposure and mean agree to
+<0.1%). **Still [needs engine work]:** indexed-spectral palettes, and non-albedo maps
+for the remaining parameters (mix weight, ior). GPU BDPT (mode D) falls back to the
+CPU for scenes using roughness/thickness maps (the device kernel's MIS pdf/eval use
+the constant parameter; the CPU BDPT threads the hit UV through so it stays unbiased).
+Textured albedo runs on both backends; the CUDA kernel ports the
 texture sampler (`dDiffuseRho`) so GPU and CPU agree. The section breaks into three pieces: **(9.1) importing the
 image, (9.2) mapping it onto geometry, (9.3) turning its colors into spectra.**
 
@@ -1268,6 +1274,26 @@ e.g. a **roughness map** (oily forehead vs. matte cheek), a **mix/weight mask**
 (where a coat or subsurface applies), or a spatially-varying **film-thickness
 map** driving §3.2 iridescence for a peacock/beetle skin. All the same texture
 machinery.
+
+**Implemented now (both backends):** a roughness map and a film-thickness map:
+
+```
+# glossy: grayscale texel = roughness directly (both 0..1)
+material "wall" { type glossy   reflect whitewall 0.9  roughness texture:rough_map }
+
+# thinfilm: film_thickness is the nominal peak (nm); the 0..1 map scales it per-hit
+material "wing" { type thinfilm ior 1.5 film_ior 1.30
+                  film_thickness 400   film_thickness_map texture:thick_map }
+```
+
+The scalar sample is the **mean of the linear RGB** (`Texture::scalarAt`, mirrored on
+the GPU by `dTexScalarAt`), so grayscale (`encoding linear`) maps are exact and colour
+maps degrade to a luminance-ish mean. Bilerp-of-means equals mean-of-bilerp, so the
+CPU and GPU forward paths agree by construction (`scenes/scalarmap.ftsl`). Because the
+BSDF is sampled per-hit from the map, MIS pdf/eval must see the **same** value: the CPU
+BDPT threads the hit UV through `bsdfPdf`/`bsdfF`; the GPU BDPT does not, so scenes with
+these maps fall back to the CPU BDPT (mode D). **Still [needs engine work]:** binding
+maps to `mix` weight and `ior`, and indexed/spectral palette textures.
 
 **Build order for this section:** (1) stb_image + `texture` block + `use_mesh`
 UVs — makes ordinary albedo maps work; (2) the reflectance upsampler (shared

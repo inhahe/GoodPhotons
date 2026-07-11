@@ -655,6 +655,24 @@ private:
         return true;
     }
 
+    // If `<key>`'s value is `texture:<name>`, bind that texture's grayscale value to a
+    // NON-albedo scalar material parameter (spec §9.4) and return true; otherwise
+    // false (the caller reads a numeric value instead). Used for roughness /
+    // film-thickness maps. Sampled via Texture::scalarAt at the hit UV.
+    bool bindScalarTexture(const Block& b, const char* key, int& texOut) {
+        const Stmt* s = find(b, key);
+        if (!s || s->val.words.empty()) return false;
+        const std::string& w0 = s->val.words[0];
+        if (w0.rfind("texture:", 0) != 0) return false;
+        std::string nm = w0.substr(8);
+        auto it = textureIndex_.find(nm);
+        if (it == textureIndex_.end()) {
+            fail(std::string(key) + " references unknown texture '" + nm + "'"); return false;
+        }
+        texOut = it->second;
+        return true;
+    }
+
     // ---- materials ----
     Material buildMaterial(const Block& b) {
         Material m;
@@ -664,9 +682,13 @@ private:
         if (find(b, "preset")) {
             std::string pname = strOf(b, "preset", "");
             if (!resolveMaterialPreset(pname, m)) { fail("unknown material preset '" + pname + "'"); return m; }
-            if (find(b, "roughness"))      m.roughness     = dblOf(b, "roughness", m.roughness);
+            if (find(b, "roughness")) {
+                if (!bindScalarTexture(b, "roughness", m.roughnessTex))
+                    m.roughness = dblOf(b, "roughness", m.roughness);
+            }
             if (find(b, "film_ior"))       m.filmIor       = dblOf(b, "film_ior", m.filmIor);
             if (find(b, "film_thickness")) m.filmThickness = dblOf(b, "film_thickness", m.filmThickness);
+            bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
             return m;
@@ -691,12 +713,18 @@ private:
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
-            m.roughness = dblOf(b, "roughness", 0.2);
+            // `roughness texture:<name>` binds a per-hit roughness map (grayscale =
+            // roughness directly, since both are 0..1); else a constant.
+            if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
+            else m.roughness = dblOf(b, "roughness", 0.2);
         } else if (type == "thinfilm") {
             m.type = MatType::ThinFilm;
             m.ior = spectrumParam(b, "ior", iorConstant(1.5));
             m.filmIor = dblOf(b, "film_ior", 1.30);
+            // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
+            // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
             m.filmThickness = dblOf(b, "film_thickness", 300.0);
+            bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             // Substrate extinction kappa (spectral): 0 = transparent dielectric
             // (lossless, default). Non-zero -> absorbing/metallic substrate giving
             // opaque structural colour; a spectral kappa (e.g. a gaussian) tints it

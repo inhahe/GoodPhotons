@@ -1,0 +1,52 @@
+# Non-albedo texture maps (spec §9.4): grayscale image maps that drive a scalar
+# material parameter per-hit instead of a colour. The same checker.ppm is bound as
+#   * a ROUGHNESS map on a glossy back wall  (grayscale 0..1 = roughness directly)
+#   * a FILM-THICKNESS map on a thin-film floor (grayscale 0..1 profile x nominal nm)
+# so the reflection blur and the iridescent hue both vary across the surface.
+#
+# Both are forward-path materials the GPU supports, so this doubles as a CPU-vs-GPU
+# forward parity check:
+#   ftrace -in scenes/scalarmap.ftsl -device cpu -n 20000000 -o png/scalarmap_cpu.png
+#   ftrace -in scenes/scalarmap.ftsl -device gpu -n 20000000 -o png/scalarmap_gpu.png
+# The scalar sample is the mean of the linear RGB (Texture::scalarAt / dTexScalarAt),
+# and bilerp-of-means == mean-of-bilerp, so the two backends agree by construction.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+texture "checker" {
+    file     scenes/checker.ppm
+    encoding linear
+    filter   bilinear
+    wrap     repeat
+}
+
+material "white"  { type diffuse reflect whitewall 0.75 }
+material "red"    { type diffuse reflect redwall }
+material "green"  { type diffuse reflect greenwall }
+
+# Glossy back wall: reflect spectrum constant, roughness driven by the map.
+material "glossywall" { type glossy reflect whitewall 0.9   roughness texture:checker }
+
+# Thin-film floor: nominal 400 nm scaled by the 0..1 map profile.
+material "filmfloor" { type thinfilm ior 1.5 film_ior 1.30
+                       film_thickness 400   film_thickness_map texture:checker }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material filmfloor }  # floor (film map)
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }      # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material glossywall } # back (roughness map)
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }      # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }      # right
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

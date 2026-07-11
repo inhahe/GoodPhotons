@@ -106,6 +106,17 @@ struct Texture {
         return a * (1 - fy) + b * fy;
     }
 
+    // Scalar (grayscale) sample of the LINEAR image, for NON-colour parameters —
+    // roughness, film thickness, mix weight, etc. (spec §9.4). Averages the three
+    // linear channels (grayscale maps carry r=g=b, so this is exact for them; a
+    // colour map degrades gracefully to its luminance-ish mean). No Jakob-Hanika
+    // upsampling — the value is used directly as the scalar parameter, so such maps
+    // should be authored `encoding linear`. Mirrored on the GPU by dTexScalarAt.
+    double scalarAt(double u, double v) const {
+        Vec3 c = sampleRgb(u, v);
+        return (c.x + c.y + c.z) * (1.0 / 3.0);
+    }
+
     // Reflectance at (u,v,lambda): bilerp the JH coefficients (the standard
     // Jakob-Hanika interpolation) then evaluate the sigmoid. Requires buildReflCoeff().
     double reflectanceAt(double u, double v, double lambda) const {

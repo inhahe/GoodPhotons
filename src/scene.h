@@ -44,6 +44,14 @@ struct Material {
     // scale (repeats per world unit). Set by `uv triplanar [scale <s>]` on the
     // geometry block (spec §9.2). 0 => use the interpolated per-vertex UVs.
     double triplanarScale = 0.0;
+    // Spatially-varying NON-albedo scalar parameters (spec §9.4): a bound texture's
+    // grayscale value (Texture::scalarAt at the hit u,v) overrides the constant field
+    // when >= 0. roughnessTex drives the glossy lobe width; filmThicknessTex drives
+    // the thin-film coating thickness (nm) for spatially-varying iridescence
+    // (peacock/beetle). -1 => use the constant `roughness` / `filmThickness`. Both use
+    // the interpolated per-vertex UVs (no triplanar for scalar params yet).
+    int roughnessTex = -1;
+    int filmThicknessTex = -1;
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
@@ -674,4 +682,23 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
         return tx.reflectanceAt(h.u, h.v, lambda);
     }
     return m.reflect(lambda);
+}
+
+// Per-hit glossy roughness: a bound roughnessTex's grayscale value at the hit,
+// else the constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf
+// see the SAME roughness at a hit — otherwise the density and the sample diverge.
+inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.roughnessTex >= 0 && m.roughnessTex < (int)scene.textures.size())
+        return scene.textures[m.roughnessTex].scalarAt(h.u, h.v);
+    return m.roughness;
+}
+
+// Per-hit thin-film coating thickness (nm): a bound filmThicknessTex's grayscale
+// value (scaled to nm by the constant `filmThickness`, so the map is a 0..1 profile
+// of the authored thickness) at the hit, else the constant thickness. A thickness
+// map spatially varies §3.2 iridescence (peacock/beetle structural colour).
+inline double materialFilmThickness(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.filmThicknessTex >= 0 && m.filmThicknessTex < (int)scene.textures.size())
+        return scene.textures[m.filmThicknessTex].scalarAt(h.u, h.v) * m.filmThickness;
+    return m.filmThickness;
 }

@@ -291,9 +291,21 @@ as practical; this file is the fallback for what can't be addressed immediately.
      clobbered the mesh's own `scale` transform (this caused an all-black render while
      the torus ballooned to 4x and occluded the box; the same fix now applies to
      `uv planar axis=x`).
-  2. **Non-albedo parameters.** A texture can only bind to diffuse `reflect` today.
-     Spec §9.4 wants textures on roughness, mix weights, ior, thickness, etc. — each
-     needs the corresponding material param to accept a per-hit texture lookup.
+  2. **Non-albedo parameters.** ~~A texture can only bind to diffuse `reflect`.~~
+     **DONE 2026-07-11 (roughness + film-thickness maps, both backends):** `glossy`
+     takes `roughness texture:<name>` (grayscale = roughness directly) and `thinfilm`
+     takes `film_thickness_map texture:<name>` (0..1 profile × nominal `film_thickness`
+     nm). Bound in `src/ftsl.h` via `bindScalarTexture`; sampled per-hit by
+     `materialRoughness`/`materialFilmThickness` (`src/scene.h`) → `Texture::scalarAt`
+     (mean of linear RGB). All three CPU tracers (forward/backward/BDPT) and the GPU
+     forward path (megakernel + wavefront, via `dMatRoughness`/`dMatFilmThickness` +
+     `dTexScalarAt` over an uploaded per-texel `gray` array) use it. **MIS
+     correctness:** the CPU BDPT threads the hit UV through `bsdfPdf`/`bsdfF` so the
+     sampled and evaluated roughness match; the GPU BDPT does not, so `cudaBdptSupported`
+     rejects roughness/thickness-map scenes → CPU BDPT fallback. Validated by
+     `scenes/scalarmap.ftsl`: CPU vs GPU forward exposure 7.3e-13 vs 7.29e-13, mean
+     agrees to <0.1%, signed diff ~0.04% (unbiased). **Still deferred:** maps on `mix`
+     weight and `ior`.
   3. ~~**GPU.** Textured scenes force the CPU tracer.~~ **DONE 2026-07-11:** the
      forward CUDA path now ports textured diffuse reflectance. `buildUpload()` uploads
      each texture's per-texel Jakob-Hanika coeff table (`DTexture`, flattened `3*w*h`)
@@ -310,8 +322,10 @@ as practical; this file is the fallback for what can't be addressed immediately.
      not implemented.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
   2026-07-10; GPU port done 2026-07-11; **analytic UV projections (planar/spherical/
-  cylindrical) + triplanar box projection done 2026-07-11 (CPU + GPU)**; non-albedo
-  params + indexed palettes (items 2/4) deferred.
+  cylindrical) + triplanar box projection done 2026-07-11 (CPU + GPU)**; **non-albedo
+  roughness + film-thickness maps done 2026-07-11 (CPU all tracers + GPU forward; GPU
+  BDPT falls back to CPU)**; `mix`/`ior` maps + indexed palettes (items 2 partial/4)
+  deferred.
 
 ### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
 - **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`
