@@ -167,10 +167,13 @@ truth), remain CPU-only.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
   (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
-  forward scenes. It also falls back for any scene using the newer CPU-only features —
-  **implicit surfaces (`isosurface`), procedural patterns, and dielectric translucency
-  (frosted/colored glass)** — whose device port is pending. `cpu` is fully
-  deterministic and is used for reference/validation baselines.
+  forward scenes. Implicit surfaces / `isosurface`, **procedural patterns**, and
+  **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
+  GPU-accelerated now — the device sphere-traces the same field expressions, runs the
+  same pattern VM, and threads the interior-absorption medium through both the forward
+  and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
+  material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
+  reproduce. `cpu` is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -304,7 +307,8 @@ two physically-motivated translucency controls (both compose with dispersion):
   (Beer–Lambert), so thick regions tint more than thin edges. Authored like any
   spectrum (e.g. `absorb gaussian center=470 sigma=60 amp=14` for amber). Interior
   absorption is threaded through all three CPU transport loops (forward, backward,
-  BDPT); see `scenes/translucency.ftsl`. *(GPU: CPU-only for now — see Known issues.)*
+  BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
+  frosting and colored-glass tint; mode-`D` BDPT still falls back to the CPU.)*
 
 ---
 
@@ -393,6 +397,7 @@ combinator** whose children are themselves field elements:
 | `cylinder` | `radius`, `height` (axis = local +y) |
 | `cone` | `radius` (bottom), `radius2` (top, 0 = pointed), `height` |
 | `plane` | `normal`, `offset` |
+| `function` | `expr "f(x,y,z)"` — arbitrary formula leaf (see below) |
 
 | Combinator | Meaning |
 |---|---|
@@ -406,8 +411,73 @@ rotation) rather than `center` (applied inside — it would orbit the world orig
 Non-uniform scale is supported (the field stays a valid Lipschitz-1 SDF by de-rating
 the step to the smallest axis scale), so an `ellipsoid`, a squashed `box`/`torus`, etc.
 all work. Surface normals come from the analytic field gradient. A worked example with
-metaballs, drilled CSG, and a tilted torus is in `scenes/implicit.ftsl`. *(GPU: implicit
-surfaces are CPU-only for now — see Known issues.)*
+metaballs, drilled CSG, and a tilted torus is in `scenes/implicit.ftsl`. Implicit
+surfaces are sphere-traced on **both the CPU and the GPU** (the device port matches the
+CPU to Monte-Carlo noise).
+
+#### Arbitrary-formula isosurfaces (`function`)
+
+The analytic leaves above are all built-in signed-distance fields. To render the
+surface of an **arbitrary equation** `f(x,y,z) = 0` — a gyroid, a Goursat/heart shape,
+any hand-typed formula — use a `function` leaf:
+
+```
+isosurface {
+    material gold
+    function {
+        translate 0.5 0.5 0.45           # (optional) place / rotate / scale the field frame
+        expr "sin(28*x)*cos(28*y) + sin(28*y)*cos(28*z) + sin(28*z)*cos(28*x)"
+    }
+    contained_by { min 0.3 0.3 0.25   max 0.7 0.7 0.65 }   # REQUIRED bound box
+    max_gradient 48                       # (optional) Lipschitz bound; auto-estimated if omitted
+    accuracy 1e-4                         # (optional) march-step floor, world units
+}
+```
+
+The `expr` string is compiled by the **same math VM as procedural patterns** (variables
+`x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
+atan2 clamp mix smoothstep noise`, and the constant `pi`). Because an arbitrary field is
+**not** a signed distance and has no analytic bound, a `function` isosurface **must**
+supply a `contained_by { min <x y z>  max <x y z> }` box (the region the surface is
+marched inside). Safe sphere-tracing needs a **Lipschitz bound** `L ≥ max|∇f|` so a step
+of `|f|/L` never overshoots the first zero crossing; give it explicitly with
+`max_gradient`, or omit it and the loader auto-estimates it by sampling `|∇f|` over the
+box (padded ×1.3). `accuracy` overrides the march-step floor. A `function` leaf also
+composes inside CSG combinators (`union`, `difference`, `blob`, …) like any other leaf.
+The worked gyroid example is in `scenes/function.ftsl`; expression isosurfaces run on
+**both the CPU and the GPU** (the device evaluates the identical formula VM — an
+expression sphere matches the analytic `sphere` leaf to RMSE ≈ 0.15 % on the same
+backend).
+
+##### Ray-march strategy (`method`, `refine`)
+
+Any `isosurface` (analytic *or* `function`) chooses how the ray finds the field's first
+zero crossing:
+
+| Key | Values | Meaning |
+|---|---|---|
+| `method` | `adaptive` (default) / `sample` | how the ray steps toward the surface |
+| `samples` | `<n>` | *sample mode only* — number of fixed steps across the container's diagonal (default 256; or size the step with `accuracy`) |
+| `refine` | `bisect` (default) / `regula_falsi` | how a bracketed sign change is refined to the root |
+
+- **`adaptive`** steps by `max(|f|/max_gradient, accuracy)` — sphere-tracing for a true
+  SDF (`max_gradient = 1`), or a Lipschitz-bounded march for a `function` field. With a
+  correct `max_gradient` it **provably cannot skip** the first crossing (across one step
+  `f` can change by at most the step size, so it can't dip through zero and back), and it
+  slows down only near surfaces. This is the right choice almost always.
+- **`sample`** ignores `|f|` and marches by a **fixed** world step (POV-Ray's sampling
+  mode). It needs **no** Lipschitz bound, so it's the fallback when `max_gradient` can't be
+  trusted (spiky/near-unbounded gradients where the auto-estimate is unreliable) — but a
+  feature thinner than one step *between two samples* can be missed, so raise `samples`
+  until the surface is clean.
+- **`refine`** only changes root-polishing speed, not the result: `bisect` is
+  unconditionally robust (linear); `regula_falsi` (secant with the Illinois safeguard)
+  converges faster on smooth brackets. Both land on the same root to ~1e-12.
+
+Validated: on a clean surface the `sample` and `adaptive` marchers agree to RMSE ≈ 0.4/255
+(CPU) / 0.01/255 (GPU) — same geometry, both backends. `scenes/function.ftsl` uses the
+adaptive default; `method sample` + `samples`/`refine` are shown in the scraps test
+scenes.
 
 ## Textures
 
@@ -457,7 +527,10 @@ Bind a pattern anywhere a scalar `texture:<name>` map is accepted, using
 `weight_map` case is the powerful one: because a `mix` blends whole materials, a pattern
 weight makes the *material itself* — colour **and** BSDF type — vary from point to
 point (checkerboard of red vs green diffuse, noise-selected metal vs glass, …). See
-`scenes/procedural.ftsl`. *(GPU: patterns are CPU-only for now — see Known issues.)*
+`scenes/procedural.ftsl`. *(GPU: patterns run on the device forward and backward
+paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT is the
+exception — its MIS kernel falls back to the CPU for any pattern or frosted/colored
+glass.)*
 
 ## Participating media / fog
 
@@ -472,11 +545,12 @@ function by default; Rayleigh optional.
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
 field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
-surface / CSG / metaballs), `light`, `group`, `medium`, `camera`, `camera_path`
-(keyframed camera animation), and `render` (render-setting overrides). See the
-`scenes/` directory for worked examples (`cornell.ftsl`, `fisheye.ftsl`,
-`spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`, `realcam.ftsl`,
-`implicit.ftsl`, `procedural.ftsl`, `translucency.ftsl`, …).
+surface / CSG / metaballs / arbitrary `function` formulas), `light`, `group`, `medium`,
+`camera`, `camera_path` (keyframed camera animation), and `render` (render-setting
+overrides). See the `scenes/` directory for worked examples (`cornell.ftsl`,
+`fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`,
+`realcam.ftsl`, `implicit.ftsl`, `function.ftsl`, `procedural.ftsl`,
+`translucency.ftsl`, …).
 
 ### Importing Mitsuba scenes
 

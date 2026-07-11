@@ -1576,9 +1576,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
                                   "(fluorescent/oversized-mix material, fog, "
-                                  "spot/env/collimated light, or a forward-CPU-only "
-                                  "feature: implicit surface / procedural pattern / "
-                                  "frosted-or-colored glass)";
+                                  "spot/env/collimated light, or a per-hit BSDF the GPU "
+                                  "BDPT can't MIS: a procedural pattern or frosted/colored "
+                                  "glass)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -1594,9 +1594,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!cudaBackwardSupported(scene, cam)) {
                 const char* why = "scene has a backward-GPU-unsupported feature "
                                   "(fog, env light, spot/collimated light, fluorescence, "
-                                  "a lens deeper than the device cap, or a forward-CPU-only "
-                                  "feature: implicit surface / procedural pattern / "
-                                  "frosted-or-colored glass)";
+                                  "or a lens deeper than the device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -1610,8 +1608,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 "[device] GPU can't accelerate this render: %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
-            const char* why = "GPU-unsupported feature (implicit surface, procedural "
-                              "pattern, frosted/colored glass, layered material, indexed "
+            const char* why = "GPU-unsupported feature (layered material, indexed "
                               "palette, or oversized multilayer/mix material)";
             if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);

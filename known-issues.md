@@ -5,6 +5,44 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Resolved
 
+### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
+- **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
+  renders the zero set of a hand-typed equation (gyroid, Goursat, etc.), distinct from
+  the built-in analytic SDF leaves. The formula is compiled by the **same shunting-yard /
+  postfix VM as procedural patterns** (`compilePatternExpr`, vars `x y z` and `r=|p|`).
+- **Implementation:** `implicit.h` gained a `FieldOp::Expr` leaf (indices a per-`Implicit`
+  `exprNodes` PatNode pool via `exprOff/exprN`); `fieldLeafSDF`/`fieldEval`/`fieldGradient`
+  thread `const PatNode* exprPool`; new helpers `fieldHasExpr` +
+  `estimateFieldLipschitz` (samples `|∇f|` on a 24³ grid over the container box).
+  `ftsl.h` `addFunctionLeaf` + rewritten `addIsosurface` parse `function`,
+  `contained_by { min max }`, optional `max_gradient` (Lipschitz bound; auto-estimated
+  ×1.3 when omitted), and optional `accuracy` (march-step floor). GPU port in
+  `render_cuda.cu`: `DF_EXPR` op, `DFieldNode.exprOff/exprN`, a flat device
+  `fieldExprNodes` PatNode pool (`DScene::fieldExprNodes`), and `dFieldLeafSDF`/
+  `dFieldEval`/`dFieldGradient` thread the pool + call `dPatternEval` for the Expr case
+  (forward-declared above the field VM).
+- **Why a container box is required:** an arbitrary field is **not** a signed distance
+  and has no analytic AABB, so the marcher needs (1) a region to march inside and (2) a
+  Lipschitz bound `L ≥ max|∇f|` so a step of `|f|/L` never overshoots the first zero.
+- **Validation:** an expression sphere (`x*x+y*y+z*z-0.04`) matches the analytic `sphere`
+  leaf to **RMSE 0.37/255 (0.15 %) on the same backend** (the ~12.6 CPU↔GPU RMSE is the
+  inherent FP32/RNG divergence — the analytic sphere shows the same 12.58). `scenes/
+  function.ftsl` (gyroid) renders correctly on both CPU and GPU. Means match ~1 %.
+- **Ray-march strategy selector — DONE 2026-07-11 (follow-up):** any `isosurface` now
+  picks how the ray finds the first zero crossing via `method adaptive|sample`,
+  `samples <n>`, and `refine bisect|regula_falsi`. `implicit.h` gained `MarchMethod` /
+  `RootRefine` enums + `Implicit.sampleStep`; `intersectImplicit` branches the march
+  (fixed `sampleStep/dlen` vs the `|f|/lipschitz` adaptive step) and the refinement
+  (bisection vs Illinois-safeguarded regula-falsi, tracking both bracket endpoints).
+  `ftsl.h` `addIsosurface` parses the three keys (sample step = box diagonal / samples,
+  else `accuracy`, else diag/256). GPU twins in `render_cuda.cu`: `DImplicit.method/
+  refine/sampleStep` + the identical branch in the device `intersectImplicit`. The
+  `adaptive` method (default) provably can't skip the first crossing given a correct
+  `max_gradient`; `sample` needs no Lipschitz bound but can miss features thinner than one
+  step. Validated: on the clean expression sphere `sample` vs `adaptive` agree to RMSE
+  0.41/255 (CPU) / **0.01/255 (GPU)** — identical geometry; regula-falsi and bisection
+  land on the same root. Bad `method`/`refine` values are rejected with a clear error.
+
 ### `-o foo.png` wrote a PPM (P6), not a PNG — extension was ignored [RESOLVED 2026-07-10]
 - **What was wrong:** the image writer (`writePPM` in `src/main.cpp`) always
   emitted binary PPM (P6) regardless of the output extension, so `ftrace -o
@@ -42,34 +80,56 @@ as practical; this file is the fallback for what can't be addressed immediately.
   endpoint sits in) and multiply the connection throughput by the resulting
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
 
-### GPU parity pending for implicit surfaces, procedural patterns, and dielectric translucency
-- **What:** the §1–4 CPU feature set — **implicit surfaces** (`isosurface`: analytic
-  SDF primitives, hard/smooth CSG, metaballs; `src/implicit.h`), **procedural patterns**
-  (`pattern` blocks + `pattern:<name>` scalar/selection drives; `src/pattern.h`), and
-  **dielectric translucency** (frosted glass = roughness lobe on the transmitted ray;
-  colored glass = Beer–Lambert `absorb` interior tint) — is **CPU-only**. The CUDA
-  backend (`src/render_cuda.cu`) has no device sphere-tracer (its `closestHit` handles
-  only triangles and spheres), no pattern VM, and its dielectric branch
-  (`refractOrReflect`) is smooth and non-absorbing.
-- **Current behavior (correct, not silently wrong):** `cudaForwardSupported()` now
-  gates all three — a scene with any `scene.implicits`, any material with a bound
-  pattern (`roughnessPat`/`filmThicknessPat`/`mixWeightPat >= 0`), or any frosted/colored
-  dielectric returns `false`, so `-device gpu`/`auto` **falls back to the CPU tracer**
-  (message names the feature). `cudaBdptSupported()`/`cudaBackwardSupported()` inherit
-  this (both call `cudaForwardSupported`). Verified: `scenes/implicit.ftsl`,
-  `procedural.ftsl`, `translucency.ftsl` all fall back; a plain clear-glass scene
-  (`cornell.ftsl`, `glass:SF10`) still runs on GPU (the gate distinguishes clear from
-  frosted/colored — clear dielectrics author `roughness 0` and a zero `absorb`).
-- **Proper fix (step 5, the remaining port):** (a) upload `FieldNode` arrays + `Implicit`
-  primitives into `DScene` and add device sphere-tracing to `closestHit` (`fieldVal`
-  written into the device Hit); (b) upload `Scene::patterns` as flat `PatNode` arrays +
-  port `patternEval` to the device, then wire `dMatRoughness`/`dMatFilmThickness`/
-  `dMixResolveChild` to consult them; (c) thread an `interior` medium pointer through the
-  device transport loops for Beer–Lambert absorption and add the roughness lobe to the
-  device dielectric (frosting). The pattern VM and noise hash were written GPU-portable
-  (POD `PatNode`, integer-hash noise) specifically to make (b) a near-direct port.
-- **Status:** OPEN — logged 2026-07-11. CPU path complete & validated; GPU port is the
-  next planned increment.
+### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
+- **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward
+  tracers: **implicit surfaces** (5a), **procedural patterns** (5b), and **dielectric
+  translucency** (5c — frosted glass = roughness lobe on both dielectric lobes; colored
+  glass = Beer–Lambert `absorb` interior tint). The only remaining fallback is **GPU BDPT**
+  (mode `D`), whose MIS kernel still can't reproduce per-hit pattern BSDFs or frosted/
+  colored glass, so those scenes fall back to the CPU BDPT.
+- **Implicit surfaces — DONE (2026-07-11, step 5a):** `render_cuda.cu` gained device
+  twins `DFieldNode`/`DImplicit`, a postfix field evaluator (`dFieldEval`/`dFieldLeafSDF`/
+  `dFieldGradient`, all FP64 for sphere-trace bisection robustness), and
+  `intersectImplicit` (a direct port of the CPU sphere-trace). `buildUpload` flattens
+  every `Implicit`'s `FieldNode` array into one device pool and uploads a `DImplicit`
+  descriptor per primitive; `closestHit`/`occluded` dispatch BVH prims with index
+  `>= nTris+nSph` to `intersectImplicit` (matching the CPU prim ordering). Validated:
+  `scenes/implicit.ftsl` (metaballs + drilled CSG + tilted torus) renders on the GPU
+  mode-R backward megakernel with GPU-vs-CPU RMSE 9.9/255 at 512 spp — *lower* than the
+  cornell baseline (12.7/255) at the same settings, i.e. pure Monte-Carlo noise, no
+  implicit-specific bias; mean brightness matches to ~1%.
+- **Procedural patterns — DONE (2026-07-11, step 5b):** `render_cuda.cu` gained a device
+  pattern VM — `DPattern` slices into a flat `PatNode` pool (`DScene::patNodes`), plus
+  `dPatHash3`/`dPatValueNoise`/`dPatternEval`/`dPatternScalarAt`, exact ports of
+  `pattern.h` (POD `PatNode`/`PatOp` uploaded verbatim; the field variable `f` is 0 at
+  surfaces, matching the CPU). `DMaterial` carries `roughnessPat`/`filmThicknessPat`/
+  `mixWeightPat`; `dMatRoughness`/`dMatFilmThickness`/`dMixResolveChild` consult a bound
+  pattern (highest priority, above textures). `buildUpload` flattens `Scene::patterns` and
+  sets the per-material indices. `cudaForwardSupported()` no longer gates patterns (only
+  frosted/colored glass), so the forward + backward paths render them on-device; **GPU
+  BDPT still falls back** for any pattern-driven material (`cudaBdptSupported`), because
+  its MIS pdf/eval kernel (`kBdpt`) uses the constant params. Validated: `scraps/patval.ftsl`
+  (checker/noise `mixWeightPat` spheres + a glossy `roughnessPat` sphere) GPU-vs-CPU RMSE
+  12.9/255 at 512 spp → 7.2/255 at 2048 spp (falls as 1/√spp — pure noise, no bias);
+  mean brightness matches to ~1%.
+- **Dielectric translucency — DONE (2026-07-11, step 5c):** the device `refractOrReflect`
+  gained a frosting lobe (jitter both the reflected and refracted directions by a
+  power-cosine lobe when per-hit `dMatRoughness` > 1e-3, rejecting jitters that cross to the
+  wrong side); `DMaterial` gained a baked `absorb[SPEC_N]` table; and an `interior` medium
+  index (the dielectric material a photon/ray is inside, -1 = vacuum) is threaded through
+  both forward paths — `shadeStep` (megakernel `kTrace` local + wavefront `WFState::interior`
+  SoA slot) — and the backward `bkRadiance`, applying `beta/thr *= exp(-absorb(λ)·dSeg)` over
+  each in-glass segment. `cudaForwardSupported()` no longer gates frosted/colored glass, so
+  `-device gpu`/`auto` renders them on the forward + backward tracers; **GPU BDPT still falls
+  back** (the `frostedOrColoredGlass` gate moved into `cudaBdptSupported`, alongside the
+  pattern gate). Validated: `translucency.ftsl` (colored glass) GPU-vs-CPU RMSE 16.9/255 →
+  9.5/255 at 512→2048 spp (falls ~1/√spp; mean matches 1.3%→0.7%); `procedural.ftsl` (frosted
+  height-banded glass + patterns) RMSE 21.7 → 13.0 at 512→2048 spp (mean matches 0.06%→0.2%);
+  forward megakernel vs wavefront agree on mean to 0.15%; BDPT falls back with the correct
+  message; `cornell.ftsl` (clear glass) + `implicit.ftsl` still run on GPU (no regression).
+- **Status:** DONE — logged 2026-07-11; implicit surfaces (5a), procedural patterns (5b), and
+  dielectric translucency (5c) all landed the same day. Full §1–4 GPU forward/backward parity
+  achieved; only GPU BDPT retains feature-scoped fallbacks (patterns, frosted/colored glass).
 
 ### Multi-camera renders re-trace photons per camera (no shared pass yet)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render

@@ -29,3 +29,12 @@ ok, let's add some native primitives to our renderer! metaballs, whatever those 
 
 let's have both isosurface algorithms, selectable within the isosurface language? and how about the ability to use functions to determine various material properties at specific xyz locations? speaking of material properties, we do have translucency and transparency, right?
 ^ doing
+
+Isosurfaces — the general case: any scalar field f(x,y,z), surface = {p : f(p)=0}. Metaballs, gyroids, tori, hearts, noise-perturbed spheres all fall out of the function. Two ways to intersect a ray:
+Sphere-tracing an SDF (signed distance function): step by the field value, guaranteed not to overshoot. Fast, robust, but the field must be a true distance (or Lipschitz-bounded).
+Root-finding a general f along the ray: sample f at intervals, bracket a sign change, bisect/regula-falsi. Handles arbitrary f (POV-Ray's approach) but needs a max_gradient/step budget to not miss thin features. 
+
+^^ did you make both of those options for generalized isosurface expressions?
+
+
+

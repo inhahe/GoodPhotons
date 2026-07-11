@@ -25,6 +25,7 @@
 #include "linalg.h"
 #include "geometry.h"
 #include "bvh.h"
+#include "pattern.h"   // PatNode / patternEval: arbitrary f(x,y,z) expression leaves
 
 // ---------------------------------------------------------------------------
 // Field expression: nodes in postfix order.
@@ -39,6 +40,9 @@ enum class FieldOp : int {
     Plane,        // p[0..2] = unit normal, p[3] = signed offset (f = dot(pl,n) + off)
     Cylinder,     // p[0] = radius, p[1] = half-height (capped, axis = local y)
     Cone,         // p[0] = bottom radius, p[1] = top radius, p[2] = half-height (axis = local y)
+    Expr,         // arbitrary f(x,y,z)=0 isosurface: exprOff/exprN index a shared PatNode
+                  // pool (the compiled infix expression). NOT a true SDF, so the marcher
+                  // relies on the primitive's Lipschitz bound (max_gradient) to step safely.
     // Combinators — pop two SDF values (a below b on the stack), push one.
     Union,             // min(a,b)
     Intersect,         // max(a,b)
@@ -48,7 +52,7 @@ enum class FieldOp : int {
     SmoothDifference,  // smax(a,-b,k)     p[0] = k
 };
 
-inline bool fieldOpIsLeaf(FieldOp op) { return op <= FieldOp::Cone; }
+inline bool fieldOpIsLeaf(FieldOp op) { return op <= FieldOp::Expr; }
 
 // One node of the field expression. POD (no std:: members) so it uploads to the
 // GPU verbatim. Leaf nodes carry their own world->local affine `inv` and the
@@ -59,6 +63,8 @@ struct FieldNode {
     double  p[4] = {1, 0, 0, 0};
     Affine  inv;          // world -> local (leaf only)
     double  scale = 1.0;  // world = scale * local; d_world = d_local * scale (leaf only)
+    int     exprOff = -1; // Expr leaf: start index into the owning Implicit's exprNodes pool
+    int     exprN   = 0;  // Expr leaf: number of PatNodes in the compiled program
 };
 
 // ---- smooth-min / smooth-max (quadratic polynomial blend, Inigo Quilez) -------
@@ -75,10 +81,22 @@ inline double sdfSmax(double a, double b, double k) {
 }
 
 // ---- leaf SDF evaluation (query point already mapped to the leaf's local space) ----
-inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl) {
+// `exprPool` backs FieldOp::Expr leaves (the shared PatNode program pool); it may be
+// null when the field has no expression leaves.
+inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl, const PatNode* exprPool) {
     switch (nd.op) {
         case FieldOp::Sphere:
             return length(pl) - nd.p[0];
+        case FieldOp::Expr: {
+            // Evaluate the compiled infix expression f(x,y,z) at the leaf-local point.
+            // r = |p_local| is exposed too (a sphere is simply "r - 1"); f/normals are
+            // meaningless when DEFINING a surface, so they read 0. The value is a raw
+            // field, not a distance — the marcher's Lipschitz bound keeps steps safe.
+            PatCtx c;
+            c.x = pl.x; c.y = pl.y; c.z = pl.z;
+            c.r = std::sqrt(pl.x * pl.x + pl.y * pl.y + pl.z * pl.z);
+            return exprPool ? patternEval(exprPool + nd.exprOff, nd.exprN, c) : DBL_MAX;
+        }
         case FieldOp::Box: {
             // Rounded box (Inigo Quilez): inset the half-extents by the rounding
             // radius r, take the plain box distance, then subtract r. r = 0 gives a
@@ -130,7 +148,8 @@ inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl) {
 }
 
 // Evaluate the whole field at a world point via the postfix scalar stack.
-inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw) {
+// `exprPool` backs FieldOp::Expr leaves (may be null when the field has none).
+inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw, const PatNode* exprPool) {
     double st[64];
     int sp = 0;
     for (int i = 0; i < n; ++i) {
@@ -144,7 +163,7 @@ inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw) {
             case FieldOp::SmoothDifference: { double b = st[--sp], a = st[--sp]; st[sp++] = sdfSmax(a, -b, nd.p[0]); break; }
             default: {  // leaf
                 Vec3 pl = nd.inv.apply(pw);
-                st[sp++] = fieldLeafSDF(nd, pl) * nd.scale;
+                st[sp++] = fieldLeafSDF(nd, pl, exprPool) * nd.scale;
             }
         }
     }
@@ -153,35 +172,62 @@ inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw) {
 
 // Surface normal from the field gradient (tetrahedron central differences). eps
 // scales with the hit distance so the stencil stays well-conditioned at any range.
-inline Vec3 fieldGradient(const FieldNode* nodes, int n, const Vec3& p, double eps) {
+inline Vec3 fieldGradient(const FieldNode* nodes, int n, const Vec3& p, double eps,
+                          const PatNode* exprPool) {
     const Vec3 k1{ 1, -1, -1}, k2{-1, -1,  1}, k3{-1,  1, -1}, k4{ 1,  1,  1};
-    Vec3 g = k1 * fieldEval(nodes, n, p + k1 * eps)
-           + k2 * fieldEval(nodes, n, p + k2 * eps)
-           + k3 * fieldEval(nodes, n, p + k3 * eps)
-           + k4 * fieldEval(nodes, n, p + k4 * eps);
+    Vec3 g = k1 * fieldEval(nodes, n, p + k1 * eps, exprPool)
+           + k2 * fieldEval(nodes, n, p + k2 * eps, exprPool)
+           + k3 * fieldEval(nodes, n, p + k3 * eps, exprPool)
+           + k4 * fieldEval(nodes, n, p + k4 * eps, exprPool);
     double len = length(g);
     return len > 0.0 ? g / len : Vec3{0, 0, 1};
 }
+
+// Ray-march strategy for finding the first zero crossing of the field along a ray.
+//   Adaptive — step by max(|f|/lipschitz, minStep). For a true SDF (lipschitz=1) this
+//     is sphere-tracing; for a Lipschitz-bounded arbitrary field it is a provably
+//     no-overshoot bracketing march (with a correct bound it cannot skip the first
+//     crossing). The default; relies on `lipschitz` being a true global bound.
+//   Sample — step by a FIXED world distance `sampleStep`, ignoring |f|. Doesn't rely
+//     on any Lipschitz bound (good when max_gradient can't be trusted), but a feature
+//     thinner than sampleStep between two samples can be missed. POV-Ray's fixed-step
+//     `evaluate`/sampling mode.
+enum class MarchMethod : int { Adaptive = 0, Sample = 1 };
+
+// Root refinement once a sign change brackets [ta, tb].
+//   Bisect — halve the bracket; unconditionally robust, linear convergence.
+//   RegulaFalsi — linear (secant) interpolation to the zero, with the Illinois
+//     safeguard so the bracket always shrinks; faster on smooth brackets.
+enum class RootRefine : int { Bisect = 0, RegulaFalsi = 1 };
 
 // ---------------------------------------------------------------------------
 // The primitive.
 // ---------------------------------------------------------------------------
 struct Implicit {
     std::vector<FieldNode> nodes;   // postfix field expression
+    std::vector<PatNode> exprNodes; // shared pool backing FieldOp::Expr leaves (f(x,y,z))
     int    matId = 0;
     Aabb   bounds;                  // conservative world AABB (BVH leaf box + ray clip)
     // Lipschitz bound of the field: for a true SDF this is 1, and a sphere-trace
     // step of |f| never overshoots. Fields that aren't unit-Lipschitz (e.g. summed
     // metaball densities) set this > 1 so the step is scaled down to |f|/lipschitz,
-    // trading speed for correctness. Set by the builder.
+    // trading speed for correctness. Set by the builder. (Adaptive method only.)
     double lipschitz = 1.0;
     // Minimum march step (world units): the floor on the sign-change ray march and
     // the thinnest resolvable feature. Sized from the bounds by the builder.
     double minStep = 1e-4;
+    // Ray-march strategy (see MarchMethod / RootRefine above). `sampleStep` is the
+    // fixed world-space march step used by MarchMethod::Sample (sized by the builder
+    // from `samples`/`accuracy`); unused by Adaptive.
+    MarchMethod method = MarchMethod::Adaptive;
+    RootRefine  refine = RootRefine::Bisect;
+    double sampleStep = 0.0;
 
-    double eval(const Vec3& pw) const { return fieldEval(nodes.data(), (int)nodes.size(), pw); }
+    double eval(const Vec3& pw) const {
+        return fieldEval(nodes.data(), (int)nodes.size(), pw, exprNodes.data());
+    }
     Vec3   gradient(const Vec3& pw, double eps) const {
-        return fieldGradient(nodes.data(), (int)nodes.size(), pw, eps);
+        return fieldGradient(nodes.data(), (int)nodes.size(), pw, eps, exprNodes.data());
     }
 };
 
@@ -205,6 +251,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     const double dlen    = length(r.d);
     const int    N       = (int)im.nodes.size();
     const FieldNode* nd  = im.nodes.data();
+    const PatNode* pool  = im.exprNodes.data();   // backs FieldOp::Expr leaves (may be null)
     const int    MAX_STEP = 2048;
     const double invLip  = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
     // Minimum world-space march step: a floor on the otherwise |f|-adaptive step so
@@ -220,10 +267,17 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     // spawned just off a surface can leave it without self-intersecting. Transmission
     // rays are spawned just INSIDE (f<0) by the tracers and correctly cross to the
     // far side. This is far more robust than proximity (|f|<eps) detection.
+    // Sample method marches by a fixed world step (ignoring |f|); Adaptive marches by
+    // the |f|/lipschitz safe distance with a minStep floor.
+    const bool  sampleMode  = (im.method == MarchMethod::Sample);
+    const double fixedStep  = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
+    const bool  regulaFalsi = (im.refine == RootRefine::RegulaFalsi);
+
     double t = t0;
-    double f = fieldEval(nd, N, r.o + r.d * t);
+    double f = fieldEval(nd, N, r.o + r.d * t, pool);
     for (int i = 0; i < MAX_STEP; ++i) {
-        double step = std::fmax(std::fabs(f) * invLip, minStep) / dlen;
+        double step = sampleMode ? fixedStep
+                                 : std::fmax(std::fabs(f) * invLip, minStep) / dlen;
         double tn = t + step;
         // Clamp the last step to the AABB exit and still test for a crossing there:
         // a ray starting inside the surface can have its first |f|-sized step land
@@ -231,25 +285,40 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         // before evaluating the boundary would drop that hit.
         bool last = false;
         if (tn >= t1) { tn = t1; last = true; }
-        double fn = fieldEval(nd, N, r.o + r.d * tn);
+        double fn = fieldEval(nd, N, r.o + r.d * tn, pool);
         bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) ||
                        (f == 0.0 && fn != 0.0);
         if (crossed) {
-            // Bisect the bracket [t, tn] to a precise root (residual ~1e-12), so the
-            // shared 1e-6 ray-spawn offset lands safely on the correct side.
-            double ta = t, tb = tn, fa = f;
-            for (int b = 0; b < 60; ++b) {
-                double tm = 0.5 * (ta + tb);
-                double fm = fieldEval(nd, N, r.o + r.d * tm);
-                if ((fa > 0.0) == (fm > 0.0)) { ta = tm; fa = fm; }
-                else                          { tb = tm; }
+            // Refine the bracket [t, tn] to a precise root (residual ~1e-12) so the
+            // shared 1e-6 ray-spawn offset lands safely on the correct side. Bisection
+            // is the robust default; regula-falsi (Illinois-safeguarded) interpolates.
+            double ta = t, tb = tn, fa = f, fb = fn;
+            int side = 0;
+            for (int b = 0; b < 80; ++b) {
+                double tm;
+                if (regulaFalsi && (fb - fa) != 0.0) {
+                    tm = (ta * fb - tb * fa) / (fb - fa);
+                    if (tm <= ta || tm >= tb) tm = 0.5 * (ta + tb);  // guard out-of-bracket
+                } else {
+                    tm = 0.5 * (ta + tb);
+                }
+                double fm = fieldEval(nd, N, r.o + r.d * tm, pool);
+                if ((fa > 0.0) == (fm > 0.0)) {
+                    ta = tm; fa = fm;
+                    if (regulaFalsi && side == +1) fb *= 0.5;   // Illinois: shrink stuck side
+                    side = +1;
+                } else {
+                    tb = tm; fb = fm;
+                    if (regulaFalsi && side == -1) fa *= 0.5;
+                    side = -1;
+                }
                 if ((tb - ta) * dlen < 1e-12) break;
             }
             double th = 0.5 * (ta + tb);
             if (th < tmin || th >= hit.t) return false;
             Vec3 p = r.o + r.d * th;
             double eps = std::fmax(1e-6, 1e-4 * th);
-            Vec3 g = fieldGradient(nd, N, p, eps);
+            Vec3 g = fieldGradient(nd, N, p, eps, pool);
             hit.t = th; hit.p = p; hit.valid = true;
             hit.ng = g;
             hit.n = (dot(r.d, g) < 0.0) ? g : -g;
@@ -327,7 +396,8 @@ inline Aabb leafBox(const FieldNode& nd) {
             return transformedLocalBox(nd, Vec3{-rr, -nd.p[2], -rr}, Vec3{rr, nd.p[2], rr});
         }
         case FieldOp::Plane:
-        default: {
+        case FieldOp::Expr:      // an arbitrary field has no analytic box: the isosurface's
+        default: {               // required `contained_by` clamps it (see addIsosurface).
             Aabb box; box.lo = Vec3{-BIG, -BIG, -BIG}; box.hi = Vec3{BIG, BIG, BIG};
             return box;
         }
@@ -357,6 +427,45 @@ inline double implicitMinStep(const Aabb& b) {
     if (s < 1e-5) s = 1e-5;
     if (s > 1e-3) s = 1e-3;
     return s;
+}
+
+// True if the field expression contains an arbitrary-expression (Expr) leaf, which is
+// NOT a signed-distance function — such a field needs an explicit container box and a
+// Lipschitz (max-gradient) bound instead of the SDF assumptions.
+inline bool fieldHasExpr(const std::vector<FieldNode>& nodes) {
+    for (const auto& nd : nodes) if (nd.op == FieldOp::Expr) return true;
+    return false;
+}
+
+// Estimate a Lipschitz bound L >= max|grad f| for the WORLD field over the box, by
+// sampling |grad f| on a grid (central differences). Sphere-tracing by |f|/L then
+// provably never overshoots the first zero crossing (|f(p)| <= L*dist => the nearest
+// surface is at least |f|/L away). The caller pads the result for safety. Returns at
+// least 1 (a true SDF has L = 1) so plain SDF leaves in the same field aren't slowed.
+inline double estimateFieldLipschitz(const std::vector<FieldNode>& nodes,
+                                     const std::vector<PatNode>& exprNodes,
+                                     const Aabb& box, int grid = 24) {
+    const FieldNode* nd = nodes.data();
+    const int N = (int)nodes.size();
+    const PatNode* pool = exprNodes.data();
+    Vec3 ext = box.hi - box.lo;
+    double diag = length(ext);
+    if (diag <= 0) return 1.0;
+    double eps = 1e-4 * diag;
+    double maxg = 1.0;
+    for (int iz = 0; iz <= grid; ++iz)
+    for (int iy = 0; iy <= grid; ++iy)
+    for (int ix = 0; ix <= grid; ++ix) {
+        Vec3 p{box.lo.x + ext.x * (ix / (double)grid),
+               box.lo.y + ext.y * (iy / (double)grid),
+               box.lo.z + ext.z * (iz / (double)grid)};
+        double gx = fieldEval(nd, N, p + Vec3{eps,0,0}, pool) - fieldEval(nd, N, p - Vec3{eps,0,0}, pool);
+        double gy = fieldEval(nd, N, p + Vec3{0,eps,0}, pool) - fieldEval(nd, N, p - Vec3{0,eps,0}, pool);
+        double gz = fieldEval(nd, N, p + Vec3{0,0,eps}, pool) - fieldEval(nd, N, p - Vec3{0,0,eps}, pool);
+        double g = std::sqrt(gx*gx + gy*gy + gz*gz) / (2.0 * eps);
+        if (g > maxg) maxg = g;
+    }
+    return maxg;
 }
 
 // Build a single-sphere implicit at world center `c`, world radius `r`. The leaf

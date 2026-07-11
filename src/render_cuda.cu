@@ -148,6 +148,11 @@ struct DMaterial {
     double reflect[SPEC_N];     // baked reflect spectrum
     double ior[SPEC_N];         // baked index spectrum
     double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
+    // Beer-Lambert interior absorption sigma_a(lambda) per metre travelled INSIDE a
+    // dielectric (colored/attenuating glass). All-zero = colorless (default). Consulted
+    // only for D_DIELECTRIC, via the `interior` material tracked through the transport
+    // loop (device twin of Material::absorb).
+    double absorb[SPEC_N];
     double roughness;
     double filmIor, filmThickness;
     // Spatially-varying diffuse albedo: index into DScene::textures (-1 = use the
@@ -186,11 +191,57 @@ struct DMaterial {
     int    mixChild[D_MIXMAX];
     double mixWeight[D_MIXMAX];
     int    mixWeightTex;   // >=0: per-hit blend mask (2-child mix); -1: constant weights
+    // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
+    // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
+    // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
+    // Material::roughnessPat / filmThicknessPat / mixWeightPat.
+    int    roughnessPat;
+    int    filmThicknessPat;
+    int    mixWeightPat;
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId; };
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
+
+// Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
+// The field is a flat postfix array evaluated with a scalar stack, sphere-traced for
+// intersection. All math is done in DOUBLE (independent of the FP32 transport `Real`):
+// the sign-change bisection converges to ~1e-12, which needs the precision, and
+// implicits are already the expensive path, so the FP64 cost is acceptable. POD twins
+// of FieldOp / FieldNode / Implicit (see src/implicit.h).
+// NOTE: this order MUST match FieldOp in implicit.h (dn.op = (int)fn.op on upload).
+// DF_EXPR is the arbitrary-formula isosurface leaf: its value is f(x,y,z) evaluated
+// by the pattern VM, NOT a signed distance, so the enclosing DImplicit carries a
+// container AABB + Lipschitz bound (see intersectImplicit / cudaForwardSupported).
+enum { DF_SPHERE = 0, DF_BOX, DF_TORUS, DF_PLANE, DF_CYLINDER, DF_CONE, DF_EXPR,
+       DF_UNION, DF_INTERSECT, DF_DIFFERENCE,
+       DF_SMOOTH_UNION, DF_SMOOTH_INTERSECT, DF_SMOOTH_DIFFERENCE };
+struct DFieldNode {
+    int    op;
+    double p[4];
+    double inv[9];        // world->local linear part (row-major, matches Affine::m)
+    double tx, ty, tz;    // world->local translation (Affine::t)
+    double scale;         // world = scale * local; d_world = d_local * scale (leaf only)
+    int    exprOff, exprN;// DF_EXPR: slice into DScene::fieldExprNodes (postfix PatNode program)
+};
+struct DImplicit {
+    int    nodeOff, nodeN;   // slice [nodeOff, nodeOff+nodeN) into DScene::fieldNodes
+    int    matId;
+    double lo[3], hi[3];     // world AABB (ray clip)
+    double lipschitz, minStep;
+    int    method;           // 0 = adaptive (|f|/lipschitz), 1 = fixed-step sample
+    int    refine;           // 0 = bisect, 1 = regula-falsi (Illinois)
+    double sampleStep;       // fixed world march step for method==1
+};
+
+// Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
+// One flat postfix PatNode pool (DScene::patNodes) holds every pattern back-to-back;
+// each DPattern slices it by [off, off+n). A material's roughnessPat/filmThicknessPat/
+// mixWeightPat index a DPattern (or -1). The postfix VM (dPatternEval) runs the same
+// opcode/hash-noise math as the host so CPU and GPU agree. PatNode/PatOp come from
+// pattern.h (POD, uploaded verbatim) — no device-specific node type is needed.
+struct DPattern { int off, n; };   // slice into DScene::patNodes
 
 struct DMedium {
     int    enabled;
@@ -301,6 +352,19 @@ struct DScene {
     const DSphere*   sph;   int nSph;
     const DMaterial* mats;
     const DNode*     nodes; const int* primIdx; int nNodes;
+    // Implicit surfaces (isosurface/CSG/metaballs). BVH prims with index
+    // >= nTris+nSph map to implicits[prim - nTris - nSph]; fieldNodes is the flat
+    // postfix node pool the DImplicit slices index into.
+    const DFieldNode* fieldNodes;
+    // Flat postfix PatNode pool for DF_EXPR leaves (arbitrary-formula isosurfaces);
+    // each Expr FieldNode slices it by [exprOff, exprOff+exprN). Separate from
+    // patNodes so material patterns and field formulas don't share offsets.
+    const PatNode*    fieldExprNodes;
+    const DImplicit*  implicits; int nImplicits;
+    // Procedural patterns (§4): flat postfix PatNode pool + per-pattern slices.
+    // A material's roughnessPat/filmThicknessPat/mixWeightPat index `patterns`.
+    const PatNode*   patNodes;
+    const DPattern*  patterns; int nPatterns;
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
@@ -723,6 +787,186 @@ struct DHit {
     Real u, v;   // interpolated surface texture coordinates
 };
 
+// ---- implicit field evaluation (device twin of implicit.h) ----------------
+// smin/smax (Inigo Quilez quadratic blend) — filleted CSG / metaball merge.
+__device__ static inline double dSmin(double a, double b, double k) {
+    if (k <= 0.0) return a < b ? a : b;
+    double h = fmax(k - fabs(a - b), 0.0) / k;
+    return (a < b ? a : b) - h * h * k * 0.25;
+}
+__device__ static inline double dSmax(double a, double b, double k) { return -dSmin(-a, -b, k); }
+
+// Leaf SDF at the leaf-LOCAL query point (px,py,pz). Mirrors fieldLeafSDF exactly.
+// Forward decl: DF_EXPR leaves evaluate their formula with the pattern VM, which is
+// defined further down (dPatternEval). The field VM only needs it for the Expr case.
+__device__ static double dPatternEval(const PatNode* nodes, int n,
+                                      double x, double y, double z, double f,
+                                      double nx, double ny, double nz, double r);
+
+__device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
+                                       const PatNode* exprPool) {
+    switch (nd.op) {
+        case DF_SPHERE:
+            return sqrt(px*px + py*py + pz*pz) - nd.p[0];
+        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+            if (!exprPool) return BIG;
+            double r = sqrt(px*px + py*py + pz*pz);
+            return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
+                                0.0, 0.0, 0.0, r);
+        }
+        case DF_BOX: {
+            double r = nd.p[3];
+            double qx = fabs(px) - nd.p[0] + r, qy = fabs(py) - nd.p[1] + r, qz = fabs(pz) - nd.p[2] + r;
+            double ox = fmax(qx, 0.0), oy = fmax(qy, 0.0), oz = fmax(qz, 0.0);
+            double outside = sqrt(ox*ox + oy*oy + oz*oz);
+            double inside  = fmin(fmax(qx, fmax(qy, qz)), 0.0);
+            return outside + inside - r;
+        }
+        case DF_TORUS: {
+            double qx = sqrt(px*px + pz*pz) - nd.p[0];
+            return sqrt(qx*qx + py*py) - nd.p[1];
+        }
+        case DF_PLANE:
+            return px*nd.p[0] + py*nd.p[1] + pz*nd.p[2] + nd.p[3];
+        case DF_CYLINDER: {
+            double dxz = sqrt(px*px + pz*pz) - nd.p[0];
+            double dy  = fabs(py) - nd.p[1];
+            double a   = fmin(fmax(dxz, dy), 0.0);
+            double bx  = fmax(dxz, 0.0), by = fmax(dy, 0.0);
+            return a + sqrt(bx*bx + by*by);
+        }
+        case DF_CONE: {
+            double rb = nd.p[0], rt = nd.p[1], h = nd.p[2];
+            double qx = sqrt(px*px + pz*pz), qy = py;
+            double k1x = rt, k1y = h, k2x = rt - rb, k2y = 2.0*h;
+            double cax = qx - fmin(qx, (qy < 0.0) ? rb : rt);
+            double cay = fabs(qy) - h;
+            double k2dot = k2x*k2x + k2y*k2y;
+            double tt = (k2dot > 0.0) ? ((k1x - qx)*k2x + (k1y - qy)*k2y) / k2dot : 0.0;
+            tt = tt < 0.0 ? 0.0 : (tt > 1.0 ? 1.0 : tt);
+            double cbx = qx - k1x + k2x*tt, cby = qy - k1y + k2y*tt;
+            double s = (cbx < 0.0 && cay < 0.0) ? -1.0 : 1.0;
+            double da = cax*cax + cay*cay, db = cbx*cbx + cby*cby;
+            return s * sqrt(fmin(da, db));
+        }
+        default: return BIG;
+    }
+}
+// Whole-field SDF at world point (pw) via the postfix scalar stack. Mirrors fieldEval.
+__device__ static double dFieldEval(const DFieldNode* nodes, int n,
+                                    double pwx, double pwy, double pwz,
+                                    const PatNode* exprPool) {
+    double st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const DFieldNode& nd = nodes[i];
+        switch (nd.op) {
+            case DF_UNION:            { double b = st[--sp], a = st[--sp]; st[sp++] = a < b ? a : b; break; }
+            case DF_INTERSECT:        { double b = st[--sp], a = st[--sp]; st[sp++] = a > b ? a : b; break; }
+            case DF_DIFFERENCE:       { double b = st[--sp], a = st[--sp]; st[sp++] = a > -b ? a : -b; break; }
+            case DF_SMOOTH_UNION:     { double b = st[--sp], a = st[--sp]; st[sp++] = dSmin(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_INTERSECT: { double b = st[--sp], a = st[--sp]; st[sp++] = dSmax(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_DIFFERENCE:{ double b = st[--sp], a = st[--sp]; st[sp++] = dSmax(a, -b, nd.p[0]); break; }
+            default: {   // leaf: world -> local via inv, then local SDF * scale
+                double plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
+                double ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
+                double plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
+                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz, exprPool) * nd.scale;
+            }
+        }
+    }
+    return sp > 0 ? st[0] : BIG;
+}
+// Field gradient (tetrahedron central differences) -> unit normal. Mirrors fieldGradient.
+__device__ static void dFieldGradient(const DFieldNode* nodes, int n,
+                                      double px, double py, double pz, double eps,
+                                      double& gx, double& gy, double& gz,
+                                      const PatNode* exprPool) {
+    // stencil offsets k1(1,-1,-1) k2(-1,-1,1) k3(-1,1,-1) k4(1,1,1)
+    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool);
+    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool);
+    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps, exprPool);
+    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps, exprPool);
+    gx =  f1 - f2 - f3 + f4;
+    gy = -f1 - f2 + f3 + f4;
+    gz = -f1 + f2 - f3 + f4;
+    double len = sqrt(gx*gx + gy*gy + gz*gz);
+    if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
+    else           { gx = 0.0; gy = 0.0; gz = 1.0; }
+}
+// Sphere-trace one implicit; writes into `hit` (respecting hit.t). Mirrors intersectImplicit.
+__device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
+                                          const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
+    double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
+    double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
+    double t0 = tmin, t1 = hit.t;
+    // clip to world AABB
+    { double ta = (im.lo[0]-ox)*idx, tb = (im.hi[0]-ox)*idx; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
+    { double ta = (im.lo[1]-oy)*idy, tb = (im.hi[1]-oy)*idy; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
+    { double ta = (im.lo[2]-oz)*idz, tb = (im.hi[2]-oz)*idz; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
+
+    const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
+    const PatNode* exprPool = sc.fieldExprNodes;
+    const int N = im.nodeN;
+    const double dlen = sqrt(dx*dx + dy*dy + dz*dz);
+    const int MAX_STEP = 2048;
+    const double invLip = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
+    const double minStep = im.minStep > 0.0 ? im.minStep : 1e-4;
+
+    const bool   sampleMode  = (im.method == 1);
+    const double fixedStep   = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
+    const bool   regulaFalsi = (im.refine == 1);
+
+    double t = t0;
+    double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
+    for (int i = 0; i < MAX_STEP; ++i) {
+        double step = sampleMode ? fixedStep : fmax(fabs(f) * invLip, minStep) / dlen;
+        double tn = t + step;
+        bool last = false;
+        if (tn >= t1) { tn = t1; last = true; }
+        double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn, exprPool);
+        bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) || (f == 0.0 && fn != 0.0);
+        if (crossed) {
+            double ta = t, tb = tn, fa = f, fb = fn;
+            int rfSide = 0;
+            for (int b = 0; b < 80; ++b) {
+                double tm;
+                if (regulaFalsi && (fb - fa) != 0.0) {
+                    tm = (ta * fb - tb * fa) / (fb - fa);
+                    if (tm <= ta || tm >= tb) tm = 0.5*(ta + tb);
+                } else {
+                    tm = 0.5*(ta + tb);
+                }
+                double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm, exprPool);
+                if ((fa > 0.0) == (fm > 0.0)) {
+                    ta = tm; fa = fm;
+                    if (regulaFalsi && rfSide == +1) fb *= 0.5;
+                    rfSide = +1;
+                } else {
+                    tb = tm; fb = fm;
+                    if (regulaFalsi && rfSide == -1) fa *= 0.5;
+                    rfSide = -1;
+                }
+                if ((tb - ta) * dlen < 1e-12) break;
+            }
+            double th = 0.5*(ta + tb);
+            if (th < tmin || th >= (double)hit.t) return false;
+            double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
+            double eps = fmax(1e-6, 1e-4*th);
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool);
+            hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
+            hit.ng = DVec3(gx, gy, gz);
+            double side = dx*gx + dy*gy + dz*gz;
+            hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
+            hit.matId = im.matId; hit.sensorId = -1;
+            hit.u = 0; hit.v = 0;
+            return true;
+        }
+        if (last) return false;
+        t = tn; f = fn;
+    }
+    return false;
+}
+
 __device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
                                      Real tmin, DHit& hit) {
     DVec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
@@ -800,8 +1044,9 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
-                if (prim < sc.nTris) { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
-                else                 { if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
+                if (prim < sc.nTris)              { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
+                else                              { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
             }
         } else {
             Real tL, tR;
@@ -831,7 +1076,8 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked = (prim < sc.nTris) ? intersectTri(o, dir, sc.tris[prim], tmin, h)
-                                                 : intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
+                             : (prim < sc.nTris + sc.nSph) ? intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h)
+                             : intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
                 if (blocked) return true;
             }
         } else {
@@ -845,8 +1091,19 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
 
 // ============================ material interactions ============================
 
-__device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const DVec3& d,
-                                         Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
+// Per-hit roughness helper (defined below, after the texture/pattern samplers) — used
+// here for frosted glass before its point of definition.
+__device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h);
+
+// Dielectric interface: Fresnel-weighted specular reflect-or-refract (Snell, spectral
+// index -> dispersion). A non-zero per-hit roughness frosts BOTH lobes (rough glass):
+// the chosen direction is jittered by a power-cosine lobe, rejecting jitters that would
+// cross to the wrong side so no light leaks through. `transmitted` (optional) reports
+// whether the ray refracted vs. reflected/TIR — the caller uses it to track which
+// medium it is now inside (interior absorption). Mirrors host refractOrReflect.
+__device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
+                                         const DVec3& d, Real lambda, DRng& rng,
+                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr) {
     Real ng = specLookup(m.ior, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
@@ -855,6 +1112,7 @@ __device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const
     Real cosI = -dot(d, nl);
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
     DVec3 outDir;
+    bool refracted = false;
     if (sin2t > 1) outDir = reflectv(d, nl);
     else {
         Real cosT = sqrt((Real)1 - sin2t);
@@ -862,9 +1120,17 @@ __device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const
         Real rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
         Real R = (Real)0.5 * (rs * rs + rp * rp);
         if (rng.uniform() < R) outDir = reflectv(d, nl);
-        else outDir = d * eta + nl * (eta * cosI - cosT);
+        else { outDir = d * eta + nl * (eta * cosI - cosT); refracted = true; }
     }
     outDir = normalize(outDir);
+    // Frosted glass: jitter the chosen lobe, keeping it on the intended side.
+    Real rough = dMatRoughness(sc, m, h);
+    if (rough > (Real)1e-3) {
+        DVec3 pert = sampleGlossy(outDir, rough, rng);
+        bool ok = refracted ? (dot(pert, nl) < 0) : (dot(pert, nl) > 0);
+        if (ok) outDir = pert;
+    }
+    if (transmitted) *transmitted = refracted;
     ro = h.p + outDir * RAY_EPS; rd = outDir;
 }
 // Returns false if the photon is absorbed by an opaque (absorbing) substrate.
@@ -1181,13 +1447,118 @@ __device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
     return a * (1 - fy) + b * fy;
 }
 
+// ---- procedural pattern VM (device twin of pattern.h) ----------------------
+// Deterministic integer-hash 3-D value noise; matches patHash3/patValueNoise so the
+// GPU and CPU produce the same noise field. Output in [0,1].
+__device__ static double dPatHash3(int ix, int iy, int iz) {
+    unsigned int h = (unsigned int)ix * 374761393u + (unsigned int)iy * 668265263u
+                   + (unsigned int)iz * 2147483647u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= (h >> 16);
+    return (double)h / 4294967295.0;
+}
+__device__ static double dPatValueNoise(double x, double y, double z) {
+    double fx = floor(x), fy = floor(y), fz = floor(z);
+    int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+    double tx = x - fx, ty = y - fy, tz = z - fz;
+    double ux = tx * tx * (3.0 - 2.0 * tx);
+    double uy = ty * ty * (3.0 - 2.0 * ty);
+    double uz = tz * tz * (3.0 - 2.0 * tz);
+    double c000 = dPatHash3(ix,     iy,     iz);
+    double c100 = dPatHash3(ix + 1, iy,     iz);
+    double c010 = dPatHash3(ix,     iy + 1, iz);
+    double c110 = dPatHash3(ix + 1, iy + 1, iz);
+    double c001 = dPatHash3(ix,     iy,     iz + 1);
+    double c101 = dPatHash3(ix + 1, iy,     iz + 1);
+    double c011 = dPatHash3(ix,     iy + 1, iz + 1);
+    double c111 = dPatHash3(ix + 1, iy + 1, iz + 1);
+    double x00 = c000 + (c100 - c000) * ux;
+    double x10 = c010 + (c110 - c010) * ux;
+    double x01 = c001 + (c101 - c001) * ux;
+    double x11 = c011 + (c111 - c011) * ux;
+    double y0  = x00 + (x10 - x00) * uy;
+    double y1  = x01 + (x11 - x01) * uy;
+    return y0 + (y1 - y0) * uz;
+}
+// Postfix scalar-stack evaluator (exact port of patternEval). PatNode/PatOp are the
+// POD host types (pattern.h), uploaded verbatim; variables come in as scalar args.
+__device__ static double dPatternEval(const PatNode* nodes, int n,
+                                      double x, double y, double z, double f,
+                                      double nx, double ny, double nz, double r) {
+    double st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const PatNode& nd = nodes[i];
+        switch (nd.op) {
+            case PatOp::Const:    st[sp++] = nd.a; break;
+            case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarY:     st[sp++] = y;  break;
+            case PatOp::VarZ:     st[sp++] = z;  break;
+            case PatOp::VarF:     st[sp++] = f;  break;
+            case PatOp::VarNx:    st[sp++] = nx; break;
+            case PatOp::VarNy:    st[sp++] = ny; break;
+            case PatOp::VarNz:    st[sp++] = nz; break;
+            case PatOp::VarR:     st[sp++] = r;  break;
+            case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
+            case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
+            case PatOp::Sqrt:     st[sp-1] = sqrt(fmax(0.0, st[sp-1])); break;
+            case PatOp::Sin:      st[sp-1] = sin(st[sp-1]); break;
+            case PatOp::Cos:      st[sp-1] = cos(st[sp-1]); break;
+            case PatOp::Tan:      st[sp-1] = tan(st[sp-1]); break;
+            case PatOp::Exp:      st[sp-1] = exp(st[sp-1]); break;
+            case PatOp::Log:      st[sp-1] = log(fmax(1e-300, st[sp-1])); break;
+            case PatOp::Floor:    st[sp-1] = floor(st[sp-1]); break;
+            case PatOp::Fract:    st[sp-1] = st[sp-1] - floor(st[sp-1]); break;
+            case PatOp::Sign:     st[sp-1] = (st[sp-1] > 0.0) - (st[sp-1] < 0.0); break;
+            case PatOp::Saturate: st[sp-1] = fmin(1.0, fmax(0.0, st[sp-1])); break;
+            case PatOp::Add:      { double b = st[--sp]; st[sp-1] += b; break; }
+            case PatOp::Sub:      { double b = st[--sp]; st[sp-1] -= b; break; }
+            case PatOp::Mul:      { double b = st[--sp]; st[sp-1] *= b; break; }
+            case PatOp::Div:      { double b = st[--sp]; st[sp-1] = (b != 0.0) ? st[sp-1] / b : 0.0; break; }
+            case PatOp::Mod:      { double b = st[--sp]; st[sp-1] = (b != 0.0) ? st[sp-1] - b * floor(st[sp-1] / b) : 0.0; break; }
+            case PatOp::Pow:      { double b = st[--sp]; st[sp-1] = pow(st[sp-1], b); break; }
+            case PatOp::Min:      { double b = st[--sp]; st[sp-1] = fmin(st[sp-1], b); break; }
+            case PatOp::Max:      { double b = st[--sp]; st[sp-1] = fmax(st[sp-1], b); break; }
+            case PatOp::Atan2:    { double b = st[--sp]; st[sp-1] = atan2(st[sp-1], b); break; }
+            case PatOp::Step:     { double b = st[--sp]; st[sp-1] = (b >= st[sp-1]) ? 1.0 : 0.0; break; }
+            case PatOp::Clamp:    { double hi = st[--sp], lo = st[--sp]; st[sp-1] = fmin(hi, fmax(lo, st[sp-1])); break; }
+            case PatOp::Mix:      { double t = st[--sp], b = st[--sp]; st[sp-1] = st[sp-1] + (b - st[sp-1]) * t; break; }
+            case PatOp::Smoothstep: {
+                double xx = st[--sp], e1 = st[--sp], e0 = st[sp-1];
+                double tt = (e1 != e0) ? (xx - e0) / (e1 - e0) : 0.0;
+                tt = fmin(1.0, fmax(0.0, tt));
+                st[sp-1] = tt * tt * (3.0 - 2.0 * tt);
+                break;
+            }
+            case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoise(st[sp-1], yy, zz); break; }
+        }
+    }
+    return sp > 0 ? st[0] : 0.0;
+}
+// Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
+// The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
+// the `f` variable is 0 at surfaces on both backends.
+__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
+    const DPattern& p = sc.patterns[pat];
+    double px = h.p.x, py = h.p.y, pz = h.p.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
+                        h.n.x, h.n.y, h.n.z, r);
+}
+
 // Per-hit glossy roughness / thin-film thickness (device twins of materialRoughness
-// / materialFilmThickness): a bound scalar map's value at the hit, else the constant.
+// / materialFilmThickness): a bound pattern (highest priority) or scalar map's value
+// at the hit, else the constant.
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.roughnessPat >= 0) {
+        double r = dPatternScalarAt(sc, m.roughnessPat, h);
+        return (Real)(r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r));
+    }
     if (m.roughnessTex >= 0) return (Real)dTexScalarAt(sc.textures[m.roughnessTex], h.u, h.v);
     return (Real)m.roughness;
 }
 __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.filmThicknessPat >= 0)
+        return (Real)(dPatternScalarAt(sc, m.filmThicknessPat, h) * m.filmThickness);
     if (m.filmThicknessTex >= 0)
         return (Real)(dTexScalarAt(sc.textures[m.filmThicknessTex], h.u, h.v) * m.filmThickness);
     return (Real)m.filmThickness;
@@ -1197,8 +1568,10 @@ __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, c
 // an optional per-hit blend mask (2-child mix: map value t = prob of child 0). Returns
 // -1 for the leftover absorption slice (constant-weight path only). u is one uniform.
 __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, const DHit& h, Real u) {
-    if (m.mixWeightTex >= 0 && m.mixCount == 2) {
-        Real t = (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
+    if ((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2) {
+        Real t = (m.mixWeightPat >= 0)
+               ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
+               : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
         if (t < 0) t = 0; else if (t > 1) t = 1;
         return (u < t) ? m.mixChild[0] : m.mixChild[1];
     }
@@ -1377,7 +1750,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* f
 __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
-                                double& eAbsorbed, double& eSensor, double& eEscaped) {
+                                double& eAbsorbed, double& eSensor, double& eEscaped,
+                                int& interior) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
@@ -1400,6 +1774,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
         }
     }
 
+    // Beer-Lambert attenuation over the free path just travelled inside a dielectric
+    // (colored/attenuating glass), applied before the event is processed (matches the
+    // host: attenuate over dEvent using the medium carried from the previous vertex).
+    if (interior >= 0) {
+        Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+        if (a > 0) beta *= exp(-a * dEvent);
+    }
+
     if (mediumEvent) {
         if (camMode == CAM_B) connectVolume(sc, cam, film, hits, mp, rd, lambda, beta);
         else if (camMode == CAM_A) connectLensVolume(sc, cam, film, hits, mp, rd, lambda, beta, rng);
@@ -1417,15 +1799,20 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     }
 
     const DMaterial* mptr = &sc.mats[h.matId];
+    int matIndex = h.matId;
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (mptr->type == D_MIX) {
         int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
         if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        mptr = &sc.mats[child];
+        mptr = &sc.mats[child]; matIndex = child;
     }
     const DMaterial& m = *mptr;
     if (m.type == D_DIELECTRIC) {
-        DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; return WF_CONTINUE;
+        bool entering = dot(rd, h.ng) < 0;
+        bool transmitted = false;
+        DVec3 nro, nrd; refractOrReflect(sc, m, h, rd, lambda, rng, nro, nrd, &transmitted);
+        if (transmitted) interior = entering ? matIndex : -1;   // track medium for Beer-Lambert
+        ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_THINFILM) {
         DVec3 nro, nrd;
         if (!thinFilmInterface(sc, m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -1515,10 +1902,11 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, doubl
         DVec3 ro, rd; Real beta, lambda;
         if (!genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
+        int interior = -1;   // dielectric the photon is currently inside (-1 = vacuum)
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, interior) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -1556,6 +1944,7 @@ struct WFState {
     DRng*  rng;
     int*   bounce;   // bounces already shaded for the photon currently in this slot
     int*   alive;    // 1 = slot holds a live photon, 0 = drained (budget spent)
+    int*   interior; // dielectric material index the photon is inside (-1 = vacuum)
     DHit*  hit;      // extend-stage intersection, consumed by shade
 };
 
@@ -1575,7 +1964,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamera& cam, double* fil
         if (genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEm)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
-            st.bounce[slot] = 0; st.alive[slot] = 1;
+            st.bounce[slot] = 0; st.alive[slot] = 1; st.interior[slot] = -1;
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -1613,9 +2002,10 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
     DVec3 ro = st.ro[slot], rd = st.rd[slot];
     Real beta = st.beta[slot], lambda = st.lambda[slot];
     DHit h = st.hit[slot];
+    int interior = st.interior[slot];
     double eAbs = 0, eSen = 0, eEsc = 0;
     int res = shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                        eAbs, eSen, eEsc);
+                        eAbs, eSen, eEsc, interior);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -1628,6 +2018,7 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
         st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
         st.bounce[slot] = bounce; st.rng[slot] = rng;
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
+        st.interior[slot] = interior;   // carry the dielectric medium to the next segment
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
@@ -1995,10 +2386,17 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                     Real lambda, double invPdfLambda, DRng& rng) {
     double L = 0.0, thr = 1.0;
     bool specularArrival = true;                       // camera ray may see a light directly
+    int interior = -1;                                 // dielectric the ray is inside (-1 = vacuum)
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
         if (!h.valid) return L;                        // escaped (no env in v1)
+        // Beer-Lambert attenuation over the in-glass segment up to this surface
+        // (colored/attenuating glass carried from the previous vertex).
+        if (interior >= 0) {
+            Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (mp->type == D_MIX) {                       // resolve stochastic mix
@@ -2013,7 +2411,10 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 
         switch (mp->type) {
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; refractOrReflect(*mp, h, rd, lambda, rng, nro, nrd);
+                bool entering = dot(rd, h.ng) < 0;
+                bool transmitted = false;
+                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd, &transmitted);
+                if (transmitted) interior = entering ? matId : -1;
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_THINFILM: {
@@ -2168,7 +2569,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; refractOrReflect(*mp, h, rd, lambda, rng, nro, nrd);
+                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd);
                 wi = nrd; betaFactor = 1.0; delta = 1;
                 break;
             }
@@ -2527,11 +2928,9 @@ bool cudaAvailable() {
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 
 bool cudaForwardSupported(const Scene& scene) {
-    // Implicit surfaces (isosurface / CSG / metaballs) are sphere-traced on the CPU
-    // only; the device closestHit handles just triangles and spheres, so any scene
-    // with an implicit falls back to the CPU tracer (otherwise the isosurface geometry
-    // would be silently missing from the GPU image).
-    if (!scene.implicits.empty()) return false;
+    // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
+    // device too (DImplicit + intersectImplicit); their materials are checked by the
+    // same `unsupported()` gate as tri/sphere materials below.
     // The device multilayer stack has a fixed cap (D_MAXLAYERS); scenes with a
     // deeper stack fall back to the CPU tracer, which has no layer limit. (Textured
     // albedo and fluorescence are now BOTH ported to the device: per-texel Jakob-
@@ -2558,35 +2957,17 @@ bool cudaForwardSupported(const Scene& scene) {
                 if (c >= 0 && c < (int)scene.mats.size() && paletteTex(scene.mats[c].reflectTex)) return true;
         return false;
     };
-    // §4 math-driven materials & dielectric translucency are CPU-only for now: the
-    // device has no procedural-pattern VM, and its dielectric branch is smooth &
-    // non-absorbing (no frosting, no Beer-Lambert interior tint). Any material relying
-    // on these forces the CPU forward/backward tracer so the GPU never renders a
-    // silently-wrong image (missing frost, clear-instead-of-colored glass, ignored
-    // pattern). Implicit surfaces (isosurface) are gated separately below.
-    auto usesPattern = [&](const Material& m) {
-        return m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0;
-    };
-    auto frostedOrColoredGlass = [&](const Material& m) {
-        if (m.type != MatType::Dielectric) return false;
-        if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
-        // colored glass: any non-zero absorption coefficient over the spectrum.
-        if (m.absorb)
-            for (int i = 0; i <= 8; ++i)
-                if (m.absorb(DLMIN + (DLMAX - DLMIN) * i / 8.0) > 0.0) return true;
-        return false;
-    };
+    // Dielectric translucency now runs on the device forward + backward tracers:
+    // frosting (a roughness lobe on both dielectric lobes, from constant/tex/pattern
+    // roughness) and Beer-Lambert interior absorption (colored glass) are both threaded
+    // through shadeStep / bkRadiance via the `interior` medium index. Procedural patterns
+    // (§4) also run on-device (dPatternEval / dMatRoughness / dMixResolveChild). So neither
+    // frosted/colored glass nor a roughness/film/mix-weight pattern forces a CPU forward
+    // fallback here. (The GPU BDPT kernel still can't MIS either — cudaBdptSupported gates
+    // both.) Implicit surfaces (isosurface) are gated separately below.
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
-        if (matId >= 0 && matId < (int)scene.mats.size()) {
-            const Material& m = scene.mats[matId];
-            if (usesPattern(m) || frostedOrColoredGlass(m)) return true;
-            if (m.type == MatType::Mix)
-                for (int c : m.mixChildren)
-                    if (c >= 0 && c < (int)scene.mats.size() &&
-                        (usesPattern(scene.mats[c]) || frostedOrColoredGlass(scene.mats[c]))) return true;
-        }
         // The physical layered stack (coat interface over a weighted body) is CPU-only;
         // the device shadeStep has no Layered branch, so any Layered material forces a
         // CPU forward/backward fallback (like indexed palettes).
@@ -2600,8 +2981,9 @@ bool cudaForwardSupported(const Scene& scene) {
         }
         return false;
     };
-    for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
-    for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
+    for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
+    for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
+    for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
     // Environment lighting runs on-device: the kernel emits env photons from the scene
     // bounding sphere (shape==3) and the directly-viewed background is added by the
     // backend-agnostic addEnvBackground() pass. Both a constant env and an IMAGE-based
@@ -2671,6 +3053,51 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     }
     std::vector<int> primIdx = scene.bvh.primIdx;
 
+    // --- bake implicit surfaces (isosurface / CSG / metaballs) ---
+    // Flatten every Implicit's postfix FieldNode array into one pool; each DImplicit
+    // slices it by [nodeOff, nodeOff+nodeN). BVH prims >= nTris+nSph index these.
+    std::vector<DFieldNode> fieldNodes;
+    std::vector<PatNode>    fieldExprNodes;   // flat pool for DF_EXPR formulas (all implicits)
+    std::vector<DImplicit>  dimpl(scene.implicits.size());
+    for (size_t i = 0; i < scene.implicits.size(); ++i) {
+        const Implicit& im = scene.implicits[i]; DImplicit& d = dimpl[i];
+        d.nodeOff = (int)fieldNodes.size();
+        d.nodeN   = (int)im.nodes.size();
+        d.matId   = im.matId;
+        d.lo[0] = im.bounds.lo.x; d.lo[1] = im.bounds.lo.y; d.lo[2] = im.bounds.lo.z;
+        d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
+        d.lipschitz = im.lipschitz; d.minStep = im.minStep;
+        d.method = (int)im.method; d.refine = (int)im.refine; d.sampleStep = im.sampleStep;
+        // Rebase this implicit's expr programs into the shared device pool. Each Implicit
+        // owns a private exprNodes vector on the host (FieldNode.exprOff indexes it), so we
+        // add the running base and copy the programs into fieldExprNodes.
+        int exprBase = (int)fieldExprNodes.size();
+        fieldExprNodes.insert(fieldExprNodes.end(), im.exprNodes.begin(), im.exprNodes.end());
+        for (const FieldNode& fn : im.nodes) {
+            DFieldNode dn;
+            dn.op = (int)fn.op;
+            dn.p[0] = fn.p[0]; dn.p[1] = fn.p[1]; dn.p[2] = fn.p[2]; dn.p[3] = fn.p[3];
+            for (int k = 0; k < 9; ++k) dn.inv[k] = fn.inv.m[k];
+            dn.tx = fn.inv.t.x; dn.ty = fn.inv.t.y; dn.tz = fn.inv.t.z;
+            dn.scale = fn.scale;
+            dn.exprOff = (fn.op == FieldOp::Expr) ? exprBase + fn.exprOff : -1;
+            dn.exprN   = (fn.op == FieldOp::Expr) ? fn.exprN : 0;
+            fieldNodes.push_back(dn);
+        }
+    }
+
+    // --- bake procedural patterns (§4) ---
+    // Flatten every Pattern's postfix PatNode program into one pool; each DPattern
+    // slices it by [off, off+n). Materials index these via roughnessPat/etc.
+    std::vector<PatNode> patNodes;
+    std::vector<DPattern> dpat(scene.patterns.size());
+    for (size_t i = 0; i < scene.patterns.size(); ++i) {
+        const Pattern& p = scene.patterns[i]; DPattern& d = dpat[i];
+        d.off = (int)patNodes.size();
+        d.n   = (int)p.nodes.size();
+        patNodes.insert(patNodes.end(), p.nodes.begin(), p.nodes.end());
+    }
+
     // --- bake materials ---
     // Fluorescent materials append their emission-SPD CDF to one flat buffer
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
@@ -2682,6 +3109,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         bakeSpec(m.reflect, d.reflect);
         bakeSpec(m.ior, d.ior);
         bakeSpec(m.substrateK, d.substrateK);
+        bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
@@ -2713,6 +3141,9 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;
         for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
         d.mixWeightTex = m.mixWeightTex;
+        d.roughnessPat = m.roughnessPat;
+        d.filmThicknessPat = m.filmThicknessPat;
+        d.mixWeightPat = m.mixWeightPat;
     }
 
     // --- upload geometry/materials ---
@@ -2721,6 +3152,11 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     DNode*     d_nodes = nodes.empty()   ? nullptr : (DNode*)keep(uploadVec(nodes));
     int*       d_prim  = primIdx.empty() ? nullptr : (int*)keep(uploadVec(primIdx));
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
+    DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
+    PatNode*    d_fexpr  = fieldExprNodes.empty() ? nullptr : (PatNode*)keep(uploadVec(fieldExprNodes));
+    DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
+    PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
+    DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
 
     // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
@@ -2831,6 +3267,9 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
+    sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
+    sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
+    sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
@@ -2911,6 +3350,7 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng));
     cudaMalloc(&st.bounce, (size_t)W * sizeof(int));
     cudaMalloc(&st.alive,  (size_t)W * sizeof(int));
+    cudaMalloc(&st.interior, (size_t)W * sizeof(int));
     cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit));
     cudaMemset(st.alive, 0, (size_t)W * sizeof(int));
 
@@ -2942,7 +3382,7 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     }
 
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
-    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.hit);
+    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.interior); cudaFree(st.hit);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -3012,6 +3452,18 @@ bool cudaBdptSupported(const Scene& scene) {
     // media, and only area/sphere/cylinder Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
     if (scene.medium.enabled) return false;
+    // Dielectric translucency (frosting + Beer-Lambert interior absorption) runs on the
+    // device forward/backward tracers, but the BDPT kernel (kBdpt) treats every dielectric
+    // as smooth & non-absorbing and its pdf/eval use constant params — a frosted or colored
+    // glass would bias MIS. Fall back to the CPU BDPT for such scenes.
+    auto frostedOrColoredGlass = [&](const Material& m) {
+        if (m.type != MatType::Dielectric) return false;
+        if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
+        if (m.absorb)
+            for (int i = 0; i <= 8; ++i)
+                if (m.absorb(DLMIN + (DLMAX - DLMIN) * i / 8.0) > 0.0) return true;  // colored
+        return false;
+    };
     // The forward path now supports textured albedo + fluorescence on the device, but
     // the BDPT kernel (kBdpt) does not implement either — its diffuse vertices sample
     // the constant reflect spectrum and it has no fluorescent-vertex strategy — so
@@ -3019,23 +3471,31 @@ bool cudaBdptSupported(const Scene& scene) {
     auto usesTexOrFluoro = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
         const Material& m = scene.mats[matId];
+        if (frostedOrColoredGlass(m)) return true;
         if (m.reflectTex >= 0 || m.type == MatType::Fluorescent) return true;
         // Non-albedo texture maps (roughness / film-thickness) drive the glossy/thin-film
         // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
         // which would bias MIS. Fall back to CPU BDPT (which threads the Hit through).
         if (m.roughnessTex >= 0 || m.filmThicknessTex >= 0) return true;
+        // Procedural patterns drive the same per-hit params; the GPU BDPT kernel's
+        // pdf/eval use the constants, so a pattern would bias MIS — use CPU BDPT.
+        if (m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0) return true;
         // Mix blend mask: the GPU BDPT mix-pick uses constant weights; use CPU BDPT.
         if (m.mixWeightTex >= 0) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
-                    (scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
-                     scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0))
+                    (frostedOrColoredGlass(scene.mats[c]) ||
+                     scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
+                     scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
+                     scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
+                     scene.mats[c].mixWeightPat >= 0))
                     return true;
         return false;
     };
-    for (const auto& t : scene.tris)    if (usesTexOrFluoro(t.matId)) return false;
-    for (const auto& s : scene.spheres) if (usesTexOrFluoro(s.matId)) return false;
+    for (const auto& t : scene.tris)      if (usesTexOrFluoro(t.matId)) return false;
+    for (const auto& s : scene.spheres)   if (usesTexOrFluoro(s.matId)) return false;
+    for (const auto& im : scene.implicits) if (usesTexOrFluoro(im.matId)) return false;
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;

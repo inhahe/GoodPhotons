@@ -1217,14 +1217,45 @@ private:
         return true;
     }
 
+    // Build an arbitrary-expression leaf: `function { expr "f(x,y,z)" }`. The infix
+    // formula (variables x y z, plus r = |p|) is compiled by the SAME shunting-yard
+    // used for procedural patterns, and its postfix program is appended to the
+    // isosurface's shared exprNodes pool; the FieldNode records the (offset, count)
+    // slice. Unlike an analytic leaf the value is NOT a distance, so `scale` stays 1
+    // (no world-distance rescale) and the isosurface must supply a container box +
+    // Lipschitz bound (see addIsosurface). `authoredXf` maps the leaf-local frame the
+    // expression is written in to world (metre rebase folded in).
+    bool addFunctionLeaf(const Block& b, const Affine& authoredXf,
+                         std::vector<FieldNode>& out, std::vector<PatNode>& exprPool) {
+        const Stmt* es = find(b, "expr");
+        if (!es || es->val.words.empty()) { fail("function leaf needs `expr \"f(x,y,z)\"`"); return false; }
+        std::string expr;
+        for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr(expr, prog, perr)) { fail("function expr: " + perr); return false; }
+        Affine L2W;
+        for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * authoredXf.m[k];
+        L2W.t = authoredXf.t * L_;
+        FieldNode nd; nd.op = FieldOp::Expr;
+        nd.inv   = L2W.inverse();
+        nd.scale = 1.0;
+        nd.exprOff = (int)exprPool.size();
+        nd.exprN   = (int)prog.size();
+        for (const auto& pn : prog) exprPool.push_back(pn);
+        out.push_back(nd);
+        return true;
+    }
+
     // Recursively emit a field element's postfix nodes. `parentXf` is the composed
     // authored transform of the enclosing element(s).
-    bool buildFieldStmt(const Stmt& st, const Affine& parentXf, std::vector<FieldNode>& out) {
+    bool buildFieldStmt(const Stmt& st, const Affine& parentXf, std::vector<FieldNode>& out,
+                        std::vector<PatNode>& exprPool) {
         const Block* b = st.val.block.get();
         if (!b) { fail("field element '" + st.key + "' needs a { } block"); return false; }
         const std::string& k = st.key;
         // Leaves — the element's own translate/rotate/scale wrap the primitive.
         Affine xf = fieldXf(*b, parentXf);
+        if (k == "function")  return addFunctionLeaf(*b, xf, out, exprPool);
         if (k == "sphere")    return addFieldLeaf(FieldOp::Sphere,   *b, xf, out);
         if (k == "ellipsoid") return addFieldLeaf(FieldOp::Sphere,   *b, xf, out, /*ellipsoid=*/true);
         if (k == "box")       return addFieldLeaf(FieldOp::Box,      *b, xf, out);
@@ -1251,7 +1282,7 @@ private:
         int nChild = 0;
         for (const auto& cs : b->stmts) {
             if (!cs.val.block) continue;              // transform-only / k stmts carry no block
-            if (!buildFieldStmt(cs, xf, out)) return false;
+            if (!buildFieldStmt(cs, xf, out, exprPool)) return false;
             if (++nChild >= 2) { FieldNode c; c.op = op; c.p[0] = kBlend; out.push_back(c); }
         }
         if (nChild < 1) { fail("'" + k + "' needs at least one child primitive"); return false; }
@@ -1264,10 +1295,12 @@ private:
         int id = matId(mat); if (!err.empty()) return false;
         Affine rootXf = fieldXf(b, Affine::identity());
         std::vector<FieldNode> nodes;
+        std::vector<PatNode> exprPool;
         int nRoot = 0;
         for (const auto& cs : b.stmts) {
             if (!cs.val.block) continue;              // skip material/translate/rotate/scale
-            if (!buildFieldStmt(cs, rootXf, nodes)) return false;
+            if (cs.key == "contained_by") continue;   // container box, not a field element
+            if (!buildFieldStmt(cs, rootXf, nodes, exprPool)) return false;
             ++nRoot;
         }
         if (nRoot != 1) {
@@ -1277,10 +1310,61 @@ private:
         }
         Implicit im;
         im.nodes = std::move(nodes);
+        im.exprNodes = std::move(exprPool);
         im.matId = id;
-        im.lipschitz = 1.0;                           // SDF leaves + smin/CSG stay unit-Lipschitz
-        im.bounds = implicitBounds(im.nodes);
-        im.minStep = implicitMinStep(im.bounds);
+        if (fieldHasExpr(im.nodes)) {
+            // An arbitrary expression field has no analytic bound and its value is not
+            // a signed distance, so the user must supply a container box (marched only
+            // inside it) and we need a Lipschitz bound to size safe march steps.
+            const Stmt* cb = find(b, "contained_by");
+            if (!cb || !cb->val.block) {
+                fail("an isosurface using function { } needs a `contained_by { min <x y z>  max <x y z> }` box");
+                return false;
+            }
+            const Block& cbb = *cb->val.block;
+            Vec3 mn{-1,-1,-1}, mx{1,1,1};
+            vec3Of(cbb, "min", mn);
+            vec3Of(cbb, "max", mx);
+            // Transform all 8 authored corners into world (metre-rebased) and take the AABB.
+            Aabb box; bool first = true;
+            for (int c = 0; c < 8; ++c) {
+                Vec3 corner{(c&1)?mx.x:mn.x, (c&2)?mx.y:mn.y, (c&4)?mx.z:mn.z};
+                Vec3 w = rootXf.apply(corner) * L_;
+                if (first) { box.lo = w; box.hi = w; first = false; } else box.expand(w);
+            }
+            im.bounds = box;
+            double mg = dblOf(b, "max_gradient", 0.0);
+            im.lipschitz = (mg > 0.0) ? mg
+                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box);
+            double acc = dblOf(b, "accuracy", 0.0);
+            im.minStep = (acc > 0.0) ? acc * L_ : implicitMinStep(box);
+        } else {
+            im.lipschitz = 1.0;                       // SDF leaves + smin/CSG stay unit-Lipschitz
+            im.bounds = implicitBounds(im.nodes);
+            im.minStep = implicitMinStep(im.bounds);
+        }
+        // Ray-march strategy (default `adaptive`). `sample` = fixed-step POV-Ray-style
+        // marching, for fields whose Lipschitz bound can't be trusted; the fixed world
+        // step comes from `samples <n>` (n intervals across the box diagonal), else from
+        // `accuracy`, else a 256-sample default.
+        std::string meth = strOf(b, "method", "adaptive");
+        if (meth == "sample" || meth == "fixed") {
+            im.method = MarchMethod::Sample;
+            double diag = length(im.bounds.hi - im.bounds.lo);
+            double ns   = dblOf(b, "samples", 0.0);
+            double acc  = dblOf(b, "accuracy", 0.0);
+            im.sampleStep = (ns > 0.0)  ? diag / ns
+                          : (acc > 0.0) ? acc * L_
+                                        : diag / 256.0;
+        } else if (meth != "adaptive") {
+            fail("isosurface `method` must be `adaptive` or `sample` (got '" + meth + "')");
+            return false;
+        }
+        // Root refinement once a sign change is bracketed (default `bisect`).
+        std::string ref = strOf(b, "refine", "bisect");
+        if (ref == "regula_falsi" || ref == "falsi" || ref == "secant") im.refine = RootRefine::RegulaFalsi;
+        else if (ref == "bisect") im.refine = RootRefine::Bisect;
+        else { fail("isosurface `refine` must be `bisect` or `regula_falsi` (got '" + ref + "')"); return false; }
         L.scene.implicits.push_back(std::move(im));
         return true;
     }
