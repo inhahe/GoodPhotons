@@ -124,13 +124,22 @@ as practical; this file is the fallback for what can't be addressed immediately.
   2. **Non-albedo parameters.** A texture can only bind to diffuse `reflect` today.
      Spec §9.4 wants textures on roughness, mix weights, ior, thickness, etc. — each
      needs the corresponding material param to accept a per-hit texture lookup.
-  3. **GPU.** Textured scenes force the CPU tracer (`cudaForwardSupported()` returns
-     false): the CUDA kernel bakes one reflect spectrum per material and has no
-     per-hit texture sampler. A device port would upload texel coeff tables + UVs.
+  3. ~~**GPU.** Textured scenes force the CPU tracer.~~ **DONE 2026-07-11:** the
+     forward CUDA path now ports textured diffuse reflectance. `buildUpload()` uploads
+     each texture's per-texel Jakob-Hanika coeff table (`DTexture`, flattened `3*w*h`)
+     plus per-tri UVs (`DTri.uv0/1/2`); `intersectTri`/`intersectSphere` interpolate
+     the hit UV into `DHit.u/v`; `dTexReflAt()` is the device twin of
+     `Texture::reflectanceAt` (wrap + nearest/bilinear + sigmoid), used via
+     `dDiffuseRho()` in the `shadeStep` diffuse/fluoro branches. `cudaForwardSupported()`
+     no longer rejects `reflectTex >= 0`. Validated GPU-vs-CPU on `textured.ftsl` and
+     `uvmesh.ftsl`: energy matches (absorbed 0.7066 vs 0.7068) and images agree to
+     within Monte-Carlo noise (RMSE ~6/255); the wavefront backend matches the
+     megakernel. The BDPT kernel (mode D) still lacks a textured vertex, so
+     `cudaBdptSupported()` explicitly rejects textured scenes → they use the CPU BDPT.
   4. **Indexed-spectral palettes** (§9.3) — an index image + name→spectrum palette —
      not implemented.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
-  2026-07-10; the four items above deferred.
+  2026-07-10; GPU port done 2026-07-11; items 1/2/4 above deferred.
 
 ### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
 - **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`
@@ -414,8 +423,10 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Constraints of `mix` (by design):** children must be non-mix materials (nesting
   rejected by the parser to keep resolution single-step and the CUDA CDF bounded);
   the CUDA path supports ≤ 8 child lobes (more → CPU fallback); a mix containing a
-  fluorescent child is forward-only and CPU-only (same fluorescence restriction as
-  the standalone type — see below).
+  fluorescent child is forward-only (mode D/BDPT still refuses fluorescence), but as
+  of 2026-07-11 it runs on the GPU forward path — the device fluoro port resolves the
+  mix child before dispatch and the `D_FLUORESCENT` `shadeStep` branch handles it (see
+  the GPU-fluorescence note below); the same is true of a textured child.
 - **Proper fix (future):** implement `layered` as a coat interface (reuse
   thinfilm/Fresnel reflect-or-enter) feeding a body lobe selector, with the body's
   transmitted radiance re-emerging through the coat. Forward-first; backward support
@@ -504,10 +515,20 @@ as practical; this file is the fallback for what can't be addressed immediately.
   never populated `hits`, so the progressive `~X% noise` graininess estimate (and the
   new `-noise` stop) read a constant **0%** for any `-device gpu` render. It still falls
   back to the CPU for mode R (backward reference) and the mode-P camera-side/backward
-  layer (no backward tracer on-device). Fluorescent scenes are rejected on-device (fall back to CPU)
-  because the emission-sampler reradiation path is not ported —
-  `cudaForwardSupported()` checks whether any *geometry* uses a Fluorescent material
-  (not just the palette, which buildCornell always populates).
+  layer (no backward tracer on-device). **Fluorescence is now ported on-device (done
+  2026-07-11):** each Fluorescent material bakes its excitation spectrum
+  (`DMaterial.fluoAbsorb`) and emission-SPD CDF (a flat `fluoCdfAll` slice, per-material
+  `fluoCdfOffset/N/step`); the `shadeStep` `D_FLUORESCENT` branch splats the elastic
+  channel at lambda and the glow channel at a Stokes-shifted lambda' (`sampleFluoEmit`)
+  with albedo `aEff*fluoYield`, then stochastically continues (elastic / reemit / absorb)
+  exactly like `render.h`'s `fluoroInteract`. `shadeStep`'s `lambda` became a reference
+  (Stokes shift mutates it), and the wavefront `kWfShade` now writes `st.lambda[slot]`
+  back on the continue branch. `cudaForwardSupported()` no longer rejects Fluorescent
+  materials. Validated GPU-vs-CPU (fluoro scene, mode B and mode A): energy conserves
+  (`sum/emitted=1.0`, absorbed 0.7034 vs 0.7036), mean RGB matches to ~0.1/255, image
+  RMSE 3.5/255, wavefront matches the megakernel, and `-checkfluoro` PASSes. The BDPT
+  kernel (mode D) has no fluorescent vertex strategy, so `cudaBdptSupported()` explicitly
+  rejects fluorescence → CPU fallback (mode D already refuses fluoro scene-wide anyway).
 - **Why acceptable / validated:** model B is the default and the one mode V
   validates. The kernel `kTrace` mirrors `Renderer::tracePhoton` exactly and gates the
   camera-specific work on `camMode`: emitter/diffuse/in-scatter `connectLens` runs for
@@ -565,8 +586,8 @@ as practical; this file is the fallback for what can't be addressed immediately.
   the supported GPU backend today; HIP is a near-drop-in future target (untested — no AMD
   hardware here).**
 - **Proper fix (future):** port the backward tracer (modes R and the mode-P
-  camera-side layer) to CUDA if those paths ever become the bottleneck; add a device
-  fluorescence path (bake `fluoEmitSampler`'s CDF) to lift the fluoro restriction.
+  camera-side layer) to CUDA if those paths ever become the bottleneck. (The device
+  fluorescence path and textured-albedo path are done — see above.)
 - **Status:** OPEN (acceptable) — logged 2026-07-10; A/C, mixed-precision FP32, portable
   multi-arch build, and the HIP compat layer added same day. Requires a CUDA toolkit at
   configure time; without one the project builds CPU-only and `-device gpu` warns and

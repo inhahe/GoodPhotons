@@ -130,6 +130,17 @@ enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCEN
 // Camera measurement model (mirrors -mode A/B/C).
 enum { CAM_A = 0, CAM_B = 1, CAM_C = 2 };
 
+// A spatially-varying reflectance texture (mirrors host Texture). `coeff` is the
+// flattened per-texel Jakob-Hanika sigmoid coefficients (3 doubles per texel,
+// row-major top-left origin), so a bound albedo becomes a physical reflectance at
+// any wavelength via dReflAt — the exact device twin of Texture::reflectanceAt.
+struct DTexture {
+    int w, h;
+    int wrap;    // TexWrap:   0 Repeat, 1 Clamp, 2 Mirror
+    int filter;  // TexFilter: 0 Nearest, 1 Bilinear
+    const double* coeff;   // 3*w*h Jakob-Hanika coefficients
+};
+
 struct DMaterial {
     int    type;
     double reflect[SPEC_N];     // baked reflect spectrum
@@ -137,6 +148,18 @@ struct DMaterial {
     double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
     double roughness;
     double filmIor, filmThickness;
+    // Spatially-varying diffuse albedo: index into DScene::textures (-1 = use the
+    // constant `reflect` spectrum). When >=0 the diffuse/fluoro elastic reflectance
+    // is sampled from the texture at the hit (u,v) instead of specLookup(reflect).
+    int    reflectTex;
+    // Fluorescence (D_FLUORESCENT): fluoAbsorb is the baked excitation probability
+    // epsilon(lambda); the dye re-radiates (quantum yield fluoYield) at a Stokes-
+    // shifted lambda' drawn from the emission-SPD CDF slice [fluoCdfOffset,
+    // fluoCdfOffset+fluoCdfN) inside DScene::fluoCdfAll (fluoCdfStep = bin width nm).
+    double fluoAbsorb[SPEC_N];
+    double fluoYield;
+    int    fluoCdfOffset, fluoCdfN;
+    double fluoCdfStep;
     // Multilayer stack (D_MULTILAYER): per-layer index/extinction/thickness; the
     // substrate is ior + substrateK (spectral). layer 0 is outermost.
     int    layerCount;
@@ -151,7 +174,7 @@ struct DMaterial {
     double mixWeight[D_MIXMAX];
 };
 
-struct DTri    { DVec3 v0, v1, v2, gn; int matId, sensorId; };
+struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId; };
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
@@ -268,6 +291,8 @@ struct DScene {
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
+    const DTexture*  textures; int nTex;   // reflectance textures (mat.reflectTex)
+    const double*    fluoCdfAll;    // flattened per-material fluorescence emission CDFs
     // BDPT shared wavelength sampler (mirrors Scene::emitSampler): the combined
     // g(lambda)=sum_k geomWeight_k*SPD_k CDF, its bin step, and emitG = its integral.
     // BDPT samples one shared lambda per sample from this and sets invPdfLambda=1/pdf.
@@ -567,6 +592,7 @@ struct DHit {
     Real t; bool valid;
     DVec3 p, n, ng;
     int matId, sensorId;
+    Real u, v;   // interpolated surface texture coordinates
 };
 
 __device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
@@ -588,6 +614,11 @@ __device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri
     hit.ng = tri.gn;
     hit.n = (dot(rd, tri.gn) < 0) ? tri.gn : -tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
+    // Barycentric-interpolate the per-vertex UVs (u,vv are the Moller-Trumbore
+    // weights of v1,v2; the v0 weight is 1-u-vv). Mirrors host intersectTri.
+    Real w0 = (Real)1 - u - vv;
+    hit.u = w0 * tri.uv0.x + u * tri.uv1.x + vv * tri.uv2.x;
+    hit.v = w0 * tri.uv0.y + u * tri.uv1.y + vv * tri.uv2.y;
     return true;
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
@@ -605,6 +636,10 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     hit.ng = ng;
     hit.n = (dot(rd, ng) < 0) ? ng : -ng;
     hit.matId = s.matId; hit.sensorId = -1;
+    // Equirectangular (lat/long) UV so spheres can be textured (mirrors host).
+    Real ny = ng.y < (Real)-1 ? (Real)-1 : (ng.y > (Real)1 ? (Real)1 : ng.y);
+    hit.u = (Real)0.5 + atan2(ng.z, ng.x) / (Real)(2.0 * DPI);
+    hit.v = (Real)0.5 - asin(ny) / (Real)DPI;
     return true;
 }
 __device__ static bool boxHit(const DNode& nd, const DVec3& ro, const DVec3& invD,
@@ -934,6 +969,63 @@ __device__ static Real dReflAt(const double* c, Real lambda) {
     return (Real)(0.5 + 0.5 * p / sqrt(1.0 + p * p));
 }
 
+// Wrap a texel index into [0,n) per the texture's wrap mode (mirrors Texture::wrapIndex).
+__device__ static int dWrapIndex(int i, int n, int wrap) {
+    if (wrap == 1) { return i < 0 ? 0 : (i >= n ? n - 1 : i); }       // Clamp
+    if (wrap == 2) {                                                  // Mirror
+        int period = 2 * n;
+        int m = ((i % period) + period) % period;
+        return (m < n) ? m : (period - 1 - m);
+    }
+    int m = i % n; return (m < 0) ? m + n : m;                        // Repeat
+}
+
+// Spatially-varying reflectance at (u,v,lambda): bilerp the per-texel JH coeffs
+// (v flipped so v=0 is the image bottom) then evaluate the sigmoid. The exact
+// device twin of Texture::reflectanceAt (nearest + bilinear filtering).
+__device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambda) {
+    if (tx.filter == 0) {   // Nearest
+        int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
+        int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
+        return dReflAt(&tx.coeff[3 * ((size_t)y * tx.w + x)], lambda);
+    }
+    double tu = (double)u * tx.w - 0.5, tv = (1.0 - (double)v) * tx.h - 0.5;
+    double flx = floor(tu), fly = floor(tv);
+    double fx = tu - flx, fy = tv - fly;
+    int x0 = dWrapIndex((int)flx, tx.w, tx.wrap), x1 = dWrapIndex((int)flx + 1, tx.w, tx.wrap);
+    int y0 = dWrapIndex((int)fly, tx.h, tx.wrap), y1 = dWrapIndex((int)fly + 1, tx.h, tx.wrap);
+    const double* c00 = &tx.coeff[3 * ((size_t)y0 * tx.w + x0)];
+    const double* c10 = &tx.coeff[3 * ((size_t)y0 * tx.w + x1)];
+    const double* c01 = &tx.coeff[3 * ((size_t)y1 * tx.w + x0)];
+    const double* c11 = &tx.coeff[3 * ((size_t)y1 * tx.w + x1)];
+    double c[3];
+    for (int k = 0; k < 3; ++k) {
+        double a = c00[k] * (1 - fx) + c10[k] * fx;
+        double b = c01[k] * (1 - fx) + c11[k] * fx;
+        c[k] = a * (1 - fy) + b * fy;
+    }
+    return dReflAt(c, lambda);
+}
+
+// Diffuse reflectance at a hit: texture-sampled when the material binds one, else
+// the constant baked reflect spectrum (mirrors host diffuseReflectance).
+__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    if (m.reflectTex >= 0) return clamp01(dTexReflAt(sc.textures[m.reflectTex], h.u, h.v, lambda));
+    return clamp01(specLookup(m.reflect, lambda));
+}
+
+// Sample a Stokes-shifted emission wavelength lambda' ~ M for a fluorescent
+// material (mirrors EmissionSampler::sample over [DLMIN, DLMAX]).
+__device__ static Real sampleFluoEmit(const DScene& sc, const DMaterial& m, DRng& rng) {
+    const double* cdf = sc.fluoCdfAll + m.fluoCdfOffset;
+    double u = (double)rng.uniform();
+    int lo = 0, hi = m.fluoCdfN - 1;
+    while (lo + 1 < hi) { int mid = (lo + hi) / 2; if (cdf[mid] <= u) lo = mid; else hi = mid; }
+    double c0 = cdf[lo], c1 = cdf[lo + 1];
+    double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
+    return (Real)(DLMIN + (lo + frac) * m.fluoCdfStep);
+}
+
 // Continuous 1D CDF sample (mirrors Distribution1D::sampleContinuous). Returns the
 // sample in [0,1); pdf is the density relative to funcInt, off the chosen bin.
 __device__ static double dSample1D(const double* cdf, const double* func,
@@ -1079,7 +1171,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* f
 // with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
 __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                 int camMode, int diffraction, const DHit& h,
-                                DVec3& ro, DVec3& rd, Real& beta, Real lambda, DRng& rng,
+                                DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped) {
     Real dSurf = h.valid ? h.t : BIG;
 
@@ -1162,9 +1254,46 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
         DVec3 o = sampleGlossy(reflectv(rd, h.n), (Real)m.roughness, rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
+    } else if (m.type == D_FLUORESCENT) {
+        // Two competing channels: elastic diffuse reflection (albedo rho, wavelength
+        // preserved) and dye excitation (prob aEff = min(eps, 1-rho) so the channels
+        // never exceed unity). Excited photons re-radiate (prob fluoYield) at a
+        // Stokes-shifted lambda' ~ M. The camera sees both: an elastic splat at
+        // lambda, and a glow splat at lambda' with albedo aEff*fluoYield. Mirrors the
+        // host MatType::Fluorescent branch (render.h) + fluoroInteract.
+        Real rho = dDiffuseRho(sc, m, h, lambda);
+        Real eps = clamp01(specLookup(m.fluoAbsorb, lambda));
+        Real oneMinusRho = (Real)1 - rho; if (oneMinusRho < 0) oneMinusRho = 0;
+        Real aEff = eps < oneMinusRho ? eps : oneMinusRho;
+        bool canGlow = (aEff > 0 && m.fluoYield > 0 && m.fluoCdfN > 0);
+        if (camMode == CAM_B) {
+            connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
+            if (canGlow) {
+                Real lp = sampleFluoEmit(sc, m, rng);
+                connect(sc, cam, film, hits, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield));
+            }
+        } else if (camMode == CAM_A) {
+            connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
+            if (canGlow) {
+                Real lp = sampleFluoEmit(sc, m, rng);
+                connectLens(sc, cam, film, hits, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield), rng);
+            }
+        }
+        // Stochastic interaction (fluoroInteract): elastic / reemit / absorb. Beta is
+        // unchanged in both surviving branches (M/pdf cancels for the sampled lambda').
+        Real u = rng.uniform();
+        if (u < rho) {
+            /* elastic: lambda unchanged */
+        } else if (u < rho + aEff) {
+            if (rng.uniform() >= m.fluoYield) { eAbsorbed += beta; return WF_TERMINATE; }
+            lambda = sampleFluoEmit(sc, m, rng);   // Stokes-shifted re-radiation
+        } else {
+            eAbsorbed += beta; return WF_TERMINATE;
+        }
+        ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
     } else {
-        // Diffuse (Fluorescent scenes are rejected on the host; never reached).
-        Real rho = clamp01(specLookup(m.reflect, lambda));
+        // Diffuse (texture-sampled reflectance when the material binds a texture).
+        Real rho = dDiffuseRho(sc, m, h, lambda);
         if (camMode == CAM_B) connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
         else if (camMode == CAM_A) connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -1296,7 +1425,8 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
     if (eEsc != 0.0) atomicAdd(&energy[3], eEsc);
     if (!pathDone) {
         st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
-        st.bounce[slot] = bounce; st.rng[slot] = rng;   // lambda unchanged mid-path
+        st.bounce[slot] = bounce; st.rng[slot] = rng;
+        st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
@@ -1883,35 +2013,24 @@ bool cudaAvailable() {
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 
 bool cudaForwardSupported(const Scene& scene) {
-    // Only reject if geometry actually USES a fluorescent material — buildCornell
-    // keeps a fluorescent entry in the material palette even when nothing points at
-    // it, so scanning scene.mats alone would spuriously disable the GPU path.
-    auto isFluoro = [&](int matId) {
-        return matId >= 0 && matId < (int)scene.mats.size() &&
-               scene.mats[matId].type == MatType::Fluorescent;
-    };
-    // A used material is unsupported if it is fluorescent, uses a spatially-varying
-    // (textured) albedo — the GPU kernel bakes only a single reflect spectrum, so
-    // textured scenes fall back to the CPU tracer — or is a mix that either has too
-    // many child lobes for the GPU or references an unsupported child.
-    auto textured = [&](int matId) {
-        return matId >= 0 && matId < (int)scene.mats.size() &&
-               scene.mats[matId].reflectTex >= 0;
-    };
     // The device multilayer stack has a fixed cap (D_MAXLAYERS); scenes with a
-    // deeper stack fall back to the CPU tracer, which has no layer limit.
+    // deeper stack fall back to the CPU tracer, which has no layer limit. (Textured
+    // albedo and fluorescence are now BOTH ported to the device: per-texel Jakob-
+    // Hanika coeff tables + per-tri UVs feed dTexReflAt, and fluorescent materials
+    // carry a baked excitation spectrum + emission-SPD CDF the shadeStep fluoro
+    // branch samples for the Stokes shift — so neither forces a CPU fallback here.)
     auto oversizedMultilayer = [&](int matId) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
                scene.mats[matId].type == MatType::Multilayer &&
                (int)scene.mats[matId].layerN.size() > D_MAXLAYERS;
     };
     auto unsupported = [&](int matId) {
-        if (isFluoro(matId) || textured(matId) || oversizedMultilayer(matId)) return true;
+        if (oversizedMultilayer(matId)) return true;
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
             if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
-            for (int c : mx.mixChildren) if (isFluoro(c) || textured(c)) return true;
+            for (int c : mx.mixChildren) if (oversizedMultilayer(c)) return true;
         }
         return false;
     };
@@ -1967,6 +2086,9 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
         const Tri& t = scene.tris[i]; DTri& d = tris[i];
         d.v0 = {t.v0.x, t.v0.y, t.v0.z}; d.v1 = {t.v1.x, t.v1.y, t.v1.z};
         d.v2 = {t.v2.x, t.v2.y, t.v2.z}; d.gn = {t.gn.x, t.gn.y, t.gn.z};
+        d.uv0 = {t.uv0.x, t.uv0.y, t.uv0.z};
+        d.uv1 = {t.uv1.x, t.uv1.y, t.uv1.z};
+        d.uv2 = {t.uv2.x, t.uv2.y, t.uv2.z};
         d.matId = t.matId; d.sensorId = t.sensorId;
     }
     std::vector<DSphere> sph(scene.spheres.size());
@@ -1984,13 +2106,30 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
     std::vector<int> primIdx = scene.bvh.primIdx;
 
     // --- bake materials ---
+    // Fluorescent materials append their emission-SPD CDF to one flat buffer
+    // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
     std::vector<DMaterial> mats(scene.mats.size());
+    std::vector<double> fluoCdfAll;
     for (size_t i = 0; i < scene.mats.size(); ++i) {
         const Material& m = scene.mats[i]; DMaterial& d = mats[i];
         d.type = (int)m.type;
         bakeSpec(m.reflect, d.reflect);
         bakeSpec(m.ior, d.ior);
         bakeSpec(m.substrateK, d.substrateK);
+        d.reflectTex = m.reflectTex;
+        // Fluorescence tables (zero/inert for every non-fluorescent material).
+        bakeSpec(m.fluoAbsorb, d.fluoAbsorb);
+        d.fluoYield = m.fluoYield;
+        if (m.type == MatType::Fluorescent && !m.fluoEmitSampler.cdf.empty() &&
+            m.fluoEmitSampler.integral > 0.0) {
+            d.fluoCdfOffset = (int)fluoCdfAll.size();
+            d.fluoCdfN = (int)m.fluoEmitSampler.cdf.size();
+            d.fluoCdfStep = m.fluoEmitSampler.step;
+            fluoCdfAll.insert(fluoCdfAll.end(), m.fluoEmitSampler.cdf.begin(),
+                              m.fluoEmitSampler.cdf.end());
+        } else {
+            d.fluoCdfOffset = 0; d.fluoCdfN = 0; d.fluoCdfStep = 1.0;
+        }
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
         d.layerCount = (int)m.layerN.size();
@@ -2083,6 +2222,29 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
         denv.condFuncInt = (double*)keep(uploadVec(condFuncInt));
     }
 
+    // --- reflectance textures (per-texel Jakob-Hanika coefficients) ---
+    std::vector<DTexture> dtex;
+    for (const auto& tx : scene.textures) {
+        DTexture dt;
+        dt.w = tx.w; dt.h = tx.h;
+        dt.wrap   = (tx.wrap   == TexWrap::Clamp)   ? 1 : (tx.wrap == TexWrap::Mirror) ? 2 : 0;
+        dt.filter = (tx.filter == TexFilter::Nearest) ? 0 : 1;
+        if (!tx.coeff.empty()) {
+            std::vector<double> flat(tx.coeff.size() * 3);
+            for (size_t i = 0; i < tx.coeff.size(); ++i) {
+                flat[3 * i + 0] = tx.coeff[i][0];
+                flat[3 * i + 1] = tx.coeff[i][1];
+                flat[3 * i + 2] = tx.coeff[i][2];
+            }
+            dt.coeff = (double*)keep(uploadVec(flat));
+        } else {
+            dt.coeff = nullptr;
+        }
+        dtex.push_back(dt);
+    }
+    DTexture* d_tex     = dtex.empty()       ? nullptr : (DTexture*)keep(uploadVec(dtex));
+    double*   d_fluoCdf = fluoCdfAll.empty() ? nullptr : (double*)keep(uploadVec(fluoCdfAll));
+
     DScene& sc = up.sc;
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
@@ -2091,6 +2253,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
+    sc.textures = d_tex; sc.nTex = (int)dtex.size();
+    sc.fluoCdfAll = d_fluoCdf;
     sc.emitSamplerCdf = d_emitSamp;
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
     sc.emitSamplerStep = scene.emitSampler.step;
@@ -2235,6 +2399,23 @@ bool cudaBdptSupported(const Scene& scene) {
     // media, and only area/sphere/cylinder Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
     if (scene.medium.enabled) return false;
+    // The forward path now supports textured albedo + fluorescence on the device, but
+    // the BDPT kernel (kBdpt) does not implement either — its diffuse vertices sample
+    // the constant reflect spectrum and it has no fluorescent-vertex strategy — so
+    // scenes using them fall back to the CPU BDPT (which does handle both).
+    auto usesTexOrFluoro = [&](int matId) {
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const Material& m = scene.mats[matId];
+        if (m.reflectTex >= 0 || m.type == MatType::Fluorescent) return true;
+        if (m.type == MatType::Mix)
+            for (int c : m.mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size() &&
+                    (scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent))
+                    return true;
+        return false;
+    };
+    for (const auto& t : scene.tris)    if (usesTexOrFluoro(t.matId)) return false;
+    for (const auto& s : scene.spheres) if (usesTexOrFluoro(s.matId)) return false;
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
