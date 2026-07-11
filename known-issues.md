@@ -42,6 +42,35 @@ as practical; this file is the fallback for what can't be addressed immediately.
   endpoint sits in) and multiply the connection throughput by the resulting
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
 
+### GPU parity pending for implicit surfaces, procedural patterns, and dielectric translucency
+- **What:** the §1–4 CPU feature set — **implicit surfaces** (`isosurface`: analytic
+  SDF primitives, hard/smooth CSG, metaballs; `src/implicit.h`), **procedural patterns**
+  (`pattern` blocks + `pattern:<name>` scalar/selection drives; `src/pattern.h`), and
+  **dielectric translucency** (frosted glass = roughness lobe on the transmitted ray;
+  colored glass = Beer–Lambert `absorb` interior tint) — is **CPU-only**. The CUDA
+  backend (`src/render_cuda.cu`) has no device sphere-tracer (its `closestHit` handles
+  only triangles and spheres), no pattern VM, and its dielectric branch
+  (`refractOrReflect`) is smooth and non-absorbing.
+- **Current behavior (correct, not silently wrong):** `cudaForwardSupported()` now
+  gates all three — a scene with any `scene.implicits`, any material with a bound
+  pattern (`roughnessPat`/`filmThicknessPat`/`mixWeightPat >= 0`), or any frosted/colored
+  dielectric returns `false`, so `-device gpu`/`auto` **falls back to the CPU tracer**
+  (message names the feature). `cudaBdptSupported()`/`cudaBackwardSupported()` inherit
+  this (both call `cudaForwardSupported`). Verified: `scenes/implicit.ftsl`,
+  `procedural.ftsl`, `translucency.ftsl` all fall back; a plain clear-glass scene
+  (`cornell.ftsl`, `glass:SF10`) still runs on GPU (the gate distinguishes clear from
+  frosted/colored — clear dielectrics author `roughness 0` and a zero `absorb`).
+- **Proper fix (step 5, the remaining port):** (a) upload `FieldNode` arrays + `Implicit`
+  primitives into `DScene` and add device sphere-tracing to `closestHit` (`fieldVal`
+  written into the device Hit); (b) upload `Scene::patterns` as flat `PatNode` arrays +
+  port `patternEval` to the device, then wire `dMatRoughness`/`dMatFilmThickness`/
+  `dMixResolveChild` to consult them; (c) thread an `interior` medium pointer through the
+  device transport loops for Beer–Lambert absorption and add the roughness lobe to the
+  device dielectric (frosting). The pattern VM and noise hash were written GPU-portable
+  (POD `PatNode`, integer-hash noise) specifically to make (b) a near-direct port.
+- **Status:** OPEN — logged 2026-07-11. CPU path complete & validated; GPU port is the
+  next planned increment.
+
 ### Multi-camera renders re-trace photons per camera (no shared pass yet)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render
   invocation emits one image per camera (`scenes/twocam.ftsl`), with `-camera

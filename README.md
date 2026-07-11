@@ -167,8 +167,10 @@ truth), remain CPU-only.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
   (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
-  forward scenes. `cpu` is fully deterministic and is used for reference/validation
-  baselines.
+  forward scenes. It also falls back for any scene using the newer CPU-only features —
+  **implicit surfaces (`isosurface`), procedural patterns, and dielectric translucency
+  (frosted/colored glass)** — whose device port is pending. `cpu` is fully
+  deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -266,7 +268,7 @@ Declared with `material "name" { type <type> … }`.
 | Type | Description | Key parameters |
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
-| `dielectric` | Refractive glass with dispersion | `ior` (Sellmeier glass or constant) |
+| `dielectric` | Refractive glass with dispersion, optional **frosting** and **colored-glass tint** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
@@ -274,7 +276,7 @@ Declared with `material "name" { type <type> … }`.
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence | `reflect`, `absorb`, `emit`, `yield` |
-| `mix` | Stochastic blend of materials | repeated `layer <material> <weight>`; optional `weight_map texture:<name>` (2-child spatial blend mask) |
+| `mix` | Stochastic blend of materials | repeated `layer <material> <weight>`; optional `weight_map texture:<name>` **or `weight_map pattern:<name>`** (2-child spatial blend mask — with a pattern this becomes a math-driven *per-point material selection*, see Procedural patterns) |
 | `layered` | Physical coat over a weighted body: reflect off the coat with prob R, else enter and pick one body lobe (energy-consistent). CPU only | `coat { reflectance fresnel\|thinfilm\|manual, ior, roughness[/roughness_map], film_ior, film_thickness[/film_thickness_map], specular }` + repeated body `layer <material> <weight>` |
 
 **Whole-material presets** (`preset <name>`) fill a complete `Material` from a name:
@@ -288,6 +290,21 @@ Declared with `material "name" { type <type> … }`.
 - **Iridescent / structural colour** (thin-film or multilayer stacks): `soap-bubble`,
   `oil-slick`, `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
   `nacre`/`mother-of-pearl`.
+
+**Translucency (dielectrics).** Beyond perfectly clear glass, a `dielectric` supports
+two physically-motivated translucency controls (both compose with dispersion):
+
+- **Frosted glass** — a `roughness` (0..1) puts a microfacet lobe on *both* the
+  reflected and the refracted ray, so light scatters as it passes through. It accepts a
+  constant, a `texture:<name>` map, or a `pattern:<name>` (so frosting can vary over the
+  surface — see `scenes/procedural.ftsl`, whose height-banded glass sphere is clear at
+  the bottom and frosted at the top).
+- **Colored glass** — an `absorb` spectrum (absorption coefficient σₐ per metre)
+  attenuates throughput by `exp(-σₐ(λ)·d)` over each in-glass path segment
+  (Beer–Lambert), so thick regions tint more than thin edges. Authored like any
+  spectrum (e.g. `absorb gaussian center=470 sigma=60 amp=14` for amber). Interior
+  absorption is threaded through all three CPU transport loops (forward, backward,
+  BDPT); see `scenes/translucency.ftsl`. *(GPU: CPU-only for now — see Known issues.)*
 
 ---
 
@@ -359,6 +376,39 @@ projection/up axis, default `y`).
 `group { translate … rotate … scale … <children> }` composes transform
 hierarchies (baked to world space at load). Everything is accelerated by a BVH.
 
+### Implicit surfaces (`isosurface`)
+
+Besides the explicit primitives above, geometry can be defined *implicitly* as the
+zero set of a signed-distance field and rendered by **sphere-tracing** (see
+`src/implicit.h`). An `isosurface { material <m>  <one field element> }` block contains
+exactly one root **field element**, which is either a **leaf** primitive or a **CSG
+combinator** whose children are themselves field elements:
+
+| Leaf | Parameters |
+|---|---|
+| `sphere` | `center`, `radius` |
+| `ellipsoid` | `center`, `radius <rx> <ry> <rz>` (a non-uniformly scaled sphere) |
+| `box` | `center`, `size <x> <y> <z>`, `round` (corner-rounding radius, 0 = sharp) |
+| `torus` | `major`, `minor` (ring / tube radii; axis = local +y) |
+| `cylinder` | `radius`, `height` (axis = local +y) |
+| `cone` | `radius` (bottom), `radius2` (top, 0 = pointed), `height` |
+| `plane` | `normal`, `offset` |
+
+| Combinator | Meaning |
+|---|---|
+| `union` / `intersect` / `difference` | hard boolean CSG (min / max / subtract) |
+| `smooth_union` / `smooth_intersect` / `smooth_difference` | filleted boolean; blend radius `k` softens the seam |
+| `blob` | alias for `smooth_union` — with `k`, children fuse like **metaballs** |
+
+Every element (leaf *or* combinator) may carry its own `translate` / `rotate` / `scale`.
+To rotate a leaf **in place**, position it with `translate` (applied outside the
+rotation) rather than `center` (applied inside — it would orbit the world origin).
+Non-uniform scale is supported (the field stays a valid Lipschitz-1 SDF by de-rating
+the step to the smallest axis scale), so an `ellipsoid`, a squashed `box`/`torus`, etc.
+all work. Surface normals come from the analytic field gradient. A worked example with
+metaballs, drilled CSG, and a tilted torus is in `scenes/implicit.ftsl`. *(GPU: implicit
+surfaces are CPU-only for now — see Known issues.)*
+
 ## Textures
 
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap
@@ -377,6 +427,38 @@ spectra, looked up nearest (CPU only; GPU falls back). A 2-child `mix` can take 
 **blend mask** (`weight_map texture:<name>`) that selects child 0 vs child 1 per hit.
 A scalar map on `ior` remains future work.
 
+## Procedural patterns (math-driven materials)
+
+A `pattern "name" { … }` block compiles a **scalar field** — a function of the hit
+point evaluated per shading sample — that can drive any scalar material parameter
+*procedurally*, without a texture image. The variables available to a pattern are the
+world-space position `x y z`, the implicit field value `f` (the SDF value at the hit,
+`~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, and
+the radius `r = √(x²+y²+z²)`. Two authoring forms:
+
+- **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
+  a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
+  math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
+  max atan2 step pow clamp mix smoothstep noise`.
+- **Named generator** — `type <gen>` plus params (mirrors material syntax):
+
+  | Generator | Parameters | Result |
+  |---|---|---|
+  | `axis`    | `axis <x\|y\|z>` `[scale]` `[offset]` | a coordinate ramp |
+  | `radial`  | `[center <x y z>]` `[scale]` | distance from a point |
+  | `bands`   | `axis <x\|y\|z>` `[freq]` `[phase]` | `0.5+0.5·sin(2π·freq·coord+phase)` stripes |
+  | `checker` | `[size]` | 0/1 world-space checkerboard |
+  | `noise`   | `[freq]` | deterministic value noise in [0,1] (CPU/GPU bit-identical) |
+  | `field`   | `[scale]` | the raw implicit field value `f`, scaled |
+
+Bind a pattern anywhere a scalar `texture:<name>` map is accepted, using
+`pattern:<name>` instead: **roughness** (`dielectric`/`glossy`/preset/`layered` coat),
+**film thickness** (`thinfilm`, preset), and a 2-child `mix` **`weight_map`**. The
+`weight_map` case is the powerful one: because a `mix` blends whole materials, a pattern
+weight makes the *material itself* — colour **and** BSDF type — vary from point to
+point (checkerboard of red vs green diffuse, noise-selected metal vs glass, …). See
+`scenes/procedural.ftsl`. *(GPU: patterns are CPU-only for now — see Known issues.)*
+
 ## Participating media / fog
 
 `medium { sigma_t <v> albedo <v> g <v> rayleigh <bool> }`, or from the CLI with
@@ -388,11 +470,13 @@ function by default; Rayleigh optional.
 ## Scene language (FTSL)
 
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
-`units …` / `spectral …` header), `material`, `texture`, `spectrum`, `sphere`,
-`quad`, `triangle`, `mesh`, `light`, `group`, `medium`, `camera`, `camera_path`
+`units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
+field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
+surface / CSG / metaballs), `light`, `group`, `medium`, `camera`, `camera_path`
 (keyframed camera animation), and `render` (render-setting overrides). See the
 `scenes/` directory for worked examples (`cornell.ftsl`, `fisheye.ftsl`,
-`spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`, `realcam.ftsl`, …).
+`spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`, `realcam.ftsl`,
+`implicit.ftsl`, `procedural.ftsl`, `translucency.ftsl`, …).
 
 ### Importing Mitsuba scenes
 

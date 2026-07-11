@@ -2527,6 +2527,11 @@ bool cudaAvailable() {
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 
 bool cudaForwardSupported(const Scene& scene) {
+    // Implicit surfaces (isosurface / CSG / metaballs) are sphere-traced on the CPU
+    // only; the device closestHit handles just triangles and spheres, so any scene
+    // with an implicit falls back to the CPU tracer (otherwise the isosurface geometry
+    // would be silently missing from the GPU image).
+    if (!scene.implicits.empty()) return false;
     // The device multilayer stack has a fixed cap (D_MAXLAYERS); scenes with a
     // deeper stack fall back to the CPU tracer, which has no layer limit. (Textured
     // albedo and fluorescence are now BOTH ported to the device: per-texel Jakob-
@@ -2553,9 +2558,35 @@ bool cudaForwardSupported(const Scene& scene) {
                 if (c >= 0 && c < (int)scene.mats.size() && paletteTex(scene.mats[c].reflectTex)) return true;
         return false;
     };
+    // §4 math-driven materials & dielectric translucency are CPU-only for now: the
+    // device has no procedural-pattern VM, and its dielectric branch is smooth &
+    // non-absorbing (no frosting, no Beer-Lambert interior tint). Any material relying
+    // on these forces the CPU forward/backward tracer so the GPU never renders a
+    // silently-wrong image (missing frost, clear-instead-of-colored glass, ignored
+    // pattern). Implicit surfaces (isosurface) are gated separately below.
+    auto usesPattern = [&](const Material& m) {
+        return m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0;
+    };
+    auto frostedOrColoredGlass = [&](const Material& m) {
+        if (m.type != MatType::Dielectric) return false;
+        if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
+        // colored glass: any non-zero absorption coefficient over the spectrum.
+        if (m.absorb)
+            for (int i = 0; i <= 8; ++i)
+                if (m.absorb(DLMIN + (DLMAX - DLMIN) * i / 8.0) > 0.0) return true;
+        return false;
+    };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
+        if (matId >= 0 && matId < (int)scene.mats.size()) {
+            const Material& m = scene.mats[matId];
+            if (usesPattern(m) || frostedOrColoredGlass(m)) return true;
+            if (m.type == MatType::Mix)
+                for (int c : m.mixChildren)
+                    if (c >= 0 && c < (int)scene.mats.size() &&
+                        (usesPattern(scene.mats[c]) || frostedOrColoredGlass(scene.mats[c]))) return true;
+        }
         // The physical layered stack (coat interface over a weighted body) is CPU-only;
         // the device shadeStep has no Layered branch, so any Layered material forces a
         // CPU forward/backward fallback (like indexed palettes).

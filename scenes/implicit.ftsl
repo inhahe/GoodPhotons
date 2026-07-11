@@ -1,0 +1,61 @@
+# Implicit surfaces: analytic SDF primitives, (smooth) CSG, and metaballs, all in a
+# Cornell-style box. Every shape here is an `isosurface` — a sign-distance field that
+# the renderer sphere-traces (see src/implicit.h). A field element is either a LEAF
+# (sphere/ellipsoid/box/torus/cylinder/cone/plane) or a COMBINATOR whose children are
+# themselves field elements (union/intersect/difference and their smooth_* variants;
+# `blob` = smooth union). Smooth combinators take a blend radius `k` that fillets the
+# seam — that is what makes metaballs merge.
+#   ftrace -in scenes/implicit.ftsl -mode R -device cpu -o png/implicit.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "gold"  { preset gold }
+
+# box (unit cube [0,1]^3)
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- metaballs: three spheres fused with a smooth union (blend radius k) ---
+isosurface {
+    material gold
+    blob {
+        k 0.09
+        sphere { center 0.26 0.20 0.45   radius 0.11 }
+        sphere { center 0.40 0.22 0.45   radius 0.11 }
+        sphere { center 0.33 0.34 0.45   radius 0.10 }
+    }
+}
+
+# --- hard CSG: a rounded box with a sphere bored out of it (difference) ---
+isosurface {
+    material white
+    difference {
+        box    { center 0.72 0.20 0.45   size 0.30 0.30 0.30   round 0.05 }
+        sphere { center 0.72 0.20 0.60   radius 0.17 }
+    }
+}
+
+# --- a torus tilted to face the camera, floating above ---
+# NOTE: to rotate a leaf in place, position it with `translate` (applied outside the
+# rotation), not `center` (applied inside — it would orbit the world origin).
+isosurface {
+    material red
+    torus { translate 0.50 0.62 0.42   rotate 90 0 0   major 0.15   minor 0.045 }
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode R
+    film { res 320 320 }
+}
