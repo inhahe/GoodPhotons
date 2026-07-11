@@ -351,6 +351,53 @@ static int checkBvh(const Scene& scene, long long rays) {
     return mismatches;
 }
 
+// Implicit-surface (SDF sphere trace) self-test. A unit-Lipschitz SDF sphere must
+// reproduce the analytic sphere intersection: for many random rays we compare the
+// sphere-traced hit (distance + geometric normal) against intersectSphere on the
+// same geometry. Rays grazing the silhouette (impact parameter within a couple of
+// surface epsilons of the radius) are ambiguous hit/miss and are excluded — the
+// surface itself, not the razor-thin tangent, is what must match.
+static int checkImplicit(long long rays) {
+    const Vec3 c{0.3, -0.1, 0.2};
+    const double r = 0.7;
+    Implicit im = makeSphereImplicit(c, r, 0);
+    Sphere sp{c, r, 0};
+    Pcg32 rng; rng.seed(0xC0FFEEu, 0x1234u);
+    int mismatches = 0; long long compared = 0, grazed = 0;
+    double maxdt = 0, maxdn = 0;
+    for (long long i = 0; i < rays; ++i) {
+        Vec3 o{rng.uniform() * 4 - 2, rng.uniform() * 4 - 2, rng.uniform() * 4 - 2};
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        Vec3 d = normalize(Vec3{rr * std::cos(phi), rr * std::sin(phi), z});
+        Ray ray{o, d};
+        // Impact parameter: perpendicular distance from the sphere center to the ray.
+        Vec3 oc = c - o;
+        double proj = dot(oc, d);
+        double b2 = std::max(0.0, dot(oc, oc) - proj * proj);
+        double impact = std::sqrt(b2);
+        // Skip rays that are ambiguous at the surface epsilon: tangent grazes
+        // (impact ~= r) and origins that start ON the surface (|o-c| ~= r) — both
+        // are sub-epsilon hit/miss coin-flips, not a test of the surface itself.
+        bool grazing = std::fabs(impact - r) < 1e-3 || std::fabs(length(oc) - r) < 1e-3;
+        Hit ha; ha.t = DBL_MAX; bool hitA = intersectSphere(ray, sp, 1e-6, ha);
+        Hit hi; hi.t = DBL_MAX; bool hitI = intersectImplicit(ray, im, 1e-6, hi);
+        if (grazing) { ++grazed; continue; }
+        if (hitA != hitI) { ++mismatches; continue; }
+        if (!hitA) continue;
+        ++compared;
+        double dt = std::fabs(ha.t - hi.t);
+        double dn = length(ha.ng - hi.ng);
+        maxdt = std::max(maxdt, dt); maxdn = std::max(maxdn, dn);
+        if (dt > 1e-3 || dn > 2e-2) ++mismatches;
+    }
+    std::printf("[checkimplicit] %lld rays (%lld surface, %lld grazing skipped), "
+                "%d mismatches, max|dt|=%.2e max|dn|=%.2e -> %s\n",
+                rays, compared, grazed, mismatches, maxdt, maxdn,
+                mismatches == 0 ? "PASS" : "FAIL");
+    return mismatches;
+}
+
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
 // inefficient to validate the lens by rendering, so instead we fire rays from a
 // fixed scene point through many aperture positions and measure the circle of
@@ -1830,6 +1877,7 @@ int main(int argc, char** argv) {
     double apertureR = 0.02;  // mode C aperture radius (scene units)
     double focusDist = 0.0;   // mode C thin-lens focus distance (0 = no lens)
     bool checkBvhOnly = false;
+    bool checkImplicitOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
     bool checkFluoroOnly = false;
@@ -1905,6 +1953,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-aperture") && i + 1 < argc) apertureR = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-focus") && i + 1 < argc) focusDist = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
+        else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
@@ -1941,6 +1990,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
     if (nThreads < 1) nThreads = 1;
+    if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed

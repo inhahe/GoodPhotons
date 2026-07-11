@@ -5,6 +5,7 @@
 #include <memory>
 #include "geometry.h"
 #include "bvh.h"
+#include "implicit.h"
 #include "spectrum.h"
 #include "scene_film.h"
 #include "texture.h"
@@ -388,6 +389,7 @@ struct Emitter {
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
+    std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     Sensor sensor;
@@ -649,6 +651,8 @@ struct Scene {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
             boxes.push_back(b);
         }
+        boxes.reserve(boxes.size() + implicits.size());
+        for (const auto& im : implicits) boxes.push_back(im.bounds);
         bvh.build(boxes);
     }
 
@@ -656,9 +660,11 @@ struct Scene {
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
+        const size_t nS = spheres.size();
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
-            if (prim < (int)nT) { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
-            else                { if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
+            if (prim < (int)nT)            { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
+            else                           { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
         }, stats);
         return h;
     }
@@ -671,18 +677,21 @@ struct Scene {
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
         Ray r{o, dir};
         const size_t nT = tris.size();
+        const size_t nS = spheres.size();
         return bvh.traverseAny(r, tmin, maxDist - tmin, [&](int prim) {
             Hit h; h.t = maxDist - tmin;
-            if (prim < (int)nT) return intersectTri(r, tris[prim], tmin, h);
-            return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)nT)             return intersectTri(r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
         });
     }
 
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
-        for (const auto& t : tris)    intersectTri(r, t, tmin, h);
-        for (const auto& s : spheres) intersectSphere(r, s, tmin, h);
+        for (const auto& t : tris)     intersectTri(r, t, tmin, h);
+        for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
+        for (const auto& im : implicits) intersectImplicit(r, im, tmin, h);
         return h;
     }
 };
