@@ -75,19 +75,78 @@ ftrace -in scenes/group.ftsl -time 120 -preview -o group.png
 
 ## Render modes (`-mode`, or per-camera `mode`)
 
+Modes `A`/`B`/`C`/`P` trace **identical forward physics** and differ only in how
+the camera *measures* the light (splat vs. physical catch vs. composite). `R` and
+`D` are separate backward / bidirectional estimators. All modes are unbiased and
+converge to the same image; they trade **speed, noise character, and which light
+paths they can capture at all**.
+
 | Mode | Name | What it does | Backend |
 |---|---|---|---|
-| `A` | Contact sensor | Pure forward photon catch on a front-wall sensor (no lens) | CPU |
-| `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; fast, independent photons | CPU + **GPU** |
-| `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU |
+| `A` | Contact sensor | Pure forward photon catch on a front-wall sensor (no lens/optics) | CPU + GPU |
+| `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
+| `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU |
-| `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU |
+| `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU |
-| `D` | BDPT | Bidirectional path tracing with MIS over all light×camera connections | CPU |
+| `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU |
 
-Choose the hardware with `-device auto|cpu|gpu` (default `auto`, falls back to CPU
-if CUDA is unavailable). `-wavefront` selects the streaming GPU backend instead of
-the megakernel.
+### Speed / accuracy / ability tradeoffs
+
+- **`B` — pinhole splat (default, fastest).** Every photon that hits a
+  camera-visible surface splats to the pinhole, so essentially no photons are
+  wasted — **orders of magnitude faster** than physically catching photons through
+  an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and it
+  **cannot render specular-first pixels** (a mirror/glass surface seen directly
+  splats nothing and stays black — use `P`, `D`, or `R` for those). Best default
+  for diffuse and caustic-heavy scenes.
+- **`A` — contact sensor (simple, no optics).** A forward catch straight onto a
+  sensor plane; no lens, no pinhole projection, so framing is limited to the sensor
+  rectangle. Simplest measurement, mainly a physics baseline.
+- **`C` — finite-aperture catch (accurate DoF, slow).** Photons must physically
+  pass through the aperture to be counted, giving true thin-lens depth of field and
+  bokeh — but it is **catch-starved** (most photons miss the aperture), so it is
+  **much noisier / slower** than `B` for the same photon budget. Use when you
+  specifically want forward-simulated DoF.
+- **`R` — backward reference (unbiased, general).** Traces from the camera, so it
+  renders **any** first-hit surface including specular, and is the **quiet, reliable
+  reference** for camera-visible lighting. It is CPU-only and gets **noisy on
+  caustics** (light focused through glass/water is hard to find backward). This mode
+  also drives the **physical multi-element lens** camera.
+- **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
+  check, not a production renderer (roughly twice the work).
+- **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for
+  diffuse-first pixels and caustics, and a backward camera ray for
+  specular/coated surfaces that `B` leaves black — a good "best of both" for scenes
+  that mix diffuse lighting with mirrors/coatings. *Cost:* CPU-only and more
+  expensive than plain `B`; there can be a subtle seam between the two layers.
+- **`D` — BDPT (most general, slowest per sample).** One unbiased estimator that
+  traces a light *and* a camera subpath and MIS-combines every connection, so it
+  captures **specular-first pixels and diffuse caustics in a single pass** on the
+  absolute-radiance scale (no composite seam). *Cost:* highest cost per sample,
+  CPU-only, and it **does not support fluorescence, participating media, or spot &
+  env lights** (use `B`/`P` or `R` for those).
+
+Only the **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are
+progressive and GPU-eligible; brightness is photon-count-independent, so more
+photons only reduce graininess.
+
+### Backends & performance (`-device`, `-wavefront`)
+
+- **`-device auto` (default, recommended).** Uses the GPU when a supported CUDA
+  device is present *and* the render is a forward trace it can handle (modes
+  `A`/`B`/`C` on a non-fluorescent scene); otherwise the CPU. Prints its choice.
+- **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
+  for the backward tracer (mode `R`, the mode-`P` camera layer) and for fluorescent
+  scenes. `cpu` is fully deterministic and is used for reference/validation
+  baselines.
+- **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
+  identical, exactly energy-conserving physics. The **megakernel** runs each
+  photon's whole path in one thread and is usually fastest on **shallow, uniform
+  scenes on a big GPU**. The **wavefront** splits the trace into coherent
+  extend/shade passes over a persistent photon pool and wins on **divergent /
+  deep-path scenes and smaller GPUs**. Their RNG streams differ, so their images
+  match only to within Monte-Carlo noise.
 
 ---
 
@@ -106,6 +165,15 @@ block. Film size can be a preset **format** — `full-frame`, `aps-c`,
 
 **Analytic depth of field:** `aperture`, `focus`, `lens` (focal length, mm),
 `fstop`, and `zoom` give a thin-lens camera with a real focus plane and bokeh.
+This is the **fast, approximate** option: an ideal paraxial thin lens with a
+circular aperture, evaluated analytically, so it runs in the forward modes (`B`
+splat / `C` catch) with no per-element ray tracing. It gives correct focus-plane
+placement and blur size but **no optical aberrations** (no spherical/chromatic
+aberration, distortion, or field curvature) and a perfectly circular bokeh.
+
+**Analytic projections** (fisheye/panoramic/orthographic, above) are likewise a
+cheap closed-form remap in the forward pinhole mode — a true wide field of view
+with none of the aberration or vignetting a real objective would add.
 
 **Physical (realistic) lens** — `lens { … }`:
 
@@ -137,6 +205,15 @@ camera "real" {
 - Or paste an **arbitrary real prescription** as repeated
   `surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]` lines
   (PBRT lens-file convention). See `scenes/realcam.ftsl` for a working demo.
+
+**Analytic vs. simulated — the tradeoff:** the physical lens is the **accurate but
+slower** option. It captures real optical behaviour the thin lens cannot
+(aberrations, distortion, field curvature, natural vignetting, dispersion-driven
+colour fringing, and aperture-shaped bokeh), but it traces every camera ray
+through the glass stack and is **backward-only (mode `R`, CPU)** — so it is
+markedly slower than the analytic thin lens and has no GPU path. Reach for the
+analytic lens/projection when you want speed and a clean ideal image, and the
+physical lens when you want a specific real objective's look.
 
 *Current limits:* the physical lens is backward-only (mode `R`, CPU), renders to a
 square film (the 3:2 sensor is cropped to the output frame), and does not model
