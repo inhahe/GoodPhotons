@@ -335,14 +335,19 @@ as practical; this file is the fallback for what can't be addressed immediately.
     **backward** reference (mode R). A future variance reduction would importance-sample
     the emission toward the actual geometry (not just the bounding sphere) and/or
     trace multiple wavelengths per photon (hero-wavelength); deferred.
-  - **Mode P + env: no sky background (minor gap).** The directly-viewed sky is
-    supplied by `addEnvBackground()`, which is wired into modes B and V but *not*
-    into `renderComposite()` (mode P). An env scene rendered in mode P therefore
-    shows the environment illumination on surfaces but a black background on the
-    forward-side (diffuse) pixels. Mode P targets specular scenes (its whole purpose
-    is the camera-side layer for S* paths), so env + mode P is niche; the proper fix
-    (add the background to the composite's forward layer, mindful of the best-fit
-    `s` interaction — now easy since the We fix makes s≈1) is deferred.
+  - **Mode P + env: sky background — DONE 2026-07-11.** The directly-viewed sky is
+    now composited in `renderComposite()` (mode P), not just modes B/V. The pixel
+    classifier became three-way — SPEC (specular-first → backward layer), SKY (camera
+    ray escapes an env scene → env radiance) and DIFF (everything else → forward
+    layer) — and the env radiance (`envXYZForDir`, already in the composite's
+    display-radiance units) is written on SKY pixels. Critically, **SKY pixels are now
+    excluded from the forward→backward scale fit**: they are measured by env radiance
+    directly (forward film ≈ 0, backward film = full bright sky), so including them
+    dragged the best-fit `s` toward 0 — exactly the bias mode V avoids by adding the
+    sky to `fwd` before its `compareFilms` fit. Verified on `envlight.ftsl` mode P:
+    excluding sky pixels restores s 0.27 → 0.957 (matching mode V's ~0.97), the sky
+    renders behind the geometry, and a non-env specular scene (`group.ftsl`) is
+    unaffected (s 0.965, no env line, DIFF/SPEC split unchanged).
 - **Image-based HDRI environment (2026-07-10, increment 2a — DONE, CPU):** `light env
   { file "sky.hdr"  rotate deg  intensity s }` registers an equirectangular (lat-long)
   environment. `src/envmap.h` (`EnvMap`) loads the map (via the existing `Texture`

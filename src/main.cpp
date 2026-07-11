@@ -1117,24 +1117,39 @@ static Film renderComposite(const Scene& scene, const Camera& cam, int resX, int
 #endif
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
 
-    // Classify each pixel by its first camera-ray hit. specular-side pixels take
-    // the camera-side (backward) layer; everything else takes the forward layer.
-    std::vector<char> spec((size_t)resX * resY, 0);
-    long long nSpec = 0;
+    // Classify each pixel by its first camera-ray hit into three exclusive classes:
+    //   SPEC (specular-first surface) -> camera-side (backward) layer,
+    //   SKY  (camera ray escapes an env scene) -> directly-viewed environment,
+    //   DIFF (everything else) -> forward (model-B) layer.
+    // Only DIFF pixels feed the forward->backward scale fit: SPEC pixels are black in
+    // the forward film (the SDS gap the camera-side layer fills), and SKY pixels are
+    // measured by the env radiance directly, not by forward photon transport — the
+    // forward film is ~0 there while the backward film has the full bright sky, so
+    // including them would drag the best-fit s toward 0 (this is exactly why mode V
+    // adds the sky to `fwd` before its compareFilms fit).
+    enum { DIFF = 0, SPEC = 1, SKY = 2 };
+    std::vector<char> cls((size_t)resX * resY, DIFF);
+    std::vector<Vec3> skyXYZ;                 // env radiance per SKY pixel (display units)
+    if (scene.envIndex >= 0) skyXYZ.assign(cls.size(), {});
+    long long nSpec = 0, nSky = 0;
     for (int py = 0; py < resY; ++py)
         for (int px = 0; px < resX; ++px) {
+            size_t i = (size_t)py * resX + px;
             Ray r = cam.genRay(px, py, 0.5, 0.5);
             Hit h = scene.closestHit(r);
-            bool s = h.valid && h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type);
-            spec[(size_t)py * resX + px] = s ? 1 : 0;
-            nSpec += s;
+            if (!h.valid) {
+                if (scene.envIndex >= 0) { cls[i] = SKY; skyXYZ[i] = scene.envXYZForDir(r.d); ++nSky; }
+                // (no env => leave as DIFF; the forward film is legitimately black there)
+            } else if (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type)) {
+                cls[i] = SPEC; ++nSpec;
+            }
         }
 
-    // Best-fit forward->backward scale over the diffuse-side pixels: Fval ~ s*Rval,
+    // Best-fit forward->backward scale over the DIFF pixels only: Fval ~ s*Rval,
     // so s = sum(Fval.Rval)/sum(Rval.Rval) (same convention as compareFilms).
     double sfr = 0, srr = 0;
-    for (size_t i = 0; i < spec.size(); ++i) {
-        if (spec[i]) continue;
+    for (size_t i = 0; i < cls.size(); ++i) {
+        if (cls[i] != DIFF) continue;
         Vec3 f = fwd.xyz[i] * invF, rv = ref.xyz[i] * invR;
         sfr += dot(f, rv); srr += dot(rv, rv);
     }
@@ -1146,8 +1161,8 @@ static Film renderComposite(const Scene& scene, const Camera& cam, int resX, int
     // confirms the two halves live on one consistent radiance scale (no transport
     // bug); a large/structured one would flag that the composite seam is real.
     double num = 0, den = 0;
-    for (size_t i = 0; i < spec.size(); ++i) {
-        if (spec[i]) continue;
+    for (size_t i = 0; i < cls.size(); ++i) {
+        if (cls[i] != DIFF) continue;
         Vec3 fr = fwd.xyz[i] * (invF / s), rv = ref.xyz[i] * invR;
         Vec3 dd = fr - rv;
         num += dot(dd, dd); den += dot(fr, fr);
@@ -1155,14 +1170,20 @@ static Film renderComposite(const Scene& scene, const Camera& cam, int resX, int
     double rmse = (den > 0) ? std::sqrt(num / den) : 0.0;
 
     // Composite in radiance-display units: writeFilm(comp, 1.0) divides only by
-    // cieYIntegral, so store forward as F/(N*s) and backward as R/spp per pixel.
+    // cieYIntegral, so store forward as F/(N*s), backward as R/spp, and the directly-
+    // viewed sky as its env XYZ (envXYZForDir already lands in these units — identical
+    // to mode B's post-norm background and the backward ray-miss term). The
+    // true-radiance We fix makes s~1, so all three layers share one radiance scale.
     Film comp; comp.resX = resX; comp.resY = resY; comp.alloc();
-    for (size_t i = 0; i < spec.size(); ++i)
-        comp.xyz[i] = spec[i] ? ref.xyz[i] * invR
-                              : fwd.xyz[i] * (invF / s);
+    for (size_t i = 0; i < cls.size(); ++i)
+        comp.xyz[i] = (cls[i] == SPEC) ? ref.xyz[i] * invR
+                    : (cls[i] == SKY)  ? skyXYZ[i]
+                                       : fwd.xyz[i] * (invF / s);
 
     std::printf("[composite] forward->radiance scale s=%.6g  specular-first pixels=%lld/%lld\n",
-                s, nSpec, (long long)spec.size());
+                s, nSpec, (long long)cls.size());
+    if (scene.envIndex >= 0)
+        std::printf("[composite] env background on %lld escaped (sky) pixels\n", nSky);
     std::printf("[composite] diffuse-side residual (forward/s vs backward) rel RMSE=%.4f\n", rmse);
     return comp;
 }
