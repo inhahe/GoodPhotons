@@ -51,19 +51,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
      auto-exposure (the film's radiometric scale is arbitrary). A true absolute
      exposure (a given ISO+shutter+f-number yielding a physically-determined
      brightness) needs **absolute light power** (watts/lumens) on emitters, which is
-     itself deferred (§7). A cheaper intermediate win: an exposure **lock** across
-     `camera_path` frames — compute the auto anchor once and reuse it so a dolly
-     doesn't flicker frame-to-frame.
+     itself deferred (§7). ~~A cheaper intermediate win: an exposure **lock** across
+     `camera_path` frames.~~ **Exposure-lock DONE 2026-07-11:** a `camera_path` can
+     author `exposure_lock` (or the CLI `-exposure-lock` forces it across *all*
+     rendered cameras) so the auto-exposure anchor is computed once from the first
+     frame and reused for the rest — no dolly/zoom flicker. Implemented by an optional
+     `double* lockAnchor` threaded `runRender → writeFilm` and a per-lock-group
+     `std::map<int,double>` anchor in the multi-camera loop (`CamSpec.pathGroup/
+     exposureLock`, `RenderCam.expGroup`); only the final converged write sets/reuses
+     the anchor, so progressive intermediate saves don't poison it. Validated on
+     `scenes/dolly.ftsl`: unlocked frames swing 2.0e-14→5.2e-13 (25×, visible
+     flicker), locked frames all hold the frame-0 anchor 2.02e-14. Standalone cameras
+     (no lock) stay bit-identical (null anchor → per-frame auto-exposure as before).
+     True *absolute* EV still needs absolute emitter power (deferred, §7).
   2. **Non-square films.** `film { res W H }` only uses the first value; the
      forward/backward tracers (and CUDA) allocate a square film. Non-square sensors
      (and a true horizontal fov from film **width**) need the tracers to carry
      resX≠resY.
   3. **Shared multi-camera mode-B pass** (already logged above under the multi-camera
      entry) — one photon trace splatting to every camera pupil.
-- **Proper fix:** (1) add absolute emitter power + a sensitometric film model; add a
-  per-`camera_path` exposure-lock flag as the near-term step. (2) thread resX/resY
-  through `renderForward`/`renderBackward`/CUDA and `writePPM`. (3) see multi-camera.
-- **Status:** OPEN (design captured) — logged 2026-07-10.
+- **Proper fix:** (1) ~~add a per-`camera_path` exposure-lock flag as the near-term
+  step~~ (DONE 2026-07-11); absolute emitter power + a sensitometric film model still
+  deferred. (2) thread resX/resY through `renderForward`/`renderBackward`/CUDA and
+  `writePPM`. (3) see multi-camera.
+- **Status:** OPEN (design captured) — logged 2026-07-10; **exposure-lock done
+  2026-07-11**; absolute-EV, non-square films and the shared pass remain.
 - **Done (2026-07-10, Phase 3a):**
   - `camera_path` keyframed motion — expands at load time into a sequence of
     `CamSpec` frames with piecewise-linear `eye`/`look_at` interpolation between

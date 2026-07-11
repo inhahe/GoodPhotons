@@ -325,6 +325,10 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 
 `sphere`, `quad` (parallelogram), `triangle`, and `mesh` (OBJ import, with
 `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UVs).
+Meshes without their own `vt` coordinates can be textured via a procedural
+projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
+at load time from the mesh's world-space bounding box (the optional token is the
+projection/up axis, default `y`).
 `group { translate … rotate … scale … <children> }` composes transform
 hierarchies (baked to world space at load). Everything is accelerated by a BVH.
 
@@ -333,8 +337,10 @@ hierarchies (baked to world space at load). Everything is accelerated by a BVH.
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap
 repeat|clamp|mirror }` loads PNG / JPG / HDR / PPM / PFM images; bind one to a
 diffuse albedo with `reflect texture:<name>`. Each texel is Jakob–Hanika
-upsampled to a reflectance spectrum. (Base-colour maps today; normal/roughness
-maps are future work.)
+upsampled to a reflectance spectrum. UVs come from quad corners, OBJ `vt`
+(`uv use_mesh`), or a procedural `planar`/`spherical`/`cylindrical` projection
+(see Geometry). (Base-colour maps today; normal/roughness maps and triplanar
+blending are future work.)
 
 ## Participating media / fog
 
@@ -394,6 +400,7 @@ An FTSL file is a list of blocks. Top-level block types: `scene` (the
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-interval <s>` | Periodic image write / preview refresh (default 15 s) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint |
+| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,

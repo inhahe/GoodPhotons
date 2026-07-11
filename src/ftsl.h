@@ -325,6 +325,16 @@ struct CamSpec {
     // Resolved exposure compensation (<= 0 => neutral auto-expose). Filled at load.
     double exposureMul = 0.0;
 
+    // Exposure-lock across a `camera_path` (Phase 3a intermediate win): frames of a
+    // path that authored `exposure_lock` share the auto-exposure anchor computed from
+    // the first frame, so a dolly/zoom doesn't flicker as scene brightness shifts.
+    // `pathGroup` (>=0) identifies the owning path (all its frames share the value);
+    // -1 for a standalone `camera`. `exposureLock` is set on every frame of a locked
+    // path. A CLI `-exposure-lock` can additionally force a single shared anchor
+    // across *all* rendered cameras regardless of these fields.
+    int  pathGroup   = -1;
+    bool exposureLock = false;
+
     // Physical multi-element lens (the "mesh-lens" camera), built from a `lens { ... }`
     // block. When set, main renders this camera through the backward realistic-camera
     // path (mode R), tracing rays through the real glass interfaces. Null => the
@@ -1247,6 +1257,18 @@ private:
         }
         const double DEG = 3.141592653589793 / 180.0;
 
+        // Exposure-lock: a bare `exposure_lock` (or `exposure_lock on`) makes every
+        // frame of this path share the auto-exposure anchor from frame 0 (no
+        // flicker); `off`/`false`/`0` disables (the default). The group id is this
+        // path's starting index in L.cameras — unique because paths occupy disjoint
+        // contiguous ranges.
+        bool pathLock = false;
+        if (const Stmt* el = find(b, "exposure_lock")) {
+            if (el->val.words.empty()) pathLock = true;
+            else { const std::string& v = el->val.words[0]; pathLock = !(v=="off"||v=="false"||v=="0"); }
+        }
+        const int pathGroup = (int)L.cameras.size();
+
         // Collect keyframes (t, eye, optional look_at, optional fov), sorted by t.
         // Field count disambiguates: 4=t,eye  5=t,eye,fov  7=t,eye,look  8=t,eye,look,fov.
         struct Key { double t; Vec3 eye, look; bool hasLook; double fov; };
@@ -1293,6 +1315,8 @@ private:
             }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
+            cs.pathGroup = pathGroup;
+            cs.exposureLock = pathLock;
             L.cameras.push_back(cs);
             if (!L.hasCamera) {
                 L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;

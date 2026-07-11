@@ -78,6 +78,7 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <map>
 #include "scene.h"
 #include "camera.h"
 #include "render.h"
@@ -792,8 +793,13 @@ static int checkUpsample() {
 // The tone-mapped 8-bit RGB result is written via writeImage(), which picks the
 // encoder from `path`'s extension (.png/.jpg/.jpeg, else PPM) — so `-o foo.png`
 // yields a real PNG, not PPM bytes in a .png file.
+// `lockAnchor` (optional) implements a shared auto-exposure anchor across the frames
+// of a `camera_path` (see the exposure-lock feature): when non-null and *lockAnchor
+// > 0 the stored `eAuto` is reused (so a dolly doesn't flicker frame-to-frame); when
+// non-null but still 0 the freshly-computed `eAuto` is written back for the next
+// frame. Null => per-frame auto-exposure (the default).
 static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
-                      bool quiet = false) {
+                      bool quiet = false, double* lockAnchor = nullptr) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -802,9 +808,15 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
         lin[i] = xyzToLinearSrgb(f.xyz[i] * norm);
         lum.push_back(std::max({lin[i].x, lin[i].y, lin[i].z, 0.0}));
     }
-    std::vector<double> sorted = lum; std::sort(sorted.begin(), sorted.end());
-    double p99 = sorted[(size_t)(0.99 * (sorted.size() - 1))];
-    double eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
+    double eAuto;
+    if (lockAnchor && *lockAnchor > 0.0) {
+        eAuto = *lockAnchor;                       // reuse the path's locked anchor
+    } else {
+        std::vector<double> sorted = lum; std::sort(sorted.begin(), sorted.end());
+        double p99 = sorted[(size_t)(0.99 * (sorted.size() - 1))];
+        eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
+        if (lockAnchor) *lockAnchor = eAuto;       // first frame sets the anchor
+    }
     double exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
 
     std::vector<uint8_t> img((size_t)W * H * 3);
@@ -1314,7 +1326,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double timeBudgetSec = 0.0, bool resume = false,
                      bool wantCheckpointFlag = false, bool runForever = false,
                      bool preview = false, double intervalSec = 15.0,
-                     double noiseTarget = 0.0, bool wavefront = false) {
+                     double noiseTarget = 0.0, bool wavefront = false,
+                     double* exposureAnchor = nullptr) {
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -1459,7 +1472,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
         ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
 #endif
-        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure); return 0; }
+        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor); return 0; }
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -1524,7 +1537,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
         img = renderBdpt(scene, cam, res, spp, nThreads, maxDepth, diffraction);
 #endif
-        writeFilm(outPath.c_str(), img, 1.0, manualExposure);
+        writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor);
         return 0;
     }
 
@@ -1534,7 +1547,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, res, nThreads, lightLabel);
         Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction, useGpu, wavefront);
-        writeFilm(outPath.c_str(), comp, 1.0, manualExposure);
+        writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor);
         return 0;
     }
 
@@ -1558,10 +1571,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("[resume] loaded %s: %lld photons accumulated so far\n",
                     checkpointPath(outPath).c_str(), acc.N);
 
-    auto writeOut = [&](bool announceCheckpoint, bool quiet = false) {
+    // `useAnchor` gates the camera_path exposure-lock: only the final converged write
+    // should set/reuse the shared anchor (a premature intermediate save would lock in
+    // a noisy anchor for the frame and every later path frame).
+    auto writeOut = [&](bool announceCheckpoint, bool quiet = false, bool useAnchor = true) {
         Film disp = acc.film;                        // display copy (+ direct sky view)
         if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet);
+        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
+                  useAnchor ? exposureAnchor : nullptr);
         if (wantCheckpoint) {
             if (writeCheckpoint(outPath, acc, guard, mode)) {
                 if (announceCheckpoint)
@@ -1643,7 +1660,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (noiseMet) metNoise = true;
             bool done = stopped || timeUp || noiseMet;
             if (done || wantStatus) {   // periodic crash-safe checkpoint + preview
-                writeOut(/*announceCheckpoint*/false, /*quiet*/preview);
+                writeOut(/*announceCheckpoint*/false, /*quiet*/preview, /*useAnchor*/done);
                 lastSave = clk::now();
                 const char* why = stopped ? " (stopping)"
                                 : noiseMet ? " (noise target met)" : "";
@@ -1727,6 +1744,7 @@ int main(int argc, char** argv) {
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
+    bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
     double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (forward A/B/C)
     bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint
@@ -1802,6 +1820,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
+        else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
@@ -1875,7 +1894,7 @@ int main(int argc, char** argv) {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
-    struct RenderCam { std::string name; Camera cam; char mode; int res; double exposure; };
+    struct RenderCam { std::string name; Camera cam; char mode; int res; double exposure; int expGroup; };
     std::vector<RenderCam> toRender;
 
     if (fromFtsl && !ftslScene.cameras.empty()) {
@@ -1918,7 +1937,11 @@ int main(int argc, char** argv) {
                     cmode = 'R';
                 }
             }
-            toRender.push_back({cs->name, c, cmode, cres, cs->exposureMul});
+            // Exposure-lock group: a global -exposure-lock forces one shared anchor
+            // (group 0) across every camera; otherwise a per-path `exposure_lock`
+            // locks only that path's frames (group = its pathGroup); -1 = per-frame.
+            int eg = forceExposureLock ? 0 : (cs->exposureLock ? cs->pathGroup : -1);
+            toRender.push_back({cs->name, c, cmode, cres, cs->exposureMul, eg});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/ref) uses
@@ -1932,7 +1955,7 @@ int main(int argc, char** argv) {
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
-        toRender.push_back({"", c, mode, res, 0.0});
+        toRender.push_back({"", c, mode, res, 0.0, forceExposureLock ? 0 : -1});
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file
@@ -1946,14 +1969,19 @@ int main(int argc, char** argv) {
         return stem + "_" + name + ext;
     };
 
+    // Shared auto-exposure anchors, one per exposure-lock group (see RenderCam.expGroup).
+    // The first frame in a group computes its anchor and stores it here; later frames
+    // in the same group reuse it (no dolly flicker). A null anchor = per-frame auto.
+    std::map<int, double> expAnchors;
     for (const RenderCam& rc : toRender) {
         if (toRender.size() > 1)
             std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
                         rc.name.c_str(), rc.mode, rc.res, rc.res, outFor(rc.name).c_str());
+        double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
-                           preview, intervalSec, noiseTarget, wavefront);
+                           preview, intervalSec, noiseTarget, wavefront, anchor);
         if (rv != 0) return rv;
     }
     return 0;

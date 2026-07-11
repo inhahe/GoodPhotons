@@ -853,9 +853,17 @@ photons where the brute-force catch needs billions.
   *not* folded in (in A/C a smaller aperture already darkens the image physically;
   in B the aperture is virtual). **True absolute EV / a physical sensitivity+
   response model still needs engine work** — it depends on absolute light power
-  (watts/lumens), which is a separate deferred feature (see §7 / known-issues). A
-  fixed exposure *lock* across `camera_path` frames (compute the anchor once, reuse
-  it) is a natural follow-up on top of this.
+  (watts/lumens), which is a separate deferred feature (see §7 / known-issues).
+- **Exposure lock** — **[done — 2026-07-11]**: because each image is auto-exposed
+  independently, a moving `camera_path` can flicker as the scene brightness under the
+  anchor shifts frame-to-frame. Author `exposure_lock` inside a `camera_path` block
+  (a bare keyword, or `exposure_lock on`; `off`/`false`/`0` disables) to compute the
+  auto-exposure anchor **once from the first frame** and reuse it for every frame of
+  that path — steady exposure, no flicker. The CLI flag `-exposure-lock` forces the
+  same behaviour across *all* rendered cameras (e.g. to match exposure between several
+  standalone `camera` blocks). Per-frame `iso`/`shutter`/`exposure` compensation still
+  applies on top of the locked anchor. This is a *relative* lock (it fixes the shared
+  anchor); true absolute EV still needs absolute light power (above).
 
 ### 8.2 Measurement model (`mode`)
 
@@ -940,6 +948,12 @@ each frame's `look_at` point, and the reference size is anchored on the first fr
 (`distance · tan(fov/2) = const`). Example — `scenes/fisheye.ftsl`'s `vertigo`
 path pulls the eye back from z = 1.0 → 2.2 while the fov auto-narrows 60° → ~22°.
 
+**Steady exposure across a path (`exposure_lock`).** Add a bare `exposure_lock`
+(or `exposure_lock on`) inside the `camera_path` block to lock the auto-exposure
+anchor to the first frame's value for the whole path, so the shot doesn't flicker as
+the framing changes (see §8.1 *Exposure lock*). The CLI `-exposure-lock` forces the
+same across every rendered camera.
+
 For a shared photon pass (a future optimization), the engine would connect each
 diffuse bounce to *every* frame/camera's pupil (mode B) in one trace — a natural
 extension of the existing `connect()` since photons are camera-independent until
@@ -962,6 +976,7 @@ photons — so adding photons only *lowers the graininess*; it never changes exp
 | `-checkpoint` | On a plain `-n` render, also write the checkpoint sidecar so a later `-resume` can continue it. (`-time`, `-forever`, and `-resume` imply checkpointing.) |
 | `-preview` | During `-time`/`-noise`/`-forever`, redraw a live ANSI-colour thumbnail of the current image in the terminal at each periodic update (in place, over the previous frame). Needs a truecolour-capable terminal. |
 | `-interval <seconds>` | Seconds between periodic image writes / preview refreshes during `-time`/`-noise`/`-forever` (default 15). The output image file is rewritten at this cadence too, so pointing an auto-reloading image viewer at it gives a live display without `-preview`. |
+| `-exposure-lock` | Compute the auto-exposure anchor once (from the first rendered camera/frame) and reuse it for **every** camera rendered this invocation, so a multi-frame `camera_path` or a set of `camera` blocks share one exposure (no flicker). A per-`camera_path` `exposure_lock` keyword locks just that path (§8.1 / §8.3). |
 
 **Checkpoint sidecar.** Because the 8-bit tone-mapped image is exposure-anchored and
 gamma-quantised, it cannot be resumed from faithfully. Alongside `-o out.png` the
