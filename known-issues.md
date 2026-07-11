@@ -572,13 +572,19 @@ as practical; this file is the fallback for what can't be addressed immediately.
   configure time; without one the project builds CPU-only and `-device gpu` warns and
   uses the CPU.
 
-### GPU scaling path (future): megakernel vs. wavefront
-- **Context:** the current GPU backend is a **megakernel** — one `kTrace` launch where
-  each thread runs an entire photon path (emit → bounce loop → connect/catch/deposit)
-  start to finish. This is the right choice for *this* renderer today: an RTX 4090 has
-  huge register/occupancy headroom, the Cornell-class scenes are shallow, and a single
-  kernel keeps all state in registers with no round-trips to global memory. It already
-  hits ~500M+ photons/s in FP32.
+### GPU scaling path: megakernel vs. wavefront (IMPLEMENTED — both backends ship)
+- **Status:** both backends now exist. The **megakernel** (`kTrace`) is the default; the
+  **wavefront** (streaming) backend is opt-in via `-wavefront`. They share the exact same
+  device physics — `genPhoton()` (emitter sample + direct connect) and `shadeStep()` (one
+  bounce: medium/catch/material dispatch) are `__device__` functions called by both — so
+  only the *scheduling* differs. Because of that shared code, adding the wavefront left the
+  megakernel bit-for-bit identical (validated: cornell/materials mode B/C images and energy
+  reports unchanged after the extraction refactor).
+- **Context:** the **megakernel** is one `kTrace` launch where each thread runs an entire
+  photon path (emit → bounce loop → connect/catch/deposit) start to finish. This is the
+  right choice for *this* renderer's typical case: an RTX 4090 has huge register/occupancy
+  headroom, Cornell-class scenes are shallow, and a single kernel keeps all state in
+  registers with no round-trips to global memory. It hits ~500M+ photons/s in FP32.
 - **The known limitation (thread divergence):** in a megakernel, threads in a warp that
   take different material branches (a dielectric refraction next to a diffuse bounce next
   to a grating), or that terminate after wildly different path lengths, **serialize** —
@@ -587,16 +593,28 @@ as practical; this file is the fallback for what can't be addressed immediately.
   *every* material's code path in *every* thread, capping occupancy. Both effects get
   worse as scenes gain more material variety and deeper paths, and they bite harder on
   smaller GPUs (fewer SMs / less latency-hiding to absorb the idle lanes).
-- **The alternative (wavefront / path-regeneration):** split the tracer into stages —
-  generate, extend (intersect), shade-per-material, connect — each its own kernel, with
-  photon state held in global "ray queues" between stages. A **sort/compaction by
-  material** before the shade stage makes each shading kernel branch-coherent (every
-  thread in a warp runs the same BSDF), and terminated paths are **compacted out** so
-  every thread always has live work (path regeneration keeps the SIMD lanes full). This
-  is how production GPU renderers (PBRT-v4's `wavefront`, OptiX path guiding) scale to
-  many-material, deep-path scenes. The cost: extra global-memory bandwidth for the queues
-  and more kernel-launch overhead, which is why it's *not* a win for shallow, uniform
-  scenes on a big GPU (the megakernel's register-resident state wins there).
+- **What we shipped (wavefront / path-regeneration):** the tracer is split into two
+  coherent stages that alternate over a **persistent pool of photon slots** (SoA state:
+  ro/rd/beta/lambda/rng/bounce/alive/hit, W = min(N, 1M) slots): **extend** (`kWfExtend`,
+  one `closestHit` per live slot) then **shade** (`kWfShade`, one `shadeStep` per live
+  slot). A warp's threads therefore execute the same stage together instead of diverging
+  on per-photon path length. When a path terminates (or hits the bounce cap), its slot
+  **immediately regenerates a fresh photon** (`wfSpawn` claims the next index from an
+  atomic budget counter) — path compaction by regeneration — so SIMD lanes stay full until
+  all N photons are traced. The host loop (`wavefrontTrace`) reads a live-slot counter each
+  pass and stops when the pool drains. **Phase 2 not yet done:** a *sort/compaction by
+  material* before the shade stage would additionally kill BSDF-branch divergence (every
+  thread in a warp running the same material) — that's the remaining coherence win over
+  what's implemented, and the natural next step if a material-diverse scene proves
+  shade-divergence-bound.
+- **The cost:** the wavefront reads/writes the whole photon state to global memory every
+  bounce and launches two kernels per pass, so it's *not* a win for shallow, uniform scenes
+  on a big GPU — the megakernel's register-resident state wins there. Measured on an RTX
+  4090, materials mode B, 400M photons: megakernel 0.79 s vs wavefront 1.60 s (~2× slower),
+  exactly the expected regime. The wavefront's payoff is on divergent / deep-path scenes and
+  smaller GPUs; energy conservation and image agreement (to within Monte-Carlo noise) hold
+  across every scene tested (cornell, materials A/B/C, spotlight, envlight, thin-film,
+  multilayer, mix, fog).
 - **Re: "wavefront helps divergent scenes AND small GPUs" (todo.txt question):** it's
   *both*, and they're related. (1) *Divergent scenes* — many materials and/or highly
   variable path lengths — benefit from the per-material sort (kills branch divergence) and
@@ -605,10 +623,12 @@ as practical; this file is the fallback for what can't be addressed immediately.
   register pressure, so keeping warps coherent and full matters more there. A big GPU on a
   shallow uniform scene (our current case) is the one regime where the megakernel clearly
   wins, which is why we ship it first.
-- **Decision:** keep the megakernel as the default and recommended path for the scenes
-  this renderer targets. Add a wavefront backend only if/when profiling on a genuinely
-  material-diverse, deep-path scene (or a small GPU) shows the megakernel is
-  divergence-bound. Documented here so the scaling path is on record; no code owed now.
+- **Decision:** the megakernel stays the default/recommended path for the scenes this
+  renderer targets (shallow, uniform, big GPU); the wavefront ships as an opt-in
+  (`-wavefront`) for the divergent/deep-path/small-GPU regime. Remaining optional work: the
+  Phase 2 per-material shade sort (above), and a heuristic for `-device auto` to pick the
+  backend by scene material variety + path depth rather than always defaulting to the
+  megakernel.
 
 ## Performance
 

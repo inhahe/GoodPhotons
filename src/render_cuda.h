@@ -40,9 +40,15 @@ bool cudaForwardSupported(const Scene& scene);
 // budget, or resuming an accumulated film) draw statistically-independent photons;
 // pass the cumulative photon count already traced. seedBase==0 reproduces the
 // original single-shot stream bit-for-bit.
+// `wavefront` selects the streaming (path-regeneration) GPU backend instead of the
+// default megakernel. Both run identical physics and conserve energy exactly; the
+// wavefront scheduler keeps SIMD lanes full on divergent / deep-path scenes and small
+// GPUs, at the cost of extra memory traffic (the RNG stream — and thus the exact image
+// noise — differs, but the two agree to within Monte-Carlo noise).
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode, unsigned long long seedBase = 0);
+                       char camMode, unsigned long long seedBase = 0,
+                       bool wavefront = false);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

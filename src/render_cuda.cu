@@ -981,6 +981,197 @@ __device__ static int dEnvTexel(const DEnvMap& e, const DVec3& d) {
     return row * e.w + col;
 }
 
+// ---- shared photon physics (megakernel + wavefront share these exactly) ----
+// Both backends run identical physics; only the *scheduling* of the two stages
+// differs (megakernel: an inner per-thread loop; wavefront: separate coherent
+// launches over a persistent state pool). Because rng is threaded by reference
+// through both stages in the same call order, the megakernel's RNG stream — and
+// thus its image and energy report — is bit-for-bit unchanged by this refactor.
+
+enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
+
+// Sample one photon from the emitters: fills ro/rd/beta/lambda, accumulates the
+// emitted energy, and performs the direct emitter->camera connection (models A/B).
+// Returns false when the wavelength draw yields a zero pdf (skip this photon).
+__device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* film, double* hits,
+                                 int camMode, DRng& rng,
+                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted) {
+    // Power-weighted emitter selection (single emitter draws no randomness).
+    int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+    const DEmitter em = sc.emitters[ei];
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 origin, emitN, dir;
+    Real spotW = (Real)1;                            // spot direction reweight (else 1)
+    bool envImage = false; double envPdfW = 0.0;     // image env: reweight below
+    if (em.shape == 2) {
+        // Point spot: uniform direction in the outer cone; reweight beta by
+        // falloff*(Omega_outer/Omega_eff) to match the smoothstep profile.
+        origin = em.origin;
+        double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
+        double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+        double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+        DVec3 t, b; onb(em.beamDir, t, b);
+        dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
+        emitN = em.beamDir;
+        double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
+        spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
+    } else if (em.shape == 3) {
+        // Infinite environment (mirrors CPU render.h). Sample the photon direction
+        // — for a constant env uniformly on the sphere (pdf 1/4pi); for an image
+        // env importance-sampled from the luminance CDF (pdf envPdfW) — then its
+        // entry point on a disk of radius R perpendicular to `dir`, centered on the
+        // scene and pushed upstream so it starts just outside the bounding sphere
+        // (disk pdf 1/(pi R^2)). For the constant case the joint pdf 1/(4pi^2 R^2)
+        // = 1/envGeom makes beta = emitIntegral*envGeom exactly analog; the image
+        // case reweights beta below by L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)).
+        if (sc.env.scale != nullptr) {
+            dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
+            envImage = true;
+        } else {
+            double z = 1.0 - 2.0 * (double)u1;
+            double sr = sqrt(fmax(0.0, 1.0 - z * z));
+            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+            dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        }
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
+        emitN = dir;
+    } else {
+        emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+        dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+    }
+    Real pdfL = 0;
+    lambda = sampleLambda(sc, em, rng, pdfL);
+    if (pdfL <= 0) return false;
+    beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
+    beta *= spotW;                                   // exactly 1 for non-spot
+    // Image env: reweight so the photon carries the radiance actually arriving
+    // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
+    // illuminant in L and avgSpd cancels, leaving the per-texel JH ratio.
+    if (envImage) {
+        int ti = dEnvTexel(sc.env, dir);
+        double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lambda);
+        double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lambda);
+        double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
+        beta = (denom > 0.0) ? (Real)((double)beta * rad / denom) : (Real)0;
+    }
+    eEmitted += beta;
+
+    // Connect the emitter itself to the camera (makes the source visible): model
+    // B splats to the pinhole, model A splats through the finite lens pupil. Model
+    // C instead catches photons that physically arrive. A spot is a point light
+    // with no projected area, so it has no direct term.
+    if (em.shape != 2 && em.shape != 3) {
+        if (camMode == CAM_B) connect(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1);
+        else if (camMode == CAM_A) connectLens(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1, rng);
+    }
+
+    ro = origin + dir * RAY_EPS; rd = dir;
+    return true;
+}
+
+// Advance a photon by one bounce given its precomputed intersection `h`. Mutates
+// ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
+// when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
+// with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
+__device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* film, double* hits,
+                                int camMode, int diffraction, const DHit& h,
+                                DVec3& ro, DVec3& rd, Real& beta, Real lambda, DRng& rng,
+                                double& eAbsorbed, double& eSensor, double& eEscaped) {
+    Real dSurf = h.valid ? h.t : BIG;
+
+    // fog free-flight; dEvent is the nearer of surface hit / volume collision.
+    bool mediumEvent = false; DVec3 mp; Real dEvent = dSurf;
+    if (sc.medium.enabled) {
+        Real st = medSigmaT(sc.medium, lambda);
+        if (st > 0) {
+            Real tMed = -log((Real)1 - rng.uniform()) / st;
+            if (tMed < dSurf) { mediumEvent = true; mp = ro + rd * tMed; dEvent = tMed; }
+        }
+    }
+
+    // Model C perspective catch: if the photon flies through the aperture
+    // nearer than the surface/fog event, it lands on the film. Analog physics.
+    if (camMode == CAM_C) {
+        int px, py;
+        if (cam.catchPhoton(ro, rd, dEvent, px, py)) {
+            filmAdd(film, hits, cam.resX, px, py, lambda, beta);
+            eSensor += beta; return WF_TERMINATE;
+        }
+    }
+
+    if (mediumEvent) {
+        if (camMode == CAM_B) connectVolume(sc, cam, film, hits, mp, rd, lambda, beta);
+        else if (camMode == CAM_A) connectLensVolume(sc, cam, film, hits, mp, rd, lambda, beta, rng);
+        if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 nd = sampleHG(rd, (Real)sc.medium.g, rng);
+        ro = mp; rd = nd;
+        return WF_CONTINUE;
+    }
+
+    if (!h.valid) { eEscaped += beta; return WF_TERMINATE; }
+    if (h.sensorId >= 0) {
+        // Legacy contact sensor: no geometry carries a sensorId in the current
+        // camera modes, so this is inert (kept for absorption bookkeeping).
+        eSensor += beta; return WF_TERMINATE;
+    }
+
+    const DMaterial* mptr = &sc.mats[h.matId];
+    // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
+    if (mptr->type == D_MIX) {
+        Real u = rng.uniform(), acc = 0; int child = -1;
+        for (int k = 0; k < mptr->mixCount; ++k) {
+            acc += (Real)mptr->mixWeight[k];
+            if (u < acc) { child = mptr->mixChild[k]; break; }
+        }
+        if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
+        mptr = &sc.mats[child];
+    }
+    const DMaterial& m = *mptr;
+    if (m.type == D_DIELECTRIC) {
+        DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; return WF_CONTINUE;
+    } else if (m.type == D_THINFILM) {
+        DVec3 nro, nrd;
+        if (!thinFilmInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = nro; rd = nrd; return WF_CONTINUE;
+    } else if (m.type == D_MULTILAYER) {
+        DVec3 nro, nrd;
+        if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = nro; rd = nrd; return WF_CONTINUE;
+    } else if (m.type == D_MIRROR) {
+        Real r = clamp01(specLookup(m.reflect, lambda));
+        if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
+    } else if (m.type == D_GRATING) {
+        Real r = clamp01(specLookup(m.reflect, lambda));
+        if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 nro, nrd;
+        if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = nro; rd = nrd; return WF_CONTINUE;
+    } else if (m.type == D_HALFMIRROR) {
+        Real r = clamp01(specLookup(m.reflect, lambda));
+        if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
+        else { ro = h.p + rd * RAY_EPS; }
+        return WF_CONTINUE;
+    } else if (m.type == D_GLOSSY) {
+        Real r = clamp01(specLookup(m.reflect, lambda));
+        if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 o = sampleGlossy(reflectv(rd, h.n), (Real)m.roughness, rng);
+        if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
+    } else {
+        // Diffuse (Fluorescent scenes are rejected on the host; never reached).
+        Real rho = clamp01(specLookup(m.reflect, lambda));
+        if (camMode == CAM_B) connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
+        else if (camMode == CAM_A) connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
+        if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
+    }
+}
+
 __global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode) {
@@ -991,172 +1182,13 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, doubl
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
-        // Power-weighted emitter selection (single emitter draws no randomness).
-        int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
-        const DEmitter em = sc.emitters[ei];
-        Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 origin, emitN, dir;
-        Real spotW = (Real)1;                            // spot direction reweight (else 1)
-        bool envImage = false; double envPdfW = 0.0;     // image env: reweight below
-        if (em.shape == 2) {
-            // Point spot: uniform direction in the outer cone; reweight beta by
-            // falloff*(Omega_outer/Omega_eff) to match the smoothstep profile.
-            origin = em.origin;
-            double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
-            double st = sqrt(fmax(0.0, 1.0 - ct * ct));
-            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
-            DVec3 t, b; onb(em.beamDir, t, b);
-            dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
-            emitN = em.beamDir;
-            double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
-            spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
-        } else if (em.shape == 3) {
-            // Infinite environment (mirrors CPU render.h). Sample the photon direction
-            // — for a constant env uniformly on the sphere (pdf 1/4pi); for an image
-            // env importance-sampled from the luminance CDF (pdf envPdfW) — then its
-            // entry point on a disk of radius R perpendicular to `dir`, centered on the
-            // scene and pushed upstream so it starts just outside the bounding sphere
-            // (disk pdf 1/(pi R^2)). For the constant case the joint pdf 1/(4pi^2 R^2)
-            // = 1/envGeom makes beta = emitIntegral*envGeom exactly analog; the image
-            // case reweights beta below by L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)).
-            if (sc.env.scale != nullptr) {
-                dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
-                envImage = true;
-            } else {
-                double z = 1.0 - 2.0 * (double)u1;
-                double sr = sqrt(fmax(0.0, 1.0 - z * z));
-                double phi = 2.0 * 3.14159265358979323846 * (double)u2;
-                dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-            }
-            DVec3 t, b; onb(dir, t, b);
-            double rd = sc.sceneRadius * sqrt((double)rng.uniform());
-            double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
-            DVec3 disk = t * (Real)(rd * cos(pd)) + b * (Real)(rd * sin(pd));
-            origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
-            emitN = dir;
-        } else {
-            emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
-            dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
-        }
-        Real pdfL = 0;
-        Real lambda = sampleLambda(sc, em, rng, pdfL);
-        if (pdfL <= 0) continue;
-        Real beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
-        beta *= spotW;                                   // exactly 1 for non-spot
-        // Image env: reweight so the photon carries the radiance actually arriving
-        // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
-        // illuminant in L and avgSpd cancels, leaving the per-texel JH ratio.
-        if (envImage) {
-            int ti = dEnvTexel(sc.env, dir);
-            double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lambda);
-            double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lambda);
-            double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
-            beta = (denom > 0.0) ? (Real)((double)beta * rad / denom) : (Real)0;
-        }
-        eEmitted += beta;
-
-        // Connect the emitter itself to the camera (makes the source visible): model
-        // B splats to the pinhole, model A splats through the finite lens pupil. Model
-        // C instead catches photons that physically arrive. A spot is a point light
-        // with no projected area, so it has no direct term.
-        if (em.shape != 2 && em.shape != 3) {
-            if (camMode == CAM_B) connect(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1);
-            else if (camMode == CAM_A) connectLens(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1, rng);
-        }
-
-        DVec3 ro = origin + dir * RAY_EPS, rd = dir;
+        DVec3 ro, rd; Real beta, lambda;
+        if (!genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             DHit h = closestHit(sc, ro, rd);
-            Real dSurf = h.valid ? h.t : BIG;
-
-            // fog free-flight; dEvent is the nearer of surface hit / volume collision.
-            bool mediumEvent = false; DVec3 mp; Real dEvent = dSurf;
-            if (sc.medium.enabled) {
-                Real st = medSigmaT(sc.medium, lambda);
-                if (st > 0) {
-                    Real tMed = -log((Real)1 - rng.uniform()) / st;
-                    if (tMed < dSurf) { mediumEvent = true; mp = ro + rd * tMed; dEvent = tMed; }
-                }
-            }
-
-            // Model C perspective catch: if the photon flies through the aperture
-            // nearer than the surface/fog event, it lands on the film. Analog physics.
-            if (camMode == CAM_C) {
-                int px, py;
-                if (cam.catchPhoton(ro, rd, dEvent, px, py)) {
-                    filmAdd(film, hits, cam.resX, px, py, lambda, beta);
-                    eSensor += beta; done = true; break;
-                }
-            }
-
-            if (mediumEvent) {
-                if (camMode == CAM_B) connectVolume(sc, cam, film, hits, mp, rd, lambda, beta);
-                else if (camMode == CAM_A) connectLensVolume(sc, cam, film, hits, mp, rd, lambda, beta, rng);
-                if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; done = true; break; }
-                DVec3 nd = sampleHG(rd, (Real)sc.medium.g, rng);
-                ro = mp; rd = nd;
-                continue;
-            }
-
-            if (!h.valid) { eEscaped += beta; done = true; break; }
-            if (h.sensorId >= 0) {
-                // Legacy contact sensor: no geometry carries a sensorId in the current
-                // camera modes, so this is inert (kept for absorption bookkeeping).
-                eSensor += beta; done = true; break;
-            }
-
-            const DMaterial* mptr = &sc.mats[h.matId];
-            // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
-            if (mptr->type == D_MIX) {
-                Real u = rng.uniform(), acc = 0; int child = -1;
-                for (int k = 0; k < mptr->mixCount; ++k) {
-                    acc += (Real)mptr->mixWeight[k];
-                    if (u < acc) { child = mptr->mixChild[k]; break; }
-                }
-                if (child < 0) { eAbsorbed += beta; done = true; break; }
-                mptr = &sc.mats[child];
-            }
-            const DMaterial& m = *mptr;
-            if (m.type == D_DIELECTRIC) {
-                DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; continue;
-            } else if (m.type == D_THINFILM) {
-                DVec3 nro, nrd;
-                if (!thinFilmInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; done = true; break; }
-                ro = nro; rd = nrd; continue;
-            } else if (m.type == D_MULTILAYER) {
-                DVec3 nro, nrd;
-                if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; done = true; break; }
-                ro = nro; rd = nrd; continue;
-            } else if (m.type == D_MIRROR) {
-                Real r = clamp01(specLookup(m.reflect, lambda));
-                if (rng.uniform() >= r) { eAbsorbed += beta; done = true; break; }
-                DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; continue;
-            } else if (m.type == D_GRATING) {
-                Real r = clamp01(specLookup(m.reflect, lambda));
-                if (rng.uniform() >= r) { eAbsorbed += beta; done = true; break; }
-                DVec3 nro, nrd;
-                if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { eAbsorbed += beta; done = true; break; }
-                ro = nro; rd = nrd; continue;
-            } else if (m.type == D_HALFMIRROR) {
-                Real r = clamp01(specLookup(m.reflect, lambda));
-                if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
-                else { ro = h.p + rd * RAY_EPS; }
-                continue;
-            } else if (m.type == D_GLOSSY) {
-                Real r = clamp01(specLookup(m.reflect, lambda));
-                if (rng.uniform() >= r) { eAbsorbed += beta; done = true; break; }
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), (Real)m.roughness, rng);
-                if (dot(o, h.n) <= 0) { eAbsorbed += beta; done = true; break; }
-                ro = h.p + h.n * RAY_EPS; rd = o; continue;
-            } else {
-                // Diffuse (Fluorescent scenes are rejected on the host; never reached).
-                Real rho = clamp01(specLookup(m.reflect, lambda));
-                if (camMode == CAM_B) connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
-                else if (camMode == CAM_A) connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
-                if (rng.uniform() >= rho) { eAbsorbed += beta; done = true; break; }
-                ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); continue;
-            }
+            if (shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
+                          eAbsorbed, eSensor, eEscaped) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -1166,6 +1198,111 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, doubl
     atomicAdd(&energy[2], eSensor);
     atomicAdd(&energy[3], eEscaped);
     atomicAdd(&energy[4], eResidual);
+}
+
+// ============================ wavefront (streaming) backend ==================
+// Same physics as the megakernel (genPhoton + shadeStep, identical device code),
+// but scheduled as separate coherent kernel launches over a *persistent* pool of
+// photon slots instead of one long-running per-thread loop. Each pass runs the two
+// stages — extend (one closestHit per live slot) then shade (one shadeStep) — across
+// the whole pool, so a warp's threads execute the same stage together rather than
+// diverging on per-photon path length. When a path terminates, its slot immediately
+// regenerates a fresh photon (path compaction by regeneration), keeping SIMD lanes
+// full until the N-photon budget is spent. This wins on divergent / deep-path scenes
+// and small GPUs; the megakernel wins on shallow, uniform scenes on big GPUs, so the
+// backend is selectable (default = megakernel). See known-issues.md "GPU scaling path".
+//
+// The RNG stream differs from the megakernel (each slot, not each grid-stride thread,
+// carries a stream), so images are NOT bit-identical — but the physics is the same, so
+// energy conserves exactly and the two agree to within Monte-Carlo noise.
+
+// SoA photon-state pool. One entry per slot; hit[] is filled by the extend stage and
+// consumed by the shade stage of the same pass.
+struct WFState {
+    DVec3* ro;
+    DVec3* rd;
+    Real*  beta;
+    Real*  lambda;
+    DRng*  rng;
+    int*   bounce;   // bounces already shaded for the photon currently in this slot
+    int*   alive;    // 1 = slot holds a live photon, 0 = drained (budget spent)
+    DHit*  hit;      // extend-stage intersection, consumed by shade
+};
+
+// Claim photon budget and emit fresh photons into `slot` until one is successfully
+// launched or the N-photon budget is exhausted. Mirrors the megakernel's per-iteration
+// genPhoton: a zero-pdf wavelength draw is skipped but still consumes its budget index,
+// so the total genPhoton count is exactly N across the whole render. Returns true and
+// fills the slot (alive=1, bounce=0) on success; false when the budget is spent (the
+// caller marks the slot dead). Emitted energy accrues into energy[0].
+__device__ static bool wfSpawn(const DScene& sc, const DCamera& cam, double* film, double* hits,
+                               double* energy, int camMode, long long N,
+                               unsigned long long* dispatched, WFState st, int slot, DRng& rng) {
+    for (;;) {
+        unsigned long long idx = atomicAdd(dispatched, 1ULL);
+        if (idx >= (unsigned long long)N) return false;
+        DVec3 ro, rd; Real beta, lambda; double eEm = 0;
+        if (genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEm)) {
+            st.ro[slot] = ro; st.rd[slot] = rd;
+            st.beta[slot] = beta; st.lambda[slot] = lambda;
+            st.bounce[slot] = 0; st.alive[slot] = 1;
+            atomicAdd(&energy[0], eEm);
+            return true;
+        }
+        // zero-pdf photon: its budget index is consumed, loop and try the next
+    }
+}
+
+// Seed each slot's RNG and fill it with a first photon.
+__global__ void kWfInit(DScene sc, DCamera cam, double* film, double* hits, double* energy,
+                        WFState st, long long N, int W, unsigned long long* dispatched,
+                        int* liveCount, unsigned long long seedBase, int camMode) {
+    int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= W) return;
+    DRng rng; rng.seed((unsigned long long)(slot * 2 + 1), seedBase ^ (unsigned long long)slot);
+    bool live = wfSpawn(sc, cam, film, hits, energy, camMode, N, dispatched, st, slot, rng);
+    st.rng[slot] = rng;
+    if (live) atomicAdd(liveCount, 1);
+    else st.alive[slot] = 0;
+}
+
+// Extend: one closestHit per live slot.
+__global__ void kWfExtend(DScene sc, WFState st, int W) {
+    int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= W || !st.alive[slot]) return;
+    st.hit[slot] = closestHit(sc, st.ro[slot], st.rd[slot]);
+}
+
+// Shade: advance each live slot by one bounce; regenerate on termination / bounce cap.
+__global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, double* energy,
+                         WFState st, int W, long long N, int diffraction, int maxBounce,
+                         unsigned long long* dispatched, int* liveCount, int camMode) {
+    int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= W || !st.alive[slot]) return;
+    DRng rng = st.rng[slot];
+    DVec3 ro = st.ro[slot], rd = st.rd[slot];
+    Real beta = st.beta[slot], lambda = st.lambda[slot];
+    DHit h = st.hit[slot];
+    double eAbs = 0, eSen = 0, eEsc = 0;
+    int res = shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
+                        eAbs, eSen, eEsc);
+    int bounce = st.bounce[slot] + 1;
+    bool pathDone = (res == WF_TERMINATE);
+    // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
+    // count its carried energy as residual, exactly as the megakernel's !done branch.
+    if (!pathDone && bounce >= maxBounce) { atomicAdd(&energy[4], (double)beta); pathDone = true; }
+    if (eAbs != 0.0) atomicAdd(&energy[1], eAbs);
+    if (eSen != 0.0) atomicAdd(&energy[2], eSen);
+    if (eEsc != 0.0) atomicAdd(&energy[3], eEsc);
+    if (!pathDone) {
+        st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
+        st.bounce[slot] = bounce; st.rng[slot] = rng;   // lambda unchanged mid-path
+        return;
+    }
+    // Path finished: regenerate this slot from the remaining budget (compaction).
+    bool live = wfSpawn(sc, cam, film, hits, energy, camMode, N, dispatched, st, slot, rng);
+    st.rng[slot] = rng;
+    if (!live) { st.alive[slot] = 0; atomicSub(liveCount, 1); }
 }
 
 // ============================ bidirectional path tracing (mode D) ============
@@ -1979,9 +2116,63 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
 }
 
+// Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
+// runs extend/shade passes until every slot has drained the N-photon budget. Writes into
+// the same d_film / d_hits / d_energy buffers as the megakernel path.
+static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* d_energy,
+                           long long N, int diffraction, unsigned long long kseed,
+                           int maxBounce, int camModeInt) {
+    using namespace gpu;
+    if (N <= 0) return;
+    int W = (int)((N < (1 << 20)) ? N : (1 << 20));   // persistent slot count
+    if (W < 1) W = 1;
+
+    WFState st;
+    cudaMalloc(&st.ro,     (size_t)W * sizeof(DVec3));
+    cudaMalloc(&st.rd,     (size_t)W * sizeof(DVec3));
+    cudaMalloc(&st.beta,   (size_t)W * sizeof(Real));
+    cudaMalloc(&st.lambda, (size_t)W * sizeof(Real));
+    cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng));
+    cudaMalloc(&st.bounce, (size_t)W * sizeof(int));
+    cudaMalloc(&st.alive,  (size_t)W * sizeof(int));
+    cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit));
+    cudaMemset(st.alive, 0, (size_t)W * sizeof(int));
+
+    unsigned long long* d_dispatched = nullptr;
+    cudaMalloc(&d_dispatched, sizeof(unsigned long long));
+    cudaMemset(d_dispatched, 0, sizeof(unsigned long long));
+    int* d_live = nullptr;
+    cudaMalloc(&d_live, sizeof(int));
+    cudaMemset(d_live, 0, sizeof(int));
+
+    int bs = 128;
+    int gb = (W + bs - 1) / bs;
+
+    kWfInit<<<gb, bs>>>(up.sc, up.dc, d_film, d_hits, d_energy, st, N, W,
+                        d_dispatched, d_live, kseed, camModeInt);
+
+    // Guard the pass loop against an unexpected non-terminating condition: the longest a
+    // slot can stay busy is one path (<= maxBounce shades) before it must regenerate or
+    // die, so once dispatched >= N every slot drains within maxBounce passes. This cap is
+    // generous slack over that bound and never triggers in normal operation.
+    long long maxPasses = (N / W + 2) * (long long)(maxBounce + 1) + 16;
+    for (long long pass = 0; pass < maxPasses; ++pass) {
+        kWfExtend<<<gb, bs>>>(up.sc, st, W);
+        kWfShade<<<gb, bs>>>(up.sc, up.dc, d_film, d_hits, d_energy, st, W, N,
+                             diffraction, maxBounce, d_dispatched, d_live, camModeInt);
+        int live = 0;
+        cudaMemcpy(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost);
+        if (live <= 0) break;
+    }
+
+    cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
+    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.hit);
+    cudaFree(d_dispatched); cudaFree(d_live);
+}
+
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode, unsigned long long seedBase) {
+                       char camMode, unsigned long long seedBase, bool wavefront) {
     using namespace gpu;
     Film out; out.resX = res; out.resY = res; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -2003,8 +2194,14 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation
     // chunk passes a distinct cumulative-photon offset for an independent stream.
     unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
-    kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_hits, d_energy, N, diffraction ? 1 : 0,
-                                     kseed, 32, camModeInt);
+    if (wavefront) {
+        // Streaming backend: identical physics, path-regeneration scheduling (see the
+        // wavefront section above). Same maxBounce (32) and camera mode as the megakernel.
+        wavefrontTrace(up, d_film, d_hits, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
+    } else {
+        kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_hits, d_energy, N, diffraction ? 1 : 0,
+                                         kseed, 32, camModeInt);
+    }
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
     if (kerr != cudaSuccess) {

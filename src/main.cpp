@@ -28,6 +28,15 @@
 // at build time (see CMakeLists.txt / FTRACE_CUDA_ARCH); without a CUDA toolkit the
 // renderer is CPU-only and -device gpu/auto use the CPU.
 //
+// -wavefront selects the streaming GPU backend instead of the default megakernel (only
+// affects a forward GPU render; ignored otherwise). Both run identical physics and
+// conserve energy exactly; the megakernel runs each photon's whole path in one thread,
+// while the wavefront splits the trace into coherent extend/shade passes over a
+// persistent photon pool and regenerates finished paths to keep SIMD lanes full. The
+// wavefront helps on divergent / deep-path scenes and small GPUs; the megakernel is
+// usually faster on shallow, uniform scenes on a big GPU (its default). The RNG stream
+// differs, so images match the megakernel only to within Monte-Carlo noise.
+//
 // Progressive rendering (forward modes A/B/C only; brightness is photon-count-
 // independent, so more photons only reduce graininess):
 //   -n <photons>   trace exactly this many photons (default).
@@ -950,17 +959,18 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 static Film renderForward(const Scene& scene, const Camera* cam, int res, long long N,
                           int nThreads, bool forwardCatch, bool lensMode, bool useCamera,
                           EnergyReport& eOut, bool diffraction = true, bool useGpu = false,
-                          uint64_t seedBase = 0) {
+                          uint64_t seedBase = 0, bool wavefront = false) {
 #ifdef HAVE_CUDA
     // GPU path covers all three finite-lens camera models: the pinhole splat (B), the
     // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
-    // scenes fall back to the CPU (the reradiation sampler is not ported).
+    // scenes fall back to the CPU (the reradiation sampler is not ported). `wavefront`
+    // selects the streaming backend over the default megakernel (same physics/energy).
     if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
         char camMode = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
-        return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode, seedBase);
+        return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode, seedBase, wavefront);
     }
 #else
-    (void)useGpu;
+    (void)useGpu; (void)wavefront;
 #endif
     std::vector<Film> films(nThreads);
     std::vector<EnergyReport> reports(nThreads);
@@ -1071,13 +1081,14 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int res,
 // silhouette pixels are assigned wholesale to one side (a sub-pixel edge approx).
 static Film renderComposite(const Scene& scene, const Camera& cam, int res,
                             long long N, long long spp, int nThreads, bool diffraction = true,
-                            bool useGpu = false) {
+                            bool useGpu = false, bool wavefront = false) {
     EnergyReport e;
     // Only the forward (model-B) layer can run on the GPU; the camera-side backward
     // layer (renderBackward, below) is CPU-only. useGpu therefore accelerates just the
     // forward half of the composite.
     Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                             /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e, diffraction, useGpu);
+                             /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e,
+                             diffraction, useGpu, /*seedBase*/0, wavefront);
     Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
 
@@ -1290,7 +1301,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double timeBudgetSec = 0.0, bool resume = false,
                      bool wantCheckpointFlag = false, bool runForever = false,
                      bool preview = false, double intervalSec = 15.0,
-                     double noiseTarget = 0.0) {
+                     double noiseTarget = 0.0, bool wavefront = false) {
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -1392,6 +1403,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #endif
     }
 
+    // The wavefront (streaming) backend only applies to a forward render on the GPU.
+    if (wavefront) {
+        if (useGpu && gpuForwardMode)
+            std::printf("[device] GPU backend: wavefront (streaming, path regeneration)\n");
+        else
+            std::fprintf(stderr, "[device] -wavefront ignored: it only applies to a forward "
+                                 "GPU render (megakernel/CPU otherwise)\n");
+    }
+
     // --- Backward reference (mode R) and validation (mode V) ---
     if (refMode) {
         std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
@@ -1402,7 +1422,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
         Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                                 /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e, diffraction, useGpu);
+                                 /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e,
+                                 diffraction, useGpu, /*seedBase*/0, wavefront);
         addEnvBackground(fwd, scene, cam, N);   // directly-viewed sky (env scenes)
         double tot = e.absorbed + e.sensor + e.escaped + e.residual;
         std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
@@ -1470,7 +1491,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, res, nThreads, lightLabel);
-        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction, useGpu);
+        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction, useGpu, wavefront);
         writeFilm(outPath.c_str(), comp, 1.0, manualExposure);
         return 0;
     }
@@ -1514,7 +1535,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     auto runBatch = [&](long long batchN) {
         EnergyReport e;
         Film b = renderForward(scene, &cam, res, batchN, nThreads, forwardCatch,
-                               lensMode, useCamera, e, diffraction, useGpu, (uint64_t)acc.N);
+                               lensMode, useCamera, e, diffraction, useGpu, (uint64_t)acc.N, wavefront);
         acc.film.merge(b);
         acc.N += batchN;
         acc.energy.emitted  += e.emitted;  acc.energy.absorbed += e.absorbed;
@@ -1662,6 +1683,7 @@ int main(int argc, char** argv) {
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
+    bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
     double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (forward A/B/C)
@@ -1733,6 +1755,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
+        else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
@@ -1874,7 +1897,7 @@ int main(int argc, char** argv) {
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
-                           preview, intervalSec, noiseTarget);
+                           preview, intervalSec, noiseTarget, wavefront);
         if (rv != 0) return rv;
     }
     return 0;
