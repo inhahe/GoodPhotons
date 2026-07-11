@@ -185,6 +185,7 @@ struct DMaterial {
     int    mixCount;
     int    mixChild[D_MIXMAX];
     double mixWeight[D_MIXMAX];
+    int    mixWeightTex;   // >=0: per-hit blend mask (2-child mix); -1: constant weights
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId; };
@@ -1192,6 +1193,20 @@ __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, c
     return (Real)m.filmThickness;
 }
 
+// Device twin of scene.h mixResolveChild: resolve a D_MIX to a child index, honouring
+// an optional per-hit blend mask (2-child mix: map value t = prob of child 0). Returns
+// -1 for the leftover absorption slice (constant-weight path only). u is one uniform.
+__device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, const DHit& h, Real u) {
+    if (m.mixWeightTex >= 0 && m.mixCount == 2) {
+        Real t = (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        return (u < t) ? m.mixChild[0] : m.mixChild[1];
+    }
+    Real acc = 0;
+    for (int k = 0; k < m.mixCount; ++k) { acc += (Real)m.mixWeight[k]; if (u < acc) return m.mixChild[k]; }
+    return -1;
+}
+
 // Diffuse reflectance at a hit: texture-sampled when the material binds one, else
 // the constant baked reflect spectrum (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
@@ -1404,11 +1419,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     const DMaterial* mptr = &sc.mats[h.matId];
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (mptr->type == D_MIX) {
-        Real u = rng.uniform(), acc = 0; int child = -1;
-        for (int k = 0; k < mptr->mixCount; ++k) {
-            acc += (Real)mptr->mixWeight[k];
-            if (u < acc) { child = mptr->mixChild[k]; break; }
-        }
+        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
         if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
         mptr = &sc.mats[child];
     }
@@ -1991,8 +2002,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (mp->type == D_MIX) {                       // resolve stochastic mix
-            Real u = rng.uniform(), acc = 0; int child = -1;
-            for (int k = 0; k < mp->mixCount; ++k) { acc += (Real)mp->mixWeight[k]; if (u < acc) { child = mp->mixChild[k]; break; } }
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
             if (child < 0) return L;                    // absorbed
             mp = &sc.mats[child]; matId = child;
         }
@@ -2634,6 +2644,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         d.mixCount = (int)m.mixChildren.size();
         if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;
         for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
+        d.mixWeightTex = m.mixWeightTex;
     }
 
     // --- upload geometry/materials ---
@@ -2944,6 +2955,8 @@ bool cudaBdptSupported(const Scene& scene) {
         // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
         // which would bias MIS. Fall back to CPU BDPT (which threads the Hit through).
         if (m.roughnessTex >= 0 || m.filmThicknessTex >= 0) return true;
+        // Mix blend mask: the GPU BDPT mix-pick uses constant weights; use CPU BDPT.
+        if (m.mixWeightTex >= 0) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&

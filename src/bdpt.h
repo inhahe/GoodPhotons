@@ -286,7 +286,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
         if (mp->type == MatType::Mix) {
-            int c = mixPickChild(*mp, rng.uniform());
+            int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;                       // absorbed
             mp = &scene.mats[c];
         }

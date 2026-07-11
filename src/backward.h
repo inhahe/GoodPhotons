@@ -304,7 +304,7 @@ struct BackwardRenderer {
             // leftover absorption slice) before the switch, mirroring the forward
             // tracer so the two agree on the blended surface by construction.
             if (mp->type == MatType::Mix) {
-                int child = mixPickChild(*mp, rng.uniform());
+                int child = mixResolveChild(scene, *mp, h, rng.uniform());
                 if (child < 0) return L;   // absorbed
                 mp = &scene.mats[child];
             }

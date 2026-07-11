@@ -565,7 +565,7 @@ struct Renderer {
             // exactly as if it were the surface material. Weights are constants,
             // so this is an unbiased per-photon lobe selection with beta unchanged.
             if (matp->type == MatType::Mix) {
-                int child = mixPickChild(*matp, rng.uniform());
+                int child = mixResolveChild(scene, *matp, h, rng.uniform());
                 if (child < 0) { e.absorbed += beta; return; }
                 matp = &scene.mats[child];
             }

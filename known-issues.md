@@ -304,8 +304,16 @@ as practical; this file is the fallback for what can't be addressed immediately.
      sampled and evaluated roughness match; the GPU BDPT does not, so `cudaBdptSupported`
      rejects roughness/thickness-map scenes → CPU BDPT fallback. Validated by
      `scenes/scalarmap.ftsl`: CPU vs GPU forward exposure 7.3e-13 vs 7.29e-13, mean
-     agrees to <0.1%, signed diff ~0.04% (unbiased). **Still deferred:** maps on `mix`
-     weight and `ior`.
+     agrees to <0.1%, signed diff ~0.04% (unbiased). **Also DONE 2026-07-11 (mix
+     blend-mask):** a 2-child `mix` takes `weight_map texture:<name>` — the map value t
+     at the hit is the probability of child 0 (child 1 = 1-t, no absorption), a spatial
+     A/B blend. `Material::mixWeightTex` + `mixResolveChild` (scene.h), threaded through
+     all three CPU tracers and the GPU forward path (`dMixResolveChild`). Mix selection
+     is a stochastic RR pick that doesn't enter the BSDF pdf, so it's unbiased in every
+     tracer; the GPU BDPT mix-pick still uses constant weights, so masked mixes take the
+     CPU-BDPT fallback (`cudaBdptSupported`). Validated by `scenes/maskblend.ftsl`.
+     **Still deferred:** a map on `ior` (spatially-varying refractive index — rare, and
+     better served by measured dispersion data than a grayscale map; low priority).
   3. ~~**GPU.** Textured scenes force the CPU tracer.~~ **DONE 2026-07-11:** the
      forward CUDA path now ports textured diffuse reflectance. `buildUpload()` uploads
      each texture's per-texel Jakob-Hanika coeff table (`DTexture`, flattened `3*w*h`)
@@ -331,9 +339,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
   2026-07-10; GPU port done 2026-07-11; **analytic UV projections (planar/spherical/
   cylindrical) + triplanar box projection done 2026-07-11 (CPU + GPU)**; **non-albedo
-  roughness + film-thickness maps done 2026-07-11 (CPU all tracers + GPU forward; GPU
-  BDPT falls back to CPU)**; `mix`/`ior` maps + indexed palettes (items 2 partial/4)
-  deferred.
+  roughness + film-thickness maps + mix blend-mask done 2026-07-11 (CPU all tracers +
+  GPU forward; GPU BDPT falls back to CPU)**; **indexed-spectral palettes done 2026-07-11
+  (CPU)**. Only an `ior` map (item 2) remains deferred (rare; low priority).
 
 ### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
 - **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`

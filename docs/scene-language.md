@@ -1298,14 +1298,31 @@ material "wing" { type thinfilm ior 1.5 film_ior 1.30
                   film_thickness 400   film_thickness_map texture:thick_map }
 ```
 
+A **mix blend-mask** works the same way — a 2-child `mix` takes `weight_map
+texture:<name>`, and the map value `t` at the hit is the probability of child 0 (child
+1 gets `1-t`, no absorption), so material A shows where the mask is bright and B where
+it is dark (wear masks, decals, patterns):
+
+```
+material "wear" {
+    type mix
+    layer "paint" 0.5
+    layer "rust"  0.5
+    weight_map texture:wear_mask
+}
+```
+
 The scalar sample is the **mean of the linear RGB** (`Texture::scalarAt`, mirrored on
 the GPU by `dTexScalarAt`), so grayscale (`encoding linear`) maps are exact and colour
 maps degrade to a luminance-ish mean. Bilerp-of-means equals mean-of-bilerp, so the
-CPU and GPU forward paths agree by construction (`scenes/scalarmap.ftsl`). Because the
-BSDF is sampled per-hit from the map, MIS pdf/eval must see the **same** value: the CPU
-BDPT threads the hit UV through `bsdfPdf`/`bsdfF`; the GPU BDPT does not, so scenes with
-these maps fall back to the CPU BDPT (mode D). **Still [needs engine work]:** binding
-maps to `mix` weight and `ior`, and indexed/spectral palette textures.
+CPU and GPU forward paths agree by construction (`scenes/scalarmap.ftsl`,
+`scenes/maskblend.ftsl`). Because roughness/thickness are sampled per-hit and enter the
+BSDF, MIS pdf/eval must see the **same** value: the CPU BDPT threads the hit UV through
+`bsdfPdf`/`bsdfF`; the GPU BDPT does not, so scenes with those maps fall back to the CPU
+BDPT (mode D). (A mix weight is a stochastic RR-style selection that does *not* enter
+the BSDF pdf, so a blend-mask is unbiased in every tracer — but the GPU BDPT mix-pick
+still uses constant weights, so masked mixes also take the CPU-BDPT fallback.) **Still
+[needs engine work]:** binding a map to `ior`.
 
 **Build order for this section:** (1) stb_image + `texture` block + `use_mesh`
 UVs — makes ordinary albedo maps work; (2) the reflectance upsampler (shared

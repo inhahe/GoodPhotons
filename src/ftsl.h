@@ -815,6 +815,15 @@ private:
         }
         if (m.mixChildren.empty()) { fail("mix material has no 'layer' entries"); return false; }
         if (sum > 1.0 + 1e-9) { fail("mix layer weights sum to " + std::to_string(sum) + " (> 1)"); return false; }
+        // Optional per-hit blend mask (§9.4): `weight_map texture:<name>` drives the
+        // selection weight of child 0 (child 1 = 1 - map). Only meaningful for a 2-child
+        // mix — reject otherwise so the semantics stay unambiguous.
+        if (find(b, "weight_map")) {
+            if (m.mixChildren.size() != 2) {
+                fail("mix weight_map requires exactly 2 layers (a binary A/B blend)"); return false;
+            }
+            bindScalarTexture(b, "weight_map", m.mixWeightTex);
+        }
         return true;
     }
 

@@ -1,0 +1,52 @@
+# Mix blend-mask (spec §9.4): a 2-child `mix` whose per-hit selection weight is driven
+# by a grayscale texture, so material A shows where the mask is bright and material B
+# where it is dark — a spatial A/B blend (wear masks, decals, painted patterns).
+#
+# The back wall is `warm` (child 0) vs `cool` (child 1) selected by checker.ppm: the
+# scalar map value t is the probability of the warm child. Both children are diffuse,
+# so this renders on both backends and doubles as a CPU-vs-GPU forward parity check:
+#   ftrace -in scenes/maskblend.ftsl -device cpu -n 20000000 -o png/maskblend_cpu.png
+#   ftrace -in scenes/maskblend.ftsl -device gpu -n 20000000 -o png/maskblend_gpu.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+texture "mask" {
+    file     scenes/checker.ppm
+    encoding linear
+    filter   bilinear
+    wrap     repeat
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "warm"  { type diffuse reflect rgb 0.85 0.55 0.30 }
+material "cool"  { type diffuse reflect rgb 0.30 0.45 0.85 }
+
+# Binary blend: warm where mask is bright, cool where dark. No leftover absorption.
+material "blend" {
+    type mix
+    layer "warm" 0.5
+    layer "cool" 0.5
+    weight_map texture:mask
+}
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material blend }   # back (masked blend)
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

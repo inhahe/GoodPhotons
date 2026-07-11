@@ -118,6 +118,11 @@ struct Material {
     // single-step and the CDF bounded).
     std::vector<int>    mixChildren;               // indices into Scene::mats
     std::vector<double> mixWeights;                // selection probs, sum <= 1
+    // Optional per-hit blend mask (spec §9.4): a grayscale texture that drives the
+    // selection weight of a 2-child mix. When set (and exactly 2 children), the map
+    // value t at the hit is the probability of child 0 (child 1 gets 1-t, no leftover
+    // absorption). -1 => use the constant mixWeights above. Resolved via scalarAt.
+    int mixWeightTex = -1;
 };
 
 // Resolve a Mix material to one of its child material indices using a single
@@ -701,4 +706,20 @@ inline double materialFilmThickness(const Scene& scene, const Material& m, const
     if (m.filmThicknessTex >= 0 && m.filmThicknessTex < (int)scene.textures.size())
         return scene.textures[m.filmThicknessTex].scalarAt(h.u, h.v) * m.filmThickness;
     return m.filmThickness;
+}
+
+// Resolve a stochastic Mix to a child index, honouring an optional per-hit blend
+// mask. With a bound mixWeightTex (2 children), the map value t at the hit is the
+// probability of child 0 (child 1 = 1-t, no absorption) — a spatial A/B blend mask.
+// Otherwise this is the constant-weight CDF pick (mixPickChild), with the leftover
+// (1 - sum) slice absorbed. Mix weight is a stochastic (RR-style) selection that does
+// not enter the BSDF pdf, so a per-hit weight stays unbiased in every tracer.
+inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, double u) {
+    if (m.mixWeightTex >= 0 && m.mixWeightTex < (int)scene.textures.size() &&
+        m.mixChildren.size() == 2) {
+        double t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
+        if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+        return (u < t) ? m.mixChildren[0] : m.mixChildren[1];
+    }
+    return mixPickChild(m, u);
 }

@@ -261,7 +261,7 @@ Declared with `material "name" { type <type> … }`.
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence | `reflect`, `absorb`, `emit`, `yield` |
-| `mix` | Stochastic blend of materials | repeated `layer <material> <weight>` |
+| `mix` | Stochastic blend of materials | repeated `layer <material> <weight>`; optional `weight_map texture:<name>` (2-child spatial blend mask) |
 
 **Whole-material presets** (`preset <name>`) fill a complete `Material` from a name:
 
@@ -359,8 +359,9 @@ map** on `thinfilm` (`film_thickness_map texture:<name>`, a 0..1 profile × the
 nominal `film_thickness`). All of these run on both the CPU and GPU forward paths.
 A texture can also be an **indexed-spectral palette** — `palette { 0 spectrum:navy
 1 spectrum:crimson … }` maps red-channel indices (0..255) to named reflectance
-spectra, looked up nearest (CPU only; GPU falls back). Scalar maps on `mix`/`ior`
-remain future work.
+spectra, looked up nearest (CPU only; GPU falls back). A 2-child `mix` can take a
+**blend mask** (`weight_map texture:<name>`) that selects child 0 vs child 1 per hit.
+A scalar map on `ior` remains future work.
 
 ## Participating media / fog
 
