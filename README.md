@@ -244,7 +244,7 @@ Declared with `material "name" { type <type> … }`.
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
 | `dielectric` | Refractive glass with dispersion | `ior` (Sellmeier glass or constant) |
 | `mirror` | Perfect specular reflector | `reflect` |
-| `halfmirror` | 50/50 beamsplitter | `reflect` |
+| `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` |
 | `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `substrate_k` |
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
@@ -252,9 +252,17 @@ Declared with `material "name" { type <type> … }`.
 | `fluorescent` | Stokes-shifted fluorescence | `reflect`, `absorb`, `emit`, `yield` |
 | `mix` | Stochastic blend of materials | repeated `layer <material> <weight>` |
 
-**Whole-material presets** (`preset <name>`): metals (gold/Au, silver/Ag,
-copper/Cu, aluminium/Al, chromium/Cr, brass), glasses, and iridescent recipes
-(soap-bubble, oil-slick, anodised-Ti, morpho, beetle, nacre).
+**Whole-material presets** (`preset <name>`) fill a complete `Material` from a name:
+
+- **Metals** (polished glossy lobe, override with `roughness`): `gold`/`Au`,
+  `silver`/`Ag`, `copper`/`Cu`, `aluminium`/`aluminum`/`Al`,
+  `chromium`/`chrome`/`Cr`, `brass`.
+- **Glasses** (dispersive `dielectric`): `glass` (=BK7), plus every `glass:<name>`
+  below (`BK7`/`crown`, `SF10`/`flint`, `silica`, `sapphire`, `diamond`, `water`,
+  `ice`, `acrylic`, `polycarbonate`).
+- **Iridescent / structural colour** (thin-film or multilayer stacks): `soap-bubble`,
+  `oil-slick`, `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
+  `nacre`/`mother-of-pearl`.
 
 ---
 
@@ -262,10 +270,16 @@ copper/Cu, aluminium/Al, chromium/Cr, brass), glasses, and iridescent recipes
 
 Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 
-- **`preset:<name>`** — illuminants and light sources: `bb<K>` blackbody (e.g.
-  `bb6500`), `sun`, `d65`/`daylight`, `a`/`incandescent`, `led`, `led-warm`,
-  `led<K>k`, CIE F-series fluorescents (`f2`/`cool-white`, `f7`, `f11`), and
-  gas-discharge lamps (`hps`/`sodium`, `mercury`, `metal-halide`).
+- **`preset:<name>`** — illuminants and light sources:
+  - **Blackbody / daylight:** `bb<K>` Planckian (e.g. `bb6500`), `sun`,
+    `d65`/`daylight`, `a`/`incandescent`.
+  - **LED:** `led` (neutral), `led-warm`, and `led<K>k` phosphor LED at a colour
+    temperature (e.g. `led4000k`).
+  - **Fluorescent:** `fluorescent`/`cfl` (generic compact-fluorescent model) plus the
+    measured CIE F-series `f2`/`cool-white`, `f7`/`daylight-fl`, `f11`/`triphosphor`.
+  - **Gas-discharge lamps:** `hps`/`sodium` (high-pressure sodium),
+    `lps`/`sodium-low` (low-pressure sodium), `mercury`/`hg` (mercury vapor),
+    `metal-halide`/`mh`.
 - **`rgb r g b`** — Jakob–Hanika sigmoid upsampling to a reflectance spectrum
   (round-trips under D65).
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
@@ -273,9 +287,11 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 - **`glass:<name>`** — dispersive index via Sellmeier: `BK7`/crown, `SF10`/flint,
   `silica`/fused-silica, `sapphire`, `diamond`, plus Cauchy fits for `water`,
   `ice`, `acrylic`/PMMA, `polycarbonate`.
-- **`metal:<name>`** and **`reflectance:<name>`** — measured metal reflectance
-  (Au/Ag/Cu/Al/Cr) and natural-material reflectances (leaf, skin, snow, soil,
-  brick, concrete).
+- **`metal:<name>`** — measured metal reflectance: `Au`/`gold`, `Ag`/`silver`,
+  `Cu`/`copper`, `Al`/`aluminium`, `Cr`/`chromium`, `brass`.
+- **`reflectance:<name>`** — measured natural-material diffuse reflectances:
+  `leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`, `soil`/`dirt`,
+  `brick`/`red-brick`, `concrete`.
 - **`spectrum "name" { … }`** blocks to define and reuse a named SPD.
 
 ---
