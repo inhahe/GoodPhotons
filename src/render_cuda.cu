@@ -2524,6 +2524,11 @@ bool cudaForwardSupported(const Scene& scene) {
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
+        // The physical layered stack (coat interface over a weighted body) is CPU-only;
+        // the device shadeStep has no Layered branch, so any Layered material forces a
+        // CPU forward/backward fallback (like indexed palettes).
+        if (matId >= 0 && matId < (int)scene.mats.size() &&
+            scene.mats[matId].type == MatType::Layered) return true;
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];

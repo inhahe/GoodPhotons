@@ -1521,10 +1521,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
             if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
-                                              "feature (fluorescent, textured, or "
-                                              "oversized-mix material); using CPU\n");
+                                              "feature (fluorescent, textured, layered, "
+                                              "or oversized-mix material); using CPU\n");
             else         std::printf("[device] auto -> CPU (GPU-unsupported feature: "
-                                     "fluorescent, textured, or oversized-mix "
+                                     "fluorescent, textured, layered, or oversized-mix "
                                      "material)\n");
         } else {
             useGpu = true;
@@ -1612,6 +1612,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             for (size_t i = 0; i < scene.mats.size(); ++i)
                 if (matUsed[i] && scene.mats[i].type == MatType::Fluorescent) {
                     unsupported = "fluorescent materials"; break;
+                }
+        // The physical layered stack (coat interface over a weighted body) has no BDPT
+        // vertex strategy yet — its randomWalk case would `default: terminate` and drop
+        // the surface silently, so refuse rather than render it black.
+        if (!unsupported)
+            for (size_t i = 0; i < scene.mats.size(); ++i)
+                if (matUsed[i] && scene.mats[i].type == MatType::Layered) {
+                    unsupported = "layered materials"; break;
                 }
         for (const auto& em : scene.emitters)
             if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated) {

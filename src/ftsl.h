@@ -445,11 +445,14 @@ public:
             matIndex_[b.name] = id;
         }
 
-        // Pass 2b: resolve Mix child references (now that every name is known).
+        // Pass 2b: resolve Mix / Layered body child references (now that every name
+        // is known). A Layered material's `layer "name" weight` list is its body,
+        // resolved by the same second pass as a mix.
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
             int id = matIndex_[b.name];
-            if (L.scene.mats[id].type != MatType::Mix) continue;
+            MatType t = L.scene.mats[id].type;
+            if (t != MatType::Mix && t != MatType::Layered) continue;
             if (!resolveMixChildren(b, L.scene.mats[id], L)) return false;
         }
 
@@ -786,6 +789,35 @@ private:
             // indices in a second pass (they may be declared later in the file);
             // here we only mark the type — resolveMixChildren() fills the lists.
             m.type = MatType::Mix;
+        } else if (type == "layered") {
+            // Physical two-layer stack (§3.2): a specular coat interface over a
+            // weighted body. On a hit a photon reflects off the coat with prob R
+            // (Fresnel / thin-film Airy / manual constant), else it enters and one
+            // body lobe is chosen (the `layer "name" weight` list, resolved in the
+            // second pass exactly like a mix). Coat R + body weights partition the
+            // photon so the surface stays energy-consistent.
+            m.type = MatType::Layered;
+            m.ior = spectrumParam(b, "ior", iorConstant(1.5));   // body/effective index
+            const Stmt* cs = find(b, "coat");
+            if (!cs || !cs->val.block) { fail("layered material needs a coat { } block"); return m; }
+            const Block& cb = *cs->val.block;
+            // Coat reflectance model: fresnel (default) | thinfilm | manual.
+            std::string cmodel = strOf(cb, "reflectance", "fresnel");
+            if      (cmodel == "fresnel")  m.coatModel = 0;
+            else if (cmodel == "thinfilm") m.coatModel = 1;
+            else if (cmodel == "manual")   m.coatModel = 2;
+            else { fail("layered coat reflectance must be fresnel|thinfilm|manual"); return m; }
+            // Coat interface roughness (glossy lobe on the reflected ray); grayscale
+            // roughness_map allowed just like a glossy material.
+            if (bindScalarTexture(cb, "roughness", m.roughnessTex)) m.roughness = 0.05;
+            else m.roughness = dblOf(cb, "roughness", 0.05);
+            // Fresnel/thinfilm read the coat index from `ior` (coat over body index
+            // m.ior); manual uses a flat specular fraction.
+            if (find(cb, "ior")) m.ior = spectrumParam(cb, "ior", m.ior);
+            m.filmIor = dblOf(cb, "film_ior", 1.30);
+            m.filmThickness = dblOf(cb, "film_thickness", 300.0);
+            bindScalarTexture(cb, "film_thickness_map", m.filmThicknessTex);
+            if (m.coatModel == 2) m.coatSpecular = dblOf(cb, "specular", 0.05);
         } else {
             fail("unknown material type '" + type + "'");
         }
@@ -805,8 +837,9 @@ private:
             double w = num(s.val.words[1]);
             auto it = matIndex_.find(cname);
             if (it == matIndex_.end()) { fail("mix layer references unknown material '" + cname + "'"); return false; }
-            if (L.scene.mats[it->second].type == MatType::Mix) {
-                fail("mix layer '" + cname + "' is itself a mix (nesting is not allowed)"); return false;
+            if (L.scene.mats[it->second].type == MatType::Mix ||
+                L.scene.mats[it->second].type == MatType::Layered) {
+                fail("layer '" + cname + "' is itself a mix/layered (nesting is not allowed)"); return false;
             }
             if (w < 0.0) { fail("mix layer weight must be >= 0"); return false; }
             m.mixChildren.push_back(it->second);

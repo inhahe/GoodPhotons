@@ -10,7 +10,7 @@
 #include "texture.h"
 #include "envmap.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -118,6 +118,18 @@ struct Material {
     // single-step and the CDF bounded).
     std::vector<int>    mixChildren;               // indices into Scene::mats
     std::vector<double> mixWeights;                // selection probs, sum <= 1
+
+    // --- Layered (MatType::Layered): a specular coat over a weighted body -------
+    // Physical two-layer stack (spec §3.2). The COAT is a reflect-or-enter interface
+    // that reuses roughness/roughnessTex for its glossiness (0 = mirror), ior for its
+    // index, and filmIor/filmThickness[Tex] for a thin-film (Airy) coat. coatModel
+    // picks the interface reflectance: 0 = Fresnel (from ior), 1 = thin-film Airy
+    // (iridescent), 2 = manual constant coatSpecular. On entry the BODY selects one
+    // lobe from mixChildren/mixWeights (the same unbiased selector as `mix`; leftover
+    // 1-Sum absorbs), which then behaves exactly as that child material. The coat R and
+    // the body weights partition each incident photon — energy-consistent by design.
+    int    coatModel    = 0;      // 0 fresnel, 1 thinfilm, 2 manual(coatSpecular)
+    double coatSpecular = -1.0;   // manual constant reflectance (used iff coatModel==2)
     // Optional per-hit blend mask (spec §9.4): a grayscale texture that drives the
     // selection weight of a 2-child mix. When set (and exactly 2 children), the map
     // value t at the hit is the probability of child 0 (child 1 gets 1-t, no leftover

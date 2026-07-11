@@ -308,6 +308,24 @@ struct BackwardRenderer {
                 if (child < 0) return L;   // absorbed
                 mp = &scene.mats[child];
             }
+            // Physical layered stack: reflect off the coat interface with prob R
+            // (a glossy lobe about the mirror direction), else enter and pick one
+            // body lobe. Mirrors the forward tracer so both split the photon budget
+            // identically; the coat reflection is lossless (throughput unchanged).
+            if (mp->type == MatType::Layered) {
+                const Material& cm = *mp;
+                double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
+                if (rng.uniform() < R) {
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    if (dot(o, h.n) <= 0) return L;
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    specularArrival = true;
+                    continue;
+                }
+                int child = mixPickChild(cm, rng.uniform());   // body lobe
+                if (child < 0) return L;                        // leftover absorbs
+                mp = &scene.mats[child];
+            }
             const Material& m = *mp;
 
             // Emission (add only on specular/camera arrival; NEE covers diffuse).

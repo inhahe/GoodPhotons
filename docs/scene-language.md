@@ -311,10 +311,10 @@ spectra — override `film_thickness` (thinfilm) to shift the colour.
 
 ### 3.2 Combining effects on one surface — the `layered` material
 
-**Can a single material be semi-mirror + glossy + transparent + translucent +
-iridescent + fluorescent at once? Yes — but only under the right model, and it
-is [needs engine work] (today a surface is exactly one `MatType`).** The
-important correction is that these are **not** independent, additively-stacked
+**Can a single material be semi-mirror + glossy + iridescent + (body color /
+fluorescence) at once? Yes — via the `layered` material (implemented on the CPU;
+`transmit`/`subsurface` body lobes are the only part still [needs engine work]).**
+The important correction is that these are **not** independent, additively-stacked
 flags. Physically a surface is a **two-layer stack — one specular *interface* on
 top of a *body*** — and most of the "effects" are different knobs on the *same*
 lobe:
@@ -360,33 +360,44 @@ interface reflection vs. entering the body by probability, then pick the body
 lobe by weight.
 
 ```
-# PROPOSED (not yet supported): one physically-layered material
+# SUPPORTED: one physically-layered material (CPU forward + backward)
+material "wall_body_a" { type diffuse reflect rgb 0.80 0.25 0.20 }
+material "wall_body_b" { type diffuse reflect rgb 0.20 0.55 0.80 }
 material "lacquered_shell" {
     type layered
-    coat {                       # the specular interface
-        roughness     0.15       # 0 = mirror, >0 = glossy
-        reflectance   thinfilm   # fresnel | thinfilm(=iridescent)
-        film_ior      1.4        # (thinfilm only)
-        film_thickness 380       # nm  (thinfilm only)
-        # specular   0.5         # optional manual partial reflectance ⇒ semi-mirror
+    coat {                        # the specular interface
+        reflectance   thinfilm    # fresnel | thinfilm(=iridescent) | manual
+        roughness     0.15        # 0 = mirror, >0 = glossy (roughness_map allowed)
+        ior           1.5         # coat/body effective index (fresnel & thinfilm)
+        film_ior      1.4         # (thinfilm only)
+        film_thickness 380        # nm  (thinfilm only; film_thickness_map allowed)
+        # specular    0.5         # manual model only: flat partial reflectance
     }
-    body {                       # what the transmitted light does; weights sum ≤ 1
-        diffuse      { reflect rgb 0.2 0.5 0.9   weight 0.5 }
-        transmit     { ior glass:BK7  absorb spectrum:amber_tint   weight 0.3 }
-        subsurface   { reflect 0.8   weight 0.1 }         # translucence
-        fluorescent  { absorb spectrum:excite  emit spectrum:emit_green
-                       yield 0.9   weight 0.1 }
-    }
+    # The body is a mix-style weighted list of NAMED materials (weights sum ≤ 1;
+    # remainder absorbs). One lobe is chosen per photon that enters the coat.
+    layer "wall_body_a" 0.55
+    layer "wall_body_b" 0.45
 }
 ```
+
+The coat interface reflects with probability `R` (Fresnel from `ior`, thin-film
+Airy from `film_ior`/`film_thickness`, or a flat `specular`) as a glossy lobe
+about the mirror direction (lossless); otherwise the photon enters and one body
+`layer` is picked exactly like a `mix`. Coat `R` + body weights partition the
+photon, so the surface is energy-consistent by construction, and the same split
+runs in the forward tracer and the backward reference. **Scope:** the body lobes
+are ordinary named materials (`diffuse`, `glossy`, `fluorescent`, …); the spec's
+inline `transmit`/`subsurface` body lobes are **[needs engine work]** (those
+`MatType`s don't exist yet). `layered` is **CPU-only** — GPU forward/backward fall
+back to the CPU tracer and BDPT (mode D) refuses a layered scene (use mode B/P or
+R). As with the standalone `fluorescent` type, a layered material whose body
+includes a `fluorescent` lobe stays forward + backward on the CPU; the backward
+reference still can't fully validate fluorescence (see known-issues).
 
 A `mix` of whole named materials (probabilistic pick among sub-materials) is a
 simpler, less-physical alternative that the same machinery supports; `layered`
 is preferred because the coat/body split is energy-consistent and matches how
-real surfaces work. (Note: the existing backward reference tracer can't validate
-a body with `fluorescent` — see known-issues — so `layered`/`mix` materials that
-include a fluorescent child stay forward-only, same restriction as the standalone
-`fluorescent` type; such scenes also fall back to the CPU forward tracer.)
+real surfaces work.
 
 **`mix` is implemented** (Phase 2d). A photon (or backward path) that hits a mix
 picks child `k` with probability `weight_k`, then behaves *exactly* as that child
@@ -409,8 +420,10 @@ material "blend" {
 }
 ```
 
-The full physical `layered` material (Fresnel/Airy-weighted coat over exotic body
-lobes) is still **[needs engine work]**.
+The physical `layered` material (Fresnel/Airy/manual coat over a weighted body of
+named material lobes) is **implemented** on the CPU (forward + backward,
+`scenes/layered.ftsl`); only the inline `transmit`/`subsurface` body-lobe types
+remain **[needs engine work]**.
 
 ---
 
@@ -1407,7 +1420,7 @@ designed to grow into.
 6. `units` scaling + configurable `spectral` range.
 7. Multiple lights (emitter list + power-weighted selection CDF). **[done — Phase 2b; `scenes/twolight.ftsl`]**
 8. RGB→reflectance upsampler (unlocks `rgb` spectra and later textures). **[done — `src/upsample.h`, Jakob-Hanika sigmoid fit, `-checkupsample`]**
-9. `mix`/layered materials (generalize `halfmirror`). **[`mix` done — Phase 2d; per-photon lobe selection in forward + backward + CUDA; `scenes/mixmat.ftsl`. Full physical `layered` still needs engine work.]**
+9. `mix`/layered materials (generalize `halfmirror`). **[`mix` done — Phase 2d; per-photon lobe selection in forward + backward + CUDA; `scenes/mixmat.ftsl`. Physical `layered` done 2026-07-11 — CPU forward + backward coat/body split; `scenes/layered.ftsl`; only inline `transmit`/`subsurface` body lobes remain.]**
 
 **Phase 3 — larger features**
 10. Multiple cameras / `camera_path`; per-camera films; physical film size +

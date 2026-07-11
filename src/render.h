@@ -185,6 +185,34 @@ inline double thinFilmReflectance(double n0, double n1, double n2, double k2,
     return 0.5 * (Rpol(r01s, r12s) + Rpol(r01p, r12p));
 }
 
+// Interface (coat) reflectance for a MatType::Layered surface at a hit. Returns the
+// unpolarised power reflectance R in [0,1] used as the reflect-vs-enter probability:
+//   coatModel 2 (manual): the constant coatSpecular (angle/wavelength independent).
+//   coatModel 1 (thinfilm): thin-film Airy R with film index filmIor over the body's
+//     effective index m.ior(lambda) — iridescent coat (transparent, so 1-R enters).
+//   coatModel 0 (fresnel): plain dielectric Fresnel from m.ior(lambda) at cosI.
+// Shared by the forward and backward tracers so both split the photon identically.
+inline double layeredCoatReflectance(const Scene& scene, const Material& m, const Hit& h,
+                                     const Vec3& d, double lambda) {
+    if (m.coatModel == 2) return clamp01(m.coatSpecular);
+    bool entering = dot(d, h.ng) < 0.0;
+    Vec3 nl = entering ? h.ng : -h.ng;
+    double cosI = clamp01(-dot(d, nl));
+    if (m.coatModel == 1) {                          // thin-film Airy coat
+        double thickness = materialFilmThickness(scene, m, h);
+        double ns = m.ior(lambda);                   // effective index below the film
+        return clamp01(thinFilmReflectance(1.0, m.filmIor, ns, 0.0, thickness, cosI, lambda));
+    }
+    double n1 = 1.0, n2 = m.ior(lambda);             // Fresnel dielectric
+    double eta = n1 / n2;
+    double sin2t = eta * eta * (1.0 - cosI * cosI);
+    if (sin2t >= 1.0) return 1.0;                     // TIR (only from inside)
+    double cosT = std::sqrt(1.0 - sin2t);
+    double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+    double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+    return clamp01(0.5 * (rs * rs + rp * rp));
+}
+
 // --- Multilayer stack reflectance (Abeles characteristic-matrix method) ------
 // Power reflectance of an ordered stack of `nLayers` thin films (per-layer real
 // index nL[j], extinction kL[j], thickness dL[j] in nm) between incident medium n0
@@ -560,6 +588,24 @@ struct Renderer {
             }
 
             const Material* matp = &scene.mats[h.matId];
+            // Layered (coat over body): split the photon at the interface BEFORE the
+            // switch. With prob R (Fresnel/Airy/manual) the coat reflects it as a
+            // specular/glossy lobe (lossless, continue); otherwise it enters the body,
+            // which picks one lobe among its children (leftover absorbs) and drives the
+            // vertex exactly as that child. Energy-consistent per-photon lobe selection.
+            if (matp->type == MatType::Layered) {
+                const Material& cm = *matp;
+                double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
+                if (rng.uniform() < R) {                    // coat reflection
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    continue;                               // lossless; beta unchanged
+                }
+                int child = mixPickChild(cm, rng.uniform());  // body lobe (leftover absorbs)
+                if (child < 0) { e.absorbed += beta; return; }
+                matp = &scene.mats[child];
+            }
             // Stochastic mix: pick a child material (or absorb on the leftover
             // slice) BEFORE the switch, so the chosen child drives the vertex
             // exactly as if it were the surface material. Weights are constants,

@@ -626,30 +626,38 @@ as practical; this file is the fallback for what can't be addressed immediately.
   measured data; skin/soil and iridescent recipes remain representative. All presets
   load on CPU==GPU and render the right colours.
 
-### Full physical `layered` material not yet implemented (`mix` is)
-- **What:** the FTSL `type mix` material (stochastic per-photon pick among named
-  child materials, weights ≤ 1, remainder absorbs) is implemented and validated
-  (Phase 2d — `scenes/mixmat.ftsl`, mode V PASS, CPU==GPU). The richer physical
-  `layered` material from the spec (§3.2) — a Fresnel/Airy-weighted specular *coat*
-  over a weighted *body* of diffuse/transmit/subsurface/fluorescent lobes with
-  energy-consistent coat↔body coupling — is **not** built yet.
-- **Why acceptable:** `mix` covers the "blend two finished materials" use case with
-  the same unbiased lobe-selection machinery; `layered` adds physically-correct
-  interface/substrate coupling (the transmitted fraction enters the body, internal
-  reflection, etc.) which is a larger transport change. The spec documents it as the
-  preferred long-term form.
-- **Constraints of `mix` (by design):** children must be non-mix materials (nesting
-  rejected by the parser to keep resolution single-step and the CUDA CDF bounded);
-  the CUDA path supports ≤ 8 child lobes (more → CPU fallback); a mix containing a
-  fluorescent child is forward-only (mode D/BDPT still refuses fluorescence), but as
-  of 2026-07-11 it runs on the GPU forward path — the device fluoro port resolves the
-  mix child before dispatch and the `D_FLUORESCENT` `shadeStep` branch handles it (see
-  the GPU-fluorescence note below); the same is true of a textured child.
-- **Proper fix (future):** implement `layered` as a coat interface (reuse
-  thinfilm/Fresnel reflect-or-enter) feeding a body lobe selector, with the body's
-  transmitted radiance re-emerging through the coat. Forward-first; backward support
-  follows the same per-lobe pattern except for fluorescent bodies.
-- **Status:** OPEN (acceptable) — `mix` done 2026-07-10; `layered` deferred.
+### Full physical `layered` material [IMPLEMENTED 2026-07-11]
+- **What:** both the FTSL `type mix` material (stochastic per-photon pick among named
+  child materials, weights ≤ 1, remainder absorbs — Phase 2d, `scenes/mixmat.ftsl`,
+  mode V PASS, CPU==GPU) and the richer physical `layered` material (spec §3.2) now
+  ship. `layered` is a specular *coat* interface over a weighted *body*: on each hit a
+  photon reflects off the coat with probability R, else it enters and one body lobe is
+  chosen from a `mix`-style `layer "name" weight` list (leftover weight absorbs). Coat R
+  + body weights partition the photon, so the surface is energy-consistent (validated:
+  `scenes/layered.ftsl`, forward mode B and backward mode R, `absorbed+escaped=1.0`,
+  residual 0).
+- **Coat models:** `coat { reflectance … }` selects the interface reflectance:
+  `fresnel` (plain dielectric Fresnel from the coat `ior`, rises toward grazing —
+  clearcoat sheen), `thinfilm` (Airy multiple-beam reflectance from `film_ior` /
+  `film_thickness` over the body index — soap-bubble iridescence), or `manual` (a flat
+  `specular` fraction). The coat reflection is a glossy lobe about the mirror direction
+  (`roughness` / `roughness_map`, lossless), and `film_thickness_map` gives spatially
+  varying iridescence just like a `thinfilm` material.
+- **Constraints of `mix`/`layered` (by design):** children/body lobes must be non-mix,
+  non-layered materials (nesting rejected by the parser to keep resolution single-step
+  and the CUDA CDF bounded); the CUDA path supports ≤ 8 child lobes (more → CPU
+  fallback); a mix containing a fluorescent child is forward-only but as of 2026-07-11
+  runs on the GPU forward path (the device fluoro port resolves the mix child before
+  dispatch and the `D_FLUORESCENT` `shadeStep` branch handles it — see the
+  GPU-fluorescence note below); a textured child is likewise fine.
+- **Scope / fallbacks:** `layered` is CPU-only (forward + backward). GPU forward/backward
+  fall back to the CPU tracer (`cudaForwardSupported` rejects any Layered material, like
+  indexed palettes); BDPT (mode D) refuses a Layered scene with a clear message
+  (`render it with mode B/P or mode R`) rather than dropping the surface via the
+  randomWalk `default: terminate`. A per-lobe BDPT vertex strategy for `layered`
+  (mirroring the forward split) is possible future work but not required for the
+  reference/forward validation paths.
+- **Status:** DONE — `mix` 2026-07-10; `layered` 2026-07-11 (CPU forward + backward).
 
 ### Backward reference tracer cannot validate fluorescence
 - **What:** `src/backward.h` has no Fluorescent case — a fluorescent material
