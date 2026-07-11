@@ -986,3 +986,37 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Validation:** `-checkbvh` still reports 0 mismatches on cornell/materials/
   prism/torus; energy conserves exactly (`sum/emitted=1.000000`) on all scenes.
 - **Status:** RESOLVED 2026-07-10. Logged & fixed same day.
+
+## Scene interoperability / importers
+
+- **Mitsuba XML → FTSL: DONE 2026-07-11** (`tools/mitsuba_to_ftsl.py`). Mitsuba
+  0.6/2/3 is also a spectral PBR renderer, so the mapping is nearly 1:1
+  (perspective/thinlens sensor → camera, diffuse/conductor/roughconductor/
+  dielectric/plastic/blendbsdf → materials, area/constant/envmap/point/directional
+  emitters → lights, rectangle/cube/sphere/obj shapes with full `to_world`
+  transforms, `<ref>`/`<default>` resolution). Validated on a converted Cornell
+  scene (glass + gold spheres, colored walls, area light) rendering correctly in
+  modes B and D. **Because Blender exports to Mitsuba XML via `mitsuba-blender`,
+  this is also the Blender→FTSL path.**
+  - **Known approximations (flagged with `# WARN:` in output):** roughdielectric →
+    smooth dielectric (no rough transmission in FTSL); plastic/roughplastic →
+    glossy (diffuse+specular coat merged); bumpmap/normalmap dropped to base BSDF;
+    mask opacity ignored; `.ply`/`.serialized` meshes emitted as `mesh` lines but
+    ftrace's loader is OBJ-only (convert first); mesh area-emitters have no FTSL
+    equivalent (emitted as lit geometry, emission dropped); mesh `to_world` with
+    rotation/shear only partly expressible (translate+scale + euler).
+  - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
+    support (needs an emissive-triangle light primitive in the core); rough
+    transmission material.
+- **POV-Ray: DECLINED (2026-07-11), rationale logged.** The SDL is genuinely nice
+  (programmable, exact CSG, implicit `isosurface`), but a poor fit here: (1) faithful
+  parsing = writing a Turing-complete interpreter (macros/loops/functions), far more
+  than an XML parse, and POV-Ray has no mesh *export* to lean on; (2) we're a
+  triangle/quad/sphere renderer with no analytic CSG or implicit intersection, so
+  importing means **tessellating** everything (marching cubes for isosurfaces/blobs,
+  mesh-booleans for CSG) — which discards POV-Ray's exact-surface advantage, its whole
+  point; (3) RGB/non-spectral/non-physical-camera means re-authoring the physics anyway.
+- **Alternative worth its own feature (deferred):** a **native SDF / implicit-surface
+  primitive** (sphere-traced, GPU-portable) would give metaballs/isosurfaces *exactly*
+  without lossy tessellation — useful independent of any importer, and the right way to
+  ever support POV-Ray-style implicit geometry. Not started.

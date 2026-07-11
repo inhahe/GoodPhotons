@@ -394,6 +394,28 @@ An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `scenes/` directory for worked examples (`cornell.ftsl`, `fisheye.ftsl`,
 `spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`, `realcam.ftsl`, …).
 
+### Importing Mitsuba scenes
+
+`tools/mitsuba_to_ftsl.py` converts a Mitsuba (0.6 / 2 / 3) XML scene to FTSL:
+
+```
+python tools/mitsuba_to_ftsl.py scene.xml scene.ftsl
+ftrace -in scene.ftsl -mode D -o out.png
+```
+
+Mitsuba is also a spectral, physically-based renderer, so most constructs map
+almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera` (`thinlens`
+becomes mode `A` with aperture + focus), `diffuse`/`conductor`/`roughconductor`/
+`dielectric`/`plastic` BSDFs → `diffuse`/`mirror`/`glossy`/`dielectric` materials,
+and `area`/`constant`/`envmap` emitters → FTSL lights. `rectangle`, `cube`,
+`sphere`, and `obj` shapes are supported (with full `to_world` transforms); RGB
+reflectances ride FTSL's Jakob–Hanika upsampling and measured/blackbody spectra
+pass through losslessly. Constructs outside FTSL's scope (rough transmission,
+bump/normal maps, `.ply`/`.serialized` meshes, mesh area-emitters) degrade to a
+documented approximation and are flagged with `# WARN:` comments in the output.
+Since **Blender can export directly to Mitsuba XML** (via the `mitsuba-blender`
+add-on), this doubles as a Blender → FTSL path.
+
 ---
 
 ## Command-line reference
