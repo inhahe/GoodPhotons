@@ -449,6 +449,36 @@ The worked gyroid example is in `scenes/function.ftsl`; expression isosurfaces r
 expression sphere matches the analytic `sphere` leaf to RMSE ≈ 0.15 % on the same
 backend).
 
+##### Ray-march strategy (`method`, `refine`)
+
+Any `isosurface` (analytic *or* `function`) chooses how the ray finds the field's first
+zero crossing:
+
+| Key | Values | Meaning |
+|---|---|---|
+| `method` | `adaptive` (default) / `sample` | how the ray steps toward the surface |
+| `samples` | `<n>` | *sample mode only* — number of fixed steps across the container's diagonal (default 256; or size the step with `accuracy`) |
+| `refine` | `bisect` (default) / `regula_falsi` | how a bracketed sign change is refined to the root |
+
+- **`adaptive`** steps by `max(|f|/max_gradient, accuracy)` — sphere-tracing for a true
+  SDF (`max_gradient = 1`), or a Lipschitz-bounded march for a `function` field. With a
+  correct `max_gradient` it **provably cannot skip** the first crossing (across one step
+  `f` can change by at most the step size, so it can't dip through zero and back), and it
+  slows down only near surfaces. This is the right choice almost always.
+- **`sample`** ignores `|f|` and marches by a **fixed** world step (POV-Ray's sampling
+  mode). It needs **no** Lipschitz bound, so it's the fallback when `max_gradient` can't be
+  trusted (spiky/near-unbounded gradients where the auto-estimate is unreliable) — but a
+  feature thinner than one step *between two samples* can be missed, so raise `samples`
+  until the surface is clean.
+- **`refine`** only changes root-polishing speed, not the result: `bisect` is
+  unconditionally robust (linear); `regula_falsi` (secant with the Illinois safeguard)
+  converges faster on smooth brackets. Both land on the same root to ~1e-12.
+
+Validated: on a clean surface the `sample` and `adaptive` marchers agree to RMSE ≈ 0.4/255
+(CPU) / 0.01/255 (GPU) — same geometry, both backends. `scenes/function.ftsl` uses the
+adaptive default; `method sample` + `samples`/`refine` are shown in the scraps test
+scenes.
+
 ## Textures
 
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap

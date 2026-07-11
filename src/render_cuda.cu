@@ -230,6 +230,9 @@ struct DImplicit {
     int    matId;
     double lo[3], hi[3];     // world AABB (ray clip)
     double lipschitz, minStep;
+    int    method;           // 0 = adaptive (|f|/lipschitz), 1 = fixed-step sample
+    int    refine;           // 0 = bisect, 1 = regula-falsi (Illinois)
+    double sampleStep;       // fixed world march step for method==1
 };
 
 // Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
@@ -909,22 +912,40 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const double invLip = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
     const double minStep = im.minStep > 0.0 ? im.minStep : 1e-4;
 
+    const bool   sampleMode  = (im.method == 1);
+    const double fixedStep   = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
+    const bool   regulaFalsi = (im.refine == 1);
+
     double t = t0;
     double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
     for (int i = 0; i < MAX_STEP; ++i) {
-        double step = fmax(fabs(f) * invLip, minStep) / dlen;
+        double step = sampleMode ? fixedStep : fmax(fabs(f) * invLip, minStep) / dlen;
         double tn = t + step;
         bool last = false;
         if (tn >= t1) { tn = t1; last = true; }
         double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn, exprPool);
         bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) || (f == 0.0 && fn != 0.0);
         if (crossed) {
-            double ta = t, tb = tn, fa = f;
-            for (int b = 0; b < 60; ++b) {
-                double tm = 0.5*(ta + tb);
+            double ta = t, tb = tn, fa = f, fb = fn;
+            int rfSide = 0;
+            for (int b = 0; b < 80; ++b) {
+                double tm;
+                if (regulaFalsi && (fb - fa) != 0.0) {
+                    tm = (ta * fb - tb * fa) / (fb - fa);
+                    if (tm <= ta || tm >= tb) tm = 0.5*(ta + tb);
+                } else {
+                    tm = 0.5*(ta + tb);
+                }
                 double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm, exprPool);
-                if ((fa > 0.0) == (fm > 0.0)) { ta = tm; fa = fm; }
-                else                          { tb = tm; }
+                if ((fa > 0.0) == (fm > 0.0)) {
+                    ta = tm; fa = fm;
+                    if (regulaFalsi && rfSide == +1) fb *= 0.5;
+                    rfSide = +1;
+                } else {
+                    tb = tm; fb = fm;
+                    if (regulaFalsi && rfSide == -1) fa *= 0.5;
+                    rfSide = -1;
+                }
                 if ((tb - ta) * dlen < 1e-12) break;
             }
             double th = 0.5*(ta + tb);
@@ -3046,6 +3067,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         d.lo[0] = im.bounds.lo.x; d.lo[1] = im.bounds.lo.y; d.lo[2] = im.bounds.lo.z;
         d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
         d.lipschitz = im.lipschitz; d.minStep = im.minStep;
+        d.method = (int)im.method; d.refine = (int)im.refine; d.sampleStep = im.sampleStep;
         // Rebase this implicit's expr programs into the shared device pool. Each Implicit
         // owns a private exprNodes vector on the host (FieldNode.exprOff indexes it), so we
         // add the running base and copy the programs into fieldExprNodes.

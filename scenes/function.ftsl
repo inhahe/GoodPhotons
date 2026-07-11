@@ -35,6 +35,10 @@ isosurface {
     }
     contained_by { min 0.3 0.3 0.25   max 0.7 0.7 0.65 }
     # max_gradient omitted -> auto-estimated (grad magnitude ~28*1.7); accuracy default.
+    # Ray-march strategy (optional; defaults shown):
+    #   method adaptive       # or `sample` (fixed-step, no Lipschitz bound needed):
+    #   samples 800           #   with e.g. `samples 800` across the box diagonal
+    #   refine bisect         # or `regula_falsi` (secant/Illinois, faster on smooth roots)
 }
 
 light area {

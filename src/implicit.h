@@ -183,6 +183,23 @@ inline Vec3 fieldGradient(const FieldNode* nodes, int n, const Vec3& p, double e
     return len > 0.0 ? g / len : Vec3{0, 0, 1};
 }
 
+// Ray-march strategy for finding the first zero crossing of the field along a ray.
+//   Adaptive — step by max(|f|/lipschitz, minStep). For a true SDF (lipschitz=1) this
+//     is sphere-tracing; for a Lipschitz-bounded arbitrary field it is a provably
+//     no-overshoot bracketing march (with a correct bound it cannot skip the first
+//     crossing). The default; relies on `lipschitz` being a true global bound.
+//   Sample — step by a FIXED world distance `sampleStep`, ignoring |f|. Doesn't rely
+//     on any Lipschitz bound (good when max_gradient can't be trusted), but a feature
+//     thinner than sampleStep between two samples can be missed. POV-Ray's fixed-step
+//     `evaluate`/sampling mode.
+enum class MarchMethod : int { Adaptive = 0, Sample = 1 };
+
+// Root refinement once a sign change brackets [ta, tb].
+//   Bisect — halve the bracket; unconditionally robust, linear convergence.
+//   RegulaFalsi — linear (secant) interpolation to the zero, with the Illinois
+//     safeguard so the bracket always shrinks; faster on smooth brackets.
+enum class RootRefine : int { Bisect = 0, RegulaFalsi = 1 };
+
 // ---------------------------------------------------------------------------
 // The primitive.
 // ---------------------------------------------------------------------------
@@ -194,11 +211,17 @@ struct Implicit {
     // Lipschitz bound of the field: for a true SDF this is 1, and a sphere-trace
     // step of |f| never overshoots. Fields that aren't unit-Lipschitz (e.g. summed
     // metaball densities) set this > 1 so the step is scaled down to |f|/lipschitz,
-    // trading speed for correctness. Set by the builder.
+    // trading speed for correctness. Set by the builder. (Adaptive method only.)
     double lipschitz = 1.0;
     // Minimum march step (world units): the floor on the sign-change ray march and
     // the thinnest resolvable feature. Sized from the bounds by the builder.
     double minStep = 1e-4;
+    // Ray-march strategy (see MarchMethod / RootRefine above). `sampleStep` is the
+    // fixed world-space march step used by MarchMethod::Sample (sized by the builder
+    // from `samples`/`accuracy`); unused by Adaptive.
+    MarchMethod method = MarchMethod::Adaptive;
+    RootRefine  refine = RootRefine::Bisect;
+    double sampleStep = 0.0;
 
     double eval(const Vec3& pw) const {
         return fieldEval(nodes.data(), (int)nodes.size(), pw, exprNodes.data());
@@ -244,10 +267,17 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     // spawned just off a surface can leave it without self-intersecting. Transmission
     // rays are spawned just INSIDE (f<0) by the tracers and correctly cross to the
     // far side. This is far more robust than proximity (|f|<eps) detection.
+    // Sample method marches by a fixed world step (ignoring |f|); Adaptive marches by
+    // the |f|/lipschitz safe distance with a minStep floor.
+    const bool  sampleMode  = (im.method == MarchMethod::Sample);
+    const double fixedStep  = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
+    const bool  regulaFalsi = (im.refine == RootRefine::RegulaFalsi);
+
     double t = t0;
     double f = fieldEval(nd, N, r.o + r.d * t, pool);
     for (int i = 0; i < MAX_STEP; ++i) {
-        double step = std::fmax(std::fabs(f) * invLip, minStep) / dlen;
+        double step = sampleMode ? fixedStep
+                                 : std::fmax(std::fabs(f) * invLip, minStep) / dlen;
         double tn = t + step;
         // Clamp the last step to the AABB exit and still test for a crossing there:
         // a ray starting inside the surface can have its first |f|-sized step land
@@ -259,14 +289,29 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) ||
                        (f == 0.0 && fn != 0.0);
         if (crossed) {
-            // Bisect the bracket [t, tn] to a precise root (residual ~1e-12), so the
-            // shared 1e-6 ray-spawn offset lands safely on the correct side.
-            double ta = t, tb = tn, fa = f;
-            for (int b = 0; b < 60; ++b) {
-                double tm = 0.5 * (ta + tb);
+            // Refine the bracket [t, tn] to a precise root (residual ~1e-12) so the
+            // shared 1e-6 ray-spawn offset lands safely on the correct side. Bisection
+            // is the robust default; regula-falsi (Illinois-safeguarded) interpolates.
+            double ta = t, tb = tn, fa = f, fb = fn;
+            int side = 0;
+            for (int b = 0; b < 80; ++b) {
+                double tm;
+                if (regulaFalsi && (fb - fa) != 0.0) {
+                    tm = (ta * fb - tb * fa) / (fb - fa);
+                    if (tm <= ta || tm >= tb) tm = 0.5 * (ta + tb);  // guard out-of-bracket
+                } else {
+                    tm = 0.5 * (ta + tb);
+                }
                 double fm = fieldEval(nd, N, r.o + r.d * tm, pool);
-                if ((fa > 0.0) == (fm > 0.0)) { ta = tm; fa = fm; }
-                else                          { tb = tm; }
+                if ((fa > 0.0) == (fm > 0.0)) {
+                    ta = tm; fa = fm;
+                    if (regulaFalsi && side == +1) fb *= 0.5;   // Illinois: shrink stuck side
+                    side = +1;
+                } else {
+                    tb = tm; fb = fm;
+                    if (regulaFalsi && side == -1) fa *= 0.5;
+                    side = -1;
+                }
                 if ((tb - ta) * dlen < 1e-12) break;
             }
             double th = 0.5 * (ta + tb);

@@ -28,6 +28,20 @@ as practical; this file is the fallback for what can't be addressed immediately.
   leaf to **RMSE 0.37/255 (0.15 %) on the same backend** (the ~12.6 CPU↔GPU RMSE is the
   inherent FP32/RNG divergence — the analytic sphere shows the same 12.58). `scenes/
   function.ftsl` (gyroid) renders correctly on both CPU and GPU. Means match ~1 %.
+- **Ray-march strategy selector — DONE 2026-07-11 (follow-up):** any `isosurface` now
+  picks how the ray finds the first zero crossing via `method adaptive|sample`,
+  `samples <n>`, and `refine bisect|regula_falsi`. `implicit.h` gained `MarchMethod` /
+  `RootRefine` enums + `Implicit.sampleStep`; `intersectImplicit` branches the march
+  (fixed `sampleStep/dlen` vs the `|f|/lipschitz` adaptive step) and the refinement
+  (bisection vs Illinois-safeguarded regula-falsi, tracking both bracket endpoints).
+  `ftsl.h` `addIsosurface` parses the three keys (sample step = box diagonal / samples,
+  else `accuracy`, else diag/256). GPU twins in `render_cuda.cu`: `DImplicit.method/
+  refine/sampleStep` + the identical branch in the device `intersectImplicit`. The
+  `adaptive` method (default) provably can't skip the first crossing given a correct
+  `max_gradient`; `sample` needs no Lipschitz bound but can miss features thinner than one
+  step. Validated: on the clean expression sphere `sample` vs `adaptive` agree to RMSE
+  0.41/255 (CPU) / **0.01/255 (GPU)** — identical geometry; regula-falsi and bisection
+  land on the same root. Bad `method`/`refine` values are rejected with a clear error.
 
 ### `-o foo.png` wrote a PPM (P6), not a PNG — extension was ignored [RESOLVED 2026-07-10]
 - **What was wrong:** the image writer (`writePPM` in `src/main.cpp`) always

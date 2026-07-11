@@ -1343,6 +1343,28 @@ private:
             im.bounds = implicitBounds(im.nodes);
             im.minStep = implicitMinStep(im.bounds);
         }
+        // Ray-march strategy (default `adaptive`). `sample` = fixed-step POV-Ray-style
+        // marching, for fields whose Lipschitz bound can't be trusted; the fixed world
+        // step comes from `samples <n>` (n intervals across the box diagonal), else from
+        // `accuracy`, else a 256-sample default.
+        std::string meth = strOf(b, "method", "adaptive");
+        if (meth == "sample" || meth == "fixed") {
+            im.method = MarchMethod::Sample;
+            double diag = length(im.bounds.hi - im.bounds.lo);
+            double ns   = dblOf(b, "samples", 0.0);
+            double acc  = dblOf(b, "accuracy", 0.0);
+            im.sampleStep = (ns > 0.0)  ? diag / ns
+                          : (acc > 0.0) ? acc * L_
+                                        : diag / 256.0;
+        } else if (meth != "adaptive") {
+            fail("isosurface `method` must be `adaptive` or `sample` (got '" + meth + "')");
+            return false;
+        }
+        // Root refinement once a sign change is bracketed (default `bisect`).
+        std::string ref = strOf(b, "refine", "bisect");
+        if (ref == "regula_falsi" || ref == "falsi" || ref == "secant") im.refine = RootRefine::RegulaFalsi;
+        else if (ref == "bisect") im.refine = RootRefine::Bisect;
+        else { fail("isosurface `refine` must be `bisect` or `regula_falsi` (got '" + ref + "')"); return false; }
         L.scene.implicits.push_back(std::move(im));
         return true;
     }
