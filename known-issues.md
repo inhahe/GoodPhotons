@@ -75,6 +75,30 @@ as practical; this file is the fallback for what can't be addressed immediately.
     the auto-exposure anchor in `writePPM`. Validated by `scenes/expo.ftsl` (ISO 200
     is exactly 2.0× ISO 100 in linear space).
 
+### Fisheye/panoramic lenses are CPU-only, and unsupported by BDPT (mode D)
+- **What:** `projection <name>` / `fisheye` (equidistant, equisolid, stereographic,
+  orthographic) is implemented on the **CPU** for the forward light tracer (modes
+  A/B/C), the backward reference (R), and validation/composite (V/P). The mode-B
+  splat importance is projection-correct (the camera computes the per-pixel solid
+  angle `Camera::pixelSolidAngle`, replacing the rectilinear `1/(A_pix·cos⁴)`). Two
+  gaps remain:
+  1. **No GPU fisheye.** The CUDA megakernels (`render_cuda.cu`) replicate only the
+     rectilinear pinhole (`DCamera` uses `tanHalfX/Y`). A non-rectilinear camera
+     therefore forces a **CPU fallback** (guarded in `runRender`, `src/main.cpp`;
+     `-device gpu` prints a notice). Fisheye renders are thus CPU-speed.
+  2. **BDPT (mode D) rejects fisheye.** `bdpt.h`'s `cameraWe`/`cameraPdfDir` are the
+     rectilinear pinhole convention (`1/(A·cos⁴)`, `1/(A·cos³)`) and feed the MIS
+     balance heuristic; a fisheye lens there would give subtly-wrong weights, so
+     mode D errors out for a non-rectilinear camera rather than lie.
+- **Proper fix (future):** (1) port `projRadius`/`projRadiusInv`/`pixelSolidAngle`
+  into the device `DCamera` and branch `genRay`/`project`/`connect` on a projection
+  enum, validated GPU-vs-CPU. (2) generalise the BDPT camera importance + its
+  importance-sampling pdf to the projection's Jacobian so the MIS weights stay
+  consistent (the harder of the two — the pdfDir must match the actual sampling
+  density over the fisheye image).
+- **Status:** OPEN (acceptable) — CPU fisheye done + validated (`scenes/fisheye.ftsl`)
+  2026-07-11; GPU + BDPT support deferred.
+
 ### Texturing is base-color only, `use_mesh`/quad UVs only (Phase 3b partial)
 - **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear
   filter nearest|bilinear wrap repeat|clamp|mirror }` block loads an image into

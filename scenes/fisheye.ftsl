@@ -1,0 +1,50 @@
+# Fisheye / zoom / dolly-zoom smoke test. Camera inside a Cornell box so a wide
+# lens wraps the walls. Compare framings across projection and zoom.
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "grey"  { type diffuse reflect rgb 0.6 0.6 0.6 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }
+sphere { center 0.5 0.30 0.4   radius 0.25   material grey }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# Rectilinear reference, wide-ish 90 deg.
+camera "rect" {
+    eye 0.5 0.5 1.6   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 90
+    mode B   film { res 192 192 }
+}
+
+# Equisolid fisheye, 160 deg — should wrap the side walls with curved lines.
+camera "fish" {
+    eye 0.5 0.5 1.6   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 160
+    fisheye equisolid
+    mode B   film { res 192 192 }
+}
+
+# Same as rect but zoom 2x (tele) — should crop tighter (narrower fov).
+camera "zoom2" {
+    eye 0.5 0.5 1.6   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 90   zoom 2
+    mode B   film { res 192 192 }
+}
+
+# Dolly-zoom: eye pulls back while fov narrows to hold the sphere size constant.
+camera_path "vertigo" {
+    look_at 0.5 0.30 0.4   up 0 1 0   fov_y 60   mode B
+    film { res 128 128 }
+    frames 3
+    dolly_zoom
+    key 0.0   0.5 0.35 1.0
+    key 1.0   0.5 0.35 2.2
+}

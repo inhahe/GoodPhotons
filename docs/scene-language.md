@@ -661,6 +661,8 @@ camera "hero" {
     up      0 1 0
     fov_y   40                 # vertical field of view, degrees
     lens    50                 # OR: focal length (mm) ⇒ fov_y from film height (overrides fov_y)
+    zoom    1                  # focal-length multiplier (2 = 2× tele; 0.5 = wider) — §8.5
+    projection rectilinear     # lens map: rectilinear | fisheye | … (§8.5)
 
     aperture 0.02              # aperture radius (scene units); 0 ⇒ pinhole-ish
     focus    3.0               # focus distance ⇒ thin-lens focal length
@@ -723,6 +725,9 @@ true focal length, so the f-number yields correct depth of field (§8.1).
   follows the film height, the *same* focal length frames wider on a taller sensor
   (a 50 mm lens is "normal" on full-frame but wide on medium format) — exactly like
   real cameras. On a full-frame sensor `lens 50` ≡ `fov_y 26.99`.
+- `zoom <x>` — **[done]**: a focal-length multiplier layered on `lens`/`fov_y`
+  (`zoom 2` = 2× tele/narrower, `zoom 0.5` = wider). It's the animatable zoom knob;
+  see §8.5 (lens/zoom) and §8.3 (per-key fov + dolly zoom).
 - **f-stop authoring** — **[done — Phase 3a]**: `fstop 2.8` ⇒
   `apertureR = focal / (2·N)` at load time (overrides any `aperture` radius). When a
   `lens` **or** `fstop` is authored the catch modes (A/C) become physically seated:
@@ -800,12 +805,24 @@ statements give sampled `(t, eye)` control points (with an optional per-key
 For each of the `frames` output frames the parameter is stepped uniformly from the
 first key's `t` to the last, and `eye`/`look_at` are **piecewise-linearly**
 interpolated between the bracketing keys. The shared block-level `look_at`, `up`,
-`fov_y`/`lens`, `mode`, `aperture`/`fstop`, `focus`, and `film { res, format/size }`
-apply to every frame.
+`fov_y`/`lens`, `mode`, `aperture`/`fstop`, `focus`, `projection`, and
+`film { res, format/size }` apply to every frame.
 `-camera dolly2` selects a single frame. The grammar is deliberately *numbers-only*
-(`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`) because the FTSL statement splitter
-breaks a statement on the next bareword, so inline keywords like `eye`/`t=` inside
-a one-line `key` are not available.
+(`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>] [<fov_deg>]`) because the FTSL statement
+splitter breaks a statement on the next bareword, so inline keywords like `eye`/`t=`
+inside a one-line `key` are not available.
+
+**Animating the zoom (per-key fov) and the dolly zoom.** A `key` may carry a
+trailing **fov** (degrees), disambiguated by field count: `t ex ey ez` (4),
+`t ex ey ez fov` (5), `t ex ey ez lx ly lz` (7), or `t ex ey ez lx ly lz fov` (8).
+The fov is piecewise-linearly interpolated per frame just like the eye — that gives
+a **zoom** across the shot. A bare `dolly_zoom` (or `dolly_zoom on`; `off`/`false`/`0`
+disables) turns on the **dolly-zoom / Vertigo effect**: the fov is instead *solved*
+each frame to hold the subject's on-screen size constant while the camera dollies,
+so the subject stays fixed while the background compression morphs. The subject is
+each frame's `look_at` point, and the reference size is anchored on the first frame
+(`distance · tan(fov/2) = const`). Example — `scenes/fisheye.ftsl`'s `vertigo`
+path pulls the eye back from z = 1.0 → 2.2 while the fov auto-narrows 60° → ~22°.
 
 For a shared photon pass (a future optimization), the engine would connect each
 diffuse bounce to *every* frame/camera's pupil (mode B) in one trace — a natural
@@ -864,6 +881,46 @@ ftrace -in scene.ftsl -mode B -time 60  -o out.png -resume   # out.png now = 180
 ftrace -in scene.ftsl -mode B -forever -preview -interval 5 -o out.png
 ftrace -in scene.ftsl -mode B -forever -o out.png -resume     # keep refining later
 ```
+
+### 8.5 Lens projection & zoom — rectilinear vs. fisheye/panoramic
+
+Two independent "focal" axes, often confused:
+
+- **`zoom <x>` / `lens <mm>` / `fov_y` — how *much* you see (the angular slice).**
+  `zoom` is a plain focal-length multiplier that composes on whatever `lens`/`fov_y`
+  you set: `zoom 2` doubles the focal length (a 2× tele — *narrower* fov), `zoom 0.5`
+  halves it (wider). It's the animatable "zoom ring"; per-keyframe fov on a
+  `camera_path` (§8.3) animates it across a shot. **Note:** perspective/"compression"
+  is *not* a focal-length property — it's set by camera **distance**. Zooming alone
+  just crops; the cinematic *dolly zoom* (§8.3 `dolly_zoom`) morphs the look by
+  changing distance and fov together while holding the subject size fixed.
+- **`projection <name>` — *how* the angle maps to the film (the lens geometry).**
+  The default `rectilinear` is a normal perspective lens: straight lines stay
+  straight, but it can't reach 180° and stretches the corners. The fisheye/panoramic
+  projections trade straight lines for very wide (≥ 180°) fields, each with a
+  different angle-to-radius law `r(θ)`:
+
+  | `projection` | `r(θ)` | character |
+  |---|---|---|
+  | `rectilinear` (default) | `tan θ` | straight lines; < 180°, corner stretch |
+  | `equidistant` / `fisheye` | `θ` | classic "true" fisheye; angle ∝ radius |
+  | `equisolid` | `2 sin(θ/2)` | most consumer fisheyes; preserves area |
+  | `stereographic` | `2 tan(θ/2)` | "little planet"; preserves local shape |
+  | `orthographic` | `sin θ` | hemispherical; 180° max |
+
+  Shorthand: bare `fisheye` ≡ `projection equisolid`; `fisheye stereographic` etc.
+  also work. With a fisheye you'll usually want a wide `fov_y` (e.g. `fov_y 160`);
+  the image is a circle inscribed in the square film, so the corners fall dark.
+  Validated by `scenes/fisheye.ftsl` (a rectilinear/equisolid/zoom/dolly-zoom set).
+
+  **Implementation status:** fisheye is **CPU-only** for now — the CUDA megakernels
+  replicate only the rectilinear pinhole, so a non-rectilinear camera automatically
+  falls back to the CPU (`-device gpu` prints a notice). Mode **D (BDPT)** rejects a
+  fisheye lens outright, because its MIS camera importance is the rectilinear
+  convention; use mode A/B/C (forward) or R (reference) for fisheye. Both are logged
+  in `known-issues.md`. The mode-B splat importance itself *is* projection-correct
+  on the CPU (the per-pixel solid-angle Jacobian is handled), so fisheye images are
+  radiometrically right, not just geometrically.
 
 ---
 

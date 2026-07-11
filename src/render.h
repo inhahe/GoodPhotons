@@ -248,10 +248,11 @@ struct Renderer {
     }
 
     // Model B: connect a surface vertex to the pinhole and splat onto the film.
-    // f = rho/pi (Lambertian). Contribution = beta * f * G * We, with
-    //   G  = cosSurf * cosCam / dist^2   (geometry term)
-    //   We = 1 / (A_pix * cosCam^4)      (pinhole importance, A_pix = per-pixel
-    //                                     image-plane area -> absolute radiance)
+    // f = rho/pi (Lambertian). The measurement contribution of a surface patch into
+    // one pixel is  beta * f * cosSurf / (dist^2 * Omega_pix), where Omega_pix is the
+    // solid angle that pixel subtends. This form is projection-general (fisheye and
+    // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
+    // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
                  const Vec3& p, const Vec3& n, double lambda, double beta, double rho) const {
         Vec3 toCam = cam.eye - p;
@@ -264,9 +265,8 @@ struct Renderer {
         if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
 
         double f = rho / PI;
-        double G = cosSurf * cosCam / dist2;
-        double We = 1.0 / (cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
-        double contrib = beta * f * G * We;
+        double omega = cam.pixelSolidAngle(cosCam);
+        double contrib = beta * f * cosSurf / (dist2 * omega);
         // Beer-Lambert attenuation of the shadow ray through a global fog.
         if (scene.medium.enabled)
             contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
@@ -277,7 +277,7 @@ struct Renderer {
     // pinhole. The surface BRDF/cosine is replaced by the phase function and the
     // single-scattering albedo; there is no surface normal. wIn is the photon's
     // propagation direction into the collision.
-    //   contrib = beta * albedo * p_HG(cos) * (cosCam/dist^2) * We * T_fog
+    //   contrib = beta * albedo * p_HG(cos) / (dist^2 * Omega_pix) * T_fog
     void connectVolume(const Scene& scene, const Camera& cam, Film& film,
                        const Vec3& p, const Vec3& wIn, double lambda, double beta) const {
         Vec3 toCam = cam.eye - p;
@@ -289,9 +289,8 @@ struct Renderer {
 
         double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
         double Lambda = scene.medium.albedo(lambda);
-        double G = cosCam / dist2;
-        double We = 1.0 / (cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
-        double contrib = beta * Lambda * ph * G * We;
+        double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
+        double contrib = beta * Lambda * ph / (dist2 * omega);
         contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);   // fog transmittance
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }

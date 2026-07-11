@@ -23,8 +23,14 @@
 //   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
-//                   lens <mm>  fstop <N>            # photographic authoring (overrides fov_y/aperture)
+//                   lens <mm>  fstop <N>  zoom <x>  # photographic authoring (overrides fov_y/aperture)
+//                   projection <name> | fisheye [type]  # lens projection (rectilinear default; §8.5)
 //                   film { res W H  format <name>  size <Wmm> <Hmm>  iso .. shutter .. exposure .. } }
+//     zoom <x> multiplies the focal length (x>1 tele/narrower, x<1 wider). projection
+//     picks the lens map: rectilinear (default), equidistant/fisheye, equisolid,
+//     stereographic, orthographic — the fisheye modes allow fov_y >= 180.
+//   camera_path "name" { ... key <t> <ex ey ez> [<lx ly lz>] [<fov>]  dolly_zoom }
+//     per-keyframe fov animates a zoom; dolly_zoom holds the subject size (Vertigo).
 //     lens <mm> sets field of view from focal length and film height; fstop <N> sets a
 //     physically-correct aperture (radius = focal/2N) and, for modes A/C, seats the film
 //     at the image distance so depth of field matches a real lens. film format presets:
@@ -261,6 +267,19 @@ inline bool filmFormatMM(const std::string& raw, double& w, double& h) {
     return false;
 }
 
+// Map a projection/fisheye name to a CameraProjection enum (-1 if unknown). Name
+// matching is case/space/hyphen/underscore-insensitive.
+inline int projectionFromName(const std::string& raw) {
+    std::string k;
+    for (char c : raw) { if (c==' '||c=='_'||c=='-') continue; k += (char)std::tolower((unsigned char)c); }
+    if (k=="rectilinear" || k=="perspective" || k=="normal" || k=="pinhole") return CAM_RECTILINEAR;
+    if (k=="equidistant" || k=="fisheye")                                     return CAM_EQUIDISTANT;
+    if (k=="equisolid"   || k=="equalarea"  || k=="equisolidangle")           return CAM_EQUISOLID;
+    if (k=="stereographic")                                                   return CAM_STEREOGRAPHIC;
+    if (k=="orthographic"|| k=="ortho")                                       return CAM_ORTHOGRAPHIC;
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -274,6 +293,11 @@ struct CamSpec {
     double fov = 40.0, aperture = 0.02, focus = 0.0;
     char   mode = 0;             // 0 = not specified -> inherit global
     int    res  = -1;            // -1 = not specified -> inherit global
+
+    // Lens projection (0 = rectilinear; see CameraProjection) and an optional zoom
+    // multiplier on the focal length (1 = none; 2 = 2x tele, i.e. half the fov).
+    int    projection = CAM_RECTILINEAR;
+    double zoom = 1.0;
 
     // Physical film + photographic exposure (Phase 3a). filmW/H are the physical
     // sensor dimensions in millimetres (0 = unspecified -> 36x24 "full frame"
@@ -983,13 +1007,17 @@ private:
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
         const double DEG = 3.141592653589793 / 180.0;
         double lensMM = dblOf(b, "lens", 0.0);     // focal length in mm (physical, unit-independent)
-        if (lensMM > 0.0) {
-            cs.focal = lensMM / 1000.0;
-            cs.fov   = 2.0 * std::atan(hmm / (2.0 * lensMM)) / DEG;
-        } else {
-            double th = std::tan(0.5 * cs.fov * DEG);
-            cs.focal  = (th > 1e-9) ? (hmm / 1000.0) / (2.0 * th) : 0.0;
-        }
+        // `zoom <x>` multiplies the focal length (x>1 = tele/narrower fov; x<1 = wider).
+        // It is the animatable "zoom ring" and composes on top of `lens`/`fov_y`.
+        double zoom = dblOf(b, "zoom", 1.0); if (zoom <= 0.0) zoom = 1.0;
+        cs.zoom = zoom;
+        double focalMM;
+        if (lensMM > 0.0) focalMM = lensMM;
+        else { double th = std::tan(0.5 * cs.fov * DEG); focalMM = (th > 1e-9) ? hmm / (2.0 * th) : 0.0; }
+        focalMM *= zoom;
+        cs.focal = focalMM / 1000.0;
+        if (lensMM > 0.0 || zoom != 1.0)           // fov follows the (zoomed) focal length
+            cs.fov = (focalMM > 1e-9) ? 2.0 * std::atan(hmm / (2.0 * focalMM)) / DEG : cs.fov;
         // f-stop authoring: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides
         // any `aperture` radius. Aperture radius is an internal (metre) length.
         double fstop = dblOf(b, "fstop", 0.0);
@@ -1015,6 +1043,25 @@ private:
         return true;
     }
 
+    // Parse a camera's lens projection: `projection <name>` or the `fisheye [type]`
+    // shorthand (bare `fisheye` -> equisolid, the common consumer default).
+    bool readProjection(const Block& b, CamSpec& cs) {
+        const Stmt* pj = find(b, "projection");
+        const Stmt* fe = find(b, "fisheye");
+        if (pj && !pj->val.words.empty()) {
+            int p = projectionFromName(pj->val.words[0]);
+            if (p < 0) { fail("unknown projection '" + pj->val.words[0] + "' (rectilinear, "
+                              "equidistant/fisheye, equisolid, stereographic, orthographic)"); return false; }
+            cs.projection = p;
+        } else if (fe) {
+            int p = fe->val.words.empty() ? CAM_EQUISOLID : projectionFromName(fe->val.words[0]);
+            if (p < 0) { fail("unknown fisheye type '" + fe->val.words[0] + "' (equidistant, "
+                              "equisolid, stereographic, orthographic)"); return false; }
+            cs.projection = p;
+        }
+        return true;
+    }
+
     // ---- camera ----
     bool addCamera(const Block& b, Loaded& L) {
         CamSpec cs;
@@ -1024,7 +1071,8 @@ private:
         cs.fov = dblOf(b, "fov_y", 40.0);
         cs.aperture = Len(dblOf(b, "aperture", 0.02));
         cs.focus = Len(dblOf(b, "focus", 0.0));
-        if (!readFilmExposure(b, cs)) return false;   // film{res,size/format,iso,...}, lens, fstop
+        if (!readFilmExposure(b, cs)) return false;   // film{res,size/format,iso,...}, lens, fstop, zoom
+        if (!readProjection(b, cs)) return false;     // projection/fisheye
         std::string md = strOf(b, "mode");
         if (!md.empty()) cs.mode = md[0];
         L.cameras.push_back(cs);
@@ -1062,27 +1110,47 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
-        if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop
+        if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
+        if (!readProjection(b, shared)) return false;     // projection/fisheye
         int frames = (int)dblOf(b, "frames", 0.0);
         if (frames < 1) { fail("camera_path '" + base + "' needs frames >= 1"); return false; }
 
-        // Collect keyframes (t, eye, optional look_at), sorted by t.
-        struct Key { double t; Vec3 eye, look; bool hasLook; };
+        // Dolly-zoom (Vertigo) mode: hold the subject's on-screen size constant by
+        // trading fov against distance. The subject is each frame's look_at point;
+        // the reference size is anchored on the first frame. Enabled by a bare
+        // `dolly_zoom` (or `dolly_zoom on`); `off`/`false`/`0` disables.
+        bool dolly = false;
+        if (const Stmt* dz = find(b, "dolly_zoom")) {
+            if (dz->val.words.empty()) dolly = true;
+            else { const std::string& v = dz->val.words[0]; dolly = !(v=="off"||v=="false"||v=="0"); }
+        }
+        const double DEG = 3.141592653589793 / 180.0;
+
+        // Collect keyframes (t, eye, optional look_at, optional fov), sorted by t.
+        // Field count disambiguates: 4=t,eye  5=t,eye,fov  7=t,eye,look  8=t,eye,look,fov.
+        struct Key { double t; Vec3 eye, look; bool hasLook; double fov; };
         std::vector<Key> keys;
         for (const auto& s : b.stmts) {
             if (s.key != "key") continue;
             const auto& w = s.val.words;
-            if (w.size() < 4) { fail("camera_path key needs: t ex ey ez [lx ly lz]"); return false; }
+            size_t n = w.size();
+            if (n != 4 && n != 5 && n != 7 && n != 8) {
+                fail("camera_path key needs: t ex ey ez [lx ly lz] [fov_deg]"); return false;
+            }
             Key k;
             k.t = num(w[0]);
             k.eye = P(Vec3{num(w[1]), num(w[2]), num(w[3])});
-            k.hasLook = (w.size() >= 7);
+            k.hasLook = (n >= 7);
             k.look = k.hasLook ? P(Vec3{num(w[4]), num(w[5]), num(w[6])}) : shared.look;
+            k.fov = shared.fov;                        // default: the shared/path fov
+            if (n == 5) k.fov = num(w[4]);             // t,eye,fov
+            else if (n == 8) k.fov = num(w[7]);        // t,eye,look,fov
             keys.push_back(k);
         }
         if (keys.size() < 2) { fail("camera_path '" + base + "' needs >= 2 keys"); return false; }
         std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b2){ return a.t < b2.t; });
 
+        double refHalf = -1.0;   // dolly-zoom reference: dist * tan(fov/2), set on frame 0
         int pad = 1; for (int f = frames - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
         for (int i = 0; i < frames; ++i) {
             double t = (frames == 1) ? keys.front().t : keys.front().t +
@@ -1096,6 +1164,12 @@ private:
             CamSpec cs = shared;
             cs.eye  = a->eye  + (c->eye  - a->eye)  * f;
             cs.look = a->look + (c->look - a->look) * f;
+            cs.fov  = a->fov  + (c->fov  - a->fov)  * f;   // per-keyframe zoom
+            if (dolly) {                                   // override fov to hold subject size
+                double di = length(cs.eye - cs.look);
+                if (refHalf < 0.0) refHalf = di * std::tan(0.5 * cs.fov * DEG);   // anchor on frame 0
+                if (di > 1e-9) cs.fov = 2.0 * std::atan(refHalf / di) / DEG;
+            }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
             L.cameras.push_back(cs);

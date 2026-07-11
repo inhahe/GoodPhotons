@@ -1324,6 +1324,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
+    // The CUDA megakernels replicate only the rectilinear pinhole; a fisheye/
+    // panoramic lens must fall back to the CPU (correct-on-CPU-first, per project
+    // policy). GPU fisheye is a logged follow-up (known-issues.md).
+    const bool fisheyeCam = (cam.projection != CAM_RECTILINEAR);
+    // BDPT's camera importance (bdpt.h cameraWe/cameraPdfDir) is the rectilinear
+    // pinhole convention and feeds the MIS balance heuristic; a fisheye lens there
+    // would give subtly-wrong weights, so mode D rejects it rather than lie.
+    if (fisheyeCam && mode == 'D') {
+        std::fprintf(stderr, "[camera] mode D (BDPT) does not support a fisheye/panoramic "
+                             "lens; render this camera with mode A/B/C (forward) or R "
+                             "(reference) instead.\n");
+        return 1;
+    }
     bool useGpu = false;
     if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
         std::fprintf(stderr, "[device] unknown -device '%s'; using CPU "
@@ -1333,6 +1346,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (!cudaAvailable()) {
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
+        } else if (fisheyeCam) {
+            if (wantGpu) std::fprintf(stderr, "[device] non-rectilinear (fisheye) lens "
+                                              "is CPU-only; using CPU\n");
+            else         std::printf("[device] auto -> CPU (fisheye lens is CPU-only)\n");
         } else if (gpuBdptMode) {
             // Mode D has its own (stricter) GPU support check: BDPT scope only.
             if (!cudaBdptSupported(scene)) {
@@ -1786,6 +1803,7 @@ int main(int argc, char** argv) {
             int cres = resFromCli ? res : (cs->res > 0 ? cs->res : res);
             Camera c;
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cres, cres);
+            c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
             c.apertureR = cs->aperture;
             if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
