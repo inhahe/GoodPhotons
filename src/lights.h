@@ -85,7 +85,9 @@ inline Spectrum emissionLines(std::vector<std::pair<double, double>> lines, doub
 // CIE Standard Illuminant F-series: real tabulated relative SPDs, 380-780 nm at
 // 5 nm. F2 = cool white halophosphate (CCT ~4230 K, CRI ~64); F7 = broadband
 // "daylight" fluorescent, a D65 simulator (CCT ~6500 K, CRI ~90); F11 = narrow-band
-// triphosphor (CCT ~4000 K, CRI ~83). Source: CIE 15 tabulated illuminant data.
+// triphosphor (CCT ~4000 K, CRI ~83). Source: CIE 15 tabulated illuminant data,
+// verified against colour-science's transcription and mirrored (for the future
+// data-file loader) in data/spd/cie_f2.csv / cie_f7.csv / cie_f11.csv.
 inline Spectrum fluorescentF2() {
     static const std::vector<double> d = {
         1.18, 1.48, 1.84, 2.15, 3.44, 15.69, 3.85, 3.74, 4.19, 4.62,   // 380-425
@@ -107,8 +109,8 @@ inline Spectrum fluorescentF7() {
         12.44, 12.33, 12.26, 29.52, 17.05, 12.44, 12.58, 12.72, 12.83, 15.46, // 530-575
         16.75, 12.83, 12.67, 12.45, 12.19, 11.89, 11.60, 11.35, 11.12, 10.95, // 580-625
         10.76, 10.42, 10.11, 10.04, 10.02, 10.11, 9.87, 8.65, 7.27, 6.44, // 630-675
-        5.83, 5.56, 5.52, 5.44, 5.29, 5.45, 4.71, 3.94, 3.94, 4.03,    // 680-725
-        4.09, 3.90, 3.55, 3.44, 3.29, 2.85, 3.68, 4.34, 3.94, 2.63, 1.83 // 730-780
+        5.83, 5.41, 5.04, 4.57, 4.12, 3.77, 3.46, 3.08, 2.73, 2.47,    // 680-725
+        2.25, 2.06, 1.90, 1.75, 1.62, 1.54, 1.45, 1.32, 1.17, 0.99, 0.81 // 730-780
     };
     return sampledSPD(380.0, 5.0, d);
 }
