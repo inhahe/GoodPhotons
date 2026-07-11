@@ -320,6 +320,14 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 | `collimated` | Thin parallel pencil beam | `origin`, `dir`, `spd` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity` |
 
+**Absolute power.** Any non-env light may author a real physical output —
+`power <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous
+flux, via `Φᵥ = 683·∫spd·V dλ`) — instead of relying on the per-image
+auto-exposure. Authoring either on *any* light puts the whole scene in **absolute
+mode**: the film is physically linear, the auto-exposure is replaced by a fixed
+sensor gain, and `iso`/`shutter`/`exposure` become true absolute stops (doubling
+`power` is exactly one stop brighter). See `scenes/absolute.ftsl`.
+
 ---
 
 ## Geometry

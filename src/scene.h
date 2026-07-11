@@ -369,6 +369,11 @@ struct Scene {
     std::vector<Emitter> emitters;
     std::vector<double> emitterCdf;   // cumulative power, normalised to [0,1]
     double totalPower = 0.0;
+    // Set true when at least one emitter authored an absolute flux (`power <watts>`
+    // or `lumens <lm>`): the emitter SPDs are then scaled to real radiant power, so
+    // the film's radiometric scale is physically meaningful and writeFilm uses a
+    // fixed photographic exposure instead of the per-image auto-exposure anchor.
+    bool absolute = false;
     // Combined emission wavelength sampler over g(lambda)=sum_k area_k*PI*SPD_k,
     // with emitG = its integral. invPdfLambda(lambda) = emitG / g(lambda) is the
     // per-lambda weight the backward reference needs (see backward.h).

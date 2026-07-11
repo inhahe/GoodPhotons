@@ -855,6 +855,43 @@ private:
     }
 
     // ---- lights ----
+    // Absolute light power. If a `light` block authored an absolute flux — `power
+    // <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous
+    // flux) — scale its SPD so the emitter's total emitted power
+    // (emitIntegral*geomW) equals that flux, and flag the scene absolute so
+    // writeFilm uses a fixed photographic exposure rather than per-image auto-
+    // exposure. `geomW` is the emitter's geometric weight (area*PI for surface
+    // emitters, spotOmega for a spot) so `power = emitIntegral*geomW` — the same law
+    // finalizeEmitters() applies. Radiant flux uses the SPD integral directly;
+    // luminous flux uses Phi_v = 683 * geomW * INT SPD(lambda)*V(lambda) dlambda with
+    // cieY() as the CIE photopic V(lambda) (peak ~1). Both integrals use the same
+    // midpoint/binWidth_ quadrature as EmissionSampler so the scaling is exact.
+    // `power` wins if both are given. Returns the (possibly scaled) SPD.
+    Spectrum absPower(const Block& b, Spectrum spd, double geomW, Loaded& L) {
+        const Stmt* pw = find(b, "power");
+        const Stmt* lm = find(b, "lumens");
+        if (!pw && !lm) return spd;
+        double rawInt = 0.0, vInt = 0.0;
+        int n = (int)((LAMBDA_MAX - LAMBDA_MIN) / binWidth_);
+        for (int i = 0; i < n; ++i) {
+            double w = LAMBDA_MIN + (i + 0.5) * binWidth_;
+            double s = std::max(0.0, spd(w)) * binWidth_;
+            rawInt += s; vInt += s * cieY(w);
+        }
+        double k = 0.0;
+        if (pw) {
+            double watts = dblOf(b, "power", 0.0);
+            double rawFlux = rawInt * geomW;               // watts of the unscaled SPD
+            k = (rawFlux > 0.0) ? watts / rawFlux : 0.0;
+        } else {
+            double lumens = dblOf(b, "lumens", 0.0);
+            double denom = 683.0 * geomW * vInt;           // lm per unit SPD scale
+            k = (denom > 0.0) ? lumens / denom : 0.0;
+        }
+        L.scene.absolute = true;
+        return [spd, k](double w) { return spd(w) * k; };
+    }
+
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
@@ -871,6 +908,7 @@ private:
             Vec3 o{0.5, 0.5, 0.95}; vec3Of(b, "origin", o);
             Vec3 t, bt; onb(beam, t, bt);
             double w = Len(0.03) * s;
+            spd = absPower(b, spd, (w * w) * PI, L);
             L.scene.addAreaLight(P(xf.apply(o)), t * w, bt * w, beam, w * w, spd, binWidth_,
                                  /*collimated*/true, beam);
             return true;
@@ -883,6 +921,7 @@ private:
             Vec3 c{0.5, 0.7, 0.5}; vec3Of(b, "center", c);
             double rad = Len(dblOf(b, "radius", 0.1)) * s;
             Vec3 cw = P(xf.apply(c));
+            spd = absPower(b, spd, (4.0 * PI * rad * rad) * PI, L);
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
             L.scene.spheres.push_back(Sphere{cw, rad, id});
@@ -909,6 +948,8 @@ private:
             if (segs < 3) segs = 3;
             std::string capsStr = strOf(b, "caps", "off");
             bool caps = (capsStr == "on" || capsStr == "true" || capsStr == "yes");
+            double cylArea = 2.0 * PI * rad * len + (caps ? 2.0 * PI * rad * rad : 0.0);
+            spd = absPower(b, spd, cylArea * PI, L);
             Vec3 axisW = normalize(xf.applyDir(dir)) * len;   // world axis vector (|.| = len)
             Vec3 baseW = P(xf.apply(c)) - axisW * 0.5;        // base-cap center
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
@@ -945,6 +986,7 @@ private:
             if (outer < inner) outer = inner;            // outer cone must enclose inner
             const double d2r = PI / 180.0;
             double cosInner = std::cos(inner * d2r), cosOuter = std::cos(outer * d2r);
+            spd = absPower(b, spd, PI * (2.0 - cosInner - cosOuter), L);
             L.scene.addSpotLight(P(xf.apply(o)), normalize(xf.applyDir(dir)), cosInner, cosOuter, spd, binWidth_);
             return true;
         }
@@ -955,6 +997,11 @@ private:
             // about the vertical axis (degrees); `intensity` scales its brightness.
             // Without a `file` it is a constant env: uniform radiance `spd` from every
             // direction. Either way it is sized by the scene bounds in Scene::build().
+            if (find(b, "power") || find(b, "lumens")) {
+                fail("env light: absolute `power`/`lumens` is not supported (the env's "
+                     "phase-space weight depends on scene bounds); use `intensity` or "
+                     "scale the `spd` instead"); return false;
+            }
             std::string file = strOf(b, "file");
             if (!file.empty()) {
                 auto map = std::make_shared<EnvMap>();
@@ -980,6 +1027,7 @@ private:
         // uniform scale; see known-issues.md for the non-uniform-scale caveat).
         Vec3 os = P(xf.apply(o)), us = xf.applyDir(u) * L_, vs = xf.applyDir(v) * L_;
         Vec3 nw = normalize(xf.applyDir(nrm));
+        spd = absPower(b, spd, length(cross(us, vs)) * PI, L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;

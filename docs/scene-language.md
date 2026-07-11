@@ -466,7 +466,8 @@ CPU==GPU).
 light area {
     origin 0.3 1.99 0.3   u 0.4 0 0   v 0 0 0.4   normal 0 -1 0
     spd blackbody 6500              # any <spectrum>, or preset:<name>
-    # power/scale TBD — see note below
+    # power  100                    # optional: absolute radiant flux in watts
+    # lumens 1500                   # optional: absolute luminous flux in lumens
 }
 
 light collimated {
@@ -622,6 +623,43 @@ has no env light, so non-env scenes keep a bit-identical RNG stream / backward i
 > with the photon-traced surface illumination on one consistent scale, and it makes
 > the mode-V / mode-P best-fit scale land at ~1 instead of an arbitrary constant.
 > Auto-exposed outputs are unchanged (a global scale is invisible after exposure).
+
+#### Absolute emitter power (`power` / `lumens`)
+
+By default an emitter's SPD sets only its **relative** brightness and the film is
+auto-exposed per image (a p99 anchor), so doubling every light's `spd` produces the
+same picture. Give any light block an **absolute flux** to pin the emitter to a real
+physical output instead:
+
+```
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd    preset:bb6500
+    power  100                 # 100 W of radiant flux (radiometric)
+}
+```
+
+- **`power <watts>`** — total **radiant** flux Φₑ in watts (radiometric). The loader
+  scales the emitter SPD by `k = watts / (∫spd(λ)dλ · geomW)`, where `geomW` is the
+  same geometric weight the power law already uses (`area·π` for a surface,
+  `spotOmega` for a spot, `envGeom` for env), so the emitter's authored SPD shape is
+  preserved and its integrated flux becomes exactly `watts`.
+- **`lumens <lm>`** — total **luminous** flux Φᵥ in lumens (photometric). The loader
+  solves `Φᵥ = 683 · geomW · ∫spd(λ)·V(λ)dλ` for the same scale `k` (using the CIE
+  `ȳ` colour-matching function as the luminous-efficiency curve `V`), so e.g. a
+  `lumens 1500` lamp emits 1500 lm regardless of its colour temperature.
+
+Authoring either keyword on **any** light switches the whole scene into **absolute
+mode**: every emitter SPD flows through the transport un-renormalised, the film is
+physically linear, and `writeFilm` replaces the per-image auto-exposure with a
+**fixed sensor gain** (`ABS_EXPOSURE_GAIN`) combined with the photographic controls.
+In this mode `iso` / `shutter` / `exposure` become true absolute stops — doubling
+`power` (or `iso`, or `shutter`) makes the image exactly one stop brighter, and a
+dimmer lamp renders darker rather than being auto-normalised back. The integrals use
+the same midpoint quadrature (`binWidth` bins over `[LAMBDA_MIN, LAMBDA_MAX]`) as the
+emission sampler, so the absolute scale is exact. `power`/`lumens` on a `light env` is
+rejected (an infinite environment has no finite total flux to author). Demonstrated by
+`scenes/absolute.ftsl`.
 
 ### 5.1 Built-in illuminant SPDs (`preset:<name>`)
 
@@ -849,15 +887,18 @@ photons where the brute-force catch needs billions.
   unit-relative blur. Legacy cameras (no `lens`/`fstop`, just an `aperture`/`focus`
   radius in scene units) keep their previous unit-film behaviour unchanged. Mode B
   (the pinhole limit) ignores the aperture entirely, so it is unaffected either way.
-- `iso` / `shutter` / `exposure` — **[done (relative) — Phase 3a]**: the film's
-  radiometric scale is not absolute, so images are always auto-exposed (99th-
-  percentile anchor). These act as an exposure **compensation** on top of that
+- `iso` / `shutter` / `exposure` — **[done — Phase 3a (relative); absolute 2026-07-11]**:
+  by default the film's radiometric scale is not absolute, so images are auto-exposed
+  (99th-percentile anchor) and these act as an exposure **compensation** on top of that
   anchor: `comp = exposure · (iso/100) · shutter` (each factor defaults to 1), e.g.
   `iso 200` is exactly one stop brighter than `iso 100`. Aperture is deliberately
   *not* folded in (in A/C a smaller aperture already darkens the image physically;
-  in B the aperture is virtual). **True absolute EV / a physical sensitivity+
-  response model still needs engine work** — it depends on absolute light power
-  (watts/lumens), which is a separate deferred feature (see §7 / known-issues).
+  in B the aperture is virtual). **True absolute EV is now available**: author an
+  absolute emitter flux (`power <watts>` / `lumens <lm>`, see §5) and the whole scene
+  renders in **absolute mode** — the auto-exposure anchor is replaced by a fixed
+  sensor gain (`ABS_EXPOSURE_GAIN`) and `comp` becomes a real absolute-stop multiplier
+  on top of it, so `iso`/`shutter`/`exposure` and the light's authored watts/lumens all
+  compose as exact photographic stops (no per-image renormalisation).
 - **Exposure lock** — **[done — 2026-07-11]**: because each image is auto-exposed
   independently, a moving `camera_path` can flicker as the scene brightness under the
   anchor shifts frame-to-frame. Author `exposure_lock` inside a `camera_path` block
@@ -867,7 +908,8 @@ photons where the brute-force catch needs billions.
   same behaviour across *all* rendered cameras (e.g. to match exposure between several
   standalone `camera` blocks). Per-frame `iso`/`shutter`/`exposure` compensation still
   applies on top of the locked anchor. This is a *relative* lock (it fixes the shared
-  anchor); true absolute EV still needs absolute light power (above).
+  auto-exposure anchor); in absolute mode (`power`/`lumens`) the exposure is already
+  fixed by the sensor gain, so a path renders flicker-free without needing the lock.
 
 ### 8.2 Measurement model (`mode`)
 

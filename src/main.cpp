@@ -798,8 +798,21 @@ static int checkUpsample() {
 // > 0 the stored `eAuto` is reused (so a dolly doesn't flicker frame-to-frame); when
 // non-null but still 0 the freshly-computed `eAuto` is written back for the next
 // frame. Null => per-frame auto-exposure (the default).
+// Absolute-exposure sensor gain. In absolute mode (a scene with `power`/`lumens`
+// emitters) the film's radiometric scale is physically meaningful, so instead of
+// the content-dependent auto-exposure anchor we apply a FIXED gain times the
+// photographic compensation `expComp = exposure*(iso/100)*shutter`. Aperture is
+// not in expComp on purpose (the physical A/C modes already darken by passing
+// fewer photons; see CamSpec). This constant is the sensor's absolute sensitivity
+// calibration: it was chosen so a ~100 W area light in a unit (Cornell-scale) box
+// at the neutral triple (ISO 100, 1 s, exposure 1) exposes to mid-tone. Changing
+// lamp wattage/lumens then brightens or darkens the image (no auto-renormalise),
+// and iso/shutter/exposure give exact photographic stops on top.
+constexpr double ABS_EXPOSURE_GAIN = 6.0;
+
 static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
-                      bool quiet = false, double* lockAnchor = nullptr) {
+                      bool quiet = false, double* lockAnchor = nullptr,
+                      bool absolute = false) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -809,6 +822,14 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
         lum.push_back(std::max({lin[i].x, lin[i].y, lin[i].z, 0.0}));
     }
     double eAuto;
+    double exposure;
+    if (absolute) {
+        // Absolute EV: fixed sensor gain, no per-image normalisation. Scene power
+        // (watts/lumens) flows straight through; the auto-exposure anchor and the
+        // camera_path exposure-lock are bypassed.
+        eAuto = ABS_EXPOSURE_GAIN;
+        exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
+    } else {
     if (lockAnchor && *lockAnchor > 0.0) {
         eAuto = *lockAnchor;                       // reuse the path's locked anchor
     } else {
@@ -817,7 +838,8 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
         eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
         if (lockAnchor) *lockAnchor = eAuto;       // first frame sets the anchor
     }
-    double exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
+    exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
+    }
 
     std::vector<uint8_t> img((size_t)W * H * 3);
     for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
@@ -833,7 +855,10 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
         return;
     }
     if (quiet) return;
-    if (expComp > 0.0)
+    if (absolute)
+        std::printf("wrote %s (%dx%d), exposure=%.3g (absolute: gain %.3g x %.3g comp)\n",
+                    path, W, H, exposure, eAuto, (expComp > 0.0 ? expComp : 1.0));
+    else if (expComp > 0.0)
         std::printf("wrote %s (%dx%d), exposure=%.3g (auto %.3g x %.3gEV-comp)\n",
                     path, W, H, exposure, eAuto, expComp);
     else
@@ -1494,7 +1519,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
         ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
 #endif
-        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor); return 0; }
+        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor, scene.absolute); return 0; }
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -1559,7 +1584,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
         img = renderBdpt(scene, cam, res, resY, spp, nThreads, maxDepth, diffraction);
 #endif
-        writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor);
+        writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor, scene.absolute);
         return 0;
     }
 
@@ -1569,7 +1594,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, resY, nThreads, lightLabel);
         Film comp = renderComposite(scene, cam, res, resY, N, spp, nThreads, diffraction, useGpu, wavefront);
-        writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor);
+        writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor, scene.absolute);
         return 0;
     }
 
@@ -1600,7 +1625,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         Film disp = acc.film;                        // display copy (+ direct sky view)
         if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
         writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
-                  useAnchor ? exposureAnchor : nullptr);
+                  useAnchor ? exposureAnchor : nullptr, scene.absolute);
         if (wantCheckpoint) {
             if (writeCheckpoint(outPath, acc, guard, mode)) {
                 if (announceCheckpoint)

@@ -46,13 +46,27 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ### Absolute-EV film sensitivity, non-square films, shared multi-camera pass
 - **What (remaining):** three camera/film pieces are still open:
-  1. **Absolute EV / physical sensitivity.** `iso`/`shutter`/`exposure` are wired
-     but act as a *relative* exposure **compensation** on top of the per-image
-     auto-exposure (the film's radiometric scale is arbitrary). A true absolute
-     exposure (a given ISO+shutter+f-number yielding a physically-determined
-     brightness) needs **absolute light power** (watts/lumens) on emitters, which is
-     itself deferred (§7). ~~A cheaper intermediate win: an exposure **lock** across
-     `camera_path` frames.~~ **Exposure-lock DONE 2026-07-11:** a `camera_path` can
+  1. ~~**Absolute EV / physical sensitivity.** `iso`/`shutter`/`exposure` act as a
+     *relative* exposure compensation on top of the per-image auto-exposure (the
+     film's radiometric scale is arbitrary). A true absolute exposure needs absolute
+     light power (watts/lumens) on emitters.~~ **DONE 2026-07-11.** A `light` block
+     may author an absolute emitted flux — `power <watts>` (radiometric) or
+     `lumens <lm>` (photometric, via Φ_v = 683·∫SPD·V(λ)dλ with cieY as V) — on
+     area/sphere/cylinder/spot/collimated lights. The FTSL loader (`absPower()` in
+     ftsl.h) scales the emitter SPD so `power = emitIntegral·geomW` equals that flux;
+     because photon β and the film accumulation are linear in the SPD, the film
+     becomes physically linear. When any light is absolute, `Scene::absolute` is set
+     and `writeFilm` swaps the 99th-percentile auto-exposure for a FIXED sensor gain
+     (`ABS_EXPOSURE_GAIN`) times the photographic compensation, so scene power flows
+     through un-renormalised and iso/shutter/exposure give exact absolute stops.
+     Validated on `scenes/absolute.ftsl`: `power 100`→`200` brightens the diffuse
+     walls ~2× (light patch clips), the `lumens` path engages absolute mode, and
+     non-absolute scenes stay bit-identical (auto-exposure, `Scene::absolute=false`).
+     Env lights reject `power`/`lumens` (their phase-space weight needs scene bounds;
+     use `intensity`). Not yet metrologically calibrated to cd/m² — the single
+     `ABS_EXPOSURE_GAIN` sets the sensor zero-point (tuned so ~100 W in a unit box at
+     the neutral triple is mid-tone); relative stops and power ratios are exact.
+     **Exposure-lock DONE 2026-07-11:** a `camera_path` can
      author `exposure_lock` (or the CLI `-exposure-lock` forces it across *all*
      rendered cameras) so the auto-exposure anchor is computed once from the first
      frame and reused for the rest — no dolly/zoom flicker. Implemented by an optional
@@ -80,13 +94,14 @@ as practical; this file is the fallback for what can't be addressed immediately.
      mismatch.
   3. **Shared multi-camera mode-B pass** (already logged above under the multi-camera
      entry) — one photon trace splatting to every camera pupil.
-- **Proper fix:** (1) ~~add a per-`camera_path` exposure-lock flag as the near-term
-  step~~ (DONE 2026-07-11); absolute emitter power + a sensitometric film model still
-  deferred. (2) ~~thread resX/resY through `renderForward`/`renderBackward`/CUDA and
+- **Proper fix:** (1) ~~add a per-`camera_path` exposure-lock flag~~ (DONE
+  2026-07-11); ~~absolute emitter power + a sensitometric film model~~ (absolute
+  power + fixed-gain exposure DONE 2026-07-11; full cd/m² sensitometry still open).
+  (2) ~~thread resX/resY through `renderForward`/`renderBackward`/CUDA and
   `writePPM`~~ (DONE 2026-07-11). (3) see multi-camera.
 - **Status:** OPEN (design captured) — logged 2026-07-10; **exposure-lock done
-  2026-07-11**, **non-square films done 2026-07-11**; absolute-EV and the shared pass
-  remain.
+  2026-07-11**, **non-square films done 2026-07-11**, **absolute-EV done
+  2026-07-11**; only the shared multi-camera pass remains.
 - **Done (2026-07-10, Phase 3a):**
   - `camera_path` keyframed motion — expands at load time into a sequence of
     `CamSpec` frames with piecewise-linear `eye`/`look_at` interpolation between
@@ -472,14 +487,15 @@ as practical; this file is the fallback for what can't be addressed immediately.
   - **CCT-tuned phosphor LED** — `ledCCT(kelvin)` via the `led<K>k` name (e.g.
     `led4000k`).
 - **The honesty caveats (tech debt, not a bug):**
-  1. **The F2/F7/F11 tables were transcribed from the canonical CIE 15 illuminant
-     data by hand/from memory, not ingested from an authoritative machine-readable
-     source.** The overall shapes are correct and render with the right colour cast
-     (validated 2026-07-11: F7 coolest/most-daylight, F2/F11 warm-white), but
-     individual 5 nm samples may carry small transcription errors. If
-     spectrophotometer-grade exactness is ever needed, diff these arrays against an
-     authoritative CIE table (or load from a data file via the Python tooling) and
-     correct any drift.
+  1. ~~**The F2/F7/F11 tables were transcribed from the canonical CIE 15 illuminant
+     data by hand/from memory.**~~ **VERIFIED & CORRECTED 2026-07-11.** The baked
+     tables were diffed against the authoritative CIE 15:2004 F-series (via
+     colour-science), which caught a real bug: `fluorescentF7()`'s tail (685–780 nm)
+     was wrong (it wiggled back up to 4.34 at 765 nm instead of decaying smoothly).
+     F7 is now corrected; F2/F11 already matched exactly. The authoritative tables
+     are committed to `data/spd/cie_f2.csv` / `cie_f7.csv` / `cie_f11.csv` for the
+     planned data-file loader. Remaining sub-item: still baked in-source rather than
+     loaded from those files (see the loader work).
   2. **The sodium / mercury / metal-halide entries are deliberately *illustrative*
      spectroscopic models, not per-lamp measurements** — correct line positions and
      plausible relative strengths (from spectroscopy references) over analytic
