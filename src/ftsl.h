@@ -1053,27 +1053,37 @@ private:
     // and the leaf's uniform scale becomes the field's distance multiplier. Params
     // (radius, half-extents, ...) stay in authored units and are rescaled at eval.
     bool addFieldLeaf(FieldOp op, const Block& b, const Affine& authoredXf,
-                      std::vector<FieldNode>& out) {
-        // Fold the authored center into the transform, then rebase to metres.
+                      std::vector<FieldNode>& out, bool ellipsoid = false) {
+        // Fold the authored center into the transform, then rebase to metres. An
+        // ellipsoid is a unit sphere with a non-uniform LEAF pre-scale (its radii)
+        // baked into the local->world map.
         Vec3 center{0, 0, 0}; vec3Of(b, "center", center);
-        Affine A = authoredXf.compose(affineFromTRS(center, Vec3{0, 0, 0}, Vec3{1, 1, 1}));
+        Vec3 preScale{1, 1, 1};
+        if (ellipsoid) vec3Of(b, "radius", preScale);   // rx, ry, rz
+        Affine A = authoredXf.compose(affineFromTRS(center, Vec3{0, 0, 0}, preScale));
         Affine L2W;
         for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * A.m[k];
         L2W.t = A.t * L_;
-        bool nonUniform = false; double s = L2W.uniformScale(nonUniform);
-        if (nonUniform) {
-            fail("isosurface leaf under non-uniform scale (not supported — shape it "
-                 "with per-leaf params like box size / torus major,minor instead)");
-            return false;
-        }
+        // Conservative world-distance factor: the SMALLEST per-axis scale of the
+        // local->world map (its columns are R*S, so column norms == the axis scales,
+        // exactly, since we only build translate/rotate/scale — no shear). Multiplying
+        // the local SDF by this underestimates true world distance, which keeps the
+        // field a valid Lipschitz-1 SDF under NON-UNIFORM scale too (sphere->ellipsoid,
+        // squashed box/torus/cone, ...): sphere-tracing just takes shorter steps along
+        // the stretched axis, and gradient normals stay correct via the chain rule.
+        double sx = std::sqrt(L2W.m[0]*L2W.m[0] + L2W.m[3]*L2W.m[3] + L2W.m[6]*L2W.m[6]);
+        double sy = std::sqrt(L2W.m[1]*L2W.m[1] + L2W.m[4]*L2W.m[4] + L2W.m[7]*L2W.m[7]);
+        double sz = std::sqrt(L2W.m[2]*L2W.m[2] + L2W.m[5]*L2W.m[5] + L2W.m[8]*L2W.m[8]);
+        double s  = std::fmin(sx, std::fmin(sy, sz));
         FieldNode nd; nd.op = op; nd.scale = s; nd.inv = L2W.inverse();
         switch (op) {
             case FieldOp::Sphere:
-                nd.p[0] = dblOf(b, "radius", 1.0);
+                nd.p[0] = ellipsoid ? 1.0 : dblOf(b, "radius", 1.0);   // radii live in the transform
                 break;
             case FieldOp::Box: {
                 Vec3 size{1, 1, 1}; vec3Of(b, "size", size);
                 nd.p[0] = size.x * 0.5; nd.p[1] = size.y * 0.5; nd.p[2] = size.z * 0.5;
+                nd.p[3] = dblOf(b, "round", 0.0);           // corner rounding radius (0 = sharp)
                 break;
             }
             case FieldOp::Torus:
@@ -1084,6 +1094,13 @@ private:
                 nd.p[0] = dblOf(b, "radius", 0.5);
                 nd.p[1] = dblOf(b, "height", 1.0) * 0.5;    // half-height (axis = local y)
                 break;
+            case FieldOp::Cone: {
+                // `radius`/`radius2` = bottom/top radii; a pure cone omits radius2 (top=0).
+                nd.p[0] = dblOf(b, "radius",  0.5);         // bottom radius (y = -h)
+                nd.p[1] = dblOf(b, "radius2", 0.0);         // top radius    (y = +h)
+                nd.p[2] = dblOf(b, "height", 1.0) * 0.5;    // half-height (axis = local y)
+                break;
+            }
             case FieldOp::Plane: {
                 Vec3 n{0, 1, 0}; vec3Of(b, "normal", n);
                 double ln = length(n); if (ln > 0) n = n / ln;
@@ -1105,11 +1122,13 @@ private:
         const std::string& k = st.key;
         // Leaves — the element's own translate/rotate/scale wrap the primitive.
         Affine xf = fieldXf(*b, parentXf);
-        if (k == "sphere")   return addFieldLeaf(FieldOp::Sphere,   *b, xf, out);
-        if (k == "box")      return addFieldLeaf(FieldOp::Box,      *b, xf, out);
-        if (k == "torus")    return addFieldLeaf(FieldOp::Torus,    *b, xf, out);
-        if (k == "cylinder") return addFieldLeaf(FieldOp::Cylinder, *b, xf, out);
-        if (k == "plane")    return addFieldLeaf(FieldOp::Plane,    *b, xf, out);
+        if (k == "sphere")    return addFieldLeaf(FieldOp::Sphere,   *b, xf, out);
+        if (k == "ellipsoid") return addFieldLeaf(FieldOp::Sphere,   *b, xf, out, /*ellipsoid=*/true);
+        if (k == "box")       return addFieldLeaf(FieldOp::Box,      *b, xf, out);
+        if (k == "torus")     return addFieldLeaf(FieldOp::Torus,    *b, xf, out);
+        if (k == "cylinder")  return addFieldLeaf(FieldOp::Cylinder, *b, xf, out);
+        if (k == "cone")      return addFieldLeaf(FieldOp::Cone,     *b, xf, out);
+        if (k == "plane")     return addFieldLeaf(FieldOp::Plane,    *b, xf, out);
         // Combinators — fold N children pairwise in postfix order.
         FieldOp op; bool smooth = false;
         if      (k == "union")             op = FieldOp::Union;
@@ -1119,9 +1138,9 @@ private:
         else if (k == "smooth_intersect" || k == "smooth_intersection") { op = FieldOp::SmoothIntersect; smooth = true; }
         else if (k == "smooth_difference" || k == "smooth_subtract")    { op = FieldOp::SmoothDifference; smooth = true; }
         else if (k == "blob")              { op = FieldOp::SmoothUnion;      smooth = true; }
-        else { fail("unknown field element '" + k + "' in isosurface (leaves: sphere/box/"
-                    "torus/cylinder/plane; combinators: union/intersect/difference, "
-                    "smooth_union/smooth_intersect/smooth_difference, blob)"); return false; }
+        else { fail("unknown field element '" + k + "' in isosurface (leaves: sphere/"
+                    "ellipsoid/box/torus/cylinder/cone/plane; combinators: union/intersect/"
+                    "difference, smooth_union/smooth_intersect/smooth_difference, blob)"); return false; }
         double kBlend = 0.0;
         const Stmt* kk = find(*b, "k");
         if (kk && !kk->val.words.empty()) kBlend = num(kk->val.words[0]) * L_;   // authored -> metres

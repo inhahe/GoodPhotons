@@ -34,10 +34,11 @@ enum class FieldOp : int {
     // op-specific parameters (all lengths in the leaf's LOCAL space; the leaf's
     // affine transform maps world<->local and a uniform scale rescales distance).
     Sphere = 0,   // p[0] = radius
-    Box,          // p[0..2] = half-extents (hx,hy,hz)
+    Box,          // p[0..2] = half-extents (hx,hy,hz), p[3] = corner rounding radius (0 = sharp)
     Torus,        // p[0] = major radius R (ring), p[1] = minor radius r (tube), in xz-plane
     Plane,        // p[0..2] = unit normal, p[3] = signed offset (f = dot(pl,n) + off)
     Cylinder,     // p[0] = radius, p[1] = half-height (capped, axis = local y)
+    Cone,         // p[0] = bottom radius, p[1] = top radius, p[2] = half-height (axis = local y)
     // Combinators — pop two SDF values (a below b on the stack), push one.
     Union,             // min(a,b)
     Intersect,         // max(a,b)
@@ -47,7 +48,7 @@ enum class FieldOp : int {
     SmoothDifference,  // smax(a,-b,k)     p[0] = k
 };
 
-inline bool fieldOpIsLeaf(FieldOp op) { return op <= FieldOp::Cylinder; }
+inline bool fieldOpIsLeaf(FieldOp op) { return op <= FieldOp::Cone; }
 
 // One node of the field expression. POD (no std:: members) so it uploads to the
 // GPU verbatim. Leaf nodes carry their own world->local affine `inv` and the
@@ -79,13 +80,17 @@ inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl) {
         case FieldOp::Sphere:
             return length(pl) - nd.p[0];
         case FieldOp::Box: {
-            double qx = std::fabs(pl.x) - nd.p[0];
-            double qy = std::fabs(pl.y) - nd.p[1];
-            double qz = std::fabs(pl.z) - nd.p[2];
+            // Rounded box (Inigo Quilez): inset the half-extents by the rounding
+            // radius r, take the plain box distance, then subtract r. r = 0 gives a
+            // sharp box exactly.
+            double r  = nd.p[3];
+            double qx = std::fabs(pl.x) - nd.p[0] + r;
+            double qy = std::fabs(pl.y) - nd.p[1] + r;
+            double qz = std::fabs(pl.z) - nd.p[2] + r;
             double ox = std::fmax(qx, 0.0), oy = std::fmax(qy, 0.0), oz = std::fmax(qz, 0.0);
             double outside = std::sqrt(ox * ox + oy * oy + oz * oz);
             double inside  = std::fmin(std::fmax(qx, std::fmax(qy, qz)), 0.0);
-            return outside + inside;
+            return outside + inside - r;
         }
         case FieldOp::Torus: {
             double qx = std::sqrt(pl.x * pl.x + pl.z * pl.z) - nd.p[0];
@@ -99,6 +104,25 @@ inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl) {
             double a   = std::fmin(std::fmax(dxz, dy), 0.0);
             double bx  = std::fmax(dxz, 0.0), by = std::fmax(dy, 0.0);
             return a + std::sqrt(bx * bx + by * by);
+        }
+        case FieldOp::Cone: {
+            // Capped/truncated cone along local y (Inigo Quilez sdCappedCone):
+            // radius p[0] at y=-h, radius p[1] at y=+h, half-height h = p[2].
+            double rb = nd.p[0], rt = nd.p[1], h = nd.p[2];
+            double qx = std::sqrt(pl.x * pl.x + pl.z * pl.z), qy = pl.y;
+            double k1x = rt,      k1y = h;
+            double k2x = rt - rb, k2y = 2.0 * h;
+            double cax = qx - std::fmin(qx, (qy < 0.0) ? rb : rt);
+            double cay = std::fabs(qy) - h;
+            double k2dot = k2x * k2x + k2y * k2y;
+            double tt = (k2dot > 0.0) ? ((k1x - qx) * k2x + (k1y - qy) * k2y) / k2dot : 0.0;
+            tt = tt < 0.0 ? 0.0 : (tt > 1.0 ? 1.0 : tt);
+            double cbx = qx - k1x + k2x * tt;
+            double cby = qy - k1y + k2y * tt;
+            double s = (cbx < 0.0 && cay < 0.0) ? -1.0 : 1.0;
+            double da = cax * cax + cay * cay;
+            double db = cbx * cbx + cby * cby;
+            return s * std::sqrt(std::fmin(da, db));
         }
         default:
             return DBL_MAX;
@@ -298,6 +322,10 @@ inline Aabb leafBox(const FieldNode& nd) {
         case FieldOp::Cylinder:
             return transformedLocalBox(nd, Vec3{-nd.p[0], -nd.p[1], -nd.p[0]},
                                            Vec3{ nd.p[0],  nd.p[1],  nd.p[0]});
+        case FieldOp::Cone: {
+            double rr = std::fmax(nd.p[0], nd.p[1]);
+            return transformedLocalBox(nd, Vec3{-rr, -nd.p[2], -rr}, Vec3{rr, nd.p[2], rr});
+        }
         case FieldOp::Plane:
         default: {
             Aabb box; box.lo = Vec3{-BIG, -BIG, -BIG}; box.hi = Vec3{BIG, BIG, BIG};
