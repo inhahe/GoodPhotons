@@ -397,6 +397,7 @@ combinator** whose children are themselves field elements:
 | `cylinder` | `radius`, `height` (axis = local +y) |
 | `cone` | `radius` (bottom), `radius2` (top, 0 = pointed), `height` |
 | `plane` | `normal`, `offset` |
+| `function` | `expr "f(x,y,z)"` — arbitrary formula leaf (see below) |
 
 | Combinator | Meaning |
 |---|---|
@@ -413,6 +414,40 @@ all work. Surface normals come from the analytic field gradient. A worked exampl
 metaballs, drilled CSG, and a tilted torus is in `scenes/implicit.ftsl`. Implicit
 surfaces are sphere-traced on **both the CPU and the GPU** (the device port matches the
 CPU to Monte-Carlo noise).
+
+#### Arbitrary-formula isosurfaces (`function`)
+
+The analytic leaves above are all built-in signed-distance fields. To render the
+surface of an **arbitrary equation** `f(x,y,z) = 0` — a gyroid, a Goursat/heart shape,
+any hand-typed formula — use a `function` leaf:
+
+```
+isosurface {
+    material gold
+    function {
+        translate 0.5 0.5 0.45           # (optional) place / rotate / scale the field frame
+        expr "sin(28*x)*cos(28*y) + sin(28*y)*cos(28*z) + sin(28*z)*cos(28*x)"
+    }
+    contained_by { min 0.3 0.3 0.25   max 0.7 0.7 0.65 }   # REQUIRED bound box
+    max_gradient 48                       # (optional) Lipschitz bound; auto-estimated if omitted
+    accuracy 1e-4                         # (optional) march-step floor, world units
+}
+```
+
+The `expr` string is compiled by the **same math VM as procedural patterns** (variables
+`x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
+atan2 clamp mix smoothstep noise`, and the constant `pi`). Because an arbitrary field is
+**not** a signed distance and has no analytic bound, a `function` isosurface **must**
+supply a `contained_by { min <x y z>  max <x y z> }` box (the region the surface is
+marched inside). Safe sphere-tracing needs a **Lipschitz bound** `L ≥ max|∇f|` so a step
+of `|f|/L` never overshoots the first zero crossing; give it explicitly with
+`max_gradient`, or omit it and the loader auto-estimates it by sampling `|∇f|` over the
+box (padded ×1.3). `accuracy` overrides the march-step floor. A `function` leaf also
+composes inside CSG combinators (`union`, `difference`, `blob`, …) like any other leaf.
+The worked gyroid example is in `scenes/function.ftsl`; expression isosurfaces run on
+**both the CPU and the GPU** (the device evaluates the identical formula VM — an
+expression sphere matches the analytic `sphere` leaf to RMSE ≈ 0.15 % on the same
+backend).
 
 ## Textures
 
@@ -480,11 +515,12 @@ function by default; Rayleigh optional.
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
 field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
-surface / CSG / metaballs), `light`, `group`, `medium`, `camera`, `camera_path`
-(keyframed camera animation), and `render` (render-setting overrides). See the
-`scenes/` directory for worked examples (`cornell.ftsl`, `fisheye.ftsl`,
-`spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`, `realcam.ftsl`,
-`implicit.ftsl`, `procedural.ftsl`, `translucency.ftsl`, …).
+surface / CSG / metaballs / arbitrary `function` formulas), `light`, `group`, `medium`,
+`camera`, `camera_path` (keyframed camera animation), and `render` (render-setting
+overrides). See the `scenes/` directory for worked examples (`cornell.ftsl`,
+`fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`,
+`realcam.ftsl`, `implicit.ftsl`, `function.ftsl`, `procedural.ftsl`,
+`translucency.ftsl`, …).
 
 ### Importing Mitsuba scenes
 

@@ -5,6 +5,30 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Resolved
 
+### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
+- **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
+  renders the zero set of a hand-typed equation (gyroid, Goursat, etc.), distinct from
+  the built-in analytic SDF leaves. The formula is compiled by the **same shunting-yard /
+  postfix VM as procedural patterns** (`compilePatternExpr`, vars `x y z` and `r=|p|`).
+- **Implementation:** `implicit.h` gained a `FieldOp::Expr` leaf (indices a per-`Implicit`
+  `exprNodes` PatNode pool via `exprOff/exprN`); `fieldLeafSDF`/`fieldEval`/`fieldGradient`
+  thread `const PatNode* exprPool`; new helpers `fieldHasExpr` +
+  `estimateFieldLipschitz` (samples `|∇f|` on a 24³ grid over the container box).
+  `ftsl.h` `addFunctionLeaf` + rewritten `addIsosurface` parse `function`,
+  `contained_by { min max }`, optional `max_gradient` (Lipschitz bound; auto-estimated
+  ×1.3 when omitted), and optional `accuracy` (march-step floor). GPU port in
+  `render_cuda.cu`: `DF_EXPR` op, `DFieldNode.exprOff/exprN`, a flat device
+  `fieldExprNodes` PatNode pool (`DScene::fieldExprNodes`), and `dFieldLeafSDF`/
+  `dFieldEval`/`dFieldGradient` thread the pool + call `dPatternEval` for the Expr case
+  (forward-declared above the field VM).
+- **Why a container box is required:** an arbitrary field is **not** a signed distance
+  and has no analytic AABB, so the marcher needs (1) a region to march inside and (2) a
+  Lipschitz bound `L ≥ max|∇f|` so a step of `|f|/L` never overshoots the first zero.
+- **Validation:** an expression sphere (`x*x+y*y+z*z-0.04`) matches the analytic `sphere`
+  leaf to **RMSE 0.37/255 (0.15 %) on the same backend** (the ~12.6 CPU↔GPU RMSE is the
+  inherent FP32/RNG divergence — the analytic sphere shows the same 12.58). `scenes/
+  function.ftsl` (gyroid) renders correctly on both CPU and GPU. Means match ~1 %.
+
 ### `-o foo.png` wrote a PPM (P6), not a PNG — extension was ignored [RESOLVED 2026-07-10]
 - **What was wrong:** the image writer (`writePPM` in `src/main.cpp`) always
   emitted binary PPM (P6) regardless of the output extension, so `ftrace -o

@@ -210,7 +210,11 @@ struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 // the sign-change bisection converges to ~1e-12, which needs the precision, and
 // implicits are already the expensive path, so the FP64 cost is acceptable. POD twins
 // of FieldOp / FieldNode / Implicit (see src/implicit.h).
-enum { DF_SPHERE = 0, DF_BOX, DF_TORUS, DF_PLANE, DF_CYLINDER, DF_CONE,
+// NOTE: this order MUST match FieldOp in implicit.h (dn.op = (int)fn.op on upload).
+// DF_EXPR is the arbitrary-formula isosurface leaf: its value is f(x,y,z) evaluated
+// by the pattern VM, NOT a signed distance, so the enclosing DImplicit carries a
+// container AABB + Lipschitz bound (see intersectImplicit / cudaForwardSupported).
+enum { DF_SPHERE = 0, DF_BOX, DF_TORUS, DF_PLANE, DF_CYLINDER, DF_CONE, DF_EXPR,
        DF_UNION, DF_INTERSECT, DF_DIFFERENCE,
        DF_SMOOTH_UNION, DF_SMOOTH_INTERSECT, DF_SMOOTH_DIFFERENCE };
 struct DFieldNode {
@@ -219,6 +223,7 @@ struct DFieldNode {
     double inv[9];        // world->local linear part (row-major, matches Affine::m)
     double tx, ty, tz;    // world->local translation (Affine::t)
     double scale;         // world = scale * local; d_world = d_local * scale (leaf only)
+    int    exprOff, exprN;// DF_EXPR: slice into DScene::fieldExprNodes (postfix PatNode program)
 };
 struct DImplicit {
     int    nodeOff, nodeN;   // slice [nodeOff, nodeOff+nodeN) into DScene::fieldNodes
@@ -348,6 +353,10 @@ struct DScene {
     // >= nTris+nSph map to implicits[prim - nTris - nSph]; fieldNodes is the flat
     // postfix node pool the DImplicit slices index into.
     const DFieldNode* fieldNodes;
+    // Flat postfix PatNode pool for DF_EXPR leaves (arbitrary-formula isosurfaces);
+    // each Expr FieldNode slices it by [exprOff, exprOff+exprN). Separate from
+    // patNodes so material patterns and field formulas don't share offsets.
+    const PatNode*    fieldExprNodes;
     const DImplicit*  implicits; int nImplicits;
     // Procedural patterns (§4): flat postfix PatNode pool + per-pattern slices.
     // A material's roughnessPat/filmThicknessPat/mixWeightPat index `patterns`.
@@ -785,10 +794,23 @@ __device__ static inline double dSmin(double a, double b, double k) {
 __device__ static inline double dSmax(double a, double b, double k) { return -dSmin(-a, -b, k); }
 
 // Leaf SDF at the leaf-LOCAL query point (px,py,pz). Mirrors fieldLeafSDF exactly.
-__device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz) {
+// Forward decl: DF_EXPR leaves evaluate their formula with the pattern VM, which is
+// defined further down (dPatternEval). The field VM only needs it for the Expr case.
+__device__ static double dPatternEval(const PatNode* nodes, int n,
+                                      double x, double y, double z, double f,
+                                      double nx, double ny, double nz, double r);
+
+__device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
+                                       const PatNode* exprPool) {
     switch (nd.op) {
         case DF_SPHERE:
             return sqrt(px*px + py*py + pz*pz) - nd.p[0];
+        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+            if (!exprPool) return BIG;
+            double r = sqrt(px*px + py*py + pz*pz);
+            return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
+                                0.0, 0.0, 0.0, r);
+        }
         case DF_BOX: {
             double r = nd.p[3];
             double qx = fabs(px) - nd.p[0] + r, qy = fabs(py) - nd.p[1] + r, qz = fabs(pz) - nd.p[2] + r;
@@ -829,7 +851,8 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
 }
 // Whole-field SDF at world point (pw) via the postfix scalar stack. Mirrors fieldEval.
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
-                                    double pwx, double pwy, double pwz) {
+                                    double pwx, double pwy, double pwz,
+                                    const PatNode* exprPool) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const DFieldNode& nd = nodes[i];
@@ -844,7 +867,7 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                 double plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
                 double ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
                 double plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
-                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz) * nd.scale;
+                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz, exprPool) * nd.scale;
             }
         }
     }
@@ -853,12 +876,13 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
 // Field gradient (tetrahedron central differences) -> unit normal. Mirrors fieldGradient.
 __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
                                       double px, double py, double pz, double eps,
-                                      double& gx, double& gy, double& gz) {
+                                      double& gx, double& gy, double& gz,
+                                      const PatNode* exprPool) {
     // stencil offsets k1(1,-1,-1) k2(-1,-1,1) k3(-1,1,-1) k4(1,1,1)
-    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps);
-    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps);
-    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps);
-    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps);
+    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool);
+    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool);
+    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps, exprPool);
+    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps, exprPool);
     gx =  f1 - f2 - f3 + f4;
     gy = -f1 - f2 + f3 + f4;
     gz = -f1 + f2 - f3 + f4;
@@ -878,6 +902,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     { double ta = (im.lo[2]-oz)*idz, tb = (im.hi[2]-oz)*idz; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
 
     const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
+    const PatNode* exprPool = sc.fieldExprNodes;
     const int N = im.nodeN;
     const double dlen = sqrt(dx*dx + dy*dy + dz*dz);
     const int MAX_STEP = 2048;
@@ -885,19 +910,19 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const double minStep = im.minStep > 0.0 ? im.minStep : 1e-4;
 
     double t = t0;
-    double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t);
+    double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
     for (int i = 0; i < MAX_STEP; ++i) {
         double step = fmax(fabs(f) * invLip, minStep) / dlen;
         double tn = t + step;
         bool last = false;
         if (tn >= t1) { tn = t1; last = true; }
-        double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn);
+        double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn, exprPool);
         bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) || (f == 0.0 && fn != 0.0);
         if (crossed) {
             double ta = t, tb = tn, fa = f;
             for (int b = 0; b < 60; ++b) {
                 double tm = 0.5*(ta + tb);
-                double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm);
+                double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm, exprPool);
                 if ((fa > 0.0) == (fm > 0.0)) { ta = tm; fa = fm; }
                 else                          { tb = tm; }
                 if ((tb - ta) * dlen < 1e-12) break;
@@ -906,7 +931,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             if (th < tmin || th >= (double)hit.t) return false;
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
-            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz);
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool);
             hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
             hit.ng = DVec3(gx, gy, gz);
             double side = dx*gx + dy*gy + dz*gz;
@@ -3011,6 +3036,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     // Flatten every Implicit's postfix FieldNode array into one pool; each DImplicit
     // slices it by [nodeOff, nodeOff+nodeN). BVH prims >= nTris+nSph index these.
     std::vector<DFieldNode> fieldNodes;
+    std::vector<PatNode>    fieldExprNodes;   // flat pool for DF_EXPR formulas (all implicits)
     std::vector<DImplicit>  dimpl(scene.implicits.size());
     for (size_t i = 0; i < scene.implicits.size(); ++i) {
         const Implicit& im = scene.implicits[i]; DImplicit& d = dimpl[i];
@@ -3020,6 +3046,11 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         d.lo[0] = im.bounds.lo.x; d.lo[1] = im.bounds.lo.y; d.lo[2] = im.bounds.lo.z;
         d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
         d.lipschitz = im.lipschitz; d.minStep = im.minStep;
+        // Rebase this implicit's expr programs into the shared device pool. Each Implicit
+        // owns a private exprNodes vector on the host (FieldNode.exprOff indexes it), so we
+        // add the running base and copy the programs into fieldExprNodes.
+        int exprBase = (int)fieldExprNodes.size();
+        fieldExprNodes.insert(fieldExprNodes.end(), im.exprNodes.begin(), im.exprNodes.end());
         for (const FieldNode& fn : im.nodes) {
             DFieldNode dn;
             dn.op = (int)fn.op;
@@ -3027,6 +3058,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
             for (int k = 0; k < 9; ++k) dn.inv[k] = fn.inv.m[k];
             dn.tx = fn.inv.t.x; dn.ty = fn.inv.t.y; dn.tz = fn.inv.t.z;
             dn.scale = fn.scale;
+            dn.exprOff = (fn.op == FieldOp::Expr) ? exprBase + fn.exprOff : -1;
+            dn.exprN   = (fn.op == FieldOp::Expr) ? fn.exprN : 0;
             fieldNodes.push_back(dn);
         }
     }
@@ -3098,6 +3131,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     int*       d_prim  = primIdx.empty() ? nullptr : (int*)keep(uploadVec(primIdx));
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
     DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
+    PatNode*    d_fexpr  = fieldExprNodes.empty() ? nullptr : (PatNode*)keep(uploadVec(fieldExprNodes));
     DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
     PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
     DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
@@ -3211,7 +3245,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
-    sc.fieldNodes = d_fnodes; sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
+    sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
+    sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
