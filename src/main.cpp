@@ -968,10 +968,14 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int res,
 // same caveat as modes R/V. Classification uses the pixel-centre camera ray, so
 // silhouette pixels are assigned wholesale to one side (a sub-pixel edge approx).
 static Film renderComposite(const Scene& scene, const Camera& cam, int res,
-                            long long N, long long spp, int nThreads, bool diffraction = true) {
+                            long long N, long long spp, int nThreads, bool diffraction = true,
+                            bool useGpu = false) {
     EnergyReport e;
+    // Only the forward (model-B) layer can run on the GPU; the camera-side backward
+    // layer (renderBackward, below) is CPU-only. useGpu therefore accelerates just the
+    // forward half of the composite.
     Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                             /*forwardCatch*/false, /*useCamera*/true, e, diffraction);
+                             /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
     Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
 
@@ -1089,10 +1093,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool forwardCatch = (mode == 'C');
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
-    // covers the forward light trace (models A/B/C, and the forward pass of mode V);
-    // the backward tracer (mode R, the mode-P camera-side layer) and fluorescent
-    // scenes always run on the CPU.
-    const bool gpuForwardMode = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V');
+    // covers the forward light trace (models A/B/C, the forward pass of mode V, and
+    // the forward layer of the mode-P composite); the backward tracer (mode R, the
+    // mode-P camera-side layer) and fluorescent scenes always run on the CPU.
+    const bool gpuForwardMode =
+        (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
     bool useGpu = false;
@@ -1120,8 +1125,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                      "material)\n");
         } else {
             useGpu = true;
-            std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
-                        cudaDeviceName());
+            std::printf("[device] %s -> GPU: %s%s\n", wantAuto ? "auto" : "gpu",
+                        cudaDeviceName(),
+                        mode == 'P' ? " (forward layer; camera-side stays CPU)" : "");
         }
 #else
         if (wantGpu)
@@ -1201,7 +1207,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, res, nThreads, lightLabel);
-        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction);
+        Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction, useGpu);
         writeFilm(outPath.c_str(), comp, 1.0, manualExposure);
         return 0;
     }
