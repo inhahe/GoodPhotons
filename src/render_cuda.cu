@@ -118,11 +118,14 @@ HD static inline void onb(const DVec3& n, DVec3& t, DVec3& b) {
 HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
 // Material type tags (must match MatType order in scene.h).
-enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM, D_GRATING, D_MIX };
+enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM, D_GRATING, D_MIX, D_MULTILAYER };
 
 // Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
 // exceed this fall back to the CPU forward tracer (cudaForwardSupported).
 #define D_MIXMAX 8
+
+// Maximum layers in a Multilayer stack on the GPU. Deeper stacks fall back to CPU.
+#define D_MAXLAYERS 16
 
 // Camera measurement model (mirrors -mode A/B/C).
 enum { CAM_A = 0, CAM_B = 1, CAM_C = 2 };
@@ -134,6 +137,10 @@ struct DMaterial {
     double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
     double roughness;
     double filmIor, filmThickness;
+    // Multilayer stack (D_MULTILAYER): per-layer index/extinction/thickness; the
+    // substrate is ior + substrateK (spectral). layer 0 is outermost.
+    int    layerCount;
+    double layerN[D_MAXLAYERS], layerK[D_MAXLAYERS], layerThick[D_MAXLAYERS];
     double grooveSpacing;
     DVec3  grooveDir;
     int    gratingMaxOrder;
@@ -403,6 +410,54 @@ __device__ static inline DCplx csqrt_(DCplx z) {  // principal root, then force 
     DCplx s(re, im);
     return s.im < 0 ? DCplx(-s.re, -s.im) : s;
 }
+__device__ static inline DCplx crmul(Real a, DCplx b) { return DCplx(a * b.re, a * b.im); }
+__device__ static inline DCplx cimul(DCplx a) { return DCplx(-a.im, a.re); }  // i*a
+__device__ static inline DCplx ccos_(DCplx z) {  // cos(a+bi) = cos a cosh b - i sin a sinh b
+    return DCplx(cos(z.re) * cosh(z.im), -sin(z.re) * sinh(z.im));
+}
+__device__ static inline DCplx csin_(DCplx z) {  // sin(a+bi) = sin a cosh b + i cos a sinh b
+    return DCplx(sin(z.re) * cosh(z.im), cos(z.re) * sinh(z.im));
+}
+
+// Multilayer stack reflectance (Abeles characteristic matrix; port of render.h
+// multilayerReflectance). nL/kL/dL are the per-layer index/extinction/thickness,
+// nLayers entries; substrate ns + i*ks. Returns R in [0,1].
+__device__ static Real multilayerReflectance(Real n0, Real cosI, Real lambda,
+                                             const double* nL, const double* kL,
+                                             const double* dL, int nLayers,
+                                             Real ns, Real ks) {
+    cosI = clamp01(fabs(cosI));
+    Real sin0_2 = fmax((Real)0, (Real)1 - cosI * cosI);
+    Real n0s = n0 * n0 * sin0_2;
+    Real q0 = n0 * cosI;
+    Real Racc = 0;
+    for (int pol = 0; pol < 2; ++pol) {
+        bool pPol = (pol == 1);
+        DCplx M00(1, 0), M01(0, 0), M10(0, 0), M11(1, 0);
+        for (int j = 0; j < nLayers; ++j) {
+            DCplx nj((Real)nL[j], (Real)kL[j]);
+            DCplx qj = csqrt_(csub(cmul(nj, nj), DCplx(n0s, 0)));
+            DCplx eta = pPol ? cdiv(cmul(nj, nj), qj) : qj;
+            DCplx delta = crmul((Real)(2.0 * DPI * dL[j] / (double)lambda), qj);
+            DCplx c = ccos_(delta), s = csin_(delta);
+            DCplx L00 = c, L01 = cdiv(cimul(s), eta), L10 = cimul(cmul(eta, s)), L11 = c;
+            DCplx n00 = cadd(cmul(M00, L00), cmul(M01, L10));
+            DCplx n01 = cadd(cmul(M00, L01), cmul(M01, L11));
+            DCplx n10 = cadd(cmul(M10, L00), cmul(M11, L10));
+            DCplx n11 = cadd(cmul(M10, L01), cmul(M11, L11));
+            M00 = n00; M01 = n01; M10 = n10; M11 = n11;
+        }
+        DCplx nsub(ns, ks);
+        DCplx qs = csqrt_(csub(cmul(nsub, nsub), DCplx(n0s, 0)));
+        DCplx etaS = pPol ? cdiv(cmul(nsub, nsub), qs) : qs;
+        DCplx eta0 = pPol ? DCplx(n0 * n0 / q0, 0) : DCplx(q0, 0);
+        DCplx B = cadd(M00, cmul(M01, etaS));
+        DCplx C = cadd(M10, cmul(M11, etaS));
+        DCplx r = cdiv(csub(cmul(eta0, B), C), cadd(cmul(eta0, B), C));
+        Racc += clamp01(cnorm(r));
+    }
+    return (Real)0.5 * Racc;
+}
 
 // Thin-film Airy reflectance (port of render.h thinFilmReflectance). k2 is the
 // substrate extinction coefficient: k2==0 uses the exact real-valued path (matches
@@ -628,6 +683,43 @@ __device__ static bool thinFilmInterface(const DMaterial& m, const DHit& h, cons
     outDir = normalize(outDir);
     ro = h.p + outDir * RAY_EPS; rd = outDir;
     return true;
+}
+// Multilayer stack interface (port of render.h multilayerInterface). Returns false
+// if the photon is absorbed by an absorbing stack/substrate.
+__device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, const DVec3& d,
+                                            Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
+    Real ns = specLookup(m.ior, lambda);
+    Real ks = specLookup(m.substrateK, lambda);
+    int nL = m.layerCount;
+    bool entering = dot(d, h.ng) < 0;
+    DVec3 nl = entering ? h.ng : -h.ng;
+    Real cosI = -dot(d, nl);
+    bool anyAbs = ks > 0;
+    for (int j = 0; j < nL; ++j) if (m.layerK[j] != 0) { anyAbs = true; break; }
+    if (anyAbs) {                                // opaque: reflect-or-absorb
+        if (!entering) return false;
+        Real R = multilayerReflectance((Real)1, cosI, lambda, m.layerN, m.layerK, m.layerThick, nL, ns, ks);
+        if (rng.uniform() >= R) return false;
+        DVec3 o = normalize(reflectv(d, nl)); ro = h.p + o * RAY_EPS; rd = o; return true;
+    }
+    Real nA = entering ? (Real)1 : ns, nB = entering ? ns : (Real)1;
+    Real eta = nA / nB;
+    Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
+    DVec3 outDir;
+    if (sin2t > 1) outDir = reflectv(d, nl);
+    else {
+        Real cosT = sqrt((Real)1 - sin2t);
+        Real R;
+        if (entering) R = multilayerReflectance((Real)1, cosI, lambda, m.layerN, m.layerK, m.layerThick, nL, ns, (Real)0);
+        else {
+            double rn[D_MAXLAYERS], rk[D_MAXLAYERS], rt[D_MAXLAYERS];
+            for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rt[j] = m.layerThick[nL-1-j]; }
+            R = multilayerReflectance(ns, cosI, lambda, rn, rk, rt, nL, (Real)1, (Real)0);
+        }
+        if (rng.uniform() < R) outDir = reflectv(d, nl);
+        else outDir = d * eta + nl * (eta * cosI - cosT);
+    }
+    outDir = normalize(outDir); ro = h.p + outDir * RAY_EPS; rd = outDir; return true;
 }
 // Grating diffraction (port of render.h gratingDiffract). Returns false if absorbed.
 __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const DVec3& din,
@@ -926,6 +1018,10 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
                 DVec3 nro, nrd;
                 if (!thinFilmInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; done = true; break; }
                 ro = nro; rd = nrd; continue;
+            } else if (m.type == D_MULTILAYER) {
+                DVec3 nro, nrd;
+                if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; done = true; break; }
+                ro = nro; rd = nrd; continue;
             } else if (m.type == D_MIRROR) {
                 Real r = clamp01(specLookup(m.reflect, lambda));
                 if (rng.uniform() >= r) { eAbsorbed += beta; done = true; break; }
@@ -1004,8 +1100,15 @@ bool cudaForwardSupported(const Scene& scene) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
                scene.mats[matId].reflectTex >= 0;
     };
+    // The device multilayer stack has a fixed cap (D_MAXLAYERS); scenes with a
+    // deeper stack fall back to the CPU tracer, which has no layer limit.
+    auto oversizedMultilayer = [&](int matId) {
+        return matId >= 0 && matId < (int)scene.mats.size() &&
+               scene.mats[matId].type == MatType::Multilayer &&
+               (int)scene.mats[matId].layerN.size() > D_MAXLAYERS;
+    };
     auto unsupported = [&](int matId) {
-        if (isFluoro(matId) || textured(matId)) return true;
+        if (isFluoro(matId) || textured(matId) || oversizedMultilayer(matId)) return true;
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
@@ -1080,6 +1183,11 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         bakeSpec(m.substrateK, d.substrateK);
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
+        d.layerCount = (int)m.layerN.size();
+        if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;   // cudaForwardSupported rejects deeper
+        for (int k = 0; k < d.layerCount; ++k) {
+            d.layerN[k] = m.layerN[k]; d.layerK[k] = m.layerK[k]; d.layerThick[k] = m.layerThick[k];
+        }
         d.grooveSpacing = m.grooveSpacing;
         d.grooveDir = {m.grooveDir.x, m.grooveDir.y, m.grooveDir.z};
         d.gratingMaxOrder = m.gratingMaxOrder;

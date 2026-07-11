@@ -10,7 +10,7 @@
 #include "texture.h"
 #include "envmap.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -20,7 +20,8 @@ enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescen
 inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||
-           t == MatType::Glossy     || t == MatType::Grating;
+           t == MatType::Glossy     || t == MatType::Grating ||
+           t == MatType::Multilayer;
 }
 
 struct Material {
@@ -53,6 +54,16 @@ struct Material {
     double filmIor = 1.30;                      // coating refractive index n1
     double filmThickness = 300.0;              // coating thickness in nanometres
     Spectrum substrateK = constantSpectrum(0.0); // substrate extinction kappa (0 = transparent)
+
+    // --- Multilayer thin-film stack (MatType::Multilayer) -------------------
+    // An ordered stack of thin dielectric/absorbing layers between the incident
+    // medium (air) and the substrate (`ior` + `substrateK`), evaluated with the
+    // Abeles characteristic-matrix method (render.h multilayerReflectance). This is
+    // the true model for Bragg-stack structural colour: beetle elytra, Morpho
+    // wings, nacre, and dichroic/dielectric mirrors. layerN[j]/layerK[j] are the
+    // (constant) real/imaginary index of layer j; layerThick[j] its thickness in
+    // nanometres. Layer 0 is the outermost (nearest the incident medium).
+    std::vector<double> layerN, layerK, layerThick;
 
     // --- Diffraction grating (MatType::Grating) -----------------------------
     // A reflective diffraction grating with groove period `grooveSpacing` (nm) and

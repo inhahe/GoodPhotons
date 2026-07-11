@@ -504,6 +504,64 @@ static int checkThinFilm() {
     return pass ? 0 : 1;
 }
 
+// Deterministic multilayer self-test. The general Abeles transfer-matrix
+// multilayerReflectance() must reduce EXACTLY to the closed-form single-film
+// Airy reflectance (thinFilmReflectance) when the stack is a single lossless
+// layer over a lossless substrate — this is the strong correctness anchor for
+// the N-layer material. Also checks (b) a symmetric quarter-wave dielectric
+// mirror is highly reflective at its design wavelength, and (c) energy stays in
+// [0,1] over a full angle/wavelength sweep of a multi-layer stack.
+static int checkMultilayer() {
+    const double n0 = 1.0, n1 = 1.30, n2 = 1.50, d = 300.0;
+
+    // (a) single lossless layer == closed-form Airy across the full sweep.
+    double maxDiff = 0.0;
+    for (double lam = 380.0; lam <= 720.0; lam += 2.0)
+        for (double ci = 0.05; ci <= 1.0; ci += 0.05) {
+            double nL[1] = { n1 }, kL[1] = { 0.0 }, dL[1] = { d };
+            double Rml = multilayerReflectance(n0, ci, lam, nL, kL, dL, 1, n2, 0.0);
+            double Rtf = thinFilmReflectance(n0, n1, n2, 0.0, d, ci, lam);
+            maxDiff = std::max(maxDiff, std::fabs(Rml - Rtf));
+        }
+    bool passA = maxDiff < 1e-9;
+
+    // (b) a quarter-wave Bragg stack (alternating high/low index, each layer an
+    //     optical quarter-wave at the design wavelength) is a strong reflector at
+    //     that wavelength. n_H=2.30, n_L=1.38, design lam0=550nm, 8 pairs.
+    const double nH = 2.30, nL_ = 1.38, lam0 = 550.0;
+    const double dH = lam0 / (4.0 * nH), dL_ = lam0 / (4.0 * nL_);
+    const int pairs = 8, NL = 2 * pairs;
+    std::vector<double> sn(NL), sk(NL, 0.0), sd(NL);
+    for (int p = 0; p < pairs; ++p) {
+        sn[2 * p] = nH; sd[2 * p] = dH;
+        sn[2 * p + 1] = nL_; sd[2 * p + 1] = dL_;
+    }
+    double Rdesign = multilayerReflectance(1.0, 1.0, lam0, sn.data(), sk.data(),
+                                           sd.data(), NL, 1.52, 0.0);
+    bool passB = Rdesign > 0.95;
+
+    // (c) energy stays in [0,1] across a full sweep of the Bragg stack.
+    bool inRange = true; double rmin = 1e9, rmax = -1e9;
+    for (double lam = 380.0; lam <= 720.0; lam += 2.0)
+        for (double ci = 0.05; ci <= 1.0; ci += 0.05) {
+            double R = multilayerReflectance(1.0, ci, lam, sn.data(), sk.data(),
+                                             sd.data(), NL, 1.52, 0.0);
+            if (R < -1e-9 || R > 1.0 + 1e-9) inRange = false;
+            rmin = std::min(rmin, R); rmax = std::max(rmax, R);
+        }
+    bool passC = inRange;
+
+    bool pass = passA && passB && passC;
+    std::printf("[checkmultilayer] single-layer vs Airy: max|dR|=%.3e  (%s)\n",
+                maxDiff, passA ? "match" : "MISMATCH");
+    std::printf("[checkmultilayer] quarter-wave Bragg stack R@%.0fnm=%.4f  (%s)\n",
+                lam0, Rdesign, passB ? "high-reflect" : "TOO LOW");
+    std::printf("[checkmultilayer] Bragg-stack sweep range: [%.4f, %.4f]  (%s)\n",
+                rmin, rmax, passC ? "in [0,1]" : "OUT OF RANGE");
+    std::printf("[checkmultilayer] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 // Deterministic diffraction-grating self-test. Validates that gratingDiffract
 // obeys the exact vector grating equation, conserves the propagating-order set,
 // reduces to specular reflection at m=0 (and with diffraction disabled), and is
@@ -1051,6 +1109,7 @@ int main(int argc, char** argv) {
     double filmThickness = 300.0; // thin-film coating thickness (nm) for -scene iridescent
     double filmIor = 1.30;        // thin-film coating refractive index
     bool checkThinFilmOnly = false;
+    bool checkMultilayerOnly = false;
     bool thinFilmSwatchOnly = false;
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
@@ -1110,6 +1169,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-filmthickness") && i + 1 < argc) filmThickness = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-filmior") && i + 1 < argc) filmIor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkthinfilm")) checkThinFilmOnly = true;
+        else if (!std::strcmp(argv[i], "-checkmultilayer")) checkMultilayerOnly = true;
         else if (!std::strcmp(argv[i], "-thinfilmswatch")) thinFilmSwatchOnly = true;
         else if (!std::strcmp(argv[i], "-diffraction") && i + 1 < argc) {
             const char* v = argv[++i];
@@ -1126,6 +1186,7 @@ int main(int argc, char** argv) {
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
+    if (checkMultilayerOnly) return checkMultilayer(); // deterministic, no scene needed
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed

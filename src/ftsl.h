@@ -551,6 +551,22 @@ private:
             m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
             m.fluoYield = dblOf(b, "yield", 1.0);
             m.fluoEmitSampler.build(m.fluoEmit, 1.0);
+        } else if (type == "multilayer") {
+            // Multilayer thin-film stack (Bragg / dichroic). Substrate index/kappa
+            // via ior / substrate_k; the stack is an ordered list of `layer <n> <k>
+            // <thickness_nm>` statements, layer 0 outermost (nearest the incident
+            // air). Evaluated with the Abeles characteristic-matrix method.
+            m.type = MatType::Multilayer;
+            m.ior = spectrumParam(b, "ior", iorConstant(1.5));
+            m.substrateK = spectrumParam(b, "substrate_k", constantSpectrum(0.0));
+            for (const auto& s : b.stmts) {
+                if (s.key != "layer") continue;
+                if (s.val.words.size() < 3) { fail("multilayer 'layer' needs: <n> <k> <thickness_nm>"); return m; }
+                m.layerN.push_back(num(s.val.words[0]));
+                m.layerK.push_back(num(s.val.words[1]));
+                m.layerThick.push_back(num(s.val.words[2]));
+            }
+            if (m.layerN.empty()) { fail("multilayer material has no 'layer' entries"); return m; }
         } else if (type == "mix") {
             // Stochastic mix of named child materials. Children are resolved to
             // indices in a second pass (they may be declared later in the file);

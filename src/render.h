@@ -177,6 +177,58 @@ inline double thinFilmReflectance(double n0, double n1, double n2, double k2,
     return 0.5 * (Rpol(r01s, r12s) + Rpol(r01p, r12p));
 }
 
+// --- Multilayer stack reflectance (Abeles characteristic-matrix method) ------
+// Power reflectance of an ordered stack of `nLayers` thin films (per-layer real
+// index nL[j], extinction kL[j], thickness dL[j] in nm) between incident medium n0
+// and substrate ns+i*ks. This is the exact generalisation of the single-film Airy
+// formula to N layers, handling absorbing layers/substrate via complex indices.
+// The colour of a Bragg stack (beetle/Morpho/nacre) or a dichroic mirror falls out
+// of the multiple-layer interference. cosI is cos of the incidence angle in n0; all
+// thicknesses and lambda share units (nanometres). Returns R in [0,1].
+//
+// Each layer contributes the characteristic matrix
+//   M_j = [[cos d_j, i sin d_j / eta_j], [i eta_j sin d_j, cos d_j]]
+// with phase thickness d_j = (2 pi / lambda) q_j t_j and transverse admittance
+// q_j = sqrt(n_j^2 - n0^2 sin^2 theta0); eta = q (s-pol) or n^2/q (p-pol). The
+// stack product M, closed with the substrate admittance, gives r = (eta0 B - C) /
+// (eta0 B + C) and R = |r|^2, averaged over the two polarisations.
+inline double multilayerReflectance(double n0, double cosI, double lambda,
+                                    const double* nL, const double* kL,
+                                    const double* dL, int nLayers,
+                                    double ns, double ks) {
+    using cd = std::complex<double>;
+    cosI = clamp01(std::fabs(cosI));
+    double sin0_2 = std::max(0.0, 1.0 - cosI * cosI);
+    double n0s = n0 * n0 * sin0_2;
+    double q0 = n0 * cosI;                         // incident transverse admittance (real)
+    auto admit = [](cd nsq, cd q, bool pPol) { return pPol ? nsq / q : q; };
+    auto solve = [&](bool pPol) {
+        cd M00(1, 0), M01(0, 0), M10(0, 0), M11(1, 0);   // identity
+        for (int j = 0; j < nLayers; ++j) {
+            cd nj(nL[j], kL[j]);
+            cd qj = std::sqrt(nj * nj - cd(n0s, 0.0));
+            if (qj.imag() < 0.0) qj = -qj;
+            cd eta = admit(nj * nj, qj, pPol);
+            cd delta = cd(2.0 * PI * dL[j] / lambda, 0.0) * qj;
+            cd c = std::cos(delta), s = std::sin(delta);
+            cd L00 = c, L01 = cd(0, 1) * s / eta, L10 = cd(0, 1) * eta * s, L11 = c;
+            cd n00 = M00 * L00 + M01 * L10, n01 = M00 * L01 + M01 * L11;
+            cd n10 = M10 * L00 + M11 * L10, n11 = M10 * L01 + M11 * L11;
+            M00 = n00; M01 = n01; M10 = n10; M11 = n11;
+        }
+        cd nsub(ns, ks);
+        cd qs = std::sqrt(nsub * nsub - cd(n0s, 0.0));
+        if (qs.imag() < 0.0) qs = -qs;
+        cd etaS = admit(nsub * nsub, qs, pPol);
+        cd eta0 = pPol ? cd(n0 * n0 / q0, 0.0) : cd(q0, 0.0);
+        cd B = M00 + M01 * etaS;
+        cd C = M10 + M11 * etaS;
+        cd r = (eta0 * B - C) / (eta0 * B + C);
+        return clamp01(std::norm(r));
+    };
+    return 0.5 * (solve(false) + solve(true));
+}
+
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
@@ -405,6 +457,15 @@ struct Renderer {
                     ray = nr;
                     continue;                       // lossless on survival; beta unchanged
                 }
+                case MatType::Multilayer: {
+                    // Multilayer (Bragg / dichroic) stack: specular reflect-or-
+                    // refract with the Abeles full-stack reflectance. Absorbing
+                    // stacks/substrates absorb the transmitted fraction here.
+                    Ray nr;
+                    if (!multilayerInterface(m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return; }
+                    ray = nr;
+                    continue;                       // lossless on survival; beta unchanged
+                }
                 case MatType::Mirror: {
                     double r = clamp01(m.reflect(lambda));
                     // Russian roulette: absorb with prob (1-r), else reflect with
@@ -553,6 +614,72 @@ struct Renderer {
             // incidence medium nA, coating nf, transmission medium nB. Reciprocal,
             // so entering and exiting rays see the same R (energy consistent).
             double R = thinFilmReflectance(nA, nf, nB, 0.0, m.filmThickness, cosI, lambda);
+            if (rng.uniform() < R) outDir = reflect(d, nl);
+            else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+        }
+        outDir = normalize(outDir);
+        out = Ray{h.p + outDir * 1e-6, outDir};
+        return true;
+    }
+
+    // Multilayer thin-film stack interface (Abeles). The reflection probability is
+    // the full-stack reflectance R(lambda, theta). Two regimes, like thinFilm:
+    //   Lossless stack (every layer real AND transparent substrate): reflect with
+    //     prob R, else refract into the substrate index (dichroic/dielectric-mirror
+    //     behaviour -- a wavelength band reflects, the rest transmits).
+    //   Any absorption (an absorbing layer OR absorbing substrate): reflect with
+    //     prob R, else the transmitted light is absorbed -> the photon terminates
+    //     (opaque structural colour: beetle/Morpho on an absorbing base).
+    // Returns false when the photon is absorbed (caller terminates the path).
+    bool multilayerInterface(const Material& m, const Hit& h, const Vec3& d,
+                             double lambda, Pcg32& rng, Ray& out) const {
+        double ns = m.ior(lambda);              // substrate index
+        double ks = m.substrateK(lambda);       // substrate extinction
+        int nL = (int)m.layerN.size();
+        bool entering = dot(d, h.ng) < 0.0;
+        Vec3 nl = entering ? h.ng : -h.ng;
+        double cosI = -dot(d, nl);              // > 0
+        bool anyLayerAbsorbs = false;
+        for (int j = 0; j < nL; ++j) if (m.layerK[j] != 0.0) { anyLayerAbsorbs = true; break; }
+        bool opaque = (ks > 0.0) || anyLayerAbsorbs;
+
+        // For a hit from inside, reverse the stack order so the ray sees the layers
+        // in traversal order (substrate-side first). Incident medium is the medium
+        // the ray is actually in (air outside, substrate inside for a clear stack).
+        if (opaque) {                           // one-sided: reflect-or-absorb
+            if (!entering) return false;        // inside the absorbing body: absorbed
+            double R = multilayerReflectance(1.0, cosI, lambda,
+                                             m.layerN.data(), m.layerK.data(),
+                                             m.layerThick.data(), nL, ns, ks);
+            if (rng.uniform() >= R) return false;               // transmitted -> absorbed
+            Vec3 o = normalize(reflect(d, nl));
+            out = Ray{h.p + o * 1e-6, o};
+            return true;
+        }
+
+        // Lossless: reflect-or-refract into/out of the transparent substrate.
+        double nA = entering ? 1.0 : ns;
+        double nB = entering ? ns : 1.0;
+        double eta = nA / nB;
+        double sin2t = eta * eta * (1.0 - cosI * cosI);
+        Vec3 outDir;
+        if (sin2t > 1.0) {
+            outDir = reflect(d, nl);            // total internal reflection
+        } else {
+            double cosT = std::sqrt(1.0 - sin2t);
+            // Evaluate the stack from the incidence side. When exiting (ray inside
+            // the substrate) the stack is traversed in reverse and the incident
+            // medium is ns; build reversed layer arrays for that case.
+            double R;
+            if (entering) {
+                R = multilayerReflectance(1.0, cosI, lambda,
+                                          m.layerN.data(), m.layerK.data(),
+                                          m.layerThick.data(), nL, ns, 0.0);
+            } else {
+                std::vector<double> rn(nL), rk(nL), rd(nL);
+                for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rd[j] = m.layerThick[nL-1-j]; }
+                R = multilayerReflectance(ns, cosI, lambda, rn.data(), rk.data(), rd.data(), nL, 1.0, 0.0);
+            }
             if (rng.uniform() < R) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }

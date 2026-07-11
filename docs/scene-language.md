@@ -180,6 +180,8 @@ material "beam50"  { type halfmirror reflect 0.5 }
 material "brushed" { type glossy     reflect spectrum:gold  roughness 0.2 }
 material "bubble"  { type thinfilm   ior 1.5  film_ior 1.33  film_thickness 380 }
 material "anodized"{ type thinfilm   ior 1.2  film_ior 1.45  film_thickness 430  substrate_k 3.0 }
+material "beetle"  { type multilayer ior 1.5                        # Bragg / dichroic stack
+                     layer 2.30 0.0 59.8   layer 1.38 0.0 99.6      # (repeat quarter-wave pairs) }
 material "grating" { type grating    reflect 0.9  groove_spacing 1000  groove_dir 1 0 0  max_order 3 }
 material "glow"    { type fluorescent  absorb spectrum:excite  emit spectrum:emit_green
                      yield 0.9  reflect 0.1 }
@@ -195,6 +197,7 @@ material "glow"    { type fluorescent  absorb spectrum:excite  emit spectrum:emi
 | `halfmirror`  | **semi-mirror / beamsplitter**    | `reflect <spectrum>` → `reflect` used as reflection **probability**; the rest passes straight through (semi-transparency). |
 | `glossy`      | **glossiness / brushed metal**    | `reflect <spectrum>` → `reflect`; `roughness <0..1>` → `roughness` (power-cosine lobe width).                    |
 | `thinfilm`    | **iridescence** (Airy interference) | `ior <spectrum>` (substrate) → `ior`; `film_ior <n>` → `filmIor`; `film_thickness <nm>` → `filmThickness`; `substrate_k <spectrum>` → `substrateK` (substrate extinction κ; **0 = transparent** substrate → lossless reflect-or-refract; **>0 = absorbing/metallic** substrate → **opaque** structural colour, transmitted light absorbed). |
+| `multilayer`  | **structural colour** (N-layer Abelès transfer matrix) | `ior <spectrum>` (substrate) → `ior`; `substrate_k <spectrum>` → `substrateK` (substrate κ, same rule as `thinfilm`); one or more ordered `layer <n> <k> <thickness_nm>` statements → `layerN`/`layerK`/`layerThick` (**layer 0 = outermost**, nearest incident air). A stack of alternating high/low-index quarter-wave layers is a Bragg/dichroic mirror (Morpho, jewel beetle, nacre, dielectric mirror). Any absorbing layer (`k > 0`) or absorbing substrate makes it **opaque** (reflect-or-absorb); a fully lossless stack over a transparent substrate is dichroic (reflect-or-refract). A single lossless layer reduces exactly to `thinfilm` Airy. GPU caps the stack at 16 layers; deeper stacks fall back to CPU. |
 | `grating`     | **diffraction** (vector grating eq.) | `reflect <spectrum>` → `reflect`; `groove_spacing <nm>` → `grooveSpacing`; `groove_dir x y z` → `grooveDir`; `max_order <int>` → `gratingMaxOrder`. |
 | `fluorescent` | **fluorescence** (wavelength shift) | `absorb <spectrum>` → `fluoAbsorb` (excitation ε(λ)); `emit <spectrum>` → `fluoEmit` (re-emission M(λ′), auto-baked into `fluoEmitSampler`); `yield <0..1>` → `fluoYield` (quantum yield Q); `reflect <spectrum>` → `reflect` (elastic base). |
 | `mix`         | **stochastic blend of materials** | `layer "<name>" <weight>` (repeatable) → `mixChildren`/`mixWeights`. Per photon, pick child `k` with prob `weight_k`; leftover `1 − Σweight` absorbs. Children are named non-mix materials. See §3.2. |
@@ -562,7 +565,9 @@ scale-safe — because they're computed from physical wavelengths.** The grating
 equation uses the dimensionless ratio `λ / grooveSpacing`, with **both in nm**
 (`src/scene.h`: `grooveSpacing` is nanometres; λ is nanometres). The thin-film
 phase is `φ = 4π·n·d·cosθ / λ` with `d` (`filmThickness`) and `λ` both in nm.
-So these effects depend only on absolute wavelength vs. absolute feature size —
+The `multilayer` transfer matrix is the same: each layer's phase `δ = (2π/λ)·q·t`
+uses `t` (`layerThick`) and `λ` in nm. So these effects depend only on absolute
+wavelength vs. absolute feature size —
 **the size of your room in metres is irrelevant to them.** You do *not* need a
 global "scene scale" knob to get diffraction right; you need the groove spacing
 and film thickness specified in real nm, which the format does.

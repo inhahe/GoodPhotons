@@ -319,6 +319,16 @@ struct BackwardRenderer {
                     specularArrival = true;
                     break;
                 }
+                case MatType::Multilayer: {
+                    // Multilayer stack: specular reflect-or-refract via the Abeles
+                    // full-stack reflectance, same delta-BSDF handling as Dielectric.
+                    // An absorbing stack/substrate terminates the path.
+                    Ray nr;
+                    if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr)) return L;
+                    ray = nr;
+                    specularArrival = true;
+                    break;
+                }
                 case MatType::Mirror: {
                     double r = clamp01(m.reflect(lambda));
                     if (rng.uniform() >= r) return L;      // RR absorb
