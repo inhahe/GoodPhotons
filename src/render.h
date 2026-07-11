@@ -539,6 +539,9 @@ struct Renderer {
             camSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
 
         Ray ray{origin + dir * 1e-6, dir};
+        // Dielectric the photon is currently INSIDE (for Beer-Lambert interior
+        // absorption / colored glass), or null in vacuum. Assumes non-nested glass.
+        const Material* interior = nullptr;
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             Hit h = scene.closestHit(ray);
@@ -568,6 +571,12 @@ struct Renderer {
                     e.sensor += beta;
                     return;
                 }
+            }
+
+            // Beer-Lambert attenuation over the free path just travelled inside glass.
+            if (interior) {
+                double a = interior->absorb(lambda);
+                if (a > 0.0) beta *= std::exp(-a * dEvent);
             }
 
             if (mediumEvent) {
@@ -620,8 +629,11 @@ struct Renderer {
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
                 case MatType::Dielectric: {
-                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng);
-                    continue;                       // lossless; beta unchanged
+                    bool entering = dot(ray.d, h.ng) < 0.0;
+                    bool transmitted = false;
+                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
+                    if (transmitted) interior = entering ? &m : nullptr;  // track medium
+                    continue;                       // lossless (absorption applied per-segment)
                 }
                 case MatType::ThinFilm: {
                     // Iridescent coated interface: specular reflect-or-refract with a

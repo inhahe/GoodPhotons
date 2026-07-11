@@ -252,6 +252,7 @@ struct BackwardRenderer {
         Renderer mats;                 // shared material sampling (stateless)
         mats.diffraction = diffraction; // grating order count follows the CLI toggle
 
+        const Material* interior = nullptr;   // dielectric the ray is inside (colored glass)
         for (int b = 0; b < maxBounce; ++b) {
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
@@ -266,6 +267,11 @@ struct BackwardRenderer {
                     double tMed = -std::log(1.0 - rng.uniform()) / st;
                     if (tMed < dSurf) {
                         Vec3 p = ray.o + ray.d * tMed;
+                        // Beer-Lambert attenuation over the in-glass free-flight leg.
+                        if (interior) {
+                            double a = interior->absorb(lambda);
+                            if (a > 0.0) thr *= std::exp(-a * tMed);
+                        }
                         L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
                         if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                             L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
@@ -288,6 +294,13 @@ struct BackwardRenderer {
             // so this BSDF-sampled hit is MIS-weighted (balance heuristic) against
             // that NEE to avoid double-counting. Same spdFn*invPdfLambda form as
             // surface emission, so forward and backward agree on env illumination.
+            // Beer-Lambert attenuation over the in-glass segment up to the surface
+            // (only when the ray actually reached a surface inside a dielectric).
+            if (interior && h.valid) {
+                double a = interior->absorb(lambda);
+                if (a > 0.0) thr *= std::exp(-a * dSurf);
+            }
+
             if (!h.valid) {
                 if (scene.envIndex >= 0) {
                     double Lenv = scene.envRadiance(ray.d, lambda) * invPdfLambda;
@@ -339,7 +352,10 @@ struct BackwardRenderer {
 
             switch (m.type) {
                 case MatType::Dielectric: {
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng);
+                    bool entering = dot(ray.d, h.ng) < 0.0;
+                    bool transmitted = false;
+                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
+                    if (transmitted) interior = entering ? &m : nullptr;
                     specularArrival = true;
                     break;
                 }

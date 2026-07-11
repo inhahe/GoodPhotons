@@ -278,10 +278,19 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
     (void)cam; (void)mode;   // cam/mode reserved for future NEE-to-camera & adjoint use
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;   // solid-angle density of the current ray direction
+    const Material* interior = nullptr;   // dielectric the subpath is inside (colored glass)
     for (int bounces = 0;;) {
         Hit h = scene.closestHit(ray);
         if (!h.valid) return;                        // escaped (no env in BDPT scope)
         if (h.sensorId >= 0) return;                 // model-A sensor: not used in BDPT
+
+        // Beer-Lambert attenuation over the in-glass segment just traversed. NOTE:
+        // this attenuates only the *subpath walk*; connection edges (connectBDPT)
+        // that cross glass are NOT absorption-weighted (see known-issues.md).
+        if (interior) {
+            double a = interior->absorb(lambda);
+            if (a > 0.0) beta *= std::exp(-a * h.t);
+        }
 
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
@@ -339,8 +348,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Dielectric: {
-                Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng);
+                bool entering = dot(ray.d, h.ng) < 0.0;
+                bool transmitted = false;
+                Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted);
                 wi = nr.d; betaFactor = 1.0; delta = true;
+                if (transmitted) interior = entering ? mp : nullptr;
                 break;
             }
             case MatType::HalfMirror: {
