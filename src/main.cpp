@@ -1856,7 +1856,21 @@ int main(int argc, char** argv) {
             c.apertureR = cs->aperture;
             if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
-            toRender.push_back({cs->name, c, effMode(cs->mode), cres, cs->exposureMul});
+            char cmode = effMode(cs->mode);
+            if (cs->lens) {
+                // Physical multi-element lens: the backward realistic-camera path traces
+                // rays from the film through the real glass, so it renders in mode R
+                // (the analytic pinhole/thin-lens modes A/B/C/P/D do not apply).
+                c.lens = cs->lens;
+                if (cmode != 'R') {
+                    std::printf("[camera] '%s' has a physical lens -> rendering in mode R "
+                                "(backward realistic camera); f=%.1fmm, sensor %.1fx%.1fmm\n",
+                                cs->name.c_str(), cs->lens->focalLengthMM(),
+                                cs->lens->filmW_mm, cs->lens->filmH_mm);
+                    cmode = 'R';
+                }
+            }
+            toRender.push_back({cs->name, c, cmode, cres, cs->exposureMul});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/ref) uses

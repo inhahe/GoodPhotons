@@ -7,8 +7,10 @@
 // there is a disk (or lens front element) we importance-sample instead of a point.
 #pragma once
 #include <cmath>
+#include <memory>
 #include "geometry.h"
 #include "scene_film.h"
+#include "lens.h"
 
 // Lens projection model: the mapping from a ray's angle-from-axis theta to its
 // image radius r (with focal length 1). RECTILINEAR (r = tan theta) is the normal
@@ -79,6 +81,13 @@ struct Camera {
     double filmDist  = 1.0;  // aperture->film distance (only ratio to apertureR matters for blur)
     double lensF     = 0.0;  // thin-lens focal length; 0 => no lens (straight-through
                              // camera obscura: blurred everywhere, no focus plane).
+
+    // Optional physical multi-element lens (the "mesh-lens" camera). When set, the
+    // backward reference tracer (mode R) generates rays by tracing them from the film
+    // out through the real glass interfaces (genLensRay), superseding the analytic
+    // pinhole/thin-lens projection. Shared so copies of a Camera share one lens.
+    std::shared_ptr<LensSystem> lens;
+    bool hasLens() const { return lens && !lens->surf.empty(); }
 
     // Configure a thin lens so the plane at `focusDist` in front of the lens
     // images sharply onto the film. Thin-lens law 1/so + 1/si = 1/f with the
@@ -194,6 +203,55 @@ struct Camera {
         Vec3 radial = (u * sx + v * sy) * (1.0 / rho);   // unit in-film direction
         Vec3 d = normalize(w * std::cos(th) + radial * std::sin(th));
         return Ray{eye, d};
+    }
+
+    // Generate a world-space camera ray for pixel (px,py) through the physical lens
+    // (requires hasLens()). Samples the film point (with pixel jitter jx,jy) and a
+    // point on the rear element disk (u1,u2), then refracts the ray from the film out
+    // through every glass interface at wavelength `lambda` (so chromatic aberration is
+    // exact). Returns false if the ray is vignetted (clipped by an element or the
+    // stop, or total-internal-reflected). On success `weight` is the radiometric
+    // importance (cos^4 * pupil-area / Z^2) that makes exposure, depth of field and
+    // corner vignetting physically correct; multiply the estimated radiance by it.
+    bool genLensRay(int px, int py, double jx, double jy, double u1, double u2,
+                    double lambda, Ray& worldRay, double& weight) const {
+        weight = 0.0;
+        const LensSystem& L = *lens;
+        // Film point in lens-local mm. The real image is inverted, so we negate the
+        // view coords: a +u/+v scene direction must come from a -x/-y film point,
+        // which reproduces the pinhole genRay()'s raster orientation.
+        double sx = 2.0 * ((px + jx) / (double)film.resX) - 1.0;
+        double sy = 2.0 * ((py + jy) / (double)film.resY) - 1.0;
+        // The renderer's film buffer may not share the sensor's aspect (it is square
+        // in the current pipeline). Anchor on the sensor width and derive the mapped
+        // vertical half-extent from the output pixel aspect so pixels stay square (no
+        // stretch); this crops the physical 3:2 sensor to the output frame.
+        double halfW = 0.5 * L.filmW_mm;
+        double halfH = halfW * ((double)film.resY / (double)film.resX);
+        Vec3 pFilm(-sx * halfW, -sy * halfH, L.filmZ);
+        // Uniform sample on the rear-element disk (the pupil we trace toward).
+        double rr = std::sqrt(u1 > 0 ? u1 : 0.0) * L.rearAperture();
+        double phi = 2.0 * PI * u2;
+        Vec3 pRear(rr * std::cos(phi), rr * std::sin(phi), L.rearZ());
+        Vec3 d0 = normalize(pRear - pFilm);
+        Ray outLocal;
+        if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
+        // PBRT-style importance: cos^4 of the film-ray axis angle, times the sampled
+        // pupil area, over the squared film->pupil axial distance.
+        double cosT = d0.z;                       // d0 is unit; z-component = cos to axis
+        if (cosT <= 0.0) return false;
+        double cos4 = (cosT * cosT) * (cosT * cosT);
+        double A = PI * L.rearAperture() * L.rearAperture();
+        double Z = L.rearZ() - L.filmZ;
+        if (Z <= 1e-9) return false;
+        weight = cos4 * A / (Z * Z);
+        // Lens-local (mm) -> world. The front-surface vertex plane is pinned at `eye`;
+        // transverse offsets and the axial (z-T) offset convert mm -> scene metres.
+        Vec3 oW = eye + (u * outLocal.o.x + v * outLocal.o.y) * 1e-3
+                      + w * ((outLocal.o.z - L.T) * 1e-3);
+        Vec3 dW = u * outLocal.d.x + v * outLocal.d.y + w * outLocal.d.z;
+        worldRay = Ray{oW, normalize(dW)};
+        return true;
     }
 
     // Image a photon that enters the lens at pupil point `A` travelling along

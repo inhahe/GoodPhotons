@@ -411,6 +411,20 @@ struct BackwardRenderer {
                     double lambda = scene.emitSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
                     double invPdfLambda = scene.invPdfLambda(lambda); // exact emitG/g(lambda)
+                    if (cam.hasLens()) {
+                        // Physical multi-element lens: trace the camera ray from the
+                        // film out through the real glass interfaces at this wavelength
+                        // (chromatic aberration + DoF + vignetting emerge). A vignetted
+                        // ray contributes nothing; survivors carry a radiometric weight.
+                        double jx = rng.uniform(), jy = rng.uniform();
+                        double u1 = rng.uniform(), u2 = rng.uniform();
+                        Ray ray; double wLens = 0.0;
+                        if (!cam.genLensRay(px, py, jx, jy, u1, u2, lambda, ray, wLens))
+                            continue;                       // clipped by an element / the stop
+                        double L = radiance(scene, ray, lambda, invPdfLambda, rng);
+                        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens));
+                        continue;
+                    }
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
                     double L = radiance(scene, ray, lambda, invPdfLambda, rng);
                     film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * L);

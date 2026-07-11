@@ -324,6 +324,12 @@ struct CamSpec {
     double iso = 0.0, shutter = 0.0, exposure = 0.0;
     // Resolved exposure compensation (<= 0 => neutral auto-expose). Filled at load.
     double exposureMul = 0.0;
+
+    // Physical multi-element lens (the "mesh-lens" camera), built from a `lens { ... }`
+    // block. When set, main renders this camera through the backward realistic-camera
+    // path (mode R), tracing rays through the real glass interfaces. Null => the
+    // analytic pinhole/thin-lens camera above.
+    std::shared_ptr<LensSystem> lens;
 };
 
 struct Loaded {
@@ -1089,6 +1095,81 @@ private:
         return true;
     }
 
+    // Resolve a lens-surface `ior` word: a glass name (`glass:BK7`, `BK7`, `SF10`,
+    // `flint`, ...) -> its Sellmeier dispersion; otherwise a bare number -> constant
+    // index. Air is index 1.
+    static Spectrum lensIorOf(const std::string& raw) {
+        std::string name = raw;
+        if (name.rfind("glass:", 0) == 0) name = name.substr(6);
+        Spectrum g;
+        if (resolveGlassIor(name, g)) return g;
+        return iorConstant(std::atof(raw.c_str()));
+    }
+
+    // Parse an optional physical lens: `lens { preset <name> | surface <r> <t> <ior>
+    // <semi_ap> [stop] ... | focal <mm> fstop <N> glass <name> }`. Radii/thicknesses/
+    // apertures are millimetres (the lens's own units). Builds the LensSystem, sets
+    // the sensor size from the camera film, and autofocuses at `cs.focus`.
+    bool readLens(const Block& b, CamSpec& cs) {
+        const Stmt* ls = find(b, "lens");
+        if (!ls || !ls->val.block) return true;    // no lens block (a scalar `lens <mm>` is handled elsewhere)
+        const Block& lb = *ls->val.block;
+
+        double focalMM = (cs.focal > 0.0) ? cs.focal * 1000.0 : 50.0;
+        focalMM = dblOf(lb, "focal", focalMM);
+        double fstop = dblOf(lb, "fstop", 0.0);
+        if (fstop <= 0.0) fstop = dblOf(b, "fstop", 0.0);
+        if (fstop <= 0.0) fstop = 2.8;
+        std::string glassName = strOf(lb, "glass", "BK7");
+
+        auto sys = std::make_shared<LensSystem>();
+        // 1) explicit surfaces take priority (paste any real prescription).
+        int nSurf = 0;
+        for (const auto& s : lb.stmts) {
+            if (s.key != "surface") continue;
+            const auto& wds = s.val.words;
+            if (wds.size() < 4) { fail("camera '" + cs.name + "' lens: `surface` needs "
+                                       "<radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]"); return false; }
+            LensSurface e;
+            e.radius    = num(wds[0]);
+            e.thickness = num(wds[1]);
+            e.ior       = lensIorOf(wds[2]);
+            e.aperture  = num(wds[3]);
+            if (wds.size() >= 5 && wds[4] == "stop") { e.isStop = true; }
+            sys->surf.push_back(e);
+            ++nSurf;
+        }
+        if (nSurf > 0) {
+            sys->finalize();
+            sys->name = "custom";
+        } else {
+            // 2) a named preset (singlet/achromat/doublet/telephoto/wide), else default
+            //    to an achromatic doublet at the derived focal length + f-number.
+            std::string preset = strOf(lb, "preset", "");
+            std::string pk;
+            for (char c : preset) { if (c==' '||c=='_'||c=='-') continue; pk += (char)std::tolower((unsigned char)c); }
+            if ((pk == "singlet" || pk == "biconvex" || pk == "simple")) {
+                Spectrum g;
+                if (!resolveGlassIor((glassName.rfind("glass:",0)==0?glassName.substr(6):glassName), g))
+                    g = iorBK7();
+                *sys = makeSinglet(focalMM, fstop, g);
+            } else if (!preset.empty()) {
+                if (!resolveLensPreset(preset, focalMM, fstop, *sys)) {
+                    fail("camera '" + cs.name + "' lens: unknown preset '" + preset +
+                         "' (singlet, achromat/doublet, telephoto, wide)"); return false;
+                }
+            } else {
+                *sys = makeAchromat(focalMM, fstop, iorBK7(), iorSF10());
+            }
+        }
+        // Sensor size from the camera film (default full-frame 36x24 mm).
+        sys->filmW_mm = (cs.filmW_mm > 0.0) ? cs.filmW_mm : 36.0;
+        sys->filmH_mm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
+        sys->focusAt(cs.focus);                    // cs.focus is metres (0 => infinity)
+        cs.lens = sys;
+        return true;
+    }
+
     // ---- camera ----
     bool addCamera(const Block& b, Loaded& L) {
         CamSpec cs;
@@ -1100,6 +1181,7 @@ private:
         cs.focus = Len(dblOf(b, "focus", 0.0));
         if (!readFilmExposure(b, cs)) return false;   // film{res,size/format,iso,...}, lens, fstop, zoom
         if (!readProjection(b, cs)) return false;     // projection/fisheye
+        if (!readLens(b, cs)) return false;           // optional physical `lens { ... }` block
         std::string md = strOf(b, "mode");
         if (!md.empty()) cs.mode = md[0];
         L.cameras.push_back(cs);

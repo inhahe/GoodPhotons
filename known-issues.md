@@ -113,46 +113,51 @@ as practical; this file is the fallback for what can't be addressed immediately.
   2026-07-11; **GPU mode-B fisheye done + validated 2026-07-11**; BDPT (mode D) and
   finite-lens (A/C) support deferred (the latter belongs to the mesh-lens camera).
 
-### Idea: a fully physical mesh-lens camera (glass lenses + enclosure + aperture as geometry)
-- **What (not started — design note):** today the finite-lens modes (A/C) use an
-  *analytical* thin-lens + circular aperture, and non-rectilinear framings (fisheye,
-  panoramic) only exist as analytical `projection` remaps in mode B. This entry logs
-  the idea of a **mesh-lens camera**: model the camera's optics as actual scene
-  geometry — one or more **glass lens elements** (clear dielectric meshes/spheres
-  with real IOR and dispersion), a **camera enclosure/body** (an opaque, absorbing
-  shell that blocks stray light), and a physical **aperture stop** (an opaque mesh
-  disc/iris with a hole). A film/sensor plane sits behind the elements. Because the
-  tracer already does spectral dielectric refraction, forward photons (or backward
-  camera rays) that pass through this glass would be focused, defocused, vignetted,
-  aberrated, and dispersed *by the geometry itself* — no analytical lens model.
-- **Why:** this is the "simulate any camera" path. It naturally yields real optical
-  behaviour the analytical model can only approximate or can't do at all: **true
-  fisheye / ultra-wide** (from a physical fisheye objective) without a projection
-  hack, **chromatic aberration, coma, spherical aberration, field curvature,
-  vignetting, real bokeh** (aperture-shape-dependent), and **flare/ghosting** from
-  inter-element reflections. It also unifies A/C/fisheye: the "projection" becomes an
-  emergent property of the lens stack rather than a `CameraProjection` enum.
-- **How (sketch):** (1) a scene/camera block that places lens elements + body +
-  aperture as geometry with a designated **sensor rectangle** (position, size,
-  resolution) behind them; a small built-in library of stock objectives (e.g. a
-  double-Gauss, a fisheye dome) plus user-supplied meshes. (2) **Forward-catch**
-  measurement (mode-C-like): photons that terminate on the sensor rectangle after
-  refracting through the stack are binned to pixels — physically correct but
-  catch-starved, so it needs the sensor to be a real absorber and likely importance
-  help. (3) Optionally a **backward** variant: sample sensor→lens rays, refract out
-  through the elements into the scene (this is how offline renderers do "realistic
-  camera" lenses, e.g. PBRT's `RealisticCamera`), which is far less noisy than
-  forward-catch and is the practical way to get usable images. (4) GPU: the glass
-  meshes are ordinary dielectric geometry the existing device intersector already
-  handles; the new work is the sensor-plane binning / camera-ray generation, not new
-  material physics.
-- **Open questions:** where the lens data lives (an `.ftsl` `lens { … }` block vs a
-  reusable objective file); how to keep the enclosure from leaking light (absorbing
-  material + solid body); whether to expose it as a new mode letter or as a variant
-  of A/C; and the importance strategy to make forward-catch converge (or default to
-  the backward realistic-camera formulation).
-- **Status:** OPEN (idea logged 2026-07-11) — not started; would supersede the
-  analytical fisheye/thin-lens for "arbitrary real camera" use.
+### Physical (realistic) lens camera — backward realistic-camera formulation [IMPLEMENTED 2026-07-11]
+- **What (done):** a camera can now carry a real **lens prescription** — a stack of
+  spherical/planar refracting interfaces plus an aperture stop (`src/lens.h`,
+  `LensSystem`). The backward reference tracer (mode R) samples a film point and a
+  point on the rear element, traces that ray *through the actual glass interfaces*
+  (per-wavelength Snell refraction, so dispersion → chromatic aberration is
+  automatic) out into the scene, then path-traces. Depth of field, distortion,
+  spherical aberration, coma, field curvature and **vignetting** (clipped/TIR rays
+  contribute nothing) all emerge from the geometry — no thin-lens or projection
+  model. Survivors carry a PBRT-style radiometric weight (cos⁴θ·A_rear/Z_rear²).
+  Wired via an FTSL `camera { lens { … } }` block (`readLens` in `src/ftsl.h`);
+  a physical lens forces the camera to mode R (`src/main.cpp`). Autofocus shifts the
+  film plane with a paraxial probe (`focusAt`). Demo: `scenes/realcam.ftsl`
+  (validated: the focus-plane sphere is sharp, near/far spheres blur; the `singlet`
+  preset visibly softens from spherical aberration).
+- **Presets & generators (`src/lens.h`):** `makeSinglet` (biconvex, lensmaker
+  R=2(n−1)f), `makeAchromat` (cemented crown+flint doublet, powers split by Abbe
+  numbers to cancel first-order CA); `resolveLensPreset` names: `singlet`/`biconvex`,
+  `achromat`/`doublet`, `telephoto`, `wide`. All physically derived (not fabricated
+  data), so focal length + achromatisation are correct by construction; dispersion at
+  render time uses the real Sellmeier glass indices. Users can also paste an arbitrary
+  real prescription as repeated `surface <radius_mm> <thickness_mm> <ior> <semi_ap_mm>
+  [stop]` lines (PBRT lens-file convention: +radius ⇒ centre of curvature on the scene
+  side; lens works in millimetres, scene in metres).
+- **Sign-convention gotcha (fixed):** the geometry stores curvature as `centre =
+  vertex + radius` with +z toward the scene (identical to PBRT's
+  `IntersectSphericalElement`). The lensmaker/achromat generators emit radii in the
+  opposite object→image convention, so their radii are **negated** at construction
+  (see comments in `makeSinglet`/`makeAchromat`). Without the negation the doublet
+  *diverges* and the autofocus places the sensor on the scene side (all rays miss) —
+  the first-cut symptom was a fully black image.
+- **Remaining gaps (OPEN, deferred):**
+  1. **Backward-only.** No forward-catch (mode C-style) or forward-splat (A/B)
+     realistic-lens path yet, and **no GPU** support (mode R is CPU-only). A physical
+     lens always renders in mode R.
+  2. **Square film only.** The pipeline allocates a square film, so `genLensRay` maps
+     the sensor width across the frame and derives the vertical half-extent from the
+     output pixel aspect (square pixels, cropping the 3:2 sensor). A true non-square
+     sensor needs the resX≠resY film work (see the non-square-films limitation above).
+  3. **No inter-element flare/ghosting** (rays refract, they don't also partially
+     reflect at each interface), **no enclosure/body geometry**, and the aperture is a
+     circular clear-diameter clip (no shaped-iris bokeh).
+  4. **Not in BDPT (mode D).** The lens branch lives in the mode-R renderer only.
+- **Status:** IMPLEMENTED (backward realistic camera, 2026-07-11). Supersedes the
+  analytical thin-lens for "arbitrary real camera" use; the gaps above are follow-ups.
 
 ### Texturing is base-color only, `use_mesh`/quad UVs only (Phase 3b partial)
 - **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear
