@@ -1321,16 +1321,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
     // the forward layer of the mode-P composite); the backward tracer (mode R, the
-    // mode-P camera-side layer) and fluorescent scenes always run on the CPU. A
-    // fisheye lens is still CPU-only (the device camera is rectilinear-only).
+    // mode-P camera-side layer) always runs on the CPU. Fisheye/panoramic lenses now
+    // run on the GPU too (the device camera's project()/pixelSolidAngle() port the
+    // analytic projection remap) for the pinhole-splat modes (B/V/P).
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
-    // The CUDA megakernels replicate only the rectilinear pinhole; a fisheye/
-    // panoramic lens must fall back to the CPU (correct-on-CPU-first, per project
-    // policy). GPU fisheye is a logged follow-up (known-issues.md).
     const bool fisheyeCam = (cam.projection != CAM_RECTILINEAR);
     // BDPT's camera importance (bdpt.h cameraWe/cameraPdfDir) is the rectilinear
     // pinhole convention and feeds the MIS balance heuristic; a fisheye lens there
@@ -1360,10 +1358,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (!cudaAvailable()) {
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
-        } else if (fisheyeCam) {
-            if (wantGpu) std::fprintf(stderr, "[device] non-rectilinear (fisheye) lens "
-                                              "is CPU-only; using CPU\n");
-            else         std::printf("[device] auto -> CPU (fisheye lens is CPU-only)\n");
         } else if (gpuBdptMode) {
             // Mode D has its own (stricter) GPU support check: BDPT scope only.
             if (!cudaBdptSupported(scene)) {

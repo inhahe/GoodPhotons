@@ -77,29 +77,82 @@ as practical; this file is the fallback for what can't be addressed immediately.
     the auto-exposure anchor in `writePPM`. Validated by `scenes/expo.ftsl` (ISO 200
     is exactly 2.0× ISO 100 in linear space).
 
-### Fisheye/panoramic lenses are CPU-only, and unsupported by BDPT (mode D)
+### Fisheye/panoramic lenses: GPU mode-B done; unsupported by BDPT (mode D) and by the finite-lens modes (A/C)
 - **What:** `projection <name>` / `fisheye` (equidistant, equisolid, stereographic,
   orthographic) is implemented on the **CPU** for the forward light tracer (modes
-  A/B/C), the backward reference (R), and validation/composite (V/P). The mode-B
-  splat importance is projection-correct (the camera computes the per-pixel solid
-  angle `Camera::pixelSolidAngle`, replacing the rectilinear `1/(A_pix·cos⁴)`). Two
-  gaps remain:
-  1. **No GPU fisheye.** The CUDA megakernels (`render_cuda.cu`) replicate only the
-     rectilinear pinhole (`DCamera` uses `tanHalfX/Y`). A non-rectilinear camera
-     therefore forces a **CPU fallback** (guarded in `runRender`, `src/main.cpp`;
-     `-device gpu` prints a notice). Fisheye renders are thus CPU-speed.
+  A/B/C), the backward reference (R), and validation/composite (V/P), and on the
+  **GPU** for the mode-B pinhole-splat path (see below). The mode-B splat importance
+  is projection-correct (the camera computes the per-pixel solid angle
+  `Camera::pixelSolidAngle`, replacing the rectilinear `1/(A_pix·cos⁴)`).
+- **GPU mode-B fisheye (done 2026-07-11):** the device `DCamera` (`render_cuda.cu`)
+  now carries a `projection` enum plus `halfFovY`/`rEdge`, with `HD dProjRadius` /
+  `dProjRadiusDeriv` helpers mirroring `Camera::projRadius`/`projRadiusDeriv`.
+  `DCamera::project()` branches rectilinear vs fisheye (azimuth + normalised
+  `projRadius/rEdge`, no `cz>0` reject), and `pixelSolidAngle()` returns the
+  projection-general solid angle (`aNorm·sinθ·rEdge²/(r·dr)`), keeping the
+  rectilinear branch bit-identical (`A_pix·cos³`). `connect`/`connectVolume` divide
+  by that solid angle. The device path only **splats** (never generates camera
+  rays), so no inverse map (`projRadiusInv`) is needed on-device. Fisheye B/V/P now
+  run on the GPU (no CPU fallback); validated GPU-vs-CPU on `scenes/fisheye.ftsl`
+  2026-07-11 — the equisolid-160° `fish` frame matches CPU at RMSE 3.0/255 (8.8%
+  rel, same noise floor as the rectilinear `rect` frame) and mean brightness within
+  0.25%. Two gaps remain:
+  1. **Finite-lens modes (A/C) reject fisheye.** A thin-lens/aperture camera cannot
+     *form* a fisheye projection analytically, so modes A and C error out for a
+     non-rectilinear lens (guarded in `src/main.cpp`). A true wide-angle physical
+     camera needs the mesh-lens forward-catch mode (see the mesh-lens camera entry).
   2. **BDPT (mode D) rejects fisheye.** `bdpt.h`'s `cameraWe`/`cameraPdfDir` are the
      rectilinear pinhole convention (`1/(A·cos⁴)`, `1/(A·cos³)`) and feed the MIS
      balance heuristic; a fisheye lens there would give subtly-wrong weights, so
      mode D errors out for a non-rectilinear camera rather than lie.
-- **Proper fix (future):** (1) port `projRadius`/`projRadiusInv`/`pixelSolidAngle`
-  into the device `DCamera` and branch `genRay`/`project`/`connect` on a projection
-  enum, validated GPU-vs-CPU. (2) generalise the BDPT camera importance + its
+- **Proper fix (future):** generalise the BDPT camera importance + its
   importance-sampling pdf to the projection's Jacobian so the MIS weights stay
-  consistent (the harder of the two — the pdfDir must match the actual sampling
-  density over the fisheye image).
+  consistent (the pdfDir must match the actual sampling density over the fisheye
+  image). The GPU mode-B port is complete.
 - **Status:** OPEN (acceptable) — CPU fisheye done + validated (`scenes/fisheye.ftsl`)
-  2026-07-11; GPU + BDPT support deferred.
+  2026-07-11; **GPU mode-B fisheye done + validated 2026-07-11**; BDPT (mode D) and
+  finite-lens (A/C) support deferred (the latter belongs to the mesh-lens camera).
+
+### Idea: a fully physical mesh-lens camera (glass lenses + enclosure + aperture as geometry)
+- **What (not started — design note):** today the finite-lens modes (A/C) use an
+  *analytical* thin-lens + circular aperture, and non-rectilinear framings (fisheye,
+  panoramic) only exist as analytical `projection` remaps in mode B. This entry logs
+  the idea of a **mesh-lens camera**: model the camera's optics as actual scene
+  geometry — one or more **glass lens elements** (clear dielectric meshes/spheres
+  with real IOR and dispersion), a **camera enclosure/body** (an opaque, absorbing
+  shell that blocks stray light), and a physical **aperture stop** (an opaque mesh
+  disc/iris with a hole). A film/sensor plane sits behind the elements. Because the
+  tracer already does spectral dielectric refraction, forward photons (or backward
+  camera rays) that pass through this glass would be focused, defocused, vignetted,
+  aberrated, and dispersed *by the geometry itself* — no analytical lens model.
+- **Why:** this is the "simulate any camera" path. It naturally yields real optical
+  behaviour the analytical model can only approximate or can't do at all: **true
+  fisheye / ultra-wide** (from a physical fisheye objective) without a projection
+  hack, **chromatic aberration, coma, spherical aberration, field curvature,
+  vignetting, real bokeh** (aperture-shape-dependent), and **flare/ghosting** from
+  inter-element reflections. It also unifies A/C/fisheye: the "projection" becomes an
+  emergent property of the lens stack rather than a `CameraProjection` enum.
+- **How (sketch):** (1) a scene/camera block that places lens elements + body +
+  aperture as geometry with a designated **sensor rectangle** (position, size,
+  resolution) behind them; a small built-in library of stock objectives (e.g. a
+  double-Gauss, a fisheye dome) plus user-supplied meshes. (2) **Forward-catch**
+  measurement (mode-C-like): photons that terminate on the sensor rectangle after
+  refracting through the stack are binned to pixels — physically correct but
+  catch-starved, so it needs the sensor to be a real absorber and likely importance
+  help. (3) Optionally a **backward** variant: sample sensor→lens rays, refract out
+  through the elements into the scene (this is how offline renderers do "realistic
+  camera" lenses, e.g. PBRT's `RealisticCamera`), which is far less noisy than
+  forward-catch and is the practical way to get usable images. (4) GPU: the glass
+  meshes are ordinary dielectric geometry the existing device intersector already
+  handles; the new work is the sensor-plane binning / camera-ray generation, not new
+  material physics.
+- **Open questions:** where the lens data lives (an `.ftsl` `lens { … }` block vs a
+  reusable objective file); how to keep the enclosure from leaking light (absorbing
+  material + solid body); whether to expose it as a new mode letter or as a variant
+  of A/C; and the importance strategy to make forward-catch converge (or default to
+  the backward realistic-camera formulation).
+- **Status:** OPEN (idea logged 2026-07-11) — not started; would supersede the
+  analytical fisheye/thin-lens for "arbitrary real camera" use.
 
 ### Texturing is base-color only, `use_mesh`/quad UVs only (Phase 3b partial)
 - **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear

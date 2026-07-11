@@ -305,11 +305,43 @@ struct DScene {
     DEnvMap env;                     // image env tables (env.scale null => constant env)
 };
 
+// Lens-projection radius maps (device twins of camera.h projRadius/Inv/Deriv). The
+// projection tag matches CameraProjection (camera.h): 0 rectilinear, 1 equidistant,
+// 2 equisolid, 3 stereographic, 4 orthographic. Kept as free HD helpers so DCamera's
+// project()/pixelSolidAngle() can share them.
+HD static inline double dProjRadius(int proj, double th) {
+    switch (proj) {
+        case CAM_EQUIDISTANT:   return th;
+        case CAM_EQUISOLID:     return 2.0 * sin(0.5 * th);
+        case CAM_STEREOGRAPHIC: return 2.0 * tan(0.5 * th);
+        case CAM_ORTHOGRAPHIC:  return sin(th);
+        default:                return tan(th);              // CAM_RECTILINEAR
+    }
+}
+// (dProjRadiusInv — the r->theta inverse used by Camera::genRay — is intentionally
+// omitted: the GPU forward path only SPLATS to the camera (project), it never
+// generates camera rays, so the inverse map has no device caller.)
+HD static inline double dProjRadiusDeriv(int proj, double th) {
+    switch (proj) {
+        case CAM_EQUIDISTANT:   return 1.0;
+        case CAM_EQUISOLID:     return cos(0.5 * th);
+        case CAM_STEREOGRAPHIC: { double c = cos(0.5 * th); return 1.0 / (c * c); }
+        case CAM_ORTHOGRAPHIC:  return cos(th);
+        default:              { double c = cos(th);        return 1.0 / (c * c); }  // sec^2
+    }
+}
+
 struct DCamera {
     DVec3  eye, u, v, w;
     double tanHalfX, tanHalfY;
     int    resX, resY;
     double apertureR, filmDist, lensF;   // models A/C finite aperture + thin lens
+    // Lens projection (mirrors Camera): rectilinear (default) keeps the pinhole math
+    // byte-for-byte; fisheye/panoramic modes remap the ray angle in project()/
+    // pixelSolidAngle(). halfFovY is the vertical half-field (rad) and rEdge the
+    // image radius at the vertical film edge (= dProjRadius(projection, halfFovY)).
+    int    projection;
+    double halfFovY, rEdge;
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
     // pinhole importance normalises by a single pixel's area (see camera.h). This
@@ -320,15 +352,53 @@ struct DCamera {
     HD bool project(const DVec3& p, int& px, int& py, Real& cosCam, Real& dist2) const {
         DVec3 d = p - eye;
         Real cz = dot(d, w);
-        if (cz <= (Real)1e-9) return false;
-        Real cx = dot(d, u), cy = dot(d, v);
-        Real ix = (cx / cz) / (Real)tanHalfX, iy = (cy / cz) / (Real)tanHalfY;
+        if (projection == CAM_RECTILINEAR) {
+            if (cz <= (Real)1e-9) return false;
+            Real cx = dot(d, u), cy = dot(d, v);
+            Real ix = (cx / cz) / (Real)tanHalfX, iy = (cy / cz) / (Real)tanHalfY;
+            if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
+            px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
+            py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+            dist2 = dot(d, d);
+            cosCam = cz / sqrt(dist2);
+            return true;
+        }
+        // Fisheye/panoramic: map the direction's angle-from-axis theta to a normalised
+        // image radius rho, then place it along the (u,v) azimuth. A wide lens sees
+        // theta > 90 deg (cz <= 0), so do NOT reject on cz (mirrors Camera::project).
+        Real len = length(d);
+        if (len < (Real)1e-12) return false;
+        Real costh = cz / len;
+        costh = costh < (Real)-1 ? (Real)-1 : (costh > (Real)1 ? (Real)1 : costh);
+        Real th = acos(costh);
+        Real rho = (Real)(dProjRadius(projection, (double)th) / rEdge);
+        Real ru = dot(d, u), rv = dot(d, v);
+        Real rhoDir = sqrt(ru * ru + rv * rv);
+        Real ix, iy;
+        if (rhoDir < (Real)1e-12) { ix = 0; iy = 0; }
+        else { ix = rho * ru / rhoDir; iy = rho * rv / rhoDir; }
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
         py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
-        dist2 = dot(d, d);
-        cosCam = cz / sqrt(dist2);
+        dist2 = len * len;
+        cosCam = costh;
         return true;
+    }
+    // Solid angle subtended by one pixel for a connection at cosine cosCam from the
+    // axis: the projection-general splat normaliser (port of Camera::pixelSolidAngle).
+    // For rectilinear this is pixelPlaneArea()*cosCam^3, recovering the classic
+    // 1/(A_pix cos^4) importance once the geometry's cosCam is folded in.
+    HD double pixelSolidAngle(Real cosCam) const {
+        if (projection == CAM_RECTILINEAR)
+            return pixelPlaneArea() * (double)cosCam * (double)cosCam * (double)cosCam;
+        double c = cosCam < -1 ? -1 : (cosCam > 1 ? 1 : (double)cosCam);
+        double th = acos(c);
+        double dr = dProjRadiusDeriv(projection, th);
+        double r  = dProjRadius(projection, th);
+        double denom = dr * r;
+        if (denom < 1e-12) denom = 1e-12;
+        double aNorm = 4.0 / ((double)resX * (double)resY);   // pixel area in [-1,1]^2 view
+        return aNorm * sin(th) * rEdge * rEdge / denom;
     }
     // Image a pupil point A along direction dir onto a film cell (port of
     // Camera::lensImage). With a thin lens the direction is refracted by the paraxial
@@ -863,9 +933,11 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real f = rho / (Real)DPI;
-    Real G = cosSurf * cosCam / dist2;
-    Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
-    Real contrib = beta * f * G * We;
+    // Projection-general splat: contrib = beta*f*cosSurf / (dist^2 * pixelSolidAngle).
+    // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
+    // classic 1/(A_pix cos^4) form; fisheye/panoramic uses the remapped solid angle.
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real contrib = beta * f * cosSurf / (Real)((double)dist2 * solidAngle);
     if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -879,9 +951,10 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real ph = hgPhase(dot(wIn, wdir), (Real)sc.medium.g);
     Real Lambda = medAlbedo(sc.medium, lambda);
-    Real G = cosCam / dist2;
-    Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
-    Real contrib = beta * Lambda * ph * G * We;
+    // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
+    // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real contrib = beta * Lambda * ph / (Real)((double)dist2 * solidAngle);
     contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -2278,6 +2351,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
     dc.tanHalfX = cam.tanHalfX; dc.tanHalfY = cam.tanHalfY;
     dc.resX = res; dc.resY = res;
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
+    dc.projection = cam.projection; dc.halfFovY = cam.halfFovY; dc.rEdge = cam.rEdge;
 }
 
 // Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
