@@ -667,7 +667,7 @@ camera "hero" {
     aperture 0.02              # aperture radius (scene units); 0 ⇒ pinhole-ish
     focus    3.0               # focus distance ⇒ thin-lens focal length
     fstop    2.8               # f-number ⇒ apertureR = focal/(2N) (overrides aperture)
-    mode     B                 # A | B | C  (measurement model, §8.2)
+    mode     A                 # A | B | C  (measurement model, §8.2; A = physical camera)
 
     film {
         res    512 512         # output pixels
@@ -680,9 +680,13 @@ camera "hero" {
 Maps onto `Camera` (`src/camera.h`) via `lookAt(eye, target, up, fovYDeg, rx, ry)`
 and `setFocus(focus)`; `aperture` → `apertureR`; `mode` picks the forward
 measurement model. **[maps 1:1]**, plus the physical-film fields below. Authoring a
-`lens`/`fstop` instead switches the catch modes (A/C) to a **physically-seated**
-camera: the film is placed at the real image distance and the thin lens gets the
-true focal length, so the f-number yields correct depth of field (§8.1).
+`lens`/`fstop` seats the finite-lens modes (A/C) as a **physically-seated** camera:
+the film is placed at the real image distance and the thin lens gets the true focal
+length, so the f-number yields correct depth of field (§8.1). **Mode A is the
+recommended physical camera** — it images the same finite aperture + thin lens +
+film as mode C, but via next-event estimation of the lens (it splats every diffuse
+bounce through a sampled pupil point onto the film), so it converges in millions of
+photons where the brute-force catch needs billions.
 
 ### 8.1 Film — present vs. proposed
 
@@ -730,13 +734,13 @@ true focal length, so the f-number yields correct depth of field (§8.1).
   see §8.5 (lens/zoom) and §8.3 (per-key fov + dolly zoom).
 - **f-stop authoring** — **[done — Phase 3a]**: `fstop 2.8` ⇒
   `apertureR = focal / (2·N)` at load time (overrides any `aperture` radius). When a
-  `lens` **or** `fstop` is authored the catch modes (A/C) become physically seated:
-  the film sits at the real image distance (`1/si = 1/f − 1/focus`, or `si = f` when
-  `focus` is 0/at infinity) and the thin lens takes the true focal length, so the
-  f-number produces *correct* depth of field rather than a unit-relative blur. Legacy
-  cameras (no `lens`/`fstop`, just an `aperture`/`focus` radius in scene units) keep
-  their previous unit-film behaviour unchanged. Mode B (pinhole splat) ignores the
-  aperture entirely, so it is unaffected either way.
+  `lens` **or** `fstop` is authored the finite-lens modes (A/C) become physically
+  seated: the film sits at the real image distance (`1/si = 1/f − 1/focus`, or
+  `si = f` when `focus` is 0/at infinity) and the thin lens takes the true focal
+  length, so the f-number produces *correct* depth of field rather than a
+  unit-relative blur. Legacy cameras (no `lens`/`fstop`, just an `aperture`/`focus`
+  radius in scene units) keep their previous unit-film behaviour unchanged. Mode B
+  (the pinhole limit) ignores the aperture entirely, so it is unaffected either way.
 - `iso` / `shutter` / `exposure` — **[done (relative) — Phase 3a]**: the film's
   radiometric scale is not absolute, so images are always auto-exposed (99th-
   percentile anchor). These act as an exposure **compensation** on top of that
@@ -751,14 +755,22 @@ true focal length, so the f-number yields correct depth of field (§8.1).
 
 ### 8.2 Measurement model (`mode`)
 
-| `mode` | Model                              | Notes                                                            |
-|--------|------------------------------------|------------------------------------------------------------------|
-| `A`    | Contact-sensor forward catch       | Physically literal; needs a `sensor`/film surface in the scene.  |
-| `B`    | Pinhole connect/splat (default)    | Unbiased estimator of an ideal pinhole; fast.                    |
-| `C`    | Finite-aperture thin-lens catch    | Real depth of field; uses `aperture`/`focus`.                    |
+| `mode` | Model                              | Notes                                                                       |
+|--------|------------------------------------|-----------------------------------------------------------------------------|
+| `A`    | Physical camera (finite-lens NEE)  | The real camera: finite aperture + thin lens + film, real depth of field from `aperture`/`fstop`/`focus`. Splats every diffuse bounce through a sampled pupil point, so it converges fast. **CPU-only; rectilinear only** (author a fisheye/panoramic lens with mode B). |
+| `B`    | Pinhole limit (connect/splat, default) | The `aperture → 0` limit of A: infinitely sharp (no DOF), fastest, GPU-accelerated. Ignores `aperture`/`focus`. Handles fisheye/panoramic projections (§8.5). |
+| `C`    | Brute-force catch (oracle)         | Same physical lens as A, but only photons that *physically* fly through the pupil are caught — unbiased but very slow (billions of photons). Mainly a validation oracle for A. |
 
-(Modes R/V/P are reference/validation/composite tooling, not scene-facing;
-they stay CLI-only.)
+The three are one physical camera seen three ways: **A** importance-samples the
+lens (correct **and** fast — the recommended default for a real camera), **B** is
+its zero-aperture pinhole limit, **C** is the brute-force ground truth A is
+validated against. (Modes R/V/P are reference/validation/composite tooling, not
+scene-facing; they stay CLI-only.)
+
+> **The old contact-sensor mode A** (a flat film wall the photons landed on) has
+> been retired: with no aperture it integrated the whole hemisphere per pixel and so
+> could not form an image. The `deposit()`/`Scene::sensor` machinery survives for
+> irradiance-map diagnostics but is no longer wired to any camera `mode`.
 
 ### 8.3 Multiple cameras & camera paths
 
@@ -913,14 +925,16 @@ Two independent "focal" axes, often confused:
   the image is a circle inscribed in the square film, so the corners fall dark.
   Validated by `scenes/fisheye.ftsl` (a rectilinear/equisolid/zoom/dolly-zoom set).
 
-  **Implementation status:** fisheye is **CPU-only** for now — the CUDA megakernels
-  replicate only the rectilinear pinhole, so a non-rectilinear camera automatically
-  falls back to the CPU (`-device gpu` prints a notice). Mode **D (BDPT)** rejects a
-  fisheye lens outright, because its MIS camera importance is the rectilinear
-  convention; use mode A/B/C (forward) or R (reference) for fisheye. Both are logged
-  in `known-issues.md`. The mode-B splat importance itself *is* projection-correct
-  on the CPU (the per-pixel solid-angle Jacobian is handled), so fisheye images are
-  radiometrically right, not just geometrically.
+  **Implementation status:** fisheye lives in the **pinhole splat (mode B)** and the
+  reference tracer (mode R/V) — those map a ray angle through the projection. The
+  finite-lens modes **A and C** are **rectilinear only**: a real fisheye is a
+  wide-angle *lens element*, which the single thin-lens model can't form, so author
+  fisheye with **mode B** (its projection-correct splat handles the per-pixel
+  solid-angle Jacobian, so images are radiometrically right, not just geometrically).
+  Fisheye is also **CPU-only** — the CUDA megakernels replicate only the rectilinear
+  pinhole, so a non-rectilinear camera falls back to the CPU (`-device gpu` prints a
+  notice) — and mode **D (BDPT)** rejects a fisheye lens outright (its MIS camera
+  importance is the rectilinear convention). All logged in `known-issues.md`.
 
 ---
 

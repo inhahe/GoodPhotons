@@ -70,9 +70,11 @@ struct Camera {
     double halfFovY   = 0.0;
     double rEdge      = 0.0;
 
-    // Finite-aperture camera-obscura parameters (model A perspective catch).
-    // A photon is recorded only if it flies through the aperture disc; smaller
-    // aperture -> sharper but darker/grainier, larger -> brighter but blurrier.
+    // Finite-aperture camera-obscura parameters. These define the physical lens
+    // shared by the next-event lens splat (model A, the default physical camera)
+    // and the brute-force forward catch (model C). Smaller aperture -> deeper focus
+    // (sharper), larger -> shallower depth of field (more bokeh). Model B is the
+    // apertureR -> 0 pinhole limit and ignores these.
     double apertureR = 0.02; // aperture radius (scene units)
     double filmDist  = 1.0;  // aperture->film distance (only ratio to apertureR matters for blur)
     double lensF     = 0.0;  // thin-lens focal length; 0 => no lens (straight-through
@@ -194,16 +196,44 @@ struct Camera {
         return Ray{eye, d};
     }
 
-    // Model A perspective catch: does this photon ray pass through the finite
-    // aperture disc (before hitting the scene, within hitDist) and land on the
-    // film? Pure forward physics — no connect/splat. On success sets px,py.
-    // The film sits filmDist behind the aperture, so the image is real (inverted);
-    // we un-invert here so the result matches project()'s raster convention.
+    // Image a photon that enters the lens at pupil point `A` travelling along
+    // `dir`, refract it through the thin lens (if any) and find the raster cell it
+    // lands on. Shared by the brute-force catch (model C) and the next-event lens
+    // splat (model A). The film sits filmDist behind the aperture, so the image is
+    // real (inverted); we un-invert here to match project()'s raster convention.
     //
-    // With a thin lens (lensF > 0) the photon direction is refracted at the lens
-    // by the paraxial ray transfer u' = u - rho/f (rho = transverse hit position,
-    // u = transverse slope). Rays from a point at the focus distance then all land
-    // at one film point (sharp); other depths spread into a blur circle (bokeh).
+    // With a thin lens (lensF > 0) the direction is refracted by the paraxial ray
+    // transfer u' = u - rho/f (rho = transverse pupil position, u = transverse
+    // slope). Rays from a point at the focus distance then all land at one film
+    // point (sharp); other depths spread into a blur circle (bokeh).
+    bool lensImage(const Vec3& A, const Vec3& dir, int& px, int& py) const {
+        Vec3 nAxis = w * (-1.0);        // propagation axis toward the film (behind eye)
+        Vec3 rho = A - eye;             // transverse offset of the pupil hit (perp to w)
+        Vec3 d = dir;
+        if (lensF > 0.0) {
+            double dax = dot(d, nAxis);
+            if (dax <= 1e-9) return false;                   // grazing/behind the lens
+            Vec3 slope = (d - nAxis * dax) / dax;            // transverse slope u
+            Vec3 slopeP = slope - rho * (1.0 / lensF);       // thin-lens: u' = u - rho/f
+            d = normalize(nAxis + slopeP);
+        }
+        double ddax = dot(d, nAxis);
+        if (ddax <= 1e-9) return false;
+        double s = filmDist / ddax;                          // A -> film plane
+        Vec3 Fcenter = eye + nAxis * filmDist;               // film centre (= eye - w*filmDist)
+        Vec3 Q = A + d * s;
+        Vec3 rel = Q - Fcenter;
+        double ix = -dot(rel, u) / (filmDist * tanHalfX);    // un-invert real image
+        double iy = -dot(rel, v) / (filmDist * tanHalfY);
+        if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
+        px = (int)((ix * 0.5 + 0.5) * film.resX);
+        py = (int)((iy * 0.5 + 0.5) * film.resY);
+        return true;
+    }
+
+    // Model C brute-force catch: does this photon ray physically pass through the
+    // finite aperture disc (before hitting the scene, within hitDist) and land on
+    // the film? Pure forward physics — no connect/splat. On success sets px,py.
     bool catchPhoton(const Ray& ray, double hitDist, int& px, int& py) const {
         double dw = dot(ray.d, w);
         if (dw >= -1e-9) return false;                       // not heading toward the film
@@ -212,26 +242,6 @@ struct Camera {
         Vec3 P = ray.o + ray.d * tAp;                        // entry point on lens/aperture plane
         Vec3 rho = P - eye;                                  // transverse offset (perp to w)
         if (dot(rho, rho) > apertureR * apertureR) return false; // missed the disc
-
-        Vec3 nAxis = w * (-1.0);        // propagation axis toward the film (behind eye)
-        Vec3 dir = ray.d;
-        if (lensF > 0.0) {
-            double dax = dot(dir, nAxis);                    // > 0 (dw < 0)
-            Vec3 slope = (dir - nAxis * dax) / dax;          // transverse slope u
-            Vec3 slopeP = slope - rho * (1.0 / lensF);       // thin-lens: u' = u - rho/f
-            dir = normalize(nAxis + slopeP);
-        }
-        double ddax = dot(dir, nAxis);
-        if (ddax <= 1e-9) return false;
-        double s = filmDist / ddax;                          // P -> film plane
-        Vec3 Fcenter = eye + nAxis * filmDist;               // film centre (= eye - w*filmDist)
-        Vec3 Q = P + dir * s;
-        Vec3 rel = Q - Fcenter;
-        double ix = -dot(rel, u) / (filmDist * tanHalfX);    // un-invert real image
-        double iy = -dot(rel, v) / (filmDist * tanHalfY);
-        if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
-        px = (int)((ix * 0.5 + 0.5) * film.resX);
-        py = (int)((iy * 0.5 + 0.5) * film.resY);
-        return true;
+        return lensImage(P, ray.d, px, py);
     }
 };

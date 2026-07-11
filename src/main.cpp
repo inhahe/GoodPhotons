@@ -209,12 +209,15 @@ static Scene buildGrating(int res, bool diffraction) {
     return s;
 }
 
-// mode 'A' builds a sensor front wall; mode 'B' leaves the front open.
+// The front of the box is left open so the external camera (any image-forming
+// mode, including the model-A finite-lens camera) can see in. `mode` is retained
+// for API compatibility but no longer changes the geometry.
 static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
                           const char* meshPath = nullptr, double meshScale = 1.0,
                           bool diffuseSphere = false, bool fluoroSphere = false,
                           bool thinFilmSphere = false,
                           double filmThickness = 300.0, double filmIor = 1.30) {
+    (void)res;   // camera resolution is set by the caller; scene geometry is res-free
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
@@ -235,9 +238,7 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     addQuad(s, {0,0,0},{0,1,0},{1,1,0},{1,0,0}, 0);            // back
     addQuad(s, {0,0,0},{0,0,1},{0,1,1},{0,1,0}, 1);            // left (red)
     addQuad(s, {1,0,0},{1,1,0},{1,1,1},{1,0,1}, 2);            // right (green)
-    if (mode == 'A')
-        addQuad(s, {0,0,1},{1,0,1},{1,1,1},{0,1,1}, 0, /*sensor*/0); // front = sensor
-    // mode 'B': front left open so the external camera can see in.
+    (void)mode;   // front left open for the external camera in every mode
 
     const double lx0 = 0.35, lx1 = 0.65, lz0 = 0.35, lz1 = 0.65, ly = 0.999;
     addQuad(s, {lx0,ly,lz0},{lx1,ly,lz0},{lx1,ly,lz1},{lx0,ly,lz1}, 3);
@@ -260,10 +261,6 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
                    /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/3);
     s.build();
 
-    if (mode == 'A') {
-        s.sensor.origin = {0,0,1}; s.sensor.uAxis = {1,0,0}; s.sensor.vAxis = {0,1,0};
-        s.sensor.film.resX = res; s.sensor.film.resY = res; s.sensor.alloc();
-    }
     return s;
 }
 
@@ -956,17 +953,16 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 // count already traced. seedBase==0 reproduces the original single-shot streams
 // bit-for-bit, so a plain `-n` render is unchanged.
 static Film renderForward(const Scene& scene, const Camera* cam, int res, long long N,
-                          int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut,
-                          bool diffraction = true, bool useGpu = false,
+                          int nThreads, bool forwardCatch, bool lensMode, bool useCamera,
+                          EnergyReport& eOut, bool diffraction = true, bool useGpu = false,
                           uint64_t seedBase = 0) {
 #ifdef HAVE_CUDA
-    // GPU path covers all three forward camera models: A (contact-sensor deposit,
-    // useCamera==false), B (connect/splat to the pinhole), C (finite-aperture
-    // forward catch). Fluorescent scenes are unsupported on-device and fall back to
-    // the CPU. cam is non-null in every mode (mode A passes a default Camera whose
-    // frame is unused; the sensor plane is baked from scene.sensor).
-    if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
-        char camMode = forwardCatch ? 'C' : (useCamera ? 'B' : 'A');
+    // GPU path covers the pinhole splat (model B) and the brute-force catch (model
+    // C). The model-A finite-lens next-event splat is CPU-only for now (the CUDA
+    // DCamera implements only the rectilinear pinhole), so lensMode never reaches
+    // here — runRender forces the CPU for it. Fluorescent scenes fall back too.
+    if (useGpu && cam && !lensMode && cudaAvailable() && cudaForwardSupported(scene)) {
+        char camMode = forwardCatch ? 'C' : 'B';
         return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode, seedBase);
     }
 #else
@@ -977,7 +973,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int res, long l
     for (auto& f : films) { f.resX = res; f.resY = res; f.alloc(); }
 
     auto worker = [&](int tid) {
-        Renderer r; r.forwardCatch = forwardCatch; r.diffraction = diffraction;
+        Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
                             (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
@@ -1087,7 +1083,7 @@ static Film renderComposite(const Scene& scene, const Camera& cam, int res,
     // layer (renderBackward, below) is CPU-only. useGpu therefore accelerates just the
     // forward half of the composite.
     Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                             /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
+                             /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e, diffraction, useGpu);
     Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
 
@@ -1301,8 +1297,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool wantCheckpointFlag = false, bool runForever = false,
                      bool preview = false, double intervalSec = 15.0) {
     const bool refMode      = (mode == 'R' || mode == 'V');
-    const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
+    const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
+    const bool lensMode     = (mode == 'A');   // finite-lens next-event splat (physical camera)
 
     // -time / -resume / -checkpoint accumulate a photon-count film, which only the
     // pure forward camera models (A/B/C) do. Other modes accumulate differently
@@ -1316,11 +1313,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
-    // covers the forward light trace (models A/B/C, the forward pass of mode V, and
+    // covers the forward light trace (models B/C, the forward pass of mode V, and
     // the forward layer of the mode-P composite); the backward tracer (mode R, the
-    // mode-P camera-side layer) and fluorescent scenes always run on the CPU.
+    // mode-P camera-side layer) and fluorescent scenes always run on the CPU. Model A
+    // (the finite-lens next-event splat) is CPU-only for now — the CUDA DCamera has
+    // only the rectilinear pinhole, so the lens splat has no device path yet.
     const bool gpuForwardMode =
-        (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
+        (mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
@@ -1333,8 +1332,18 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // would give subtly-wrong weights, so mode D rejects it rather than lie.
     if (fisheyeCam && mode == 'D') {
         std::fprintf(stderr, "[camera] mode D (BDPT) does not support a fisheye/panoramic "
-                             "lens; render this camera with mode A/B/C (forward) or R "
+                             "lens; render this camera with mode B (forward pinhole) or R "
                              "(reference) instead.\n");
+        return 1;
+    }
+    // Model A/C image through a single rectilinear thin lens (lensImage uses
+    // tanHalfX/Y), so they cannot form a fisheye — that needs a wide-angle lens
+    // element. A fisheye is authored via the pinhole splat (mode B) or reference.
+    if (fisheyeCam && (mode == 'A' || mode == 'C')) {
+        std::fprintf(stderr, "[camera] mode %c (finite-lens camera) is rectilinear only; a "
+                             "fisheye/panoramic lens can't be formed by the thin-lens model. "
+                             "Render this camera with mode B (pinhole splat) or R (reference).\n",
+                     mode);
         return 1;
     }
     bool useGpu = false;
@@ -1350,6 +1359,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] non-rectilinear (fisheye) lens "
                                               "is CPU-only; using CPU\n");
             else         std::printf("[device] auto -> CPU (fisheye lens is CPU-only)\n");
+        } else if (lensMode) {
+            if (wantGpu) std::fprintf(stderr, "[device] mode A (finite-lens physical camera) "
+                                              "is CPU-only; using CPU (use mode B for the GPU "
+                                              "pinhole limit)\n");
+            else         std::printf("[device] auto -> CPU (mode A finite-lens camera is CPU-only)\n");
         } else if (gpuBdptMode) {
             // Mode D has its own (stricter) GPU support check: BDPT scope only.
             if (!cudaBdptSupported(scene)) {
@@ -1399,7 +1413,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
         Film fwd = renderForward(scene, &cam, res, N, nThreads,
-                                 /*forwardCatch*/false, /*useCamera*/true, e, diffraction, useGpu);
+                                 /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e, diffraction, useGpu);
         addEnvBackground(fwd, scene, cam, N);   // directly-viewed sky (env scenes)
         double tot = e.absorbed + e.sensor + e.escaped + e.residual;
         std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
@@ -1511,7 +1525,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     auto runBatch = [&](long long batchN) {
         EnergyReport e;
         Film b = renderForward(scene, &cam, res, batchN, nThreads, forwardCatch,
-                               useCamera, e, diffraction, useGpu, (uint64_t)acc.N);
+                               lensMode, useCamera, e, diffraction, useGpu, (uint64_t)acc.N);
         acc.film.merge(b);
         acc.N += batchN;
         acc.energy.emitted  += e.emitted;  acc.energy.absorbed += e.absorbed;
@@ -1810,15 +1824,16 @@ int main(int argc, char** argv) {
             toRender.push_back({cs->name, c, effMode(cs->mode), cres, cs->exposureMul});
         }
     } else {
-        // Built-in scene: one camera. mode A needs no camera frame (a default Camera
-        // is passed and its frame is unused; the sensor plane is baked from scene).
-        const bool useCamera = (mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
+        // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/ref) uses
+        // the same camera frame; only the old contact-sensor diagnostic did not.
+        const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
+                                mode == 'P' || mode == 'D' || refMode);
         Camera c;
         if (useCamera) {
             if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);
             else       c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, res);
             c.apertureR = apertureR;
-            c.setFocus(focusDist);   // mode C thin lens (0 = camera obscura, no focus plane)
+            c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
         toRender.push_back({"", c, mode, res, 0.0});
     }

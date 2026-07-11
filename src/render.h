@@ -1,7 +1,15 @@
 // Forward photon tracing.
-//   Model A: photon physically lands on a contact sensor -> deposit, terminate.
-//   Model B: at every surface vertex, connect to the camera pinhole and splat.
-// Both can share a scene; typically A uses a sensor wall, B leaves it open.
+//   Model A: physical camera. At every surface vertex, connect through a sampled
+//            point on the finite lens pupil, refract through the thin lens onto the
+//            film cell, and splat (next-event estimation of the lens). Gives real
+//            depth of field / bokeh and converges (unlike waiting for photons to
+//            physically thread the aperture, which is model C).
+//   Model B: the apertureR -> 0 pinhole limit of A: connect to a single point and
+//            splat. Infinitely sharp (no DOF), fastest.
+//   Model C: brute-force oracle. Only photons that physically fly through the lens
+//            pupil are caught (camera.h catchPhoton). Unbiased but very slow.
+// (A legacy flat "contact sensor" wall — deposit()/Scene::sensor — still exists for
+// irradiance-map diagnostics but is no longer wired to any camera model.)
 //
 // Energy bookkeeping (absorbed/escaped/residual) tracks the PHOTON's own energy
 // only. Model-B splats are side-channel measurements and are intentionally NOT
@@ -232,8 +240,10 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
-    bool forwardCatch = false;   // model A perspective: catch photons at the aperture,
-                                 // no connect/splat (photons must physically fly in).
+    bool forwardCatch = false;   // model C: catch photons that physically fly through
+                                 // the aperture (brute-force oracle, no connect/splat).
+    bool lensMode     = false;   // model A: next-event splat through the finite lens
+                                 // pupil (physical camera with depth of field).
     bool diffraction = true;     // when false, MatType::Grating collapses to its m=0
                                  // (specular) order — a plain mirror (CLI -diffraction).
 
@@ -295,7 +305,83 @@ struct Renderer {
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
-    // Trace a single photon. sensorFilm (model A) and/or cam+camFilm (model B)
+    // Model A (physical camera): next-event splat through the finite lens pupil.
+    // Sample a point A uniformly on the aperture disc, connect the surface vertex to
+    // A, refract through the thin lens and splat onto the film cell A images to.
+    // This is the importance-sampled form of model C's brute-force catch: the same
+    // flux-per-cell estimator, so A and C share both scale and shape (validated), but
+    // A converges because it never waits for a photon to randomly thread the pupil.
+    //
+    // Deriving the weight. In C a diffuse vertex scatters cosine-distributed and, if
+    // the ray happens to pass through pupil area dA around A, deposits beta into
+    // cell(A). The expected deposit is  beta * rho * INT (cosSurf/pi)(cosLens/dist^2) dA
+    // over the pupil. Importance-sampling A ~ uniform(1/(pi R^2)) gives the single
+    // sample estimator  beta * rho * cosSurf * cosLens * R^2 / dist^2  (the BRDF's 1/pi
+    // cancels the pupil pdf's pi R^2). cosLens is the cosine at the pupil (natural
+    // vignetting); the film-cell mapping supplies the rest of the angular falloff and
+    // the depth-of-field spread automatically. Rectilinear film mapping only — a real
+    // fisheye needs a wide-angle lens element, so author fisheye with model B instead.
+    void connectLens(const Scene& scene, const Camera& cam, Film& film,
+                     const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
+                     Pcg32& rng) const {
+        double R = cam.apertureR;
+        double rr = R * std::sqrt(rng.uniform());
+        double a  = 2.0 * PI * rng.uniform();
+        Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        Vec3 toA = A - p;
+        double dist = length(toA);
+        if (dist < 1e-9) return;
+        Vec3 wdir = toA / dist;
+        double cosSurf = dot(n, wdir);
+        if (cosSurf <= 0) return;                        // pupil behind the surface
+        double cosLens = -dot(wdir, cam.w);              // cosine at the lens (w faces the scene)
+        if (cosLens <= 1e-6) return;                     // not heading toward the film
+        int px, py;
+        if (!cam.lensImage(A, wdir, px, py)) return;
+        if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
+
+        // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
+        double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
+        if (scene.medium.enabled)
+            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
+    // surface BRDF*cosSurf is replaced by albedo*phase; the phase function carries no
+    // 1/pi, so the pupil pdf's pi R^2 stays. wIn is the photon's incoming direction.
+    void connectLensVolume(const Scene& scene, const Camera& cam, Film& film,
+                           const Vec3& p, const Vec3& wIn, double lambda, double beta,
+                           Pcg32& rng) const {
+        double R = cam.apertureR;
+        double rr = R * std::sqrt(rng.uniform());
+        double a  = 2.0 * PI * rng.uniform();
+        Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        Vec3 toA = A - p;
+        double dist = length(toA);
+        if (dist < 1e-9) return;
+        Vec3 wdir = toA / dist;
+        double cosLens = -dot(wdir, cam.w);
+        if (cosLens <= 1e-6) return;
+        int px, py;
+        if (!cam.lensImage(A, wdir, px, py)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+
+        double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
+        double Lambda = scene.medium.albedo(lambda);
+        double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
+        contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Route a camera connection to the pinhole (model B) or the finite lens (model A).
+    void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
+                  const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
+        if (lensMode) connectLens(scene, cam, film, p, n, lambda, beta, rho, rng);
+        else          connect(scene, cam, film, p, n, lambda, beta, rho);
+    }
+
+    // Trace a single photon. sensorFilm (legacy contact sensor) and/or cam+camFilm
     // may be null; the caller supplies per-thread films for parallel runs.
     void tracePhoton(const Scene& scene, const Camera* cam, Film* sensorFilm,
                      Film* camFilm, Pcg32& rng, EnergyReport& e) const {
@@ -378,7 +464,7 @@ struct Renderer {
         // term (its cone illuminates surfaces, which then connect to the camera).
         if (cam && camFilm && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env)
-            connect(scene, *cam, *camFilm, origin, emitN, lambda, beta, 1.0);
+            camSplat(scene, *cam, *camFilm, origin, emitN, lambda, beta, 1.0, rng);
 
         Ray ray{origin + dir * 1e-6, dir};
 
@@ -413,8 +499,10 @@ struct Renderer {
             }
 
             if (mediumEvent) {
-                if (cam && camFilm && !forwardCatch)
-                    connectVolume(scene, *cam, *camFilm, mp, ray.d, lambda, beta);
+                if (cam && camFilm && !forwardCatch) {
+                    if (lensMode) connectLensVolume(scene, *cam, *camFilm, mp, ray.d, lambda, beta, rng);
+                    else          connectVolume(scene, *cam, *camFilm, mp, ray.d, lambda, beta);
+                }
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
                 if (rng.uniform() >= scene.medium.albedo(lambda)) { e.absorbed += beta; return; }
                 ray = Ray{mp, sampleHG(ray.d, scene.medium.g, rng)};
@@ -513,10 +601,10 @@ struct Renderer {
                     // lambda' ~ M and splats the glow (albedo aEff*Q) with the
                     // camera-response evaluated at lambda' (Stokes-shifted colour).
                     if (cam && camFilm && !forwardCatch) {
-                        connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
+                        camSplat(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho, rng);
                         if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
                             double pf; double lp = m.fluoEmitSampler.sample(rng, pf);
-                            connect(scene, *cam, *camFilm, h.p, h.n, lp, beta, aEff * m.fluoYield);
+                            camSplat(scene, *cam, *camFilm, h.p, h.n, lp, beta, aEff * m.fluoYield, rng);
                         }
                     }
                     FluoroResult fr = fluoroInteract(m, lambda, rng);
@@ -528,7 +616,7 @@ struct Renderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-                    if (cam && camFilm && !forwardCatch) connect(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho);
+                    if (cam && camFilm && !forwardCatch) camSplat(scene, *cam, *camFilm, h.p, h.n, lambda, beta, rho, rng);
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.

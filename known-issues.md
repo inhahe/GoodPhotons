@@ -35,9 +35,11 @@ as practical; this file is the fallback for what can't be addressed immediately.
   each diffuse/emitter vertex to *every* camera's pupil at once. Photons are
   camera-independent until the `connect()` splat, so `tracePhoton` would take a
   list of (Camera, Film) targets and call `connect`/`connectVolume` once per
-  camera per vertex; per-thread films become per-thread × per-camera. Modes A/C
-  (contact-sensor / thin-lens forward catch) are inherently per-camera and would
-  stay single-camera or need their own catch loop; the CUDA kernel would also need
+  camera per vertex; per-thread films become per-thread × per-camera. Mode A
+  (finite-lens next-event splat) shares this structure and could join the shared
+  pass (connect to each camera's pupil per vertex); mode C (thin-lens forward
+  catch) is inherently per-camera and would stay single-camera or need its own
+  catch loop; the CUDA kernel would also need
   the camera list (currently one `DCamera`). Scoped as a follow-up so the initial
   multi-camera feature (correct, just not yet shared) could land validated.
 - **Status:** OPEN (acceptable) — multi-camera done 2026-07-10; shared pass deferred.
@@ -384,11 +386,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
   `-checkfog` (deterministic transmittance / HG mean-cosine / phase-normalization
   self-test) is retained as a fast complementary check.
 
-### GPU backend (`-device gpu`) covers all three forward camera models (A/B/C)
+### Model A redefined as the finite-lens physical camera (CPU-only) — GPU port is a follow-up
+- **What:** as of 2026-07-11 **mode A is the physical finite-lens camera**: a finite
+  aperture + thin lens + film imaged by next-event estimation of the pupil
+  (`Renderer::connectLens`/`camera.h::lensImage`). It replaces the old contact-sensor
+  "mode A" (a flat film wall — no aperture, so it integrated the whole hemisphere per
+  pixel and could not form an image; retired). Mode B is now the pinhole (`aperture→0`)
+  limit; mode C is the brute-force forward-catch oracle A is validated against
+  (matching framing/DOF/scale — auto-exposure within ~2.5% at equal aperture/focus).
+- **CPU-only:** the CUDA `DCamera` implements only the rectilinear pinhole, so the
+  lens splat has no device path; `runRender` forces the CPU for mode A (`-device gpu`
+  prints a notice). Proper fix (follow-up): add pupil sampling + `lensImage` (thin-lens
+  `u' = u − ρ/f`) to the device camera and a `connectLens`-equivalent splat in `kTrace`
+  under a new `camMode 'A'`, then validate GPU-vs-CPU as for B/C. Mode A is also
+  **rectilinear only** (a real fisheye needs a wide-angle lens element the single
+  thin-lens can't form) — a fisheye+A/C camera is rejected, directing the user to mode B.
+- **Vestigial GPU deposit path:** the CUDA kernel still contains the old contact-sensor
+  `deposit` under `camMode 'A'`, but `renderForward` no longer passes 'A' to the GPU
+  (`camMode = forwardCatch ? 'C' : 'B'`), so it is now unreachable. Remove it when the
+  finite-lens GPU port lands.
+
+### GPU backend (`-device gpu`) covers forward camera models B/C
 - **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCuda`) implements
-  the three forward camera models — A (contact-sensor deposit), B (connect/splat to
-  the pinhole), and C (finite-aperture thin-lens forward catch) — selected by the
-  `camMode` parameter. It is used for `-mode A/B/C` and the forward pass of `-mode V`.
+  the pinhole splat (B) and the finite-aperture thin-lens forward catch (C), selected
+  by the `camMode` parameter. It is used for `-mode B/C` and the forward pass of
+  `-mode V`. (The finite-lens next-event mode A is CPU-only — see the entry above.)
   It still falls back to the CPU for mode R (backward reference) and the mode-P
   camera-side/backward layer (no backward tracer on-device). Fluorescent scenes are
   rejected on-device (fall back to CPU) because the emission-sampler reradiation
@@ -398,14 +420,22 @@ as practical; this file is the fallback for what can't be addressed immediately.
   validates. The kernel `kTrace` mirrors `Renderer::tracePhoton` exactly and gates the
   camera-specific work on `camMode`: emitter→pinhole connect, in-scatter
   `connectVolume`, and diffuse-vertex `connect` run only for B; `catchPhoton` (thin
-  lens `u' = u - rho/f`) runs only for C; the sensor-plane `deposit` runs only for A.
+  lens `u' = u - rho/f`) runs only for C. (The kernel still contains a `camMode 'A'`
+  branch that runs the retired contact-sensor `deposit`, but `renderForward` now
+  selects only `'C'`/`'B'` for the GPU — see the vestigial-path note in the entry
+  above — so that branch is unreachable. The **Mode A validation bullet below is a
+  historical record of that retired contact-sensor GPU path**, not of the current
+  finite-lens next-event mode A, which is CPU-only.)
   Validation vs CPU (Cornell, 128²):
   - **Mode B:** image RMSE ≈ 0.85/255 at 200M photons (pure MC noise); `-mode V
     -device gpu` PASSes vs the backward reference (bulk RMSE 4.17% ≈ CPU 4.22%);
     ~14× speedup (400M @256²: 153s CPU → 10.9s GPU on an RTX 4090).
-  - **Mode A:** energy report matches to 4 sig figs (sensor 0.3298 vs 0.3299); image
-    RMSE scales as √N — 11.18/255 @40M → 5.11/255 @200M (5× photons, ideal 2.24×,
-    measured 2.19×), proving variance not bias.
+  - **Mode A (retired contact-sensor GPU path — historical):** energy report matched
+    to 4 sig figs (sensor 0.3298 vs 0.3299); image RMSE scaled as √N — 11.18/255 @40M
+    → 5.11/255 @200M (5× photons, ideal 2.24×, measured 2.19×), proving variance not
+    bias. This validated the old flat-film-wall mode A, which has since been replaced
+    by the CPU-only finite-lens next-event camera; it is retained only as a record of
+    the now-unreachable device `deposit` path.
   - **Mode C:** energy report matches to 4 sig figs; with a wide aperture (0.25,
     focus 2.2) the caught fraction matches exactly (sensor=0.0058) and per-image
     auto-exposure agrees (1.60e-8 vs 1.59e-8). Image RMSE scales as √N —
@@ -428,7 +458,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
   (`RAY_EPS=1e-4`, `DET_EPS=1e-6`) replace the FP64 `1e-6`/`1e-9`. **FP32 validated vs
   FP64 CPU (Cornell, RTX 4090):** energy conserves exactly (`sum/emitted=1.000000`,
   residual=0 on A/B/C/V — no self-intersection leak from the float epsilons); fractions
-  converge to 4 sig figs (mode A sensor 0.3298 vs 0.3301, mode C 0.0059 vs 0.0058); mode
+  converge to 4 sig figs (retired contact-sensor mode A sensor 0.3298 vs 0.3301, mode C 0.0059 vs 0.0058); mode
   V PASSES (bulk RMSE 2.89%, firefly-dominated); ~14× faster than FP64 (400M @256² in
   0.76s vs 10.9s). The DVec3 3-arg ctor deliberately keeps `double` params so host
   brace-init from `double` Scene coords is a widening (legal) conversion, never
