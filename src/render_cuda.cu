@@ -148,6 +148,11 @@ struct DMaterial {
     double reflect[SPEC_N];     // baked reflect spectrum
     double ior[SPEC_N];         // baked index spectrum
     double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
+    // Beer-Lambert interior absorption sigma_a(lambda) per metre travelled INSIDE a
+    // dielectric (colored/attenuating glass). All-zero = colorless (default). Consulted
+    // only for D_DIELECTRIC, via the `interior` material tracked through the transport
+    // loop (device twin of Material::absorb).
+    double absorb[SPEC_N];
     double roughness;
     double filmIor, filmThickness;
     // Spatially-varying diffuse albedo: index into DScene::textures (-1 = use the
@@ -1040,8 +1045,19 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
 
 // ============================ material interactions ============================
 
-__device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const DVec3& d,
-                                         Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
+// Per-hit roughness helper (defined below, after the texture/pattern samplers) — used
+// here for frosted glass before its point of definition.
+__device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h);
+
+// Dielectric interface: Fresnel-weighted specular reflect-or-refract (Snell, spectral
+// index -> dispersion). A non-zero per-hit roughness frosts BOTH lobes (rough glass):
+// the chosen direction is jittered by a power-cosine lobe, rejecting jitters that would
+// cross to the wrong side so no light leaks through. `transmitted` (optional) reports
+// whether the ray refracted vs. reflected/TIR — the caller uses it to track which
+// medium it is now inside (interior absorption). Mirrors host refractOrReflect.
+__device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
+                                         const DVec3& d, Real lambda, DRng& rng,
+                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr) {
     Real ng = specLookup(m.ior, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
@@ -1050,6 +1066,7 @@ __device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const
     Real cosI = -dot(d, nl);
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
     DVec3 outDir;
+    bool refracted = false;
     if (sin2t > 1) outDir = reflectv(d, nl);
     else {
         Real cosT = sqrt((Real)1 - sin2t);
@@ -1057,9 +1074,17 @@ __device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const
         Real rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
         Real R = (Real)0.5 * (rs * rs + rp * rp);
         if (rng.uniform() < R) outDir = reflectv(d, nl);
-        else outDir = d * eta + nl * (eta * cosI - cosT);
+        else { outDir = d * eta + nl * (eta * cosI - cosT); refracted = true; }
     }
     outDir = normalize(outDir);
+    // Frosted glass: jitter the chosen lobe, keeping it on the intended side.
+    Real rough = dMatRoughness(sc, m, h);
+    if (rough > (Real)1e-3) {
+        DVec3 pert = sampleGlossy(outDir, rough, rng);
+        bool ok = refracted ? (dot(pert, nl) < 0) : (dot(pert, nl) > 0);
+        if (ok) outDir = pert;
+    }
+    if (transmitted) *transmitted = refracted;
     ro = h.p + outDir * RAY_EPS; rd = outDir;
 }
 // Returns false if the photon is absorbed by an opaque (absorbing) substrate.
@@ -1679,7 +1704,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* f
 __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
-                                double& eAbsorbed, double& eSensor, double& eEscaped) {
+                                double& eAbsorbed, double& eSensor, double& eEscaped,
+                                int& interior) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
@@ -1702,6 +1728,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
         }
     }
 
+    // Beer-Lambert attenuation over the free path just travelled inside a dielectric
+    // (colored/attenuating glass), applied before the event is processed (matches the
+    // host: attenuate over dEvent using the medium carried from the previous vertex).
+    if (interior >= 0) {
+        Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+        if (a > 0) beta *= exp(-a * dEvent);
+    }
+
     if (mediumEvent) {
         if (camMode == CAM_B) connectVolume(sc, cam, film, hits, mp, rd, lambda, beta);
         else if (camMode == CAM_A) connectLensVolume(sc, cam, film, hits, mp, rd, lambda, beta, rng);
@@ -1719,15 +1753,20 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     }
 
     const DMaterial* mptr = &sc.mats[h.matId];
+    int matIndex = h.matId;
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (mptr->type == D_MIX) {
         int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
         if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        mptr = &sc.mats[child];
+        mptr = &sc.mats[child]; matIndex = child;
     }
     const DMaterial& m = *mptr;
     if (m.type == D_DIELECTRIC) {
-        DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; return WF_CONTINUE;
+        bool entering = dot(rd, h.ng) < 0;
+        bool transmitted = false;
+        DVec3 nro, nrd; refractOrReflect(sc, m, h, rd, lambda, rng, nro, nrd, &transmitted);
+        if (transmitted) interior = entering ? matIndex : -1;   // track medium for Beer-Lambert
+        ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_THINFILM) {
         DVec3 nro, nrd;
         if (!thinFilmInterface(sc, m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -1817,10 +1856,11 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, doubl
         DVec3 ro, rd; Real beta, lambda;
         if (!genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
+        int interior = -1;   // dielectric the photon is currently inside (-1 = vacuum)
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, interior) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -1858,6 +1898,7 @@ struct WFState {
     DRng*  rng;
     int*   bounce;   // bounces already shaded for the photon currently in this slot
     int*   alive;    // 1 = slot holds a live photon, 0 = drained (budget spent)
+    int*   interior; // dielectric material index the photon is inside (-1 = vacuum)
     DHit*  hit;      // extend-stage intersection, consumed by shade
 };
 
@@ -1877,7 +1918,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamera& cam, double* fil
         if (genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEm)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
-            st.bounce[slot] = 0; st.alive[slot] = 1;
+            st.bounce[slot] = 0; st.alive[slot] = 1; st.interior[slot] = -1;
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -1915,9 +1956,10 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
     DVec3 ro = st.ro[slot], rd = st.rd[slot];
     Real beta = st.beta[slot], lambda = st.lambda[slot];
     DHit h = st.hit[slot];
+    int interior = st.interior[slot];
     double eAbs = 0, eSen = 0, eEsc = 0;
     int res = shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                        eAbs, eSen, eEsc);
+                        eAbs, eSen, eEsc, interior);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -1930,6 +1972,7 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
         st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
         st.bounce[slot] = bounce; st.rng[slot] = rng;
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
+        st.interior[slot] = interior;   // carry the dielectric medium to the next segment
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
@@ -2297,10 +2340,17 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                     Real lambda, double invPdfLambda, DRng& rng) {
     double L = 0.0, thr = 1.0;
     bool specularArrival = true;                       // camera ray may see a light directly
+    int interior = -1;                                 // dielectric the ray is inside (-1 = vacuum)
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
         if (!h.valid) return L;                        // escaped (no env in v1)
+        // Beer-Lambert attenuation over the in-glass segment up to this surface
+        // (colored/attenuating glass carried from the previous vertex).
+        if (interior >= 0) {
+            Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (mp->type == D_MIX) {                       // resolve stochastic mix
@@ -2315,7 +2365,10 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 
         switch (mp->type) {
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; refractOrReflect(*mp, h, rd, lambda, rng, nro, nrd);
+                bool entering = dot(rd, h.ng) < 0;
+                bool transmitted = false;
+                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd, &transmitted);
+                if (transmitted) interior = entering ? matId : -1;
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_THINFILM: {
@@ -2470,7 +2523,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; refractOrReflect(*mp, h, rd, lambda, rng, nro, nrd);
+                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd);
                 wi = nrd; betaFactor = 1.0; delta = 1;
                 break;
             }
@@ -2858,34 +2911,17 @@ bool cudaForwardSupported(const Scene& scene) {
                 if (c >= 0 && c < (int)scene.mats.size() && paletteTex(scene.mats[c].reflectTex)) return true;
         return false;
     };
-    // Dielectric translucency is CPU-only for now: the device dielectric branch is
-    // smooth & non-absorbing (no frosting, no Beer-Lambert interior tint). A frosted or
-    // colored dielectric forces the CPU forward/backward tracer so the GPU never renders
-    // a silently-wrong image (missing frost, clear-instead-of-colored glass). Procedural
-    // patterns (§4) run on-device now (dPatternEval / dMatRoughness / dMixResolveChild),
-    // so a roughness/film/mix-weight pattern on a NON-dielectric is supported; a
-    // roughnessPat on a dielectric is still frosting, caught by frostedOrColoredGlass.
-    // Implicit surfaces (isosurface) are gated separately below.
-    auto frostedOrColoredGlass = [&](const Material& m) {
-        if (m.type != MatType::Dielectric) return false;
-        if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
-        // colored glass: any non-zero absorption coefficient over the spectrum.
-        if (m.absorb)
-            for (int i = 0; i <= 8; ++i)
-                if (m.absorb(DLMIN + (DLMAX - DLMIN) * i / 8.0) > 0.0) return true;
-        return false;
-    };
+    // Dielectric translucency now runs on the device forward + backward tracers:
+    // frosting (a roughness lobe on both dielectric lobes, from constant/tex/pattern
+    // roughness) and Beer-Lambert interior absorption (colored glass) are both threaded
+    // through shadeStep / bkRadiance via the `interior` medium index. Procedural patterns
+    // (§4) also run on-device (dPatternEval / dMatRoughness / dMixResolveChild). So neither
+    // frosted/colored glass nor a roughness/film/mix-weight pattern forces a CPU forward
+    // fallback here. (The GPU BDPT kernel still can't MIS either — cudaBdptSupported gates
+    // both.) Implicit surfaces (isosurface) are gated separately below.
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
-        if (matId >= 0 && matId < (int)scene.mats.size()) {
-            const Material& m = scene.mats[matId];
-            if (frostedOrColoredGlass(m)) return true;
-            if (m.type == MatType::Mix)
-                for (int c : m.mixChildren)
-                    if (c >= 0 && c < (int)scene.mats.size() &&
-                        frostedOrColoredGlass(scene.mats[c])) return true;
-        }
         // The physical layered stack (coat interface over a weighted body) is CPU-only;
         // the device shadeStep has no Layered branch, so any Layered material forces a
         // CPU forward/backward fallback (like indexed palettes).
@@ -3018,6 +3054,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         bakeSpec(m.reflect, d.reflect);
         bakeSpec(m.ior, d.ior);
         bakeSpec(m.substrateK, d.substrateK);
+        bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
@@ -3256,6 +3293,7 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng));
     cudaMalloc(&st.bounce, (size_t)W * sizeof(int));
     cudaMalloc(&st.alive,  (size_t)W * sizeof(int));
+    cudaMalloc(&st.interior, (size_t)W * sizeof(int));
     cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit));
     cudaMemset(st.alive, 0, (size_t)W * sizeof(int));
 
@@ -3287,7 +3325,7 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     }
 
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
-    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.hit);
+    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.interior); cudaFree(st.hit);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -3357,6 +3395,18 @@ bool cudaBdptSupported(const Scene& scene) {
     // media, and only area/sphere/cylinder Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
     if (scene.medium.enabled) return false;
+    // Dielectric translucency (frosting + Beer-Lambert interior absorption) runs on the
+    // device forward/backward tracers, but the BDPT kernel (kBdpt) treats every dielectric
+    // as smooth & non-absorbing and its pdf/eval use constant params — a frosted or colored
+    // glass would bias MIS. Fall back to the CPU BDPT for such scenes.
+    auto frostedOrColoredGlass = [&](const Material& m) {
+        if (m.type != MatType::Dielectric) return false;
+        if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
+        if (m.absorb)
+            for (int i = 0; i <= 8; ++i)
+                if (m.absorb(DLMIN + (DLMAX - DLMIN) * i / 8.0) > 0.0) return true;  // colored
+        return false;
+    };
     // The forward path now supports textured albedo + fluorescence on the device, but
     // the BDPT kernel (kBdpt) does not implement either — its diffuse vertices sample
     // the constant reflect spectrum and it has no fluorescent-vertex strategy — so
@@ -3364,6 +3414,7 @@ bool cudaBdptSupported(const Scene& scene) {
     auto usesTexOrFluoro = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
         const Material& m = scene.mats[matId];
+        if (frostedOrColoredGlass(m)) return true;
         if (m.reflectTex >= 0 || m.type == MatType::Fluorescent) return true;
         // Non-albedo texture maps (roughness / film-thickness) drive the glossy/thin-film
         // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
@@ -3377,7 +3428,8 @@ bool cudaBdptSupported(const Scene& scene) {
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
-                    (scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
+                    (frostedOrColoredGlass(scene.mats[c]) ||
+                     scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
                      scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
                      scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
                      scene.mats[c].mixWeightPat >= 0))

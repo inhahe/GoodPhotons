@@ -167,14 +167,13 @@ truth), remain CPU-only.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
   (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
-  forward scenes. It also falls back for any scene using **dielectric translucency
-  (frosted/colored glass)**, whose device port is pending. (Implicit surfaces /
-  `isosurface` and **procedural patterns** are now GPU-accelerated — the device
-  sphere-traces the same field expressions and runs the same pattern VM; a *frosted*
-  dielectric, i.e. a `dielectric` with a roughness pattern, still falls back as
-  translucency. GPU **BDPT** (mode `D`) additionally falls back for any pattern-driven
-  material, whose per-hit values its MIS kernel can't yet reproduce.) `cpu` is fully
-  deterministic and is used for reference/validation baselines.
+  forward scenes. Implicit surfaces / `isosurface`, **procedural patterns**, and
+  **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
+  GPU-accelerated now — the device sphere-traces the same field expressions, runs the
+  same pattern VM, and threads the interior-absorption medium through both the forward
+  and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
+  material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
+  reproduce. `cpu` is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -308,7 +307,8 @@ two physically-motivated translucency controls (both compose with dispersion):
   (Beer–Lambert), so thick regions tint more than thin edges. Authored like any
   spectrum (e.g. `absorb gaussian center=470 sigma=60 amp=14` for amber). Interior
   absorption is threaded through all three CPU transport loops (forward, backward,
-  BDPT); see `scenes/translucency.ftsl`. *(GPU: CPU-only for now — see Known issues.)*
+  BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
+  frosting and colored-glass tint; mode-`D` BDPT still falls back to the CPU.)*
 
 ---
 
@@ -412,8 +412,7 @@ the step to the smallest axis scale), so an `ellipsoid`, a squashed `box`/`torus
 all work. Surface normals come from the analytic field gradient. A worked example with
 metaballs, drilled CSG, and a tilted torus is in `scenes/implicit.ftsl`. Implicit
 surfaces are sphere-traced on **both the CPU and the GPU** (the device port matches the
-CPU to Monte-Carlo noise); a scene is only forced onto the CPU if it *also* uses
-dielectric translucency (still CPU-only — see Known issues).
+CPU to Monte-Carlo noise).
 
 ## Textures
 
@@ -464,9 +463,9 @@ Bind a pattern anywhere a scalar `texture:<name>` map is accepted, using
 weight makes the *material itself* — colour **and** BSDF type — vary from point to
 point (checkerboard of red vs green diffuse, noise-selected metal vs glass, …). See
 `scenes/procedural.ftsl`. *(GPU: patterns run on the device forward and backward
-paths; the exception is a roughness pattern on a `dielectric` — that is frosted glass,
-still CPU-only — and GPU BDPT, whose MIS kernel falls back for any pattern. See Known
-issues.)*
+paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT is the
+exception — its MIS kernel falls back to the CPU for any pattern or frosted/colored
+glass.)*
 
 ## Participating media / fog
 

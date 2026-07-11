@@ -42,12 +42,13 @@ as practical; this file is the fallback for what can't be addressed immediately.
   endpoint sits in) and multiply the connection throughput by the resulting
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
 
-### GPU parity pending for dielectric translucency (implicits + patterns DONE)
-- **What:** of the §1–4 CPU feature set, **implicit surfaces** (5a) and **procedural
-  patterns** (5b) are now ported to the GPU (see below). The only remaining CPU-only
-  piece is **dielectric translucency** (frosted glass = roughness lobe on the transmitted
-  ray; colored glass = Beer–Lambert `absorb` interior tint): the CUDA backend's dielectric
-  branch (`refractOrReflect`) is still smooth and non-absorbing.
+### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
+- **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward
+  tracers: **implicit surfaces** (5a), **procedural patterns** (5b), and **dielectric
+  translucency** (5c — frosted glass = roughness lobe on both dielectric lobes; colored
+  glass = Beer–Lambert `absorb` interior tint). The only remaining fallback is **GPU BDPT**
+  (mode `D`), whose MIS kernel still can't reproduce per-hit pattern BSDFs or frosted/
+  colored glass, so those scenes fall back to the CPU BDPT.
 - **Implicit surfaces — DONE (2026-07-11, step 5a):** `render_cuda.cu` gained device
   twins `DFieldNode`/`DImplicit`, a postfix field evaluator (`dFieldEval`/`dFieldLeafSDF`/
   `dFieldGradient`, all FP64 for sphere-trace bisection robustness), and
@@ -73,18 +74,24 @@ as practical; this file is the fallback for what can't be addressed immediately.
   (checker/noise `mixWeightPat` spheres + a glossy `roughnessPat` sphere) GPU-vs-CPU RMSE
   12.9/255 at 512 spp → 7.2/255 at 2048 spp (falls as 1/√spp — pure noise, no bias);
   mean brightness matches to ~1%.
-- **Current behavior for translucency (correct, not silently wrong):**
-  `cudaForwardSupported()` still gates a frosted/colored dielectric — `frostedOrColoredGlass`
-  returns true for a `dielectric` with `roughness > 1e-3`/`roughnessTex`/`roughnessPat` or
-  any non-zero `absorb`, so `-device gpu`/`auto` **falls back to the CPU tracer** (message
-  names the feature). `cudaBdptSupported()`/`cudaBackwardSupported()` inherit this. Verified:
-  `translucency.ftsl` and the frosted sphere in `procedural.ftsl` fall back; `implicit.ftsl`,
-  `scraps/patval.ftsl`, and plain clear-glass `cornell.ftsl` run on GPU.
-- **Proper fix (remaining step-5 work):** (c) thread an `interior` medium pointer through
-  the device transport loops for Beer–Lambert absorption and add the roughness lobe to the
-  device dielectric (frosting); then drop the `frostedOrColoredGlass` gate.
-- **Status:** OPEN — logged 2026-07-11; implicit surfaces (5a) + procedural patterns (5b)
-  landed same day. Dielectric translucency (5c) is the remaining increment.
+- **Dielectric translucency — DONE (2026-07-11, step 5c):** the device `refractOrReflect`
+  gained a frosting lobe (jitter both the reflected and refracted directions by a
+  power-cosine lobe when per-hit `dMatRoughness` > 1e-3, rejecting jitters that cross to the
+  wrong side); `DMaterial` gained a baked `absorb[SPEC_N]` table; and an `interior` medium
+  index (the dielectric material a photon/ray is inside, -1 = vacuum) is threaded through
+  both forward paths — `shadeStep` (megakernel `kTrace` local + wavefront `WFState::interior`
+  SoA slot) — and the backward `bkRadiance`, applying `beta/thr *= exp(-absorb(λ)·dSeg)` over
+  each in-glass segment. `cudaForwardSupported()` no longer gates frosted/colored glass, so
+  `-device gpu`/`auto` renders them on the forward + backward tracers; **GPU BDPT still falls
+  back** (the `frostedOrColoredGlass` gate moved into `cudaBdptSupported`, alongside the
+  pattern gate). Validated: `translucency.ftsl` (colored glass) GPU-vs-CPU RMSE 16.9/255 →
+  9.5/255 at 512→2048 spp (falls ~1/√spp; mean matches 1.3%→0.7%); `procedural.ftsl` (frosted
+  height-banded glass + patterns) RMSE 21.7 → 13.0 at 512→2048 spp (mean matches 0.06%→0.2%);
+  forward megakernel vs wavefront agree on mean to 0.15%; BDPT falls back with the correct
+  message; `cornell.ftsl` (clear glass) + `implicit.ftsl` still run on GPU (no regression).
+- **Status:** DONE — logged 2026-07-11; implicit surfaces (5a), procedural patterns (5b), and
+  dielectric translucency (5c) all landed the same day. Full §1–4 GPU forward/backward parity
+  achieved; only GPU BDPT retains feature-scoped fallbacks (patterns, frosted/colored glass).
 
 ### Multi-camera renders re-trace photons per camera (no shared pass yet)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render
