@@ -10,6 +10,9 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <array>
+#include <algorithm>
+#include <cmath>
 #include "geometry.h"
 #include "scene.h"
 
@@ -88,6 +91,51 @@ inline Affine affineFromTRS(const Vec3& translate, const Vec3& rotDeg, const Vec
 // the name is unknown (the caller then keeps the mesh's default material).
 using MtlResolver = std::function<int(const std::string&)>;
 
+// Procedural UV projection for meshes that carry no `vt` coordinates (spec §9.2).
+// Applied at load time from the WORLD-space vertex positions, so the generated UVs
+// travel through the exact same per-vertex `Tri.uv{0,1,2}` slots that `use_mesh`
+// fills — no shading/GPU change is needed (the tracers already interpolate stored
+// UVs). `axis` (0=x,1=y,2=z) is the projection/up axis. Coordinates are normalised
+// to [0,1] across the mesh AABB so the map wraps once over the object by default;
+// `repeat` wrap + a texture-space `scale` tile it further.
+enum class UvProjection { None = 0, Planar, Spherical, Cylindrical };
+
+inline UvProjection parseUvProjection(const std::string& s) {
+    if (s == "planar")      return UvProjection::Planar;
+    if (s == "spherical")   return UvProjection::Spherical;
+    if (s == "cylindrical") return UvProjection::Cylindrical;
+    return UvProjection::None;
+}
+
+// Project one world-space point to (u,v) given the mesh AABB (lo..hi), its centre,
+// the projection kind and the up/projection axis (0/1/2). Returns {u,v,0}.
+inline Vec3 projectUV(const Vec3& p, const Vec3& lo, const Vec3& hi,
+                      const Vec3& ctr, UvProjection proj, int axis) {
+    auto comp = [](const Vec3& v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); };
+    // The two axes orthogonal to `axis`, in a stable (right-handed-ish) order.
+    int a0 = (axis + 1) % 3, a1 = (axis + 2) % 3;
+    auto norm01 = [&](double val, int i) {
+        double l = comp(lo, i), h = comp(hi, i);
+        double d = h - l;
+        return d > 1e-12 ? (val - l) / d : 0.5;
+    };
+    if (proj == UvProjection::Planar) {
+        return Vec3{norm01(comp(p, a0), a0), norm01(comp(p, a1), a1), 0};
+    }
+    // Direction from the mesh centre (spherical/cylindrical share the azimuth).
+    Vec3 d = p - ctr;
+    double dz = comp(d, axis);
+    double dx = comp(d, a0), dy = comp(d, a1);
+    double azim = 0.5 + std::atan2(dy, dx) / (2.0 * PI);   // [0,1)
+    if (proj == UvProjection::Cylindrical) {
+        return Vec3{azim, norm01(comp(p, axis), axis), 0};
+    }
+    // Spherical: polar angle from the up axis.
+    double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+    double v = (r > 1e-12) ? std::acos(std::max(-1.0, std::min(1.0, dz / r))) / PI : 0.5;
+    return Vec3{azim, v, 0};
+}
+
 // Load an OBJ into the scene as triangles of material `matId`, applying the full
 // affine transform `xf` (translate + rotation + non-uniform scale). When `loadUV`
 // is set, per-vertex texture coordinates are read from `vt` lines and assigned to
@@ -97,7 +145,8 @@ using MtlResolver = std::function<int(const std::string&)>;
 // when the name is unknown) — this is the per-face `usemtl use_names` path.
 // Returns the number of triangles added (0 on failure). Call before Scene::build().
 inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
-                   bool loadUV = false, const MtlResolver* matResolver = nullptr) {
+                   bool loadUV = false, const MtlResolver* matResolver = nullptr,
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1) {
     std::ifstream f(path);
     if (!f) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
 
@@ -106,6 +155,11 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
     int curMat = matId;            // active material (switched by `usemtl` when resolving)
     int added = 0;
     std::string line;
+    // For a procedural UV projection we need the whole mesh AABB, so record each
+    // added triangle's source vertex indices and fill UVs in a second pass.
+    const bool proceduralUV = (uvProj != UvProjection::None) && !loadUV;
+    std::vector<std::array<int, 3>> triVI;   // vertex indices per added tri
+    size_t triStart = s.tris.size();
     while (std::getline(f, line)) {
         if (line.size() < 2) continue;
         if (line[0] == 'v' && line[1] == ' ') {
@@ -141,19 +195,38 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
                     t.uv0 = uvAt(tidx[0]); t.uv1 = uvAt(tidx[k]); t.uv2 = uvAt(tidx[k + 1]);
                 }
                 s.tris.push_back(t);
+                if (proceduralUV) triVI.push_back({idx[0], idx[k], idx[k + 1]});
                 ++added;
             }
         }
     }
-    std::printf("loadObj: %s -> %d verts, %d tris (mat %d)\n",
-                path, (int)verts.size(), added, matId);
+    // Second pass: assign procedural UVs from the world-space mesh AABB.
+    if (proceduralUV && !verts.empty()) {
+        Vec3 lo = verts[0], hi = verts[0];
+        for (const Vec3& v : verts) {
+            lo = Vec3{std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+            hi = Vec3{std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+        }
+        Vec3 ctr = (lo + hi) * 0.5;
+        int ax = (uvAxis >= 0 && uvAxis <= 2) ? uvAxis : 1;
+        for (size_t i = 0; i < triVI.size(); ++i) {
+            Tri& t = s.tris[triStart + i];
+            t.uv0 = projectUV(verts[triVI[i][0]], lo, hi, ctr, uvProj, ax);
+            t.uv1 = projectUV(verts[triVI[i][1]], lo, hi, ctr, uvProj, ax);
+            t.uv2 = projectUV(verts[triVI[i][2]], lo, hi, ctr, uvProj, ax);
+        }
+    }
+    std::printf("loadObj: %s -> %d verts, %d tris (mat %d)%s\n",
+                path, (int)verts.size(), added, matId,
+                proceduralUV ? " [procedural UVs]" : "");
     return added;
 }
 
 // MeshXform overload: a single scale+Euler+translate transform (the common case).
 inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
-                   bool loadUV = false, const MtlResolver* matResolver = nullptr) {
-    return loadObj(s, path, matId, xf.toAffine(), loadUV, matResolver);
+                   bool loadUV = false, const MtlResolver* matResolver = nullptr,
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1) {
+    return loadObj(s, path, matId, xf.toAffine(), loadUV, matResolver, uvProj, uvAxis);
 }
 
 // Backward-compatible convenience overload: translate + uniform scale only.

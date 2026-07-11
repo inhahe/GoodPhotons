@@ -216,9 +216,19 @@ as practical; this file is the fallback for what can't be addressed immediately.
   colour; a PNG copy of the checker renders bit-identically to the PPM (RMSE 0.0),
   confirming the stb sRGB decode + orientation.
 - **Remaining [needs engine work]:**
-  1. **UV projections.** Only `uv use_mesh` (OBJ `vt`) and quad corners exist. The
-     procedural projections in the spec (§9.2 triplanar/planar/spherical/cylindrical)
-     are not built — meshes without `vt` fall back to zero UVs.
+  1. **UV projections.** ~~Only `uv use_mesh` (OBJ `vt`) and quad corners exist.~~
+     **PARTLY DONE 2026-07-11:** the analytic projections `uv planar|spherical|
+     cylindrical [x|y|z]` (spec §9.2) are now synthesized at load time from the
+     world-space vertex AABB (`UvProjection`/`projectUV` in `src/mesh.h`, parsed in
+     `src/ftsl.h`), normalised to [0,1] across the mesh so the map wraps once by
+     default. Because they fill the same per-vertex `Tri.uv{0,1,2}` slots as
+     `use_mesh`, both tracers **and the GPU** interpolate them with no shading change
+     (validated on `torus.obj`, which carries no `vt` — the checker maps onto the
+     torus via the spherical projection; `scraps/uvproc.ftsl`). **Still deferred:**
+     `triplanar` — unlike the three analytic maps it can't be baked into per-vertex
+     UVs (it blends three planar samples per hit, weighted by the surface normal), so
+     it needs a per-hit texture-lookup change in `diffuseReflectance()` (CPU) and
+     `dTexReflAt()` (GPU), tracked with item 2 below.
   2. **Non-albedo parameters.** A texture can only bind to diffuse `reflect` today.
      Spec §9.4 wants textures on roughness, mix weights, ior, thickness, etc. — each
      needs the corresponding material param to accept a per-hit texture lookup.
@@ -237,7 +247,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
   4. **Indexed-spectral palettes** (§9.3) — an index image + name→spectrum palette —
      not implemented.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
-  2026-07-10; GPU port done 2026-07-11; items 1/2/4 above deferred.
+  2026-07-10; GPU port done 2026-07-11; **analytic UV projections (planar/spherical/
+  cylindrical) done 2026-07-11**; triplanar + non-albedo params + indexed palettes
+  (items 1-triplanar/2/4) deferred.
 
 ### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
 - **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`

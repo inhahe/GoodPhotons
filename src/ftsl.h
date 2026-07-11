@@ -780,7 +780,18 @@ private:
         xf.t = xf.t * L_;
         // `uv use_mesh` reads texture coordinates from the OBJ's `vt` records (needed
         // for textured materials); the default keeps the Tri fallback UVs.
-        bool loadUV = (strOf(b, "uv") == "use_mesh");
+        // `uv planar|spherical|cylindrical [x|y|z]` instead synthesizes UVs at load
+        // time from the world-space vertex positions (spec §9.2 procedural
+        // projections), for meshes without their own `vt` coordinates. The optional
+        // second token picks the projection/up axis (default y).
+        const std::string uvMode = strOf(b, "uv");
+        bool loadUV = (uvMode == "use_mesh");
+        UvProjection uvProj = parseUvProjection(uvMode);
+        int uvAxis = 1;   // y up by default
+        if (const Stmt* uvs = find(b, "uv"); uvs && uvs->val.words.size() >= 2) {
+            const std::string& a = uvs->val.words[1];
+            if (a == "x") uvAxis = 0; else if (a == "z") uvAxis = 2; else uvAxis = 1;
+        }
         // `usemtl use_names` switches material per OBJ `usemtl` group by matching the
         // group name to an FTSL material of the same name (unknown -> the mesh's
         // default `material`). Two-token maps can't survive the statement splitter,
@@ -790,7 +801,8 @@ private:
             auto it = matIndex_.find(nm);
             return (it == matIndex_.end()) ? -1 : it->second;
         };
-        loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr);
+        loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                uvProj, uvAxis);
         return true;
     }
 
