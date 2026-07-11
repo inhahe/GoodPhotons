@@ -23,6 +23,25 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Limitations (by design, tracked for future work)
 
+### BDPT connection edges through colored glass are not absorption-weighted
+- **What:** Beer-Lambert interior absorption (`Material::absorb`, colored glass)
+  is threaded through all three CPU transport loops via an `interior` medium
+  pointer (forward `tracePhoton`, backward `radiance`, BDPT `randomWalk`). In
+  BDPT this attenuates only the **subpath walk** — the camera/light subpaths that
+  are traced by ray marching. A **connection edge** (`connectBDPT`, the
+  deterministic segment joining a camera vertex to a light vertex) that happens
+  to cross a dielectric is treated as unoccluded transmittance = 1, so it picks
+  up no absorption tint.
+- **Why it matters:** BDPT (mode D) images of scenes with colored glass will be
+  slightly biased along light↔eye connections that pass through the glass — the
+  glass tints direct-walk contributions correctly but not the connected ones.
+  Forward (A/B/C) and backward (R) modes are unaffected (they have no connection
+  edges), so the primary/reference renders are correct.
+- **Proper fix:** accumulate optical depth along the connection ray by
+  intersecting it against dielectric boundaries (or track the medium a connection
+  endpoint sits in) and multiply the connection throughput by the resulting
+  `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
+
 ### Multi-camera renders re-trace photons per camera (no shared pass yet)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render
   invocation emits one image per camera (`scenes/twocam.ftsl`), with `-camera
