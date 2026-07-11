@@ -7,6 +7,12 @@
 //   -mode P : forward + camera-side composite — model B for diffuse-first pixels
 //             (and caustics), a backward camera-side ray path for specular/coated
 //             surfaces (which model B alone leaves black). See renderComposite.
+//   -mode D : bidirectional path tracing (BDPT) — one unbiased estimator that traces
+//             a light AND a camera subpath and MIS-combines every connection. Renders
+//             specular-first pixels directly (no composite seam) AND diffuse caustics
+//             in a single pass, on the absolute-radiance scale. CPU-only. Does not
+//             support fluorescence / participating media / spot & env lights (use B/P
+//             or R for those). See renderBdpt / bdpt.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
@@ -34,6 +40,7 @@
 #include "camera.h"
 #include "render.h"
 #include "backward.h"
+#include "bdpt.h"
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
@@ -219,7 +226,8 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     }
 
     s.addAreaLight(/*origin*/{lx0, ly, lz0}, /*u*/{lx1 - lx0, 0, 0}, /*v*/{0, 0, lz1 - lz0},
-                   /*normal*/{0, -1, 0}, /*area*/(lx1 - lx0) * (lz1 - lz0), s.mats[3].emit, 1.0);
+                   /*normal*/{0, -1, 0}, /*area*/(lx1 - lx0) * (lz1 - lz0), s.mats[3].emit, 1.0,
+                   /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/3);
     s.build();
 
     if (mode == 'A') {
@@ -267,7 +275,8 @@ static Scene buildMaterials(int res, const Spectrum& lightSpd) {
     s.spheres.push_back(Sphere{{0.50, 0.22, 0.68}, 0.20, 6}); // half-mirror
 
     s.addAreaLight(/*origin*/{lx0, ly, lz0}, /*u*/{lx1 - lx0, 0, 0}, /*v*/{0, 0, lz1 - lz0},
-                   /*normal*/{0, -1, 0}, /*area*/(lx1 - lx0) * (lz1 - lz0), s.mats[3].emit, 1.0);
+                   /*normal*/{0, -1, 0}, /*area*/(lx1 - lx0) * (lz1 - lz0), s.mats[3].emit, 1.0,
+                   /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/3);
     s.finalizeTris();
     return s;
 }
@@ -896,6 +905,46 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int res,
     return out;
 }
 
+// Mode D: bidirectional path tracing. Each thread renders a band of rows into its own
+// camera-image film (t>=2 connections, current-pixel) and light-image film (t==1
+// splats to the projected raster position), then all bands are merged. BDPT produces
+// one absolute-radiance image: normalise the camera image by spp (the per-pixel
+// radiance convention shared with the backward reference, mode R) and the light image
+// by the total light-subpath count (W*H*spp), matching mode B's splat convention. The
+// two normalised films sum to the final radiance; writeFilm(...,1.0) then only divides
+// by cieYIntegral for display, exactly like mode P's composite.
+static Film renderBdpt(const Scene& scene, const Camera& cam, int res,
+                       long long spp, int nThreads, int maxDepth, bool diffraction = true) {
+    std::vector<Film> camBands(nThreads), splatBands(nThreads);
+    auto worker = [&](int tid) {
+        bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11, 0x9E3779B97F4A7C15ULL ^ (uint64_t)tid);
+        Film& cf = camBands[tid]; cf.resX = res; cf.resY = res; cf.alloc();
+        Film& sf = splatBands[tid]; sf.resX = res; sf.resY = res; sf.alloc();
+        int y0 = res * tid / nThreads, y1 = res * (tid + 1) / nThreads;
+        br.renderRows(scene, cam, cf, sf, y0, y1, spp, rng);
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
+
+    Film cam_film; cam_film.resX = res; cam_film.resY = res; cam_film.alloc();
+    Film splat_film; splat_film.resX = res; splat_film.resY = res; splat_film.alloc();
+    for (int t = 0; t < nThreads; ++t) { cam_film.merge(camBands[t]); splat_film.merge(splatBands[t]); }
+
+    // Combine onto one radiance scale. Both halves are normalised by the per-pixel
+    // sample count spp: the camera image (t>=2) is a per-pixel radiance estimate; the
+    // light image (t==1 splats) uses the full-image-plane camera importance We (see
+    // bdpt.h cameraWe), for which (1/spp)*We(A_full) is exactly the light-tracing scale
+    // (equivalently (1/(W*H*spp))*We(A_pixel) — the mode-B convention).
+    const double invCam = 1.0 / (double)spp;
+    const double invSplat = 1.0 / (double)spp;
+    Film out; out.resX = res; out.resY = res; out.alloc();
+    for (size_t i = 0; i < out.xyz.size(); ++i)
+        out.xyz[i] = cam_film.xyz[i] * invCam + splat_film.xyz[i] * invSplat;
+    return out;
+}
+
 // Mode P: forward light tracing (model B) composited with a camera-side ray path,
 // so specular/coated surfaces are finally visible directly from the camera.
 //
@@ -1036,7 +1085,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      const char* lightLabel, const std::string& outPath,
                      double manualExposure = 0.0) {
     const bool refMode      = (mode == 'R' || mode == 'V');
-    const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
+    const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
@@ -1057,6 +1106,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (!gpuForwardMode) {
             const char* why = (mode == 'R') ? "backward reference - no forward GPU pass"
+                            : (mode == 'D') ? "bidirectional path tracing - CPU-only path"
                                             : "camera-side composite - CPU-only path";
             if (wantGpu) std::fprintf(stderr,
                 "[device] GPU can't accelerate this render: %s; using CPU\n", why);
@@ -1099,6 +1149,50 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         compareFilms(fwd, N, ref, spp);
         writeFilm("validate_forward.ppm", fwd, (double)N);
         writeFilm("validate_backward.ppm", ref, (double)spp);
+        return 0;
+    }
+
+    // --- Bidirectional path tracing (mode D) ---
+    if (mode == 'D') {
+        // BDPT's connection strategies here cover Lambertian/glossy scatter and
+        // quad/sphere area emission only. Features outside that scope (fluorescence,
+        // participating media, spot/env/collimated lights) would silently drop their
+        // contribution, so refuse rather than render a subtly wrong image.
+        const char* unsupported = nullptr;
+        if (scene.medium.enabled) unsupported = "participating media (fog)";
+        // Only flag materials actually referenced by geometry (built-in palettes carry
+        // spare entries like an unused fluorescent material). Expand Mix children too,
+        // since a used Mix can pick a fluorescent child at runtime.
+        std::vector<char> matUsed(scene.mats.size(), 0);
+        auto markUsed = [&](int id) {
+            if (id < 0 || id >= (int)scene.mats.size() || matUsed[id]) return;
+            matUsed[id] = 1;
+            if (scene.mats[id].type == MatType::Mix)
+                for (int c : scene.mats[id].mixChildren)
+                    if (c >= 0 && c < (int)scene.mats.size()) matUsed[c] = 1;
+        };
+        for (const auto& tr : scene.tris) markUsed(tr.matId);
+        for (const auto& sp : scene.spheres) markUsed(sp.matId);
+        if (!unsupported)
+            for (size_t i = 0; i < scene.mats.size(); ++i)
+                if (matUsed[i] && scene.mats[i].type == MatType::Fluorescent) {
+                    unsupported = "fluorescent materials"; break;
+                }
+        for (const auto& em : scene.emitters)
+            if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated) {
+                unsupported = "spot / environment / collimated lights"; break;
+            }
+        if (unsupported) {
+            std::fprintf(stderr, "[mode D] this scene uses %s, which BDPT (mode D) does not "
+                                 "support; render it with mode B/P (forward) or mode R "
+                                 "(backward) instead.\n", unsupported);
+            return 1;
+        }
+        int maxDepth = 8;   // path length in edges; connection cost grows ~depth^2
+        std::printf("mode D: bidirectional path tracing, %lld spp at %dx%d on %d threads "
+                    "(maxDepth=%d, light=%s) ...\n", spp, res, res, nThreads, maxDepth, lightLabel);
+        Film img = renderBdpt(scene, cam, res, spp, nThreads, maxDepth, diffraction);
+        writeFilm(outPath.c_str(), img, 1.0, manualExposure);
         return 0;
     }
 
@@ -1241,15 +1335,19 @@ int main(int argc, char** argv) {
 
     // Modes R (backward reference) and V (validate: forward vs backward) need an
     // all-diffuse scene so the known model-B specular limitation doesn't pollute
-    // the comparison — use a diffuse sphere when no mesh is supplied.
+    // the comparison — use a diffuse sphere when no mesh is supplied. Mode D (BDPT)
+    // uses the same all-diffuse built-in cornell so it can be diffed directly against
+    // mode R as the primary validation; to exercise D on specular/glossy surfaces use
+    // -scene materials (which builds the mirror+glossy scene for every mode).
     const bool refMode = (mode == 'R' || mode == 'V');
+    const bool diffuseScene = refMode || mode == 'D';
     Scene scene = fromFtsl  ? std::move(ftslScene.scene)
                 : prism     ? buildPrism(res)
                 : grating   ? buildGrating(res, diffraction)
                 : materials ? buildMaterials(res, resolveLight(lightName))
                             : buildCornell(res, mode, resolveLight(lightName),
                                            fluoro ? nullptr : meshPath, meshScale,
-                                           /*diffuseSphere*/refMode, /*fluoroSphere*/fluoro,
+                                           /*diffuseSphere*/diffuseScene, /*fluoroSphere*/fluoro,
                                            /*thinFilmSphere*/iridescent, filmThickness, filmIor);
 
     // Optional global fog / participating medium (-fog sigma_t). With -fograyleigh
@@ -1318,7 +1416,7 @@ int main(int argc, char** argv) {
     } else {
         // Built-in scene: one camera. mode A needs no camera frame (a default Camera
         // is passed and its frame is unused; the sensor plane is baked from scene).
-        const bool useCamera = (mode == 'B' || mode == 'C' || mode == 'P' || refMode);
+        const bool useCamera = (mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
         Camera c;
         if (useCamera) {
             if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, res);

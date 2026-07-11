@@ -198,6 +198,12 @@ struct Emitter {
     Vec3 origin, u, v, normal;
     double area = 0.0;
     EmitterShape shape = EmitterShape::Quad;
+    // Index into Scene::mats of the emissive material on this light's GEOMETRY
+    // (area/sphere lights add both an emitter and a matching emissive surface), or
+    // -1 for lights with no geometry (spot/env/collimated). BDPT needs this to map a
+    // camera-ray hit on a light surface back to its emitter for the s=0 MIS term
+    // (pdfLightOrigin = selection prob * 1/area). Set by the scene builders.
+    int matId = -1;
     double radius = 0.0;      // sphere radius (Sphere only)
     bool collimated = false;
     Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
@@ -328,10 +334,11 @@ struct Scene {
     // and the FTSL loader; call finalizeEmitters() (via build()) afterwards.
     void addAreaLight(const Vec3& o, const Vec3& U, const Vec3& V, const Vec3& n,
                       double area, const Spectrum& spd, double stepNm,
-                      bool collimated = false, const Vec3& beamDir = {1, 0, 0}) {
+                      bool collimated = false, const Vec3& beamDir = {1, 0, 0},
+                      int matId = -1) {
         Emitter e;
         e.origin = o; e.u = U; e.v = V; e.normal = n; e.area = area;
-        e.collimated = collimated; e.beamDir = beamDir;
+        e.collimated = collimated; e.beamDir = beamDir; e.matId = matId;
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
     }
@@ -339,12 +346,23 @@ struct Scene {
     // Register a spherical area light: a glowing ball of radius r at center c.
     // area = 4*PI*r^2 feeds the same power law (power = emitIntegral*area*PI) and
     // the same 1/area point-sampling pdf as a quad. u/v/normal are unused.
-    void addSphereLight(const Vec3& c, double r, const Spectrum& spd, double stepNm) {
+    void addSphereLight(const Vec3& c, double r, const Spectrum& spd, double stepNm,
+                        int matId = -1) {
         Emitter e;
         e.origin = c; e.radius = r; e.area = 4.0 * PI * r * r;
-        e.shape = EmitterShape::Sphere;
+        e.shape = EmitterShape::Sphere; e.matId = matId;
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
+    }
+
+    // Map a hit surface's material index back to the emitter registered on that
+    // geometry (or nullptr if none). Linear scan over the few emitters; used by the
+    // BDPT s=0 MIS term when a camera subpath lands on a light surface directly.
+    const Emitter* emitterForMat(int matId) const {
+        if (matId < 0) return nullptr;
+        for (const auto& e : emitters)
+            if (e.matId == matId) return &e;
+        return nullptr;
     }
 
     // Register a spotlight: a point at `pos` radiating into a cone about unit

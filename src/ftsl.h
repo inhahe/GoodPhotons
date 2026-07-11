@@ -764,7 +764,7 @@ private:
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
             L.scene.spheres.push_back(Sphere{cw, rad, id});
-            L.scene.addSphereLight(cw, rad, spd, binWidth_);
+            L.scene.addSphereLight(cw, rad, spd, binWidth_, /*matId*/id);
             return true;
         }
         if (subtype == "spot") {
@@ -817,7 +817,8 @@ private:
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
         L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
-        L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_);
+        L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
+                             /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
         return true;
     }
 
