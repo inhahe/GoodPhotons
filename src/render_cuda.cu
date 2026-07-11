@@ -2215,12 +2215,39 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 }
 
 // Trace an eye subpath through pixel (px,py). path[0] is the camera vertex (beta=1).
+// Realistic-lens cameras (cam.hasLens, Plan B): the first ray is traced through the real
+// glass (dGenLensRay, as GPU mode R does), the camera vertex sits at the ray's scene-entry
+// point with beta = the lens weight wLens, and is flagged delta. The multi-element lens map
+// has no closed-form inverse, so the light-image splat (t=1) is disabled in dConnectBDPT and
+// the delta flag makes dMisWeight omit that strategy too — the surviving strategies (s>=0,
+// t>=2) still partition unity, so the estimator stays unbiased. The camera vertex being
+// delta means its direction pdf only enters the excluded t=1 term, so the placeholder
+// dCameraPdfDir seed is never used in a retained MIS ratio. Mirrors bdpt.h.
 __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                         int px, int py, Real lambda, int maxDepth,
                                         DRng& rng, DVertex* path) {
     DVertex c;
-    c.type = BV_CAMERA; c.p = cam.eye; c.ns = cam.w; c.ng = cam.w;
+    c.type = BV_CAMERA; c.ns = cam.w; c.ng = cam.w;
     c.beta = 1.0; c.pdfFwd = 0; c.pdfRev = 0; c.delta = 0; c.matId = -1; c.lightIdx = -1;
+    if (cam.hasLens) {
+        Real jx = rng.uniform(), jy = rng.uniform();
+        Real u1 = rng.uniform(), u2 = rng.uniform();
+        DVec3 ro, rd; Real wl = 0;
+        if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, lambda, ro, rd, wl) || wl <= 0) {
+            // Vignetted: lone delta camera vertex (nE=1) contributes 0 (t=1 off, t>=2 needs a
+            // scene vertex we never added).
+            c.p = cam.eye; c.delta = 1;
+            path[0] = c; return 1;
+        }
+        c.p = ro;                // scene-entry point (front element plane): correct wo / dist
+        c.beta = (double)wl;     // radiometric lens weight -> per-pixel measurement
+        c.delta = 1;             // no closed-form lens inverse: not connectible (t=1 off)
+        path[0] = c; int n = 1;
+        double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
+        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, lambda, maxDepth - 1, rng, path, n);
+        return n;
+    }
+    c.p = cam.eye;
     path[0] = c; int n = 1;
     Real jx = rng.uniform(), jy = rng.uniform();
     Real sx = (Real)2 * (((Real)px + jx) / (Real)cam.resX) - (Real)1;
@@ -2348,6 +2375,11 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (Le <= 0.0) return 0.0;
         L = pt.beta * Le;
     } else if (t == 1) {
+        // Realistic lens (Plan B): the light-image splat needs a world->sensor projection
+        // the multi-element lens map can't provide (no closed-form inverse), so it's
+        // disabled. dMisWeight omits this strategy too (camera vertex is delta), so the
+        // retained strategies still partition unity.
+        if (cam.hasLens) return 0.0;
         const DVertex& qs = light[s - 1];
         if (!dVertConnectible(sc, qs)) return 0.0;
         int px, py; Real cc, d2f;
@@ -2800,7 +2832,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
 
     // Physical multi-element lens (mesh-lens camera). Bake each surface's sensor-side
     // index into an SPEC_N table (air => 1) so the std::function Spectrum stays host-
-    // side. Only used by the backward tracer (mode R); forward/BDPT kernels ignore it.
+    // side. Used by the backward tracer (GPU mode R) and the BDPT camera subpath (mode D,
+    // Plan B); the pinhole forward kernels ignore it.
     dc.hasLens = 0;
     dc.lens.iorAll = nullptr;
     if (cam.hasLens()) {

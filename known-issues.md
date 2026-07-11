@@ -218,9 +218,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
   4. ~~**Not in BDPT (mode D).**~~ **DONE 2026-07-11 (Plan B, below).** The lens now
      also rides on the BDPT camera subpath (mode D), and mode P routes to it.
 - **Status:** IMPLEMENTED (backward realistic camera, 2026-07-11; GPU backward
-  megakernel / Plan A, 2026-07-11; **BDPT camera-subpath lens / Plan B, 2026-07-11**).
-  Supersedes the analytical thin-lens for "arbitrary real camera" use; the remaining
-  gaps above (inter-element flare, shaped-iris bokeh, GPU BDPT lens) are follow-ups.
+  megakernel / Plan A, 2026-07-11; **BDPT camera-subpath lens / Plan B, CPU + GPU,
+  2026-07-11**). Supersedes the analytical thin-lens for "arbitrary real camera" use;
+  the remaining gaps above (inter-element flare, shaped-iris bokeh) are follow-ups.
 
 #### Plan B — realistic lens on the camera subpath of BDPT (mode D) and composite (mode P) [DONE 2026-07-11]
 - **Why it's wanted:** the physical lens currently rides on **pure mode R** (backward
@@ -279,20 +279,25 @@ as practical; this file is the fallback for what can't be addressed immediately.
     when the scene is within BDPT scope, else **falls back to mode R** (fog / env / spot /
     fluorescence / layered — which R supports and D doesn't). Wired in `src/main.cpp`
     (`bdptUnsupportedFeature` helper shared by the mode-D gate and the P routing).
-  - **GPU:** the GPU BDPT megakernel generates pinhole rays only, so a lensed mode-D
-    scene forces the **CPU** BDPT path (guarded in `src/main.cpp`).
+  - **GPU: DONE 2026-07-11.** The GPU BDPT megakernel (`kBdpt`) now takes the lens on its
+    camera subpath too: `dGenCameraSubpath` generates the first ray via `dGenLensRay` (the
+    same device lens tracer Plan A ported for GPU mode R), sets the camera vertex `beta =
+    wLens` and `delta = 1`, and `dConnectBDPT`'s t==1 branch returns 0 for a lensed camera
+    — a bit-for-bit mirror of the CPU path. The DCamera lens is already uploaded by
+    `buildUpload`. So `-mode D -device gpu` on a lensed scene runs entirely on-device; the
+    old CPU-force guard in `src/main.cpp` is removed.
   - **Validation** (`scenes/realcam.ftsl`, achromat 50 mm f/2.8, full-frame): mode D vs
-    mode R with the same lens agree on absolute radiance (median per-pixel ratio 0.988 @
-    400 spp → 0.991 @ 1600 spp; mean 0.996 → 0.992) and the residual is **pure Monte-
-    Carlo noise** — the ratio IQR narrows 0.174 → 0.100 as spp goes 400 → 1600 (≈√4
-    narrowing), and mode D's auto-exposure converges toward mode R's (9.42e-12 → 1.07e-11
-    vs R's 1.1e-11). No bias. Mode P lens routing (→ D) and out-of-scope fallback (→ R,
-    tested with `-fog`) both verified; lensless mode D/P unchanged (cornell regression).
-  - **Remaining follow-up:** a GPU BDPT lens (would need `genLensRay` ported to the
-    device, as Plan A did for mode R) and the true t=1 splat through an approximate lens
-    inverse (PBRT-style exit-pupil sampling) for the extra light-tracing strategy — both
-    optional, since scene-side connections already recover the main forward win.
-- **Status:** DONE 2026-07-11 (CPU BDPT + composite routing). GPU BDPT lens deferred.
+    mode R with the same lens agree on absolute radiance and the residual is **pure Monte-
+    Carlo noise**. CPU-D↔GPU-D↔R all agree (median per-pixel ratios 0.987–1.010 @ 256–512
+    spp). Unbiasedness: high-spp GPU-D vs R gives median **1.0003** with the ratio IQR
+    narrowing [0.905,1.096] → [0.967,1.035] as spp goes 512 → 8192 (≈√16 narrowing), and
+    the auto-exposures converge (GPU-D 1.07e-11 vs R 1.08e-11). No bias, CPU or GPU. Mode P
+    lens routing (→ D) and out-of-scope fallback (→ R, tested with `-fog`) both verified;
+    lensless mode D/P unchanged (cornell regression).
+  - **Remaining follow-up:** the true t=1 splat through an approximate lens inverse
+    (PBRT-style exit-pupil sampling) for the extra light-tracing strategy — optional, since
+    scene-side connections already recover the main forward win.
+- **Status:** DONE 2026-07-11 (CPU + GPU BDPT + composite routing).
 
 ### Texturing is base-color only, `use_mesh`/quad UVs only (Phase 3b partial)
 - **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear

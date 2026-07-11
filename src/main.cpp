@@ -1520,15 +1520,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (gpuBdptMode) {
-            // Mode D has its own (stricter) GPU support check: BDPT scope only. The GPU
-            // BDPT megakernel generates pinhole camera rays, so a realistic lens on the
-            // camera subpath (Plan B) forces the CPU BDPT path.
-            if (!cudaBdptSupported(scene) || cam.hasLens()) {
-                const char* why = cam.hasLens()
-                    ? "a physical lens on the camera subpath (GPU BDPT is pinhole-only)"
-                    : "scene has a BDPT-GPU-unsupported feature "
-                      "(fluorescent/textured/oversized-mix material, fog, "
-                      "or spot/env/collimated light)";
+            // Mode D has its own (stricter) GPU support check: BDPT scope only. A realistic
+            // lens on the camera subpath (Plan B) is supported on-device too — the BDPT
+            // kernel generates the lens ray via dGenLensRay, exactly as the GPU mode-R
+            // backward megakernel does.
+            if (!cudaBdptSupported(scene)) {
+                const char* why = "scene has a BDPT-GPU-unsupported feature "
+                                  "(fluorescent/textured/oversized-mix material, fog, "
+                                  "or spot/env/collimated light)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {

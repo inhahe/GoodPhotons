@@ -144,7 +144,7 @@ paths they can capture at all**.
   It also supports the **physical (realistic) lens on its camera subpath** — the
   camera ray is traced through the real glass while forward light transport keeps its
   caustic efficiency (the light-image splat strategy is disabled, since a multi-element
-  lens has no closed-form sensor projection; this runs on the CPU). *Cost:* highest
+  lens has no closed-form sensor projection; runs on the CPU **and GPU**). *Cost:* highest
   cost per sample, and it **does not support fluorescence, participating media, or
   spot & env lights** (use `B`/`P` or `R` for those).
 
@@ -242,21 +242,20 @@ slower** option. It captures real optical behaviour the thin lens cannot
 (aberrations, distortion, field curvature, natural vignetting, dispersion-driven
 colour fringing, and aperture-shaped bokeh), but it traces every camera ray
 through the glass stack, so it is more expensive per sample than the analytic thin
-lens. In mode `R` it **runs on the GPU** (the backward megakernel refracts each
-camera ray through the glass stack on the device), so within the GPU-supported scope
-it is still fast; in mode `D` the lens rides on the BDPT camera subpath and runs on
-the CPU. Reach for the analytic lens/projection when you want speed and a clean ideal
-image, and the physical lens when you want a specific real objective's look.
+lens. In both mode `R` and mode `D` it **runs on the GPU** (the backward and BDPT
+megakernels each refract the camera ray through the glass stack on the device via the
+same lens tracer), so within the GPU-supported scope it is still fast. Reach for the
+analytic lens/projection when you want speed and a clean ideal image, and the physical
+lens when you want a specific real objective's look.
 
 *Current limits:* the lens attaches to the **camera subpath** — mode `R` (backward),
 mode `D` (BDPT, keeping forward caustics but with the light-image splat disabled), or
 mode `P` (which routes to `D`/`R`). It maps the sensor across the film width, so a
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
-flare/ghosting or shaped-iris bokeh. On the GPU (mode `R`) it inherits mode `R`'s
-scope (no fog/env/spot/fluorescence, and at most 16 lens surfaces); mode `D` with a
-lens runs on the CPU. Outside a mode's GPU scope it falls back to the CPU
-automatically.
+flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no
+fog/env/spot/fluorescence, and at most 16 lens surfaces); outside that scope it falls
+back to the CPU automatically.
 
 ---
 
@@ -457,4 +456,4 @@ deterministically.
 
 Open limitations and technical debt are tracked in `known-issues.md` — including
 the physical-lens camera's remaining gaps (inter-element flare/ghosting,
-shaped-iris bokeh, GPU BDPT lens) and the shared multi-camera pass.
+shaped-iris bokeh) and the shared multi-camera pass.
