@@ -7,7 +7,7 @@
 > `glass:`, `preset:`, `spectrum:` refs, and `table { }`), builds materials
 > (all eight `MatType`s), geometry (`sphere`/`quad`/`triangle`/`mesh` with full
 > translate+rotate+non-uniform-scale transforms), any number of `light` blocks
-> (area or collimated), a `medium`, a `camera`, and a `render` block (overridable by CLI).
+> (area/sphere/cylinder/spot/env/collimated), a `medium`, a `camera`, and a `render` block (overridable by CLI).
 > `scenes/cornell.ftsl` reproduces the hard-coded `buildCornell` **bit-for-bit**.
 > Phase 2a is also done: the `scene { units … }` length unit
 > (meters/centimeters/millimeters/inches/feet) is scaled to internal metres at
@@ -37,7 +37,7 @@
 > pieces (configurable spectral *range*, absolute light power/units — which also
 > gates absolute-EV film sensitivity — the full physical `layered` material, the
 > shared multi-camera mode-B pass, non-square films, textures on non-albedo
-> parameters, procedural UV projections, extra light shapes) remain tagged
+> parameters, procedural UV projections) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -110,7 +110,7 @@ Top-level block types:
 | `quad`       | 0+         | Rectangle (two triangles) — walls, panels           |
 | `triangle`   | 0+         | Single triangle                                     |
 | `mesh`       | 0+         | OBJ instance with transform                         |
-| `light`      | 1+         | Emitter (area, sphere, spot, or collimated)         |
+| `light`      | 1+         | Emitter (area, sphere, cylinder, spot, env, or collimated) |
 | `medium`     | 0 or 1     | Global homogeneous fog                              |
 | `camera`     | 1+         | Viewpoint + film + measurement model                |
 | `render`     | 0 or 1     | Optional render controls (overridable by CLI)       |
@@ -357,9 +357,10 @@ mesh { file "teapot.obj" material brushed
 
 The scene supports **any number of emitters** (Phase 2b). Each `light` block adds
 one `Emitter` (`src/scene.h`): a rectangular area light with a spectral power
-distribution, a **spherical area light** (a glowing ball, Phase 3c), a **point
-spotlight** (a cone with a soft penumbra, Phase 3c), or a collimated beam
-(prism/grating demos). `Scene::emitters` holds
+distribution, a **spherical area light** (a glowing ball, Phase 3c), a
+**cylindrical area light** (a glowing tube / fluorescent lamp), a **point
+spotlight** (a cone with a soft penumbra, Phase 3c), an infinite environment, or a
+collimated beam (prism/grating demos). `Scene::emitters` holds
 the list; `finalizeEmitters()` computes each emitter's `power = emitIntegral *
 area * PI`, a power-weighted selection CDF (`emitterCdf`/`totalPower`), and a
 combined wavelength sampler (`emitSampler`) for the backward reference. The
@@ -385,6 +386,12 @@ light collimated {
 
 light sphere {                     # Phase 3c: a glowing ball
     center 0.5 0.75 0.5   radius 0.12
+    spd preset:bb6500
+}
+
+light cylinder {                   # a glowing tube (fluorescent lamp)
+    center 0.5 0.85 0.5   axis 1 0 0
+    length 0.7   radius 0.05       # optional: segments 48 (wall tessellation)
     spd preset:bb6500
 }
 
@@ -419,6 +426,23 @@ hemisphere facing the receiver contributes, and the `1/area` point pdf and the
 Sampling shares `Emitter::samplePoint()` (quad draws are byte-for-byte identical,
 so existing quad scenes stay bit-identical). Validated by `scenes/spherelight.ftsl`
 (mode V: forward agrees with backward; CPU==GPU energy).
+
+A `light cylinder` registers a cylindrical `Emitter` (`shape =
+EmitterShape::Cylinder`, `area = 2·π·r·L` — the **lateral** wall only; the end caps
+are not emissive) for a fluorescent-lamp-shaped tube. `center` is the tube midpoint,
+`axis` its direction, `length`/`radius` its size, and the optional `segments`
+(default 48) sets how finely the loader tessellates the emissive wall into
+triangles (dropped into the geometry so the tube is visible and absorbs returning
+photons, mirroring the sphere light). Both tracers sample a **uniform point on the
+lateral surface** — `u₁` slides along the axis, `u₂` picks the angle around it — and
+use that point's outward radial normal for the one-sided Lambertian cosine; the
+`1/area` point pdf and the `power = emitIntegral · area · π` law carry over
+unchanged from the quad/sphere cases, so the cylinder needs no special-casing in the
+forward tracer, the backward reference, or BDPT. The analytic sampling surface is
+the true cylinder while the rendered wall is faceted; with the default segment count
+the difference is far below Monte-Carlo noise (and only affects the geometric shape,
+not the MIS pdfs, which are analytic). Validated by `scenes/cylinderlight.ftsl`
+(mode V: forward agrees with backward; forward/BDPT and CPU/GPU agree to MC noise).
 
 ```
 light env { spd 0.5 }              # Phase 3c: uniform infinite environment

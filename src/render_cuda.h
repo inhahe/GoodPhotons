@@ -41,8 +41,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
                        char camMode);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
-// than cudaForwardSupported: also requires no participating media and only area/sphere
-// Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the
+// than cudaForwardSupported: also requires no participating media and only area/sphere/
+// cylinder Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the
 // caller must use the CPU BDPT renderer.
 bool cudaBdptSupported(const Scene& scene);
 

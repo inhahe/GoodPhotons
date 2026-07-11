@@ -178,7 +178,7 @@ struct Sensor {
 // phase-space volume 4*PI^2*R^2 (R = scene bounding radius), so total power =
 // emitIntegral*4*PI^2*R^2; forward photons are emitted from a disk of radius R on
 // the bounding sphere and the backward tracer picks it up on ray misses.
-enum class EmitterShape { Quad, Sphere, Spot, Env };
+enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder };
 
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
@@ -204,7 +204,10 @@ struct Emitter {
     // camera-ray hit on a light surface back to its emitter for the s=0 MIS term
     // (pdfLightOrigin = selection prob * 1/area). Set by the scene builders.
     int matId = -1;
-    double radius = 0.0;      // sphere radius (Sphere only)
+    double radius = 0.0;      // sphere radius (Sphere); tube radius (Cylinder)
+    // Cylinder (fluorescent-tube) light: `origin` is the base-cap center, `v` is the
+    // axis vector (its length = the tube length), and `u`/`normal` are an orthonormal
+    // radial basis; the lateral surface is sampled uniformly (area = 2*PI*radius*|v|).
     bool collimated = false;
     Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
     double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
@@ -237,6 +240,14 @@ struct Emitter {
             Vec3 d{r * std::cos(phi), r * std::sin(phi), z};
             nOut = d;                                  // unit outward normal
             y = origin + d * radius;
+        } else if (shape == EmitterShape::Cylinder) {
+            // Uniform over the lateral surface: u1 slides along the axis (v), u2 picks
+            // the angle around it. u/normal are the precomputed radial basis, so the
+            // outward radial direction is rad = u*cos + normal*sin (a unit vector).
+            double phi = 2.0 * PI * u2;
+            Vec3 rad = u * std::cos(phi) + normal * std::sin(phi);
+            y = origin + v * u1 + rad * radius;
+            nOut = rad;                                // unit outward normal
         } else {
             y = origin + u * u1 + v * u2;
             nOut = normal;
@@ -351,6 +362,25 @@ struct Scene {
         Emitter e;
         e.origin = c; e.radius = r; e.area = 4.0 * PI * r * r;
         e.shape = EmitterShape::Sphere; e.matId = matId;
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
+    // Register a cylindrical area light: a glowing tube (fluorescent lamp) whose
+    // LATERAL surface emits. `base` is the center of one end cap and `axis` points
+    // to the other (|axis| = the tube length); `r` is the radius. area = 2*PI*r*|axis|
+    // feeds the same power law (power = emitIntegral*area*PI) and the same 1/area
+    // uniform-surface pdf as a quad. The end caps are not emissive (they are omitted
+    // from both the sampling area and the emissive geometry the loader tessellates).
+    void addCylinderLight(const Vec3& base, const Vec3& axis, double r,
+                          const Spectrum& spd, double stepNm, int matId = -1) {
+        Emitter e;
+        double len = length(axis);
+        Vec3 a = (len > 0.0) ? axis / len : Vec3{0, 1, 0};
+        Vec3 t, b; onb(a, t, b);                 // orthonormal radial basis
+        e.origin = base; e.v = axis; e.u = t; e.normal = b; e.radius = r;
+        e.area = 2.0 * PI * r * len;
+        e.shape = EmitterShape::Cylinder; e.matId = matId;
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
     }

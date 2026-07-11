@@ -168,8 +168,8 @@ struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
-    int    shape;              // 0 = quad, 1 = sphere, 2 = spot, 3 = env (mirrors EmitterShape)
-    double radius;             // sphere radius (shape==1)
+    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder (EmitterShape)
+    double radius;             // sphere radius (shape==1) / tube radius (shape==4)
     double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
     int    cdfOffset, cdfN;
     double cdfStep;
@@ -199,6 +199,13 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
         DVec3 d{(Real)(r * cos(phi)), (Real)(r * sin(phi)), (Real)z};
         nOut = d;
         y = em.origin + d * (Real)em.radius;
+    } else if (em.shape == 4) {
+        // Cylinder (tube) lateral surface: u1 along the axis (v), u2 around it. u and
+        // normal are the precomputed radial basis (mirrors host Emitter::samplePoint).
+        double phi = 2.0 * 3.14159265358979323846 * u2;
+        DVec3 rad = em.u * (Real)cos(phi) + em.normal * (Real)sin(phi);
+        y = em.origin + em.v * (Real)u1 + rad * (Real)em.radius;
+        nOut = rad;
     } else {
         y = em.origin + em.u * (Real)u1 + em.v * (Real)u2;
         nOut = em.normal;
@@ -1791,9 +1798,10 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
-        de.shape = (e.shape == EmitterShape::Sphere) ? 1
-                 : (e.shape == EmitterShape::Spot)   ? 2
-                 : (e.shape == EmitterShape::Env)    ? 3 : 0;
+        de.shape = (e.shape == EmitterShape::Sphere)   ? 1
+                 : (e.shape == EmitterShape::Spot)     ? 2
+                 : (e.shape == EmitterShape::Env)      ? 3
+                 : (e.shape == EmitterShape::Cylinder) ? 4 : 0;
         de.radius = e.radius;
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
@@ -1930,7 +1938,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
 bool cudaBdptSupported(const Scene& scene) {
     // BDPT-GPU needs the same POD-bakeable materials as the forward path, PLUS the
     // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): no participating
-    // media, and only area/sphere Lambertian emitters (no spot/env/collimated).
+    // media, and only area/sphere/cylinder Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
     if (scene.medium.enabled) return false;
     for (const auto& em : scene.emitters)

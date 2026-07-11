@@ -17,6 +17,7 @@
 //   light area       { origin ...  u ...  v ...  normal ...  spd <spectrum-expr> }
 //   light collimated { dir x y z  spd <spectrum-expr> }   # repeatable: N emitters
 //   light sphere     { center x y z  radius r  spd <spectrum-expr> }  # glowing ball
+//   light cylinder   { center x y z  axis x y z  length l  radius r  spd … }  # tube/fluorescent
 //   light spot       { origin x y z  dir x y z  inner_angle d  outer_angle d  spd … }
 //   light env        { spd <spectrum-expr> }   # constant infinite environment
 //   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
@@ -765,6 +766,40 @@ private:
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
             L.scene.spheres.push_back(Sphere{cw, rad, id});
             L.scene.addSphereLight(cw, rad, spd, binWidth_, /*matId*/id);
+            return true;
+        }
+        if (subtype == "cylinder") {
+            // Cylindrical area light: a glowing tube (fluorescent lamp). The LATERAL
+            // surface emits; the end caps are omitted (matching the analytic
+            // 2*PI*r*L sampling area). We tessellate the wall into emissive triangles
+            // so the tube is visible and absorbs returning photons (mirrors how the
+            // sphere light drops an emissive sphere into geometry). `center` is the
+            // tube midpoint, `axis` its direction (default +Y), `length`/`radius` its
+            // size, and `segments` (default 48) the wall tessellation fineness.
+            if (nonUniform) { fail("cylinder light under non-uniform scale would be an elliptic cylinder; use uniform scale"); return false; }
+            Vec3 c{0.5, 0.5, 0.5}; vec3Of(b, "center", c);
+            Vec3 dir{0, 1, 0}; vec3Of(b, "axis", dir);
+            double len = Len(dblOf(b, "length", 0.5)) * s;
+            double rad = Len(dblOf(b, "radius", 0.05)) * s;
+            int segs = (int)dblOf(b, "segments", 48.0);
+            if (segs < 3) segs = 3;
+            Vec3 axisW = normalize(xf.applyDir(dir)) * len;   // world axis vector (|.| = len)
+            Vec3 baseW = P(xf.apply(c)) - axisW * 0.5;        // base-cap center
+            Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+            int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+            // Tessellate the lateral wall. onb(normalize(axisW),...) here matches the
+            // basis addCylinderLight computes, so facets align with the sampled radius.
+            Vec3 au = normalize(axisW); Vec3 t, bt; onb(au, t, bt);
+            for (int i = 0; i < segs; ++i) {
+                double a0 = 2.0 * PI * i / segs, a1 = 2.0 * PI * (i + 1) / segs;
+                Vec3 r0 = t * std::cos(a0) + bt * std::sin(a0);
+                Vec3 r1 = t * std::cos(a1) + bt * std::sin(a1);
+                Vec3 b0 = baseW + r0 * rad, b1 = baseW + r1 * rad;
+                Vec3 p0 = b0 + axisW, p1 = b1 + axisW;
+                L.scene.tris.push_back(Tri{b0, b1, p1, id, -1, {}});   // outward winding
+                L.scene.tris.push_back(Tri{b0, p1, p0, id, -1, {}});
+            }
+            L.scene.addCylinderLight(baseW, axisW, rad, spd, binWidth_, /*matId*/id);
             return true;
         }
         if (subtype == "spot") {
