@@ -33,7 +33,7 @@ bool cudaForwardSupported(const Scene& scene);
 // deposit), 'B' (connect/splat to the pinhole), or 'C' (finite-aperture forward
 // catch). Traces N photons and returns the accumulated camera film (same
 // units/convention as the CPU renderForward for the matching mode), so
-// writePPM(film, N) and the mode-V comparison work unchanged. Fills eOut with the
+// writeFilm(film, N) and the mode-V comparison work unchanged. Fills eOut with the
 // same energy report. Requires cudaAvailable() && cudaForwardSupported(scene);
 // otherwise returns an empty film.
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,

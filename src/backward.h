@@ -385,7 +385,7 @@ struct BackwardRenderer {
     }
 
     // Render `spp` samples per pixel into `film` (accumulates cieXYZ * radiance,
-    // exactly like the forward film, so writePPM with N=spp displays it). Renders
+    // exactly like the forward film, so writeFilm with N=spp displays it). Renders
     // the pixel rows [y0, y1) — the caller partitions rows across threads.
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
                     int y0, int y1, long long spp, Pcg32& rng) const {

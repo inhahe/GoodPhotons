@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <fstream>
 #include <vector>
 #include <algorithm>
@@ -39,6 +40,41 @@
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
 #endif
+
+// stb_image_write encoders (implementation compiled once in stb_image_impl.cpp).
+// Only the two we use for 8-bit RGB output; see writeImage().
+extern "C" {
+    int stbi_write_png(const char* filename, int w, int h, int comp, const void* data, int stride_bytes);
+    int stbi_write_jpg(const char* filename, int w, int h, int comp, const void* data, int quality);
+}
+
+// Case-insensitive test for a filename ending in `ext` (e.g. ".png").
+static bool endsWithCI(const std::string& s, const char* ext) {
+    size_t n = std::strlen(ext);
+    if (s.size() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (std::tolower((unsigned char)s[s.size() - n + i]) != std::tolower((unsigned char)ext[i]))
+            return false;
+    return true;
+}
+
+// Write an 8-bit RGB buffer (row-major, top row first) to `path`, choosing the
+// encoder from the file extension: .png -> PNG, .jpg/.jpeg -> JPEG (q=95), and
+// anything else (incl. .ppm / no extension) -> binary PPM (P6). This honours the
+// requested format instead of always emitting PPM bytes — a mislabeled .png
+// (PPM bytes in a .png file) breaks any consumer that trusts the extension.
+// Returns true on success. `label` is the human name printed by the caller.
+static bool writeImage(const std::string& path, int W, int H, const std::vector<uint8_t>& img) {
+    if (endsWithCI(path, ".png"))
+        return stbi_write_png(path.c_str(), W, H, 3, img.data(), W * 3) != 0;
+    if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg"))
+        return stbi_write_jpg(path.c_str(), W, H, 3, img.data(), 95) != 0;
+    std::ofstream fo(path, std::ios::binary);
+    if (!fo) return false;
+    fo << "P6\n" << W << ' ' << H << "\n255\n";
+    fo.write((const char*)img.data(), (std::streamsize)img.size());
+    return (bool)fo;
+}
 
 // Resolve a -light name to an emission SPD. "bbNNNN" means a Planckian at NNNN K
 // (e.g. bb3200). Unknown names fall back to a 6500 K blackbody.
@@ -709,7 +745,11 @@ static int checkUpsample() {
 // control — true absolute EV needs absolute light power (watts/lumens), which is a
 // separate deferred feature (see docs §8.1 / known-issues). expComp <= 0 means
 // "not authored" -> neutral auto-exposure.
-static void writePPM(const char* path, const Film& f, double N, double expComp = 0.0) {
+//
+// The tone-mapped 8-bit RGB result is written via writeImage(), which picks the
+// encoder from `path`'s extension (.png/.jpg/.jpeg, else PPM) — so `-o foo.png`
+// yields a real PNG, not PPM bytes in a .png file.
+static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -732,9 +772,10 @@ static void writePPM(const char* path, const Film& f, double N, double expComp =
             img[dst + c] = (uint8_t)std::clamp(srgbGamma(v) * 255.0 + 0.5, 0.0, 255.0);
         }
     }
-    std::ofstream fo(path, std::ios::binary);
-    fo << "P6\n" << W << ' ' << H << "\n255\n";
-    fo.write((const char*)img.data(), (std::streamsize)img.size());
+    if (!writeImage(path, W, H, img)) {
+        std::fprintf(stderr, "error: could not write %s\n", path);
+        return;
+    }
     if (expComp > 0.0)
         std::printf("wrote %s (%dx%d), exposure=%.3g (auto %.3g x %.3gEV-comp)\n",
                     path, W, H, exposure, eAuto, expComp);
@@ -766,9 +807,9 @@ static void thinFilmSwatch(double n1, double n2) {
             f.add(x, y, xyz);
         }
     }
-    // N=1: writePPM's 1/(N*cieYIntegral) makes a perfect (R=1) reflector map to
+    // N=1: writeFilm's 1/(N*cieYIntegral) makes a perfect (R=1) reflector map to
     // white, so the swatch colours are physical reflectances (up to auto-exposure).
-    writePPM("thinfilm_swatch.ppm", f, 1.0);
+    writeFilm("thinfilm_swatch.ppm", f, 1.0);
     std::printf("[thinfilm] swatch n1=%.2f n2=%.2f: rows=thickness %.0f-%.0fnm, cols=angle 0-85deg\n",
                 n1, n2, dMin, dMax);
 }
@@ -776,7 +817,7 @@ static void thinFilmSwatch(double n1, double n2) {
 // Add the directly-viewed environment background to a forward (model-B) film. For
 // each pixel whose pixel-center camera ray escapes all geometry, deposit N times the
 // escape direction's env XYZ (constant for a flat env, the lat-long map colour for
-// an image env), so that after writePPM's 1/(N*cieYIntegral) normalisation the pixel
+// an image env), so that after writeFilm's 1/(N*cieYIntegral) normalisation the pixel
 // shows the environment radiance in XYZ — matching the backward tracer's ray-miss
 // term (which adds L_env(dir)*invPdfLambda). Forward photons carry the env *illumination* of
 // surfaces; this pass supplies the *direct view* of the sky behind the geometry.
@@ -922,7 +963,7 @@ static Film renderComposite(const Scene& scene, const Camera& cam, int res,
     }
     double rmse = (den > 0) ? std::sqrt(num / den) : 0.0;
 
-    // Composite in radiance-display units: writePPM(comp, 1.0) divides only by
+    // Composite in radiance-display units: writeFilm(comp, 1.0) divides only by
     // cieYIntegral, so store forward as F/(N*s) and backward as R/spp per pixel.
     Film comp; comp.resX = res; comp.resY = res; comp.alloc();
     for (size_t i = 0; i < spec.size(); ++i)
@@ -1044,7 +1085,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode %c: backward reference %lld spp at %dx%d on %d threads (light=%s) ...\n",
                     mode, spp, res, res, nThreads, lightLabel);
         Film ref = renderBackward(scene, cam, res, spp, nThreads, diffraction);
-        if (mode == 'R') { writePPM(outPath.c_str(), ref, (double)spp, manualExposure); return 0; }
+        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure); return 0; }
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -1056,8 +1097,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                     e.residual / e.emitted, tot / e.emitted);
         compareFilms(fwd, N, ref, spp);
-        writePPM("validate_forward.ppm", fwd, (double)N);
-        writePPM("validate_backward.ppm", ref, (double)spp);
+        writeFilm("validate_forward.ppm", fwd, (double)N);
+        writeFilm("validate_backward.ppm", ref, (double)spp);
         return 0;
     }
 
@@ -1067,7 +1108,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, res, nThreads, lightLabel);
         Film comp = renderComposite(scene, cam, res, N, spp, nThreads, diffraction);
-        writePPM(outPath.c_str(), comp, 1.0, manualExposure);
+        writeFilm(outPath.c_str(), comp, 1.0, manualExposure);
         return 0;
     }
 
@@ -1080,7 +1121,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                 e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                 e.residual / e.emitted, tot / e.emitted);
-    writePPM(outPath.c_str(), out_film, (double)N, manualExposure);
+    writeFilm(outPath.c_str(), out_film, (double)N, manualExposure);
     return 0;
 }
 

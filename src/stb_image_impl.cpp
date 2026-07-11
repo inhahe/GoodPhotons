@@ -10,3 +10,9 @@
 #define STBI_NO_PIC
 #define STBI_NO_PNM   // we have our own PPM/PFM loaders in texture.h
 #include "third_party/stb_image.h"
+
+// stb_image_write: the renderer writes 8-bit RGB output. Honour the output
+// extension (.png/.jpg) with a real encoder instead of always emitting PPM; see
+// writeImage() in main.cpp. PNG uses stb's built-in zlib deflate.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "third_party/stb_image_write.h"
