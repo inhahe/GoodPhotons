@@ -19,11 +19,14 @@
 //   Glossy     : power-cosine lobe around the mirror dir, RR on reflectance.
 //   HalfMirror : stochastic reflect/transmit, lossless.
 //   Dielectric : Fresnel-weighted reflect/refract, lossless.
-// NOTE: Fluorescence is intentionally NOT supported here — backward tracing a
-// wavelength-shifting material needs the full bispectral reradiation matrix,
-// whereas forward single-wavelength tracing handles it trivially. A Fluorescent
-// material falls through to the Diffuse case below, so fluoro scenes must not be
-// used with modes R/V (the forward-tracer's -scene fluoro is model A/B/C only).
+//   Fluorescent: bispectral reradiation (Stokes shift). The elastic base reflects
+//                at the output wavelength; the fluorescent channel excites at a
+//                separately-sampled input wavelength lambdaIn and reradiates at the
+//                output wavelength (colour ~ M). Direct excitation is NEE'd; indirect
+//                excitation is carried by a stochastic wavelength-switching
+//                continuation. This is the unbiased backward adjoint of the forward
+//                tracer's fluoroInteract(), so -scene fluoro now validates with modes
+//                R/V (previously fluoro was forward-only).
 // Participating media (scene.medium / -fog) IS supported here: camera and
 // scattered rays sample volume free-flight, and volume vertices do phase-function
 // NEE to the light (neeVolume). So -fog CAN be combined with modes R/V, which is
@@ -395,6 +398,73 @@ struct BackwardRenderer {
                     ray = Ray{h.p + h.n * 1e-6, o};
                     specularArrival = true;
                     break;
+                }
+                case MatType::Fluorescent: {
+                    // Bispectral reradiation — the backward adjoint of the forward
+                    // tracer's fluoroInteract(). The surface reflects ELASTICALLY at
+                    // the current output wavelength (albedo rho(lambda)) AND re-radiates
+                    // at lambda from excitation absorbed at a DIFFERENT input wavelength
+                    // lambdaIn (Stokes shift). Both channels do NEE; a single stochastic
+                    // continuation carries the indirect term (elastic at lambda, or
+                    // wavelength-switched to lambdaIn for indirect excitation), so the
+                    // estimator is unbiased and validates forward-vs-backward (mode V).
+                    double rhoEl = clamp01(m.reflect(lambda));   // elastic base at lambda(out)
+                    // Elastic diffuse NEE at the output wavelength.
+                    L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng);
+                    if (scene.envIndex >= 0)
+                        L += thr * neeEnv(scene, h, rhoEl, invPdfLambda, lambda, rng);
+
+                    // Fluorescent channel: draw an excitation wavelength lambdaIn.
+                    double Mint = m.fluoEmitSampler.integral;
+                    bool haveFluoro = (Mint > 0.0 && m.fluoYield > 0.0);
+                    double gOut = 0.0, rhoFluo = 0.0, lambdaIn = 0.0, invPdfIn = 0.0;
+                    if (haveFluoro) {
+                        // Emission colour at lambda(out), deconvolved from the camera-
+                        // path wavelength-sampling density (invPdfLambda) so the
+                        // reradiated colour follows M(lambda), not the light SPD used
+                        // to sample lambda.
+                        gOut = (m.fluoEmit(lambda) / Mint) * invPdfLambda;
+                        double pin = 0.0;
+                        lambdaIn = scene.emitSampler.sample(rng, pin);
+                        if (pin > 0.0) {
+                            invPdfIn = scene.invPdfLambda(lambdaIn);
+                            double rhoIn, aEffIn;
+                            fluoroWeights(m, lambdaIn, rhoIn, aEffIn);   // shared with forward
+                            rhoFluo = aEffIn * m.fluoYield;              // reradiation albedo @lambdaIn
+                            if (rhoFluo > 0.0) {                          // fluoro DIRECT NEE
+                                L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
+                                if (scene.envIndex >= 0)
+                                    L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
+                            }
+                        }
+                    }
+
+                    // Single stochastic continuation for INDIRECT illumination:
+                    //   [0, rhoEl)          -> elastic bounce at lambda (throughput kept)
+                    //   [rhoEl, rhoEl+pF)   -> fluoro bounce, switch to lambdaIn, throughput
+                    //                          *= wFluo/pF (indirect excitation)
+                    //   else                -> terminate. pF ~ wFluo keeps the surviving
+                    //   weight ~O(1); f*cos/pdf folds into the cosine-sampled direction.
+                    double wFluo = gOut * rhoFluo;               // natural indirect-fluoro weight
+                    double pF = (wFluo > 0.0) ? std::min(std::max(0.0, 1.0 - rhoEl), wFluo) : 0.0;
+                    double u = rng.uniform();
+                    if (u < rhoEl) {                             // elastic continuation
+                        Vec3 wOut = cosineHemisphere(h.n, rng);
+                        contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
+                        ray = Ray{h.p + h.n * 1e-6, wOut};
+                        specularArrival = false;
+                        break;
+                    } else if (u < rhoEl + pF) {                 // fluoro (wavelength-switched)
+                        thr *= wFluo / pF;
+                        lambda = lambdaIn;                       // Stokes shift (to the input wl)
+                        invPdfLambda = invPdfIn;
+                        Vec3 wOut = cosineHemisphere(h.n, rng);
+                        contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
+                        ray = Ray{h.p + h.n * 1e-6, wOut};
+                        specularArrival = false;
+                        break;
+                    }
+                    return L;                                    // absorbed / terminated
                 }
                 case MatType::Diffuse:
                 default: {

@@ -659,22 +659,41 @@ as practical; this file is the fallback for what can't be addressed immediately.
   reference/forward validation paths.
 - **Status:** DONE — `mix` 2026-07-10; `layered` 2026-07-11 (CPU forward + backward).
 
-### Backward reference tracer cannot validate fluorescence
-- **What:** `src/backward.h` has no Fluorescent case — a fluorescent material
-  falls through to the Diffuse branch, so modes R (reference) and V (validate)
-  would silently mis-render `-scene fluoro`.
-- **Why:** Backward tracing a wavelength-shifting material requires the full
-  bispectral reradiation matrix (integrate the camera-side path over all possible
-  input wavelengths for each output wavelength). Forward single-wavelength tracing
-  handles fluorescence trivially (sample lambda' ~ emission SPD, M/pdf cancels).
-- **Mitigation in place:** `-scene fluoro` is a forward-only (model A/B/C) scene;
-  it is never selected in refMode. Fluorescence correctness is instead validated
-  deterministically by `-checkfluoro` (emission-sampler mean, epsilon*Q branch
-  fraction, Stokes shift). Energy conservation holds (`sum/emitted=1.000000`).
-- **Proper fix (future):** implement a bispectral backward estimator (reradiation
-  matrix / Mojzik-style hero-wavelength reweighting) if we ever want R/V to cover
-  fluorescent scenes. Not needed for the forward tracer's own correctness.
-- **Status:** OPEN (acceptable) — logged 2026-07-10.
+### Backward reference tracer now validates fluorescence [RESOLVED 2026-07-11]
+- **What (was):** `src/backward.h` had no Fluorescent case — a fluorescent material
+  fell through to the Diffuse branch, so modes R (reference) and V (validate)
+  silently mis-rendered `-scene fluoro`; fluoro scenes were forward-only.
+- **Fix applied:** added a bispectral reradiation case to `BackwardRenderer::radiance`
+  — the unbiased backward adjoint of the forward tracer's `fluoroInteract()`:
+  1. **Elastic channel** — diffuse NEE (+ RR continuation) at the output wavelength
+     with the small elastic base `rho(lambda)`, exactly as before.
+  2. **Fluorescent DIRECT NEE** — a *second* excitation wavelength `lambdaIn` is drawn
+     from the combined emission distribution (reusing `scene.emitSampler` /
+     `invPdfLambda`, so multi-light SPDs weight correctly). The lights are connected at
+     `lambdaIn` with a reradiation "albedo" `aEff(lambdaIn)*Q` (shared `fluoroWeights`),
+     and the result is tinted by the emission colour at the OUTPUT wavelength
+     `gOut = (M(lambda)/∫M) * invPdfLambda` — the `invPdfLambda` factor deconvolves the
+     camera-path wavelength-sampling density so the reradiated colour follows `M(lambda)`
+     and not the light SPD used to sample `lambda`.
+  3. **Indirect excitation** — a single stochastic continuation splits between an elastic
+     bounce at `lambda` (prob `rho`) and a wavelength-switched bounce to `lambdaIn`
+     (prob `pF ~ gOut*aEff*Q`, throughput `*= wFluo/pF`), so light that bounces before
+     exciting the dye (light→wall→dye→camera) is captured without double-counting the
+     direct term (`specularArrival=false` suppresses the emission-on-hit term).
+- **Validation (mode V, forward mode-B vs backward, `-scene fluoro`):** best-fit
+  backward→forward scale = **0.996** (≈1, i.e. the two agree on ABSOLUTE scale — a wrong
+  bispectral normalisation would not), residual 94% firefly-concentrated (variance not
+  bias), and the bulk RMSE (ex. top-1%) scales as **1/sqrt(N)**: 2.05% at 40M/400spp →
+  **1.02%** at 160M/1600spp (4× samples ⇒ exactly 2× reduction), which a transport bias
+  could not produce. `-checkfluoro` (deterministic sampler/branch/Stokes-shift self-test)
+  is retained as a fast complementary check.
+- **Remaining (BDPT / mode D):** bidirectional bispectral fluorescence (a wavelength
+  change inside a light↔camera connection needs hero-wavelength MIS, à la Mojžík et al.
+  2018) is still deferred — mode D refuses fluoro with a clear message pointing to modes
+  B/P (forward) or R (backward). The backward reference now covers fluorescence
+  validation, so this is low priority.
+- **Status:** RESOLVED 2026-07-11 for modes R/V; BDPT (mode D) bispectral vertices
+  remain future work.
 
 ### RESOLVED: Backward reference tracer now validates participating media (fog)
 - **What (was):** `src/backward.h` ignored `scene.medium` — its camera rays didn't
