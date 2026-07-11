@@ -186,6 +186,13 @@ struct DMaterial {
     int    mixChild[D_MIXMAX];
     double mixWeight[D_MIXMAX];
     int    mixWeightTex;   // >=0: per-hit blend mask (2-child mix); -1: constant weights
+    // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
+    // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
+    // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
+    // Material::roughnessPat / filmThicknessPat / mixWeightPat.
+    int    roughnessPat;
+    int    filmThicknessPat;
+    int    mixWeightPat;
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId; };
@@ -214,6 +221,14 @@ struct DImplicit {
     double lo[3], hi[3];     // world AABB (ray clip)
     double lipschitz, minStep;
 };
+
+// Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
+// One flat postfix PatNode pool (DScene::patNodes) holds every pattern back-to-back;
+// each DPattern slices it by [off, off+n). A material's roughnessPat/filmThicknessPat/
+// mixWeightPat index a DPattern (or -1). The postfix VM (dPatternEval) runs the same
+// opcode/hash-noise math as the host so CPU and GPU agree. PatNode/PatOp come from
+// pattern.h (POD, uploaded verbatim) — no device-specific node type is needed.
+struct DPattern { int off, n; };   // slice into DScene::patNodes
 
 struct DMedium {
     int    enabled;
@@ -329,6 +344,10 @@ struct DScene {
     // postfix node pool the DImplicit slices index into.
     const DFieldNode* fieldNodes;
     const DImplicit*  implicits; int nImplicits;
+    // Procedural patterns (§4): flat postfix PatNode pool + per-pattern slices.
+    // A material's roughnessPat/filmThicknessPat/mixWeightPat index `patterns`.
+    const PatNode*   patNodes;
+    const DPattern*  patterns; int nPatterns;
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
@@ -1357,13 +1376,118 @@ __device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
     return a * (1 - fy) + b * fy;
 }
 
+// ---- procedural pattern VM (device twin of pattern.h) ----------------------
+// Deterministic integer-hash 3-D value noise; matches patHash3/patValueNoise so the
+// GPU and CPU produce the same noise field. Output in [0,1].
+__device__ static double dPatHash3(int ix, int iy, int iz) {
+    unsigned int h = (unsigned int)ix * 374761393u + (unsigned int)iy * 668265263u
+                   + (unsigned int)iz * 2147483647u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= (h >> 16);
+    return (double)h / 4294967295.0;
+}
+__device__ static double dPatValueNoise(double x, double y, double z) {
+    double fx = floor(x), fy = floor(y), fz = floor(z);
+    int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+    double tx = x - fx, ty = y - fy, tz = z - fz;
+    double ux = tx * tx * (3.0 - 2.0 * tx);
+    double uy = ty * ty * (3.0 - 2.0 * ty);
+    double uz = tz * tz * (3.0 - 2.0 * tz);
+    double c000 = dPatHash3(ix,     iy,     iz);
+    double c100 = dPatHash3(ix + 1, iy,     iz);
+    double c010 = dPatHash3(ix,     iy + 1, iz);
+    double c110 = dPatHash3(ix + 1, iy + 1, iz);
+    double c001 = dPatHash3(ix,     iy,     iz + 1);
+    double c101 = dPatHash3(ix + 1, iy,     iz + 1);
+    double c011 = dPatHash3(ix,     iy + 1, iz + 1);
+    double c111 = dPatHash3(ix + 1, iy + 1, iz + 1);
+    double x00 = c000 + (c100 - c000) * ux;
+    double x10 = c010 + (c110 - c010) * ux;
+    double x01 = c001 + (c101 - c001) * ux;
+    double x11 = c011 + (c111 - c011) * ux;
+    double y0  = x00 + (x10 - x00) * uy;
+    double y1  = x01 + (x11 - x01) * uy;
+    return y0 + (y1 - y0) * uz;
+}
+// Postfix scalar-stack evaluator (exact port of patternEval). PatNode/PatOp are the
+// POD host types (pattern.h), uploaded verbatim; variables come in as scalar args.
+__device__ static double dPatternEval(const PatNode* nodes, int n,
+                                      double x, double y, double z, double f,
+                                      double nx, double ny, double nz, double r) {
+    double st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const PatNode& nd = nodes[i];
+        switch (nd.op) {
+            case PatOp::Const:    st[sp++] = nd.a; break;
+            case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarY:     st[sp++] = y;  break;
+            case PatOp::VarZ:     st[sp++] = z;  break;
+            case PatOp::VarF:     st[sp++] = f;  break;
+            case PatOp::VarNx:    st[sp++] = nx; break;
+            case PatOp::VarNy:    st[sp++] = ny; break;
+            case PatOp::VarNz:    st[sp++] = nz; break;
+            case PatOp::VarR:     st[sp++] = r;  break;
+            case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
+            case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
+            case PatOp::Sqrt:     st[sp-1] = sqrt(fmax(0.0, st[sp-1])); break;
+            case PatOp::Sin:      st[sp-1] = sin(st[sp-1]); break;
+            case PatOp::Cos:      st[sp-1] = cos(st[sp-1]); break;
+            case PatOp::Tan:      st[sp-1] = tan(st[sp-1]); break;
+            case PatOp::Exp:      st[sp-1] = exp(st[sp-1]); break;
+            case PatOp::Log:      st[sp-1] = log(fmax(1e-300, st[sp-1])); break;
+            case PatOp::Floor:    st[sp-1] = floor(st[sp-1]); break;
+            case PatOp::Fract:    st[sp-1] = st[sp-1] - floor(st[sp-1]); break;
+            case PatOp::Sign:     st[sp-1] = (st[sp-1] > 0.0) - (st[sp-1] < 0.0); break;
+            case PatOp::Saturate: st[sp-1] = fmin(1.0, fmax(0.0, st[sp-1])); break;
+            case PatOp::Add:      { double b = st[--sp]; st[sp-1] += b; break; }
+            case PatOp::Sub:      { double b = st[--sp]; st[sp-1] -= b; break; }
+            case PatOp::Mul:      { double b = st[--sp]; st[sp-1] *= b; break; }
+            case PatOp::Div:      { double b = st[--sp]; st[sp-1] = (b != 0.0) ? st[sp-1] / b : 0.0; break; }
+            case PatOp::Mod:      { double b = st[--sp]; st[sp-1] = (b != 0.0) ? st[sp-1] - b * floor(st[sp-1] / b) : 0.0; break; }
+            case PatOp::Pow:      { double b = st[--sp]; st[sp-1] = pow(st[sp-1], b); break; }
+            case PatOp::Min:      { double b = st[--sp]; st[sp-1] = fmin(st[sp-1], b); break; }
+            case PatOp::Max:      { double b = st[--sp]; st[sp-1] = fmax(st[sp-1], b); break; }
+            case PatOp::Atan2:    { double b = st[--sp]; st[sp-1] = atan2(st[sp-1], b); break; }
+            case PatOp::Step:     { double b = st[--sp]; st[sp-1] = (b >= st[sp-1]) ? 1.0 : 0.0; break; }
+            case PatOp::Clamp:    { double hi = st[--sp], lo = st[--sp]; st[sp-1] = fmin(hi, fmax(lo, st[sp-1])); break; }
+            case PatOp::Mix:      { double t = st[--sp], b = st[--sp]; st[sp-1] = st[sp-1] + (b - st[sp-1]) * t; break; }
+            case PatOp::Smoothstep: {
+                double xx = st[--sp], e1 = st[--sp], e0 = st[sp-1];
+                double tt = (e1 != e0) ? (xx - e0) / (e1 - e0) : 0.0;
+                tt = fmin(1.0, fmax(0.0, tt));
+                st[sp-1] = tt * tt * (3.0 - 2.0 * tt);
+                break;
+            }
+            case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoise(st[sp-1], yy, zz); break; }
+        }
+    }
+    return sp > 0 ? st[0] : 0.0;
+}
+// Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
+// The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
+// the `f` variable is 0 at surfaces on both backends.
+__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
+    const DPattern& p = sc.patterns[pat];
+    double px = h.p.x, py = h.p.y, pz = h.p.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
+                        h.n.x, h.n.y, h.n.z, r);
+}
+
 // Per-hit glossy roughness / thin-film thickness (device twins of materialRoughness
-// / materialFilmThickness): a bound scalar map's value at the hit, else the constant.
+// / materialFilmThickness): a bound pattern (highest priority) or scalar map's value
+// at the hit, else the constant.
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.roughnessPat >= 0) {
+        double r = dPatternScalarAt(sc, m.roughnessPat, h);
+        return (Real)(r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r));
+    }
     if (m.roughnessTex >= 0) return (Real)dTexScalarAt(sc.textures[m.roughnessTex], h.u, h.v);
     return (Real)m.roughness;
 }
 __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.filmThicknessPat >= 0)
+        return (Real)(dPatternScalarAt(sc, m.filmThicknessPat, h) * m.filmThickness);
     if (m.filmThicknessTex >= 0)
         return (Real)(dTexScalarAt(sc.textures[m.filmThicknessTex], h.u, h.v) * m.filmThickness);
     return (Real)m.filmThickness;
@@ -1373,8 +1497,10 @@ __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, c
 // an optional per-hit blend mask (2-child mix: map value t = prob of child 0). Returns
 // -1 for the leftover absorption slice (constant-weight path only). u is one uniform.
 __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, const DHit& h, Real u) {
-    if (m.mixWeightTex >= 0 && m.mixCount == 2) {
-        Real t = (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
+    if ((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2) {
+        Real t = (m.mixWeightPat >= 0)
+               ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
+               : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
         if (t < 0) t = 0; else if (t > 1) t = 1;
         return (u < t) ? m.mixChild[0] : m.mixChild[1];
     }
@@ -2732,15 +2858,14 @@ bool cudaForwardSupported(const Scene& scene) {
                 if (c >= 0 && c < (int)scene.mats.size() && paletteTex(scene.mats[c].reflectTex)) return true;
         return false;
     };
-    // §4 math-driven materials & dielectric translucency are CPU-only for now: the
-    // device has no procedural-pattern VM, and its dielectric branch is smooth &
-    // non-absorbing (no frosting, no Beer-Lambert interior tint). Any material relying
-    // on these forces the CPU forward/backward tracer so the GPU never renders a
-    // silently-wrong image (missing frost, clear-instead-of-colored glass, ignored
-    // pattern). Implicit surfaces (isosurface) are gated separately below.
-    auto usesPattern = [&](const Material& m) {
-        return m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0;
-    };
+    // Dielectric translucency is CPU-only for now: the device dielectric branch is
+    // smooth & non-absorbing (no frosting, no Beer-Lambert interior tint). A frosted or
+    // colored dielectric forces the CPU forward/backward tracer so the GPU never renders
+    // a silently-wrong image (missing frost, clear-instead-of-colored glass). Procedural
+    // patterns (§4) run on-device now (dPatternEval / dMatRoughness / dMixResolveChild),
+    // so a roughness/film/mix-weight pattern on a NON-dielectric is supported; a
+    // roughnessPat on a dielectric is still frosting, caught by frostedOrColoredGlass.
+    // Implicit surfaces (isosurface) are gated separately below.
     auto frostedOrColoredGlass = [&](const Material& m) {
         if (m.type != MatType::Dielectric) return false;
         if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
@@ -2755,11 +2880,11 @@ bool cudaForwardSupported(const Scene& scene) {
         if (usesPaletteTex(matId)) return true;
         if (matId >= 0 && matId < (int)scene.mats.size()) {
             const Material& m = scene.mats[matId];
-            if (usesPattern(m) || frostedOrColoredGlass(m)) return true;
+            if (frostedOrColoredGlass(m)) return true;
             if (m.type == MatType::Mix)
                 for (int c : m.mixChildren)
                     if (c >= 0 && c < (int)scene.mats.size() &&
-                        (usesPattern(scene.mats[c]) || frostedOrColoredGlass(scene.mats[c]))) return true;
+                        frostedOrColoredGlass(scene.mats[c])) return true;
         }
         // The physical layered stack (coat interface over a weighted body) is CPU-only;
         // the device shadeStep has no Layered branch, so any Layered material forces a
@@ -2870,6 +2995,18 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         }
     }
 
+    // --- bake procedural patterns (§4) ---
+    // Flatten every Pattern's postfix PatNode program into one pool; each DPattern
+    // slices it by [off, off+n). Materials index these via roughnessPat/etc.
+    std::vector<PatNode> patNodes;
+    std::vector<DPattern> dpat(scene.patterns.size());
+    for (size_t i = 0; i < scene.patterns.size(); ++i) {
+        const Pattern& p = scene.patterns[i]; DPattern& d = dpat[i];
+        d.off = (int)patNodes.size();
+        d.n   = (int)p.nodes.size();
+        patNodes.insert(patNodes.end(), p.nodes.begin(), p.nodes.end());
+    }
+
     // --- bake materials ---
     // Fluorescent materials append their emission-SPD CDF to one flat buffer
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
@@ -2912,6 +3049,9 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;
         for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
         d.mixWeightTex = m.mixWeightTex;
+        d.roughnessPat = m.roughnessPat;
+        d.filmThicknessPat = m.filmThicknessPat;
+        d.mixWeightPat = m.mixWeightPat;
     }
 
     // --- upload geometry/materials ---
@@ -2922,6 +3062,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
     DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
     DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
+    PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
+    DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
 
     // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
@@ -3033,6 +3175,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
+    sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
@@ -3226,18 +3369,24 @@ bool cudaBdptSupported(const Scene& scene) {
         // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
         // which would bias MIS. Fall back to CPU BDPT (which threads the Hit through).
         if (m.roughnessTex >= 0 || m.filmThicknessTex >= 0) return true;
+        // Procedural patterns drive the same per-hit params; the GPU BDPT kernel's
+        // pdf/eval use the constants, so a pattern would bias MIS — use CPU BDPT.
+        if (m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0) return true;
         // Mix blend mask: the GPU BDPT mix-pick uses constant weights; use CPU BDPT.
         if (m.mixWeightTex >= 0) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
                     (scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
-                     scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0))
+                     scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
+                     scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
+                     scene.mats[c].mixWeightPat >= 0))
                     return true;
         return false;
     };
-    for (const auto& t : scene.tris)    if (usesTexOrFluoro(t.matId)) return false;
-    for (const auto& s : scene.spheres) if (usesTexOrFluoro(s.matId)) return false;
+    for (const auto& t : scene.tris)      if (usesTexOrFluoro(t.matId)) return false;
+    for (const auto& s : scene.spheres)   if (usesTexOrFluoro(s.matId)) return false;
+    for (const auto& im : scene.implicits) if (usesTexOrFluoro(im.matId)) return false;
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
