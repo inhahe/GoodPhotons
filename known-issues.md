@@ -159,6 +159,37 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** IMPLEMENTED (backward realistic camera, 2026-07-11). Supersedes the
   analytical thin-lens for "arbitrary real camera" use; the gaps above are follow-ups.
 
+#### Plan B — realistic lens on the camera subpath of BDPT (mode D) and composite (mode P), deferred
+- **Why it's wanted:** the physical lens currently rides on **pure mode R** (backward
+  everything), so it inherits mode R's weaknesses — noisy on in-frame caustics, and no
+  fluorescence. The lens only ever lives on the *camera subpath*; in principle you can
+  keep forward light transport lighting the scene (caustics on surfaces) while a
+  backward lens ray samples that lit scene through the glass — i.e. attach the lens to
+  the camera subpath of a bidirectional/composite estimator instead of forcing pure R.
+  That would recover *some* of the forward tracer's caustic efficiency while keeping the
+  physical optics.
+- **The catch (why it's only a partial win, and deferred):** the multi-element lens map
+  has **no closed-form inverse**, and both D and P need that inverse for the parts that
+  would buy the forward advantage:
+  1. **BDPT (mode D).** BDPT's power comes from light→camera connection strategies. The
+     **t=1 strategy** (splat a light-subpath vertex directly onto the film) requires
+     projecting a world point onto the sensor *through the glass stack* — the lens
+     inversion. PBRT disables the camera-connection strategies for realistic cameras for
+     exactly this reason. So a realistic lens in D must run with t=1 disabled: you keep
+     the *scene-side* connections (a camera-subpath vertex out in the scene connects to
+     light-subpath vertices), which recovers part of the caustic efficiency, but not the
+     full forward win. It's a substantial, delicate, per-wavelength change layered on a
+     mode D that already lacks fog / env / spot / fluorescence support.
+  2. **Composite (mode P).** Worse fit: P's forward pass **splats to a pinhole** — it
+     fundamentally assumes a pinhole camera. Routing that forward pass through a physical
+     lens is the ill-posed forward-through-lens problem again. So P does not cleanly
+     extend to a realistic lens without solving the same inversion.
+- **Bottom line:** the clean, buildable step is **Plan A** — a dedicated GPU backward
+  megakernel (GPU mode R) with the lens as a ray-generation front-end (see gap #1
+  below/above). Plan B (D and P) is genuinely more general but only a *partial* caustic
+  recovery for a much larger, more fragile implementation, and can't do the light→film
+  splat through the glass at all. Captured here as future research work, not scheduled.
+
 ### Texturing is base-color only, `use_mesh`/quad UVs only (Phase 3b partial)
 - **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear
   filter nearest|bilinear wrap repeat|clamp|mirror }` block loads an image into
