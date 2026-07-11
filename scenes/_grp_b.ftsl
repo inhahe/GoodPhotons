@@ -1,0 +1,20 @@
+# Group-transform equivalence test B: the hand-composed world-space equivalent of
+# _grp_a.ftsl (no group blocks). Renders must match _grp_a.ftsl bit-for-bit.
+scene { units meters  spectral 360 830 1 }
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "mir"   { type mirror reflect 0.9 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.3 0.3  radius 0.12  material mir   }
+sphere { center 0.6 0.5 0.5  radius 0.1   material white }
+sphere { center 0.5 0.2 0.4  radius 0.06  material green }
+
+light area { origin 0.35 0.999 0.35  u 0.30 0 0  v 0 0 0.30  normal 0 -1 0  spd preset:bb6500 }
+camera "cam" { eye 0.5 0.5 2.7  look_at 0.5 0.5 0.5  up 0 1 0  fov_y 40  mode B  film { res 128 128 } }
