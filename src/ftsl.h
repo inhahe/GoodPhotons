@@ -17,7 +17,7 @@
 //   light area       { origin ...  u ...  v ...  normal ...  spd <spectrum-expr> }
 //   light collimated { dir x y z  spd <spectrum-expr> }   # repeatable: N emitters
 //   light sphere     { center x y z  radius r  spd <spectrum-expr> }  # glowing ball
-//   light cylinder   { center x y z  axis x y z  length l  radius r  spd … }  # tube/fluorescent
+//   light cylinder   { center x y z  axis x y z  length l  radius r  [caps on] spd … }  # tube/fluorescent (caps=closed capsule)
 //   light spot       { origin x y z  dir x y z  inner_angle d  outer_angle d  spd … }
 //   light env        { spd <spectrum-expr> }   # constant infinite environment
 //   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
@@ -770,12 +770,15 @@ private:
         }
         if (subtype == "cylinder") {
             // Cylindrical area light: a glowing tube (fluorescent lamp). The LATERAL
-            // surface emits; the end caps are omitted (matching the analytic
-            // 2*PI*r*L sampling area). We tessellate the wall into emissive triangles
-            // so the tube is visible and absorbs returning photons (mirrors how the
-            // sphere light drops an emissive sphere into geometry). `center` is the
-            // tube midpoint, `axis` its direction (default +Y), `length`/`radius` its
-            // size, and `segments` (default 48) the wall tessellation fineness.
+            // surface emits; by default the end caps are omitted (matching the analytic
+            // 2*PI*r*L sampling area and a real tube's non-emissive metal ends). With
+            // `caps on` the two end discs also emit (a closed glowing capsule) -- both
+            // added to the sampling area (see addCylinderLight) and tessellated as
+            // emissive fans below. We tessellate the wall into emissive triangles so
+            // the tube is visible and absorbs returning photons (mirrors how the sphere
+            // light drops an emissive sphere into geometry). `center` is the tube
+            // midpoint, `axis` its direction (default +Y), `length`/`radius` its size,
+            // and `segments` (default 48) the wall tessellation fineness.
             if (nonUniform) { fail("cylinder light under non-uniform scale would be an elliptic cylinder; use uniform scale"); return false; }
             Vec3 c{0.5, 0.5, 0.5}; vec3Of(b, "center", c);
             Vec3 dir{0, 1, 0}; vec3Of(b, "axis", dir);
@@ -783,6 +786,8 @@ private:
             double rad = Len(dblOf(b, "radius", 0.05)) * s;
             int segs = (int)dblOf(b, "segments", 48.0);
             if (segs < 3) segs = 3;
+            std::string capsStr = strOf(b, "caps", "off");
+            bool caps = (capsStr == "on" || capsStr == "true" || capsStr == "yes");
             Vec3 axisW = normalize(xf.applyDir(dir)) * len;   // world axis vector (|.| = len)
             Vec3 baseW = P(xf.apply(c)) - axisW * 0.5;        // base-cap center
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
@@ -790,6 +795,7 @@ private:
             // Tessellate the lateral wall. onb(normalize(axisW),...) here matches the
             // basis addCylinderLight computes, so facets align with the sampled radius.
             Vec3 au = normalize(axisW); Vec3 t, bt; onb(au, t, bt);
+            Vec3 topW = baseW + axisW;                          // top-cap center
             for (int i = 0; i < segs; ++i) {
                 double a0 = 2.0 * PI * i / segs, a1 = 2.0 * PI * (i + 1) / segs;
                 Vec3 r0 = t * std::cos(a0) + bt * std::sin(a0);
@@ -798,8 +804,14 @@ private:
                 Vec3 p0 = b0 + axisW, p1 = b1 + axisW;
                 L.scene.tris.push_back(Tri{b0, b1, p1, id, -1, {}});   // outward winding
                 L.scene.tris.push_back(Tri{b0, p1, p0, id, -1, {}});
+                if (caps) {
+                    // Emissive end-disc fans: base normal -au (winding b1,b0,center),
+                    // top normal +au (winding p0,p1,center).
+                    L.scene.tris.push_back(Tri{b1, b0, baseW, id, -1, {}});
+                    L.scene.tris.push_back(Tri{p0, p1, topW, id, -1, {}});
+                }
             }
-            L.scene.addCylinderLight(baseW, axisW, rad, spd, binWidth_, /*matId*/id);
+            L.scene.addCylinderLight(baseW, axisW, rad, spd, binWidth_, /*matId*/id, caps);
             return true;
         }
         if (subtype == "spot") {

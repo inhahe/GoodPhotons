@@ -1,0 +1,42 @@
+# Capped cylindrical area light — a short, fat glowing capsule (`caps on`) so the
+# two end discs are a meaningful fraction of the emitting area. The tube axis runs
+# left-to-right, so one end cap faces the red wall and the other the green wall
+# (their emission lights those walls in a way an uncapped tube would not). Exercises
+# the three-region cylinder sampling (lateral wall + both end discs) in the forward
+# tracer, the backward reference, and BDPT. All surfaces are diffuse so mode V
+# (forward-vs-backward) should agree tightly.
+#
+#   ftrace -in scenes/cylindercaps.ftsl -mode V -n 40000000 -spp 1024
+#   ftrace -in scenes/cylindercaps.ftsl -n 40000000 -o cylindercaps.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- capped cylindrical area light: a short fat capsule near the ceiling ----
+light cylinder {
+    center 0.5 0.75 0.5
+    axis   1 0 0            # tube runs left-to-right; end caps face the side walls
+    length 0.5   radius 0.12
+    caps   on              # the two end discs also emit (closed capsule)
+    spd    preset:bb6500
+}
+
+# --- camera ---------------------------------------------------------------
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

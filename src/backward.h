@@ -92,6 +92,7 @@ struct BackwardRenderer {
             // (the visible area) replaces em.area and no samples land on the back side.
             double effArea = em.area, pdfAreaCyl = 0.0;
             bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
+                              !em.caps &&   // capped tubes: uniform samplePoint covers the caps too
                               em.sampleCylinderVisible(h.p, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             double cosSurf, contrib;
@@ -157,6 +158,7 @@ struct BackwardRenderer {
             // Cylinder: front-facing lateral-arc sampling (area measure) toward `p`.
             double effArea = em.area, pdfAreaCyl = 0.0;
             bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
+                              !em.caps &&   // capped tubes: uniform samplePoint covers the caps too
                               em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             double albedo = scene.medium.albedo(lambda);

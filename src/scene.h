@@ -208,6 +208,9 @@ struct Emitter {
     // Cylinder (fluorescent-tube) light: `origin` is the base-cap center, `v` is the
     // axis vector (its length = the tube length), and `u`/`normal` are an orthonormal
     // radial basis; the lateral surface is sampled uniformly (area = 2*PI*radius*|v|).
+    // When `caps` is set the two circular end discs also emit (a closed glowing
+    // capsule): area = 2*PI*r*|v| + 2*PI*r^2 and samplePoint draws all three regions.
+    bool caps = false;        // Cylinder: also emit from the two end-cap discs
     bool collimated = false;
     Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
     double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
@@ -246,8 +249,34 @@ struct Emitter {
             // outward radial direction is rad = u*cos + normal*sin (a unit vector).
             double phi = 2.0 * PI * u2;
             Vec3 rad = u * std::cos(phi) + normal * std::sin(phi);
-            y = origin + v * u1 + rad * radius;
-            nOut = rad;                                // unit outward normal
+            if (caps) {
+                // Closed capsule: pick lateral wall or one of the two end discs with
+                // probability proportional to area, then reuse u1 (remapped to [0,1))
+                // within the chosen region so the combined density is uniform over the
+                // whole surface (pdf = 1/area still holds for the caller's 1/area law).
+                double len = length(v);
+                Vec3 a = (len > 0.0) ? v / len : Vec3{0, 1, 0};
+                double latA = 2.0 * PI * radius * len;     // lateral wall
+                double capA = PI * radius * radius;        // one end disc
+                double total = latA + 2.0 * capA;
+                double pLat = latA / total, pCap = capA / total;
+                if (u1 < pLat) {                            // lateral wall
+                    double uu = u1 / pLat;
+                    y = origin + v * uu + rad * radius;
+                    nOut = rad;
+                } else if (u1 < pLat + pCap) {              // base cap (normal -a)
+                    double rr = radius * std::sqrt((u1 - pLat) / pCap);
+                    y = origin + rad * rr;
+                    nOut = a * -1.0;
+                } else {                                    // top cap (normal +a)
+                    double rr = radius * std::sqrt((u1 - pLat - pCap) / pCap);
+                    y = origin + v + rad * rr;
+                    nOut = a;
+                }
+            } else {
+                y = origin + v * u1 + rad * radius;
+                nOut = rad;                            // unit outward normal
+            }
         } else {
             y = origin + u * u1 + v * u2;
             nOut = normal;
@@ -405,16 +434,21 @@ struct Scene {
     // LATERAL surface emits. `base` is the center of one end cap and `axis` points
     // to the other (|axis| = the tube length); `r` is the radius. area = 2*PI*r*|axis|
     // feeds the same power law (power = emitIntegral*area*PI) and the same 1/area
-    // uniform-surface pdf as a quad. The end caps are not emissive (they are omitted
-    // from both the sampling area and the emissive geometry the loader tessellates).
+    // uniform-surface pdf as a quad. With `caps` the two end discs also emit (a closed
+    // capsule): area += 2*PI*r^2, and samplePoint draws all three regions uniformly.
+    // The default (caps=false) omits the caps from both the sampling area and the
+    // emissive geometry the loader tessellates (a real fluorescent tube's ends are
+    // non-emissive metal end-caps).
     void addCylinderLight(const Vec3& base, const Vec3& axis, double r,
-                          const Spectrum& spd, double stepNm, int matId = -1) {
+                          const Spectrum& spd, double stepNm, int matId = -1,
+                          bool caps = false) {
         Emitter e;
         double len = length(axis);
         Vec3 a = (len > 0.0) ? axis / len : Vec3{0, 1, 0};
         Vec3 t, b; onb(a, t, b);                 // orthonormal radial basis
         e.origin = base; e.v = axis; e.u = t; e.normal = b; e.radius = r;
-        e.area = 2.0 * PI * r * len;
+        e.area = 2.0 * PI * r * len + (caps ? 2.0 * PI * r * r : 0.0);
+        e.caps = caps;
         e.shape = EmitterShape::Cylinder; e.matId = matId;
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));

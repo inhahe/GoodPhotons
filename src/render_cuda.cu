@@ -170,6 +170,7 @@ struct DEmitter {
     int    collimated;
     int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder (EmitterShape)
     double radius;             // sphere radius (shape==1) / tube radius (shape==4)
+    int    caps;               // cylinder (shape==4): also emit from the two end discs
     double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
     int    cdfOffset, cdfN;
     double cdfStep;
@@ -204,8 +205,32 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
         // normal are the precomputed radial basis (mirrors host Emitter::samplePoint).
         double phi = 2.0 * 3.14159265358979323846 * u2;
         DVec3 rad = em.u * (Real)cos(phi) + em.normal * (Real)sin(phi);
-        y = em.origin + em.v * (Real)u1 + rad * (Real)em.radius;
-        nOut = rad;
+        if (em.caps) {
+            // Closed capsule: pick lateral wall or one end disc proportional to area,
+            // then reuse u1 (remapped) within the region (mirrors host samplePoint).
+            double len = length(em.v);
+            DVec3 a = (len > 0.0) ? em.v / (Real)len : DVec3{(Real)0,(Real)1,(Real)0};
+            double latA = 2.0 * 3.14159265358979323846 * em.radius * len;
+            double capA = 3.14159265358979323846 * em.radius * em.radius;
+            double total = latA + 2.0 * capA;
+            double pLat = latA / total, pCap = capA / total;
+            if (u1 < pLat) {
+                double uu = u1 / pLat;
+                y = em.origin + em.v * (Real)uu + rad * (Real)em.radius;
+                nOut = rad;
+            } else if (u1 < pLat + pCap) {
+                double rr = em.radius * sqrt((u1 - pLat) / pCap);
+                y = em.origin + rad * (Real)rr;
+                nOut = a * (Real)(-1.0);
+            } else {
+                double rr = em.radius * sqrt((u1 - pLat - pCap) / pCap);
+                y = em.origin + em.v + rad * (Real)rr;
+                nOut = a;
+            }
+        } else {
+            y = em.origin + em.v * (Real)u1 + rad * (Real)em.radius;
+            nOut = rad;
+        }
     } else {
         y = em.origin + em.u * (Real)u1 + em.v * (Real)u2;
         nOut = em.normal;
@@ -1803,6 +1828,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
                  : (e.shape == EmitterShape::Env)      ? 3
                  : (e.shape == EmitterShape::Cylinder) ? 4 : 0;
         de.radius = e.radius;
+        de.caps = e.caps ? 1 : 0;
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
         de.cdfOffset = (int)cdfAll.size();

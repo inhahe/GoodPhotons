@@ -392,6 +392,7 @@ light sphere {                     # Phase 3c: a glowing ball
 light cylinder {                   # a glowing tube (fluorescent lamp)
     center 0.5 0.85 0.5   axis 1 0 0
     length 0.7   radius 0.05       # optional: segments 48 (wall tessellation)
+    caps off                       # optional: `caps on` also emits the two end discs
     spd preset:bb6500
 }
 
@@ -428,10 +429,10 @@ so existing quad scenes stay bit-identical). Validated by `scenes/spherelight.ft
 (mode V: forward agrees with backward; CPU==GPU energy).
 
 A `light cylinder` registers a cylindrical `Emitter` (`shape =
-EmitterShape::Cylinder`, `area = 2·π·r·L` — the **lateral** wall only; the end caps
-are not emissive) for a fluorescent-lamp-shaped tube. `center` is the tube midpoint,
-`axis` its direction, `length`/`radius` its size, and the optional `segments`
-(default 48) sets how finely the loader tessellates the emissive wall into
+EmitterShape::Cylinder`, `area = 2·π·r·L` — the **lateral** wall only; by default the
+end caps are not emissive) for a fluorescent-lamp-shaped tube. `center` is the tube
+midpoint, `axis` its direction, `length`/`radius` its size, and the optional
+`segments` (default 48) sets how finely the loader tessellates the emissive wall into
 triangles (dropped into the geometry so the tube is visible and absorbs returning
 photons, mirroring the sphere light). Both tracers sample a **uniform point on the
 lateral surface** — `u₁` slides along the axis, `u₂` picks the angle around it — and
@@ -443,6 +444,24 @@ the true cylinder while the rendered wall is faceted; with the default segment c
 the difference is far below Monte-Carlo noise (and only affects the geometric shape,
 not the MIS pdfs, which are analytic). Validated by `scenes/cylinderlight.ftsl`
 (mode V: forward agrees with backward; forward/BDPT and CPU/GPU agree to MC noise).
+
+Add **`caps on`** to also emit from the two circular end discs — a **closed glowing
+capsule** rather than an open tube. This is worth it for short, fat emissive
+cylinders (a glowing puck/can, a neon segment seen end-on) where the caps are a
+meaningful fraction of the emitting surface, or for any view straight down the tube's
+axis where the grazing lateral wall would otherwise nearly vanish; it is *off* by
+default because a real fluorescent lamp's ends are non-emissive metal end-caps and,
+for a long thin tube, the caps are a negligible `~r/L` of the total. With caps the
+sampling area becomes `2·π·r·L + 2·π·r²`, `samplePoint` draws all three regions
+(lateral wall + both discs) with probability proportional to their area so the
+`1/area` pdf and power law still hold, the loader tessellates two extra emissive
+disc fans, and GPU parity is maintained (device `caps` flag). One consequence: the
+backward reference's visible-arc importance sampler (`sampleCylinderVisible`, which
+covers only the lateral wall) is bypassed for capped tubes, falling back to the
+plain uniform `samplePoint` (still unbiased, just noisier) — a fair trade since caps
+are used precisely for the short/fat cylinders where the lateral-arc win is smallest.
+Validated by `scenes/cylindercaps.ftsl` (mode V forward-vs-backward scale ≈ 0.996;
+forward B, BDPT D, and CPU/GPU all agree to MC noise).
 
 ```
 light env { spd 0.5 }              # Phase 3c: uniform infinite environment
