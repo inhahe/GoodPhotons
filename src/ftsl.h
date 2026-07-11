@@ -293,7 +293,8 @@ struct CamSpec {
     Vec3   eye{0, 1, 3}, look{0, 1, 0}, up{0, 1, 0};
     double fov = 40.0, aperture = 0.02, focus = 0.0;
     char   mode = 0;             // 0 = not specified -> inherit global
-    int    res  = -1;            // -1 = not specified -> inherit global
+    int    res  = -1;            // film WIDTH  in px (-1 = inherit global/CLI res)
+    int    resY = -1;            // film HEIGHT in px (-1 = square: follow res)
 
     // Lens projection (0 = rectilinear; see CameraProjection) and an optional zoom
     // multiplier on the focal length (1 = none; 2 = 2x tele, i.e. half the fov).
@@ -1029,7 +1030,11 @@ private:
         if (film && film->val.block) {
             const Block& fb = *film->val.block;
             const Stmt* r = find(fb, "res");
-            if (r && !r->val.words.empty()) cs.res = (int)num(r->val.words[0]);
+            if (r && !r->val.words.empty()) {
+                cs.res  = (int)num(r->val.words[0]);
+                // `res W H` gives a non-square film; `res W` stays square (resY=W).
+                cs.resY = (r->val.words.size() >= 2) ? (int)num(r->val.words[1]) : cs.res;
+            }
             // Named sensor/film format -> physical size in mm (e.g. `format full-frame`,
             // `format medium-format`, `format 4x5`). Words are joined so a spaced
             // "medium format" also works. An explicit `size w h` below overrides it.

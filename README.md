@@ -237,9 +237,10 @@ device), so within the GPU-supported scope it is still fast. Reach for the analy
 lens/projection when you want speed and a clean ideal image, and the physical lens
 when you want a specific real objective's look.
 
-*Current limits:* the physical lens is backward-only (mode `R`), renders to a
-square film (the 3:2 sensor is cropped to the output frame), and does not model
-inter-element flare/ghosting or shaped-iris bokeh. On the GPU it inherits mode
+*Current limits:* the physical lens is backward-only (mode `R`); it maps the sensor
+across the film width, so a film whose aspect matches the sensor (e.g. `res 360 240`
+for a 3:2 sensor) covers it without cropping, while a mismatched aspect crops. It does
+not model inter-element flare/ghosting or shaped-iris bokeh. On the GPU it inherits mode
 `R`'s scope (no fog/env/spot/fluorescence, and at most 16 lens surfaces); outside
 that it falls back to the CPU tracer automatically.
 
@@ -370,7 +371,7 @@ An FTSL file is a list of blocks. Top-level block types: `scene` (the
 | `-in <path>` | Load an FTSL scene file |
 | `-scene <name>` | Built-in scene (e.g. `cornell`) |
 | `-n <photons>` | Trace exactly this many photons/samples |
-| `-r <res>` | Square output resolution (overrides scene default) |
+| `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-mode <A..D>` | Render mode (default `B`) |
 | `-camera <name>` | Select a named camera |
@@ -420,5 +421,5 @@ deterministically.
 ## Known issues & roadmap
 
 Open limitations and technical debt are tracked in `known-issues.md` — including
-the physical-lens camera's remaining gaps (BDPT/composite support, non-square film,
-inter-element flare) and the shared multi-camera pass.
+the physical-lens camera's remaining gaps (BDPT/composite support, inter-element
+flare) and the shared multi-camera pass.

@@ -36,8 +36,8 @@
 > tracer). The still-unimplemented
 > pieces (configurable spectral *range*, absolute light power/units — which also
 > gates absolute-EV film sensitivity — the full physical `layered` material, the
-> shared multi-camera mode-B pass, non-square films, textures on non-albedo
-> parameters, procedural UV projections) remain tagged
+> shared multi-camera mode-B pass, textures on non-albedo
+> parameters) remain tagged
 > **[needs engine work]** below. Alongside them, constructs
 > the loader already handles are tagged **[maps 1:1]**; the spec doubles as the
 > implementation checklist (§11).
@@ -794,9 +794,12 @@ photons where the brute-force catch needs billions.
 
 ### 8.1 Film — present vs. proposed
 
-- `res W H` — output resolution. **[maps 1:1]** (`Film::resX/resY`). *Note: the
-  forward/backward tracers currently allocate a **square** film, so only the first
-  value is used; non-square sensors are a follow-up.*
+- `res W H` — output resolution. **[maps 1:1]** (`Film::resX/resY`). Non-square films
+  (W≠H) are fully supported across every tracer (CPU/GPU forward A/B/C, backward R,
+  BDPT D, composite P, validate V) and checkpoint/resume. The horizontal field of view
+  is derived from the width (`tanHalfX = tanHalfY·W/H`), so a wider film shows more of
+  the scene rather than stretching it. The CLI `-r W H` sets a non-square film too
+  (`-r N` stays square).
 - `format <name>` — **[done — Phase 3a]**: a named sensor/film preset that expands
   to a physical `size` (mm). Case-, space-, hyphen-, and underscore-insensitive, so
   `full-frame`, `full frame`, and `fullframe` are the same. Recognised names:
@@ -823,9 +826,10 @@ photons where the brute-force catch needs billions.
 - `size <w> <h>` (mm) — physical sensor dimensions. **[done — Phase 3a]**: the
   focal length is derived from the film **height** and `fov_y`
   (`f = filmH / (2·tan(fov_y/2))`, in metres) and used for f-stop → aperture. A
-  35 mm "full frame" is `size 36 24` (or `format full-frame`). *(Because the film is
-  square today the width is not yet used for a true horizontal fov; when unspecified
-  a 24 mm full-frame height is assumed wherever a physical length is needed.)*
+  35 mm "full frame" is `size 36 24` (or `format full-frame`). *(When unspecified a
+  24 mm full-frame height is assumed wherever a physical length is needed. Pair the
+  sensor with a matching-aspect `res W H` — e.g. 3:2 — for a physically faithful
+  horizontal fov and no crop.)*
 - `lens <mm>` — **[done — Phase 3a]**: focal length in millimetres. Photographers
   pick a lens far more often than an angle, so `lens 50` sets the vertical field of
   view directly from the focal length and film **height**
@@ -1288,9 +1292,11 @@ designed to grow into.
     `-camera` selection + per-camera film resolution + per-camera mode
     (`scenes/twocam.ftsl`); `camera_path` keyframe interpolation
     (`scenes/dolly.ftsl`); physical film `size` (mm) → focal length, `fstop` →
-    aperture radius, and relative exposure compensation via `iso`/`shutter`/
-    `exposure` (`scenes/expo.ftsl`). Remaining: shared mode-B multi-camera pass,
-    non-square films, and absolute-EV/sensitivity (needs absolute light power).]**
+    aperture radius, relative exposure compensation via `iso`/`shutter`/
+    `exposure` (`scenes/expo.ftsl`), a `camera_path`/CLI exposure **lock**, and
+    non-square films (`res W H` / `-r W H`, resX≠resY through every tracer).
+    Remaining: shared mode-B multi-camera pass and absolute-EV/sensitivity (needs
+    absolute light power).]**
 11. UVs + spectral/RGB textures; per-face materials from OBJ `usemtl`.
 12. Additional light shapes (sphere/spot/HDRI environment).
 

@@ -45,7 +45,7 @@ bool cudaForwardSupported(const Scene& scene);
 // wavefront scheduler keeps SIMD lanes full on divergent / deep-path scenes and small
 // GPUs, at the cost of extra memory traffic (the RNG stream — and thus the exact image
 // noise — differs, but the two agree to within Monte-Carlo noise).
-Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
+Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase = 0,
                        bool wavefront = false);
@@ -61,7 +61,7 @@ bool cudaBdptSupported(const Scene& scene);
 // the CPU renderBdpt, i.e. writeFilm(film, 1.0) for display). maxDepth is the maximum
 // path length in edges (clamped to the device capacity). Requires cudaAvailable() &&
 // cudaBdptSupported(scene); otherwise returns an empty film.
-Film renderBdptCuda(const Scene& scene, const Camera& cam, int res,
+Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
@@ -79,5 +79,5 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // cos^4*A/Z^2 radiometric weight). Requires cudaAvailable() && cudaBackwardSupported();
 // otherwise returns an empty film. The device RNG differs from the CPU, so the image is
 // an independent noise realization that agrees to within Monte-Carlo noise.
-Film renderBackwardCuda(const Scene& scene, const Camera& cam, int res,
+Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction);

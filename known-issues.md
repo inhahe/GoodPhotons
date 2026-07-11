@@ -64,18 +64,29 @@ as practical; this file is the fallback for what can't be addressed immediately.
      flicker), locked frames all hold the frame-0 anchor 2.02e-14. Standalone cameras
      (no lock) stay bit-identical (null anchor → per-frame auto-exposure as before).
      True *absolute* EV still needs absolute emitter power (deferred, §7).
-  2. **Non-square films.** `film { res W H }` only uses the first value; the
-     forward/backward tracers (and CUDA) allocate a square film. Non-square sensors
-     (and a true horizontal fov from film **width**) need the tracers to carry
-     resX≠resY.
+  2. ~~**Non-square films.** `film { res W H }` only uses the first value; the
+     forward/backward tracers (and CUDA) allocate a square film.~~ **DONE
+     2026-07-11.** `film { res W H }` (and the CLI `-r W H`) now flow resX≠resY
+     through every tracer: CPU/GPU forward (A/B/C), backward (R), BDPT (D), composite
+     (P), validate (V), plus checkpoint/resume (the identity guard mixes resY, so a
+     mismatched height is rejected instead of silently poisoning the image). The
+     camera already carried the true horizontal fov from width
+     (`tanHalfX = tanHalfY·rx/ry`); only the render-entry plumbing had collapsed to a
+     single square `res`. `renderForward/Backward/Bdpt/Composite`, `runRender`,
+     `readCheckpoint`, and the CUDA entry points + `kBackward`/`kBdpt` kernels all
+     take resX,resY now. Validated at 320×180: mode V PASSES (bulk RMSE 3%,
+     firefly-dominated top-1%), CPU vs GPU auto-exposure agree (4.68e-13 vs 4.62e-13),
+     resume accumulates 1M→2M correctly, and the guard rejects a 200×120→200×140
+     mismatch.
   3. **Shared multi-camera mode-B pass** (already logged above under the multi-camera
      entry) — one photon trace splatting to every camera pupil.
 - **Proper fix:** (1) ~~add a per-`camera_path` exposure-lock flag as the near-term
   step~~ (DONE 2026-07-11); absolute emitter power + a sensitometric film model still
-  deferred. (2) thread resX/resY through `renderForward`/`renderBackward`/CUDA and
-  `writePPM`. (3) see multi-camera.
+  deferred. (2) ~~thread resX/resY through `renderForward`/`renderBackward`/CUDA and
+  `writePPM`~~ (DONE 2026-07-11). (3) see multi-camera.
 - **Status:** OPEN (design captured) — logged 2026-07-10; **exposure-lock done
-  2026-07-11**; absolute-EV, non-square films and the shared pass remain.
+  2026-07-11**, **non-square films done 2026-07-11**; absolute-EV and the shared pass
+  remain.
 - **Done (2026-07-10, Phase 3a):**
   - `camera_path` keyframed motion — expands at load time into a sequence of
     `CamSpec` frames with piecewise-linear `eye`/`look_at` interpolation between
@@ -168,10 +179,11 @@ as practical; this file is the fallback for what can't be addressed immediately.
      tracer), and ≤ `D_MAXLENS` (16) lens surfaces; textured albedo IS supported. The
      device RNG differs from the CPU, so the image is an independent noise realization
      that agrees to within Monte-Carlo noise.
-  2. **Square film only.** The pipeline allocates a square film, so `genLensRay` maps
-     the sensor width across the frame and derives the vertical half-extent from the
-     output pixel aspect (square pixels, cropping the 3:2 sensor). A true non-square
-     sensor needs the resX≠resY film work (see the non-square-films limitation above).
+  2. **Sensor mapping.** `genLensRay` maps the sensor width across the film width and
+     derives the vertical extent from the output pixel aspect. Now that the film
+     pipeline carries resX≠resY (non-square films, DONE 2026-07-11), rendering the
+     physical lens into a film whose aspect matches the sensor (e.g. 3:2) covers the
+     sensor with square pixels and no crop; a mismatched aspect still crops as before.
   3. **No inter-element flare/ghosting** (rays refract, they don't also partially
      reflect at each interface), **no enclosure/body geometry**, and the aperture is a
      circular clear-diameter clip (no shaped-iris bokeh).

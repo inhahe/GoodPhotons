@@ -1987,15 +1987,15 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 // estimates radiance, and accumulates cieXYZ * (L * lensWeight) into the film. The film
 // holds the SUM over spp (writeFilm divides by spp), matching renderForwardCuda.
 __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
-                          long long totalSamples, long long spp, int res,
+                          long long totalSamples, long long spp, int resX,
                           int diffraction, unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
         DRng rng; rng.seed((unsigned long long)(idx * 2 + 1), seedBase ^ (unsigned long long)idx);
         long long pix = idx / spp;
-        int px = (int)(pix % res);
-        int py = (int)(pix / res);
+        int px = (int)(pix % resX);
+        int py = (int)(pix / resX);
 
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
@@ -2016,11 +2016,11 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         }
         double Lval = bkRadiance(sc, diffraction, ro, rd, lambda, invPdfLambda, rng);
         double w = Lval * wLens;
-        size_t o = ((size_t)py * res + px) * 3;
+        size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
         atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
         atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
-        if (hits) atomicAdd(&hits[(size_t)py * res + px], 1.0);
+        if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
     }
 }
 
@@ -2346,15 +2346,15 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // t==1 splats land on the projected raster pixel (splatFilm). Both are normalised by
 // 1/spp on the host (bdpt.h renderBdpt convention).
 __global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
-                      long long totalSamples, long long spp, int res, int maxDepth,
+                      long long totalSamples, long long spp, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
         DRng rng; rng.seed((unsigned long long)(idx * 2 + 1), seedBase ^ (unsigned long long)idx);
         long long pix = idx / spp;
-        int px = (int)(pix % res);
-        int py = (int)(pix / res);
+        int px = (int)(pix % resX);
+        int py = (int)(pix / resX);
 
         double pdfLam = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdfLam);
@@ -2374,12 +2374,12 @@ __global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm
                 double c = dConnectBDPT(sc, cam, light, eye, s, t, lambda, invPdfLambda, rng, spx, spy, isSplat);
                 if (c <= 0.0) continue;
                 if (isSplat) {
-                    size_t o = ((size_t)spy * res + spx) * 3;
+                    size_t o = ((size_t)spy * resX + spx) * 3;
                     atomicAdd(&splatFilm[o + 0], (double)(cx * c));
                     atomicAdd(&splatFilm[o + 1], (double)(cy * c));
                     atomicAdd(&splatFilm[o + 2], (double)(cz * c));
                 } else {
-                    size_t o = ((size_t)py * res + px) * 3;
+                    size_t o = ((size_t)py * resX + px) * 3;
                     atomicAdd(&camFilm[o + 0], (double)(cx * c));
                     atomicAdd(&camFilm[o + 1], (double)(cy * c));
                     atomicAdd(&camFilm[o + 2], (double)(cz * c));
@@ -2475,7 +2475,7 @@ static void freeUpload(DUpload& up) {
 
 // Bake the std::function Scene + Camera into POD device tables and upload them.
 // Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up) when done.
-static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload& up) {
+static void buildUpload(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
     using namespace gpu;
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
 
@@ -2675,7 +2675,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
     dc.v = {cam.v.x, cam.v.y, cam.v.z};
     dc.w = {cam.w.x, cam.w.y, cam.w.z};
     dc.tanHalfX = cam.tanHalfX; dc.tanHalfY = cam.tanHalfY;
-    dc.resX = res; dc.resY = res;
+    dc.resX = resX; dc.resY = resY;
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
     dc.projection = cam.projection; dc.halfFovY = cam.halfFovY; dc.rEdge = cam.rEdge;
 
@@ -2763,20 +2763,21 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
-Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
+Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase, bool wavefront) {
     using namespace gpu;
-    Film out; out.resX = res; out.resY = res; out.alloc();
+    Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
 
     DUpload up;
-    buildUpload(scene, cam, res, up);
+    buildUpload(scene, cam, resX, resY, up);
 
-    double* d_film = nullptr;   cudaMalloc(&d_film, (size_t)res * res * 3 * sizeof(double));
-    cudaMemset(d_film, 0, (size_t)res * res * 3 * sizeof(double));
-    double* d_hits = nullptr;   cudaMalloc(&d_hits, (size_t)res * res * sizeof(double));
-    cudaMemset(d_hits, 0, (size_t)res * res * sizeof(double));
+    const size_t npix = (size_t)resX * resY;
+    double* d_film = nullptr;   cudaMalloc(&d_film, npix * 3 * sizeof(double));
+    cudaMemset(d_film, 0, npix * 3 * sizeof(double));
+    double* d_hits = nullptr;   cudaMalloc(&d_hits, npix * sizeof(double));
+    cudaMemset(d_hits, 0, npix * sizeof(double));
     double* d_energy = nullptr; cudaMalloc(&d_energy, 5 * sizeof(double));
     cudaMemset(d_energy, 0, 5 * sizeof(double));
 
@@ -2802,12 +2803,12 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     }
 
     // --- download ---
-    std::vector<double> film((size_t)res * res * 3);
+    std::vector<double> film(npix * 3);
     cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out.hits.data(), d_hits, (size_t)res * res * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost);
     double energy[5] = {0,0,0,0,0};
     cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost);
-    for (size_t i = 0; i < (size_t)res * res; ++i)
+    for (size_t i = 0; i < npix; ++i)
         out.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
     eOut.emitted  += energy[0];
     eOut.absorbed += energy[1];
@@ -2851,24 +2852,24 @@ bool cudaBdptSupported(const Scene& scene) {
     return true;
 }
 
-Film renderBdptCuda(const Scene& scene, const Camera& cam, int res,
+Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction) {
     using namespace gpu;
-    Film out; out.resX = res; out.resY = res; out.alloc();
+    Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
     if (maxDepth > BDPT_MAXDEPTH) maxDepth = BDPT_MAXDEPTH;   // device array bound
 
     DUpload up;
-    buildUpload(scene, cam, res, up);
+    buildUpload(scene, cam, resX, resY, up);
 
-    const size_t npix = (size_t)res * res;
+    const size_t npix = (size_t)resX * resY;
     double* d_cam   = nullptr; cudaMalloc(&d_cam,   npix * 3 * sizeof(double));
     double* d_splat = nullptr; cudaMalloc(&d_splat, npix * 3 * sizeof(double));
     cudaMemset(d_cam,   0, npix * 3 * sizeof(double));
     cudaMemset(d_splat, 0, npix * 3 * sizeof(double));
 
-    long long totalSamples = (long long)res * res * spp;
-    kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, spp, res,
+    long long totalSamples = (long long)npix * spp;
+    kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, spp, resX,
                          maxDepth, diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
@@ -2920,23 +2921,23 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     return true;
 }
 
-Film renderBackwardCuda(const Scene& scene, const Camera& cam, int res,
+Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction) {
     using namespace gpu;
-    Film out; out.resX = res; out.resY = res; out.alloc();
+    Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
 
     DUpload up;
-    buildUpload(scene, cam, res, up);
+    buildUpload(scene, cam, resX, resY, up);
 
-    const size_t npix = (size_t)res * res;
+    const size_t npix = (size_t)resX * resY;
     double* d_film = nullptr; cudaMalloc(&d_film, npix * 3 * sizeof(double));
     double* d_hits = nullptr; cudaMalloc(&d_hits, npix * sizeof(double));
     cudaMemset(d_film, 0, npix * 3 * sizeof(double));
     cudaMemset(d_hits, 0, npix * sizeof(double));
 
-    long long totalSamples = (long long)res * res * spp;
-    kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, spp, res,
+    long long totalSamples = (long long)npix * spp;
+    kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, spp, resX,
                              diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
