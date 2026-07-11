@@ -6,6 +6,7 @@
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
+#include "pattern.h"
 #include "spectrum.h"
 #include "scene_film.h"
 #include "texture.h"
@@ -59,6 +60,13 @@ struct Material {
     // the interpolated per-vertex UVs (no triplanar for scalar params yet).
     int roughnessTex = -1;
     int filmThicknessTex = -1;
+    // Procedural (math-driven) scalar drives (§4): index into Scene::patterns, or -1.
+    // A bound pattern is evaluated at the hit point (x,y,z,f,normal,r) and OVERRIDES
+    // the constant/texture value — this is how implicit surfaces (which carry no UVs)
+    // get spatially-varying roughness, film thickness, and A/B material selection.
+    int roughnessPat = -1;
+    int filmThicknessPat = -1;
+    int mixWeightPat = -1;   // drives child-0 selection prob of a 2-child Mix (see mixResolveChild)
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
@@ -398,6 +406,7 @@ struct Scene {
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
+    std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
     Sensor sensor;
     Medium medium;   // optional global fog / participating medium (disabled by default)
 
@@ -716,35 +725,59 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
     return m.reflect(lambda);
 }
 
-// Per-hit glossy roughness: a bound roughnessTex's grayscale value at the hit,
-// else the constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf
-// see the SAME roughness at a hit — otherwise the density and the sample diverge.
+// Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
+// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
+inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n); }
+
+// Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern
+// value, or `dflt` if `pat` is out of range.
+inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double dflt) {
+    if (pat >= 0 && pat < (int)scene.patterns.size())
+        return scene.patterns[pat].eval(patCtxFromHit(h));
+    return dflt;
+}
+
+// Per-hit glossy roughness: a bound roughness pattern (highest priority, for
+// implicit surfaces) or roughnessTex's grayscale value at the hit, else the
+// constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf see the
+// SAME roughness at a hit — otherwise the density and the sample diverge.
 inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
+        double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(h));
+        return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
+    }
     if (m.roughnessTex >= 0 && m.roughnessTex < (int)scene.textures.size())
         return scene.textures[m.roughnessTex].scalarAt(h.u, h.v);
     return m.roughness;
 }
 
-// Per-hit thin-film coating thickness (nm): a bound filmThicknessTex's grayscale
-// value (scaled to nm by the constant `filmThickness`, so the map is a 0..1 profile
-// of the authored thickness) at the hit, else the constant thickness. A thickness
-// map spatially varies §3.2 iridescence (peacock/beetle structural colour).
+// Per-hit thin-film coating thickness (nm): a bound thickness pattern or
+// filmThicknessTex's grayscale value (both scaled to nm by the constant
+// `filmThickness`, so the map is a 0..1 profile of the authored thickness) at the
+// hit, else the constant thickness. Spatially varies §3.2 iridescence.
 inline double materialFilmThickness(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.filmThicknessPat >= 0 && m.filmThicknessPat < (int)scene.patterns.size())
+        return scene.patterns[m.filmThicknessPat].eval(patCtxFromHit(h)) * m.filmThickness;
     if (m.filmThicknessTex >= 0 && m.filmThicknessTex < (int)scene.textures.size())
         return scene.textures[m.filmThicknessTex].scalarAt(h.u, h.v) * m.filmThickness;
     return m.filmThickness;
 }
 
 // Resolve a stochastic Mix to a child index, honouring an optional per-hit blend
-// mask. With a bound mixWeightTex (2 children), the map value t at the hit is the
-// probability of child 0 (child 1 = 1-t, no absorption) — a spatial A/B blend mask.
+// mask. With a bound mixWeightPat or mixWeightTex (2 children), the value t at the
+// hit is the probability of child 0 (child 1 = 1-t, no absorption) — a spatial A/B
+// selection that lets colour AND material type vary across an implicit surface.
 // Otherwise this is the constant-weight CDF pick (mixPickChild), with the leftover
 // (1 - sum) slice absorbed. Mix weight is a stochastic (RR-style) selection that does
 // not enter the BSDF pdf, so a per-hit weight stays unbiased in every tracer.
 inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, double u) {
-    if (m.mixWeightTex >= 0 && m.mixWeightTex < (int)scene.textures.size() &&
-        m.mixChildren.size() == 2) {
-        double t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
+    if (m.mixChildren.size() == 2 &&
+        (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
+        double t;
+        if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
+            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(h));
+        else
+            t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
         if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
         return (u < t) ? m.mixChildren[0] : m.mixChildren[1];
     }

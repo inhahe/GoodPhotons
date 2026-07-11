@@ -434,6 +434,12 @@ public:
             if (!addTexture(b, L)) return false;
         }
 
+        // Pass 1c: procedural patterns (must exist before materials that bind them).
+        for (const auto& b : blocks) {
+            if (b.type != "pattern") continue;
+            if (!addPattern(b, L)) return false;
+        }
+
         // Pass 2: materials (must exist before geometry references them).
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
@@ -470,7 +476,8 @@ public:
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
             else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
-            else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" || b.type == "texture") { /* handled */ }
+            else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
+                     b.type == "texture" || b.type == "pattern") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         if (!haveLight) { fail("scene has no 'light' block"); return false; }
@@ -491,6 +498,7 @@ private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
+    std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
@@ -699,6 +707,83 @@ private:
         return true;
     }
 
+    // If `<key>`'s value is `pattern:<name>`, bind a procedural pattern to a scalar
+    // material parameter (§4) and return true; otherwise false (the caller reads a
+    // numeric value or tries bindScalarTexture instead). Patterns are evaluated at
+    // the hit's (x,y,z,f,normal,r) — the mechanism that gives UV-less implicit
+    // surfaces spatially-varying roughness / thickness / material selection.
+    bool bindScalarPattern(const Block& b, const char* key, int& patOut) {
+        const Stmt* s = find(b, key);
+        if (!s || s->val.words.empty()) return false;
+        const std::string& w0 = s->val.words[0];
+        if (w0.rfind("pattern:", 0) != 0) return false;
+        std::string nm = w0.substr(8);
+        auto it = patternIndex_.find(nm);
+        if (it == patternIndex_.end()) {
+            fail(std::string(key) + " references unknown pattern '" + nm + "'"); return false;
+        }
+        patOut = it->second;
+        return true;
+    }
+
+    // ---- patterns ----
+    // A `pattern "name" { ... }` block compiles a procedural scalar field into
+    // Scene::patterns. Two authoring forms:
+    //   * an infix formula:  `expr "0.5 + 0.5*sin(20*x)"`  (MUST be quoted; compiled
+    //     by the shunting-yard evaluator over the variables x y z f nx ny nz r), or
+    //   * a named generator via `type <gen>` + params (mirrors material syntax):
+    //       type axis    axis <x|y|z>  [scale <s>] [offset <o>]
+    //       type radial  [center <x y z>] [scale <s>]
+    //       type bands   axis <x|y|z>  [freq <f>] [phase <p>]
+    //       type checker [size <s>]
+    //       type noise   [freq <f>]
+    //       type field   [scale <s>]
+    bool addPattern(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("pattern needs a \"name\""); return false; }
+        if (patternIndex_.count(b.name)) { fail("duplicate pattern name '" + b.name + "'"); return false; }
+        Pattern pat;
+        auto axisOp = [&](const std::string& a, PatOp& out) -> bool {
+            if (a == "x") { out = PatOp::VarX; return true; }
+            if (a == "y") { out = PatOp::VarY; return true; }
+            if (a == "z") { out = PatOp::VarZ; return true; }
+            fail("pattern '" + b.name + "': axis must be x|y|z"); return false;
+        };
+        if (const Stmt* es = find(b, "expr")) {
+            // The quoted expression arrives as a single token (spaces preserved).
+            std::string expr;
+            for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
+            std::string perr;
+            if (!compilePatternExpr(expr, pat.nodes, perr)) {
+                fail("pattern '" + b.name + "': " + perr); return false;
+            }
+        } else {
+            std::string g = strOf(b, "type", "");
+            if (g == "axis") {
+                PatOp coord; if (!axisOp(strOf(b, "axis", "x"), coord)) return false;
+                pat.nodes = pattern_gen::axis(coord, dblOf(b, "scale", 1.0), dblOf(b, "offset", 0.0));
+            } else if (g == "radial") {
+                Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
+                pat.nodes = pattern_gen::radial(c, dblOf(b, "scale", 1.0));
+            } else if (g == "bands") {
+                PatOp coord; if (!axisOp(strOf(b, "axis", "x"), coord)) return false;
+                pat.nodes = pattern_gen::bands(coord, dblOf(b, "freq", 1.0), dblOf(b, "phase", 0.0));
+            } else if (g == "checker") {
+                pat.nodes = pattern_gen::checker(dblOf(b, "size", 1.0));
+            } else if (g == "noise") {
+                pat.nodes = pattern_gen::noise(dblOf(b, "freq", 1.0));
+            } else if (g == "field") {
+                pat.nodes = pattern_gen::field(dblOf(b, "scale", 1.0));
+            } else {
+                fail("pattern '" + b.name + "' needs `expr \"...\"` or `type <axis|radial|bands|checker|noise|field>`");
+                return false;
+            }
+        }
+        int id = (int)L.scene.patterns.size();
+        L.scene.patterns.push_back(std::move(pat));
+        patternIndex_[b.name] = id;
+        return true;
+    }
+
     // ---- materials ----
     Material buildMaterial(const Block& b) {
         Material m;
@@ -709,12 +794,14 @@ private:
             std::string pname = strOf(b, "preset", "");
             if (!resolveMaterialPreset(pname, m)) { fail("unknown material preset '" + pname + "'"); return m; }
             if (find(b, "roughness")) {
-                if (!bindScalarTexture(b, "roughness", m.roughnessTex))
+                if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
+                    !bindScalarTexture(b, "roughness", m.roughnessTex))
                     m.roughness = dblOf(b, "roughness", m.roughness);
             }
             if (find(b, "film_ior"))       m.filmIor       = dblOf(b, "film_ior", m.filmIor);
             if (find(b, "film_thickness")) m.filmThickness = dblOf(b, "film_thickness", m.filmThickness);
-            bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
+            if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
+                bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
             return m;
@@ -732,8 +819,9 @@ private:
             m.ior = spectrumParam(b, "ior", iorBK7());
             // Frosted/rough transmission: 0 (default) = perfectly clear glass, bit-
             // identical to before; >0 roughens both the reflected and refracted lobes.
-            // `roughness texture:<name>` binds a per-hit map (grayscale = roughness).
-            if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
+            // `roughness pattern:<name>` (§4) or `texture:<name>` binds a per-hit map.
+            if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
+            else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
             else m.roughness = dblOf(b, "roughness", 0.0);
             // Interior absorption sigma_a(lambda) per metre travelled inside the glass
             // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb 3 0.5 0.3`
@@ -748,9 +836,10 @@ private:
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
-            // `roughness texture:<name>` binds a per-hit roughness map (grayscale =
-            // roughness directly, since both are 0..1); else a constant.
-            if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
+            // `roughness pattern:<name>` (§4) / `texture:<name>` binds a per-hit
+            // roughness map (grayscale = roughness directly, both 0..1); else a constant.
+            if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
+            else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
             else m.roughness = dblOf(b, "roughness", 0.2);
         } else if (type == "thinfilm") {
             m.type = MatType::ThinFilm;
@@ -759,7 +848,8 @@ private:
             // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
             // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
             m.filmThickness = dblOf(b, "film_thickness", 300.0);
-            bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
+            if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
+                bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             // Substrate extinction kappa (spectral): 0 = transparent dielectric
             // (lossless, default). Non-zero -> absorbing/metallic substrate giving
             // opaque structural colour; a spectral kappa (e.g. a gaussian) tints it
@@ -819,7 +909,8 @@ private:
             else { fail("layered coat reflectance must be fresnel|thinfilm|manual"); return m; }
             // Coat interface roughness (glossy lobe on the reflected ray); grayscale
             // roughness_map allowed just like a glossy material.
-            if (bindScalarTexture(cb, "roughness", m.roughnessTex)) m.roughness = 0.05;
+            if (bindScalarPattern(cb, "roughness", m.roughnessPat)) m.roughness = 0.05;
+            else if (bindScalarTexture(cb, "roughness", m.roughnessTex)) m.roughness = 0.05;
             else m.roughness = dblOf(cb, "roughness", 0.05);
             // Fresnel/thinfilm read the coat index from `ior` (coat over body index
             // m.ior); manual uses a flat specular fraction.
@@ -858,14 +949,17 @@ private:
         }
         if (m.mixChildren.empty()) { fail("mix material has no 'layer' entries"); return false; }
         if (sum > 1.0 + 1e-9) { fail("mix layer weights sum to " + std::to_string(sum) + " (> 1)"); return false; }
-        // Optional per-hit blend mask (§9.4): `weight_map texture:<name>` drives the
-        // selection weight of child 0 (child 1 = 1 - map). Only meaningful for a 2-child
-        // mix — reject otherwise so the semantics stay unambiguous.
+        // Optional per-hit blend mask: `weight_map pattern:<name>` (§4, math-driven
+        // spatial selection — the key mechanism for per-xyz material choice on an
+        // implicit surface) or `weight_map texture:<name>` (§9.4, UV map) drives the
+        // selection weight of child 0 (child 1 = 1 - map). Only meaningful for a
+        // 2-child mix — reject otherwise so the semantics stay unambiguous.
         if (find(b, "weight_map")) {
             if (m.mixChildren.size() != 2) {
                 fail("mix weight_map requires exactly 2 layers (a binary A/B blend)"); return false;
             }
-            bindScalarTexture(b, "weight_map", m.mixWeightTex);
+            if (!bindScalarPattern(b, "weight_map", m.mixWeightPat))
+                bindScalarTexture(b, "weight_map", m.mixWeightTex);
         }
         return true;
     }

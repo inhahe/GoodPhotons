@@ -34,6 +34,8 @@ struct Hit {
     int matId = 0;
     int sensorId = -1;
     double u = 0, v = 0;   // interpolated surface texture coordinates
+    double fieldVal = 0;   // implicit field value at the hit (~0 on a surface; 0 for
+                           // non-implicit hits). Exposed to procedural patterns as `f`.
 };
 
 inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
