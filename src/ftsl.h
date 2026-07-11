@@ -633,7 +633,29 @@ private:
         else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
         std::string terr;
         if (!tex.load(file, terr)) { fail("texture '" + b.name + "': " + terr); return false; }
-        tex.buildReflCoeff();   // precompute Jakob-Hanika reflectance coefficients
+        // Optional indexed-spectral palette (§9.3): `palette { 0 spectrum:navy 1 ... }`.
+        // The nested block's flat word dump is (index, spectrum-ref) pairs in order; we
+        // resolve each ref to a Spectrum now and size the palette to max-index+1. The
+        // texture's red channel then selects an entry per texel (nearest, no upsample).
+        if (const Stmt* ps = find(b, "palette")) {
+            if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
+            const auto& w = ps->val.block->words;
+            if (w.empty() || (w.size() % 2) != 0) {
+                fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
+            }
+            std::vector<std::pair<int, Spectrum>> entries;
+            int maxIdx = -1;
+            for (size_t k = 0; k + 1 < w.size(); k += 2) {
+                int idx = std::atoi(w[k].c_str());
+                if (idx < 0 || idx > 255) { fail("texture '" + b.name + "': palette index out of 0..255"); return false; }
+                Value ref; ref.words.push_back(w[k + 1]);
+                entries.emplace_back(idx, evalSpectrum(ref));
+                if (idx > maxIdx) maxIdx = idx;
+            }
+            tex.palette.assign((size_t)maxIdx + 1, constantSpectrum(0.0));
+            for (auto& e : entries) tex.palette[(size_t)e.first] = e.second;
+        }
+        tex.buildReflCoeff();   // precompute Jakob-Hanika reflectance coefficients (skipped for palette maps)
         int id = (int)L.scene.textures.size();
         L.scene.textures.push_back(std::move(tex));
         textureIndex_[b.name] = id;

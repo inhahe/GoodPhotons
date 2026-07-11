@@ -26,6 +26,7 @@
 #include "linalg.h"
 #include "color.h"
 #include "upsample.h"
+#include "spectrum.h"
 
 // stb_image API (implementation lives in src/stb_image_impl.cpp). Declared here so
 // this header stays light and CUDA never parses the full stb_image.h.
@@ -46,6 +47,12 @@ struct Texture {
     int w = 0, h = 0;
     std::vector<Vec3> rgb;                    // decoded LINEAR rgb, row-major, top-left origin
     std::vector<std::array<double, 3>> coeff; // per-texel JH reflectance coefficients (built on demand)
+    // Indexed-spectral palette (spec §9.3): when non-empty, this texture is an INDEX
+    // map — the red channel quantized to 0..255 selects a named reflectance spectrum
+    // from `palette` (resolved at parse time) instead of an RGB colour to upsample.
+    // Indices never interpolate (nearest only). GPU falls back to CPU for such maps.
+    std::vector<Spectrum> palette;
+    bool hasPalette() const { return !palette.empty(); }
     TexEncoding encoding = TexEncoding::sRGB;
     TexFilter   filter   = TexFilter::Bilinear;
     TexWrap     wrap     = TexWrap::Repeat;
@@ -56,7 +63,7 @@ struct Texture {
     // when a texture is bound to a reflectance parameter so per-hit sampling is a
     // cheap coefficient bilerp + sigmoid evaluation rather than a Gauss-Newton fit.
     void buildReflCoeff() {
-        if (!valid() || coeff.size() == (size_t)w * h) return;
+        if (!valid() || hasPalette() || coeff.size() == (size_t)w * h) return;
         coeff.resize((size_t)w * h);
         for (size_t i = 0; i < rgb.size(); ++i)
             coeff[i] = upsample::fit(rgb[i].x, rgb[i].y, rgb[i].z);
@@ -119,7 +126,21 @@ struct Texture {
 
     // Reflectance at (u,v,lambda): bilerp the JH coefficients (the standard
     // Jakob-Hanika interpolation) then evaluate the sigmoid. Requires buildReflCoeff().
+    // Nearest-index palette lookup: the red channel (already LINEAR, 0..1) is the
+    // index / 255. Indices are categorical, so this never bilerps — it snaps to the
+    // nearest texel and clamps the index into the palette. Returns the selected
+    // spectrum's reflectance at lambda.
+    double paletteReflectanceAt(double u, double v, double lambda) const {
+        int x = wrapIndex((int)std::floor(u * w), w);
+        int y = wrapIndex((int)std::floor((1.0 - v) * h), h);
+        int idx = (int)std::lround(rgb[(size_t)y * w + x].x * 255.0);
+        if (idx < 0) idx = 0;
+        if (idx >= (int)palette.size()) idx = (int)palette.size() - 1;
+        return palette[idx] ? palette[idx](lambda) : 0.0;
+    }
+
     double reflectanceAt(double u, double v, double lambda) const {
+        if (hasPalette()) return paletteReflectanceAt(u, v, lambda);
         if (coeff.empty()) return 0.5;
         auto at = [&](int x, int y) -> const std::array<double, 3>& {
             return coeff[(size_t)y * w + x];

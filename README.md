@@ -356,8 +356,11 @@ per-hit `triplanar` box projection for un-UV'd meshes (see Geometry). Besides
 base-colour albedo, a texture can also drive a **scalar** parameter: a grayscale
 **roughness map** on `glossy` (`roughness texture:<name>`) or a **film-thickness
 map** on `thinfilm` (`film_thickness_map texture:<name>`, a 0..1 profile × the
-nominal `film_thickness`). All of these run on both the CPU and GPU forward paths;
-scalar maps on `mix`/`ior` and indexed-spectral palettes remain future work.
+nominal `film_thickness`). All of these run on both the CPU and GPU forward paths.
+A texture can also be an **indexed-spectral palette** — `palette { 0 spectrum:navy
+1 spectrum:crimson … }` maps red-channel indices (0..255) to named reflectance
+spectra, looked up nearest (CPU only; GPU falls back). Scalar maps on `mix`/`ior`
+remain future work.
 
 ## Participating media / fog
 

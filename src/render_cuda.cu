@@ -2496,8 +2496,24 @@ bool cudaForwardSupported(const Scene& scene) {
                scene.mats[matId].type == MatType::Multilayer &&
                (int)scene.mats[matId].layerN.size() > D_MAXLAYERS;
     };
+    // Indexed-spectral palette maps (§9.3) resolve per-texel to an arbitrary named
+    // reflectance spectrum; the device only bakes the JH-upsampled coeff path, so a
+    // palette-bound albedo forces the CPU tracer (which evaluates the palette exactly).
+    auto paletteTex = [&](int t) {
+        return t >= 0 && t < (int)scene.textures.size() && scene.textures[t].hasPalette();
+    };
+    auto usesPaletteTex = [&](int matId) {
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const Material& m = scene.mats[matId];
+        if (paletteTex(m.reflectTex)) return true;
+        if (m.type == MatType::Mix)
+            for (int c : m.mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size() && paletteTex(scene.mats[c].reflectTex)) return true;
+        return false;
+    };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
+        if (usesPaletteTex(matId)) return true;
         if (matId >= 0 && matId < (int)scene.mats.size() &&
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];

@@ -318,8 +318,16 @@ as practical; this file is the fallback for what can't be addressed immediately.
      within Monte-Carlo noise (RMSE ~6/255); the wavefront backend matches the
      megakernel. The BDPT kernel (mode D) still lacks a textured vertex, so
      `cudaBdptSupported()` explicitly rejects textured scenes → they use the CPU BDPT.
-  4. **Indexed-spectral palettes** (§9.3) — an index image + name→spectrum palette —
-     not implemented.
+  4. **Indexed-spectral palettes** (§9.3). ~~An index image + name→spectrum palette —
+     not implemented.~~ **DONE 2026-07-11 (CPU):** a `texture { ... palette { <idx>
+     spectrum:<name> ... } }` block resolves each index to a named reflectance spectrum
+     at parse time (`Texture::palette`, `src/ftsl.h addTexture`). The red channel,
+     quantized to 0..255, selects an entry per texel — nearest only (indices are
+     categorical, never bilerped) via `Texture::paletteReflectanceAt`. No JH upsampling
+     (palette entries are arbitrary measured spectra used directly), so `buildReflCoeff`
+     skips palette maps and the GPU forward path (`cudaForwardSupported`) rejects them →
+     CPU fallback. Validated by `scenes/palette.ftsl` (a 4-index swatch chart). **Limit:**
+     8-bit index channel → ≤256 entries; 16-bit index maps are future work.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
   2026-07-10; GPU port done 2026-07-11; **analytic UV projections (planar/spherical/
   cylindrical) + triplanar box projection done 2026-07-11 (CPU + GPU)**; **non-albedo

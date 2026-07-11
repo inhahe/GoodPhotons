@@ -1144,8 +1144,10 @@ material) are implemented on both CPU and GPU; validated by `scenes/triplanar.ft
 Textures on **non-albedo** scalar parameters — a **roughness map** on `glossy` and a
 **film-thickness map** on `thinfilm` (§9.4) — are implemented on both backends;
 validated by `scenes/scalarmap.ftsl` (CPU/GPU forward exposure and mean agree to
-<0.1%). **Still [needs engine work]:** indexed-spectral palettes, and non-albedo maps
-for the remaining parameters (mix weight, ior). GPU BDPT (mode D) falls back to the
+<0.1%). **Indexed-spectral palettes** (§9.3) are implemented on the CPU (a `palette`
+block maps red-channel indices to named spectra; `scenes/palette.ftsl`); GPU falls
+back to CPU for them. **Still [needs engine work]:** non-albedo maps for the remaining
+parameters (mix weight, ior). GPU BDPT (mode D) falls back to the
 CPU for scenes using roughness/thickness maps (the device kernel's MIS pdf/eval use
 the constant parameter; the CPU BDPT threads the hit UV through so it stays unbiased).
 Textured albedo runs on both backends; the CUDA kernel ports the
@@ -1239,15 +1241,25 @@ from UV derivatives is still future work (only needed once normal/bump maps arri
   material "face" { type diffuse  reflect texture:face_albedo }
   ```
 
-- **Indexed-spectral (precise, for known pigments / scientific skins).** The
-  image stores *indices*, and a palette maps each index to a named spectrum
-  (measured pigment, dye, metal). Exact where you know the actual materials —
-  e.g. a flag or a chart of paint chips.
+- **Indexed-spectral (precise, for known pigments / scientific skins). [implemented,
+  CPU]** The image stores *indices* (in the **red channel**, quantized to 0..255),
+  and a `palette` maps each index to a named spectrum (measured pigment, dye, metal).
+  Exact where you know the actual materials — e.g. a flag or a chart of paint chips.
 
   ```
-  texture "flag" { file "flag_index.png"  encoding linear
+  texture "flag" { file "flag_index.png"  encoding linear  filter nearest
       palette { 0 spectrum:navy   1 spectrum:crimson   2 spectrum:offwhite } }
   ```
+
+  The palette is resolved to reflectance spectra at parse time and looked up
+  **nearest** (indices are categorical — never bilinearly blended). Because a palette
+  entry can be *any* measured spectrum (not an RGB colour), there is no Jakob-Hanika
+  upsampling and the value is used directly — so `encoding linear` + `filter nearest`
+  are the right choices. Palette maps evaluate on the **CPU**; the GPU forward path
+  only bakes the RGB→coeff upsampler, so palette-bound albedos fall back to the CPU
+  tracer (`cudaForwardSupported`). Validated by `scenes/palette.ftsl` (a four-index
+  swatch chart). **Note:** an index map with more than 256 entries needs a wider
+  channel (16-bit PNG) — not yet supported; 8-bit / ≤256 indices for now.
 
 - **True spectral images** (per-texel measured spectra, e.g. hyperspectral
   captures) are the most faithful but rarely available and storage-heavy; the
