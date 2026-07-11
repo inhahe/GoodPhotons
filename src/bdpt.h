@@ -339,7 +339,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Dielectric: {
-                Ray nr = mats.refractOrReflect(*mp, h, ray.d, lambda, rng);
+                Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng);
                 wi = nr.d; betaFactor = 1.0; delta = true;
                 break;
             }

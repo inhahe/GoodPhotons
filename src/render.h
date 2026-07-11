@@ -620,7 +620,7 @@ struct Renderer {
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
                 case MatType::Dielectric: {
-                    ray = refractOrReflect(m, h, ray.d, lambda, rng);
+                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng);
                     continue;                       // lossless; beta unchanged
                 }
                 case MatType::ThinFilm: {
@@ -719,8 +719,14 @@ struct Renderer {
 
     // Dielectric interface: Fresnel-weighted stochastic choice of specular
     // reflection or refraction (Snell), with wavelength-dependent index -> dispersion.
-    Ray refractOrReflect(const Material& m, const Hit& h, const Vec3& d,
-                         double lambda, Pcg32& rng) const {
+    // Specular reflect-or-refract at a dielectric interface. If `transmitted` is
+    // given it reports whether the photon crossed the interface (refracted) vs.
+    // reflected/TIR — the caller uses this to track which medium it is now inside
+    // (interior absorption). A non-zero `roughness` frosts the interface: BOTH the
+    // reflected and refracted lobes are jittered by a power-cosine lobe (rough glass),
+    // rejecting samples that would cross to the wrong side so no light leaks through.
+    Ray refractOrReflect(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
+                         double lambda, Pcg32& rng, bool* transmitted = nullptr) const {
         double ng = m.ior(lambda);
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
@@ -731,6 +737,7 @@ struct Renderer {
         double sin2t = eta * eta * (1.0 - cosI * cosI);
 
         Vec3 outDir;
+        bool refracted = false;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
         } else {
@@ -739,9 +746,17 @@ struct Renderer {
             double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
             double R = 0.5 * (rs * rs + rp * rp);
             if (rng.uniform() < R) outDir = reflect(d, nl);
-            else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+            else { outDir = eta * d + nl * (eta * cosI - cosT); refracted = true; } // Snell
         }
         outDir = normalize(outDir);
+        // Frosted glass: jitter the chosen lobe, keeping it on the intended side.
+        double rough = materialRoughness(scene, m, h);
+        if (rough > 1e-3) {
+            Vec3 pert = sampleGlossy(outDir, rough, rng);
+            bool ok = refracted ? (dot(pert, nl) < 0.0) : (dot(pert, nl) > 0.0);
+            if (ok) outDir = pert;
+        }
+        if (transmitted) *transmitted = refracted;
         return Ray{h.p + outDir * 1e-6, outDir};
     }
 

@@ -33,7 +33,13 @@ struct Material {
     Spectrum reflect = constantSpectrum(0.5);
     Spectrum emit    = constantSpectrum(0.0); // emitted radiance vs lambda
     Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
-    double roughness = 0.1;                    // glossy lobe width [0,1]
+    // Interior absorption coefficient sigma_a(lambda) in units of 1/metre, applied
+    // Beer-Lambert along the path a photon travels INSIDE a dielectric (colored /
+    // attenuating glass; also the `absorb` target a field_material can drive). 0 =
+    // colorless (default, bit-identical to before). Only consulted for Dielectric.
+    Spectrum absorb  = constantSpectrum(0.0);
+    double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
+                                               // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;
     // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
     // constant `reflect` spectrum). When set, the reflectance at a hit is the

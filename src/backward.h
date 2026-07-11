@@ -339,7 +339,7 @@ struct BackwardRenderer {
 
             switch (m.type) {
                 case MatType::Dielectric: {
-                    ray = mats.refractOrReflect(m, h, ray.d, lambda, rng);
+                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng);
                     specularArrival = true;
                     break;
                 }

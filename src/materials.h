@@ -176,6 +176,7 @@ inline bool resolveMaterialPreset(const std::string& name, Material& out) {
     if (resolveGlassIor(glassName, s)) {
         m.type = MatType::Dielectric;
         m.ior = s;
+        m.roughness = 0.0;                        // clear glass (opt into frosting explicitly)
         out = m; return true;
     }
     // Iridescent / structural colour.

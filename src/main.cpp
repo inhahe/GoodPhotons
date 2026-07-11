@@ -155,6 +155,7 @@ static Scene buildPrism(int res) {
     Scene s;
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material glass; glass.type = MatType::Dielectric;
+    glass.roughness = 0.0;
     glass.ior = iorSF10();                                       s.mats.push_back(glass); // 1
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);   // floor
@@ -233,6 +234,7 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     Material light; light.reflect = constantSpectrum(0.0);
     light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
     Material glass; glass.type = MatType::Dielectric;
+    glass.roughness = 0.0;
     glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
     Material mesh;  mesh.reflect  = whiteWall(0.8);              s.mats.push_back(mesh);  // 5 (diffuse)
     s.mats.push_back(makeFluoroMaterial());                                              // 6 (fluorescent)

@@ -730,6 +730,15 @@ private:
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
             m.ior = spectrumParam(b, "ior", iorBK7());
+            // Frosted/rough transmission: 0 (default) = perfectly clear glass, bit-
+            // identical to before; >0 roughens both the reflected and refracted lobes.
+            // `roughness texture:<name>` binds a per-hit map (grayscale = roughness).
+            if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
+            else m.roughness = dblOf(b, "roughness", 0.0);
+            // Interior absorption sigma_a(lambda) per metre travelled inside the glass
+            // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb 3 0.5 0.3`
+            // (per-channel, upsampled) gives green-tinted glass.
+            m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.95));
