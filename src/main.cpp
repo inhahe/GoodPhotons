@@ -33,19 +33,29 @@
 //   -n <photons>   trace exactly this many photons (default).
 //   -time <sec>    trace in batches until the wall-clock budget elapses (-n is the
 //                  batch/checkpoint granularity).
+//   -forever       trace indefinitely, refining the image, until interrupted (Ctrl-C):
+//                  the first Ctrl-C finishes the current batch, writes a final image +
+//                  checkpoint, and exits cleanly (a second Ctrl-C force-quits). Implies
+//                  the checkpoint, so a later -resume picks up where you stopped.
 //   -resume        reload the accumulated film from the "<out>.ftbuf" checkpoint and
-//                  keep adding photons (with -n more, or -time more seconds).
+//                  keep adding photons (with -n more, -time more seconds, or -forever).
 //   -checkpoint    on a plain -n render, also write the checkpoint so a later -resume
-//                  can continue it (-time/-resume imply it). Each batch/resume draws an
-//                  independent RNG stream (seed offset = cumulative photons), so the
-//                  result matches a single render of the combined count; a fresh -n
+//                  can continue it (-time/-forever/-resume imply it). Each batch/resume
+//                  draws an independent RNG stream (seed offset = cumulative photons), so
+//                  the result matches a single render of the combined count; a fresh -n
 //                  render (offset 0) is bit-identical to the historical single-shot path.
+//   -preview       during -time/-forever, redraw a live ANSI colour thumbnail of the
+//                  current image in the terminal at each periodic update (in place).
+//   -interval <s>  seconds between periodic image writes / preview refreshes during
+//                  -time/-forever (default 15). The output image file is rewritten at
+//                  this cadence, so an auto-reloading image viewer is also a live display.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <cstdint>
+#include <csignal>
 #include <chrono>
 #include <fstream>
 #include <vector>
@@ -61,6 +71,11 @@
 #include "ftsl.h"
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
+#endif
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX               // keep std::min/std::max (windows.h else macro-clobbers them)
+#include <windows.h>          // -preview: enable ANSI VT processing in a plain console
 #endif
 
 // stb_image_write encoders (implementation compiled once in stb_image_impl.cpp).
@@ -773,7 +788,8 @@ static int checkUpsample() {
 // The tone-mapped 8-bit RGB result is written via writeImage(), which picks the
 // encoder from `path`'s extension (.png/.jpg/.jpeg, else PPM) — so `-o foo.png`
 // yields a real PNG, not PPM bytes in a .png file.
-static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0) {
+static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
+                      bool quiet = false) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -800,11 +816,85 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
         std::fprintf(stderr, "error: could not write %s\n", path);
         return;
     }
+    if (quiet) return;
     if (expComp > 0.0)
         std::printf("wrote %s (%dx%d), exposure=%.3g (auto %.3g x %.3gEV-comp)\n",
                     path, W, H, exposure, eAuto, expComp);
     else
         std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
+}
+
+// --- Live terminal preview ----------------------------------------------------
+// Downsample the display film to a small ANSI-truecolour thumbnail and redraw it in
+// place (cursor moved back up over the previous frame) so -time/-forever renders show
+// a coarse live view without any external viewer. Uses the upper-half-block glyph so
+// each character cell carries two vertical pixels (fg = upper, bg = lower), doubling
+// the effective vertical resolution. Tone-mapping mirrors writeFilm (same p99 auto-
+// exposure + sRGB gamma) so the thumbnail tracks what the written image looks like.
+static int g_previewRows = 0;   // terminal lines the last preview occupied (for redraw)
+
+// Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
+// Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
+static void enableAnsiTerminal() {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD m = 0;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &m))
+        SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+}
+static void ansiPreview(const Film& f, double N, double expComp, const char* status) {
+    const int W = f.resX, H = f.resY;
+    const int gw = std::min(W, 72);                   // thumbnail width in characters
+    int gh = std::max(2, (int)std::llround((double)H / W * gw)); // thumbnail pixel rows
+    if (gh % 2) ++gh;                                 // even so half-blocks pair cleanly
+
+    double norm = 1.0 / (N * cieYIntegral());
+    // Box-downsample film -> linear sRGB grid, tracking p99 for auto-exposure.
+    std::vector<Vec3> grid((size_t)gw * gh);
+    std::vector<double> lum; lum.reserve(grid.size());
+    for (int gy = 0; gy < gh; ++gy) for (int gx = 0; gx < gw; ++gx) {
+        int x0 = gx * W / gw, x1 = std::max(x0 + 1, (gx + 1) * W / gw);
+        int y0 = gy * H / gh, y1 = std::max(y0 + 1, (gy + 1) * H / gh);
+        Vec3 s{}; double n = 0.0;
+        for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+            s += f.xyz[(size_t)y * W + x]; n += 1.0;
+        }
+        Vec3 c = xyzToLinearSrgb((s / std::max(1.0, n)) * norm);
+        grid[(size_t)gy * gw + gx] = c;
+        lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
+    }
+    std::vector<double> sorted = lum; std::sort(sorted.begin(), sorted.end());
+    double p99 = sorted.empty() ? 0.0 : sorted[(size_t)(0.99 * (sorted.size() - 1))];
+    double eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
+    double exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
+
+    auto px = [&](int gx, int gy, int& r, int& g, int& b) {
+        // Flip vertically so +y is image-top, matching writeFilm.
+        const Vec3& c = grid[(size_t)(gh - 1 - gy) * gw + gx];
+        r = (int)std::clamp(srgbGamma(c.x * exposure) * 255.0 + 0.5, 0.0, 255.0);
+        g = (int)std::clamp(srgbGamma(c.y * exposure) * 255.0 + 0.5, 0.0, 255.0);
+        b = (int)std::clamp(srgbGamma(c.z * exposure) * 255.0 + 0.5, 0.0, 255.0);
+    };
+
+    std::string out;
+    if (g_previewRows > 0) { out += "\033["; out += std::to_string(g_previewRows); out += "A"; }
+    for (int gy = 0; gy < gh; gy += 2) {
+        for (int gx = 0; gx < gw; ++gx) {
+            int tr, tg, tb, br, bg, bb;
+            px(gx, gy, tr, tg, tb);
+            px(gx, std::min(gy + 1, gh - 1), br, bg, bb);
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm\xE2\x96\x80",
+                          tr, tg, tb, br, bg, bb);
+            out += buf;
+        }
+        out += "\033[0m\033[K\n";
+    }
+    out += "\033[K"; out += (status ? status : ""); out += "\n";
+    g_previewRows = gh / 2 + 1;
+    std::fputs(out.c_str(), stdout);
+    std::fflush(stdout);
 }
 
 // Deterministic, noise-free visualisation of the thin-film structural colour: a
@@ -1100,6 +1190,17 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
                 : "review: residual above 5% — increase -n/-spp (if firefly-dominated) or investigate transport.");
 }
 
+// --- Graceful interrupt (Ctrl-C) for indefinite / long renders ----------------
+// -forever (and any long -time render) traps SIGINT so the first Ctrl-C requests a
+// clean stop -- the batch loop notices the flag, writes a final image + checkpoint,
+// and returns -- while a second Ctrl-C restores the default handler and force-quits.
+// A sig_atomic_t flag is the only state a signal handler may touch portably.
+static volatile std::sig_atomic_t g_stopRequested = 0;
+static void onInterrupt(int sig) {
+    if (g_stopRequested) { std::signal(sig, SIG_DFL); std::raise(sig); return; }
+    g_stopRequested = 1;
+}
+
 // --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
 // A forward render accumulates radiance photon-by-photon into a Film, so it can be
 // stopped and continued: brightness scales with photon count and only graininess
@@ -1197,7 +1298,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      const char* lightLabel, const std::string& outPath,
                      double manualExposure = 0.0,
                      double timeBudgetSec = 0.0, bool resume = false,
-                     bool wantCheckpointFlag = false) {
+                     bool wantCheckpointFlag = false, bool runForever = false,
+                     bool preview = false, double intervalSec = 15.0) {
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -1205,12 +1307,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // -time / -resume / -checkpoint accumulate a photon-count film, which only the
     // pure forward camera models (A/B/C) do. Other modes accumulate differently
     // (spp-based reference/BDPT, or the P composite) and are not resumable here.
-    if ((timeBudgetSec > 0.0 || resume || wantCheckpointFlag) &&
+    if ((timeBudgetSec > 0.0 || resume || wantCheckpointFlag || runForever) &&
         !(mode == 'A' || mode == 'B' || mode == 'C')) {
-        std::fprintf(stderr, "[render] -time/-resume/-checkpoint apply only to forward "
-                             "camera modes A/B/C; ignoring for mode %c\n", mode);
-        timeBudgetSec = 0.0; resume = false; wantCheckpointFlag = false;
+        std::fprintf(stderr, "[render] -time/-forever/-resume/-checkpoint apply only to "
+                             "forward camera modes A/B/C; ignoring for mode %c\n", mode);
+        timeBudgetSec = 0.0; resume = false; wantCheckpointFlag = false; runForever = false;
     }
+    if (intervalSec <= 0.0) intervalSec = 15.0;
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
@@ -1360,7 +1463,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // independent stream; the checkpoint stores the PURE-photon film (the direct view
     // of the sky is re-added deterministically at write time, never accumulated, so a
     // resume can't double-count it).
-    const bool wantCheckpoint = resume || timeBudgetSec > 0.0 || wantCheckpointFlag;
+    const bool progressive = timeBudgetSec > 0.0 || runForever;   // batch loop modes
+    const bool wantCheckpoint = resume || progressive || wantCheckpointFlag;
     const uint64_t guard = checkpointGuard(scene, mode, res);
     const std::string backend = useGpu ? std::string("GPU")
                                        : (std::to_string(nThreads) + " CPU threads");
@@ -1371,10 +1475,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("[resume] loaded %s: %lld photons accumulated so far\n",
                     checkpointPath(outPath).c_str(), acc.N);
 
-    auto writeOut = [&](bool announceCheckpoint) {
+    auto writeOut = [&](bool announceCheckpoint, bool quiet = false) {
         Film disp = acc.film;                        // display copy (+ direct sky view)
         if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure);
+        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet);
         if (wantCheckpoint) {
             if (writeCheckpoint(outPath, acc, guard, mode)) {
                 if (announceCheckpoint)
@@ -1399,11 +1503,25 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     };
 
     using clk = std::chrono::steady_clock;
-    if (timeBudgetSec > 0.0) {
+    if (progressive) {
         long long batchN = (N > 0) ? N : 2'000'000;  // -n is the per-batch granularity
-        std::printf("mode %c: tracing for %.3gs in %lld-photon batches at %dx%d on %s (light=%s)%s ...\n",
-                    mode, timeBudgetSec, batchN, res, res, backend.c_str(), lightLabel,
-                    (resume && acc.N > 0) ? " [resuming]" : "");
+        if (runForever)
+            std::printf("mode %c: tracing indefinitely in %lld-photon batches at %dx%d on %s "
+                        "(light=%s)%s — press Ctrl-C to stop ...\n",
+                        mode, batchN, res, res, backend.c_str(), lightLabel,
+                        (resume && acc.N > 0) ? " [resuming]" : "");
+        else
+            std::printf("mode %c: tracing for %.3gs in %lld-photon batches at %dx%d on %s "
+                        "(light=%s)%s (Ctrl-C to stop early) ...\n",
+                        mode, timeBudgetSec, batchN, res, res, backend.c_str(), lightLabel,
+                        (resume && acc.N > 0) ? " [resuming]" : "");
+        if (preview) { enableAnsiTerminal(); g_previewRows = 0; }  // fresh preview per render
+        // Trap Ctrl-C so a long/indefinite render stops cleanly (final image +
+        // checkpoint) instead of losing the batch since the last periodic save.
+        auto prev = std::signal(SIGINT, onInterrupt);
+#ifdef SIGBREAK
+        auto prevBrk = std::signal(SIGBREAK, onInterrupt);  // Windows Ctrl-Break too
+#endif
         auto t0 = clk::now();
         auto lastSave = t0;
         long long batches = 0;
@@ -1411,15 +1529,39 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             runBatch(batchN); ++batches;
             double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
             double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
-            bool done = elapsed >= timeBudgetSec;
-            if (done || sinceSave >= 15.0) {          // periodic crash-safe checkpoint
-                writeOut(/*announceCheckpoint*/false);
+            bool stopped = g_stopRequested != 0;
+            bool done = stopped || (!runForever && elapsed >= timeBudgetSec);
+            if (done || sinceSave >= intervalSec) {   // periodic crash-safe checkpoint + preview
+                writeOut(/*announceCheckpoint*/false, /*quiet*/preview);
                 lastSave = clk::now();
-                std::printf("[time] %.1fs / %.3gs elapsed, %lld batches, %lld photons total\n",
-                            elapsed, timeBudgetSec, batches, acc.N);
+                // Cheap graininess estimate: Monte-Carlo relative error at an
+                // illuminated pixel falls as 1/sqrt(samples), and the per-pixel photon
+                // (hit) count is that sample count, so 100/sqrt(mean hits over lit
+                // pixels) is an honest ballpark for how noisy the image still is.
+                double sumHits = 0.0; long long lit = 0;
+                for (double h : acc.film.hits) if (h > 0.0) { sumHits += h; ++lit; }
+                double meanHits = lit ? sumHits / (double)lit : 0.0;
+                double noisePct = meanHits > 0.0 ? 100.0 / std::sqrt(meanHits) : 0.0;
+                char st[200];
+                if (runForever)
+                    std::snprintf(st, sizeof st, "[forever] %.1fs elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  elapsed, batches, acc.N, noisePct, stopped ? " (stopping)" : "");
+                else
+                    std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  elapsed, timeBudgetSec, batches, acc.N, noisePct, stopped ? " (stopping)" : "");
+                if (preview) {
+                    Film disp = acc.film;
+                    if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
+                    ansiPreview(disp, (double)acc.N, manualExposure, st);
+                } else { std::printf("%s\n", st); std::fflush(stdout); }
             }
             if (done) break;
         }
+        std::signal(SIGINT, prev);                    // restore prior handler
+#ifdef SIGBREAK
+        std::signal(SIGBREAK, prevBrk);
+#endif
+        if (g_stopRequested) std::printf("\n[stop] interrupted — image and checkpoint saved.\n");
         if (wantCheckpoint)
             std::printf("[checkpoint] %s holds %lld photons — rerun with -resume to add more\n",
                         checkpointPath(outPath).c_str(), acc.N);
@@ -1477,6 +1619,9 @@ int main(int argc, char** argv) {
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
     bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint
     bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o
+    bool runForever = false;      // -forever: trace until Ctrl-C (forward modes A/B/C)
+    bool preview = false;         // -preview: live ANSI thumbnail during -time/-forever
+    double intervalSec = 15.0;    // -interval <sec>: periodic image-write / preview cadence
     bool modeFromCli = false;     // did the CLI force a global -mode? (else per-camera)
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
 
@@ -1541,6 +1686,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-forever")) runForever = true;
+        else if (!std::strcmp(argv[i], "-preview")) preview = true;
+        else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
@@ -1673,7 +1821,8 @@ int main(int argc, char** argv) {
                         rc.name.c_str(), rc.mode, rc.res, rc.res, outFor(rc.name).c_str());
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
-                           timeBudgetSec, resume, wantCheckpointFlag);
+                           timeBudgetSec, resume, wantCheckpointFlag, runForever,
+                           preview, intervalSec);
         if (rv != 0) return rv;
     }
     return 0;

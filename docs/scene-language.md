@@ -783,8 +783,11 @@ photons — so adding photons only *lowers the graininess*; it never changes exp
 |---|---|
 | `-n <photons>` | Trace exactly this many photons, then stop (the default sizing). |
 | `-time <seconds>` | Trace in batches until the wall-clock budget elapses. `-n` becomes the **batch size** (checkpoint granularity; default 2 000 000). Runs at least one batch and stops on the first batch boundary past the budget. |
-| `-resume` | Before rendering, reload the accumulated film from the checkpoint sidecar (below) and keep adding photons to it — combine with `-n` (add that many more) or `-time` (render that many more seconds). |
-| `-checkpoint` | On a plain `-n` render, also write the checkpoint sidecar so a later `-resume` can continue it. (`-time` and `-resume` imply checkpointing.) |
+| `-forever` | Trace indefinitely, refining the image, until you interrupt it. The first **Ctrl-C** (or Ctrl-Break) finishes the current batch, writes a final image + checkpoint, and exits cleanly; a second Ctrl-C force-quits. Implies checkpointing, so a later `-resume` picks up exactly where you stopped. |
+| `-resume` | Before rendering, reload the accumulated film from the checkpoint sidecar (below) and keep adding photons to it — combine with `-n` (add that many more), `-time` (that many more seconds), or `-forever`. |
+| `-checkpoint` | On a plain `-n` render, also write the checkpoint sidecar so a later `-resume` can continue it. (`-time`, `-forever`, and `-resume` imply checkpointing.) |
+| `-preview` | During `-time`/`-forever`, redraw a live ANSI-colour thumbnail of the current image in the terminal at each periodic update (in place, over the previous frame). Needs a truecolour-capable terminal. |
+| `-interval <seconds>` | Seconds between periodic image writes / preview refreshes during `-time`/`-forever` (default 15). The output image file is rewritten at this cadence too, so pointing an auto-reloading image viewer at it gives a live display without `-preview`. |
 
 **Checkpoint sidecar.** Because the 8-bit tone-mapped image is exposure-anchored and
 gamma-quantised, it cannot be resumed from faithfully. Alongside `-o out.png` the
@@ -792,9 +795,17 @@ renderer therefore writes `out.png.ftbuf`: the raw linear XYZ film, the per-pixe
 counts, the cumulative photon count, the energy tally, and a small identity hash of
 the scene/mode/resolution. `-resume` reloads it; if the hash or resolution disagrees
 with the current invocation it refuses to blend (printing a message and starting
-fresh) so a stale file can never silently corrupt an image. During a `-time` render
-the sidecar (and preview image) are re-written at least every ~15 s, so an
-interrupted run loses at most that much work.
+fresh) so a stale file can never silently corrupt an image. During a `-time` or
+`-forever` render the sidecar (and output image) are re-written every `-interval`
+seconds (default ~15 s), so an interrupted run loses at most that much work.
+
+**Live display.** Two ways to watch a long render progress, composable with any of the
+above: (1) the output image file is rewritten every `-interval` seconds, so any
+auto-reloading image viewer pointed at `out.png` is a live preview; (2) `-preview`
+draws a coarse in-terminal ANSI-colour thumbnail (upper-half-block glyphs, two pixels
+per character cell), redrawn in place each interval, using the same auto-exposure as
+the written image so it tracks the final look. `-forever` + `-preview` is the "run and
+watch until it looks good, then Ctrl-C" workflow.
 
 Each accumulation batch is seeded with an RNG offset equal to the cumulative photon
 count, so every batch — and every resume — draws a **statistically independent**
@@ -808,6 +819,10 @@ only to the forward models `A/B/C`; the spp-based reference/BDPT (`R/V/D`) and t
 # render for two minutes, then add another minute later:
 ftrace -in scene.ftsl -mode B -time 120 -o out.png
 ftrace -in scene.ftsl -mode B -time 60  -o out.png -resume   # out.png now = 180 s of photons
+
+# run and watch until it looks clean, then Ctrl-C to stop (image + checkpoint saved):
+ftrace -in scene.ftsl -mode B -forever -preview -interval 5 -o out.png
+ftrace -in scene.ftsl -mode B -forever -o out.png -resume     # keep refining later
 ```
 
 ---
