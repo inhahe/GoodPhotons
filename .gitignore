@@ -1,0 +1,28 @@
+# Build output
+/build/
+/out/
+*.ppm
+*.exr
+*.png
+
+# Generated meshes (regenerate with tools/make_mesh.py)
+*.obj
+
+# Checkpoints / render state
+*.ckpt
+/renders/
+
+# Scratch / throwaway scripts and test outputs
+/scraps/
+
+# Editor / IDE
+.vs/
+.vscode/
+*.user
+
+# Agent runtime
+.claude/
+
+# OS
+Thumbs.db
+Desktop.ini

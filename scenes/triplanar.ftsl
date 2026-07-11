@@ -1,0 +1,59 @@
+# Triplanar (box) texture projection test (Phase 3b). A torus OBJ that carries NO
+# `vt` texture coordinates is textured by projecting the checker image from the
+# three world axes and blending the three samples by the surface normal — the
+# renderer-side, unwrap-free mapping (spec §9.2). Unlike `uv planar|spherical|
+# cylindrical` (baked into per-vertex UVs at load), triplanar is a per-hit blend,
+# so it lives on the bound material (`Material::triplanarScale`) and is evaluated
+# in diffuseReflectance (CPU) / dDiffuseRho (GPU) — the two agree by construction.
+#
+#   ftrace -in scenes/triplanar.ftsl -n 40000000 -o png/triplanar.png
+#   ftrace -in scenes/triplanar.ftsl -device gpu -n 40000000 -o png/triplanar_gpu.png
+#
+# `scale` sets the world-to-texture repeat rate (2 => the checker tiles twice per
+# unit); the `repeat` wrap tiles it seamlessly across the whole torus.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+texture "checker" {
+    file     scenes/checker.ppm
+    encoding srgb
+    filter   bilinear
+    wrap     repeat
+}
+
+material "white"     { type diffuse reflect whitewall 0.75 }
+material "red"       { type diffuse reflect redwall }
+material "green"     { type diffuse reflect greenwall }
+material "wallpaper" { type diffuse reflect texture:checker }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# Torus with no vt: triplanar box-projects the checker at 4 repeats per world unit.
+# The scale is a value continuation on the `uv` statement — a bare number or a
+# `scale=<s>` param. (A bareword `scale` would start a new statement and clobber the
+# mesh's own `scale` transform below.)
+mesh {
+    file      scenes/torus.obj
+    material  wallpaper
+    uv        triplanar scale=4
+    scale     0.9
+    translate 0.5 0.5 0.5
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

@@ -1,0 +1,61 @@
+# Realistic (mesh-lens) camera demo. The camera carries a physical lens
+# prescription — a stack of spherical glass interfaces plus an aperture stop —
+# so depth of field, distortion, vignetting and chromatic aberration all emerge
+# from tracing rays through the actual optics. A physical lens forces mode R
+# (the backward realistic-camera path).
+#
+#   ftrace -in scenes/realcam.ftsl -n 4000000 -o realcam.ppm
+#
+# Three glossy spheres recede into the distance; only the one at the focus
+# distance is sharp, the others blur. A bright key light gives the out-of-focus
+# highlights visible bokeh.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- materials -------------------------------------------------------------
+material "floor"  { type diffuse    reflect rgb 0.6 0.6 0.62 }
+material "red"    { type diffuse    reflect rgb 0.75 0.15 0.12 }
+material "green"  { type diffuse    reflect rgb 0.15 0.6 0.2 }
+material "blue"   { type diffuse    reflect rgb 0.15 0.25 0.7 }
+material "chrome" { type mirror     reflect rgb 0.9 0.9 0.9 }
+
+# --- ground plane ----------------------------------------------------------
+quad { origin -10 0 -20   u 20 0 0   v 0 0 30   material floor }
+
+# --- three spheres at increasing depth (z) ---------------------------------
+sphere { center -0.9 0.35 1.2   radius 0.35   material red   }   # near
+sphere { center  0.0 0.35 2.4   radius 0.35   material green }   # focus plane
+sphere { center  1.1 0.35 3.8   radius 0.35   material blue  }   # far
+
+# --- a small chrome ball for specular highlights ---------------------------
+sphere { center 0.55 0.18 1.6   radius 0.18   material chrome }
+
+# --- lighting: overhead area light + warm key --------------------------------
+light area {
+    origin -0.6 3.0 1.8   u 1.2 0 0   v 0 0 1.2   normal 0 -1 0
+    spd preset:bb6500
+}
+light area {
+    origin 2.2 1.6 0.6   u 0 0.6 0   v 0 0 0.6   normal -1 0 0
+    spd preset:bb3200
+}
+
+# --- realistic camera ------------------------------------------------------
+# Achromatic doublet at 50 mm, f/2.8, full-frame sensor, focused on the middle
+# sphere at 2.4 m. Swap `preset achromat` for `preset singlet` to see spherical
+# and chromatic aberration blow up, or paste explicit `surface` lines for a real
+# prescription.
+camera "real" {
+    eye 0.0 0.55 -1.6   look_at 0.0 0.35 2.4   up 0 1 0
+    focus 2.4
+    film { res 512 342   format full-frame }
+    lens {
+        preset achromat
+        focal 50
+        fstop 2.8
+        glass BK7
+    }
+}

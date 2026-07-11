@@ -1,0 +1,1070 @@
+# Known Issues & Technical Debt
+
+Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
+as practical; this file is the fallback for what can't be addressed immediately.
+
+## Resolved
+
+### `-o foo.png` wrote a PPM (P6), not a PNG — extension was ignored [RESOLVED 2026-07-10]
+- **What was wrong:** the image writer (`writePPM` in `src/main.cpp`) always
+  emitted binary PPM (P6) regardless of the output extension, so `ftrace -o
+  group.png` produced a file starting with `P6\n256 256\n255` but named `.png`.
+- **Why it mattered:** anything that trusts the extension mis-handled the file.
+  Concretely it softlocked a Claude session: reading the mislabeled `.png` sent
+  it to the vision API as `image/png`; the API rejected the PPM bytes (`Image
+  format image/png not supported`), and the bad image stayed pinned in the
+  conversation, so *every* subsequent request 400'd until a fresh session.
+- **Fix:** vendored `stb_image_write.h` (compiled once in `stb_image_impl.cpp`)
+  and added `writeImage()`, which dispatches on the output extension — `.png` ->
+  PNG, `.jpg`/`.jpeg` -> JPEG (q95), everything else -> PPM (P6). The tone-map
+  writer was renamed `writePPM` -> `writeFilm` since it no longer only writes PPM.
+  Verified: `-o x.png` / `x.jpg` / `x.ppm` produce correct magic bytes and a
+  real `.png` now loads in the vision API without error.
+
+## Limitations (by design, tracked for future work)
+
+### BDPT connection edges through colored glass are not absorption-weighted
+- **What:** Beer-Lambert interior absorption (`Material::absorb`, colored glass)
+  is threaded through all three CPU transport loops via an `interior` medium
+  pointer (forward `tracePhoton`, backward `radiance`, BDPT `randomWalk`). In
+  BDPT this attenuates only the **subpath walk** — the camera/light subpaths that
+  are traced by ray marching. A **connection edge** (`connectBDPT`, the
+  deterministic segment joining a camera vertex to a light vertex) that happens
+  to cross a dielectric is treated as unoccluded transmittance = 1, so it picks
+  up no absorption tint.
+- **Why it matters:** BDPT (mode D) images of scenes with colored glass will be
+  slightly biased along light↔eye connections that pass through the glass — the
+  glass tints direct-walk contributions correctly but not the connected ones.
+  Forward (A/B/C) and backward (R) modes are unaffected (they have no connection
+  edges), so the primary/reference renders are correct.
+- **Proper fix:** accumulate optical depth along the connection ray by
+  intersecting it against dielectric boundaries (or track the medium a connection
+  endpoint sits in) and multiply the connection throughput by the resulting
+  `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
+
+### GPU parity pending for implicit surfaces, procedural patterns, and dielectric translucency
+- **What:** the §1–4 CPU feature set — **implicit surfaces** (`isosurface`: analytic
+  SDF primitives, hard/smooth CSG, metaballs; `src/implicit.h`), **procedural patterns**
+  (`pattern` blocks + `pattern:<name>` scalar/selection drives; `src/pattern.h`), and
+  **dielectric translucency** (frosted glass = roughness lobe on the transmitted ray;
+  colored glass = Beer–Lambert `absorb` interior tint) — is **CPU-only**. The CUDA
+  backend (`src/render_cuda.cu`) has no device sphere-tracer (its `closestHit` handles
+  only triangles and spheres), no pattern VM, and its dielectric branch
+  (`refractOrReflect`) is smooth and non-absorbing.
+- **Current behavior (correct, not silently wrong):** `cudaForwardSupported()` now
+  gates all three — a scene with any `scene.implicits`, any material with a bound
+  pattern (`roughnessPat`/`filmThicknessPat`/`mixWeightPat >= 0`), or any frosted/colored
+  dielectric returns `false`, so `-device gpu`/`auto` **falls back to the CPU tracer**
+  (message names the feature). `cudaBdptSupported()`/`cudaBackwardSupported()` inherit
+  this (both call `cudaForwardSupported`). Verified: `scenes/implicit.ftsl`,
+  `procedural.ftsl`, `translucency.ftsl` all fall back; a plain clear-glass scene
+  (`cornell.ftsl`, `glass:SF10`) still runs on GPU (the gate distinguishes clear from
+  frosted/colored — clear dielectrics author `roughness 0` and a zero `absorb`).
+- **Proper fix (step 5, the remaining port):** (a) upload `FieldNode` arrays + `Implicit`
+  primitives into `DScene` and add device sphere-tracing to `closestHit` (`fieldVal`
+  written into the device Hit); (b) upload `Scene::patterns` as flat `PatNode` arrays +
+  port `patternEval` to the device, then wire `dMatRoughness`/`dMatFilmThickness`/
+  `dMixResolveChild` to consult them; (c) thread an `interior` medium pointer through the
+  device transport loops for Beer–Lambert absorption and add the roughness lobe to the
+  device dielectric (frosting). The pattern VM and noise hash were written GPU-portable
+  (POD `PatNode`, integer-hash noise) specifically to make (b) a near-direct port.
+- **Status:** OPEN — logged 2026-07-11. CPU path complete & validated; GPU port is the
+  next planned increment.
+
+### Multi-camera renders re-trace photons per camera (no shared pass yet)
+- **What:** Phase 3a implements multiple named `camera` blocks: one render
+  invocation emits one image per camera (`scenes/twocam.ftsl`), with `-camera
+  <name>` selection and per-camera film resolution + mode. But each camera is a
+  **separate forward pass** — the photon set is re-traced from scratch for every
+  camera (`runRender` is called in a loop in `src/main.cpp`).
+- **Why it matters:** the wishlist's framing is "many cameras at once… *same
+  render for efficiency*". For N cameras this is N× the photon work instead of 1×.
+- **CPU shared pass — DONE 2026-07-11.** `tracePhoton` now takes a list of
+  `CamTarget{Camera,Film}` and splats each diffuse/emitter/volume vertex to *every*
+  camera at once (`camSplatAll`/`camSplatVolumeAll`). Because model-B `connect()` draws
+  no RNG, adding cameras never perturbs the photon's RNG stream: the single-camera
+  overload is bit-identical to the old path, and an N-camera shared pass reproduces N
+  independent single-camera renders exactly. `renderForwardShared()` (src/main.cpp) runs
+  one CPU photon trace feeding one film per camera; the multi-camera loop groups the
+  eligible cameras (plain `-n`, model B, per-frame auto-exposure, CPU device) into that
+  single pass and renders the rest per-camera as before. **Validated:** `twocam.ftsl`
+  `-device cpu` shared vs. per-`-camera` solo renders are pixel-identical (max abs diff
+  0, both films). The fluoro reradiation λ' is sampled once (camera-independent), and
+  mode-A aperture RNG is drawn once, so those single-camera streams are preserved too.
+- **Remaining (deferred):** (1) **GPU shared pass** — the forward megakernel still
+  renders one camera per launch; it takes a single `DCamera`/film/`camMode`, so the
+  shared pass would need a `DCamera` array + N device film buffers threaded through
+  `emitPhoton`/`shadeStep`/`connect`. This is why the CPU shared pass only triggers when
+  the forward-GPU path *isn't* used (`-device cpu`, or a GPU-unsupported scene). (2)
+  **Mode A** (finite-lens splat) could join the shared pass but draws an aperture sample
+  per camera, so an N-camera mode-A trace perturbs the RNG stream — it would need its
+  own validation; mode C (forward catch) is inherently per-camera (a photon is consumed
+  by one aperture).
+- **Status:** OPEN (much reduced) — CPU shared pass done + validated; GPU shared pass
+  and mode-A sharing are the tracked remainder.
+
+### Absolute-EV film sensitivity, non-square films, shared multi-camera pass
+- **What (remaining):** three camera/film pieces are still open:
+  1. ~~**Absolute EV / physical sensitivity.** `iso`/`shutter`/`exposure` act as a
+     *relative* exposure compensation on top of the per-image auto-exposure (the
+     film's radiometric scale is arbitrary). A true absolute exposure needs absolute
+     light power (watts/lumens) on emitters.~~ **DONE 2026-07-11.** A `light` block
+     may author an absolute emitted flux — `power <watts>` (radiometric) or
+     `lumens <lm>` (photometric, via Φ_v = 683·∫SPD·V(λ)dλ with cieY as V) — on
+     area/sphere/cylinder/spot/collimated lights. The FTSL loader (`absPower()` in
+     ftsl.h) scales the emitter SPD so `power = emitIntegral·geomW` equals that flux;
+     because photon β and the film accumulation are linear in the SPD, the film
+     becomes physically linear. When any light is absolute, `Scene::absolute` is set
+     and `writeFilm` swaps the 99th-percentile auto-exposure for a FIXED sensor gain
+     (`ABS_EXPOSURE_GAIN`) times the photographic compensation, so scene power flows
+     through un-renormalised and iso/shutter/exposure give exact absolute stops.
+     Validated on `scenes/absolute.ftsl`: `power 100`→`200` brightens the diffuse
+     walls ~2× (light patch clips), the `lumens` path engages absolute mode, and
+     non-absolute scenes stay bit-identical (auto-exposure, `Scene::absolute=false`).
+     Env lights reject `power`/`lumens` (their phase-space weight needs scene bounds;
+     use `intensity`). Not yet metrologically calibrated to cd/m² — the single
+     `ABS_EXPOSURE_GAIN` sets the sensor zero-point (tuned so ~100 W in a unit box at
+     the neutral triple is mid-tone); relative stops and power ratios are exact.
+     **Exposure-lock DONE 2026-07-11:** a `camera_path` can
+     author `exposure_lock` (or the CLI `-exposure-lock` forces it across *all*
+     rendered cameras) so the auto-exposure anchor is computed once from the first
+     frame and reused for the rest — no dolly/zoom flicker. Implemented by an optional
+     `double* lockAnchor` threaded `runRender → writeFilm` and a per-lock-group
+     `std::map<int,double>` anchor in the multi-camera loop (`CamSpec.pathGroup/
+     exposureLock`, `RenderCam.expGroup`); only the final converged write sets/reuses
+     the anchor, so progressive intermediate saves don't poison it. Validated on
+     `scenes/dolly.ftsl`: unlocked frames swing 2.0e-14→5.2e-13 (25×, visible
+     flicker), locked frames all hold the frame-0 anchor 2.02e-14. Standalone cameras
+     (no lock) stay bit-identical (null anchor → per-frame auto-exposure as before).
+     True *absolute* EV still needs absolute emitter power (deferred, §7).
+  2. ~~**Non-square films.** `film { res W H }` only uses the first value; the
+     forward/backward tracers (and CUDA) allocate a square film.~~ **DONE
+     2026-07-11.** `film { res W H }` (and the CLI `-r W H`) now flow resX≠resY
+     through every tracer: CPU/GPU forward (A/B/C), backward (R), BDPT (D), composite
+     (P), validate (V), plus checkpoint/resume (the identity guard mixes resY, so a
+     mismatched height is rejected instead of silently poisoning the image). The
+     camera already carried the true horizontal fov from width
+     (`tanHalfX = tanHalfY·rx/ry`); only the render-entry plumbing had collapsed to a
+     single square `res`. `renderForward/Backward/Bdpt/Composite`, `runRender`,
+     `readCheckpoint`, and the CUDA entry points + `kBackward`/`kBdpt` kernels all
+     take resX,resY now. Validated at 320×180: mode V PASSES (bulk RMSE 3%,
+     firefly-dominated top-1%), CPU vs GPU auto-exposure agree (4.68e-13 vs 4.62e-13),
+     resume accumulates 1M→2M correctly, and the guard rejects a 200×120→200×140
+     mismatch.
+  3. ~~**Shared multi-camera mode-B pass**~~ (CPU shared pass DONE 2026-07-11 — see the
+     multi-camera entry above; GPU shared pass still deferred) — one photon trace
+     splatting to every camera pupil.
+- **Proper fix:** (1) ~~add a per-`camera_path` exposure-lock flag~~ (DONE
+  2026-07-11); ~~absolute emitter power + a sensitometric film model~~ (absolute
+  power + fixed-gain exposure DONE 2026-07-11; full cd/m² sensitometry still open).
+  (2) ~~thread resX/resY through `renderForward`/`renderBackward`/CUDA and
+  `writePPM`~~ (DONE 2026-07-11). (3) see multi-camera (CPU shared pass done).
+- **Status:** OPEN (design captured) — logged 2026-07-10; **exposure-lock done
+  2026-07-11**, **non-square films done 2026-07-11**, **absolute-EV done
+  2026-07-11**, **CPU shared multi-camera pass done 2026-07-11**; only the GPU shared
+  pass (and optional mode-A sharing) remains.
+- **Done (2026-07-10, Phase 3a):**
+  - `camera_path` keyframed motion — expands at load time into a sequence of
+    `CamSpec` frames with piecewise-linear `eye`/`look_at` interpolation between
+    sorted `key` control points; the multi-camera loop renders the generated list
+    with frame-numbered output names. Grammar is numbers-only
+    (`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`). Validated by `scenes/dolly.ftsl`.
+  - Physical film `size <w> <h>` (mm) → focal length `f = filmH/(2·tan(fov_y/2))`
+    (metres); `fstop N` → `apertureR = f/(2N)` at load time (overrides `aperture`),
+    giving physically-meaningful DOF in modes A/C. `iso`/`shutter`/`exposure` →
+    relative exposure compensation `comp = exposure·(iso/100)·shutter` applied over
+    the auto-exposure anchor in `writePPM`. Validated by `scenes/expo.ftsl` (ISO 200
+    is exactly 2.0× ISO 100 in linear space).
+
+### Fisheye/panoramic lenses: GPU mode-B done; unsupported by BDPT (mode D) and by the finite-lens modes (A/C)
+- **What:** `projection <name>` / `fisheye` (equidistant, equisolid, stereographic,
+  orthographic) is implemented on the **CPU** for the forward light tracer (modes
+  A/B/C), the backward reference (R), and validation/composite (V/P), and on the
+  **GPU** for the mode-B pinhole-splat path (see below). The mode-B splat importance
+  is projection-correct (the camera computes the per-pixel solid angle
+  `Camera::pixelSolidAngle`, replacing the rectilinear `1/(A_pix·cos⁴)`).
+- **GPU mode-B fisheye (done 2026-07-11):** the device `DCamera` (`render_cuda.cu`)
+  now carries a `projection` enum plus `halfFovY`/`rEdge`, with `HD dProjRadius` /
+  `dProjRadiusDeriv` helpers mirroring `Camera::projRadius`/`projRadiusDeriv`.
+  `DCamera::project()` branches rectilinear vs fisheye (azimuth + normalised
+  `projRadius/rEdge`, no `cz>0` reject), and `pixelSolidAngle()` returns the
+  projection-general solid angle (`aNorm·sinθ·rEdge²/(r·dr)`), keeping the
+  rectilinear branch bit-identical (`A_pix·cos³`). `connect`/`connectVolume` divide
+  by that solid angle. The device path only **splats** (never generates camera
+  rays), so no inverse map (`projRadiusInv`) is needed on-device. Fisheye B/V/P now
+  run on the GPU (no CPU fallback); validated GPU-vs-CPU on `scenes/fisheye.ftsl`
+  2026-07-11 — the equisolid-160° `fish` frame matches CPU at RMSE 3.0/255 (8.8%
+  rel, same noise floor as the rectilinear `rect` frame) and mean brightness within
+  0.25%. Two gaps remain:
+  1. **Finite-lens modes (A/C) reject fisheye.** A thin-lens/aperture camera cannot
+     *form* a fisheye projection analytically, so modes A and C error out for a
+     non-rectilinear lens (guarded in `src/main.cpp`). A true wide-angle physical
+     camera needs the mesh-lens forward-catch mode (see the mesh-lens camera entry).
+  2. **BDPT (mode D) rejects fisheye.** `bdpt.h`'s `cameraWe`/`cameraPdfDir` are the
+     rectilinear pinhole convention (`1/(A·cos⁴)`, `1/(A·cos³)`) and feed the MIS
+     balance heuristic; a fisheye lens there would give subtly-wrong weights, so
+     mode D errors out for a non-rectilinear camera rather than lie.
+- **Proper fix (future):** generalise the BDPT camera importance + its
+  importance-sampling pdf to the projection's Jacobian so the MIS weights stay
+  consistent (the pdfDir must match the actual sampling density over the fisheye
+  image). The GPU mode-B port is complete.
+- **Status:** OPEN (acceptable) — CPU fisheye done + validated (`scenes/fisheye.ftsl`)
+  2026-07-11; **GPU mode-B fisheye done + validated 2026-07-11**; BDPT (mode D) and
+  finite-lens (A/C) support deferred (the latter belongs to the mesh-lens camera).
+
+### Physical (realistic) lens camera — backward realistic-camera formulation [IMPLEMENTED 2026-07-11]
+- **What (done):** a camera can now carry a real **lens prescription** — a stack of
+  spherical/planar refracting interfaces plus an aperture stop (`src/lens.h`,
+  `LensSystem`). The backward reference tracer (mode R) samples a film point and a
+  point on the rear element, traces that ray *through the actual glass interfaces*
+  (per-wavelength Snell refraction, so dispersion → chromatic aberration is
+  automatic) out into the scene, then path-traces. Depth of field, distortion,
+  spherical aberration, coma, field curvature and **vignetting** (clipped/TIR rays
+  contribute nothing) all emerge from the geometry — no thin-lens or projection
+  model. Survivors carry a PBRT-style radiometric weight (cos⁴θ·A_rear/Z_rear²).
+  Wired via an FTSL `camera { lens { … } }` block (`readLens` in `src/ftsl.h`);
+  a physical lens forces the camera to mode R (`src/main.cpp`). Autofocus shifts the
+  film plane with a paraxial probe (`focusAt`). Demo: `scenes/realcam.ftsl`
+  (validated: the focus-plane sphere is sharp, near/far spheres blur; the `singlet`
+  preset visibly softens from spherical aberration).
+- **Presets & generators (`src/lens.h`):** `makeSinglet` (biconvex, lensmaker
+  R=2(n−1)f), `makeAchromat` (cemented crown+flint doublet, powers split by Abbe
+  numbers to cancel first-order CA); `resolveLensPreset` names: `singlet`/`biconvex`,
+  `achromat`/`doublet`, `telephoto`, `wide`. All physically derived (not fabricated
+  data), so focal length + achromatisation are correct by construction; dispersion at
+  render time uses the real Sellmeier glass indices. Users can also paste an arbitrary
+  real prescription as repeated `surface <radius_mm> <thickness_mm> <ior> <semi_ap_mm>
+  [stop]` lines (PBRT lens-file convention: +radius ⇒ centre of curvature on the scene
+  side; lens works in millimetres, scene in metres).
+- **Sign-convention gotcha (fixed):** the geometry stores curvature as `centre =
+  vertex + radius` with +z toward the scene (identical to PBRT's
+  `IntersectSphericalElement`). The lensmaker/achromat generators emit radii in the
+  opposite object→image convention, so their radii are **negated** at construction
+  (see comments in `makeSinglet`/`makeAchromat`). Without the negation the doublet
+  *diverges* and the autofocus places the sensor on the scene side (all rays miss) —
+  the first-cut symptom was a fully black image.
+- **Remaining gaps (OPEN, deferred):**
+  1. **Backward-only.** No forward-catch (mode C-style) or forward-splat (A/B)
+     realistic-lens path yet. A physical lens always renders in mode R. **GPU: DONE**
+     (Plan A, 2026-07-11) — a dedicated GPU backward megakernel (GPU mode R) runs the
+     physical lens as a ray-generation front-end (`kBackward` in `render_cuda.cu`, the
+     lens bit-for-bit ported to `dGenLensRay`/`dLensTrace` with per-surface sensor-side
+     ior baked into a device table). `-device auto`/`gpu` selects it. v1 scope
+     (`cudaBackwardSupported`): no participating media, no environment light, no
+     spot/collimated emitters, no fluorescence (all fall back to the CPU backward
+     tracer), and ≤ `D_MAXLENS` (16) lens surfaces; textured albedo IS supported. The
+     device RNG differs from the CPU, so the image is an independent noise realization
+     that agrees to within Monte-Carlo noise.
+  2. **Sensor mapping.** `genLensRay` maps the sensor width across the film width and
+     derives the vertical extent from the output pixel aspect. Now that the film
+     pipeline carries resX≠resY (non-square films, DONE 2026-07-11), rendering the
+     physical lens into a film whose aspect matches the sensor (e.g. 3:2) covers the
+     sensor with square pixels and no crop; a mismatched aspect still crops as before.
+  3. **No inter-element flare/ghosting** (rays refract, they don't also partially
+     reflect at each interface), **no enclosure/body geometry**, and the aperture is a
+     circular clear-diameter clip (no shaped-iris bokeh).
+  4. ~~**Not in BDPT (mode D).**~~ **DONE 2026-07-11 (Plan B, below).** The lens now
+     also rides on the BDPT camera subpath (mode D), and mode P routes to it.
+- **Status:** IMPLEMENTED (backward realistic camera, 2026-07-11; GPU backward
+  megakernel / Plan A, 2026-07-11; **BDPT camera-subpath lens / Plan B, CPU + GPU,
+  2026-07-11**). Supersedes the analytical thin-lens for "arbitrary real camera" use;
+  the remaining gaps above (inter-element flare, shaped-iris bokeh) are follow-ups.
+
+#### Plan B — realistic lens on the camera subpath of BDPT (mode D) and composite (mode P) [DONE 2026-07-11]
+- **Why it's wanted:** the physical lens currently rides on **pure mode R** (backward
+  everything), so it inherits mode R's weaknesses — noisy on in-frame caustics, and no
+  fluorescence. The lens only ever lives on the *camera subpath*; in principle you can
+  keep forward light transport lighting the scene (caustics on surfaces) while a
+  backward lens ray samples that lit scene through the glass — i.e. attach the lens to
+  the camera subpath of a bidirectional/composite estimator instead of forcing pure R.
+  That would recover *some* of the forward tracer's caustic efficiency while keeping the
+  physical optics.
+- **The catch (why it's only a partial win, and deferred):** the multi-element lens map
+  has **no closed-form inverse**, and both D and P need that inverse for the parts that
+  would buy the forward advantage:
+  1. **BDPT (mode D).** BDPT's power comes from light→camera connection strategies. The
+     **t=1 strategy** (splat a light-subpath vertex directly onto the film) requires
+     projecting a world point onto the sensor *through the glass stack* — the lens
+     inversion. PBRT disables the camera-connection strategies for realistic cameras for
+     exactly this reason. So a realistic lens in D must run with t=1 disabled: you keep
+     the *scene-side* connections (a camera-subpath vertex out in the scene connects to
+     light-subpath vertices), which recovers part of the caustic efficiency, but not the
+     full forward win. It's a substantial, delicate, per-wavelength change layered on a
+     mode D that already lacks fog / env / spot / fluorescence support.
+  2. **Composite (mode P).** Worse fit: P's forward pass **splats to a pinhole** — it
+     fundamentally assumes a pinhole camera. Routing that forward pass through a physical
+     lens is the ill-posed forward-through-lens problem again. So P does not cleanly
+     extend to a realistic lens without solving the same inversion.
+- **Bottom line:** the clean, buildable step was **Plan A** — a dedicated GPU backward
+  megakernel (GPU mode R) with the lens as a ray-generation front-end (**DONE**
+  2026-07-11; see gap #1 above). Plan B (D and P) is genuinely more general but only a
+  *partial* caustic recovery, and can't do the light→film splat through the glass.
+
+- **DONE 2026-07-11 (the resolution that made Plan B clean and rigorous):** the t=1
+  light-image splat is simply **disabled** for a lensed camera (no closed-form lens
+  inverse), and the key realisation is that this needs **no lens direction-pdf** at all:
+  1. `generateCameraSubpath` (`src/bdpt.h`): when `cam.hasLens()`, the first camera ray
+     is generated by `Camera::genLensRay` (film point + rear-pupil point traced through
+     the real glass, identical to mode R). The camera vertex sits at the ray's
+     **scene-entry point** with `beta = wLens` (the lens radiometric weight), so a pure
+     eye path measures `L·wLens` — matching mode R's film `add`. The camera vertex is
+     flagged **`delta = true`**.
+  2. `connectBDPT` t==1 branch returns 0 for `cam.hasLens()` (the splat needs the
+     sensor projection we don't have). The retained strategies are the scene-side
+     connections (s≥0, t≥2: pure path trace, NEE, interior light↔eye), which keep the
+     forward tracer's caustic efficiency through the physical lens.
+  3. **Why the lens direction pdf is unnecessary (the rigorous part):** `misWeight`'s
+     camera loop runs `i = t-1 … 1` and only *adds* a hypothetical strategy's term when
+     `!eye[i].delta && !eye[i-1].delta`. The i==1 term (the t=1 splat) is gated on
+     `!eye[0].delta` — which is now false — so it is **excluded from the MIS sum**, and
+     since the loop never reaches i==0, `eye[1].pdfFwd` (the only place the camera
+     direction density would enter) never affects any *retained* ratio. The surviving
+     strategies therefore still form a **partition of unity** ⇒ the estimator is
+     **unbiased** regardless of the (unused) camera-ray direction pdf. `eye[1].pdfFwd`
+     is seeded with the pinhole `cameraPdfDir` purely as an inert placeholder.
+  - **Mode P (composite):** its forward pass splats to a **pinhole** and can't form the
+    lens image, so a lensed camera in mode P **routes to the lens-aware BDPT (mode D)**
+    when the scene is within BDPT scope, else **falls back to mode R** (fog / env / spot /
+    fluorescence / layered — which R supports and D doesn't). Wired in `src/main.cpp`
+    (`bdptUnsupportedFeature` helper shared by the mode-D gate and the P routing).
+  - **GPU: DONE 2026-07-11.** The GPU BDPT megakernel (`kBdpt`) now takes the lens on its
+    camera subpath too: `dGenCameraSubpath` generates the first ray via `dGenLensRay` (the
+    same device lens tracer Plan A ported for GPU mode R), sets the camera vertex `beta =
+    wLens` and `delta = 1`, and `dConnectBDPT`'s t==1 branch returns 0 for a lensed camera
+    — a bit-for-bit mirror of the CPU path. The DCamera lens is already uploaded by
+    `buildUpload`. So `-mode D -device gpu` on a lensed scene runs entirely on-device; the
+    old CPU-force guard in `src/main.cpp` is removed.
+  - **Validation** (`scenes/realcam.ftsl`, achromat 50 mm f/2.8, full-frame): mode D vs
+    mode R with the same lens agree on absolute radiance and the residual is **pure Monte-
+    Carlo noise**. CPU-D↔GPU-D↔R all agree (median per-pixel ratios 0.987–1.010 @ 256–512
+    spp). Unbiasedness: high-spp GPU-D vs R gives median **1.0003** with the ratio IQR
+    narrowing [0.905,1.096] → [0.967,1.035] as spp goes 512 → 8192 (≈√16 narrowing), and
+    the auto-exposures converge (GPU-D 1.07e-11 vs R 1.08e-11). No bias, CPU or GPU. Mode P
+    lens routing (→ D) and out-of-scope fallback (→ R, tested with `-fog`) both verified;
+    lensless mode D/P unchanged (cornell regression).
+  - **Remaining follow-up:** the true t=1 splat through an approximate lens inverse
+    (PBRT-style exit-pupil sampling) for the extra light-tracing strategy — optional, since
+    scene-side connections already recover the main forward win.
+- **Status:** DONE 2026-07-11 (CPU + GPU BDPT + composite routing).
+
+### Texturing is base-color only, `use_mesh`/quad UVs only (Phase 3b partial)
+- **What (done 2026-07-10):** a `texture "name" { file … encoding srgb|linear
+  filter nearest|bilinear wrap repeat|clamp|mirror }` block loads an image into
+  `Scene::textures` (`src/texture.h`); `reflect texture:<name>` on a `diffuse`
+  material binds it (`Material::reflectTex`); per-vertex UVs live on `Tri`
+  (`src/geometry.h`), auto-generated for quads and read from OBJ `vt` when a mesh
+  sets `uv use_mesh`; each texel is Jakob-Hanika–upsampled to a reflectance
+  spectrum (coefficients precomputed at load via `Texture::buildReflCoeff`, bilerped
+  + sigmoid-evaluated per hit through `diffuseReflectance()`). Shared by the forward
+  tracer and the backward reference. Image formats: PNG/JPG/BMP/TGA + Radiance
+  `.hdr` via the vendored stb_image (`src/third_party/stb_image.h`, compiled once in
+  `src/stb_image_impl.cpp`), plus built-in PPM/PFM. Validated by
+  `scenes/textured.ftsl` (quad) and `scenes/uvmesh.ftsl` (mesh) — the checker maps
+  with correct orientation (blue band at v≈1/top, yellow at u≈0/left) and spectral
+  colour; a PNG copy of the checker renders bit-identically to the PPM (RMSE 0.0),
+  confirming the stb sRGB decode + orientation.
+- **Remaining [needs engine work]:**
+  1. **UV projections.** ~~Only `uv use_mesh` (OBJ `vt`) and quad corners exist.~~
+     **PARTLY DONE 2026-07-11:** the analytic projections `uv planar|spherical|
+     cylindrical [x|y|z]` (spec §9.2) are now synthesized at load time from the
+     world-space vertex AABB (`UvProjection`/`projectUV` in `src/mesh.h`, parsed in
+     `src/ftsl.h`), normalised to [0,1] across the mesh so the map wraps once by
+     default. Because they fill the same per-vertex `Tri.uv{0,1,2}` slots as
+     `use_mesh`, both tracers **and the GPU** interpolate them with no shading change
+     (validated on `torus.obj`, which carries no `vt` — the checker maps onto the
+     torus via the spherical projection; `scraps/uvproc.ftsl`). **DONE 2026-07-11:**
+     `triplanar` — unlike the three analytic maps it can't be baked into per-vertex
+     UVs (it blends three world-axis planar samples per hit, weighted by |n|^4), so it
+     lives on the bound material as `Material::triplanarScale` (world->texture repeat
+     rate) and is evaluated per hit in `Texture::reflectanceTriplanar`, called from
+     `diffuseReflectance()` (CPU, shared by forward/backward/BDPT) and the device twin
+     `dTexReflTriplanar` from `dDiffuseRho()` (GPU) — the two agree by construction.
+     Parsed from `mesh { uv triplanar [<s>|scale=<s>] }` in `src/ftsl.h`. Validated by
+     `scenes/triplanar.ftsl`: CPU vs GPU exposures match to 3 digits (4.87e-13 vs
+     4.88e-13) and the box-projected checker is visually identical on both backends.
+     **Parser gotcha fixed:** the scale/axis argument must be a bare number or a
+     `key=val` param — a bareword `scale`/axis letter starts a *new* statement and
+     clobbered the mesh's own `scale` transform (this caused an all-black render while
+     the torus ballooned to 4x and occluded the box; the same fix now applies to
+     `uv planar axis=x`).
+  2. **Non-albedo parameters.** ~~A texture can only bind to diffuse `reflect`.~~
+     **DONE 2026-07-11 (roughness + film-thickness maps, both backends):** `glossy`
+     takes `roughness texture:<name>` (grayscale = roughness directly) and `thinfilm`
+     takes `film_thickness_map texture:<name>` (0..1 profile × nominal `film_thickness`
+     nm). Bound in `src/ftsl.h` via `bindScalarTexture`; sampled per-hit by
+     `materialRoughness`/`materialFilmThickness` (`src/scene.h`) → `Texture::scalarAt`
+     (mean of linear RGB). All three CPU tracers (forward/backward/BDPT) and the GPU
+     forward path (megakernel + wavefront, via `dMatRoughness`/`dMatFilmThickness` +
+     `dTexScalarAt` over an uploaded per-texel `gray` array) use it. **MIS
+     correctness:** the CPU BDPT threads the hit UV through `bsdfPdf`/`bsdfF` so the
+     sampled and evaluated roughness match; the GPU BDPT does not, so `cudaBdptSupported`
+     rejects roughness/thickness-map scenes → CPU BDPT fallback. Validated by
+     `scenes/scalarmap.ftsl`: CPU vs GPU forward exposure 7.3e-13 vs 7.29e-13, mean
+     agrees to <0.1%, signed diff ~0.04% (unbiased). **Also DONE 2026-07-11 (mix
+     blend-mask):** a 2-child `mix` takes `weight_map texture:<name>` — the map value t
+     at the hit is the probability of child 0 (child 1 = 1-t, no absorption), a spatial
+     A/B blend. `Material::mixWeightTex` + `mixResolveChild` (scene.h), threaded through
+     all three CPU tracers and the GPU forward path (`dMixResolveChild`). Mix selection
+     is a stochastic RR pick that doesn't enter the BSDF pdf, so it's unbiased in every
+     tracer; the GPU BDPT mix-pick still uses constant weights, so masked mixes take the
+     CPU-BDPT fallback (`cudaBdptSupported`). Validated by `scenes/maskblend.ftsl`.
+     **Still deferred:** a map on `ior` (spatially-varying refractive index — rare, and
+     better served by measured dispersion data than a grayscale map; low priority).
+  3. ~~**GPU.** Textured scenes force the CPU tracer.~~ **DONE 2026-07-11:** the
+     forward CUDA path now ports textured diffuse reflectance. `buildUpload()` uploads
+     each texture's per-texel Jakob-Hanika coeff table (`DTexture`, flattened `3*w*h`)
+     plus per-tri UVs (`DTri.uv0/1/2`); `intersectTri`/`intersectSphere` interpolate
+     the hit UV into `DHit.u/v`; `dTexReflAt()` is the device twin of
+     `Texture::reflectanceAt` (wrap + nearest/bilinear + sigmoid), used via
+     `dDiffuseRho()` in the `shadeStep` diffuse/fluoro branches. `cudaForwardSupported()`
+     no longer rejects `reflectTex >= 0`. Validated GPU-vs-CPU on `textured.ftsl` and
+     `uvmesh.ftsl`: energy matches (absorbed 0.7066 vs 0.7068) and images agree to
+     within Monte-Carlo noise (RMSE ~6/255); the wavefront backend matches the
+     megakernel. The BDPT kernel (mode D) still lacks a textured vertex, so
+     `cudaBdptSupported()` explicitly rejects textured scenes → they use the CPU BDPT.
+  4. **Indexed-spectral palettes** (§9.3). ~~An index image + name→spectrum palette —
+     not implemented.~~ **DONE 2026-07-11 (CPU):** a `texture { ... palette { <idx>
+     spectrum:<name> ... } }` block resolves each index to a named reflectance spectrum
+     at parse time (`Texture::palette`, `src/ftsl.h addTexture`). The red channel,
+     quantized to 0..255, selects an entry per texel — nearest only (indices are
+     categorical, never bilerped) via `Texture::paletteReflectanceAt`. No JH upsampling
+     (palette entries are arbitrary measured spectra used directly), so `buildReflCoeff`
+     skips palette maps and the GPU forward path (`cudaForwardSupported`) rejects them →
+     CPU fallback. Validated by `scenes/palette.ftsl` (a 4-index swatch chart). **Limit:**
+     8-bit index channel → ≤256 entries; 16-bit index maps are future work.
+- **Status:** OPEN (acceptable) — base-color texturing + stb image import done
+  2026-07-10; GPU port done 2026-07-11; **analytic UV projections (planar/spherical/
+  cylindrical) + triplanar box projection done 2026-07-11 (CPU + GPU)**; **non-albedo
+  roughness + film-thickness maps + mix blend-mask done 2026-07-11 (CPU all tracers +
+  GPU forward; GPU BDPT falls back to CPU)**; **indexed-spectral palettes done 2026-07-11
+  (CPU)**. Only an `ior` map (item 2) remains deferred (rare; low priority).
+
+### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
+- **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`
+  (`src/scene.h`), both routed through forward + backward + CUDA:
+  - **Spherical area light** — `light sphere { center x y z  radius r  spd … }` —
+    `shape = EmitterShape::Sphere`, `area = 4·π·r²`. Forward and backward both call
+    `Emitter::samplePoint()` (uniform surface point + outward normal; quad draws are
+    byte-identical so quad scenes stay bit-identical). The FTSL loader also drops an
+    emissive sphere into the geometry (mirroring the area-light quad). Validated by
+    `scenes/spherelight.ftsl` (mode V PASS at 60M photons / 1024 spp; CPU==GPU).
+  - **Point spotlight** — `light spot { origin … dir … inner_angle d  outer_angle d
+    spd … }` — `shape = EmitterShape::Spot`, a cone with a cubic-smoothstep
+    penumbra. Geometric weight is the falloff-weighted solid angle `spotOmega =
+    π·(2−cosᵢ−cosₒ)`, so `power = emitIntegral·spotOmega`, peak intensity/SPD = 1.
+    Forward samples a direction uniformly in the outer cone and reweights beta by
+    `falloff·Ω_outer/spotOmega`; backward connects straight to the light point with
+    a cone-falloff weight (`I(ω)·cosθ/d²`, no area/light-cosine). No emissive
+    geometry (a point). Validated by `scenes/spotlight.ftsl` (mode V PASS at 200M
+    photons / 4096 spp → 3.8% RMSE; CPU==GPU energy).
+  - `finalizeEmitters()` now keys the power law / combined wavelength sampler off a
+    per-emitter `geomWeight()` (area·PI for surfaces, spotOmega for spots); the
+    area/sphere branch keeps the exact `emitIntegral·area·PI` expression so those
+    renders stay bit-identical (verified: cornell FTSL==C++==pre-3c hash).
+- **Constant environment done (2026-07-10, increment 1a):** `light env { spd … }`
+  registers a uniform infinite emitter (`shape = EmitterShape::Env`,
+  `geomWeight = envGeom = 4·π²·R²` with `R` the scene bounding-sphere radius set in
+  `Scene::build()` from the BVH root AABB). Forward emission spawns each photon from
+  a disk of radius `R` perpendicular to a uniformly-sampled sphere direction (joint
+  pdf `1/envGeom` → exactly analog `beta = emitIntegral·envGeom`); backward adds
+  `L(λ)·invPdfλ` on ray-miss; a per-pixel background pass (`addEnvBackground`) supplies
+  the directly-viewed sky in forward mode B. Validated by `scenes/envlight.ftsl`
+  (mode V: forward converges to backward on a **unit** radiance scale — best-fit
+  s→1).
+- **GPU constant env done (2026-07-10, increment 1b):** the device forward kernel
+  now emits env photons (`DEmitter::shape == 3`) from the scene bounding sphere
+  (`DScene::sceneCenter`/`sceneRadius`) exactly like the CPU path, and the
+  directly-viewed sky is added by the backend-agnostic `addEnvBackground()` pass in
+  `main.cpp` — so `cudaForwardSupported()` no longer rejects `envIndex ≥ 0` and env
+  scenes run on the GPU. Verified CPU==GPU on `envlight.ftsl` mode V (both best-fit
+  s≈0.97, absorbed≈0.129, RMSE≈58% at 8M — deltas are independent RNG streams).
+  - **Absolute-radiance We fix (same change):** the model-B pinhole importance was
+    normalizing by the *whole* image-plane area (`imagePlaneArea()`), making the
+    forward tracer measure `radiance / (resX·resY)` — an arbitrary global constant
+    that modes V/P best-fit away and auto-exposure hid. This blocked compositing the
+    (true-radiance) env background with the (scaled) photon surface illumination.
+    Fixed by normalizing by the **per-pixel** image-plane area
+    (`Camera::pixelPlaneArea() = imagePlaneArea()/(resX·resY)`) in `connect()` /
+    `connectVolume()` on **both** CPU (`render.h`) and GPU (`render_cuda.cu`). Now
+    forward measures absolute radiance (mode V/P best-fit s → ~1). Displayed outputs
+    are unchanged (a global scale is invisible after auto-exposure; mode-P
+    `fwd·invF/s` and mode-V RMSE are scale-invariant); verified cornell mode V still
+    PASSes (s 5.8e-5 → 0.98) and CPU==GPU film scale holds.
+  - **Forward env is high-variance (acceptable limitation):** the env photon
+    emission is isotropic over 4π, so in an open scene the vast majority of photons
+    escape without hitting geometry (~87% on `envlight.ftsl`). Combined with
+    single-wavelength spectral spikes, forward mode-B env images are heavily
+    chromatic-noisy and need large `-n` to converge (mode V RMSE falls as 1/√N with
+    s≈1 — variance, not bias: 58%@8M → 27%@60M). Clean env images come from the
+    **backward** reference (mode R). A future variance reduction would importance-sample
+    the emission toward the actual geometry (not just the bounding sphere) and/or
+    trace multiple wavelengths per photon (hero-wavelength); deferred.
+  - **Mode P + env: sky background — DONE 2026-07-11.** The directly-viewed sky is
+    now composited in `renderComposite()` (mode P), not just modes B/V. The pixel
+    classifier became three-way — SPEC (specular-first → backward layer), SKY (camera
+    ray escapes an env scene → env radiance) and DIFF (everything else → forward
+    layer) — and the env radiance (`envXYZForDir`, already in the composite's
+    display-radiance units) is written on SKY pixels. Critically, **SKY pixels are now
+    excluded from the forward→backward scale fit**: they are measured by env radiance
+    directly (forward film ≈ 0, backward film = full bright sky), so including them
+    dragged the best-fit `s` toward 0 — exactly the bias mode V avoids by adding the
+    sky to `fwd` before its `compareFilms` fit. Verified on `envlight.ftsl` mode P:
+    excluding sky pixels restores s 0.27 → 0.957 (matching mode V's ~0.97), the sky
+    renders behind the geometry, and a non-env specular scene (`group.ftsl`) is
+    unaffected (s 0.965, no env line, DIFF/SPEC split unchanged).
+- **Image-based HDRI environment (2026-07-10, increment 2a — DONE, CPU):** `light env
+  { file "sky.hdr"  rotate deg  intensity s }` registers an equirectangular (lat-long)
+  environment. `src/envmap.h` (`EnvMap`) loads the map (via the existing `Texture`
+  loader — `.hdr`/`.pfm`/LDR), upsamples each texel to a physical emission spectrum
+  `L(λ) = scale·S_JH(chroma)(λ)·illum(λ)` (Jakob-Hanika chroma fit × normalized 6504 K
+  illuminant, PBRT RGB-illuminant convention; `scale` carries HDR brightness), and
+  builds a 2D luminance CDF (`Distribution2D`: marginal rows × conditional cols,
+  `sin θ`-weighted) for importance-sampled directions. Wired through `Scene`
+  (`envMap` shared_ptr, `addEnvLight(map)`, direction-dependent `envRadiance(dir,λ)` /
+  `envXYZForDir(dir)` / `sampleEnvDir`), `render.h` (forward emission importance-samples
+  the direction and reweights the flat power by `L(dir,λ)/(4π·pdf_ω·meanSpd(λ))` — a
+  factor that is exactly 1 for a constant env, so those stay bit-identical), `backward.h`
+  (miss term uses the escape direction), `main.cpp` (`addEnvBackground` uses per-texel
+  spectral XYZ), and `ftsl.h` (`file`/`rotate`/`intensity` parse). The emitter power +
+  wavelength CDF use the map's `sin θ`-weighted mean radiance spectrum. Validated by
+  `scenes/envmap.ftsl` + `scenes/sky.pfm` (mode V: best-fit s→~0.95 and climbing with
+  samples — the residual is Monte-Carlo variance from the sun glow, not bias;
+  forward/backward auto-exposure agree to ~3%; energy conserves). Constant env
+  (`envlight.ftsl`) stays **bit-identical** (mode-V scale 0.971252, unchanged).
+  - **Increment 2b — DONE (2026-07-10):** backward env **NEE** at every diffuse and
+    fog-scatter vertex (`neeEnv`/`neeEnvVolume` in `backward.h`): sample `ω` from the
+    map's luminance CDF, shadow-ray past the scene bounds, and **MIS-combine** (balance
+    heuristic) with the BSDF-sampled continuation that reaches the sky on a ray miss.
+    The miss term is added at full weight only on a camera/specular arrival and MIS-
+    weighted otherwise (gated on `specularArrival`), so nothing is double-counted;
+    `envMap->pdf(d)` provably equals `sample()`'s reported pdfW, so the weights sum to
+    1 (unbiased — verified: `envmap.ftsl` mode-V scale stays ~0.947 at 60M/512, energy
+    conserves, residual broadly distributed). All env-NEE work is gated on
+    `scene.envIndex >= 0`, so non-env scenes keep a **bit-identical** RNG stream /
+    backward image (cornell mode V unchanged).
+  - **Increment 2c — DONE (2026-07-10):** GPU port of the lat-long sampler
+    (`render_cuda.cu`). The host flattens the EnvMap into device buffers — per-texel JH
+    `coeff`/`scale`, the mean `avgCoeff`/`avgScale`, and the 2D luminance CDF (marginal
+    `Distribution1D` over rows + one conditional per row) — and the device gets
+    `dReflAt`/`dSample1D`/`dEnvSample`/`dEnvTexel` so the `shape==3` emission branch
+    importance-samples the map and reweights beta by `L(dir,λ)/(4π·pdfW·avgSpd)`. The
+    reweight's shared illuminant cancels in `L/avgSpd`, so no illuminant table is
+    uploaded. `cudaForwardSupported()` now returns true for image env; the constant-env
+    device path is untouched (`sc.env.scale == nullptr`). Verified: GPU vs CPU forward on
+    `envmap.ftsl` agree — energy conserves (sum/emitted=1.0, escaped 0.8893 vs 0.8894),
+    mean RGB within ~0.5%, auto-exposure 53.5 vs 53.8; constant env + all other GPU
+    scenes unchanged.
+- **Deferred (still future):**
+  1. **HDRI env** — image-based environment lighting (`light env { file … }`) is fully
+     done: increments 2a (CPU forward + backward miss/background), 2b (backward env-NEE
+     with MIS), and 2c (GPU forward port) are all complete. Original 7-step plan below,
+     all steps done, kept for reference:
+     **Concrete plan (each sub-step
+     independently
+     buildable + validatable):**
+     1. *Scene bounding sphere.* Add `Vec3 sceneCenter; double sceneRadius;`
+        computed in `Scene::build()` from the BVH root AABB (`center`, `0.5·diag`).
+        The env disk/emission and the "to infinity" shadow-ray length key off this.
+     2. *Env data + importance sampler.* Store the lat-long map as linear RGB +
+        per-texel JH coeffs (reuse `Texture`). Precompute a 2D luminance CDF
+        (marginal over rows, conditional over columns, each row weighted by
+        `sin θ`) → `sampleEnvDir(u1,u2, pdfω)` and `envPdf(ω)`. `envRadiance(ω,λ)`
+        = `reflAt(coeff(ω), λ)` scaled by an intensity factor.
+     3. *Backward first (easiest to validate in mode R).* In `radiance()`, on
+        `!h.valid` return `L + thr·envRadiance(ray.d,λ)·invPdfLambda` when
+        `specularArrival` (direct/mirror view of the sky). Add env NEE at diffuse
+        vertices: sample `ω~envPdf`, shadow-ray to `sceneRadius`, add
+        `f·envRadiance(ω,λ)·cosSurf·invPdfLambda/envPdf(ω)`. Fold the env into the
+        combined wavelength sampler `g(λ)` (its geomWeight ≈ `π·sceneRadius²·avgLum`).
+     4. *Forward emission.* New branch in `tracePhoton`: `shape == Env` emits a
+        photon FROM the sky — importance-sample `ω~envPdf`, pick a point on the disk
+        of radius `sceneRadius` perpendicular to `-ω` tangent to the bounding sphere,
+        fire along `-ω`, `beta = envPower · envRadiance(ω)/(avgLum·envPdf(ω))`.
+        `envPower = π·sceneRadius²·∫envRadiance dω` feeds the selection CDF like any
+        other emitter's `power`.
+     5. *Mode-B background.* In forward mode B a camera ray isn't traced, so the sky
+        isn't directly visible via `connect()`. Add a per-pixel background pass:
+        for each pixel, project the pinhole ray, and if it escapes, splat
+        `envRadiance(dir,λ)` (spectrally integrated) — a cheap deterministic add,
+        analogous to the existing direct-emitter `connect`.
+     6. *CUDA.* Upload the env RGB+coeff tables + the marginal/conditional CDFs;
+        port `sampleEnvDir`/`envPdf`/`envRadiance` and the forward disk-emission
+        branch. Escaped photons already terminate; only emission + (optional) the
+        mode-B background pass need device code. Keep `cudaForwardSupported()`
+        returning true for env scenes once ported (else fall back to CPU).
+     7. *Validation.* `scenes/envlight.ftsl` (a diffuse box open to the sky):
+        mode V forward-vs-backward RMSE < 5%; energy conserves; CPU==GPU. A constant
+        (single-colour) env is the smallest first milestone — it exercises steps
+        1/3/4/5/6 with a trivial step 2 (uniform pdf), so land that before the full
+        image-based 2D CDF.
+  2. **Sphere-light importance sampling.** *(DONE 2026-07-10.)* The backward
+     reference's sphere NEE now does cone/solid-angle importance sampling of only
+     the visible cap toward the receiver (`Emitter::sampleSphereCone`, PBRT's
+     `Sphere::Sample`): sample `cosθ` uniformly in `[cosθmax, 1]` about the
+     centre-to-point axis (`sinθmax = r/dc`), find the near intersection, and weight
+     in solid-angle measure with `pdfW = 1/(2π(1−cosθmax))` — so no draws land on
+     the far, self-occluded, back-facing hemisphere. A receiver inside the sphere
+     (`dc ≤ r`) falls back to uniform `samplePoint`. Applies to both surface
+     (`neeLight`) and fog-vertex (`neeVolume`) NEE. Quad lights are untouched and
+     keep a bit-identical RNG stream. Validation: `spherelight.ftsl` mode V best-fit
+     scale → 0.9997 (unbiased) at 80M/1024 spp, RMSE 2.5% bulk; sphere+`-fog 0.5`
+     scale 0.988; cornell (quad) unaffected. Only the backward reference changed —
+     the forward tracer emits sphere photons omnidirectionally as before, so the
+     GPU/CUDA path is unaffected.
+  3. **Spot penumbra sampling.** The forward spot samples uniformly in the outer
+     cone then reweights by falloff, so photons in the dark penumbra edge carry
+     small weights (mild variance). Exact CDF sampling of the smoothstep band would
+     be lower-variance but needs a quartic inverse; uniform+reweight is correct.
+- **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; **constant
+  environment (`light env { spd … }`) done 2026-07-10 (increments 1a CPU + 1b GPU)**
+  incl. the absolute-radiance We fix and on-device env emission; **image-based HDRI
+  (`light env { file … }`, 2D luminance CDF + per-texel JH spectral upsampling) fully
+  done 2026-07-10 (increments 2a CPU forward+backward miss/background + 2b backward
+  env-NEE with MIS + 2c GPU forward port)**; **sphere-light cone importance sampling
+  in the backward reference done 2026-07-10**; only spot penumbra CDF sampling (item
+  3) still deferred.
+
+### Built-in artificial-light SPDs: F-series transcribed from memory, discharge lamps are models not measurements
+- **What (added 2026-07-11):** `src/lights.h` now provides spectral envelopes for
+  artificial light sources, wired into `resolveLight()` / `preset:<name>`:
+  - **CIE F-series fluorescents** — `fluorescentF2/F7/F11()` (`f2`/`cool-white`,
+    `f7`/`daylight-fl`, `f11`/`triphosphor`), tabulated 380–780 nm at 5 nm via
+    `sampledSPD()` → `tabulatedSpectrum()`.
+  - **Gas-discharge lamps** — `sodiumHigh()` (`hps`/`sodium`), `sodiumLow()`
+    (`lps`/`sodium-low`), `mercuryVapor()` (`mercury`/`hg`), `metalHalide()`
+    (`metal-halide`/`mh`).
+  - **CCT-tuned phosphor LED** — `ledCCT(kelvin)` via the `led<K>k` name (e.g.
+    `led4000k`).
+- **The honesty caveats (tech debt, not a bug):**
+  1. ~~**The F2/F7/F11 tables were transcribed from the canonical CIE 15 illuminant
+     data by hand/from memory.**~~ **VERIFIED & CORRECTED 2026-07-11.** The baked
+     tables were diffed against the authoritative CIE 15:2004 F-series (via
+     colour-science), which caught a real bug: `fluorescentF7()`'s tail (685–780 nm)
+     was wrong (it wiggled back up to 4.34 at 765 nm instead of decaying smoothly).
+     F7 is now corrected; F2/F11 already matched exactly. The authoritative tables
+     are committed to `data/spd/cie_f2.csv` / `cie_f7.csv` / `cie_f11.csv`. The
+     runtime measured-SPD loader now exists (`file:<path>`, DONE 2026-07-11 — see
+     below), so a scene can drive a light straight from those CSVs
+     (`spd file:data/spd/cie_f2.csv`, verified pixel-identical to `preset:f2` by
+     `scenes/measured_spd.ftsl`). Remaining sub-item: the *built-in* `preset:f2/f7/f11`
+     names are still baked in-source rather than reading the CSVs at startup (a minor
+     wiring change now that the loader exists).
+  2. **The sodium / mercury / metal-halide entries are deliberately *illustrative*
+     spectroscopic models, not per-lamp measurements** — correct line positions and
+     plausible relative strengths (from spectroscopy references) over analytic
+     continua, tuned to give the right visual cast. They are not a specific
+     manufacturer's lamp and are not radiometrically calibrated. Same intended
+     upgrade path: swap for measured SPDs when the data-file loader lands.
+- **Proper fix:** the measured-SPD data loader now exists (`file:<path>` — DONE
+  2026-07-11), so the path to fully closing this is (a) mirror measured lamp SPDs
+  (LSPDD / LICA-UCM, see `data/README.md`) into `data/spd/`, and (b) point the
+  built-in `preset:` names at those CSVs at load time instead of the baked/analytic
+  tables — turning the built-ins into verifiable data. The discharge lamps still need
+  their measured CSVs fetched; the F-series CSVs are already present.
+- **Status:** OPEN (acceptable, reduced) — loader + F-series data done; discharge-lamp
+  measurements and the preset-reads-CSV wiring are the tracked remainder.
+
+### Built-in material presets: skin/soil & iridescent recipes are representative (metals + most natural curves now measured)
+- **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
+  and recipes, plus expanded glasses in `src/spectrum.h`:
+  - **Metals** — `metal:Au|Ag|Cu|Al|Cr|brass` reflectance R(λ) (`metalGold()` etc.).
+    Au/Ag/Cu/Al/Cr now computed from published measured n,k (Johnson & Christy 1972,
+    Rakić 1995/1998; CC0 via refractiveindex.info) with
+    `tools/ri_nk_to_reflectance.py` — see resolved item below. `brass` is still an
+    alloy fit (no single canonical dataset).
+  - **Glasses/crystals** — `glass:` gained `silica`/`fused-silica`/`quartz`,
+    `sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`
+    (Sellmeier for glass/crystal, `cauchy()` fits for water/ice/plastics), unified
+    behind `resolveGlassIor()`.
+  - **Natural diffuse** — `reflectance:leaf|skin|skin-dark|snow|soil|brick|concrete`.
+    `leaf`/`snow`/`brick`/`concrete` are now measured USGS splib07 samples (see item 2);
+    `skin`/`skin-dark`/`soil` remain representative shapes.
+  - **Whole-material recipes** — `material { preset <name> }` via
+    `resolveMaterialPreset()`: metals (glossy), glasses (dielectric), and iridescent
+    `soap-bubble`/`oil-slick`/`anodized-ti`/`morpho`/`beetle`/`nacre`.
+- **The honesty caveats (tech debt, not a bug):**
+  1. *(RESOLVED 2026-07-11)* Metal reflectances were hand-transcribed and coarse;
+     now regenerated from the canonical measured n,k datasets (Johnson & Christy
+     1972 for Au/Ag/Cu at native sample points, Rakić 1995/1998 for Al/Cr at 20 nm)
+     via `tools/ri_nk_to_reflectance.py`, which computes normal-incidence
+     R=((n-1)²+k²)/((n+1)²+k²). Colours re-validated on diffuse-lit spheres
+     (gold/copper/salmon/neutral-silver/neutral-chrome). Only `brass` remains an
+     alloy fit — no single canonical dataset exists for it.
+  2. *(PARTLY RESOLVED 2026-07-11)* Most `reflectance:` natural curves are now
+     measured samples from the USGS Spectral Library v7 (splib07, public domain,
+     DOI 10.5066/F7RR1WDJ), extracted with `tools/splib_to_reflectance.py`:
+     `leaf` = fresh green Oak leaf (ASD, 10 nm — captures the real chlorophyll dip
+     and steep red-edge), `snow` = melting snow mSnw01a, `brick` = medium-red
+     building brick GDS353, `concrete` = light-grey road concrete GDS375 (all ASD).
+     Still representative shapes: `skin`/`skin-dark` (human skin isn't in splib) and
+     `soil` (splib's Soils chapter is mineral mixtures/sand, not a generic loam).
+     Real vegetation/skin still vary enormously sample-to-sample.
+  3. **The iridescent recipes (`soap-bubble`, `oil-slick`, `anodized-ti`, `morpho`,
+     `beetle`, `nacre`) are physically-motivated film/stack *configurations*, not
+     measured spectra** — layer indices/thicknesses tuned to give the right colour
+     family, not matched to a specimen.
+- **Renderer note (not a preset bug):** metal/glass presets are *specular*, so they
+  show colour only through what they reflect/transmit. In a closed pinhole (mode B)
+  box with nothing bright around them they read near-black — expected forward-tracer
+  behaviour (same as the existing `mirror`/`glossy`/`dielectric` types); use mode A,
+  an environment light, or surrounding geometry to see them. Their reflectance data
+  is correct (verified by putting the same `metal:` spectra on a diffuse surface).
+- **Proper fix (remaining):** three offline generators exist — `tools/csv_to_table.py`
+  (generic CSV→`table`), `tools/ri_nk_to_reflectance.py` (refractiveindex.info
+  n,k→reflectance), and `tools/splib_to_reflectance.py` (USGS splib07→reflectance) —
+  plus, as of 2026-07-11, a *runtime* `file:<path>` loader so a reflectance CSV can be
+  bound directly (`reflect file:data/reflectance/skin.csv`) without re-baking source.
+  Metals and leaf/snow/brick/concrete are done. Remaining debt is finding measured
+  samples for `skin`/`skin-dark` (a skin-optics dataset, e.g. NIST JRES 122.026) and
+  `soil` (a loam/dirt reflectance, e.g. ECOSTRESS/ISRIC) and dropping them into
+  `data/`, plus optionally validating the iridescent recipes against specimens.
+- **Status:** OPEN (acceptable, much reduced) — metals + 4 natural curves are now
+  measured data; skin/soil and iridescent recipes remain representative. All presets
+  load on CPU==GPU and render the right colours.
+
+### Full physical `layered` material [IMPLEMENTED 2026-07-11]
+- **What:** both the FTSL `type mix` material (stochastic per-photon pick among named
+  child materials, weights ≤ 1, remainder absorbs — Phase 2d, `scenes/mixmat.ftsl`,
+  mode V PASS, CPU==GPU) and the richer physical `layered` material (spec §3.2) now
+  ship. `layered` is a specular *coat* interface over a weighted *body*: on each hit a
+  photon reflects off the coat with probability R, else it enters and one body lobe is
+  chosen from a `mix`-style `layer "name" weight` list (leftover weight absorbs). Coat R
+  + body weights partition the photon, so the surface is energy-consistent (validated:
+  `scenes/layered.ftsl`, forward mode B and backward mode R, `absorbed+escaped=1.0`,
+  residual 0).
+- **Coat models:** `coat { reflectance … }` selects the interface reflectance:
+  `fresnel` (plain dielectric Fresnel from the coat `ior`, rises toward grazing —
+  clearcoat sheen), `thinfilm` (Airy multiple-beam reflectance from `film_ior` /
+  `film_thickness` over the body index — soap-bubble iridescence), or `manual` (a flat
+  `specular` fraction). The coat reflection is a glossy lobe about the mirror direction
+  (`roughness` / `roughness_map`, lossless), and `film_thickness_map` gives spatially
+  varying iridescence just like a `thinfilm` material.
+- **Constraints of `mix`/`layered` (by design):** children/body lobes must be non-mix,
+  non-layered materials (nesting rejected by the parser to keep resolution single-step
+  and the CUDA CDF bounded); the CUDA path supports ≤ 8 child lobes (more → CPU
+  fallback); a mix containing a fluorescent child is forward-only but as of 2026-07-11
+  runs on the GPU forward path (the device fluoro port resolves the mix child before
+  dispatch and the `D_FLUORESCENT` `shadeStep` branch handles it — see the
+  GPU-fluorescence note below); a textured child is likewise fine.
+- **Scope / fallbacks:** `layered` is CPU-only (forward + backward). GPU forward/backward
+  fall back to the CPU tracer (`cudaForwardSupported` rejects any Layered material, like
+  indexed palettes); BDPT (mode D) refuses a Layered scene with a clear message
+  (`render it with mode B/P or mode R`) rather than dropping the surface via the
+  randomWalk `default: terminate`. A per-lobe BDPT vertex strategy for `layered`
+  (mirroring the forward split) is possible future work but not required for the
+  reference/forward validation paths.
+- **Status:** DONE — `mix` 2026-07-10; `layered` 2026-07-11 (CPU forward + backward).
+
+### Backward reference tracer now validates fluorescence [RESOLVED 2026-07-11]
+- **What (was):** `src/backward.h` had no Fluorescent case — a fluorescent material
+  fell through to the Diffuse branch, so modes R (reference) and V (validate)
+  silently mis-rendered `-scene fluoro`; fluoro scenes were forward-only.
+- **Fix applied:** added a bispectral reradiation case to `BackwardRenderer::radiance`
+  — the unbiased backward adjoint of the forward tracer's `fluoroInteract()`:
+  1. **Elastic channel** — diffuse NEE (+ RR continuation) at the output wavelength
+     with the small elastic base `rho(lambda)`, exactly as before.
+  2. **Fluorescent DIRECT NEE** — a *second* excitation wavelength `lambdaIn` is drawn
+     from the combined emission distribution (reusing `scene.emitSampler` /
+     `invPdfLambda`, so multi-light SPDs weight correctly). The lights are connected at
+     `lambdaIn` with a reradiation "albedo" `aEff(lambdaIn)*Q` (shared `fluoroWeights`),
+     and the result is tinted by the emission colour at the OUTPUT wavelength
+     `gOut = (M(lambda)/∫M) * invPdfLambda` — the `invPdfLambda` factor deconvolves the
+     camera-path wavelength-sampling density so the reradiated colour follows `M(lambda)`
+     and not the light SPD used to sample `lambda`.
+  3. **Indirect excitation** — a single stochastic continuation splits between an elastic
+     bounce at `lambda` (prob `rho`) and a wavelength-switched bounce to `lambdaIn`
+     (prob `pF ~ gOut*aEff*Q`, throughput `*= wFluo/pF`), so light that bounces before
+     exciting the dye (light→wall→dye→camera) is captured without double-counting the
+     direct term (`specularArrival=false` suppresses the emission-on-hit term).
+- **Validation (mode V, forward mode-B vs backward, `-scene fluoro`):** best-fit
+  backward→forward scale = **0.996** (≈1, i.e. the two agree on ABSOLUTE scale — a wrong
+  bispectral normalisation would not), residual 94% firefly-concentrated (variance not
+  bias), and the bulk RMSE (ex. top-1%) scales as **1/sqrt(N)**: 2.05% at 40M/400spp →
+  **1.02%** at 160M/1600spp (4× samples ⇒ exactly 2× reduction), which a transport bias
+  could not produce. `-checkfluoro` (deterministic sampler/branch/Stokes-shift self-test)
+  is retained as a fast complementary check.
+- **Remaining (BDPT / mode D):** bidirectional bispectral fluorescence (a wavelength
+  change inside a light↔camera connection needs hero-wavelength MIS, à la Mojžík et al.
+  2018) is still deferred — mode D refuses fluoro with a clear message pointing to modes
+  B/P (forward) or R (backward). The backward reference now covers fluorescence
+  validation, so this is low priority.
+- **Status:** RESOLVED 2026-07-11 for modes R/V; BDPT (mode D) bispectral vertices
+  remain future work.
+
+### RESOLVED: Backward reference tracer now validates participating media (fog)
+- **What (was):** `src/backward.h` ignored `scene.medium` — its camera rays didn't
+  sample volume free-flight or in-scattering, so `-fog` with modes R/V would have
+  compared a volumetric forward image against a vacuum backward image (garbage
+  residual). Fog was therefore forward-only and never set in refMode.
+- **Fix applied:** added a homogeneous-medium path to `BackwardRenderer::radiance`
+  that mirrors the forward tracer exactly:
+  1. **Free-flight sampling** competes with the surface hit each bounce
+     (`tMed = -ln(1-u)/sigma_t`; on `tMed < dSurf` a volume collision occurs).
+  2. **`neeVolume()`** — phase-function next-event estimation at the collision
+     vertex: the surface BRDF/cosine are replaced by the single-scattering albedo
+     and the HG phase function `hgPhase(dot(wIn, wi), g)`, with fog transmittance
+     `exp(-sigma_t*dist)` on the shadow ray (the backward mirror of the forward
+     `connectVolume`). The phase angle uses reciprocal conventions to the forward
+     side, both equal to the physical `dot(prop_in, prop_out)`.
+  3. **Analog scatter/absorb** continuation: survive with prob = albedo, then
+     `sampleHG` a new direction (throughput unchanged); otherwise absorb.
+  4. **Beer-Lambert on surface NEE too:** `neeLight` now attenuates its shadow ray
+     by `exp(-sigma_t*dist)` (took a new `lambda` parameter).
+- **Validation (mode V, forward vs backward, identical fog):** the best-fit
+  backward→forward scale agrees to ~4 sig figs across no-fog / fog-g0.3 /
+  fog-rayleigh, which a transport bug could not produce. The raw-linear residual is
+  firefly-dominated (top-1% pixels hold 77–95% of it) from the unbounded 1/dist^2
+  light connection, so full RMSE plateaus but the **bulk RMSE (ex. top-1%) scales
+  as ~1/sqrt(N)**, proving variance not bias: for fog g=0.3 alb=0.85 at 256^2, bulk
+  RMSE went 7.67% (120M/800spp) -> 4.53% (480M/3200spp) [1.69x ~ ideal 2x], with
+  firefly concentration held constant at ~86% and the 4x run reporting PASS.
+  No-fog bulk RMSE is 1.2% (95% firefly-concentrated). The firefly-vs-bias
+  diagnostic (residual concentration + bulk RMSE) was added to `compareFilms` in
+  `src/main.cpp` specifically to make this distinction rigorous.
+- **Status:** RESOLVED 2026-07-10. `-fog` can now be combined with modes R/V.
+  `-checkfog` (deterministic transmittance / HG mean-cosine / phase-normalization
+  self-test) is retained as a fast complementary check.
+
+### Model A redefined as the finite-lens physical camera (GPU port landed)
+- **What:** as of 2026-07-11 **mode A is the physical finite-lens camera**: a finite
+  aperture + thin lens + film imaged by next-event estimation of the pupil
+  (`Renderer::connectLens`/`camera.h::lensImage`). It replaces the old contact-sensor
+  "mode A" (a flat film wall — no aperture, so it integrated the whole hemisphere per
+  pixel and could not form an image; retired). Mode B is now the pinhole (`aperture→0`)
+  limit; mode C is the brute-force forward-catch oracle A is validated against
+  (matching framing/DOF/scale — auto-exposure within ~2.5% at equal aperture/focus).
+- **GPU port (done):** the CUDA `DCamera` now has `lensImage` (thin-lens `u' = u − ρ/f`,
+  shared with the mode-C `catchPhoton`) and `kTrace` runs device `connectLens`/
+  `connectLensVolume` splats under `camMode 'A'` — emitter-direct, diffuse-vertex, and
+  fog-in-scatter, mirroring the CPU. `renderForward` selects `camMode 'A'` on the GPU
+  and `runRender` treats mode A as a GPU-forward mode. Validated vs CPU (Cornell, 192²,
+  wide aperture 0.25/focus 2.2, 40M photons): energy to 4 sig figs, auto-exposure 2.99e-8
+  GPU vs 2.95e-8 CPU (1.4%), image RMSE 2.6/255 (pure MC noise — the GPU is an
+  independent realization); the tiny-aperture A→B pinhole limit holds on-device (sharp,
+  RMSE 3.16/255 vs mode B). The old contact-sensor GPU `deposit` path was removed with
+  the port. Mode A remains **rectilinear only** (a real fisheye needs a wide-angle lens
+  element the single thin-lens can't form) — a fisheye+A/C camera is rejected, and a
+  fisheye lens still falls back to the CPU even on `-device gpu` (see GPU-fisheye entry).
+
+### GPU backend (`-device gpu`) covers forward camera models A/B/C
+- **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCuda`) implements
+  the finite-lens next-event splat (A), the pinhole splat (B), and the finite-aperture
+  thin-lens forward catch (C), selected by the `camMode` parameter. It is used for
+  `-mode A/B/C` and the forward pass of `-mode V`. It also tracks per-pixel photon
+  **hit counts** on-device (a `d_hits` buffer incremented in `filmAdd`, downloaded into
+  `Film::hits`) — matching the CPU `Film::add`. This fixed a latent bug where the GPU
+  never populated `hits`, so the progressive `~X% noise` graininess estimate (and the
+  new `-noise` stop) read a constant **0%** for any `-device gpu` render. The backward
+  tracer is now on-device too: **mode R has its own GPU backward megakernel** (`kBackward`,
+  Plan A, 2026-07-11 — including the physical mesh-lens as a ray-gen front-end), and the
+  **mode-P composite reuses it for its camera-side layer** (`renderComposite` calls
+  `renderBackwardCuda` when `cudaBackwardSupported`), so both of P's layers run on the GPU
+  within the backward-GPU scope. Only scenes outside that scope (fog/env/spot/collimated/
+  fluorescence) — and mode V's backward reference, kept on the CPU by design as a stable
+  ground truth — still use the CPU backward tracer. **Fluorescence is now ported on-device (done
+  2026-07-11):** each Fluorescent material bakes its excitation spectrum
+  (`DMaterial.fluoAbsorb`) and emission-SPD CDF (a flat `fluoCdfAll` slice, per-material
+  `fluoCdfOffset/N/step`); the `shadeStep` `D_FLUORESCENT` branch splats the elastic
+  channel at lambda and the glow channel at a Stokes-shifted lambda' (`sampleFluoEmit`)
+  with albedo `aEff*fluoYield`, then stochastically continues (elastic / reemit / absorb)
+  exactly like `render.h`'s `fluoroInteract`. `shadeStep`'s `lambda` became a reference
+  (Stokes shift mutates it), and the wavefront `kWfShade` now writes `st.lambda[slot]`
+  back on the continue branch. `cudaForwardSupported()` no longer rejects Fluorescent
+  materials. Validated GPU-vs-CPU (fluoro scene, mode B and mode A): energy conserves
+  (`sum/emitted=1.0`, absorbed 0.7034 vs 0.7036), mean RGB matches to ~0.1/255, image
+  RMSE 3.5/255, wavefront matches the megakernel, and `-checkfluoro` PASSes. The BDPT
+  kernel (mode D) has no fluorescent vertex strategy, so `cudaBdptSupported()` explicitly
+  rejects fluorescence → CPU fallback (mode D already refuses fluoro scene-wide anyway).
+- **Why acceptable / validated:** model B is the default and the one mode V
+  validates. The kernel `kTrace` mirrors `Renderer::tracePhoton` exactly and gates the
+  camera-specific work on `camMode`: emitter/diffuse/in-scatter `connectLens` runs for
+  A, the pinhole `connect`/`connectVolume` for B, and `catchPhoton` (thin lens
+  `u' = u - rho/f`) for C. (Mode A validation is in the redefinition entry above; the
+  historical **Mode A bullet below** records the now-removed contact-sensor GPU
+  `deposit` path, not the current finite-lens next-event mode A.)
+  Validation vs CPU (Cornell, 128²):
+  - **Mode B:** image RMSE ≈ 0.85/255 at 200M photons (pure MC noise); `-mode V
+    -device gpu` PASSes vs the backward reference (bulk RMSE 4.17% ≈ CPU 4.22%);
+    ~14× speedup (400M @256²: 153s CPU → 10.9s GPU on an RTX 4090).
+  - **Mode A (retired contact-sensor GPU path — historical):** energy report matched
+    to 4 sig figs (sensor 0.3298 vs 0.3299); image RMSE scaled as √N — 11.18/255 @40M
+    → 5.11/255 @200M (5× photons, ideal 2.24×, measured 2.19×), proving variance not
+    bias. This validated the old flat-film-wall mode A, which has since been replaced
+    by the finite-lens next-event camera (validated separately above); the device
+    `deposit` path it exercised has been removed. Retained only as a historical record.
+  - **Mode C:** energy report matches to 4 sig figs; with a wide aperture (0.25,
+    focus 2.2) the caught fraction matches exactly (sensor=0.0058) and per-image
+    auto-exposure agrees (1.60e-8 vs 1.59e-8). Image RMSE scales as √N —
+    15.70/255 @200M → 8.10/255 @800M (4× photons, ideal 2×, measured 1.94×) —
+    proving variance not bias. (The CPU is deterministic across runs, so GPU is the
+    only independent noise realization; the small default aperture is catch-starved
+    and its tone-mapped RMSE is dominated by per-image auto-exposure.)
+- **Spectral baking:** device materials/fog sample each `std::function` Spectrum into
+  a fixed 96-entry table over [360,830] nm with linear interpolation (`SPEC_N=96`).
+  Smooth reflectances/Sellmeier indices make this accurate to within MC noise; a
+  pathologically spiky spectrum would need a finer table. CIE CMFs are ported
+  analytically (no table).
+- **Precision (mixed FP32/FP64, default float transport):** consumer GeForce GPUs run
+  FP64 at ~1/64 the FP32 rate, so the megakernel computes all geometry/BRDF/spectral
+  transport in a compile-time `Real` scalar (`float` by default) while accumulating the
+  film and energy in `double` (`atomicAdd` on `double*`). Build with
+  `-DFTRACE_GPU_FP32=OFF` for a full-FP64 device path (bit-closer to the CPU, far slower
+  on GeForce; sensible on datacenter cards or for precision debugging). The CPU renderer
+  is always `double` and remains the ground-truth. Float-safe self-intersection epsilons
+  (`RAY_EPS=1e-4`, `DET_EPS=1e-6`) replace the FP64 `1e-6`/`1e-9`. **FP32 validated vs
+  FP64 CPU (Cornell, RTX 4090):** energy conserves exactly (`sum/emitted=1.000000`,
+  residual=0 on A/B/C/V — no self-intersection leak from the float epsilons); fractions
+  converge to 4 sig figs (retired contact-sensor mode A sensor 0.3298 vs 0.3301, mode C 0.0059 vs 0.0058); mode
+  V PASSES (bulk RMSE 2.89%, firefly-dominated); ~14× faster than FP64 (400M @256² in
+  0.76s vs 10.9s). The DVec3 3-arg ctor deliberately keeps `double` params so host
+  brace-init from `double` Scene coords is a widening (legal) conversion, never
+  narrowing; spectral/CDF tables stay `double` (host-baked, tiny, cached).
+- **Portable build (multi-arch) + HIP-ready:** `-DFTRACE_CUDA_ARCH=` selects the device
+  arch set — `native` (default; the local GPU only, fast builds), `all-major` (a
+  redistributable fat binary: one cubin per major arch + forward-compatible PTX so newer
+  GPUs JIT at load), `all`, or an explicit `"75;86;89"` list. The device kernel is
+  written in the portable CUDA/HIP subset (`__global__`/`__device__`, grid-stride, double
+  `atomicAdd`, `<<<>>>` launches); the only vendor-specific surface — the host runtime API
+  (device query, malloc/memcpy/memset/free, error strings, synchronize) — is isolated
+  behind a compat block at the top of `render_cuda.cu` that maps `cuda*` → `hip*` under
+  `-DFTRACE_USE_HIP`/`__HIP_PLATFORM_AMD__`. Porting to AMD ROCm is therefore a
+  build-system change (compile this one file with `hipcc`), not a code rewrite. **CUDA is
+  the supported GPU backend today; HIP is a near-drop-in future target (untested — no AMD
+  hardware here).**
+- **Proper fix — DONE (2026-07-11):** the backward tracer is now ported to CUDA — mode R
+  has its own GPU backward megakernel (`kBackward`, including the physical-lens ray-gen
+  front-end), and the mode-P composite reuses it for its camera-side layer. (The device
+  fluorescence path and textured-albedo path are done too — see above.) Remaining CPU-only
+  backward work: scenes outside the backward-GPU scope (fog/env/spot/collimated/
+  fluorescence) and mode V's reference (kept on the CPU by design).
+- **Status:** OPEN (acceptable) — logged 2026-07-10; A/C, mixed-precision FP32, portable
+  multi-arch build, and the HIP compat layer added same day. Requires a CUDA toolkit at
+  configure time; without one the project builds CPU-only and `-device gpu` warns and
+  uses the CPU.
+
+### GPU scaling path: megakernel vs. wavefront (IMPLEMENTED — both backends ship)
+- **Status:** both backends now exist. The **megakernel** (`kTrace`) is the default; the
+  **wavefront** (streaming) backend is opt-in via `-wavefront`. They share the exact same
+  device physics — `genPhoton()` (emitter sample + direct connect) and `shadeStep()` (one
+  bounce: medium/catch/material dispatch) are `__device__` functions called by both — so
+  only the *scheduling* differs. Because of that shared code, adding the wavefront left the
+  megakernel bit-for-bit identical (validated: cornell/materials mode B/C images and energy
+  reports unchanged after the extraction refactor).
+- **Context:** the **megakernel** is one `kTrace` launch where each thread runs an entire
+  photon path (emit → bounce loop → connect/catch/deposit) start to finish. This is the
+  right choice for *this* renderer's typical case: an RTX 4090 has huge register/occupancy
+  headroom, Cornell-class scenes are shallow, and a single kernel keeps all state in
+  registers with no round-trips to global memory. It hits ~500M+ photons/s in FP32.
+- **The known limitation (thread divergence):** in a megakernel, threads in a warp that
+  take different material branches (a dielectric refraction next to a diffuse bounce next
+  to a grating), or that terminate after wildly different path lengths, **serialize** —
+  the warp runs at the speed of its slowest/most-divergent lane, and finished lanes sit
+  idle while others keep bouncing. The megakernel also carries the register footprint of
+  *every* material's code path in *every* thread, capping occupancy. Both effects get
+  worse as scenes gain more material variety and deeper paths, and they bite harder on
+  smaller GPUs (fewer SMs / less latency-hiding to absorb the idle lanes).
+- **What we shipped (wavefront / path-regeneration):** the tracer is split into two
+  coherent stages that alternate over a **persistent pool of photon slots** (SoA state:
+  ro/rd/beta/lambda/rng/bounce/alive/hit, W = min(N, 1M) slots): **extend** (`kWfExtend`,
+  one `closestHit` per live slot) then **shade** (`kWfShade`, one `shadeStep` per live
+  slot). A warp's threads therefore execute the same stage together instead of diverging
+  on per-photon path length. When a path terminates (or hits the bounce cap), its slot
+  **immediately regenerates a fresh photon** (`wfSpawn` claims the next index from an
+  atomic budget counter) — path compaction by regeneration — so SIMD lanes stay full until
+  all N photons are traced. The host loop (`wavefrontTrace`) reads a live-slot counter each
+  pass and stops when the pool drains. **Phase 2 not yet done:** a *sort/compaction by
+  material* before the shade stage would additionally kill BSDF-branch divergence (every
+  thread in a warp running the same material) — that's the remaining coherence win over
+  what's implemented, and the natural next step if a material-diverse scene proves
+  shade-divergence-bound.
+- **The cost:** the wavefront reads/writes the whole photon state to global memory every
+  bounce and launches two kernels per pass, so it's *not* a win for shallow, uniform scenes
+  on a big GPU — the megakernel's register-resident state wins there. Measured on an RTX
+  4090, materials mode B, 400M photons: megakernel 0.79 s vs wavefront 1.60 s (~2× slower),
+  exactly the expected regime. The wavefront's payoff is on divergent / deep-path scenes and
+  smaller GPUs; energy conservation and image agreement (to within Monte-Carlo noise) hold
+  across every scene tested (cornell, materials A/B/C, spotlight, envlight, thin-film,
+  multilayer, mix, fog).
+- **Re: "wavefront helps divergent scenes AND small GPUs" (todo.txt question):** it's
+  *both*, and they're related. (1) *Divergent scenes* — many materials and/or highly
+  variable path lengths — benefit from the per-material sort (kills branch divergence) and
+  compaction (kills path-length divergence). (2) *Small GPUs* benefit because they have
+  less occupancy/latency-hiding headroom to paper over idle lanes and high per-thread
+  register pressure, so keeping warps coherent and full matters more there. A big GPU on a
+  shallow uniform scene (our current case) is the one regime where the megakernel clearly
+  wins, which is why we ship it first.
+- **Decision:** the megakernel stays the default/recommended path for the scenes this
+  renderer targets (shallow, uniform, big GPU); the wavefront ships as an opt-in
+  (`-wavefront`) for the divergent/deep-path/small-GPU regime. Remaining optional work: the
+  Phase 2 per-material shade sort (above), and a heuristic for `-device auto` to pick the
+  backend by scene material variety + path depth rather than always defaulting to the
+  megakernel.
+
+## Performance
+
+### RESOLVED: Diffuse-mesh renders were ~60× slower per photon (degenerate BVH)
+- **Symptom:** The Cornell + diffuse torus (`-mesh torus.obj`) traced at
+  ~34–37 µs/photon, vs ~0.55 µs/photon for the Cornell + glass sphere. 3M photons
+  took ~112s. Made mesh scenes impractical.
+- **Root cause (found by instrumentation):** The BVH build was leaving giant
+  leaves. Added a `-bvhstats` diagnostic (nodes/leaf-tests per ray + leaf-size
+  histogram) which showed the 16k-tri torus BVH had only **245 nodes / 123 leaves,
+  max leaf = 9334 primitives**, and each ray did **~1091 leaf primitive tests**.
+  The culprit was the SAH termination in `Bvh::buildRecursive` (`src/bvh.h`):
+  `if (bestSplit < 0 || bestCost >= leafCost) makeLeaf();`. Object-SAH on a
+  ring-like shape hits a top-level pathology — splitting a torus through its
+  centre yields two C-shaped halves whose AABBs each nearly equal the *whole*
+  box, so every candidate split has cost ≈ the leaf cost. The greedy "only split
+  if it lowers SAH" test therefore gave up immediately at the top and dumped
+  most of the mesh into one leaf. (Path length was a red herring: the diffuse
+  Cornell walls dominate bounce count regardless of the mesh.)
+- **Fix applied:**
+  1. **BVH (the real fix):** use SAH only to *choose* the split plane, and always
+     recurse down to `LEAF_SIZE`, falling back to a median (`nth_element`) split
+     when SAH finds no usable partition. Result: 245→**10425 nodes**, max leaf
+     9334→**4**, leaf-tests/ray 1091→**0.7**. Torus 3M render 112s→**1.3s**
+     (0.43 µs/photon — now *faster* than the glass-sphere reference).
+  2. **Front-to-back traversal ordering** in `traverseClosest` (descend nearer
+     child first; cull children against `tMax` at push time). Minor on its own
+     (~8%) but correct and keeps the win robust.
+  3. **Russian roulette** for Diffuse/Mirror/Glossy in `Renderer::tracePhoton`
+     (`src/render.h`): terminate with prob `1-reflectance`, keep `beta` unchanged
+     on survival. Unbiased; caps path length (residual now 0.0000) and removed the
+     now-dead `betaCutoff`. `maxBounce=32` kept as a hard safety cap.
+- **Validation:** `-checkbvh` still reports 0 mismatches on cornell/materials/
+  prism/torus; energy conserves exactly (`sum/emitted=1.000000`) on all scenes.
+- **Status:** RESOLVED 2026-07-10. Logged & fixed same day.
+
+## Scene interoperability / importers
+
+- **Mitsuba XML → FTSL: DONE 2026-07-11** (`tools/mitsuba_to_ftsl.py`). Mitsuba
+  0.6/2/3 is also a spectral PBR renderer, so the mapping is nearly 1:1
+  (perspective/thinlens sensor → camera, diffuse/conductor/roughconductor/
+  dielectric/plastic/blendbsdf → materials, area/constant/envmap/point/directional
+  emitters → lights, rectangle/cube/sphere/obj shapes with full `to_world`
+  transforms, `<ref>`/`<default>` resolution). Validated on a converted Cornell
+  scene (glass + gold spheres, colored walls, area light) rendering correctly in
+  modes B and D. **Because Blender exports to Mitsuba XML via `mitsuba-blender`,
+  this is also the Blender→FTSL path.**
+  - **Known approximations (flagged with `# WARN:` in output):** roughdielectric →
+    smooth dielectric (no rough transmission in FTSL); plastic/roughplastic →
+    glossy (diffuse+specular coat merged); bumpmap/normalmap dropped to base BSDF;
+    mask opacity ignored; `.ply`/`.serialized` meshes emitted as `mesh` lines but
+    ftrace's loader is OBJ-only (convert first); mesh area-emitters have no FTSL
+    equivalent (emitted as lit geometry, emission dropped); mesh `to_world` with
+    rotation/shear only partly expressible (translate+scale + euler).
+  - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
+    support (needs an emissive-triangle light primitive in the core); rough
+    transmission material.
+- **POV-Ray: DECLINED (2026-07-11), rationale logged.** The SDL is genuinely nice
+  (programmable, exact CSG, implicit `isosurface`), but a poor fit here: (1) faithful
+  parsing = writing a Turing-complete interpreter (macros/loops/functions), far more
+  than an XML parse, and POV-Ray has no mesh *export* to lean on; (2) we're a
+  triangle/quad/sphere renderer with no analytic CSG or implicit intersection, so
+  importing means **tessellating** everything (marching cubes for isosurfaces/blobs,
+  mesh-booleans for CSG) — which discards POV-Ray's exact-surface advantage, its whole
+  point; (3) RGB/non-spectral/non-physical-camera means re-authoring the physics anyway.
+- **Alternative worth its own feature (deferred):** a **native SDF / implicit-surface
+  primitive** (sphere-traced, GPU-portable) would give metaballs/isosurfaces *exactly*
+  without lossy tessellation — useful independent of any importer, and the right way to
+  ever support POV-Ray-style implicit geometry. Not started.

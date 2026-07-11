@@ -1,0 +1,46 @@
+# Absolute light units — demonstrates physically-scaled emitter power.
+#
+# A light block may author an ABSOLUTE emitted flux instead of relying on the
+# per-image auto-exposure to guess a brightness:
+#   power  <watts>   radiometric radiant flux (W)
+#   lumens <lm>      photometric luminous flux (lm), via Phi_v = 683*INT Phi_e*V dlambda
+# When any light authors power/lumens the scene renders in ABSOLUTE mode: the film
+# is physically linear, so the auto-exposure is replaced by a fixed sensor gain and
+# the photographic controls (iso/shutter/exposure) become true absolute stops.
+# Doubling `power` makes the image one stop brighter (no auto-renormalisation).
+#
+#   ftrace -in scenes/absolute.ftsl -n 50000000 -o png/absolute.png
+#
+# Try:  double `power 100` -> `power 200`  (one stop brighter)
+#       iso 200            (one stop brighter)   shutter 0.5 (one stop darker)
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "red"   { type diffuse    reflect redwall }
+material "green" { type diffuse    reflect greenwall }
+material "glass" { type dielectric ior    glass:SF10 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.32 0.4   radius 0.25   material glass }
+
+# Ceiling area light, 6500 K, emitting an absolute 100 W of radiant flux.
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd    preset:bb6500
+    power  100
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256   iso 100   shutter 1   exposure 1 }
+}

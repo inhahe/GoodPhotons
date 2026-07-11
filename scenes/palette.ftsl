@@ -1,0 +1,52 @@
+# Indexed-spectral palette texture (spec §9.3). Instead of RGB→reflectance
+# upsampling, the image stores INDICES (in the red channel, 0..255) and a `palette`
+# maps each index to a named reflectance spectrum. Exact where the pigments are known
+# (paint chips, dyed swatches, scientific charts) — no metameric approximation.
+#
+# palette_index.ppm is a 64x64 map: four quadrants carry indices 0/1/2/3, so the back
+# wall shows four exact-spectrum panels. Palette textures evaluate their spectra
+# directly, so they render on the CPU (the GPU forward path upsamples RGB only and
+# falls back to CPU for palette maps).
+#
+#   ftrace -in scenes/palette.ftsl -n 20000000 -o png/palette.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# Four reflectance spectra selected by index.
+spectrum "navy"     = rgb 0.10 0.12 0.45
+spectrum "crimson"  = rgb 0.55 0.05 0.09
+spectrum "offwhite" = 0.80
+spectrum "olive"    = rgb 0.30 0.32 0.08
+
+texture "swatches" {
+    file     scenes/palette_index.ppm
+    encoding linear
+    filter   nearest
+    wrap     clamp
+    palette { 0 spectrum:navy   1 spectrum:crimson   2 spectrum:offwhite   3 spectrum:olive }
+}
+
+material "white"    { type diffuse reflect whitewall 0.75 }
+material "red"      { type diffuse reflect redwall }
+material "green"    { type diffuse reflect greenwall }
+material "chart"    { type diffuse reflect texture:swatches }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material chart }   # back (indexed palette)
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

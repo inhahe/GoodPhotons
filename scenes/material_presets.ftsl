@@ -1,0 +1,46 @@
+# Validation scene for the built-in material presets (metals, glasses, iridescent
+# recipes) and the metal:/reflectance:/glass: spectrum expressions.
+#   ftrace -in scenes/material_presets.ftsl -n 20000000 -o presets.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- whole-material recipes via `preset` -----------------------------------
+material "gold"    { preset gold }
+material "copper"  { preset copper }
+material "silver"  { preset silver }
+material "diamond" { preset diamond }
+material "water"   { preset water }
+material "bubble"  { preset soap-bubble }
+material "morpho"  { preset morpho }
+material "oil"     { preset oil-slick }
+
+# --- spectrum expressions used directly on a material ----------------------
+material "brushed" { type glossy   reflect metal:brass   roughness 0.3 }
+material "leaf"    { type diffuse  reflect reflectance:leaf }
+material "wall"    { type diffuse  reflect reflectance:concrete }
+
+# --- box -------------------------------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material wall }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material wall }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material wall }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leaf }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material gold }   # right
+
+# --- a row of preset spheres ----------------------------------------------
+sphere { center 0.22 0.20 0.30   radius 0.16   material copper }
+sphere { center 0.55 0.22 0.45   radius 0.18   material diamond }
+sphere { center 0.82 0.20 0.30   radius 0.16   material morpho }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:d65
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 128 128 }
+}

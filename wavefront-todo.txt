@@ -1,0 +1,35 @@
+"Wavefront helps divergent scenes and small GPUs" <- does this mean it helps divergent scenes on small GPUs only, or that it helps both divergent scenes *and* small GPUs? if the latter, what kinds of divergent scenes and how does it help them? what is Wavefront?
+Direct answer: both — it's two separate wins that happen to share a root cause, not "divergent scenes only on small GPUs."
+What "wavefront" is
+
+It's an architectural choice for how you map a path tracer onto the GPU. There are two styles:
+
+Megakernel (what this renderer ships today): one kernel launch, and each GPU thread runs an entire photon's life start-to-finish — emit, then the whole bounce loop (intersect → pick material → scatter → repeat), then the final connect/catch/deposit. All the photon's state lives in registers the whole time. Simple, no memory round-trips, great when paths are short and similar.
+
+Wavefront (a.k.a. streaming / path-regeneration): break that one big loop into stages, each its own kernel:
+generate — spawn new photons
+extend — do the ray-scene intersection
+shade — run the material/BSDF and pick the next direction
+connect — the NEE/splat/deposit
+
+Between stages the photon state doesn't live in registers — it's written out to queues in global memory ("this many rays need intersecting", "this many hit a dielectric", etc.). You loop these kernels over and over; each pass advances every live photon by one bounce. The name comes from advancing a whole "wavefront" of rays through one stage at a time instead of marching each ray to completion independently.
+
+That queue-based structure is what unlocks two tricks the megakernel can't do: sorting/compacting rays by material before shading, and compacting out dead paths so no lane sits idle.
+Why it's a win in two independent situations
+
+The GPU executes threads in warps of 32 that must run in lockstep (SIMT). Anything that makes lanes in a warp want to do different things, or finish at different times, wastes the warp. That single fact produces both wins:
+
+1. Divergent scenes. Two kinds of divergence:
+Branch divergence — threads in a warp hit different materials. In a megakernel, if lane 0 hits glass (refraction math), lane 1 hits a diffuse wall, lane 2 hits a diffraction grating, the warp runs each branch serially with the other lanes masked off. The warp effectively pays for glass + diffuse + grating back-to-back. Wavefront fixes this by sorting rays by material before the shade stage, so a shading kernel launch is all-glass or all-diffuse — every lane runs the same code, full speed. It also means each shading kernel only carries one material's register footprint instead of all of them, which raises occupancy.
+Path-length divergence — some photons die after 1 bounce (absorbed, escaped), others bounce 30 times (a hall of mirrors, a dense glass stack, thick fog). In a megakernel the whole warp is pinned until its longest path finishes; the lanes that died at bounce 1 sit idle for the other 29 bounces. Wavefront compacts the live rays each pass and regenerates new photons into the freed slots, so every lane always has real work.
+
+  So "what kinds of divergent scenes": many different material types in one frame (mixed glass / diffuse / metal / grating / thin-film), and/or scenes with a wide spread of path lengths — deep specular chains, thick participating media, hall-of-mirrors geometry. Uniform scenes (an all-diffuse Cornell box) barely diverge, which is exactly why the megakernel is fine for what we ship.
+
+2. Small GPUs. This is a separate axis. Even with the same scene, the megakernel's cost of idle/divergent lanes has to be hidden, and hiding it takes occupancy — lots of resident warps so the scheduler can swap a stalled warp for a ready one. A big GPU (4090: 128 SMs, huge register file) has enough warps in flight to paper over a lot of waste. A small GPU (few SMs, tight register budget, laptop/older card) doesn't — it can't keep enough warps resident to hide the idle lanes, and the megakernel's high per-thread register pressure (it carries every material's code) caps how many warps fit at all. Wavefront's coherent, compacted, lower-register kernels keep the few warps a small GPU can run busy and full.
+
+They're related (both trace back to warp lockstep + occupancy), but they're genuinely two different reasons: one is about the scene, one is about the hardware. A material-diverse scene hurts on any GPU; a small GPU hurts on any scene — and wavefront addresses each.
+The catch (why we didn't just do wavefront)
+
+Wavefront isn't free: shuffling ray state through global-memory queues every bounce costs bandwidth, and you pay kernel-launch + sort overhead per stage per bounce. For a shallow, uniform scene on a big GPU — our current target — the megakernel's register-resident state simply wins; there's little divergence to fix and no occupancy shortfall to relieve, so you'd be paying wavefront's overhead for benefits you don't need. That's why the plan (now recorded in known-issues.md) is: ship the megakernel as default, and add a wavefront backend only if profiling on a genuinely material-diverse / deep-path scene (or a small GPU) shows the megakernel is divergence-bound.
+
+This is exactly the reasoning I logged under "GPU scaling path (future): megakernel vs. wavefront" in known-issues.md — happy to expand any part of it.

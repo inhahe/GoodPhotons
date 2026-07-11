@@ -1,0 +1,94 @@
+# Multilayer structural colour — quarter-wave Bragg stacks in a diffuse Cornell
+# box, lit by a ceiling area light. Demonstrates the general N-layer transfer-
+# matrix (Abeles characteristic-matrix) `multilayer` material: alternating high/
+# low index dielectric layers produce a photonic reflection band whose centre
+# wavelength (the visible colour) is set by the layer optical thickness. This is
+# the mechanism behind dielectric mirrors, Morpho butterflies, jewel beetles,
+# and nacre — NOT pigment.
+#
+# Each layer is a quarter-wave at its design wavelength: thickness = lam0/(4*n).
+#   "green_mirror": 6 pairs  nH=2.30 (d=59.8nm) / nL=1.38 (d=99.6nm), lam0=550nm.
+#                   Transparent substrate (ior 1.5) -> lossless reflect-or-refract:
+#                   reflects a green band, transmits the rest (dichroic — you see
+#                   green by reflection, magenta by transmission).
+#   "gold_beetle" : 6 pairs tuned to lam0=600nm over an ABSORBING substrate
+#                   (substrate_k 3.0) -> opaque metallic structural gold.
+#
+# Both materials are specular, so use mode B (forward) / P; mode V/R also work
+# (the backward reference evaluates the same multilayer interface).
+#
+#   ftrace -in scenes/multilayer.ftsl -n 40000000 -o multilayer.ppm
+#   ftrace -in scenes/multilayer.ftsl -mode B -device gpu -n 200000000
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# Dichroic dielectric mirror tuned to reflect green (~550 nm). Transparent
+# substrate -> lossless: reflects the green band, transmits the complement.
+material "green_mirror" {
+    type multilayer
+    ior 1.50
+    layer 2.30 0.0 59.8
+    layer 1.38 0.0 99.6
+    layer 2.30 0.0 59.8
+    layer 1.38 0.0 99.6
+    layer 2.30 0.0 59.8
+    layer 1.38 0.0 99.6
+    layer 2.30 0.0 59.8
+    layer 1.38 0.0 99.6
+    layer 2.30 0.0 59.8
+    layer 1.38 0.0 99.6
+    layer 2.30 0.0 59.8
+    layer 1.38 0.0 99.6
+}
+
+# Metallic structural colour: same quarter-wave idea tuned to ~600 nm, but over
+# an absorbing substrate (substrate_k > 0). The stack reflects the design band
+# and everything transmitted is absorbed -> opaque, jewel-beetle gold.
+material "gold_beetle" {
+    type multilayer
+    ior 1.20
+    substrate_k 3.0
+    layer 2.30 0.0 65.2
+    layer 1.38 0.0 108.7
+    layer 2.30 0.0 65.2
+    layer 1.38 0.0 108.7
+    layer 2.30 0.0 65.2
+    layer 1.38 0.0 108.7
+    layer 2.30 0.0 65.2
+    layer 1.38 0.0 108.7
+    layer 2.30 0.0 65.2
+    layer 1.38 0.0 108.7
+    layer 2.30 0.0 65.2
+    layer 1.38 0.0 108.7
+}
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- two structural-colour spheres ----------------------------------------
+sphere { center 0.30 0.28 0.45   radius 0.22   material green_mirror }
+sphere { center 0.72 0.26 0.40   radius 0.20   material gold_beetle  }
+
+# --- ceiling area light (6500 K) ------------------------------------------
+light area {
+    origin 0.35 0.999 0.35   u 0.30 0 0   v 0 0 0.30   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# --- camera ---------------------------------------------------------------
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

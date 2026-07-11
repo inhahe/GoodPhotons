@@ -1,0 +1,31 @@
+forward renderer
+- one photon at a time, selected from one of the light sources, at one of its component frequencies (configurable frequency bin size?), at random using the proper distribution
+- light sources defined by spectral envelope too; built-in common types (sunlight / color temperature) plus artificial sources (incandescent, LED, fluorescent)
+- supports fluorescence
+- supports diffraction(?) - Keller's "diffracted rays" - works for near-objects bending, which is what people usually want, but not for interference patterns - maybe add this later
+- support GPU rendering (many photons at a time, but still all independent of each other), but "Debug the physics on CPU first. Single-wavelength spectral MC is subtle (white balance, SPD→XYZ→RGB, energy conservation). Get a spectral cornell box matching a reference before adding GPU/fluorescence/lenses."
+- can resume current state to add fidelity in the future (scales brightness accordinng to how long it's ran, only thing that changes is graininess)
+- supports refraction 
+- supports iridescence
+- fog support
+- loads a mesh defining the scene, surface colors can be defined according to a whole spectral envelope, also transparency/translucence, mirror/glossiness, etc. - can combine semi-mirror with semi-transparency, etc. - solves transparency using a probability of a single photon passing through or being absorbed
+- light sources are defined by spectral envelope too - have some common types built-in (sunlight, or allow user to specify a color temperature) plus some artificial light sources
+- camera lenses and enclosure also part of the scene
+- special part of the scene defining the camera film
+- supports many cammeras at once (possibly along a path) for rendering multiple viepwoints or simulating camera motion throughout the scene (no other motion possible this way) using the same render for more efficiency
+- include built-in definitions for various cameras
+- use BVH for locating objects and jumping rays directly to the next object?
+- ppm/sppm - make it optional (add this later)
+-- and/or: "If it matters to you, there's also a "best of both" option: run an unbiased path/forward tracer and SPPM together and MIS-combine them (this is UPS / VCM — Vertex Connection and Merging). It gets unbiased-where-you-can, photon-mapped-where-you-must, in one estimator. It's the most capable option and also the most complex — I'd only go there if a simpler method proves inadequate." - could add that later and make it optional
+- (A) Pure-forward catch. Photon physically lands on the film surface → accumulate → terminate. Dead simple, maximally honest, GPU-perfect. Just slow, and slower the smaller the aperture. Good for "show me the physical lens doing lens things.
+(B) Connect-to-pupil splatting (light tracing with next-event estimation to the camera). At every photon bounce, additionally: sample a point on the camera's entrance pupil, form the connection ray from bounce→pupil, and if unobstructed, splat a weighted contribution onto the film. This is the standard fix and it's orders of magnitude faster because every bounce contributes to the image instead of only the rare photon that happens to hit. - not maximally honest
+The subtlety — and it's important given your physical-lens goal: you cannot connect a diffuse bounce through the lens glass, because refractive lens elements are specular (delta BSDF) and the connection probability is zero (this is the SDS problem again). The fix: connect to the entrance pupil (the front of the lens system), and once you have a position+direction hitting the pupil, the path through the lens elements is deterministic (specular refraction is deterministic given a ray) — trace it through the elements, and if it lands on the film, splat. So (B) works even with a full physical multi-element lens; you're just importance-sampling the pupil instead of praying a photon flies into it. Crucially, each photon is still independent → still GPU-friendly.
+- forward-only rendering (including supporting mirrors, etc.) if the user opts out of connect/splat
+
+how much more computationally expensive would it be for the entire thing to use wave mechanics instead of photons?
+
+ok, let's add some native primitives to our renderer! metaballs, whatever those are, i especially like the idea of isosurfaces (and let the math define more than just boundaries, but transparency, iridescence, fluorescence, transparency, translucency, mirror?), and what other useful primitives does pov-ray have? and how about pov-ray's rounded intersections of primitives?
+^ doing
+
+let's have both isosurface algorithms, selectable within the isosurface language? and how about the ability to use functions to determine various material properties at specific xyz locations? speaking of material properties, we do have translucency and transparency, right?
+^ doing

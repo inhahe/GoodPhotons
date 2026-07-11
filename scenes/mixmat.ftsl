@@ -1,0 +1,53 @@
+# Mix-material validation scene (Phase 2d). A diffuse Cornell box whose central
+# sphere is a STOCHASTIC MIX of two diffuse albedos: a photon hitting it picks the
+# "warm" child with prob 0.5 or the "cool" child with prob 0.3, and is absorbed on
+# the leftover 0.2. Because a mix of diffuse lobes is itself an (effective) diffuse
+# BRDF with albedo = 0.5*warm + 0.3*cool, everything here is diffuse, so the forward
+# light tracer (mode B) and the backward reference (mode R) can be cross-validated
+# with mode V — the check that per-photon mix selection is unbiased.
+#
+#   ftrace -in scenes/mixmat.ftsl -mode V -n 40000000 -r 64
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- materials -------------------------------------------------------------
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# The two child lobes of the mix (declared BEFORE the mix; order-independent).
+material "warm"  { type diffuse reflect rgb 0.85 0.55 0.30 }
+material "cool"  { type diffuse reflect rgb 0.30 0.45 0.85 }
+
+# The stochastic mix: 0.5 warm + 0.3 cool, 0.2 absorption. Weights must sum <= 1.
+material "blend" {
+    type mix
+    layer "warm" 0.5
+    layer "cool" 0.3
+}
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- mixed-albedo sphere (all-diffuse, so mode V is valid) ----------------
+sphere { center 0.5 0.30 0.4   radius 0.25   material blend }
+
+# --- ceiling area light (blackbody 6500 K) --------------------------------
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# --- camera ---------------------------------------------------------------
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

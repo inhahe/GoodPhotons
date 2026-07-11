@@ -1,0 +1,80 @@
+# Physical `layered` material (spec §3.2): a specular *coat* interface over a weighted
+# *body* of named child lobes. On each hit a photon reflects off the coat with prob R
+# (Fresnel / thin-film Airy / manual), else it enters and one body lobe is picked (the
+# `layer "name" weight` list, resolved like a `mix`; leftover weight absorbs). Coat R +
+# body weights partition the photon, so the surface is energy-consistent.
+#
+# The back wall is a clearcoat over a red/green diffuse body (a Fresnel coat gives the
+# glossy sheen at grazing angles); the sphere is a thin-film iridescent coat over a
+# white+fluorescent body. Layered is CPU-only (forward + backward); GPU and BDPT fall
+# back / refuse (documented). Render:
+#   ftrace -in scenes/layered.ftsl -mode B -n 20000000 -o png/layered.png
+#   ftrace -in scenes/layered.ftsl -mode R -n 400        -o png/layered_ref.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# --- back-wall body lobes + clearcoat ---
+material "wall_body_a" { type diffuse reflect rgb 0.80 0.25 0.20 }
+material "wall_body_b" { type diffuse reflect rgb 0.20 0.55 0.80 }
+
+# Clearcoat: plain dielectric Fresnel coat (n=1.5) over a two-lobe diffuse body.
+# Coat R rises toward grazing (physical sheen); 1-R enters and picks a body lobe.
+material "coated_wall" {
+    type layered
+    coat {
+        reflectance fresnel
+        ior         1.5
+        roughness   0.04
+    }
+    layer "wall_body_a" 0.55
+    layer "wall_body_b" 0.45
+}
+
+# --- sphere body lobes + iridescent thin-film coat ---
+material "sphere_body_diff" { type diffuse reflect rgb 0.85 0.85 0.85 }
+material "sphere_body_fluo" {
+    type fluorescent
+    absorb shortpass 470 0.2 1.0
+    emit   gaussian 600 30 1.0
+    yield  0.8
+}
+
+# Thin-film Airy coat (soap-bubble iridescence) over a white/fluorescent body.
+material "iridescent" {
+    type layered
+    coat {
+        reflectance    thinfilm
+        film_ior       1.33
+        film_thickness 380
+        ior            1.5
+        roughness      0.02
+    }
+    layer "sphere_body_diff" 0.6
+    layer "sphere_body_fluo" 0.4
+}
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }        # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }        # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material coated_wall }  # back (clearcoat)
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }        # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }        # right
+
+sphere { center 0.5 0.32 0.45   radius 0.28   material iridescent }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

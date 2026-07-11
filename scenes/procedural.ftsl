@@ -1,0 +1,47 @@
+# Math-driven (procedural) material properties on implicit surfaces. A `pattern`
+# block compiles a scalar field f(x,y,z,f,nx,ny,nz,r) — either a named built-in
+# GENERATOR (`type checker|noise|axis|radial|bands|field`) or a free-form
+# EXPRESSION (`expr "..."`). Anywhere a scalar map accepts `texture:<name>`, it now
+# also accepts `pattern:<name>`, so a pattern can drive roughness, film thickness, or
+# — via a 2-child `mix` weight_map — the per-point choice of which MATERIAL is used.
+#   ftrace -in scenes/procedural.ftsl -mode R -device cpu -o png/procedural.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# --- procedural patterns ---
+pattern "checkcol"  { type checker  size 0.05 }          # 0/1 checkerboard in world space
+pattern "spots"     { type noise    freq 26 }            # value noise in [0,1]
+pattern "frostband" { expr "0.5 + 0.5*sin(40*y)" }       # smooth stripes along y
+
+# --- math-driven materials ---
+# 2-child mixes whose child-0 probability is a pattern -> per-xyz material choice.
+material "cmix"  { type mix  layer "red" 0.5   layer "green" 0.5  weight_map pattern:checkcol }
+material "smix"  { type mix  layer "white" 0.5 layer "red" 0.5    weight_map pattern:spots }
+# Glass whose frosting varies with height (clear where the band -> 0, frosted -> 1).
+material "frost" { type dielectric  ior glass:BK7  roughness pattern:frostband }
+
+# box (unit cube [0,1]^3)
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+isosurface { material cmix   sphere { center 0.25 0.22 0.45   radius 0.16 } }
+isosurface { material smix   sphere { center 0.75 0.22 0.45   radius 0.16 } }
+isosurface { material frost  sphere { center 0.50 0.58 0.35   radius 0.14 } }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode R
+    film { res 320 320 }
+}

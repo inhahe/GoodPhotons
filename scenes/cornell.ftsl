@@ -1,0 +1,42 @@
+# Cornell box — FTSL reproduction of the hard-coded buildCornell (default scene,
+# model B). Renders identically to `ftrace -scene cornell -mode B`; used to
+# validate the loader against the C++ builder.
+#
+#   ftrace -in scenes/cornell.ftsl -n 200000000 -o cornell_ftsl.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- materials -------------------------------------------------------------
+# whitewall/redwall/greenwall reproduce the exact spectral builders buildCornell
+# uses, so the FTSL render matches the C++ one bit-for-bit (rather than the
+# placeholder `rgb` upsampler).
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "red"   { type diffuse    reflect redwall }
+material "green" { type diffuse    reflect greenwall }
+material "glass" { type dielectric ior    glass:SF10 }
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- dispersive glass sphere ----------------------------------------------
+sphere { center 0.5 0.32 0.4   radius 0.25   material glass }
+
+# --- ceiling area light (blackbody 6500 K) --------------------------------
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# --- camera (matches buildCornell mode B) ---------------------------------
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

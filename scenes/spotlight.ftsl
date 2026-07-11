@@ -1,0 +1,38 @@
+# Spot light — a point source hung on the ceiling of a diffuse Cornell box,
+# aimed straight down with a smoothstep penumbra (inner 18 deg, outer 30 deg).
+# Exercises the Phase 3c cone-limited point emitter in the forward tracer and the
+# backward reference. All surfaces diffuse, so mode V should agree tightly and the
+# floor should show a soft-edged bright pool under the light.
+#
+#   ftrace -in scenes/spotlight.ftsl -mode V -n 40000000 -spp 512
+#   ftrace -in scenes/spotlight.ftsl -n 40000000 -o spotlight.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+# --- box (unit cube [0,1]^3) ----------------------------------------------
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# --- ceiling spotlight aimed down (blackbody 6500 K) ----------------------
+light spot {
+    origin 0.5 0.98 0.5   dir 0 -1 0
+    inner_angle 18   outer_angle 30
+    spd preset:bb6500
+}
+
+# --- camera ---------------------------------------------------------------
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}
