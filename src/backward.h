@@ -78,21 +78,37 @@ struct BackwardRenderer {
                 continue;
             }
             double u1 = rng.uniform(), u2 = rng.uniform();
-            Vec3 y, nLight;
-            em.samplePoint(u1, u2, y, nLight);            // quad or sphere surface point
-            Vec3 toL = y - h.p;
-            double dist2 = dot(toL, toL);
-            double dist = std::sqrt(dist2);
-            Vec3 wi = toL / dist;
-            double cosSurf = dot(h.n, wi);
-            if (cosSurf <= 0) continue;
-            double cosLight = dot(nLight, -wi);           // light is one-sided
-            if (cosLight <= 0) continue;
-            if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+            Vec3 y, nLight, wi;
+            double dist = 0.0, pdfW = 0.0;
+            // Sphere: cone/solid-angle importance sampling of only the visible cap
+            // toward `h.p` (low variance, no wasted back-facing draws). The estimator
+            // is in solid-angle measure, so the cosLight/dist^2/area area-measure
+            // Jacobian is replaced by 1/pdfW. Quads (and a receiver inside a sphere)
+            // keep the uniform area-measure estimator.
+            bool coneSampled = (em.shape == EmitterShape::Sphere) &&
+                               em.sampleSphereCone(h.p, u1, u2, y, nLight, wi, dist, pdfW);
+            double cosSurf, contrib;
             double f = rho / PI;                          // Lambertian BRDF
-            double G = cosSurf * cosLight / dist2;        // geometry term
             double emitW = em.spdFn(lambda) * invPdfLambda;   // Le(lambda)/pdf_lambda
-            double contrib = f * emitW * G * em.area;     // pdf_area = 1/area
+            if (coneSampled) {
+                cosSurf = dot(h.n, wi);
+                if (cosSurf <= 0) continue;
+                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                contrib = f * emitW * cosSurf / pdfW;     // solid-angle measure
+            } else {
+                em.samplePoint(u1, u2, y, nLight);        // quad or interior-sphere point
+                Vec3 toL = y - h.p;
+                double dist2 = dot(toL, toL);
+                dist = std::sqrt(dist2);
+                wi = toL / dist;
+                cosSurf = dot(h.n, wi);
+                if (cosSurf <= 0) continue;
+                double cosLight = dot(nLight, -wi);       // light is one-sided
+                if (cosLight <= 0) continue;
+                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                double G = cosSurf * cosLight / dist2;    // geometry term
+                contrib = f * emitW * G * em.area;        // pdf_area = 1/area
+            }
             if (scene.medium.enabled)                     // Beer-Lambert on the shadow ray
                 contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
             total += contrib;
@@ -127,21 +143,32 @@ struct BackwardRenderer {
                 continue;
             }
             double u1 = rng.uniform(), u2 = rng.uniform();
-            Vec3 y, nLight;
-            em.samplePoint(u1, u2, y, nLight);            // quad or sphere surface point
-            Vec3 toL = y - p;
-            double dist2 = dot(toL, toL);
-            double dist = std::sqrt(dist2);
-            Vec3 wi = toL / dist;
-            double cosLight = dot(nLight, -wi);           // light is one-sided
-            if (cosLight <= 0) continue;
-            if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-            double phase  = hgPhase(dot(wIn, wi), scene.medium.g);
+            Vec3 y, nLight, wi;
+            double dist = 0.0, pdfW = 0.0;
+            bool coneSampled = (em.shape == EmitterShape::Sphere) &&
+                               em.sampleSphereCone(p, u1, u2, y, nLight, wi, dist, pdfW);
             double albedo = scene.medium.albedo(lambda);
-            double G = cosLight / dist2;                   // no surface cosine at a volume vertex
-            double T = std::exp(-scene.medium.sigmaT(lambda) * dist);
             double emitW = em.spdFn(lambda) * invPdfLambda;
-            total += albedo * phase * emitW * G * em.area * T;
+            double contrib;
+            if (coneSampled) {
+                if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+                double phase = hgPhase(dot(wIn, wi), scene.medium.g);
+                contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
+            } else {
+                em.samplePoint(u1, u2, y, nLight);         // quad or interior-sphere point
+                Vec3 toL = y - p;
+                double dist2 = dot(toL, toL);
+                dist = std::sqrt(dist2);
+                wi = toL / dist;
+                double cosLight = dot(nLight, -wi);        // light is one-sided
+                if (cosLight <= 0) continue;
+                if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+                double phase = hgPhase(dot(wIn, wi), scene.medium.g);
+                double G = cosLight / dist2;               // no surface cosine at a volume vertex
+                contrib = albedo * phase * emitW * G * em.area;
+            }
+            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+            total += contrib;
         }
         return total;
     }

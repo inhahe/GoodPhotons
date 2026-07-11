@@ -218,6 +218,41 @@ struct Emitter {
             nOut = normal;
         }
     }
+
+    // Solid-angle (cone) importance sampling of a sphere emitter as seen from a
+    // reference point `ref` (PBRT's Sphere::Sample_Li). Samples a direction `wi`
+    // uniformly inside the cone the sphere subtends at `ref`, then finds the near
+    // intersection point `y`/normal `nOut`; `pdfW` is the solid-angle-measure pdf.
+    // Only the visible cap is sampled, so cosLight = dot(nOut,-wi) is always > 0 —
+    // no draws are wasted on the far, self-occluded, back-facing hemisphere.
+    // Returns false (and does not sample) when `ref` is inside the sphere, where the
+    // subtended cone is the whole sphere; the caller then falls back to samplePoint.
+    bool sampleSphereCone(const Vec3& ref, double u1, double u2,
+                          Vec3& y, Vec3& nOut, Vec3& wi, double& dist,
+                          double& pdfW) const {
+        Vec3 toC = origin - ref;
+        double dc2 = dot(toC, toC);
+        double r2 = radius * radius;
+        if (dc2 <= r2) return false;                   // ref inside sphere: use area sampling
+        double dc = std::sqrt(dc2);
+        Vec3 wc = toC / dc;                            // axis toward the sphere centre
+        double sin2Max = r2 / dc2;
+        double cosMax = std::sqrt(std::max(0.0, 1.0 - sin2Max));
+        double cosT = 1.0 - u1 * (1.0 - cosMax);      // uniform cos in [cosMax, 1]
+        double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
+        double phi = 2.0 * PI * u2;
+        Vec3 t, b; onb(wc, t, b);
+        wi = t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + wc * cosT;
+        // Near intersection of the ray (ref, wi) with the sphere (guaranteed to hit).
+        double tca = dot(toC, wi);
+        double d2 = dc2 - tca * tca;
+        double thc = std::sqrt(std::max(0.0, r2 - d2));
+        dist = tca - thc;
+        y = ref + wi * dist;
+        nOut = (y - origin) / radius;
+        pdfW = 1.0 / (2.0 * PI * (1.0 - cosMax));      // uniform over the cone
+        return true;
+    }
 };
 
 struct Scene {

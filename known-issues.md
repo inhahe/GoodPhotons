@@ -241,11 +241,20 @@ as practical; this file is the fallback for what can't be addressed immediately.
         (single-colour) env is the smallest first milestone — it exercises steps
         1/3/4/5/6 with a trivial step 2 (uniform pdf), so land that before the full
         image-based 2D CDF.
-  2. **Sphere-light importance sampling.** The current sphere sampler is uniform
-     over the whole surface (half the samples face away → cosLight=0, wasted). The
-     efficient fix is cone/solid-angle sampling of the visible cap toward the
-     receiver (PBRT's `Sphere::Sample`), which would cut NEE variance substantially.
-     Correct but noisier as-is; validation needed higher sample counts to converge.
+  2. **Sphere-light importance sampling.** *(DONE 2026-07-10.)* The backward
+     reference's sphere NEE now does cone/solid-angle importance sampling of only
+     the visible cap toward the receiver (`Emitter::sampleSphereCone`, PBRT's
+     `Sphere::Sample`): sample `cosθ` uniformly in `[cosθmax, 1]` about the
+     centre-to-point axis (`sinθmax = r/dc`), find the near intersection, and weight
+     in solid-angle measure with `pdfW = 1/(2π(1−cosθmax))` — so no draws land on
+     the far, self-occluded, back-facing hemisphere. A receiver inside the sphere
+     (`dc ≤ r`) falls back to uniform `samplePoint`. Applies to both surface
+     (`neeLight`) and fog-vertex (`neeVolume`) NEE. Quad lights are untouched and
+     keep a bit-identical RNG stream. Validation: `spherelight.ftsl` mode V best-fit
+     scale → 0.9997 (unbiased) at 80M/1024 spp, RMSE 2.5% bulk; sphere+`-fog 0.5`
+     scale 0.988; cornell (quad) unaffected. Only the backward reference changed —
+     the forward tracer emits sphere photons omnidirectionally as before, so the
+     GPU/CUDA path is unaffected.
   3. **Spot penumbra sampling.** The forward spot samples uniformly in the outer
      cone then reweights by falloff, so photons in the dark penumbra edge carry
      small weights (mild variance). Exact CDF sampling of the smoothstep band would
@@ -255,8 +264,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
   incl. the absolute-radiance We fix and on-device env emission; **image-based HDRI
   (`light env { file … }`, 2D luminance CDF + per-texel JH spectral upsampling) fully
   done 2026-07-10 (increments 2a CPU forward+backward miss/background + 2b backward
-  env-NEE with MIS + 2c GPU forward port)**; sphere/spot importance-sampling still
-  deferred.
+  env-NEE with MIS + 2c GPU forward port)**; **sphere-light cone importance sampling
+  in the backward reference done 2026-07-10**; only spot penumbra CDF sampling (item
+  3) still deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
