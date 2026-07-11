@@ -174,13 +174,26 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 > envelopes for any common materials?"): **partly done** — built-in `metal:<name>`
 > reflectances, an expanded `glass:<name>` dispersion set, `reflectance:<name>`
 > natural curves, and whole-material `preset`s (§3.1) now ship for common
-> materials. The metal reflectances and glass IORs are real measured data (n,k /
-> Sellmeier); the natural reflectances and iridescent recipes are representative,
-> not per-sample measurements (see known-issues.md). For full fidelity to a
-> specific dataset, the `table { }` form remains the ingestion point for published
-> data (e.g. RPMK/Vos pigment & metal reflectances, or refractiveindex.info).
-> Use `tools/csv_to_table.py` to convert a two-column CSV/TSV of
-> (wavelength, value) straight into a `table { }` block:
+> materials. The `metal:<name>` reflectances for Au/Ag/Cu/Al/Cr are now computed
+> from published **measured** complex indices (Johnson & Christy 1972, Rakić
+> 1995/1998; CC0 via refractiveindex.info) and the glass IORs are real Sellmeier
+> data; `brass`, the natural reflectances, and the iridescent recipes remain
+> representative, not per-sample measurements (see known-issues.md).
+>
+> Two stdlib-only converters in `tools/` ingest published data into scenes:
+>
+> `tools/ri_nk_to_reflectance.py` — refractiveindex.info tabulated-nk YAML →
+> normal-incidence reflectance `R=((n-1)²+k²)/((n+1)²+k²)`, as an FTSL `table`
+> block or a C++ `tabulatedSpectrum` initializer (this is exactly how the built-in
+> metals were generated):
+>
+> ```
+> python tools/ri_nk_to_reflectance.py Au_Johnson.yml --name gold_measured
+> python tools/ri_nk_to_reflectance.py Al_Rakic.yml --format cpp --resample 20
+> ```
+>
+> `tools/csv_to_table.py` — a generic two-column CSV/TSV of (wavelength, value) →
+> a `table { }` block, for any reflectance/SPD/n(λ) dataset:
 >
 > ```
 > # a reflectance CSV (nm, value) -> a named spectrum block
@@ -193,9 +206,9 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 > python tools/csv_to_table.py leaf.csv --resample 5 --min 380 --max 780 --clamp01
 > ```
 >
-> It auto-detects the delimiter, skips headers/comments, sorts by wavelength, and
-> emits either a `spectrum "name" = table { … }` block or (with `--bare`) just the
-> `table { … }` expression to paste into any `<spectrum>` slot. stdlib only.
+> Both auto-detect the delimiter, skip headers/comments, sort by wavelength, and
+> emit either a `spectrum "name" = table { … }` block or (with `--bare`) just the
+> `table { … }` expression to paste into any `<spectrum>` slot.
 
 ---
 

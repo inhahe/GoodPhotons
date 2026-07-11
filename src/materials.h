@@ -2,8 +2,10 @@
 //
 // Three kinds of built-in live here:
 //   1. Metal spectral reflectances (`metal:<name>`) — normal-incidence R(lambda)
-//      derived from published complex refractive indices (Johnson & Christy 1972
-//      for Au/Ag/Cu; Rakic 1998 for Al/Cr; alloy fit for brass). Feed a
+//      computed from published measured complex refractive indices: Johnson &
+//      Christy 1972 for Au/Ag/Cu, Rakic 1995/1998 for Al/Cr (all CC0 via
+//      refractiveindex.info; regenerate with tools/ri_nk_to_reflectance.py).
+//      Brass has no single canonical dataset and remains an alloy fit. Feed a
 //      `mirror`/`glossy` material's `reflect`.
 //   2. Natural diffuse reflectances (`reflectance:<name>`) — representative curves
 //      for vegetation, skin, snow, etc. These capture the characteristic spectral
@@ -19,38 +21,44 @@
 #include "scene.h"
 
 // --- Metal spectral reflectance (normal incidence) --------------------------
-// R(lambda) = ((n-1)^2 + k^2) / ((n+1)^2 + k^2), tabulated from measured n,k.
-// Coarse sampling is fine: metal reflectance varies smoothly across the visible.
-inline Spectrum metalGold() {
+// R(lambda) = ((n-1)^2 + k^2) / ((n+1)^2 + k^2), computed from published complex
+// refractive indices n,k (see tools/ri_nk_to_reflectance.py). Au/Ag/Cu use the
+// canonical Johnson & Christy 1972 measurements at their native sample points;
+// Al/Cr use the Rakic 1995/1998 datasets resampled to 20 nm. All data is CC0
+// (refractiveindex.info). Wavelengths in nm; tabulatedSpectrum interpolates.
+inline Spectrum metalGold() {   // Johnson & Christy 1972 (Au), R from n,k
     return tabulatedSpectrum({
-        {380,0.39},{400,0.37},{420,0.37},{440,0.37},{460,0.37},{480,0.39},
-        {500,0.47},{520,0.60},{540,0.74},{560,0.83},{580,0.88},{600,0.90},
-        {620,0.92},{640,0.94},{660,0.95},{680,0.96},{700,0.97},{760,0.98}
+        {354.2,0.383},{367.9,0.392},{381.5,0.403},{397.4,0.407},{413.3,0.409},{430.5,0.408},{450.9,0.408},{471.4,0.401},
+        {495.9,0.447},{520.9,0.643},{548.6,0.787},{582.1,0.882},{616.8,0.931},{659.5,0.963},{704.5,0.971},{756,0.974},
+        {821.1,0.976},{892,0.98}
     });
 }
-inline Spectrum metalSilver() {
+inline Spectrum metalSilver() {   // Johnson & Christy 1972 (Ag), R from n,k
     return tabulatedSpectrum({
-        {380,0.92},{400,0.93},{440,0.94},{480,0.95},{520,0.97},{560,0.98},
-        {600,0.98},{640,0.98},{680,0.99},{720,0.99},{760,0.99}
+        {354.2,0.876},{367.9,0.928},{381.5,0.956},{397.4,0.963},{413.3,0.968},{430.5,0.978},{450.9,0.98},{471.4,0.979},
+        {495.9,0.981},{520.9,0.984},{548.6,0.983},{582.1,0.987},{616.8,0.987},{659.5,0.991},{704.5,0.993},{756,0.996},
+        {821.1,0.995},{892,0.996}
     });
 }
-inline Spectrum metalCopper() {
+inline Spectrum metalCopper() {   // Johnson & Christy 1972 (Cu), R from n,k
     return tabulatedSpectrum({
-        {380,0.36},{400,0.37},{440,0.39},{480,0.42},{520,0.45},{540,0.47},
-        {560,0.50},{580,0.57},{600,0.72},{620,0.83},{640,0.89},{660,0.93},
-        {680,0.95},{700,0.96},{760,0.97}
+        {354.2,0.41},{367.9,0.426},{381.5,0.446},{397.4,0.464},{413.3,0.492},{430.5,0.518},{450.9,0.539},{471.4,0.555},
+        {495.9,0.576},{520.9,0.591},{548.6,0.619},{582.1,0.726},{616.8,0.9},{659.5,0.943},{704.5,0.956},{756,0.959},
+        {821.1,0.963},{892,0.966}
     });
 }
-inline Spectrum metalAluminium() {
+inline Spectrum metalAluminium() {   // Rakic 1995 (Al), R from n,k, 20 nm grid
     return tabulatedSpectrum({
-        {380,0.92},{420,0.92},{460,0.92},{500,0.92},{540,0.91},{580,0.91},
-        {620,0.90},{660,0.90},{700,0.89},{760,0.88}
+        {360,0.925},{380,0.925},{400,0.924},{420,0.923},{440,0.923},{460,0.921},{480,0.92},{500,0.919},
+        {520,0.918},{540,0.916},{560,0.915},{580,0.913},{600,0.911},{620,0.91},{640,0.907},{660,0.904},
+        {680,0.901},{700,0.897},{720,0.894},{740,0.888},{760,0.882},{780,0.875},{800,0.868},{820,0.866}
     });
 }
-inline Spectrum metalChromium() {
+inline Spectrum metalChromium() {   // Rakic 1998 (Cr, LD model), R from n,k, 20 nm grid
     return tabulatedSpectrum({
-        {380,0.57},{420,0.56},{460,0.56},{500,0.58},{540,0.60},{580,0.61},
-        {620,0.62},{660,0.63},{700,0.64},{760,0.65}
+        {360,0.647},{380,0.65},{400,0.652},{420,0.654},{440,0.654},{460,0.654},{480,0.654},{500,0.653},
+        {520,0.652},{540,0.65},{560,0.649},{580,0.647},{600,0.646},{620,0.644},{640,0.643},{660,0.641},
+        {680,0.639},{700,0.638},{720,0.636},{740,0.635},{760,0.634},{780,0.633},{800,0.631},{820,0.63}
     });
 }
 inline Spectrum metalBrass() {   // Cu-Zn alloy: a paler, less saturated gold

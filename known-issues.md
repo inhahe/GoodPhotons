@@ -344,11 +344,14 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** OPEN (acceptable) — feature works and looks right; accuracy of the
   underlying numbers is the tracked debt.
 
-### Built-in material presets: metal reflectances coarse, natural reflectances & iridescent recipes are representative
+### Built-in material presets: natural reflectances & iridescent recipes are representative (metals now measured)
 - **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
   and recipes, plus expanded glasses in `src/spectrum.h`:
-  - **Metals** — `metal:Au|Ag|Cu|Al|Cr|brass` reflectance R(λ) (`metalGold()` etc.),
-    tabulated from published normal-incidence values.
+  - **Metals** — `metal:Au|Ag|Cu|Al|Cr|brass` reflectance R(λ) (`metalGold()` etc.).
+    Au/Ag/Cu/Al/Cr now computed from published measured n,k (Johnson & Christy 1972,
+    Rakić 1995/1998; CC0 via refractiveindex.info) with
+    `tools/ri_nk_to_reflectance.py` — see resolved item below. `brass` is still an
+    alloy fit (no single canonical dataset).
   - **Glasses/crystals** — `glass:` gained `silica`/`fused-silica`/`quartz`,
     `sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`
     (Sellmeier for glass/crystal, `cauchy()` fits for water/ice/plastics), unified
@@ -358,11 +361,13 @@ as practical; this file is the fallback for what can't be addressed immediately.
     `resolveMaterialPreset()`: metals (glossy), glasses (dielectric), and iridescent
     `soap-bubble`/`oil-slick`/`anodized-ti`/`morpho`/`beetle`/`nacre`.
 - **The honesty caveats (tech debt, not a bug):**
-  1. **Metal reflectances are hand-transcribed and coarsely sampled** from published
-     n,k (Johnson & Christy / Rakić); shapes/colours are correct (validated
-     2026-07-11: diffuse-lit spheres read gold/copper/salmon/neutral-silver
-     correctly) but individual samples are approximate, not a full-resolution
-     tabulation.
+  1. *(RESOLVED 2026-07-11)* Metal reflectances were hand-transcribed and coarse;
+     now regenerated from the canonical measured n,k datasets (Johnson & Christy
+     1972 for Au/Ag/Cu at native sample points, Rakić 1995/1998 for Al/Cr at 20 nm)
+     via `tools/ri_nk_to_reflectance.py`, which computes normal-incidence
+     R=((n-1)²+k²)/((n+1)²+k²). Colours re-validated on diffuse-lit spheres
+     (gold/copper/salmon/neutral-silver/neutral-chrome). Only `brass` remains an
+     alloy fit — no single canonical dataset exists for it.
   2. **The `reflectance:` natural curves are representative shapes, not a specific
      measured sample** — a plausible "a leaf / some skin / snow," capturing the
      characteristic features (chlorophyll dip + red-edge, haemoglobin W, flat snow),
@@ -378,11 +383,14 @@ as practical; this file is the fallback for what can't be addressed immediately.
   behaviour (same as the existing `mirror`/`glossy`/`dielectric` types); use mode A,
   an environment light, or surrounding geometry to see them. Their reflectance data
   is correct (verified by putting the same `metal:` spectra on a diffuse surface).
-- **Proper fix (future):** ingest real datasets (refractiveindex.info for n,k, a
-  spectral reflectance library for the diffuse curves) through the planned CSV→`table`
-  loader so these become verifiable data rather than transcribed/representative.
-- **Status:** OPEN (acceptable) — presets work, load on CPU==GPU, and render the
-  right colours; numeric provenance is the tracked debt.
+- **Proper fix (remaining):** the loaders now exist — `tools/csv_to_table.py`
+  (generic CSV→`table`) and `tools/ri_nk_to_reflectance.py` (refractiveindex.info
+  n,k→reflectance). Metals are done. Remaining debt is ingesting a measured spectral
+  reflectance library (e.g. USGS/ECOSTRESS) for the `reflectance:` diffuse curves so
+  they too become verifiable data rather than representative shapes.
+- **Status:** OPEN (acceptable, reduced) — metals are now measured data; natural
+  reflectances and iridescent recipes remain representative. All presets load on
+  CPU==GPU and render the right colours.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
