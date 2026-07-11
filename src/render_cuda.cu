@@ -192,6 +192,29 @@ struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId;
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
+// Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
+// The field is a flat postfix array evaluated with a scalar stack, sphere-traced for
+// intersection. All math is done in DOUBLE (independent of the FP32 transport `Real`):
+// the sign-change bisection converges to ~1e-12, which needs the precision, and
+// implicits are already the expensive path, so the FP64 cost is acceptable. POD twins
+// of FieldOp / FieldNode / Implicit (see src/implicit.h).
+enum { DF_SPHERE = 0, DF_BOX, DF_TORUS, DF_PLANE, DF_CYLINDER, DF_CONE,
+       DF_UNION, DF_INTERSECT, DF_DIFFERENCE,
+       DF_SMOOTH_UNION, DF_SMOOTH_INTERSECT, DF_SMOOTH_DIFFERENCE };
+struct DFieldNode {
+    int    op;
+    double p[4];
+    double inv[9];        // world->local linear part (row-major, matches Affine::m)
+    double tx, ty, tz;    // world->local translation (Affine::t)
+    double scale;         // world = scale * local; d_world = d_local * scale (leaf only)
+};
+struct DImplicit {
+    int    nodeOff, nodeN;   // slice [nodeOff, nodeOff+nodeN) into DScene::fieldNodes
+    int    matId;
+    double lo[3], hi[3];     // world AABB (ray clip)
+    double lipschitz, minStep;
+};
+
 struct DMedium {
     int    enabled;
     double sigma_a[SPEC_N];
@@ -301,6 +324,11 @@ struct DScene {
     const DSphere*   sph;   int nSph;
     const DMaterial* mats;
     const DNode*     nodes; const int* primIdx; int nNodes;
+    // Implicit surfaces (isosurface/CSG/metaballs). BVH prims with index
+    // >= nTris+nSph map to implicits[prim - nTris - nSph]; fieldNodes is the flat
+    // postfix node pool the DImplicit slices index into.
+    const DFieldNode* fieldNodes;
+    const DImplicit*  implicits; int nImplicits;
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
@@ -723,6 +751,152 @@ struct DHit {
     Real u, v;   // interpolated surface texture coordinates
 };
 
+// ---- implicit field evaluation (device twin of implicit.h) ----------------
+// smin/smax (Inigo Quilez quadratic blend) — filleted CSG / metaball merge.
+__device__ static inline double dSmin(double a, double b, double k) {
+    if (k <= 0.0) return a < b ? a : b;
+    double h = fmax(k - fabs(a - b), 0.0) / k;
+    return (a < b ? a : b) - h * h * k * 0.25;
+}
+__device__ static inline double dSmax(double a, double b, double k) { return -dSmin(-a, -b, k); }
+
+// Leaf SDF at the leaf-LOCAL query point (px,py,pz). Mirrors fieldLeafSDF exactly.
+__device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz) {
+    switch (nd.op) {
+        case DF_SPHERE:
+            return sqrt(px*px + py*py + pz*pz) - nd.p[0];
+        case DF_BOX: {
+            double r = nd.p[3];
+            double qx = fabs(px) - nd.p[0] + r, qy = fabs(py) - nd.p[1] + r, qz = fabs(pz) - nd.p[2] + r;
+            double ox = fmax(qx, 0.0), oy = fmax(qy, 0.0), oz = fmax(qz, 0.0);
+            double outside = sqrt(ox*ox + oy*oy + oz*oz);
+            double inside  = fmin(fmax(qx, fmax(qy, qz)), 0.0);
+            return outside + inside - r;
+        }
+        case DF_TORUS: {
+            double qx = sqrt(px*px + pz*pz) - nd.p[0];
+            return sqrt(qx*qx + py*py) - nd.p[1];
+        }
+        case DF_PLANE:
+            return px*nd.p[0] + py*nd.p[1] + pz*nd.p[2] + nd.p[3];
+        case DF_CYLINDER: {
+            double dxz = sqrt(px*px + pz*pz) - nd.p[0];
+            double dy  = fabs(py) - nd.p[1];
+            double a   = fmin(fmax(dxz, dy), 0.0);
+            double bx  = fmax(dxz, 0.0), by = fmax(dy, 0.0);
+            return a + sqrt(bx*bx + by*by);
+        }
+        case DF_CONE: {
+            double rb = nd.p[0], rt = nd.p[1], h = nd.p[2];
+            double qx = sqrt(px*px + pz*pz), qy = py;
+            double k1x = rt, k1y = h, k2x = rt - rb, k2y = 2.0*h;
+            double cax = qx - fmin(qx, (qy < 0.0) ? rb : rt);
+            double cay = fabs(qy) - h;
+            double k2dot = k2x*k2x + k2y*k2y;
+            double tt = (k2dot > 0.0) ? ((k1x - qx)*k2x + (k1y - qy)*k2y) / k2dot : 0.0;
+            tt = tt < 0.0 ? 0.0 : (tt > 1.0 ? 1.0 : tt);
+            double cbx = qx - k1x + k2x*tt, cby = qy - k1y + k2y*tt;
+            double s = (cbx < 0.0 && cay < 0.0) ? -1.0 : 1.0;
+            double da = cax*cax + cay*cay, db = cbx*cbx + cby*cby;
+            return s * sqrt(fmin(da, db));
+        }
+        default: return BIG;
+    }
+}
+// Whole-field SDF at world point (pw) via the postfix scalar stack. Mirrors fieldEval.
+__device__ static double dFieldEval(const DFieldNode* nodes, int n,
+                                    double pwx, double pwy, double pwz) {
+    double st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const DFieldNode& nd = nodes[i];
+        switch (nd.op) {
+            case DF_UNION:            { double b = st[--sp], a = st[--sp]; st[sp++] = a < b ? a : b; break; }
+            case DF_INTERSECT:        { double b = st[--sp], a = st[--sp]; st[sp++] = a > b ? a : b; break; }
+            case DF_DIFFERENCE:       { double b = st[--sp], a = st[--sp]; st[sp++] = a > -b ? a : -b; break; }
+            case DF_SMOOTH_UNION:     { double b = st[--sp], a = st[--sp]; st[sp++] = dSmin(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_INTERSECT: { double b = st[--sp], a = st[--sp]; st[sp++] = dSmax(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_DIFFERENCE:{ double b = st[--sp], a = st[--sp]; st[sp++] = dSmax(a, -b, nd.p[0]); break; }
+            default: {   // leaf: world -> local via inv, then local SDF * scale
+                double plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
+                double ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
+                double plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
+                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz) * nd.scale;
+            }
+        }
+    }
+    return sp > 0 ? st[0] : BIG;
+}
+// Field gradient (tetrahedron central differences) -> unit normal. Mirrors fieldGradient.
+__device__ static void dFieldGradient(const DFieldNode* nodes, int n,
+                                      double px, double py, double pz, double eps,
+                                      double& gx, double& gy, double& gz) {
+    // stencil offsets k1(1,-1,-1) k2(-1,-1,1) k3(-1,1,-1) k4(1,1,1)
+    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps);
+    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps);
+    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps);
+    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps);
+    gx =  f1 - f2 - f3 + f4;
+    gy = -f1 - f2 + f3 + f4;
+    gz = -f1 + f2 - f3 + f4;
+    double len = sqrt(gx*gx + gy*gy + gz*gz);
+    if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
+    else           { gx = 0.0; gy = 0.0; gz = 1.0; }
+}
+// Sphere-trace one implicit; writes into `hit` (respecting hit.t). Mirrors intersectImplicit.
+__device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
+                                          const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
+    double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
+    double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
+    double t0 = tmin, t1 = hit.t;
+    // clip to world AABB
+    { double ta = (im.lo[0]-ox)*idx, tb = (im.hi[0]-ox)*idx; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
+    { double ta = (im.lo[1]-oy)*idy, tb = (im.hi[1]-oy)*idy; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
+    { double ta = (im.lo[2]-oz)*idz, tb = (im.hi[2]-oz)*idz; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
+
+    const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
+    const int N = im.nodeN;
+    const double dlen = sqrt(dx*dx + dy*dy + dz*dz);
+    const int MAX_STEP = 2048;
+    const double invLip = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
+    const double minStep = im.minStep > 0.0 ? im.minStep : 1e-4;
+
+    double t = t0;
+    double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t);
+    for (int i = 0; i < MAX_STEP; ++i) {
+        double step = fmax(fabs(f) * invLip, minStep) / dlen;
+        double tn = t + step;
+        bool last = false;
+        if (tn >= t1) { tn = t1; last = true; }
+        double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn);
+        bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) || (f == 0.0 && fn != 0.0);
+        if (crossed) {
+            double ta = t, tb = tn, fa = f;
+            for (int b = 0; b < 60; ++b) {
+                double tm = 0.5*(ta + tb);
+                double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm);
+                if ((fa > 0.0) == (fm > 0.0)) { ta = tm; fa = fm; }
+                else                          { tb = tm; }
+                if ((tb - ta) * dlen < 1e-12) break;
+            }
+            double th = 0.5*(ta + tb);
+            if (th < tmin || th >= (double)hit.t) return false;
+            double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
+            double eps = fmax(1e-6, 1e-4*th);
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz);
+            hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
+            hit.ng = DVec3(gx, gy, gz);
+            double side = dx*gx + dy*gy + dz*gz;
+            hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
+            hit.matId = im.matId; hit.sensorId = -1;
+            hit.u = 0; hit.v = 0;
+            return true;
+        }
+        if (last) return false;
+        t = tn; f = fn;
+    }
+    return false;
+}
+
 __device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
                                      Real tmin, DHit& hit) {
     DVec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
@@ -800,8 +974,9 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
-                if (prim < sc.nTris) { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
-                else                 { if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
+                if (prim < sc.nTris)              { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
+                else                              { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
             }
         } else {
             Real tL, tR;
@@ -831,7 +1006,8 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked = (prim < sc.nTris) ? intersectTri(o, dir, sc.tris[prim], tmin, h)
-                                                 : intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
+                             : (prim < sc.nTris + sc.nSph) ? intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h)
+                             : intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
                 if (blocked) return true;
             }
         } else {
@@ -2527,11 +2703,9 @@ bool cudaAvailable() {
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 
 bool cudaForwardSupported(const Scene& scene) {
-    // Implicit surfaces (isosurface / CSG / metaballs) are sphere-traced on the CPU
-    // only; the device closestHit handles just triangles and spheres, so any scene
-    // with an implicit falls back to the CPU tracer (otherwise the isosurface geometry
-    // would be silently missing from the GPU image).
-    if (!scene.implicits.empty()) return false;
+    // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
+    // device too (DImplicit + intersectImplicit); their materials are checked by the
+    // same `unsupported()` gate as tri/sphere materials below.
     // The device multilayer stack has a fixed cap (D_MAXLAYERS); scenes with a
     // deeper stack fall back to the CPU tracer, which has no layer limit. (Textured
     // albedo and fluorescence are now BOTH ported to the device: per-texel Jakob-
@@ -2600,8 +2774,9 @@ bool cudaForwardSupported(const Scene& scene) {
         }
         return false;
     };
-    for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
-    for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
+    for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
+    for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
+    for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
     // Environment lighting runs on-device: the kernel emits env photons from the scene
     // bounding sphere (shape==3) and the directly-viewed background is added by the
     // backend-agnostic addEnvBackground() pass. Both a constant env and an IMAGE-based
@@ -2671,6 +2846,30 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     }
     std::vector<int> primIdx = scene.bvh.primIdx;
 
+    // --- bake implicit surfaces (isosurface / CSG / metaballs) ---
+    // Flatten every Implicit's postfix FieldNode array into one pool; each DImplicit
+    // slices it by [nodeOff, nodeOff+nodeN). BVH prims >= nTris+nSph index these.
+    std::vector<DFieldNode> fieldNodes;
+    std::vector<DImplicit>  dimpl(scene.implicits.size());
+    for (size_t i = 0; i < scene.implicits.size(); ++i) {
+        const Implicit& im = scene.implicits[i]; DImplicit& d = dimpl[i];
+        d.nodeOff = (int)fieldNodes.size();
+        d.nodeN   = (int)im.nodes.size();
+        d.matId   = im.matId;
+        d.lo[0] = im.bounds.lo.x; d.lo[1] = im.bounds.lo.y; d.lo[2] = im.bounds.lo.z;
+        d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
+        d.lipschitz = im.lipschitz; d.minStep = im.minStep;
+        for (const FieldNode& fn : im.nodes) {
+            DFieldNode dn;
+            dn.op = (int)fn.op;
+            dn.p[0] = fn.p[0]; dn.p[1] = fn.p[1]; dn.p[2] = fn.p[2]; dn.p[3] = fn.p[3];
+            for (int k = 0; k < 9; ++k) dn.inv[k] = fn.inv.m[k];
+            dn.tx = fn.inv.t.x; dn.ty = fn.inv.t.y; dn.tz = fn.inv.t.z;
+            dn.scale = fn.scale;
+            fieldNodes.push_back(dn);
+        }
+    }
+
     // --- bake materials ---
     // Fluorescent materials append their emission-SPD CDF to one flat buffer
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
@@ -2721,6 +2920,8 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     DNode*     d_nodes = nodes.empty()   ? nullptr : (DNode*)keep(uploadVec(nodes));
     int*       d_prim  = primIdx.empty() ? nullptr : (int*)keep(uploadVec(primIdx));
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
+    DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
+    DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
 
     // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
@@ -2831,6 +3032,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
+    sc.fieldNodes = d_fnodes; sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;

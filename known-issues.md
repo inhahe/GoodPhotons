@@ -42,34 +42,41 @@ as practical; this file is the fallback for what can't be addressed immediately.
   endpoint sits in) and multiply the connection throughput by the resulting
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
 
-### GPU parity pending for implicit surfaces, procedural patterns, and dielectric translucency
-- **What:** the §1–4 CPU feature set — **implicit surfaces** (`isosurface`: analytic
-  SDF primitives, hard/smooth CSG, metaballs; `src/implicit.h`), **procedural patterns**
-  (`pattern` blocks + `pattern:<name>` scalar/selection drives; `src/pattern.h`), and
-  **dielectric translucency** (frosted glass = roughness lobe on the transmitted ray;
-  colored glass = Beer–Lambert `absorb` interior tint) — is **CPU-only**. The CUDA
-  backend (`src/render_cuda.cu`) has no device sphere-tracer (its `closestHit` handles
-  only triangles and spheres), no pattern VM, and its dielectric branch
-  (`refractOrReflect`) is smooth and non-absorbing.
-- **Current behavior (correct, not silently wrong):** `cudaForwardSupported()` now
-  gates all three — a scene with any `scene.implicits`, any material with a bound
-  pattern (`roughnessPat`/`filmThicknessPat`/`mixWeightPat >= 0`), or any frosted/colored
-  dielectric returns `false`, so `-device gpu`/`auto` **falls back to the CPU tracer**
-  (message names the feature). `cudaBdptSupported()`/`cudaBackwardSupported()` inherit
-  this (both call `cudaForwardSupported`). Verified: `scenes/implicit.ftsl`,
-  `procedural.ftsl`, `translucency.ftsl` all fall back; a plain clear-glass scene
-  (`cornell.ftsl`, `glass:SF10`) still runs on GPU (the gate distinguishes clear from
-  frosted/colored — clear dielectrics author `roughness 0` and a zero `absorb`).
-- **Proper fix (step 5, the remaining port):** (a) upload `FieldNode` arrays + `Implicit`
-  primitives into `DScene` and add device sphere-tracing to `closestHit` (`fieldVal`
-  written into the device Hit); (b) upload `Scene::patterns` as flat `PatNode` arrays +
-  port `patternEval` to the device, then wire `dMatRoughness`/`dMatFilmThickness`/
-  `dMixResolveChild` to consult them; (c) thread an `interior` medium pointer through the
-  device transport loops for Beer–Lambert absorption and add the roughness lobe to the
-  device dielectric (frosting). The pattern VM and noise hash were written GPU-portable
-  (POD `PatNode`, integer-hash noise) specifically to make (b) a near-direct port.
-- **Status:** OPEN — logged 2026-07-11. CPU path complete & validated; GPU port is the
-  next planned increment.
+### GPU parity pending for procedural patterns and dielectric translucency (implicits DONE)
+- **What:** of the §1–4 CPU feature set, **implicit surfaces** are now ported to the
+  GPU (see below); **procedural patterns** (`pattern` blocks + `pattern:<name>` scalar/
+  selection drives; `src/pattern.h`) and **dielectric translucency** (frosted glass =
+  roughness lobe on the transmitted ray; colored glass = Beer–Lambert `absorb` interior
+  tint) remain **CPU-only**. The CUDA backend (`src/render_cuda.cu`) still has no pattern
+  VM, and its dielectric branch (`refractOrReflect`) is smooth and non-absorbing.
+- **Implicit surfaces — DONE (2026-07-11, step 5a):** `render_cuda.cu` gained device
+  twins `DFieldNode`/`DImplicit`, a postfix field evaluator (`dFieldEval`/`dFieldLeafSDF`/
+  `dFieldGradient`, all FP64 for sphere-trace bisection robustness), and
+  `intersectImplicit` (a direct port of the CPU sphere-trace). `buildUpload` flattens
+  every `Implicit`'s `FieldNode` array into one device pool and uploads a `DImplicit`
+  descriptor per primitive; `closestHit`/`occluded` dispatch BVH prims with index
+  `>= nTris+nSph` to `intersectImplicit` (matching the CPU prim ordering). Validated:
+  `scenes/implicit.ftsl` (metaballs + drilled CSG + tilted torus) renders on the GPU
+  mode-R backward megakernel with GPU-vs-CPU RMSE 9.9/255 at 512 spp — *lower* than the
+  cornell baseline (12.7/255) at the same settings, i.e. pure Monte-Carlo noise, no
+  implicit-specific bias; mean brightness matches to ~1%.
+- **Current behavior for the remaining two (correct, not silently wrong):**
+  `cudaForwardSupported()` still gates patterns & translucency — a material with a bound
+  pattern (`roughnessPat`/`filmThicknessPat`/`mixWeightPat >= 0`, checked for tri/sphere
+  **and implicit** materials) or a frosted/colored dielectric returns `false`, so
+  `-device gpu`/`auto` **falls back to the CPU tracer** (message names the feature).
+  `cudaBdptSupported()`/`cudaBackwardSupported()` inherit this. Verified: `procedural.ftsl`
+  and `translucency.ftsl` fall back; `implicit.ftsl` and plain clear-glass `cornell.ftsl`
+  run on GPU.
+- **Proper fix (remaining step-5 work):** (b) upload `Scene::patterns` as flat `PatNode`
+  arrays + port `patternEval` to the device, then wire `dMatRoughness`/
+  `dMatFilmThickness`/`dMixResolveChild` to consult them; (c) thread an `interior` medium
+  pointer through the device transport loops for Beer–Lambert absorption and add the
+  roughness lobe to the device dielectric (frosting). The pattern VM and noise hash were
+  written GPU-portable (POD `PatNode`, integer-hash noise) specifically to make (b) a
+  near-direct port.
+- **Status:** OPEN — logged 2026-07-11; implicit surfaces (5a) landed same day. Patterns
+  (5b) + translucency (5c) are the remaining increments.
 
 ### Multi-camera renders re-trace photons per camera (no shared pass yet)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render
