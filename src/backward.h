@@ -31,6 +31,13 @@
 // Emission is added only when a light is reached via the camera ray or a
 // specular/near-specular bounce; diffuse arrivals are covered by NEE (no double
 // counting).
+// An environment light (scene.envIndex >= 0) is treated as an infinitely-distant
+// light: diffuse and fog-scatter vertices do env NEE (neeEnv / neeEnvVolume) by
+// importance-sampling the sky's luminance CDF, MIS-combined (balance heuristic) with
+// the BSDF-sampled continuation that reaches the sky on a ray miss — the miss term
+// is added at full weight only on a camera/specular arrival and MIS-weighted after a
+// diffuse/volume bounce. All of this is skipped when the scene has no env light, so
+// non-env scenes keep a bit-identical RNG stream / backward image.
 #pragma once
 #include "scene.h"
 #include "camera.h"
@@ -139,6 +146,55 @@ struct BackwardRenderer {
         return total;
     }
 
+    // Environment next-event estimation at a diffuse surface vertex. Importance-
+    // samples a direction from the env map's luminance CDF (a uniform sphere
+    // direction for a constant env), connects with a shadow ray out past the scene
+    // bounds, and MIS-weights (balance heuristic) against the BSDF-sampled
+    // continuation that also reaches the env on a ray miss — so bright, concentrated
+    // skies (a sun disk) are low-variance without being double-counted. Only invoked
+    // when the scene actually has an env light (guarded by the caller so non-env
+    // scenes keep a bit-identical RNG stream). Mirrors neeLight's transmittance /
+    // shadow-bias conventions.
+    double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
+                  double lambda, Pcg32& rng) const {
+        double pdfW;
+        Vec3 wi = scene.sampleEnvDir(rng, pdfW);
+        if (pdfW <= 0.0) return 0.0;
+        double cosSurf = dot(h.n, wi);
+        if (cosSurf <= 0.0) return 0.0;                 // below the horizon
+        double farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+        if (scene.occluded(h.p + h.n * 1e-6, wi, farDist)) return 0.0;
+        double Lenv = scene.envRadiance(wi, lambda);
+        if (Lenv <= 0.0) return 0.0;
+        double f = rho / PI;                            // Lambertian BRDF
+        double pdfBsdf = cosSurf / PI;                  // cosine-hemisphere pdf for wi
+        double wMis = pdfW / (pdfW + pdfBsdf);          // balance heuristic
+        double contrib = f * Lenv * cosSurf * invPdfLambda / pdfW * wMis;
+        if (scene.medium.enabled)                       // Beer-Lambert to the scene exit
+            contrib *= std::exp(-scene.medium.sigmaT(lambda) * farDist);
+        return contrib;
+    }
+
+    // Environment NEE at a fog scattering vertex: same as neeEnv but the surface
+    // BRDF/cosine is replaced by the single-scattering albedo and the HG phase
+    // function (which is also the pdf used for the MIS weight against the phase-
+    // sampled continuation). Only invoked when the scene has an env light.
+    double neeEnvVolume(const Scene& scene, const Vec3& p, const Vec3& wIn,
+                        double lambda, double invPdfLambda, Pcg32& rng) const {
+        double pdfW;
+        Vec3 wi = scene.sampleEnvDir(rng, pdfW);
+        if (pdfW <= 0.0) return 0.0;
+        double farDist = length(scene.sceneCenter - p) + scene.sceneRadius;
+        if (scene.occluded(p + wi * 1e-6, wi, farDist)) return 0.0;
+        double Lenv = scene.envRadiance(wi, lambda);
+        if (Lenv <= 0.0) return 0.0;
+        double phase  = hgPhase(dot(wIn, wi), scene.medium.g);  // == BSDF pdf here
+        double albedo = scene.medium.albedo(lambda);
+        double wMis   = pdfW / (pdfW + phase);          // balance heuristic
+        double T = std::exp(-scene.medium.sigmaT(lambda) * farDist);
+        return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T;
+    }
+
     // Estimate spectral-weighted radiance for a single wavelength along `ray`.
     // `invPdfLambda` = emitG/g(lambda), the reciprocal of the sampled-wavelength
     // pdf; an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
@@ -146,6 +202,9 @@ struct BackwardRenderer {
                     Pcg32& rng) const {
         double L = 0.0, thr = 1.0;
         bool specularArrival = true;   // camera ray may see the light directly
+        double contBsdfPdf = 0.0;      // solid-angle pdf of the current continuation
+                                       // ray (for env-miss MIS after a diffuse/volume
+                                       // bounce; unused while specularArrival)
         Renderer mats;                 // shared material sampling (stateless)
         mats.diffraction = diffraction; // grating order count follows the CLI toggle
 
@@ -164,8 +223,12 @@ struct BackwardRenderer {
                     if (tMed < dSurf) {
                         Vec3 p = ray.o + ray.d * tMed;
                         L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
+                        if (scene.envIndex >= 0)   // env-NEE at the volume vertex
+                            L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
                         if (rng.uniform() >= scene.medium.albedo(lambda)) return L; // absorbed
-                        ray = Ray{p, sampleHG(ray.d, scene.medium.g, rng)};
+                        Vec3 wOut = sampleHG(ray.d, scene.medium.g, rng);
+                        contBsdfPdf = hgPhase(dot(ray.d, wOut), scene.medium.g);
+                        ray = Ray{p, wOut};
                         specularArrival = false;   // phase-NEE covered the direct light
                         continue;
                     }
@@ -174,11 +237,25 @@ struct BackwardRenderer {
 
             // Ray escaped the scene: pick up the environment radiance from the escape
             // direction (0 if no env light; constant env ignores the direction, an
-            // image env samples the lat-long map). Added unconditionally (no env NEE
-            // yet), the same spdFn*invPdfLambda form as surface emission, so forward
-            // and backward agree on env illumination and directly-viewed background.
+            // image env samples the lat-long map). On a camera/specular arrival there
+            // is no competing env-NEE, so it is added at full weight (the directly-
+            // viewed background and specular-chain sky). On a diffuse/volume arrival
+            // the env is also sampled by neeEnv/neeEnvVolume at the previous vertex,
+            // so this BSDF-sampled hit is MIS-weighted (balance heuristic) against
+            // that NEE to avoid double-counting. Same spdFn*invPdfLambda form as
+            // surface emission, so forward and backward agree on env illumination.
             if (!h.valid) {
-                L += thr * scene.envRadiance(ray.d, lambda) * invPdfLambda;
+                if (scene.envIndex >= 0) {
+                    double Lenv = scene.envRadiance(ray.d, lambda) * invPdfLambda;
+                    if (specularArrival) {
+                        L += thr * Lenv;
+                    } else {
+                        double pdfEnv = scene.envPdfDir(ray.d);
+                        double wMis = (contBsdfPdf + pdfEnv > 0.0)
+                                          ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
+                        L += thr * Lenv * wMis;
+                    }
+                }
                 return L;
             }
             const Material* mp = &scene.mats[h.matId];
@@ -251,10 +328,14 @@ struct BackwardRenderer {
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
                     L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng);
+                    if (scene.envIndex >= 0)   // env-NEE toward the sky (MIS'd on miss)
+                        L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng);
                     // Russian roulette on the albedo (throughput unchanged on
                     // survival) — matches the forward tracer's diffuse handling.
                     if (rng.uniform() >= rho) return L;
-                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
+                    Vec3 wOut = cosineHemisphere(h.n, rng);
+                    contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
+                    ray = Ray{h.p + h.n * 1e-6, wOut};
                     specularArrival = false;
                     break;
                 }

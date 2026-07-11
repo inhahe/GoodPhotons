@@ -175,11 +175,17 @@ as practical; this file is the fallback for what can't be addressed immediately.
   samples — the residual is Monte-Carlo variance from the sun glow, not bias;
   forward/backward auto-exposure agree to ~3%; energy conserves). Constant env
   (`envlight.ftsl`) stays **bit-identical** (mode-V scale 0.971252, unchanged).
-  - **Remaining (increment 2b):** backward env **NEE** at diffuse/volume vertices
-    (sample `ω~envPdf`, shadow-ray to `sceneRadius`) so a strongly peaked map (sun) is
-    clean in the reference — currently the unconditional miss term alone covers env
-    illumination (unbiased but noisy for peaked maps). Adding NEE requires gating the
-    miss term on `specularArrival` to avoid double-counting.
+  - **Increment 2b — DONE (2026-07-10):** backward env **NEE** at every diffuse and
+    fog-scatter vertex (`neeEnv`/`neeEnvVolume` in `backward.h`): sample `ω` from the
+    map's luminance CDF, shadow-ray past the scene bounds, and **MIS-combine** (balance
+    heuristic) with the BSDF-sampled continuation that reaches the sky on a ray miss.
+    The miss term is added at full weight only on a camera/specular arrival and MIS-
+    weighted otherwise (gated on `specularArrival`), so nothing is double-counted;
+    `envMap->pdf(d)` provably equals `sample()`'s reported pdfW, so the weights sum to
+    1 (unbiased — verified: `envmap.ftsl` mode-V scale stays ~0.947 at 60M/512, energy
+    conserves, residual broadly distributed). All env-NEE work is gated on
+    `scene.envIndex >= 0`, so non-env scenes keep a **bit-identical** RNG stream /
+    backward image (cornell mode V unchanged).
   - **Remaining (increment 2c):** GPU port of the lat-long sampler (upload the RGB/
     coeff tables + marginal/conditional CDFs; port `sample`/`pdf`/`radiance`). Until
     then `cudaForwardSupported()` returns false when `scene.envMap` is set, so image-env
@@ -241,9 +247,9 @@ as practical; this file is the fallback for what can't be addressed immediately.
   environment (`light env { spd … }`) done 2026-07-10 (increments 1a CPU + 1b GPU)**
   incl. the absolute-radiance We fix and on-device env emission; **image-based HDRI
   (`light env { file … }`, 2D luminance CDF + per-texel JH spectral upsampling) done
-  2026-07-10 (increment 2a, CPU forward+backward miss/background)**; backward env-NEE
-  (2b) and GPU port of the lat-long sampler (2c) still deferred (see the plan above);
-  sphere/spot importance-sampling also deferred.
+  2026-07-10 (increments 2a CPU forward+backward miss/background + 2b backward
+  env-NEE with MIS)**; only the GPU port of the lat-long sampler (2c) still deferred
+  (see the plan above); sphere/spot importance-sampling also deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

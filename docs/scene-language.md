@@ -466,8 +466,14 @@ reference on a unit radiance scale). Direction convention: `θ` from `+y` (up), 
 at the top; `φ = atan2(z,x)`, `u = φ/2π + ½`. **The image environment currently runs
 on the CPU only** (the device kernel handles the *constant* env; the lat-long
 sampler's GPU port is a follow-up), so image-env scenes auto-fall-back to the CPU
-forward tracer. Backward env **NEE** is not yet added (the miss term alone covers env
-illumination), so a strongly peaked map is noisier in the reference than a smooth one.
+forward tracer. The backward reference does **env next-event estimation** at every
+diffuse and fog-scatter vertex — it samples a sky direction from the map's luminance
+CDF, shadow-rays past the scene bounds, and **MIS-combines** (balance heuristic) that
+connection with the BSDF-sampled continuation that reaches the sky on a ray miss (the
+miss term is added at full weight only on a camera/specular arrival, and MIS-weighted
+otherwise, so nothing is double-counted). This keeps a strongly peaked map — e.g. a
+sun disk — low-variance in the reference. All env-NEE work is skipped when the scene
+has no env light, so non-env scenes keep a bit-identical RNG stream / backward image.
 
 > **Absolute-radiance camera convention.** The model-B forward light tracer now
 > measures **absolute radiance** — a pixel viewing radiance `L` reads `L` (the
