@@ -33,6 +33,11 @@
 //   -n <photons>   trace exactly this many photons (default).
 //   -time <sec>    trace in batches until the wall-clock budget elapses (-n is the
 //                  batch/checkpoint granularity).
+//   -noise <pct>   trace in batches until the estimated graininess falls to <= pct
+//                  percent (the same "~X% noise" figure the progress line reports:
+//                  100/sqrt(mean per-lit-pixel photon count)), then stop and save.
+//                  Combine with -time to also cap the wall-clock ("stop at whichever
+//                  comes first"); alone it traces until converged (Ctrl-C stops early).
 //   -forever       trace indefinitely, refining the image, until interrupted (Ctrl-C):
 //                  the first Ctrl-C finishes the current batch, writes a final image +
 //                  checkpoint, and exits cleanly (a second Ctrl-C force-quits). Implies
@@ -44,10 +49,10 @@
 //                  draws an independent RNG stream (seed offset = cumulative photons), so
 //                  the result matches a single render of the combined count; a fresh -n
 //                  render (offset 0) is bit-identical to the historical single-shot path.
-//   -preview       during -time/-forever, redraw a live ANSI colour thumbnail of the
-//                  current image in the terminal at each periodic update (in place).
+//   -preview       during -time/-noise/-forever, redraw a live ANSI colour thumbnail of
+//                  the current image in the terminal at each periodic update (in place).
 //   -interval <s>  seconds between periodic image writes / preview refreshes during
-//                  -time/-forever (default 15). The output image file is rewritten at
+//                  -time/-noise/-forever (default 15). The output image file is rewritten at
 //                  this cadence, so an auto-reloading image viewer is also a live display.
 
 #include <cstdio>
@@ -1294,20 +1299,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double manualExposure = 0.0,
                      double timeBudgetSec = 0.0, bool resume = false,
                      bool wantCheckpointFlag = false, bool runForever = false,
-                     bool preview = false, double intervalSec = 15.0) {
+                     bool preview = false, double intervalSec = 15.0,
+                     double noiseTarget = 0.0) {
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
     const bool lensMode     = (mode == 'A');   // finite-lens next-event splat (physical camera)
 
-    // -time / -resume / -checkpoint accumulate a photon-count film, which only the
-    // pure forward camera models (A/B/C) do. Other modes accumulate differently
+    // -time / -noise / -resume / -checkpoint accumulate a photon-count film, which only
+    // the pure forward camera models (A/B/C) do. Other modes accumulate differently
     // (spp-based reference/BDPT, or the P composite) and are not resumable here.
-    if ((timeBudgetSec > 0.0 || resume || wantCheckpointFlag || runForever) &&
+    if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume || wantCheckpointFlag || runForever) &&
         !(mode == 'A' || mode == 'B' || mode == 'C')) {
-        std::fprintf(stderr, "[render] -time/-forever/-resume/-checkpoint apply only to "
+        std::fprintf(stderr, "[render] -time/-noise/-forever/-resume/-checkpoint apply only to "
                              "forward camera modes A/B/C; ignoring for mode %c\n", mode);
-        timeBudgetSec = 0.0; resume = false; wantCheckpointFlag = false; runForever = false;
+        timeBudgetSec = 0.0; noiseTarget = 0.0; resume = false; wantCheckpointFlag = false; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
@@ -1487,7 +1493,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // independent stream; the checkpoint stores the PURE-photon film (the direct view
     // of the sky is re-added deterministically at write time, never accumulated, so a
     // resume can't double-count it).
-    const bool progressive = timeBudgetSec > 0.0 || runForever;   // batch loop modes
+    const bool progressive = timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0;   // batch loop modes
     const bool wantCheckpoint = resume || progressive || wantCheckpointFlag;
     const uint64_t guard = checkpointGuard(scene, mode, res);
     const std::string backend = useGpu ? std::string("GPU")
@@ -1529,16 +1535,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     using clk = std::chrono::steady_clock;
     if (progressive) {
         long long batchN = (N > 0) ? N : 2'000'000;  // -n is the per-batch granularity
+        const char* resumeTag = (resume && acc.N > 0) ? " [resuming]" : "";
+        char noiseSuffix[64] = "";                    // appended when -noise adds a floor
+        if (noiseTarget > 0.0)
+            std::snprintf(noiseSuffix, sizeof noiseSuffix, " or until ~%.2g%% noise", noiseTarget);
         if (runForever)
             std::printf("mode %c: tracing indefinitely in %lld-photon batches at %dx%d on %s "
-                        "(light=%s)%s — press Ctrl-C to stop ...\n",
-                        mode, batchN, res, res, backend.c_str(), lightLabel,
-                        (resume && acc.N > 0) ? " [resuming]" : "");
-        else
-            std::printf("mode %c: tracing for %.3gs in %lld-photon batches at %dx%d on %s "
+                        "(light=%s)%s%s — press Ctrl-C to stop ...\n",
+                        mode, batchN, res, res, backend.c_str(), lightLabel, resumeTag, noiseSuffix);
+        else if (timeBudgetSec > 0.0)
+            std::printf("mode %c: tracing for %.3gs%s in %lld-photon batches at %dx%d on %s "
                         "(light=%s)%s (Ctrl-C to stop early) ...\n",
-                        mode, timeBudgetSec, batchN, res, res, backend.c_str(), lightLabel,
-                        (resume && acc.N > 0) ? " [resuming]" : "");
+                        mode, timeBudgetSec, noiseSuffix, batchN, res, res, backend.c_str(),
+                        lightLabel, resumeTag);
+        else   // -noise only: trace until the graininess estimate reaches the target
+            std::printf("mode %c: tracing until ~%.2g%% noise in %lld-photon batches at %dx%d on %s "
+                        "(light=%s)%s (Ctrl-C to stop early) ...\n",
+                        mode, noiseTarget, batchN, res, res, backend.c_str(), lightLabel, resumeTag);
         if (preview) { enableAnsiTerminal(); g_previewRows = 0; }  // fresh preview per render
         // Trap Ctrl-C so a long/indefinite render stops cleanly (final image +
         // checkpoint) instead of losing the batch since the last periodic save.
@@ -1549,30 +1562,48 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         auto t0 = clk::now();
         auto lastSave = t0;
         long long batches = 0;
+        bool metNoise = false;
         for (;;) {
             runBatch(batchN); ++batches;
             double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
             double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
             bool stopped = g_stopRequested != 0;
-            bool done = stopped || (!runForever && elapsed >= timeBudgetSec);
-            if (done || sinceSave >= intervalSec) {   // periodic crash-safe checkpoint + preview
-                writeOut(/*announceCheckpoint*/false, /*quiet*/preview);
-                lastSave = clk::now();
-                // Cheap graininess estimate: Monte-Carlo relative error at an
-                // illuminated pixel falls as 1/sqrt(samples), and the per-pixel photon
-                // (hit) count is that sample count, so 100/sqrt(mean hits over lit
-                // pixels) is an honest ballpark for how noisy the image still is.
+            bool timeUp  = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
+            bool wantStatus = sinceSave >= intervalSec;
+            // Cheap graininess estimate: Monte-Carlo relative error at an illuminated
+            // pixel falls as 1/sqrt(samples), and the per-pixel photon (hit) count is
+            // that sample count, so 100/sqrt(mean hits over lit pixels) is an honest
+            // ballpark for how noisy the image still is. It drives both the status line
+            // and the -noise stop. Computed every batch only when -noise is active
+            // (needed to test the floor); otherwise just when we're about to report.
+            double noisePct = 0.0, meanHits = 0.0;
+            if (noiseTarget > 0.0 || wantStatus || stopped || timeUp) {
                 double sumHits = 0.0; long long lit = 0;
                 for (double h : acc.film.hits) if (h > 0.0) { sumHits += h; ++lit; }
-                double meanHits = lit ? sumHits / (double)lit : 0.0;
-                double noisePct = meanHits > 0.0 ? 100.0 / std::sqrt(meanHits) : 0.0;
-                char st[200];
+                meanHits = lit ? sumHits / (double)lit : 0.0;
+                noisePct = meanHits > 0.0 ? 100.0 / std::sqrt(meanHits) : 0.0;
+            }
+            // The estimate is only trustworthy once lit pixels have real coverage, so
+            // require meanHits > 0 before honouring the floor (guards a degenerate
+            // black frame from "converging" at 0% on the very first batch).
+            bool noiseMet = (noiseTarget > 0.0 && meanHits > 0.0 && noisePct <= noiseTarget);
+            if (noiseMet) metNoise = true;
+            bool done = stopped || timeUp || noiseMet;
+            if (done || wantStatus) {   // periodic crash-safe checkpoint + preview
+                writeOut(/*announceCheckpoint*/false, /*quiet*/preview);
+                lastSave = clk::now();
+                const char* why = stopped ? " (stopping)"
+                                : noiseMet ? " (noise target met)" : "";
+                char st[220];
                 if (runForever)
                     std::snprintf(st, sizeof st, "[forever] %.1fs elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  elapsed, batches, acc.N, noisePct, stopped ? " (stopping)" : "");
-                else
+                                  elapsed, batches, acc.N, noisePct, why);
+                else if (timeBudgetSec > 0.0)
                     std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld batches, %lld photons, ~%.1f%% noise%s",
-                                  elapsed, timeBudgetSec, batches, acc.N, noisePct, stopped ? " (stopping)" : "");
+                                  elapsed, timeBudgetSec, batches, acc.N, noisePct, why);
+                else
+                    std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld batches, %lld photons, ~%.1f%% noise%s",
+                                  noiseTarget, elapsed, batches, acc.N, noisePct, why);
                 if (preview) {
                     Film disp = acc.film;
                     if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
@@ -1586,6 +1617,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::signal(SIGBREAK, prevBrk);
 #endif
         if (g_stopRequested) std::printf("\n[stop] interrupted — image and checkpoint saved.\n");
+        else if (metNoise) std::printf("[noise] reached the ~%.2g%% target at %lld photons — image saved.\n",
+                                       noiseTarget, acc.N);
         if (wantCheckpoint)
             std::printf("[checkpoint] %s holds %lld photons — rerun with -resume to add more\n",
                         checkpointPath(outPath).c_str(), acc.N);
@@ -1641,6 +1674,7 @@ int main(int argc, char** argv) {
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
+    double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (forward A/B/C)
     bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint
     bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o
     bool runForever = false;      // -forever: trace until Ctrl-C (forward modes A/B/C)
@@ -1710,6 +1744,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
@@ -1849,7 +1884,7 @@ int main(int argc, char** argv) {
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
-                           preview, intervalSec);
+                           preview, intervalSec, noiseTarget);
         if (rv != 0) return rv;
     }
     return 0;

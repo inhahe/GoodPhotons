@@ -411,9 +411,13 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCuda`) implements
   the finite-lens next-event splat (A), the pinhole splat (B), and the finite-aperture
   thin-lens forward catch (C), selected by the `camMode` parameter. It is used for
-  `-mode A/B/C` and the forward pass of `-mode V`. It still falls back to the CPU for
-  mode R (backward reference) and the mode-P camera-side/backward layer (no backward
-  tracer on-device). Fluorescent scenes are rejected on-device (fall back to CPU)
+  `-mode A/B/C` and the forward pass of `-mode V`. It also tracks per-pixel photon
+  **hit counts** on-device (a `d_hits` buffer incremented in `filmAdd`, downloaded into
+  `Film::hits`) — matching the CPU `Film::add`. This fixed a latent bug where the GPU
+  never populated `hits`, so the progressive `~X% noise` graininess estimate (and the
+  new `-noise` stop) read a constant **0%** for any `-device gpu` render. It still falls
+  back to the CPU for mode R (backward reference) and the mode-P camera-side/backward
+  layer (no backward tracer on-device). Fluorescent scenes are rejected on-device (fall back to CPU)
   because the emission-sampler reradiation path is not ported —
   `cudaForwardSupported()` checks whether any *geometry* uses a Fluorescent material
   (not just the palette, which buildCornell always populates).

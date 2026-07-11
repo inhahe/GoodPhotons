@@ -852,11 +852,12 @@ photons — so adding photons only *lowers the graininess*; it never changes exp
 |---|---|
 | `-n <photons>` | Trace exactly this many photons, then stop (the default sizing). |
 | `-time <seconds>` | Trace in batches until the wall-clock budget elapses. `-n` becomes the **batch size** (checkpoint granularity; default 2 000 000). Runs at least one batch and stops on the first batch boundary past the budget. |
+| `-noise <percent>` | Trace in batches until the estimated graininess falls to `<= percent`, then stop and save. The metric is the same **`~X% noise`** figure the progress line reports — `100 / sqrt(mean per-lit-pixel photon count)`, the Monte-Carlo relative error at a typical lit pixel — so `-noise 2` means "keep going until it reads about 2 %". It's a global-average proxy (bright regions converge first; deep shadows may still be grainier), not a per-pixel guarantee. Alone it traces until converged; combine with `-time` to also cap the wall clock (**stops at whichever comes first**). `-n` is the batch size. Ctrl-C still stops early. |
 | `-forever` | Trace indefinitely, refining the image, until you interrupt it. The first **Ctrl-C** (or Ctrl-Break) finishes the current batch, writes a final image + checkpoint, and exits cleanly; a second Ctrl-C force-quits. Implies checkpointing, so a later `-resume` picks up exactly where you stopped. |
 | `-resume` | Before rendering, reload the accumulated film from the checkpoint sidecar (below) and keep adding photons to it — combine with `-n` (add that many more), `-time` (that many more seconds), or `-forever`. |
 | `-checkpoint` | On a plain `-n` render, also write the checkpoint sidecar so a later `-resume` can continue it. (`-time`, `-forever`, and `-resume` imply checkpointing.) |
-| `-preview` | During `-time`/`-forever`, redraw a live ANSI-colour thumbnail of the current image in the terminal at each periodic update (in place, over the previous frame). Needs a truecolour-capable terminal. |
-| `-interval <seconds>` | Seconds between periodic image writes / preview refreshes during `-time`/`-forever` (default 15). The output image file is rewritten at this cadence too, so pointing an auto-reloading image viewer at it gives a live display without `-preview`. |
+| `-preview` | During `-time`/`-noise`/`-forever`, redraw a live ANSI-colour thumbnail of the current image in the terminal at each periodic update (in place, over the previous frame). Needs a truecolour-capable terminal. |
+| `-interval <seconds>` | Seconds between periodic image writes / preview refreshes during `-time`/`-noise`/`-forever` (default 15). The output image file is rewritten at this cadence too, so pointing an auto-reloading image viewer at it gives a live display without `-preview`. |
 
 **Checkpoint sidecar.** Because the 8-bit tone-mapped image is exposure-anchored and
 gamma-quantised, it cannot be resumed from faithfully. Alongside `-o out.png` the
@@ -892,6 +893,10 @@ ftrace -in scene.ftsl -mode B -time 60  -o out.png -resume   # out.png now = 180
 # run and watch until it looks clean, then Ctrl-C to stop (image + checkpoint saved):
 ftrace -in scene.ftsl -mode B -forever -preview -interval 5 -o out.png
 ftrace -in scene.ftsl -mode B -forever -o out.png -resume     # keep refining later
+
+# stop automatically once the image is clean enough (~2% estimated noise):
+ftrace -in scene.ftsl -mode B -noise 2 -o out.png
+ftrace -in scene.ftsl -mode B -noise 1 -time 300 -o out.png   # ...but never longer than 5 min
 ```
 
 ### 8.5 Lens projection & zoom — rectilinear vs. fisheye/panoramic

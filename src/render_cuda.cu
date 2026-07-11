@@ -804,13 +804,20 @@ __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const 
 
 // ============================ model-B connect / splat ============================
 
-__device__ static void filmAdd(double* film, int resX, int px, int py, Real lambda, Real w) {
-    size_t idx = ((size_t)py * resX + px) * 3;
+// Accumulate one photon contribution into the film cell, and count it in `hits` (the
+// per-pixel contribution count that drives the CPU-side graininess/noise estimate;
+// mirrors Film::add incrementing hits by 1). `hits` may be null for callers that
+// don't track it.
+__device__ static void filmAdd(double* film, double* hits, int resX, int px, int py,
+                               Real lambda, Real w) {
+    size_t pix = (size_t)py * resX + px;
+    size_t idx = pix * 3;
     atomicAdd(&film[idx + 0], (double)(cieX(lambda) * w));
     atomicAdd(&film[idx + 1], (double)(cieY(lambda) * w));
     atomicAdd(&film[idx + 2], (double)(cieZ(lambda) * w));
+    if (hits) atomicAdd(&hits[pix], 1.0);
 }
-__device__ static void connect(const DScene& sc, const DCamera& cam, double* film,
+__device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, Real lambda, Real beta, Real rho) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
@@ -825,9 +832,9 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
     Real contrib = beta * f * G * We;
     if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
-    filmAdd(film, cam.resX, px, py, lambda, contrib);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
-__device__ static void connectVolume(const DScene& sc, const DCamera& cam, double* film,
+__device__ static void connectVolume(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                       const DVec3& p, const DVec3& wIn, Real lambda, Real beta) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
@@ -841,7 +848,7 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
     Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
     Real contrib = beta * Lambda * ph * G * We;
     contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
-    filmAdd(film, cam.resX, px, py, lambda, contrib);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (physical camera): next-event splat through the finite lens pupil. Sample a
 // point A uniformly on the aperture disc, connect the surface vertex to A, refract
@@ -849,7 +856,7 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
 // Renderer::connectLens — the importance-sampled form of model C's brute-force catch,
 // so A and C share both scale and shape. Weight beta*rho*cosSurf*cosLens*R^2/dist^2
 // (the BRDF's 1/pi cancels the pupil pdf's pi R^2).
-__device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film,
+__device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                    const DVec3& p, const DVec3& n, Real lambda, Real beta,
                                    Real rho, DRng& rng) {
     Real R  = (Real)cam.apertureR;
@@ -869,12 +876,12 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
     if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
-    filmAdd(film, cam.resX, px, py, lambda, contrib);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
 // surface BRDF*cosSurf is replaced by albedo*phase; the phase carries no 1/pi, so the
 // pupil pdf's pi R^2 stays. Port of Renderer::connectLensVolume.
-__device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, double* film,
+__device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                          const DVec3& p, const DVec3& wIn, Real lambda,
                                          Real beta, DRng& rng) {
     Real R  = (Real)cam.apertureR;
@@ -894,7 +901,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, d
     Real Lambda = medAlbedo(sc.medium, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
-    filmAdd(film, cam.resX, px, py, lambda, contrib);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
 // ============================ megakernel ============================
@@ -974,7 +981,7 @@ __device__ static int dEnvTexel(const DEnvMap& e, const DVec3& d) {
     return row * e.w + col;
 }
 
-__global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
+__global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1053,8 +1060,8 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         // C instead catches photons that physically arrive. A spot is a point light
         // with no projected area, so it has no direct term.
         if (em.shape != 2 && em.shape != 3) {
-            if (camMode == CAM_B) connect(sc, cam, film, origin, emitN, lambda, beta, (Real)1);
-            else if (camMode == CAM_A) connectLens(sc, cam, film, origin, emitN, lambda, beta, (Real)1, rng);
+            if (camMode == CAM_B) connect(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1);
+            else if (camMode == CAM_A) connectLens(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1, rng);
         }
 
         DVec3 ro = origin + dir * RAY_EPS, rd = dir;
@@ -1078,14 +1085,14 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             if (camMode == CAM_C) {
                 int px, py;
                 if (cam.catchPhoton(ro, rd, dEvent, px, py)) {
-                    filmAdd(film, cam.resX, px, py, lambda, beta);
+                    filmAdd(film, hits, cam.resX, px, py, lambda, beta);
                     eSensor += beta; done = true; break;
                 }
             }
 
             if (mediumEvent) {
-                if (camMode == CAM_B) connectVolume(sc, cam, film, mp, rd, lambda, beta);
-                else if (camMode == CAM_A) connectLensVolume(sc, cam, film, mp, rd, lambda, beta, rng);
+                if (camMode == CAM_B) connectVolume(sc, cam, film, hits, mp, rd, lambda, beta);
+                else if (camMode == CAM_A) connectLensVolume(sc, cam, film, hits, mp, rd, lambda, beta, rng);
                 if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; done = true; break; }
                 DVec3 nd = sampleHG(rd, (Real)sc.medium.g, rng);
                 ro = mp; rd = nd;
@@ -1145,8 +1152,8 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             } else {
                 // Diffuse (Fluorescent scenes are rejected on the host; never reached).
                 Real rho = clamp01(specLookup(m.reflect, lambda));
-                if (camMode == CAM_B) connect(sc, cam, film, h.p, h.n, lambda, beta, rho);
-                else if (camMode == CAM_A) connectLens(sc, cam, film, h.p, h.n, lambda, beta, rho, rng);
+                if (camMode == CAM_B) connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
+                else if (camMode == CAM_A) connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
                 if (rng.uniform() >= rho) { eAbsorbed += beta; done = true; break; }
                 ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); continue;
             }
@@ -1984,6 +1991,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
 
     double* d_film = nullptr;   cudaMalloc(&d_film, (size_t)res * res * 3 * sizeof(double));
     cudaMemset(d_film, 0, (size_t)res * res * 3 * sizeof(double));
+    double* d_hits = nullptr;   cudaMalloc(&d_hits, (size_t)res * res * sizeof(double));
+    cudaMemset(d_hits, 0, (size_t)res * res * sizeof(double));
     double* d_energy = nullptr; cudaMalloc(&d_energy, 5 * sizeof(double));
     cudaMemset(d_energy, 0, 5 * sizeof(double));
 
@@ -1994,7 +2003,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation
     // chunk passes a distinct cumulative-photon offset for an independent stream.
     unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
-    kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_energy, N, diffraction ? 1 : 0,
+    kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_hits, d_energy, N, diffraction ? 1 : 0,
                                      kseed, 32, camModeInt);
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
@@ -2005,6 +2014,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     // --- download ---
     std::vector<double> film((size_t)res * res * 3);
     cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out.hits.data(), d_hits, (size_t)res * res * sizeof(double), cudaMemcpyDeviceToHost);
     double energy[5] = {0,0,0,0,0};
     cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost);
     for (size_t i = 0; i < (size_t)res * res; ++i)
@@ -2016,7 +2026,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     eOut.residual += energy[4];
 
     freeUpload(up);
-    cudaFree(d_film); cudaFree(d_energy);
+    cudaFree(d_film); cudaFree(d_hits); cudaFree(d_energy);
     return out;
 }
 
