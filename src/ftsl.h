@@ -533,6 +533,11 @@ private:
             m.ior = spectrumParam(b, "ior", iorConstant(1.5));
             m.filmIor = dblOf(b, "film_ior", 1.30);
             m.filmThickness = dblOf(b, "film_thickness", 300.0);
+            // Substrate extinction kappa (spectral): 0 = transparent dielectric
+            // (lossless, default). Non-zero -> absorbing/metallic substrate giving
+            // opaque structural colour; a spectral kappa (e.g. a gaussian) tints it
+            // like a real metal (gold, copper).
+            m.substrateK = spectrumParam(b, "substrate_k", constantSpectrum(0.0));
         } else if (type == "grating") {
             m.type = MatType::Grating;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));

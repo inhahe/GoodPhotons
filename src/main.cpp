@@ -462,7 +462,7 @@ static int checkThinFilm() {
     bool inRange = true; double rmin = 1e9, rmax = -1e9;
     for (double lam = 380.0; lam <= 720.0; lam += 2.0)
         for (double ci = 0.05; ci <= 1.0; ci += 0.05) {
-            double R = thinFilmReflectance(n0, n1, n2, d, ci, lam);
+            double R = thinFilmReflectance(n0, n1, n2, 0.0, d, ci, lam);
             if (R < -1e-9 || R > 1.0 + 1e-9) inRange = false;
             rmin = std::min(rmin, R); rmax = std::max(rmax, R);
         }
@@ -477,15 +477,15 @@ static int checkThinFilm() {
     double num0 = r01 * r01 + r12 * r12 + 2.0 * r01 * r12 * cphi0;
     double den0 = 1.0 + r01 * r01 * r12 * r12 + 2.0 * r01 * r12 * cphi0;
     double Ranalytic = clamp01(num0 / den0);
-    double Rcode = thinFilmReflectance(n0, n1, n2, d, 1.0, lam0);
+    double Rcode = thinFilmReflectance(n0, n1, n2, 0.0, d, 1.0, lam0);
     bool passB = std::fabs(Ranalytic - Rcode) < 1e-9;
 
     // (c) periodicity in phase: pick two wavelengths whose phase differs by 2*pi
     //     (phi = 4*pi*n1*d/lambda at normal incidence -> lambda = 4*pi*n1*d/phi).
     double phiA = 6.0, phiB = phiA + 2.0 * PI;
     double lamA = 4.0 * PI * n1 * d / phiA, lamB = 4.0 * PI * n1 * d / phiB;
-    double RA = thinFilmReflectance(n0, n1, n2, d, 1.0, lamA);
-    double RB = thinFilmReflectance(n0, n1, n2, d, 1.0, lamB);
+    double RA = thinFilmReflectance(n0, n1, n2, 0.0, d, 1.0, lamA);
+    double RB = thinFilmReflectance(n0, n1, n2, 0.0, d, 1.0, lamB);
     bool passC = std::fabs(RA - RB) < 1e-9;
 
     // (d) the film is genuinely iridescent: reflectance varies with wavelength.
@@ -702,7 +702,7 @@ static void thinFilmSwatch(double n1, double n2) {
             double cosI = std::cos(thetaMax * (x + 0.5) / W);        // angle (column)
             Vec3 xyz{};
             for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {
-                double R = thinFilmReflectance(1.0, n1, n2, d, cosI, lam);
+                double R = thinFilmReflectance(1.0, n1, n2, 0.0, d, cosI, lam);
                 xyz += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * R;    // flat illuminant
             }
             f.add(x, y, xyz);

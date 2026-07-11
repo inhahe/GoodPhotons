@@ -309,10 +309,13 @@ struct BackwardRenderer {
                     break;
                 }
                 case MatType::ThinFilm: {
-                    // Iridescent coated dielectric: specular reflect-or-refract,
-                    // same delta-BSDF handling as Dielectric (reflectance carries
-                    // the thin-film interference colour).
-                    ray = mats.thinFilmInterface(m, h, ray.d, lambda, rng);
+                    // Iridescent coated interface: specular reflect-or-refract, same
+                    // delta-BSDF handling as Dielectric (reflectance carries the
+                    // thin-film interference colour). An absorbing substrate absorbs
+                    // the transmitted fraction -> the path terminates here.
+                    Ray nr;
+                    if (!mats.thinFilmInterface(m, h, ray.d, lambda, rng, nr)) return L;
+                    ray = nr;
                     specularArrival = true;
                     break;
                 }

@@ -40,12 +40,19 @@ struct Material {
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
-    // nanometres) over a dielectric substrate whose index is `ior`. Interference
-    // between the two coating interfaces yields an angle/wavelength-dependent
-    // reflectance (structural colour). Transport is lossless specular reflect-or-
-    // refract, exactly like Dielectric (so the backward tracer handles it too).
+    // nanometres) over a substrate whose index is `ior`. Interference between the
+    // two coating interfaces yields an angle/wavelength-dependent reflectance
+    // (structural colour). With a transparent (real-index) substrate, transport is
+    // lossless specular reflect-or-refract, exactly like Dielectric. `substrateK` is
+    // the substrate's extinction coefficient kappa (spectral); when non-zero the
+    // substrate is absorbing/metallic (complex index n+i*kappa), giving OPAQUE
+    // structural colour (oil-on-asphalt, anodised metal, heat-tempered steel): the
+    // film reflects the interference fraction R and the transmitted rest is absorbed
+    // (no refracted ray). Default 0 -> the exact lossless behaviour is preserved
+    // bit-for-bit.
     double filmIor = 1.30;                      // coating refractive index n1
     double filmThickness = 300.0;              // coating thickness in nanometres
+    Spectrum substrateK = constantSpectrum(0.0); // substrate extinction kappa (0 = transparent)
 
     // --- Diffraction grating (MatType::Grating) -----------------------------
     // A reflective diffraction grating with groove period `grooveSpacing` (nm) and

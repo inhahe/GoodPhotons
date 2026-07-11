@@ -9,6 +9,7 @@
 #pragma once
 #include <cstdint>
 #include <algorithm>
+#include <complex>
 #include "scene.h"
 #include "camera.h"
 
@@ -101,22 +102,54 @@ inline Vec3 sampleHG(const Vec3& wi, double g, Pcg32& rng) {
 // fraction is 1-R, so the film is lossless. cosI is cos of the incidence angle in
 // n0; d and lambda must share units (nanometres here).
 //
-// This is the exact Airy multiple-beam reflectance for a lossless single film:
-// the full geometric sum over every internal round trip between the two
-// interfaces, evaluated per polarisation (s and p) and averaged. It is correct at
-// every thickness and angle and is naturally bounded in [0,1]. (The earlier
-// two-beam form kept only the first two reflected beams; the Airy denominator
-// below restores the higher-order beams, sharpening the fringes.) A metallic or
-// absorbing substrate would use a complex n2 in the r12 Fresnel terms; here n2 is
-// a real dielectric index.
-inline double thinFilmReflectance(double n0, double n1, double n2, double d,
-                                  double cosI, double lambda) {
+// This is the exact Airy multiple-beam reflectance for a single film: the full
+// geometric sum over every internal round trip between the two interfaces,
+// evaluated per polarisation (s and p) and averaged. It is correct at every
+// thickness and angle and is naturally bounded in [0,1]. (The earlier two-beam
+// form kept only the first two reflected beams; the Airy denominator below
+// restores the higher-order beams, sharpening the fringes.)
+//
+// `k2` is the substrate's extinction coefficient: k2==0 is a transparent
+// dielectric substrate (lossless, the transmitted 1-R passes through) and takes
+// the exact real-valued path below (bit-identical to the pre-absorption engine).
+// k2>0 is an absorbing/metallic substrate (complex index n2+i*k2): the bottom
+// interface uses complex Fresnel coefficients, so the interference colour shifts
+// and desaturates the way real metal-backed films do, and the transmitted light is
+// absorbed (opaque). R is still the reflected power fraction in [0,1].
+inline double thinFilmReflectance(double n0, double n1, double n2, double k2,
+                                  double d, double cosI, double lambda) {
     cosI = clamp01(std::fabs(cosI));
     double sin0_2 = std::max(0.0, 1.0 - cosI * cosI);
     // Snell into the film: sin(theta1) = (n0/n1) sin(theta0).
     double sin1_2 = (n0 * n0) / (n1 * n1) * sin0_2;
     if (sin1_2 >= 1.0) return 1.0;                       // (n1>=n0 so this won't fire)
     double cos1 = std::sqrt(1.0 - sin1_2);
+    if (k2 != 0.0) {
+        // Absorbing/metallic substrate: complex index n2c = n2 + i*k2. Work with the
+        // admittance q = n*cos(theta) whose transverse-momentum form q = sqrt(n^2 -
+        // n0^2 sin^2 theta0) is analytic across the (now complex) substrate. The top
+        // interface (n0|n1) stays real; only the bottom (n1|n2c) is complex.
+        using cd = std::complex<double>;
+        cd n2c(n2, k2);
+        double q0 = n0 * cosI, q1 = n1 * cos1;           // real incident/film admittances
+        cd q2 = std::sqrt(n2c * n2c - cd(n0 * n0 * sin0_2, 0.0));
+        if (q2.imag() < 0.0) q2 = -q2;                   // decaying (absorbing) branch
+        // Fresnel amplitude reflections. s-pol uses q; p-pol uses n^2/q, arranged as
+        // (nb^2 qa - na^2 qb)/(...) so the real limit matches the rS/rP forms above.
+        double r01s = (q0 - q1) / (q0 + q1);
+        double r01p = (n1 * n1 * q0 - n0 * n0 * q1) / (n1 * n1 * q0 + n0 * n0 * q1);
+        cd r12s = (cd(q1) - q2) / (cd(q1) + q2);
+        cd r12p = (n2c * n2c * cd(q1) - cd(n1 * n1) * q2) /
+                  (n2c * n2c * cd(q1) + cd(n1 * n1) * q2);
+        double phi = (4.0 * PI * n1 * d * cos1) / lambda;
+        cd p = std::exp(cd(0.0, phi));                   // round-trip phase factor e^{i*phi}
+        auto Rpol = [&](double r01, cd r12) {
+            cd num = cd(r01) + r12 * p;
+            cd den = cd(1.0) + cd(r01) * r12 * p;
+            return clamp01(std::norm(num) / std::norm(den));  // |num/den|^2
+        };
+        return 0.5 * (Rpol(r01s, r12s) + Rpol(r01p, r12p));
+    }
     // Snell into the substrate: sin(theta2) = (n0/n2) sin(theta0).
     double sin2_2 = (n0 * n0) / (n2 * n2) * sin0_2;
     bool tir = sin2_2 >= 1.0;                            // TIR at the n1|n2 interface
@@ -364,10 +397,13 @@ struct Renderer {
                     continue;                       // lossless; beta unchanged
                 }
                 case MatType::ThinFilm: {
-                    // Iridescent coated dielectric: specular reflect-or-refract
-                    // with a thin-film interference reflectance (structural colour).
-                    ray = thinFilmInterface(m, h, ray.d, lambda, rng);
-                    continue;                       // lossless; beta unchanged
+                    // Iridescent coated interface: specular reflect-or-refract with a
+                    // thin-film interference reflectance (structural colour). With an
+                    // absorbing substrate the transmitted fraction is absorbed here.
+                    Ray nr;
+                    if (!thinFilmInterface(m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return; }
+                    ray = nr;
+                    continue;                       // lossless on survival; beta unchanged
                 }
                 case MatType::Mirror: {
                     double r = clamp01(m.reflect(lambda));
@@ -473,25 +509,41 @@ struct Renderer {
         return Ray{h.p + outDir * 1e-6, outDir};
     }
 
-    // Thin-film-coated dielectric interface (iridescence). Structurally identical
-    // to refractOrReflect (specular reflect-or-refract into the substrate index),
-    // but the reflection probability is the thin-film interference reflectance
-    // R(lambda, theta) rather than the single-interface Fresnel R. Lossless:
-    // reflect with prob R, else refract into the substrate. Because it is purely
-    // specular it needs no camera connection and the backward tracer handles it
-    // exactly like Dielectric (so modes R/V remain valid).
-    Ray thinFilmInterface(const Material& m, const Hit& h, const Vec3& d,
-                          double lambda, Pcg32& rng) const {
+    // Thin-film-coated interface (iridescence). The reflection probability is the
+    // thin-film interference reflectance R(lambda, theta) rather than a single
+    // Fresnel R. Two substrate regimes, selected by the substrate extinction kappa:
+    //   Transparent substrate (kappa==0): structurally identical to refractOrReflect
+    //     -- reflect with prob R, else refract into the substrate. Lossless. Purely
+    //     specular, so no camera connection and the backward tracer treats it like
+    //     Dielectric (modes R/V stay valid).
+    //   Absorbing/metallic substrate (kappa>0): reflect the interference fraction R,
+    //     else the transmitted light is absorbed -> the photon terminates (opaque
+    //     structural colour). There is no refracted ray, so this is one-sided; a hit
+    //     from inside an opaque body is simply absorbed.
+    // Returns false when the photon is absorbed (caller terminates the path); on
+    // true, `out` is the continuation ray.
+    bool thinFilmInterface(const Material& m, const Hit& h, const Vec3& d,
+                           double lambda, Pcg32& rng, Ray& out) const {
         double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
         double nf = m.filmIor;                  // coating film index
+        double ks = m.substrateK(lambda);       // substrate extinction (0 = transparent)
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
+        double cosI = -dot(d, nl);              // > 0
+
+        if (ks > 0.0) {                         // opaque metal-backed film
+            if (!entering) return false;        // inside the absorbing substrate: absorbed
+            double R = thinFilmReflectance(1.0, nf, ns, ks, m.filmThickness, cosI, lambda);
+            if (rng.uniform() >= R) return false;               // transmitted -> absorbed
+            Vec3 o = normalize(reflect(d, nl));
+            out = Ray{h.p + o * 1e-6, o};
+            return true;
+        }
+
         double nA = entering ? 1.0 : ns;        // incidence-side medium
         double nB = entering ? ns : 1.0;        // transmission-side medium
         double eta = nA / nB;
-        double cosI = -dot(d, nl);              // > 0
         double sin2t = eta * eta * (1.0 - cosI * cosI);
-
         Vec3 outDir;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
@@ -500,12 +552,13 @@ struct Renderer {
             // Interference reflectance for the actual stack traversed this hit:
             // incidence medium nA, coating nf, transmission medium nB. Reciprocal,
             // so entering and exiting rays see the same R (energy consistent).
-            double R = thinFilmReflectance(nA, nf, nB, m.filmThickness, cosI, lambda);
+            double R = thinFilmReflectance(nA, nf, nB, 0.0, m.filmThickness, cosI, lambda);
             if (rng.uniform() < R) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }
         outDir = normalize(outDir);
-        return Ray{h.p + outDir * 1e-6, outDir};
+        out = Ray{h.p + outDir * 1e-6, outDir};
+        return true;
     }
 
     // Reflective diffraction grating. The exact vector grating equation preserves

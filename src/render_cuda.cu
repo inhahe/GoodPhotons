@@ -131,6 +131,7 @@ struct DMaterial {
     int    type;
     double reflect[SPEC_N];     // baked reflect spectrum
     double ior[SPEC_N];         // baked index spectrum
+    double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
     double roughness;
     double filmIor, filmThickness;
     double grooveSpacing;
@@ -378,14 +379,64 @@ __device__ static Real medAlbedo(const DMedium& m, Real lambda) {
     return t > 0 ? s / t : 0;
 }
 
-// Thin-film Airy reflectance (port of render.h thinFilmReflectance).
-__device__ static Real thinFilmReflectance(Real n0, Real n1, Real n2, Real d,
+// Minimal device complex (host uses std::complex; not available in device code).
+struct DCplx {
+    Real re, im;
+    __device__ DCplx() : re(0), im(0) {}
+    __device__ DCplx(Real r, Real i) : re(r), im(i) {}
+};
+__device__ static inline DCplx cadd(DCplx a, DCplx b) { return DCplx(a.re + b.re, a.im + b.im); }
+__device__ static inline DCplx csub(DCplx a, DCplx b) { return DCplx(a.re - b.re, a.im - b.im); }
+__device__ static inline DCplx cmul(DCplx a, DCplx b) {
+    return DCplx(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+__device__ static inline DCplx cdiv(DCplx a, DCplx b) {
+    Real den = b.re * b.re + b.im * b.im;
+    return DCplx((a.re * b.re + a.im * b.im) / den, (a.im * b.re - a.re * b.im) / den);
+}
+__device__ static inline Real cnorm(DCplx a) { return a.re * a.re + a.im * a.im; }
+__device__ static inline DCplx csqrt_(DCplx z) {  // principal root, then force Im>=0
+    Real r = sqrt(z.re * z.re + z.im * z.im);
+    Real re = sqrt(fmax((Real)0, (Real)0.5 * (r + z.re)));
+    Real im = sqrt(fmax((Real)0, (Real)0.5 * (r - z.re)));
+    if (z.im < 0) im = -im;
+    DCplx s(re, im);
+    return s.im < 0 ? DCplx(-s.re, -s.im) : s;
+}
+
+// Thin-film Airy reflectance (port of render.h thinFilmReflectance). k2 is the
+// substrate extinction coefficient: k2==0 uses the exact real-valued path (matches
+// the transparent-substrate host result); k2>0 uses the complex bottom-interface
+// Fresnel of an absorbing/metallic substrate (opaque structural colour).
+__device__ static Real thinFilmReflectance(Real n0, Real n1, Real n2, Real k2, Real d,
                                            Real cosI, Real lambda) {
     cosI = clamp01(fabs(cosI));
     Real sin0_2 = fmax((Real)0, (Real)1 - cosI * cosI);
     Real sin1_2 = (n0 * n0) / (n1 * n1) * sin0_2;
     if (sin1_2 >= 1) return 1;
     Real cos1 = sqrt((Real)1 - sin1_2);
+    if (k2 != (Real)0) {
+        DCplx n2c(n2, k2);
+        Real q0 = n0 * cosI, q1 = n1 * cos1;
+        DCplx q2 = csqrt_(csub(cmul(n2c, n2c), DCplx(n0 * n0 * sin0_2, 0)));
+        Real r01s = (q0 - q1) / (q0 + q1);
+        Real r01p = (n1 * n1 * q0 - n0 * n0 * q1) / (n1 * n1 * q0 + n0 * n0 * q1);
+        DCplx q1c(q1, 0);
+        DCplx r12s = cdiv(csub(q1c, q2), cadd(q1c, q2));
+        DCplx n2c2 = cmul(n2c, n2c);
+        DCplx r12p = cdiv(csub(cmul(n2c2, q1c), DCplx(n1 * n1 * q2.re, n1 * n1 * q2.im)),
+                          cadd(cmul(n2c2, q1c), DCplx(n1 * n1 * q2.re, n1 * n1 * q2.im)));
+        Real phi = ((Real)4 * (Real)DPI * n1 * d * cos1) / lambda;
+        DCplx p(cos(phi), sin(phi));
+        // R_pol = |r01 + r12 p|^2 / |1 + r01 r12 p|^2
+        DCplx numS = cadd(DCplx(r01s, 0), cmul(r12s, p));
+        DCplx denS = cadd(DCplx(1, 0), cmul(DCplx(r01s, 0), cmul(r12s, p)));
+        DCplx numP = cadd(DCplx(r01p, 0), cmul(r12p, p));
+        DCplx denP = cadd(DCplx(1, 0), cmul(DCplx(r01p, 0), cmul(r12p, p)));
+        Real Rs = clamp01(cnorm(numS) / cnorm(denS));
+        Real Rp = clamp01(cnorm(numP) / cnorm(denP));
+        return (Real)0.5 * (Rs + Rp);
+    }
     Real sin2_2 = (n0 * n0) / (n2 * n2) * sin0_2;
     bool tir = sin2_2 >= 1;
     Real cos2 = tir ? (Real)0 : sqrt((Real)1 - sin2_2);
@@ -547,25 +598,36 @@ __device__ static void refractOrReflect(const DMaterial& m, const DHit& h, const
     outDir = normalize(outDir);
     ro = h.p + outDir * RAY_EPS; rd = outDir;
 }
-__device__ static void thinFilmInterface(const DMaterial& m, const DHit& h, const DVec3& d,
+// Returns false if the photon is absorbed by an opaque (absorbing) substrate.
+__device__ static bool thinFilmInterface(const DMaterial& m, const DHit& h, const DVec3& d,
                                           Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
     Real ns = specLookup(m.ior, lambda), nf = (Real)m.filmIor;
+    Real ks = specLookup(m.substrateK, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
+    Real cosI = -dot(d, nl);
+    if (ks > 0) {                                // opaque metal-backed film
+        if (!entering) return false;             // inside absorbing substrate: absorbed
+        Real R = thinFilmReflectance((Real)1, nf, ns, ks, (Real)m.filmThickness, cosI, lambda);
+        if (rng.uniform() >= R) return false;    // transmitted -> absorbed
+        DVec3 o = normalize(reflectv(d, nl));
+        ro = h.p + o * RAY_EPS; rd = o;
+        return true;
+    }
     Real nA = entering ? (Real)1 : ns, nB = entering ? ns : (Real)1;
     Real eta = nA / nB;
-    Real cosI = -dot(d, nl);
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
     DVec3 outDir;
     if (sin2t > 1) outDir = reflectv(d, nl);
     else {
         Real cosT = sqrt((Real)1 - sin2t);
-        Real R = thinFilmReflectance(nA, nf, nB, (Real)m.filmThickness, cosI, lambda);
+        Real R = thinFilmReflectance(nA, nf, nB, (Real)0, (Real)m.filmThickness, cosI, lambda);
         if (rng.uniform() < R) outDir = reflectv(d, nl);
         else outDir = d * eta + nl * (eta * cosI - cosT);
     }
     outDir = normalize(outDir);
     ro = h.p + outDir * RAY_EPS; rd = outDir;
+    return true;
 }
 // Grating diffraction (port of render.h gratingDiffract). Returns false if absorbed.
 __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const DVec3& din,
@@ -861,7 +923,9 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             if (m.type == D_DIELECTRIC) {
                 DVec3 nro, nrd; refractOrReflect(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; continue;
             } else if (m.type == D_THINFILM) {
-                DVec3 nro, nrd; thinFilmInterface(m, h, rd, lambda, rng, nro, nrd); ro = nro; rd = nrd; continue;
+                DVec3 nro, nrd;
+                if (!thinFilmInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; done = true; break; }
+                ro = nro; rd = nrd; continue;
             } else if (m.type == D_MIRROR) {
                 Real r = clamp01(specLookup(m.reflect, lambda));
                 if (rng.uniform() >= r) { eAbsorbed += beta; done = true; break; }
@@ -1013,6 +1077,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         d.type = (int)m.type;
         bakeSpec(m.reflect, d.reflect);
         bakeSpec(m.ior, d.ior);
+        bakeSpec(m.substrateK, d.substrateK);
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
         d.grooveSpacing = m.grooveSpacing;
