@@ -151,6 +151,9 @@ struct Implicit {
     // metaball densities) set this > 1 so the step is scaled down to |f|/lipschitz,
     // trading speed for correctness. Set by the builder.
     double lipschitz = 1.0;
+    // Minimum march step (world units): the floor on the sign-change ray march and
+    // the thinnest resolvable feature. Sized from the bounds by the builder.
+    double minStep = 1e-4;
 
     double eval(const Vec3& pw) const { return fieldEval(nodes.data(), (int)nodes.size(), pw); }
     Vec3   gradient(const Vec3& pw, double eps) const {
@@ -178,33 +181,60 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     const double dlen    = length(r.d);
     const int    N       = (int)im.nodes.size();
     const FieldNode* nd  = im.nodes.data();
-    const int    MAX_STEP = 512;
-    const double surfEps = 1e-5;             // world-distance surface threshold
+    const int    MAX_STEP = 2048;
     const double invLip  = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
+    // Minimum world-space march step: a floor on the otherwise |f|-adaptive step so
+    // the ray actually STEPS ACROSS the zero level set (rather than asymptotically
+    // creeping up to it), which is what lets us detect a sign CHANGE. It also caps
+    // the thinnest resolvable feature. Sized to the primitive so unit-scale scenes
+    // and metre-scale scenes both behave.
+    const double minStep = im.minStep > 0.0 ? im.minStep : 1e-4;
 
+    // March by min(|f|, ...) with a floor, watching for f to change sign. A sign
+    // change brackets a genuine surface crossing; merely grazing the surface (f
+    // dips but stays one sign) never triggers a hit — so a shadow/bounce ray
+    // spawned just off a surface can leave it without self-intersecting. Transmission
+    // rays are spawned just INSIDE (f<0) by the tracers and correctly cross to the
+    // far side. This is far more robust than proximity (|f|<eps) detection.
     double t = t0;
+    double f = fieldEval(nd, N, r.o + r.d * t);
     for (int i = 0; i < MAX_STEP; ++i) {
-        Vec3 p = r.o + r.d * t;
-        double f = fieldEval(nd, N, p);
-        double af = std::fabs(f);
-        if (af < surfEps) {
-            if (t < tmin || t >= hit.t) return false;
-            // Gradient-based normal; scale the stencil to the local step size.
-            double eps = std::fmax(surfEps, 1e-4 * t);
+        double step = std::fmax(std::fabs(f) * invLip, minStep) / dlen;
+        double tn = t + step;
+        // Clamp the last step to the AABB exit and still test for a crossing there:
+        // a ray starting inside the surface can have its first |f|-sized step land
+        // just past t1, but the genuine zero crossing lies within [t, t1]. Bailing
+        // before evaluating the boundary would drop that hit.
+        bool last = false;
+        if (tn >= t1) { tn = t1; last = true; }
+        double fn = fieldEval(nd, N, r.o + r.d * tn);
+        bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) ||
+                       (f == 0.0 && fn != 0.0);
+        if (crossed) {
+            // Bisect the bracket [t, tn] to a precise root (residual ~1e-12), so the
+            // shared 1e-6 ray-spawn offset lands safely on the correct side.
+            double ta = t, tb = tn, fa = f;
+            for (int b = 0; b < 60; ++b) {
+                double tm = 0.5 * (ta + tb);
+                double fm = fieldEval(nd, N, r.o + r.d * tm);
+                if ((fa > 0.0) == (fm > 0.0)) { ta = tm; fa = fm; }
+                else                          { tb = tm; }
+                if ((tb - ta) * dlen < 1e-12) break;
+            }
+            double th = 0.5 * (ta + tb);
+            if (th < tmin || th >= hit.t) return false;
+            Vec3 p = r.o + r.d * th;
+            double eps = std::fmax(1e-6, 1e-4 * th);
             Vec3 g = fieldGradient(nd, N, p, eps);
-            hit.t = t; hit.p = p; hit.valid = true;
+            hit.t = th; hit.p = p; hit.valid = true;
             hit.ng = g;
             hit.n = (dot(r.d, g) < 0.0) ? g : -g;
             hit.matId = im.matId; hit.sensorId = -1;
             hit.u = 0.0; hit.v = 0.0;   // procedural materials use hit.p directly
             return true;
         }
-        // Advance by the guaranteed-empty distance (in ray-parameter units).
-        double step = (af * invLip) / dlen;
-        // Ensure forward progress even if the field momentarily flattens.
-        if (step < surfEps * 0.5 / dlen) step = surfEps * 0.5 / dlen;
-        t += step;
-        if (t > t1) return false;
+        if (last) return false;
+        t = tn; f = fn;
     }
     return false;
 }
@@ -290,6 +320,17 @@ inline void boxPad(Aabb& a, double k) {
 
 inline Aabb implicitBounds(const std::vector<FieldNode>& nodes);   // fwd decl
 
+// March-step floor for a primitive of the given world bounds: a small fraction of
+// the bounds diagonal, clamped so it neither creeps (too small) nor skips features
+// (too large). Bounded planes/huge boxes clamp to the ceiling.
+inline double implicitMinStep(const Aabb& b) {
+    double diag = length(b.hi - b.lo);
+    double s = 1e-3 * diag;
+    if (s < 1e-5) s = 1e-5;
+    if (s > 1e-3) s = 1e-3;
+    return s;
+}
+
 // Build a single-sphere implicit at world center `c`, world radius `r`. The leaf
 // is a unit-Lipschitz SDF (a true distance function), so a sphere trace against it
 // reproduces the analytic sphere intersection to the surface epsilon — the step-1
@@ -306,6 +347,7 @@ inline Implicit makeSphereImplicit(const Vec3& c, double r, int matId) {
     im.matId = matId;
     im.lipschitz = 1.0;
     im.bounds = implicitBounds(im.nodes);
+    im.minStep = implicitMinStep(im.bounds);
     return im;
 }
 

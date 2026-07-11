@@ -463,6 +463,7 @@ public:
             else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
             else if (b.type == "triangle") { if (!addTriangle(b, L)) return false; }
             else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
+            else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
             else if (b.type == "medium")   { if (!addMedium(b, L)) return false; }
@@ -1025,6 +1026,140 @@ private:
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
             else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, light, group)"); return false; }
         }
+        return true;
+    }
+
+    // ---- isosurface / metaballs / (smooth) CSG ----
+    // An `isosurface { material <m>  <one field element> }` builds an Implicit whose
+    // field is a flat postfix expression (see implicit.h). A field element is either
+    // a LEAF analytic SDF (sphere/box/torus/cylinder/plane) or a COMBINATOR
+    // (union/intersect/difference and their smooth_* variants, plus `blob` = smooth
+    // union) whose nested children are themselves field elements. Each element may
+    // carry translate/rotate/scale that composes down the tree (a mini scene graph),
+    // and smooth combinators take a blend radius `k` (authored length) that fillets
+    // the seam — this is what makes metaballs merge and gives rounded booleans.
+
+    // Compose the authored-space transform for a field block: parentXf ∘ TRS(this).
+    Affine fieldXf(const Block& b, const Affine& parentXf) {
+        Vec3 tr{0, 0, 0}, rot{0, 0, 0}; double sc = 1.0;
+        vec3Of(b, "translate", tr); vec3Of(b, "rotate", rot);
+        const Stmt* scs = find(b, "scale");
+        if (scs && !scs->val.words.empty()) sc = num(scs->val.words[0]);
+        return parentXf.compose(affineFromTRS(tr, rot, Vec3{sc, sc, sc}));
+    }
+
+    // Build one analytic-SDF leaf. `authoredXf` is the leaf's local->world transform
+    // in authored units; the global unit scale L_ folds in here (world = L_·authored),
+    // and the leaf's uniform scale becomes the field's distance multiplier. Params
+    // (radius, half-extents, ...) stay in authored units and are rescaled at eval.
+    bool addFieldLeaf(FieldOp op, const Block& b, const Affine& authoredXf,
+                      std::vector<FieldNode>& out) {
+        // Fold the authored center into the transform, then rebase to metres.
+        Vec3 center{0, 0, 0}; vec3Of(b, "center", center);
+        Affine A = authoredXf.compose(affineFromTRS(center, Vec3{0, 0, 0}, Vec3{1, 1, 1}));
+        Affine L2W;
+        for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * A.m[k];
+        L2W.t = A.t * L_;
+        bool nonUniform = false; double s = L2W.uniformScale(nonUniform);
+        if (nonUniform) {
+            fail("isosurface leaf under non-uniform scale (not supported — shape it "
+                 "with per-leaf params like box size / torus major,minor instead)");
+            return false;
+        }
+        FieldNode nd; nd.op = op; nd.scale = s; nd.inv = L2W.inverse();
+        switch (op) {
+            case FieldOp::Sphere:
+                nd.p[0] = dblOf(b, "radius", 1.0);
+                break;
+            case FieldOp::Box: {
+                Vec3 size{1, 1, 1}; vec3Of(b, "size", size);
+                nd.p[0] = size.x * 0.5; nd.p[1] = size.y * 0.5; nd.p[2] = size.z * 0.5;
+                break;
+            }
+            case FieldOp::Torus:
+                nd.p[0] = dblOf(b, "major", 1.0);
+                nd.p[1] = dblOf(b, "minor", 0.25);
+                break;
+            case FieldOp::Cylinder:
+                nd.p[0] = dblOf(b, "radius", 0.5);
+                nd.p[1] = dblOf(b, "height", 1.0) * 0.5;    // half-height (axis = local y)
+                break;
+            case FieldOp::Plane: {
+                Vec3 n{0, 1, 0}; vec3Of(b, "normal", n);
+                double ln = length(n); if (ln > 0) n = n / ln;
+                nd.p[0] = n.x; nd.p[1] = n.y; nd.p[2] = n.z;
+                nd.p[3] = dblOf(b, "offset", 0.0);
+                break;
+            }
+            default: break;
+        }
+        out.push_back(nd);
+        return true;
+    }
+
+    // Recursively emit a field element's postfix nodes. `parentXf` is the composed
+    // authored transform of the enclosing element(s).
+    bool buildFieldStmt(const Stmt& st, const Affine& parentXf, std::vector<FieldNode>& out) {
+        const Block* b = st.val.block.get();
+        if (!b) { fail("field element '" + st.key + "' needs a { } block"); return false; }
+        const std::string& k = st.key;
+        // Leaves — the element's own translate/rotate/scale wrap the primitive.
+        Affine xf = fieldXf(*b, parentXf);
+        if (k == "sphere")   return addFieldLeaf(FieldOp::Sphere,   *b, xf, out);
+        if (k == "box")      return addFieldLeaf(FieldOp::Box,      *b, xf, out);
+        if (k == "torus")    return addFieldLeaf(FieldOp::Torus,    *b, xf, out);
+        if (k == "cylinder") return addFieldLeaf(FieldOp::Cylinder, *b, xf, out);
+        if (k == "plane")    return addFieldLeaf(FieldOp::Plane,    *b, xf, out);
+        // Combinators — fold N children pairwise in postfix order.
+        FieldOp op; bool smooth = false;
+        if      (k == "union")             op = FieldOp::Union;
+        else if (k == "intersect" || k == "intersection") op = FieldOp::Intersect;
+        else if (k == "difference" || k == "subtract")    op = FieldOp::Difference;
+        else if (k == "smooth_union")      { op = FieldOp::SmoothUnion;      smooth = true; }
+        else if (k == "smooth_intersect" || k == "smooth_intersection") { op = FieldOp::SmoothIntersect; smooth = true; }
+        else if (k == "smooth_difference" || k == "smooth_subtract")    { op = FieldOp::SmoothDifference; smooth = true; }
+        else if (k == "blob")              { op = FieldOp::SmoothUnion;      smooth = true; }
+        else { fail("unknown field element '" + k + "' in isosurface (leaves: sphere/box/"
+                    "torus/cylinder/plane; combinators: union/intersect/difference, "
+                    "smooth_union/smooth_intersect/smooth_difference, blob)"); return false; }
+        double kBlend = 0.0;
+        const Stmt* kk = find(*b, "k");
+        if (kk && !kk->val.words.empty()) kBlend = num(kk->val.words[0]) * L_;   // authored -> metres
+        (void)smooth;
+        int nChild = 0;
+        for (const auto& cs : b->stmts) {
+            if (!cs.val.block) continue;              // transform-only / k stmts carry no block
+            if (!buildFieldStmt(cs, xf, out)) return false;
+            if (++nChild >= 2) { FieldNode c; c.op = op; c.p[0] = kBlend; out.push_back(c); }
+        }
+        if (nChild < 1) { fail("'" + k + "' needs at least one child primitive"); return false; }
+        return true;
+    }
+
+    bool addIsosurface(const Block& b, Loaded& L) {
+        std::string mat = strOf(b, "material");
+        if (mat.empty()) { fail("isosurface needs a material"); return false; }
+        int id = matId(mat); if (!err.empty()) return false;
+        Affine rootXf = fieldXf(b, Affine::identity());
+        std::vector<FieldNode> nodes;
+        int nRoot = 0;
+        for (const auto& cs : b.stmts) {
+            if (!cs.val.block) continue;              // skip material/translate/rotate/scale
+            if (!buildFieldStmt(cs, rootXf, nodes)) return false;
+            ++nRoot;
+        }
+        if (nRoot != 1) {
+            fail("isosurface must contain exactly one root field element (a leaf or a "
+                 "CSG combinator); wrap multiple shapes in a union { ... }");
+            return false;
+        }
+        Implicit im;
+        im.nodes = std::move(nodes);
+        im.matId = id;
+        im.lipschitz = 1.0;                           // SDF leaves + smin/CSG stay unit-Lipschitz
+        im.bounds = implicitBounds(im.nodes);
+        im.minStep = implicitMinStep(im.bounds);
+        L.scene.implicits.push_back(std::move(im));
         return true;
     }
 

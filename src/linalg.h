@@ -67,6 +67,26 @@ struct Affine {
         r.t = apply(c.t);   // M*c.t + t
         return r;
     }
+    // Inverse affine: (M,t)^-1 = (M^-1, -M^-1 t). Returns identity if the linear
+    // part is singular (degenerate scale). Used to turn a primitive's local->world
+    // transform into the world->local map an SDF leaf stores.
+    Affine inverse() const {
+        double a = m[0], b = m[1], c = m[2];
+        double d = m[3], e = m[4], f = m[5];
+        double g = m[6], h = m[7], i = m[8];
+        double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+        Affine r;
+        if (std::fabs(det) < 1e-30) return r;   // identity fallback
+        double id = 1.0 / det;
+        r.m[0] = (e * i - f * h) * id; r.m[1] = (c * h - b * i) * id; r.m[2] = (b * f - c * e) * id;
+        r.m[3] = (f * g - d * i) * id; r.m[4] = (a * i - c * g) * id; r.m[5] = (c * d - a * f) * id;
+        r.m[6] = (d * h - e * g) * id; r.m[7] = (b * g - a * h) * id; r.m[8] = (a * e - b * d) * id;
+        r.t = Vec3{-(r.m[0] * t.x + r.m[1] * t.y + r.m[2] * t.z),
+                   -(r.m[3] * t.x + r.m[4] * t.y + r.m[5] * t.z),
+                   -(r.m[6] * t.x + r.m[7] * t.y + r.m[8] * t.z)};
+        return r;
+    }
+
     // Uniform-scale factor of the linear part (column norms; rotation preserves
     // length so a column's norm is its axis scale). Sets `nonUniform` when the
     // three axis scales differ beyond a small tolerance — the caller uses this to
