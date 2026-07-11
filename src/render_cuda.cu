@@ -173,6 +173,11 @@ struct DEmitter {
     double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
     int    cdfOffset, cdfN;
     double cdfStep;
+    // BDPT (mode D) extras. matId links this emitter to its emissive surface material
+    // (for the s=0 direct-hit strategy); emitSpd is the baked emission SPD so the
+    // device can evaluate Le(lambda) directly (DMaterial carries no emit spectrum).
+    int    matId;
+    double emitSpd[SPEC_N];
 };
 
 // Smoothstep spot falloff (mirrors host scene.h spotFalloff).
@@ -231,6 +236,11 @@ struct DScene {
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
+    // BDPT shared wavelength sampler (mirrors Scene::emitSampler): the combined
+    // g(lambda)=sum_k geomWeight_k*SPD_k CDF, its bin step, and emitG = its integral.
+    // BDPT samples one shared lambda per sample from this and sets invPdfLambda=1/pdf.
+    const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
+    double           emitG;
     DMedium medium;
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
@@ -1144,12 +1154,24 @@ static T* uploadVec(const std::vector<T>& v) {
     return d;
 }
 
-Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
-                       long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode) {
+// Baked device scene + camera, plus the list of device allocations to free. Shared
+// by the forward megakernel (renderForwardCuda) and the BDPT kernel (renderBdptCuda)
+// so the ~150-line Scene->POD baking lives in exactly one place.
+struct DUpload {
+    gpu::DScene  sc{};
+    gpu::DCamera dc{};
+    std::vector<void*> frees;
+};
+static void freeUpload(DUpload& up) {
+    for (void* p : up.frees) cudaFree(p);
+    up.frees.clear();
+}
+
+// Bake the std::function Scene + Camera into POD device tables and upload them.
+// Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up) when done.
+static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload& up) {
     using namespace gpu;
-    Film out; out.resX = res; out.resY = res; out.alloc();
-    if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
+    auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
 
     // --- bake geometry ---
     std::vector<DTri> tris(scene.tris.size());
@@ -1184,7 +1206,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
         d.layerCount = (int)m.layerN.size();
-        if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;   // cudaForwardSupported rejects deeper
+        if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;
         for (int k = 0; k < d.layerCount; ++k) {
             d.layerN[k] = m.layerN[k]; d.layerK[k] = m.layerK[k]; d.layerThick[k] = m.layerThick[k];
         }
@@ -1192,19 +1214,18 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         d.grooveDir = {m.grooveDir.x, m.grooveDir.y, m.grooveDir.z};
         d.gratingMaxOrder = m.gratingMaxOrder;
         d.mixCount = (int)m.mixChildren.size();
-        if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;   // cudaForwardSupported already rejected
+        if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;
         for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
     }
 
-    // --- upload ---
-    DTri*      d_tris = tris.empty() ? nullptr : uploadVec(tris);
-    DSphere*   d_sph  = sph.empty()  ? nullptr : uploadVec(sph);
-    DNode*     d_nodes = nodes.empty() ? nullptr : uploadVec(nodes);
-    int*       d_prim = primIdx.empty() ? nullptr : uploadVec(primIdx);
-    DMaterial* d_mats = mats.empty() ? nullptr : uploadVec(mats);
+    // --- upload geometry/materials ---
+    DTri*      d_tris  = tris.empty()    ? nullptr : (DTri*)keep(uploadVec(tris));
+    DSphere*   d_sph   = sph.empty()     ? nullptr : (DSphere*)keep(uploadVec(sph));
+    DNode*     d_nodes = nodes.empty()   ? nullptr : (DNode*)keep(uploadVec(nodes));
+    int*       d_prim  = primIdx.empty() ? nullptr : (int*)keep(uploadVec(primIdx));
+    DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
 
-    // Emitters: build a DEmitter array + a flattened wavelength-CDF buffer, plus
-    // the normalised power selection CDF.
+    // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
     std::vector<double> cdfAll;
     for (const auto& e : scene.emitters) {
@@ -1225,23 +1246,19 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
         de.cdfOffset = (int)cdfAll.size();
         de.cdfN = (int)e.spd.cdf.size();
         de.cdfStep = e.spd.step;
+        de.matId = e.matId;                 // BDPT: link to emissive surface material
+        bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
         dems.push_back(de);
     }
     std::vector<double> emitCdf = scene.emitterCdf;
-    DEmitter* d_ems     = dems.empty()    ? nullptr : uploadVec(dems);
-    double*   d_cdfAll  = cdfAll.empty()  ? nullptr : uploadVec(cdfAll);
-    double*   d_emitCdf = emitCdf.empty() ? nullptr : uploadVec(emitCdf);
+    std::vector<double> emitSampCdf = scene.emitSampler.cdf;   // BDPT shared lambda CDF
+    DEmitter* d_ems     = dems.empty()       ? nullptr : (DEmitter*)keep(uploadVec(dems));
+    double*   d_cdfAll  = cdfAll.empty()     ? nullptr : (double*)keep(uploadVec(cdfAll));
+    double*   d_emitCdf = emitCdf.empty()    ? nullptr : (double*)keep(uploadVec(emitCdf));
+    double*   d_emitSamp = emitSampCdf.empty() ? nullptr : (double*)keep(uploadVec(emitSampCdf));
 
-    // --- image environment tables (lat-long map, increment 2c) ------------------
-    // Flatten the host EnvMap into device buffers: the per-texel JH coeff/scale, the
-    // sin(theta)-weighted mean coeff/scale, and the 2D luminance sampler (a marginal
-    // Distribution1D over rows plus one conditional Distribution1D per row). Constant-
-    // env and non-env scenes leave every pointer null, so sc.env.scale stays null and
-    // the kernel takes the constant/no-env path unchanged.
-    double *d_envCoeff = nullptr, *d_envScale = nullptr;
-    double *d_margCdf = nullptr, *d_margFunc = nullptr;
-    double *d_condCdf = nullptr, *d_condFunc = nullptr, *d_condFuncInt = nullptr;
+    // --- image environment tables (lat-long map) ---
     DEnvMap denv;
     if (scene.envMap) {
         const EnvMap& em = *scene.envMap;
@@ -1261,26 +1278,22 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
             condFunc.insert(condFunc.end(), c.func.begin(), c.func.end());
             condFuncInt[v] = c.funcInt;
         }
-        d_envCoeff    = uploadVec(coeffFlat);
-        d_envScale    = uploadVec(em.scaleT);
-        d_margCdf     = uploadVec(em.dist.marg.cdf);
-        d_margFunc    = uploadVec(em.dist.marg.func);
-        d_condCdf     = uploadVec(condCdf);
-        d_condFunc    = uploadVec(condFunc);
-        d_condFuncInt = uploadVec(condFuncInt);
         denv.w = w; denv.h = h; denv.rot = em.rotOffset;
-        denv.coeff = d_envCoeff; denv.scale = d_envScale;
+        denv.coeff = (double*)keep(uploadVec(coeffFlat));
+        denv.scale = (double*)keep(uploadVec(em.scaleT));
         denv.avgCoeff[0] = em.avgCoeff[0];
         denv.avgCoeff[1] = em.avgCoeff[1];
         denv.avgCoeff[2] = em.avgCoeff[2];
         denv.avgScale = em.avgScale;
-        denv.margCdf = d_margCdf; denv.margFunc = d_margFunc;
+        denv.margCdf = (double*)keep(uploadVec(em.dist.marg.cdf));
+        denv.margFunc = (double*)keep(uploadVec(em.dist.marg.func));
         denv.margFuncInt = em.dist.marg.funcInt;
-        denv.condCdf = d_condCdf; denv.condFunc = d_condFunc;
-        denv.condFuncInt = d_condFuncInt;
+        denv.condCdf = (double*)keep(uploadVec(condCdf));
+        denv.condFunc = (double*)keep(uploadVec(condFunc));
+        denv.condFuncInt = (double*)keep(uploadVec(condFuncInt));
     }
 
-    DScene sc;
+    DScene& sc = up.sc;
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.mats = d_mats;
@@ -1288,28 +1301,40 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
+    sc.emitSamplerCdf = d_emitSamp;
+    sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
+    sc.emitSamplerStep = scene.emitSampler.step;
+    sc.emitG = scene.emitG;
     sc.medium.enabled = scene.medium.enabled ? 1 : 0;
     sc.medium.g = scene.medium.g;
     bakeSpec(scene.medium.sigma_a, sc.medium.sigma_a);
     bakeSpec(scene.medium.sigma_s, sc.medium.sigma_s);
-    // Model-A contact sensor plane (only used when camMode == 'A').
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
-    // Env bounding sphere (shape==3 disk emission). Harmless when no env light.
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
-    sc.env = denv;   // image-env tables (denv.scale null for constant/no-env scenes)
+    sc.env = denv;
 
-    DCamera dc;
+    DCamera& dc = up.dc;
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
     dc.u = {cam.u.x, cam.u.y, cam.u.z};
     dc.v = {cam.v.x, cam.v.y, cam.v.z};
     dc.w = {cam.w.x, cam.w.y, cam.w.z};
     dc.tanHalfX = cam.tanHalfX; dc.tanHalfY = cam.tanHalfY;
     dc.resX = res; dc.resY = res;
-    // Finite-aperture thin-lens parameters (only used when camMode == 'C').
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
+}
+
+Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
+                       long long N, EnergyReport& eOut, bool diffraction,
+                       char camMode) {
+    using namespace gpu;
+    Film out; out.resX = res; out.resY = res; out.alloc();
+    if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
+
+    DUpload up;
+    buildUpload(scene, cam, res, up);
 
     double* d_film = nullptr;   cudaMalloc(&d_film, (size_t)res * res * 3 * sizeof(double));
     cudaMemset(d_film, 0, (size_t)res * res * 3 * sizeof(double));
@@ -1320,7 +1345,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
 
     int blockSize = 128;
     int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
-    kTrace<<<numBlocks, blockSize>>>(sc, dc, d_film, d_energy, N, diffraction ? 1 : 0,
+    kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_energy, N, diffraction ? 1 : 0,
                                      0x9e3779b97f4a7c15ULL, 32, camModeInt);
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
@@ -1341,10 +1366,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     eOut.escaped  += energy[3];
     eOut.residual += energy[4];
 
-    cudaFree(d_tris); cudaFree(d_sph); cudaFree(d_nodes); cudaFree(d_prim);
-    cudaFree(d_mats); cudaFree(d_ems); cudaFree(d_cdfAll); cudaFree(d_emitCdf);
-    cudaFree(d_envCoeff); cudaFree(d_envScale); cudaFree(d_margCdf); cudaFree(d_margFunc);
-    cudaFree(d_condCdf); cudaFree(d_condFunc); cudaFree(d_condFuncInt);
+    freeUpload(up);
     cudaFree(d_film); cudaFree(d_energy);
     return out;
 }
