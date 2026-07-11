@@ -39,3 +39,17 @@ bool cudaForwardSupported(const Scene& scene);
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode);
+
+// True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
+// than cudaForwardSupported: also requires no participating media and only area/sphere
+// Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the
+// caller must use the CPU BDPT renderer.
+bool cudaBdptSupported(const Scene& scene);
+
+// GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
+// resolution and returns the final absolute-radiance film (same units/convention as
+// the CPU renderBdpt, i.e. writeFilm(film, 1.0) for display). maxDepth is the maximum
+// path length in edges (clamped to the device capacity). Requires cudaAvailable() &&
+// cudaBdptSupported(scene); otherwise returns an empty film.
+Film renderBdptCuda(const Scene& scene, const Camera& cam, int res,
+                    long long spp, int maxDepth, bool diffraction);

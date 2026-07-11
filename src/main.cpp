@@ -1098,6 +1098,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // mode-P camera-side layer) and fluorescent scenes always run on the CPU.
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
+    const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
     bool useGpu = false;
@@ -1109,10 +1110,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (!cudaAvailable()) {
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
+        } else if (gpuBdptMode) {
+            // Mode D has its own (stricter) GPU support check: BDPT scope only.
+            if (!cudaBdptSupported(scene)) {
+                const char* why = "scene has a BDPT-GPU-unsupported feature "
+                                  "(fluorescent/textured/oversized-mix material, fog, "
+                                  "or spot/env/collimated light)";
+                if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+                else         std::printf("[device] auto -> CPU (%s)\n", why);
+            } else {
+                useGpu = true;
+                std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
+                            cudaDeviceName());
+            }
         } else if (!gpuForwardMode) {
             const char* why = (mode == 'R') ? "backward reference - no forward GPU pass"
-                            : (mode == 'D') ? "bidirectional path tracing - CPU-only path"
-                                            : "camera-side composite - CPU-only path";
+                                            : "unsupported mode - CPU-only path";
             if (wantGpu) std::fprintf(stderr,
                 "[device] GPU can't accelerate this render: %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
@@ -1195,9 +1208,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return 1;
         }
         int maxDepth = 8;   // path length in edges; connection cost grows ~depth^2
-        std::printf("mode D: bidirectional path tracing, %lld spp at %dx%d on %d threads "
-                    "(maxDepth=%d, light=%s) ...\n", spp, res, res, nThreads, maxDepth, lightLabel);
-        Film img = renderBdpt(scene, cam, res, spp, nThreads, maxDepth, diffraction);
+        std::printf("mode D: bidirectional path tracing, %lld spp at %dx%d on %s "
+                    "(maxDepth=%d, light=%s) ...\n", spp, res, res,
+                    useGpu ? "GPU" : "CPU threads", maxDepth, lightLabel);
+        Film img;
+#ifdef HAVE_CUDA
+        if (useGpu) img = renderBdptCuda(scene, cam, res, spp, maxDepth, diffraction);
+        else        img = renderBdpt(scene, cam, res, spp, nThreads, maxDepth, diffraction);
+#else
+        img = renderBdpt(scene, cam, res, spp, nThreads, maxDepth, diffraction);
+#endif
         writeFilm(outPath.c_str(), img, 1.0, manualExposure);
         return 0;
     }

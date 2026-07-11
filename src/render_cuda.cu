@@ -1071,6 +1071,560 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
     atomicAdd(&energy[4], eResidual);
 }
 
+// ============================ bidirectional path tracing (mode D) ============
+// Device port of bdpt.h (Veach / PBRT-v3). One thread renders one (pixel,sample):
+// it builds a camera subpath and a light subpath at a single shared wavelength,
+// then MIS-connects every vertex pair (balance heuristic). Geometry stays in Real;
+// all pdf/MIS arithmetic runs in double (ddot) to keep the balance-heuristic ratios
+// stable, matching the CPU reference to within Monte-Carlo noise. Emissive surfaces
+// and area/sphere lights only (spot/env/collimated/fog scenes fall back to the CPU
+// via cudaBdptSupported). See bdpt.h for the derivation of every quantity below.
+
+#define BDPT_MAXDEPTH 8
+#define BDPT_MAXV     (BDPT_MAXDEPTH + 3)   // path[0] endpoint + up to MAXDEPTH surfaces + slack
+enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2 };
+
+// A path vertex. Mirrors bdpt.h Vertex, but stores INDICES (matId into sc.mats,
+// lightIdx into sc.emitters) instead of pointers, and drops the Hit field (the GPU
+// rejects textured scenes, so albedo needs no surface-local (u,v)). pdfFwd/pdfRev/
+// beta stay double for MIS stability; geometry (p/ns/ng) is Real.
+struct DVertex {
+    int   type;                 // BV_CAMERA / BV_LIGHT / BV_SURFACE
+    DVec3 p, ns, ng;            // position, shading normal, geometric normal
+    double beta;                // throughput carried to this vertex
+    double pdfFwd, pdfRev;      // area-measure densities (0 for delta vertices)
+    int   delta;                // 1 => specular (skipped in connections/MIS)
+    int   matId;                // sc.mats index (-1 for camera)
+    int   lightIdx;             // sc.emitters index if emissive, else -1
+};
+
+__device__ static inline double ddot(const DVec3& a, const DVec3& b) {
+    return (double)a.x * b.x + (double)a.y * b.y + (double)a.z * b.z;
+}
+__device__ static inline bool dOnSurface(const DVertex& v) { return v.type != BV_CAMERA; }
+__device__ static inline bool dConnectibleType(int tp) {
+    return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT;
+}
+__device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
+    if (v.type == BV_CAMERA) return true;
+    if (v.type == BV_LIGHT)  return v.lightIdx >= 0 && sc.emitters[v.lightIdx].collimated == 0;
+    if (v.delta) return false;
+    return dConnectibleType(sc.mats[v.matId].type);
+}
+__device__ static inline bool dIsLightVertex(const DVertex& v) {
+    return v.type == BV_LIGHT || (v.type == BV_SURFACE && v.lightIdx >= 0);
+}
+__device__ static inline double dGlossyExp(double roughness) {
+    double rr = roughness < 1e-3 ? 1e-3 : roughness;
+    double e = 2.0 / (rr * rr) - 2.0;
+    return e < 0 ? 0 : e;
+}
+
+// BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L).
+__device__ static double dBsdfF(const DScene& sc, int matId, const DVec3& ns,
+                                const DVec3& wo, const DVec3& wi, Real lambda) {
+    const DMaterial& m = sc.mats[matId];
+    double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
+    if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
+        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        double rho = clamp01(specLookup(m.reflect, lambda));
+        return rho / DPI;
+    } else if (m.type == D_GLOSSY) {
+        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        double r = clamp01(specLookup(m.reflect, lambda));
+        double e = dGlossyExp(m.roughness);
+        DVec3 mdir = reflectv(wo * (Real)-1, ns);
+        double cosLobe = ddot(wi, mdir);
+        if (cosLobe <= 0) return 0.0;
+        double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+        return r * lobe / cosWi;
+    }
+    return 0.0;
+}
+// Directional pdf (solid angle) of sampling wi at a surface vertex (double, for MIS).
+__device__ static double dBsdfPdf(const DScene& sc, int matId, const DVec3& ns,
+                                  const DVec3& wo, const DVec3& wi) {
+    const DMaterial& m = sc.mats[matId];
+    double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
+    if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
+        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        return cosWi / DPI;
+    } else if (m.type == D_GLOSSY) {
+        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        double e = dGlossyExp(m.roughness);
+        DVec3 mdir = reflectv(wo * (Real)-1, ns);
+        double cosLobe = ddot(wi, mdir);
+        if (cosLobe <= 0) return 0.0;
+        return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+    }
+    return 0.0;
+}
+
+// Camera importance (PBRT imagePlaneArea convention — see bdpt.h cameraWe/PdfDir).
+__device__ static double dCamCos(const DCamera& cam, const DVec3& p) {
+    DVec3 d = p - cam.eye;
+    double len = sqrt(ddot(d, d));
+    return len > 0 ? ddot(d, cam.w) / len : 0.0;
+}
+__device__ static double dCameraPdfDir(const DCamera& cam, double cosCam) {
+    if (cosCam <= 0) return 0.0;
+    return 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam);
+}
+__device__ static double dCameraWe(const DCamera& cam, double cosCam) {
+    if (cosCam <= 0) return 0.0;
+    double c2 = cosCam * cosCam;
+    return 1.0 / (cam.imagePlaneArea() * c2 * c2);
+}
+
+// Convert a solid-angle pdf of leaving `from` toward `to` into an area density at `to`.
+__device__ static double dConvertDensity(double pdfW, const DVertex& from, const DVertex& to) {
+    DVec3 w = to.p - from.p;
+    double d2 = ddot(w, w);
+    if (d2 == 0.0) return 0.0;
+    double invD2 = 1.0 / d2;
+    if (dOnSurface(to)) pdfW *= fabs(ddot(to.ns, w * (Real)sqrt(invD2)));
+    return pdfW * invD2;
+}
+// Emission directional density at a light vertex toward `next` (area measure).
+__device__ static double dVertexPdfLight(const DVertex& cur, const DVertex& next) {
+    DVec3 w = next.p - cur.p;
+    double d2 = ddot(w, w);
+    if (d2 == 0.0) return 0.0;
+    double invD2 = 1.0 / d2;
+    DVec3 wn = w * (Real)sqrt(invD2);
+    double cosLight = ddot(cur.ng, wn);
+    if (cosLight <= 0.0) return 0.0;
+    double pdf = (cosLight / DPI) * invD2;
+    if (dOnSurface(next)) pdf *= fabs(ddot(next.ns, wn));
+    return pdf;
+}
+__device__ static double dVertexPdf(const DScene& sc, const DCamera& cam,
+                                    const DVertex* prev, const DVertex& cur, const DVertex& next) {
+    if (cur.type == BV_LIGHT) return dVertexPdfLight(cur, next);
+    DVec3 wn = next.p - cur.p;
+    if (ddot(wn, wn) == 0.0) return 0.0;
+    wn = normalize(wn);
+    double pdfW = 0.0;
+    if (cur.type == BV_CAMERA) {
+        pdfW = dCameraPdfDir(cam, dCamCos(cam, next.p));
+    } else {
+        if (!prev) return 0.0;
+        DVec3 wp = prev->p - cur.p;
+        if (ddot(wp, wp) == 0.0) return 0.0;
+        wp = normalize(wp);
+        pdfW = dBsdfPdf(sc, cur.matId, cur.ns, wp, wn);
+    }
+    return dConvertDensity(pdfW, cur, next);
+}
+__device__ static double dVertexPdfLightOrigin(const DScene& sc, const DVertex& cur) {
+    if (cur.lightIdx < 0) return 0.0;
+    const DEmitter& em = sc.emitters[cur.lightIdx];
+    if (sc.totalPower <= 0.0 || em.area <= 0.0) return 0.0;
+    double pdfChoice = em.power / sc.totalPower;
+    return pdfChoice / em.area;
+}
+// Emitted radiance (single wavelength) leaving a light vertex toward w.
+__device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVec3& w,
+                                   Real lambda, double invPdfLambda) {
+    if (v.lightIdx < 0) return 0.0;
+    if (ddot(v.ng, w) <= 0.0) return 0.0;
+    return (double)specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda;
+}
+// Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
+__device__ static int dEmitterForMat(const DScene& sc, int matId) {
+    for (int i = 0; i < sc.nEmitters; ++i)
+        if (sc.emitters[i].matId == matId) return i;
+    return -1;
+}
+
+// Sample the shared wavelength from the scene emission sampler (mirrors
+// EmissionSampler::sample). Sets pdf (per nm, for the >0 guard); the BDPT weight
+// uses the continuous invPdfLambda below (exactly as the CPU path does).
+__device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
+    double u = (double)rng.uniform();
+    const double* cdf = sc.emitSamplerCdf;
+    int lo = 0, hi = sc.emitSamplerN;
+    while (lo + 1 < hi) { int m = (lo + hi) / 2; if (cdf[m] <= u) lo = m; else hi = m; }
+    double c0 = cdf[lo], c1 = cdf[lo + 1];
+    double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
+    pdf = (c1 - c0) / sc.emitSamplerStep;
+    return (Real)(DLMIN + (lo + frac) * sc.emitSamplerStep);
+}
+// invPdfLambda(lambda) = emitG / g(lambda), g(lambda) = sum_k geomWeight_k*SPD_k.
+// In BDPT scope every emitter is an area/sphere light, so geomWeight = area*PI.
+__device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
+    double g = 0.0;
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& e = sc.emitters[k];
+        g += (double)e.area * DPI * (double)specLookup(e.emitSpd, lambda);
+    }
+    return (g > 0.0) ? sc.emitG / g : 0.0;
+}
+
+// Continue a subpath whose endpoint is already path[0]; append surface vertices
+// until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
+__device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int diffraction,
+                                   DVec3 ro, DVec3 rd, double beta, double pdfDir, Real lambda,
+                                   int maxDepth, DRng& rng, DVertex* path, int& n) {
+    if (maxDepth == 0) return;
+    double pdfFwd = pdfDir;
+    for (int bounces = 0;;) {
+        DHit h = closestHit(sc, ro, rd);
+        if (!h.valid) return;
+        if (h.sensorId >= 0) return;
+
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {
+            Real u = rng.uniform(), acc = 0; int child = -1;
+            for (int k = 0; k < mp->mixCount; ++k) { acc += (Real)mp->mixWeight[k]; if (u < acc) { child = mp->mixChild[k]; break; } }
+            if (child < 0) return;
+            mp = &sc.mats[child]; matId = child;
+        }
+        if (n >= BDPT_MAXV) return;
+        DVertex v;
+        v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
+        v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
+        v.matId = matId; v.lightIdx = dEmitterForMat(sc, matId);
+        v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
+        path[n] = v; int cur = n; n++;
+        if (++bounces >= maxDepth) return;
+
+        DVec3 wo = normalize(path[cur - 1].p - path[cur].p);
+        DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
+        switch (mp->type) {
+            case D_DIFFUSE:
+            case D_FLUORESCENT: {
+                wi = cosineHemisphere(path[cur].ns, rng);
+                if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
+                double rho = clamp01(specLookup(mp->reflect, lambda));
+                pdfW = dBsdfPdf(sc, matId, path[cur].ns, wo, wi);
+                pdfRevW = dBsdfPdf(sc, matId, path[cur].ns, wi, wo);
+                betaFactor = rho;
+                if (rho <= 0) terminate = true;
+                break;
+            }
+            case D_GLOSSY: {
+                DVec3 mdir = reflectv(rd, path[cur].ns);   // rd == -wo (incoming dir)
+                wi = sampleGlossy(mdir, (Real)mp->roughness, rng);
+                if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
+                double r = clamp01(specLookup(mp->reflect, lambda));
+                pdfW = dBsdfPdf(sc, matId, path[cur].ns, wo, wi);
+                pdfRevW = dBsdfPdf(sc, matId, path[cur].ns, wi, wo);
+                betaFactor = r;
+                if (r <= 0 || pdfW <= 0) terminate = true;
+                break;
+            }
+            case D_MIRROR: {
+                double r = clamp01(specLookup(mp->reflect, lambda));
+                wi = reflectv(rd, path[cur].ns); betaFactor = r; delta = 1;
+                if (r <= 0) terminate = true;
+                break;
+            }
+            case D_DIELECTRIC: {
+                DVec3 nro, nrd; refractOrReflect(*mp, h, rd, lambda, rng, nro, nrd);
+                wi = nrd; betaFactor = 1.0; delta = 1;
+                break;
+            }
+            case D_HALFMIRROR: {
+                double r = clamp01(specLookup(mp->reflect, lambda));
+                if (rng.uniform() < r) wi = reflectv(rd, path[cur].ns); else wi = rd;
+                betaFactor = 1.0; delta = 1;
+                break;
+            }
+            case D_THINFILM: {
+                DVec3 nro, nrd;
+                if (!thinFilmInterface(*mp, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+                wi = nrd; betaFactor = 1.0; delta = 1;
+                break;
+            }
+            case D_MULTILAYER: {
+                DVec3 nro, nrd;
+                if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+                wi = nrd; betaFactor = 1.0; delta = 1;
+                break;
+            }
+            case D_GRATING: {
+                double r = clamp01(specLookup(mp->reflect, lambda));
+                if (r <= 0) { terminate = true; break; }
+                DVec3 nro, nrd;
+                if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) { terminate = true; break; }
+                wi = nrd; betaFactor = r; delta = 1;
+                break;
+            }
+            default: terminate = true; break;
+        }
+        if (terminate || betaFactor <= 0.0) return;
+
+        path[cur].delta = delta;
+        if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
+        path[cur - 1].pdfRev = dConvertDensity(pdfRevW, path[cur], path[cur - 1]);
+
+        beta *= betaFactor;
+        double sgn = dot(wi, path[cur].ng) >= 0.0 ? 1.0 : -1.0;
+        ro = path[cur].p + path[cur].ng * (Real)(sgn * 1e-6);
+        rd = normalize(wi);
+        pdfFwd = delta ? 0.0 : pdfW;
+    }
+}
+
+// Trace an eye subpath through pixel (px,py). path[0] is the camera vertex (beta=1).
+__device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
+                                        int px, int py, Real lambda, int maxDepth,
+                                        DRng& rng, DVertex* path) {
+    DVertex c;
+    c.type = BV_CAMERA; c.p = cam.eye; c.ns = cam.w; c.ng = cam.w;
+    c.beta = 1.0; c.pdfFwd = 0; c.pdfRev = 0; c.delta = 0; c.matId = -1; c.lightIdx = -1;
+    path[0] = c; int n = 1;
+    Real jx = rng.uniform(), jy = rng.uniform();
+    Real sx = (Real)2 * (((Real)px + jx) / (Real)cam.resX) - (Real)1;
+    Real sy = (Real)2 * (((Real)py + jy) / (Real)cam.resY) - (Real)1;
+    DVec3 rd = normalize(cam.w + cam.u * (sx * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
+    double cosCam = ddot(rd, cam.w);
+    double pdfDir = dCameraPdfDir(cam, cosCam);
+    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n);
+    return n;
+}
+// Sample a light subpath. path[0] is the light endpoint (beta = Le).
+__device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int diffraction,
+                                       Real lambda, double invPdfLambda, int maxDepth,
+                                       DRng& rng, DVertex* path) {
+    if (sc.nEmitters == 0 || sc.totalPower <= 0.0) return 0;
+    int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+    const DEmitter& em = sc.emitters[ei];
+    if (em.shape == 2 || em.shape == 3 || em.collimated) return 0;
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
+    double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+    if (Le <= 0.0) return 0;
+    double pdfChoice = em.power / sc.totalPower;
+    double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
+    if (pdfPos <= 0.0) return 0;
+    DVertex L0;
+    L0.type = BV_LIGHT; L0.p = y; L0.ns = nOut; L0.ng = nOut;
+    L0.beta = Le; L0.pdfFwd = pdfChoice * pdfPos; L0.pdfRev = 0; L0.delta = 0;
+    L0.matId = em.matId; L0.lightIdx = ei;
+    path[0] = L0; int n = 1;
+    DVec3 dir = cosineHemisphere(nOut, rng);
+    double cosLight = ddot(nOut, dir);
+    if (cosLight <= 0.0) return 1;
+    double pdfDir = cosLight / DPI;
+    double betaWalk = Le * cosLight / (pdfChoice * pdfPos * pdfDir);
+    DVec3 ro = y + nOut * (Real)1e-6;
+    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, lambda, maxDepth - 1, rng, path, n);
+    return n;
+}
+
+// Balance-heuristic MIS weight for strategy (s,t). Direct port of bdpt.h misWeight:
+// PBRT temporarily rewrites the connection vertices' reverse densities / delta flags
+// and (for s==1/t==1) installs the resampled endpoint, sums the density ratios of all
+// other strategies, then rolls the mutations back. Here the vertices live in the
+// per-thread local arrays, so we save whole vertices before ANY mutation and restore
+// them at the end (whole-vertex restore subsumes PBRT's field-wise ScopedAssignments).
+__device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
+                                    DVertex* light, DVertex* eye, const DVertex& sampled,
+                                    int s, int t) {
+    if (s + t == 2) return 1.0;
+    int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
+    bool hasQs = s > 0, hasPt = t > 0, hasQsM = s > 1, hasPtM = t > 1;
+
+    DVertex sQs, sPt, sQsM, sPtM;
+    if (hasQs)  sQs  = light[si];
+    if (hasPt)  sPt  = eye[ti];
+    if (hasQsM) sQsM = light[sMi];
+    if (hasPtM) sPtM = eye[tMi];
+
+    // a1: install the resampled endpoint for s==1 / t==1.
+    if (s == 1)      light[si] = sampled;
+    else if (t == 1) eye[ti]   = sampled;
+    // a2/a3: connection endpoints act as non-delta while probing hypotheticals.
+    if (hasPt) eye[ti].delta   = 0;
+    if (hasQs) light[si].delta = 0;
+    // a4: reverse density of the eye connection vertex pt.
+    if (hasPt) {
+        double val = (s > 0) ? dVertexPdf(sc, cam, hasQsM ? &light[sMi] : nullptr, light[si], eye[ti])
+                             : dVertexPdfLightOrigin(sc, eye[ti]);
+        eye[ti].pdfRev = val;
+    }
+    // a5: reverse density of pt's predecessor.
+    if (hasPtM) {
+        double val = (s > 0) ? dVertexPdf(sc, cam, hasQs ? &light[si] : nullptr, eye[ti], eye[tMi])
+                             : dVertexPdfLight(eye[ti], eye[tMi]);
+        eye[tMi].pdfRev = val;
+    }
+    // a6/a7: reverse density of the light connection vertex qs and its predecessor.
+    if (hasQs)  light[si].pdfRev  = dVertexPdf(sc, cam, hasPtM ? &eye[tMi] : nullptr, eye[ti], light[si]);
+    if (hasQsM) light[sMi].pdfRev = dVertexPdf(sc, cam, hasPt ? &eye[ti] : nullptr, light[si], light[sMi]);
+
+    double sumRi = 0.0, ri = 1.0;
+    for (int i = t - 1; i > 0; --i) {
+        double num = eye[i].pdfRev != 0.0 ? eye[i].pdfRev : 1.0;
+        double den = eye[i].pdfFwd != 0.0 ? eye[i].pdfFwd : 1.0;
+        ri *= num / den;
+        if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
+    }
+    ri = 1.0;
+    for (int i = s - 1; i >= 0; --i) {
+        double num = light[i].pdfRev != 0.0 ? light[i].pdfRev : 1.0;
+        double den = light[i].pdfFwd != 0.0 ? light[i].pdfFwd : 1.0;
+        ri *= num / den;
+        bool deltaPrev = (i > 0) ? (light[i - 1].delta != 0) : false;
+        if (!light[i].delta && !deltaPrev) sumRi += ri;
+    }
+
+    if (hasQsM) light[sMi] = sQsM;
+    if (hasPtM) eye[tMi]   = sPtM;
+    if (hasQs)  light[si]  = sQs;
+    if (hasPt)  eye[ti]    = sPt;
+    return 1.0 / (1.0 + sumRi);
+}
+
+// Connect strategy (s,t); returns the MIS-weighted radiance. For t==1 the result is a
+// light-image splat to (outPx,outPy) with isSplat=1. Direct port of bdpt.h connectBDPT.
+__device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
+                                      DVertex* light, DVertex* eye, int s, int t,
+                                      Real lambda, double invPdfLambda, DRng& rng,
+                                      int& outPx, int& outPy, int& isSplat) {
+    isSplat = 0;
+    if (t > 1 && s != 0 && dIsLightVertex(eye[t - 1])) return 0.0;
+
+    double L = 0.0;
+    DVertex sampled;
+    sampled.type = BV_SURFACE; sampled.beta = 0; sampled.pdfFwd = 0; sampled.pdfRev = 0;
+    sampled.delta = 0; sampled.matId = -1; sampled.lightIdx = -1;
+
+    if (s == 0) {
+        if (t < 2) return 0.0;
+        const DVertex& pt = eye[t - 1];
+        if (!dIsLightVertex(pt)) return 0.0;
+        DVec3 wo = normalize(eye[t - 2].p - pt.p);
+        double Le = dVertexLe(sc, pt, wo, lambda, invPdfLambda);
+        if (Le <= 0.0) return 0.0;
+        L = pt.beta * Le;
+    } else if (t == 1) {
+        const DVertex& qs = light[s - 1];
+        if (!dVertConnectible(sc, qs)) return 0.0;
+        int px, py; Real cc, d2f;
+        if (!cam.project(qs.p, px, py, cc, d2f)) return 0.0;
+        double dist2 = ddot(cam.eye - qs.p, cam.eye - qs.p);
+        double dist = sqrt(dist2);
+        DVec3 wcam = (cam.eye - qs.p) * (Real)(1.0 / dist);
+        double cosSurf = ddot(qs.ns, wcam);
+        if (cosSurf <= 0.0) return 0.0;
+        DVec3 wo = normalize(light[s - 2].p - qs.p);
+        double f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
+        if (f <= 0.0) return 0.0;
+        double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
+        DVec3 o = qs.p + qs.ng * (Real)(sgn * 1e-6);
+        if (occluded(sc, o, wcam, (Real)(dist - 2e-6))) return 0.0;
+        double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
+        double G = cosSurf * cosCam / dist2;
+        L = qs.beta * f * G * dCameraWe(cam, cosCam);
+        if (L <= 0.0) return 0.0;
+        sampled.type = BV_CAMERA; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
+        sampled.beta = 1.0;
+        outPx = px; outPy = py; isSplat = 1;
+    } else if (s == 1) {
+        const DVertex& pt = eye[t - 1];
+        if (!dVertConnectible(sc, pt)) return 0.0;
+        int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+        const DEmitter& em = sc.emitters[ei];
+        if (em.shape == 2 || em.shape == 3 || em.collimated) return 0.0;
+        Real u1 = rng.uniform(), u2 = rng.uniform();
+        DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
+        DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
+        if (dist2 <= 0.0) return 0.0;
+        double dist = sqrt(dist2); DVec3 wi = toL * (Real)(1.0 / dist);
+        double cosLight = ddot(nOut, wi * (Real)-1);
+        double cosSurf = ddot(pt.ns, wi);
+        if (cosLight <= 0.0 || cosSurf <= 0.0) return 0.0;
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        if (Le <= 0.0) return 0.0;
+        double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
+        DVec3 o = pt.p + pt.ng * (Real)(sgn * 1e-6);
+        if (occluded(sc, o, wi, (Real)(dist - 2e-6))) return 0.0;
+        DVec3 wo = normalize(eye[t - 2].p - pt.p);
+        double f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda);
+        if (f <= 0.0) return 0.0;
+        double pdfChoice = em.power / sc.totalPower;
+        double pdfA = pdfChoice / em.area;
+        if (pdfA <= 0.0) return 0.0;
+        double G = cosSurf * cosLight / dist2;
+        L = pt.beta * f * Le * G / pdfA;
+        if (L <= 0.0) return 0.0;
+        sampled.type = BV_LIGHT; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
+        sampled.lightIdx = ei; sampled.matId = em.matId; sampled.beta = Le / pdfA; sampled.pdfFwd = pdfA;
+    } else {
+        const DVertex& qs = light[s - 1];
+        const DVertex& pt = eye[t - 1];
+        if (!dVertConnectible(sc, qs) || !dVertConnectible(sc, pt)) return 0.0;
+        DVec3 d = qs.p - pt.p; double dist2 = ddot(d, d);
+        if (dist2 <= 0.0) return 0.0;
+        double dist = sqrt(dist2); DVec3 w = d * (Real)(1.0 / dist);
+        double cosE = ddot(pt.ns, w), cosL = ddot(qs.ns, w * (Real)-1);
+        if (cosE <= 0.0 || cosL <= 0.0) return 0.0;
+        DVec3 woE = normalize(eye[t - 2].p - pt.p);
+        DVec3 woL = normalize(light[s - 2].p - qs.p);
+        double fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda);
+        double fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
+        if (fE <= 0.0 || fL <= 0.0) return 0.0;
+        double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
+        DVec3 o = pt.p + pt.ng * (Real)(sgn * 1e-6);
+        if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
+        double G = cosE * cosL / dist2;
+        L = pt.beta * fE * fL * qs.beta * G;
+    }
+    if (L <= 0.0) return 0.0;
+    return L * dMisWeight(sc, cam, light, eye, sampled, s, t);
+}
+
+// BDPT megakernel: one thread renders one (pixel,sample), grid-stride over all
+// res*res*spp samples. t>=2 connections land on the sample's own pixel (camFilm);
+// t==1 splats land on the projected raster pixel (splatFilm). Both are normalised by
+// 1/spp on the host (bdpt.h renderBdpt convention).
+__global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
+                      long long totalSamples, long long spp, int res, int maxDepth,
+                      int diffraction, unsigned long long seedBase) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    for (long long idx = g; idx < totalSamples; idx += G) {
+        DRng rng; rng.seed((unsigned long long)(idx * 2 + 1), seedBase ^ (unsigned long long)idx);
+        long long pix = idx / spp;
+        int px = (int)(pix % res);
+        int py = (int)(pix / res);
+
+        double pdfLam = 0.0;
+        Real lambda = dSampleSceneLambda(sc, rng, pdfLam);
+        if (pdfLam <= 0.0) continue;
+        double invPdfLambda = dInvPdfLambda(sc, lambda);
+
+        DVertex eye[BDPT_MAXV], light[BDPT_MAXV];
+        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, lambda, maxDepth + 1, rng, eye);
+        int nL = dGenLightSubpath(sc, cam, diffraction, lambda, invPdfLambda, maxDepth + 1, rng, light);
+
+        Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
+        for (int t = 1; t <= nE; ++t)
+            for (int s = 0; s <= nL; ++s) {
+                int depth = t + s - 2;
+                if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
+                int spx = 0, spy = 0, isSplat = 0;
+                double c = dConnectBDPT(sc, cam, light, eye, s, t, lambda, invPdfLambda, rng, spx, spy, isSplat);
+                if (c <= 0.0) continue;
+                if (isSplat) {
+                    size_t o = ((size_t)spy * res + spx) * 3;
+                    atomicAdd(&splatFilm[o + 0], (double)(cx * c));
+                    atomicAdd(&splatFilm[o + 1], (double)(cy * c));
+                    atomicAdd(&splatFilm[o + 2], (double)(cz * c));
+                } else {
+                    size_t o = ((size_t)py * res + px) * 3;
+                    atomicAdd(&camFilm[o + 0], (double)(cx * c));
+                    atomicAdd(&camFilm[o + 1], (double)(cy * c));
+                    atomicAdd(&camFilm[o + 2], (double)(cz * c));
+                }
+            }
+    }
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
@@ -1368,5 +1922,57 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
 
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_energy);
+    return out;
+}
+
+// ------------------------------ BDPT (mode D) host ---------------------------
+
+bool cudaBdptSupported(const Scene& scene) {
+    // BDPT-GPU needs the same POD-bakeable materials as the forward path, PLUS the
+    // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): no participating
+    // media, and only area/sphere Lambertian emitters (no spot/env/collimated).
+    if (!cudaForwardSupported(scene)) return false;
+    if (scene.medium.enabled) return false;
+    for (const auto& em : scene.emitters)
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
+            return false;
+    return true;
+}
+
+Film renderBdptCuda(const Scene& scene, const Camera& cam, int res,
+                    long long spp, int maxDepth, bool diffraction) {
+    using namespace gpu;
+    Film out; out.resX = res; out.resY = res; out.alloc();
+    if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
+    if (maxDepth > BDPT_MAXDEPTH) maxDepth = BDPT_MAXDEPTH;   // device array bound
+
+    DUpload up;
+    buildUpload(scene, cam, res, up);
+
+    const size_t npix = (size_t)res * res;
+    double* d_cam   = nullptr; cudaMalloc(&d_cam,   npix * 3 * sizeof(double));
+    double* d_splat = nullptr; cudaMalloc(&d_splat, npix * 3 * sizeof(double));
+    cudaMemset(d_cam,   0, npix * 3 * sizeof(double));
+    cudaMemset(d_splat, 0, npix * 3 * sizeof(double));
+
+    long long totalSamples = (long long)res * res * spp;
+    kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, spp, res,
+                         maxDepth, diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
+    cudaError_t kerr = cudaGetLastError();
+    if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
+    if (kerr != cudaSuccess)
+        std::fprintf(stderr, "[cuda] bdpt kernel error: %s\n", cudaGetErrorString(kerr));
+
+    std::vector<double> camH(npix * 3), splatH(npix * 3);
+    cudaMemcpy(camH.data(),   d_cam,   npix * 3 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(splatH.data(), d_splat, npix * 3 * sizeof(double), cudaMemcpyDeviceToHost);
+    const double inv = 1.0 / (double)spp;   // camera + light images share the 1/spp scale
+    for (size_t i = 0; i < npix; ++i)
+        out.xyz[i] = Vec3((camH[3 * i + 0] + splatH[3 * i + 0]) * inv,
+                          (camH[3 * i + 1] + splatH[3 * i + 1]) * inv,
+                          (camH[3 * i + 2] + splatH[3 * i + 2]) * inv);
+
+    freeUpload(up);
+    cudaFree(d_cam); cudaFree(d_splat);
     return out;
 }
