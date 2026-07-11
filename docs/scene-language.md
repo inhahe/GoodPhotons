@@ -139,6 +139,7 @@ declared once as a named `spectrum` block and referenced as `spectrum:name`.
 | `reflectance:leaf`, `reflectance:skin`, ... | Named natural diffuse reflectance (representative)        | `resolveNaturalReflectance`, `src/materials.h` — **[maps 1:1]** |
 | `ior 1.5`                              | Constant refractive index                                     | `iorConstant` — **[maps 1:1]** |
 | `table { 400:0.05 450:0.12 ... }`      | Piecewise-linear measured curve (λnm:value pairs)             | `tabulatedSpectrum` — **[maps 1:1]** |
+| `file:data/spd/cie_f2.csv`             | Piecewise-linear curve loaded from an external data file (see below) | `loadSpdCsv` → `tabulatedSpectrum` — **[maps 1:1]** |
 | `rgb 0.63 0.06 0.05`                   | Convenience: upsample an sRGB triple to a smooth reflectance   | `rgbToReflectanceJH` (Jakob-Hanika sigmoid fit, `src/upsample.h`) — **[maps 1:1]**; validated by `-checkupsample` |
 | `spectrum:name`                        | Reference a named `spectrum` block                            | name resolution                |
 | `preset:D65`, `preset:led`, ...        | Named illuminant SPD (see §5)                                 | `src/lights.h` — **[maps 1:1]** |
@@ -155,6 +156,22 @@ the glasses/crystals, Cauchy fits for water/ice/plastics.
 **`reflectance:<name>` natural diffuse curves** (representative spectral shapes, *not*
 a specific measured sample — see known-issues): `leaf`/`vegetation`, `skin`/`skin-light`,
 `skin-dark`, `snow`, `soil`/`dirt`, `brick`/`red-brick`, `concrete`.
+
+**`file:<path>` — measured spectra from disk.** Any `<spectrum>` slot accepts
+`file:<path>` to load a piecewise-linear curve (an SPD, a reflectance, or an n(λ)
+table) from an external CSV/whitespace data file — the runtime ingestion point for the
+authoritative measured data mirrored under `data/` (see `data/README.md`). The parser
+is liberal: lines beginning with `#` are comments, fields may be comma- **or**
+whitespace-separated, and any line whose first two fields are not both numeric (e.g. a
+`wavelength_nm,relative_power` header row) is skipped. The first numeric field is the
+wavelength in nm and the second is the value (extra columns are ignored); values are
+taken verbatim (an emission SPD's absolute scale is irrelevant — the power law
+renormalises it — and a reflectance file should already be in 0..1). Paths resolve
+relative to the current working directory (the same convention as `texture`/`mesh`
+file refs), and repeated references to one path share a cached curve. Because the
+built-in `preset:f2` blackbody-table was transcribed from `data/spd/cie_f2.csv`,
+`spd file:data/spd/cie_f2.csv` renders pixel-identically to `spd preset:f2` — the
+end-to-end loader proof (`scenes/measured_spd.ftsl`).
 
 ### 2.2 Named spectrum blocks
 

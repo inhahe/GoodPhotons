@@ -493,20 +493,27 @@ as practical; this file is the fallback for what can't be addressed immediately.
      colour-science), which caught a real bug: `fluorescentF7()`'s tail (685–780 nm)
      was wrong (it wiggled back up to 4.34 at 765 nm instead of decaying smoothly).
      F7 is now corrected; F2/F11 already matched exactly. The authoritative tables
-     are committed to `data/spd/cie_f2.csv` / `cie_f7.csv` / `cie_f11.csv` for the
-     planned data-file loader. Remaining sub-item: still baked in-source rather than
-     loaded from those files (see the loader work).
+     are committed to `data/spd/cie_f2.csv` / `cie_f7.csv` / `cie_f11.csv`. The
+     runtime measured-SPD loader now exists (`file:<path>`, DONE 2026-07-11 — see
+     below), so a scene can drive a light straight from those CSVs
+     (`spd file:data/spd/cie_f2.csv`, verified pixel-identical to `preset:f2` by
+     `scenes/measured_spd.ftsl`). Remaining sub-item: the *built-in* `preset:f2/f7/f11`
+     names are still baked in-source rather than reading the CSVs at startup (a minor
+     wiring change now that the loader exists).
   2. **The sodium / mercury / metal-halide entries are deliberately *illustrative*
      spectroscopic models, not per-lamp measurements** — correct line positions and
      plausible relative strengths (from spectroscopy references) over analytic
      continua, tuned to give the right visual cast. They are not a specific
      manufacturer's lamp and are not radiometrically calibrated. Same intended
      upgrade path: swap for measured SPDs when the data-file loader lands.
-- **Proper fix (future):** route all of these through the planned measured-SPD data
-  loader (the same Python tooling earmarked for D65/solar/specific lamps) so the
-  built-ins become verifiable data rather than transcribed/analytic approximations.
-- **Status:** OPEN (acceptable) — feature works and looks right; accuracy of the
-  underlying numbers is the tracked debt.
+- **Proper fix:** the measured-SPD data loader now exists (`file:<path>` — DONE
+  2026-07-11), so the path to fully closing this is (a) mirror measured lamp SPDs
+  (LSPDD / LICA-UCM, see `data/README.md`) into `data/spd/`, and (b) point the
+  built-in `preset:` names at those CSVs at load time instead of the baked/analytic
+  tables — turning the built-ins into verifiable data. The discharge lamps still need
+  their measured CSVs fetched; the F-series CSVs are already present.
+- **Status:** OPEN (acceptable, reduced) — loader + F-series data done; discharge-lamp
+  measurements and the preset-reads-CSV wiring are the tracked remainder.
 
 ### Built-in material presets: skin/soil & iridescent recipes are representative (metals + most natural curves now measured)
 - **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
@@ -553,12 +560,15 @@ as practical; this file is the fallback for what can't be addressed immediately.
   behaviour (same as the existing `mirror`/`glossy`/`dielectric` types); use mode A,
   an environment light, or surrounding geometry to see them. Their reflectance data
   is correct (verified by putting the same `metal:` spectra on a diffuse surface).
-- **Proper fix (remaining):** three loaders now exist — `tools/csv_to_table.py`
+- **Proper fix (remaining):** three offline generators exist — `tools/csv_to_table.py`
   (generic CSV→`table`), `tools/ri_nk_to_reflectance.py` (refractiveindex.info
-  n,k→reflectance), and `tools/splib_to_reflectance.py` (USGS splib07→reflectance).
+  n,k→reflectance), and `tools/splib_to_reflectance.py` (USGS splib07→reflectance) —
+  plus, as of 2026-07-11, a *runtime* `file:<path>` loader so a reflectance CSV can be
+  bound directly (`reflect file:data/reflectance/skin.csv`) without re-baking source.
   Metals and leaf/snow/brick/concrete are done. Remaining debt is finding measured
-  samples for `skin`/`skin-dark` (a skin-optics dataset) and `soil` (a loam/dirt
-  reflectance), plus optionally validating the iridescent recipes against specimens.
+  samples for `skin`/`skin-dark` (a skin-optics dataset, e.g. NIST JRES 122.026) and
+  `soil` (a loam/dirt reflectance, e.g. ECOSTRESS/ISRIC) and dropping them into
+  `data/`, plus optionally validating the iridescent recipes against specimens.
 - **Status:** OPEN (acceptable, much reduced) — metals + 4 natural curves are now
   measured data; skin/soil and iridescent recipes remain representative. All presets
   load on CPU==GPU and render the right colours.

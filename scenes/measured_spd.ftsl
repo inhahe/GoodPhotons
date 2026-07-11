@@ -1,0 +1,45 @@
+# Measured-SPD data-file loader demo.
+#
+# Any <spectrum> expression may be `file:<path>`, which loads a measured spectral
+# curve from an external data file (CSV or whitespace, `#` comments, a header row,
+# then `wavelength_nm,value` rows — see data/README.md). Paths resolve relative to
+# the current working directory, like `texture`/`mesh` file references.
+#
+# This lights a Cornell box with the *measured* CIE F2 cool-white fluorescent SPD
+# mirrored under data/spd/cie_f2.csv. It should render identically to authoring
+# `spd preset:f2` (the baked table in src/lights.h was transcribed from this file),
+# which is the end-to-end proof that the loader ingests the data correctly.
+#
+#   ftrace -in scenes/measured_spd.ftsl -n 20000000 -o png/measured_spd.png
+#
+# Try:  swap `file:data/spd/cie_f2.csv` -> `file:data/spd/cie_f11.csv`
+#       (triphosphor fluorescent — note the sharper narrow-band colour rendering)
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.3 0.5   radius 0.28   material white }
+
+# Ceiling area light driven by the measured F2 fluorescent SPD read from disk.
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd    file:data/spd/cie_f2.csv
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

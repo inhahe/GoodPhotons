@@ -1,11 +1,18 @@
 # Measured spectral data
 
-Public-domain / open measured spectra, mirrored here so the (planned) runtime
-measured-SPD loader and the `tools/` regeneration scripts have a canonical local
-copy. Format for `.csv` files: comment lines start with `#`, one header row
+Public-domain / open measured spectra, mirrored here so the runtime measured-SPD
+loader and the `tools/` regeneration scripts have a canonical local copy. Format
+for `.csv` files: comment lines start with `#`, one header row
 `wavelength_nm,<value column>`, then `wavelength_nm,value` rows. Values are
-relative unless a column name says otherwise; the loader peak- or integral-
-normalises as appropriate.
+relative unless a column name says otherwise (an emission SPD's absolute scale is
+irrelevant — the power law renormalises it; a reflectance should already be 0..1).
+
+**Runtime loader.** Any `<spectrum>` slot in FTSL accepts `file:<path>`, which
+loads one of these files into a piecewise-linear curve (`loadSpdCsv` in
+`src/ftsl.h` → `tabulatedSpectrum`). The parser is liberal about comma-vs-whitespace
+delimiters and skips non-numeric header rows. E.g. `spd file:data/spd/cie_f2.csv`,
+demonstrated by `scenes/measured_spd.ftsl` (which renders pixel-identically to the
+baked `preset:f2`, the end-to-end proof).
 
 ## Present
 
@@ -19,10 +26,12 @@ CIE standard illuminant F-series relative SPDs, 380-780 nm at 5 nm.
   files exactly (an earlier F7 tail 685-780 nm was mis-transcribed "from memory"
   and has been corrected against this data).
 
-## Pending (sourced, awaiting the loader — "option A")
+## Pending (loader exists; data still to be fetched + wired)
 
-These close the remaining measured-data debt in `known-issues.md`. Each entry
-lists an authoritative, openly-licensed source and how to extract a clean table.
+The `file:<path>` loader now exists, so closing each of these is just: download the
+source below into `data/spd/` (or `data/reflectance/`) as a `wavelength_nm,value`
+CSV, then point the relevant preset (or a scene) at it. Each entry lists an
+authoritative, openly-licensed source and how to extract a clean table.
 
 ### Discharge lamps (HPS, LPS, metal-halide, mercury)
 Currently `src/lights.h` `sodiumHigh/sodiumLow/mercuryVapor/metalHalide()` are

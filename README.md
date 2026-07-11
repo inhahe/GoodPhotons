@@ -295,6 +295,10 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   (round-trips under D65).
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
+- **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
+  external CSV/whitespace data file (`#` comments, a header row, `wavelength_nm,value`
+  rows); the runtime ingestion point for the data mirrored under `data/`. E.g.
+  `spd file:data/spd/cie_f2.csv` (see `scenes/measured_spd.ftsl`).
 - **`glass:<name>`** — dispersive index via Sellmeier: `BK7`/crown, `SF10`/flint,
   `silica`/fused-silica, `sapphire`, `diamond`, plus Cauchy fits for `water`,
   `ice`, `acrylic`/PMMA, `polycarbonate`.
