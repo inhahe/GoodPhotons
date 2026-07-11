@@ -1787,7 +1787,8 @@ int main(int argc, char** argv) {
             Camera c;
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cres, cres);
             c.apertureR = cs->aperture;
-            c.setFocus(cs->focus);
+            if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
+            else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
             toRender.push_back({cs->name, c, effMode(cs->mode), cres, cs->exposureMul});
         }
     } else {

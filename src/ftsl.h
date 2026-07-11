@@ -23,7 +23,13 @@
 //   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
-//                   film { res W H } }
+//                   lens <mm>  fstop <N>            # photographic authoring (overrides fov_y/aperture)
+//                   film { res W H  format <name>  size <Wmm> <Hmm>  iso .. shutter .. exposure .. } }
+//     lens <mm> sets field of view from focal length and film height; fstop <N> sets a
+//     physically-correct aperture (radius = focal/2N) and, for modes A/C, seats the film
+//     at the image distance so depth of field matches a real lens. film format presets:
+//     full-frame(35mm) aps-c micro-four-thirds super35 medium-format(645) 6x6 6x7
+//     large-format(4x5) 8x10 (see filmFormatMM). size gives an explicit W H in mm.
 //   render   { photons N  device auto  mode B }
 //
 // Statements are newline-terminated; brace values (table {…}, film {…}) nest. A
@@ -225,6 +231,36 @@ inline double dblOf(const Block& b, const char* key, double dflt) {
     return (s && !s->val.words.empty()) ? num(s->val.words[0]) : dflt;
 }
 
+// Named film / sensor formats -> physical (width, height) in millimetres, landscape
+// orientation. Lets a camera say `film { format full-frame }` instead of `size 36 24`,
+// matching how photographers pick a body/back. The key is normalised (lower-cased with
+// spaces / underscores / hyphens stripped) so "medium format", "medium-format" and
+// "MediumFormat" all match. Returns false for an unknown name.
+inline bool filmFormatMM(const std::string& raw, double& w, double& h) {
+    std::string k;
+    for (char c : raw) { if (c==' '||c=='_'||c=='-') continue; k += (char)std::tolower((unsigned char)c); }
+    struct F { const char* k; double w, h; };
+    static const F tbl[] = {
+        // 35 mm still / cine
+        {"35mm",36,24}, {"fullframe",36,24}, {"135",36,24}, {"ff",36,24},
+        {"halfframe",24,18},
+        {"super35",24.89,18.66}, {"s35",24.89,18.66}, {"academy",21.95,16.0},
+        // digital crop sensors
+        {"apsc",23.6,15.6}, {"apsh",28.7,19.0},
+        {"microfourthirds",17.3,13.0}, {"mft",17.3,13.0}, {"m43",17.3,13.0}, {"fourthirds",17.3,13.0},
+        {"1inch",13.2,8.8}, {"1in",13.2,8.8},
+        // medium format
+        {"mediumformat",56,41.5}, {"645",56,41.5}, {"6x45",56,41.5},
+        {"6x6",56,56}, {"6x7",70,56}, {"6x9",84,56},
+        {"digitalmediumformat",43.8,32.9}, {"gfx",43.8,32.9},
+        // large / sheet film
+        {"largeformat",127,101.6}, {"4x5",127,101.6}, {"5x4",127,101.6},
+        {"8x10",254,203.2},
+    };
+    for (const auto& f : tbl) if (k == f.k) { w = f.w; h = f.h; return true; }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -245,6 +281,11 @@ struct CamSpec {
     // turn an f-number into an aperture radius). `focal` is the derived focal
     // length in metres (internal units), from filmH + fov_y.
     double filmW_mm = 0.0, filmH_mm = 0.0, focal = 0.0;
+    // Physical-optics camera (filled when `lens <mm>` or `fstop` is authored): the
+    // film sits at the image distance and the thin lens has the real focal length,
+    // so the f-number produces true depth of field in the catch modes (A/C). Both 0
+    // => legacy camera (unit film distance, lens synthesised from `focus` by setFocus).
+    double filmDist_m = 0.0, lensF_m = 0.0;
     // Photographic exposure controls. The film's radiometric scale is not absolute,
     // so images are always auto-exposed (99th-percentile anchor); these act as an
     // exposure *compensation* on top of that anchor:
@@ -899,16 +940,33 @@ private:
         return true;
     }
 
-    // Read the film sub-block + photographic exposure/f-stop controls shared by
-    // `camera` and `camera_path`, and resolve the derived focal length, f-stop ->
-    // aperture radius, and manual exposure multiplier. `cs.fov` must already be set.
-    void readFilmExposure(const Block& b, CamSpec& cs) {
+    // Read the film sub-block + photographic exposure/f-stop/lens controls shared by
+    // `camera` and `camera_path`, and resolve the film size (named format or explicit
+    // mm), the focal length (from `lens <mm>` or `fov_y`), the f-stop -> aperture
+    // radius, the physical-optics film distance, and the manual exposure multiplier.
+    // `cs.fov` must already be set. Returns false only on an unknown film format.
+    bool readFilmExposure(const Block& b, CamSpec& cs) {
         const Stmt* film = find(b, "film");
         if (film && film->val.block) {
             const Block& fb = *film->val.block;
             const Stmt* r = find(fb, "res");
             if (r && !r->val.words.empty()) cs.res = (int)num(r->val.words[0]);
-            const Stmt* sz = find(fb, "size");     // physical sensor, millimetres
+            // Named sensor/film format -> physical size in mm (e.g. `format full-frame`,
+            // `format medium-format`, `format 4x5`). Words are joined so a spaced
+            // "medium format" also works. An explicit `size w h` below overrides it.
+            const Stmt* fmt = find(fb, "format");
+            if (fmt && !fmt->val.words.empty()) {
+                std::string joined;
+                for (const auto& w : fmt->val.words) joined += w;
+                double fw = 0.0, fh = 0.0;
+                if (!filmFormatMM(joined, fw, fh)) {
+                    fail("unknown film format '" + joined + "' (try: full-frame, aps-c, "
+                         "micro-four-thirds, super35, medium-format, 6x6, 6x7, large-format, 4x5, 8x10)");
+                    return false;
+                }
+                cs.filmW_mm = fw; cs.filmH_mm = fh;
+            }
+            const Stmt* sz = find(fb, "size");     // explicit physical sensor, millimetres
             if (sz && sz->val.words.size() >= 2) {
                 cs.filmW_mm = num(sz->val.words[0]);
                 cs.filmH_mm = num(sz->val.words[1]);
@@ -917,17 +975,36 @@ private:
             cs.shutter  = dblOf(fb, "shutter", 0.0);
             cs.exposure = dblOf(fb, "exposure", 0.0);
         }
-        // Focal length (metres) from the vertical fov and physical film height.
-        // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a
-        // 35mm full-frame 24mm height when no physical size is authored (only used
-        // where a real length is needed, i.e. f-stop -> aperture).
+        // Focal length. Photographers pick a lens (mm) far more often than a fov, so
+        // `lens <mm>` is honoured first: fov_y = 2*atan(filmH/(2*focal)) (overrides any
+        // fov_y). Otherwise derive the focal length from fov_y and the film height:
+        // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a 35mm
+        // full-frame 24mm height when no physical size is authored.
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
-        double th  = std::tan(0.5 * cs.fov * 3.141592653589793 / 180.0);
-        cs.focal = (th > 1e-9) ? (hmm / 1000.0) / (2.0 * th) : 0.0;
+        const double DEG = 3.141592653589793 / 180.0;
+        double lensMM = dblOf(b, "lens", 0.0);     // focal length in mm (physical, unit-independent)
+        if (lensMM > 0.0) {
+            cs.focal = lensMM / 1000.0;
+            cs.fov   = 2.0 * std::atan(hmm / (2.0 * lensMM)) / DEG;
+        } else {
+            double th = std::tan(0.5 * cs.fov * DEG);
+            cs.focal  = (th > 1e-9) ? (hmm / 1000.0) / (2.0 * th) : 0.0;
+        }
         // f-stop authoring: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides
         // any `aperture` radius. Aperture radius is an internal (metre) length.
         double fstop = dblOf(b, "fstop", 0.0);
         if (fstop > 0.0 && cs.focal > 0.0) cs.aperture = cs.focal / (2.0 * fstop);
+        // Physical-optics camera: when a lens/f-stop is authored, put the film at the
+        // real image distance and give the thin lens the true focal length, so the
+        // f-number yields correct depth of field in the catch modes (A/C). Thin-lens
+        // law 1/so + 1/si = 1/f: a focus plane at so (metres) images at si; focus 0
+        // (or beyond hyperfocal) means infinity -> si = f. Legacy cameras (no lens /
+        // f-stop) leave these 0 and keep the unit-film-distance behaviour.
+        if ((lensMM > 0.0 || fstop > 0.0) && cs.focal > 0.0) {
+            double f = cs.focal, so = cs.focus;    // cs.focus already in metres (Len-scaled)
+            cs.filmDist_m = (so > f) ? 1.0 / (1.0 / f - 1.0 / so) : f;
+            cs.lensF_m    = f;
+        }
         // Manual exposure multiplier (see CamSpec). Active iff any control authored.
         if (cs.exposure > 0.0 || cs.iso > 0.0 || cs.shutter > 0.0) {
             double base = (cs.exposure > 0.0) ? cs.exposure : 1.0;
@@ -935,6 +1012,7 @@ private:
             double shF  = (cs.shutter > 0.0) ? cs.shutter     : 1.0;
             cs.exposureMul = base * isoF * shF;
         }
+        return true;
     }
 
     // ---- camera ----
@@ -946,7 +1024,7 @@ private:
         cs.fov = dblOf(b, "fov_y", 40.0);
         cs.aperture = Len(dblOf(b, "aperture", 0.02));
         cs.focus = Len(dblOf(b, "focus", 0.0));
-        readFilmExposure(b, cs);   // film{res,size,iso,shutter,exposure}, fstop
+        if (!readFilmExposure(b, cs)) return false;   // film{res,size/format,iso,...}, lens, fstop
         std::string md = strOf(b, "mode");
         if (!md.empty()) cs.mode = md[0];
         L.cameras.push_back(cs);
@@ -984,7 +1062,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
-        readFilmExposure(b, shared);   // film{res,size,iso,shutter,exposure}, fstop
+        if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop
         int frames = (int)dblOf(b, "frames", 0.0);
         if (frames < 1) { fail("camera_path '" + base + "' needs frames >= 1"); return false; }
 

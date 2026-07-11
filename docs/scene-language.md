@@ -660,6 +660,7 @@ camera "hero" {
     look_at 0 1 0
     up      0 1 0
     fov_y   40                 # vertical field of view, degrees
+    lens    50                 # OR: focal length (mm) ⇒ fov_y from film height (overrides fov_y)
 
     aperture 0.02              # aperture radius (scene units); 0 ⇒ pinhole-ish
     focus    3.0               # focus distance ⇒ thin-lens focal length
@@ -667,32 +668,70 @@ camera "hero" {
     mode     B                 # A | B | C  (measurement model, §8.2)
 
     film {
-        res  512 512           # output pixels
-        size 36 24             # physical sensor size (mm) — §8.1
-        iso  100               # exposure compensation (relative) — §8.1
+        res    512 512         # output pixels
+        format full-frame      # named sensor size (§8.1); OR: size 36 24 (mm)
+        iso    100             # exposure compensation (relative) — §8.1
     }
 }
 ```
 
 Maps onto `Camera` (`src/camera.h`) via `lookAt(eye, target, up, fovYDeg, rx, ry)`
 and `setFocus(focus)`; `aperture` → `apertureR`; `mode` picks the forward
-measurement model. **[maps 1:1]**, plus the physical-film fields below.
+measurement model. **[maps 1:1]**, plus the physical-film fields below. Authoring a
+`lens`/`fstop` instead switches the catch modes (A/C) to a **physically-seated**
+camera: the film is placed at the real image distance and the thin lens gets the
+true focal length, so the f-number yields correct depth of field (§8.1).
 
 ### 8.1 Film — present vs. proposed
 
 - `res W H` — output resolution. **[maps 1:1]** (`Film::resX/resY`). *Note: the
   forward/backward tracers currently allocate a **square** film, so only the first
   value is used; non-square sensors are a follow-up.*
+- `format <name>` — **[done — Phase 3a]**: a named sensor/film preset that expands
+  to a physical `size` (mm). Case-, space-, hyphen-, and underscore-insensitive, so
+  `full-frame`, `full frame`, and `fullframe` are the same. Recognised names:
+
+  | name(s)                                             | size (mm, W×H) |
+  |-----------------------------------------------------|----------------|
+  | `full-frame` `35mm` `135` `ff`                      | 36 × 24        |
+  | `half-frame`                                         | 24 × 18        |
+  | `super35` `s35`                                      | 24.89 × 18.66  |
+  | `academy`                                            | 21.95 × 16.0   |
+  | `aps-c`                                              | 23.6 × 15.6    |
+  | `aps-h`                                              | 28.7 × 19.0    |
+  | `micro-four-thirds` `mft` `m43` `four-thirds`       | 17.3 × 13.0    |
+  | `1inch` `1in`                                        | 13.2 × 8.8     |
+  | `medium-format` `645` `6x45`                        | 56 × 41.5      |
+  | `6x6`                                               | 56 × 56        |
+  | `6x7`                                               | 70 × 56        |
+  | `6x9`                                               | 84 × 56        |
+  | `digital-medium-format` `gfx`                       | 43.8 × 32.9    |
+  | `large-format` `4x5` `5x4`                          | 127 × 101.6    |
+  | `8x10`                                              | 254 × 203.2    |
+
+  An explicit `size w h` below overrides a `format`.
 - `size <w> <h>` (mm) — physical sensor dimensions. **[done — Phase 3a]**: the
   focal length is derived from the film **height** and `fov_y`
   (`f = filmH / (2·tan(fov_y/2))`, in metres) and used for f-stop → aperture. A
-  35 mm "full frame" is `size 36 24`. *(Because the film is square today the width
-  is not yet used for a true horizontal fov; when unspecified a 24 mm full-frame
-  height is assumed wherever a physical length is needed.)*
+  35 mm "full frame" is `size 36 24` (or `format full-frame`). *(Because the film is
+  square today the width is not yet used for a true horizontal fov; when unspecified
+  a 24 mm full-frame height is assumed wherever a physical length is needed.)*
+- `lens <mm>` — **[done — Phase 3a]**: focal length in millimetres. Photographers
+  pick a lens far more often than an angle, so `lens 50` sets the vertical field of
+  view directly from the focal length and film **height**
+  (`fov_y = 2·atan(filmH / (2·f))`) and **overrides** any `fov_y`. Because the fov
+  follows the film height, the *same* focal length frames wider on a taller sensor
+  (a 50 mm lens is "normal" on full-frame but wide on medium format) — exactly like
+  real cameras. On a full-frame sensor `lens 50` ≡ `fov_y 26.99`.
 - **f-stop authoring** — **[done — Phase 3a]**: `fstop 2.8` ⇒
-  `apertureR = focal / (2·N)` at load time (overrides any `aperture` radius), so
-  depth of field in the finite-aperture catch modes (A/C) is physically meaningful
-  instead of unit-relative.
+  `apertureR = focal / (2·N)` at load time (overrides any `aperture` radius). When a
+  `lens` **or** `fstop` is authored the catch modes (A/C) become physically seated:
+  the film sits at the real image distance (`1/si = 1/f − 1/focus`, or `si = f` when
+  `focus` is 0/at infinity) and the thin lens takes the true focal length, so the
+  f-number produces *correct* depth of field rather than a unit-relative blur. Legacy
+  cameras (no `lens`/`fstop`, just an `aperture`/`focus` radius in scene units) keep
+  their previous unit-film behaviour unchanged. Mode B (pinhole splat) ignores the
+  aperture entirely, so it is unaffected either way.
 - `iso` / `shutter` / `exposure` — **[done (relative) — Phase 3a]**: the film's
   radiometric scale is not absolute, so images are always auto-exposed (99th-
   percentile anchor). These act as an exposure **compensation** on top of that
@@ -761,7 +800,8 @@ statements give sampled `(t, eye)` control points (with an optional per-key
 For each of the `frames` output frames the parameter is stepped uniformly from the
 first key's `t` to the last, and `eye`/`look_at` are **piecewise-linearly**
 interpolated between the bracketing keys. The shared block-level `look_at`, `up`,
-`fov_y`, `mode`, `aperture`, `focus`, and `film { res }` apply to every frame.
+`fov_y`/`lens`, `mode`, `aperture`/`fstop`, `focus`, and `film { res, format/size }`
+apply to every frame.
 `-camera dolly2` selects a single frame. The grammar is deliberately *numbers-only*
 (`key <t> <ex> <ey> <ez> [<lx> <ly> <lz>]`) because the FTSL statement splitter
 breaks a statement on the next bareword, so inline keywords like `eye`/`t=` inside
