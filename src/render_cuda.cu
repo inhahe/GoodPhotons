@@ -152,6 +152,10 @@ struct DMaterial {
     // constant `reflect` spectrum). When >=0 the diffuse/fluoro elastic reflectance
     // is sampled from the texture at the hit (u,v) instead of specLookup(reflect).
     int    reflectTex;
+    // Triplanar (box) projection: > 0 => sample reflectTex by world-space triplanar
+    // projection at this world-to-texture scale instead of the per-vertex (u,v).
+    // Device twin of Material::triplanarScale (dTexReflTriplanar). 0 => use (u,v).
+    double triplanarScale;
     // Fluorescence (D_FLUORESCENT): fluoAbsorb is the baked excitation probability
     // epsilon(lambda); the dye re-radiates (quantum yield fluoYield) at a Stokes-
     // shifted lambda' drawn from the emission-SPD CDF slice [fluoCdfOffset,
@@ -1124,10 +1128,32 @@ __device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambd
     return dReflAt(c, lambda);
 }
 
+// Triplanar (box) projection reflectance at a world hit: sample the texture from
+// the three world axes (plane ⊥X at (z,y), ⊥Y at (x,z), ⊥Z at (x,y), each scaled)
+// and blend by |n|^4 componentwise. Exact device twin of Texture::reflectanceTriplanar.
+__device__ static Real dTexReflTriplanar(const DTexture& tx, const DVec3& p, const DVec3& n,
+                                         double scale, Real lambda) {
+    double ax = fabs((double)n.x), ay = fabs((double)n.y), az = fabs((double)n.z);
+    double wx = ax * ax * ax * ax, wy = ay * ay * ay * ay, wz = az * az * az * az;
+    double s = wx + wy + wz;
+    if (s <= 0.0) return dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.y * scale), lambda);
+    wx /= s; wy /= s; wz /= s;
+    double r = 0.0;
+    if (wx > 0.0) r += wx * (double)dTexReflAt(tx, (Real)(p.z * scale), (Real)(p.y * scale), lambda);
+    if (wy > 0.0) r += wy * (double)dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.z * scale), lambda);
+    if (wz > 0.0) r += wz * (double)dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.y * scale), lambda);
+    return (Real)r;
+}
+
 // Diffuse reflectance at a hit: texture-sampled when the material binds one, else
 // the constant baked reflect spectrum (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
-    if (m.reflectTex >= 0) return clamp01(dTexReflAt(sc.textures[m.reflectTex], h.u, h.v, lambda));
+    if (m.reflectTex >= 0) {
+        const DTexture& tx = sc.textures[m.reflectTex];
+        if (m.triplanarScale > 0.0)
+            return clamp01(dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda));
+        return clamp01(dTexReflAt(tx, h.u, h.v, lambda));
+    }
     return clamp01(specLookup(m.reflect, lambda));
 }
 
@@ -2516,6 +2542,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         bakeSpec(m.ior, d.ior);
         bakeSpec(m.substrateK, d.substrateK);
         d.reflectTex = m.reflectTex;
+        d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
         bakeSpec(m.fluoAbsorb, d.fluoAbsorb);
         d.fluoYield = m.fluoYield;

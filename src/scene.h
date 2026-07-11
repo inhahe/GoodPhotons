@@ -38,6 +38,12 @@ struct Material {
     // constant `reflect` spectrum). When set, the reflectance at a hit is the
     // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
     int reflectTex = -1;
+    // Triplanar (box) projection: when > 0, a bound reflectTex is sampled by
+    // world-space triplanar projection (three axis planes blended by the surface
+    // normal) instead of the per-vertex (u,v) — the value is the world-to-texture
+    // scale (repeats per world unit). Set by `uv triplanar [scale <s>]` on the
+    // geometry block (spec §9.2). 0 => use the interpolated per-vertex UVs.
+    double triplanarScale = 0.0;
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
@@ -661,7 +667,11 @@ struct Scene {
 // forward tracer and the backward reference so both see identical albedo.
 inline double diffuseReflectance(const Scene& scene, const Material& m,
                                  const Hit& h, double lambda) {
-    if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size())
-        return scene.textures[m.reflectTex].reflectanceAt(h.u, h.v, lambda);
+    if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
+        const Texture& tx = scene.textures[m.reflectTex];
+        if (m.triplanarScale > 0.0)
+            return tx.reflectanceTriplanar(h.p, h.ng, m.triplanarScale, lambda);
+        return tx.reflectanceAt(h.u, h.v, lambda);
+    }
     return m.reflect(lambda);
 }

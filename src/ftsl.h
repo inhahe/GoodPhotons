@@ -851,10 +851,39 @@ private:
         const std::string uvMode = strOf(b, "uv");
         bool loadUV = (uvMode == "use_mesh");
         UvProjection uvProj = parseUvProjection(uvMode);
+        // The projection/up axis is an optional value continuation on the `uv`
+        // statement. It must be a `key=val` param (`uv planar axis=x`) — a bareword
+        // (`uv planar x`) would start a NEW statement the parser never folds back in,
+        // so the axis would be silently ignored. Default y.
         int uvAxis = 1;   // y up by default
-        if (const Stmt* uvs = find(b, "uv"); uvs && uvs->val.words.size() >= 2) {
-            const std::string& a = uvs->val.words[1];
-            if (a == "x") uvAxis = 0; else if (a == "z") uvAxis = 2; else uvAxis = 1;
+        if (const Stmt* uvs = find(b, "uv"); uvs && uvMode != "triplanar") {
+            for (size_t i = 1; i < uvs->val.words.size(); ++i) {
+                std::string k, a;
+                if (!splitEq(uvs->val.words[i], k, a) || k != "axis") continue;
+                if (a == "x") uvAxis = 0; else if (a == "z") uvAxis = 2; else uvAxis = 1;
+            }
+        }
+        // `uv triplanar [<s>|scale=<s>]` (spec §9.2) can't be baked into per-vertex
+        // UVs — it blends three world-axis projections per hit, weighted by the
+        // surface normal — so it's carried on the bound material as a world-to-texture
+        // scale (repeats per world unit) and applied in diffuseReflectance / dDiffuseRho.
+        // The scale must be a *value continuation* the parser keeps on the `uv`
+        // statement: a bare number (`uv triplanar 4`) or a `key=val` param
+        // (`uv triplanar scale=4`). A bareword `scale` would instead start a NEW
+        // statement and collide with the mesh's own `scale` transform, so it is not
+        // accepted. Default scale 1.0.
+        if (uvMode == "triplanar") {
+            double tpScale = 1.0;
+            if (const Stmt* uvs = find(b, "uv")) {
+                const auto& w = uvs->val.words;
+                for (size_t i = 1; i < w.size(); ++i) {
+                    std::string k, val;
+                    if (splitEq(w[i], k, val)) { if (k == "scale") tpScale = num(val); }
+                    else if (isNumber(w[i]))   tpScale = num(w[i]);
+                }
+            }
+            if (id >= 0 && id < (int)L.scene.mats.size()) L.scene.mats[id].triplanarScale = tpScale;
+            loadUV = false; uvProj = UvProjection::None;
         }
         // `usemtl use_names` switches material per OBJ `usemtl` group by matching the
         // group name to an FTSL material of the same name (unknown -> the mesh's

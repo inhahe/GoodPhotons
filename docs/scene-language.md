@@ -1138,11 +1138,12 @@ flow through quads (auto corners) and OBJ meshes (`uv use_mesh` reads `vt`),
 barycentric-interpolated at the hit (`src/geometry.h`); and each texel is
 Jakob-Hanika–upsampled to a reflectance spectrum at the sampled wavelength
 (`src/texture.h`). Validated by `scenes/textured.ftsl` (quad) and `scenes/uvmesh.ftsl`
-(mesh). **Still [needs engine work]:** procedural UV projections
-(triplanar/planar/spherical/cylindrical — only `use_mesh` + quad corners exist),
-indexed-spectral palettes, and textures on non-albedo parameters (§9.4). Textured
-scenes run on the CPU (the CUDA kernel bakes a single reflect spectrum, so it defers
-to the CPU tracer). The section breaks into three pieces: **(9.1) importing the
+(mesh). Procedural UV projections (planar/spherical/cylindrical, baked into
+per-vertex UVs at load) and `triplanar` box projection (a per-hit blend on the
+material) are implemented on both CPU and GPU; validated by `scenes/triplanar.ftsl`.
+**Still [needs engine work]:** indexed-spectral palettes and textures on non-albedo
+parameters (§9.4). Textured albedo runs on both backends; the CUDA kernel ports the
+texture sampler (`dDiffuseRho`) so GPU and CPU agree. The section breaks into three pieces: **(9.1) importing the
 image, (9.2) mapping it onto geometry, (9.3) turning its colors into spectra.**
 
 ### 9.1 Importing a skin (the image)
@@ -1175,13 +1176,21 @@ A texture is sampled at a `(u,v)` produced from the surface hit. How that
 
 ```
 mesh "head" { file "head.obj"  material face
-    uv use_mesh              # use the OBJ's own vt coordinates  [implemented]
-    # uv triplanar scale 1.0 # box projection from 3 axes, blended by normal  [needs engine work]
-    # uv planar axis y       # single-axis projection                          [needs engine work]
-    # uv spherical           # lat/long — globes, eyeballs                      [needs engine work]
-    # uv cylindrical         # bottles, limbs                                   [needs engine work]
+    uv use_mesh              # use the OBJ's own vt coordinates                 [implemented]
+    # uv triplanar scale=4   # box projection from 3 axes, blended by normal    [implemented]
+    # uv planar axis=y       # single-axis projection                          [implemented]
+    # uv spherical           # lat/long — globes, eyeballs                      [implemented]
+    # uv cylindrical         # bottles, limbs                                   [implemented]
 }
 ```
+
+> **Sub-parameter syntax.** The optional `uv` argument (`scale`, `axis`) must be a
+> value the parser keeps attached to the `uv` statement: a bare number
+> (`uv triplanar 4`) or a `key=val` param (`uv triplanar scale=4`, `uv planar axis=x`).
+> A bareword (`uv triplanar scale 4` or `uv planar x`) is *not* accepted — the parser
+> treats a trailing bareword as the start of the next statement, so `scale 4` would
+> silently become a second `scale` statement and clobber the mesh's own `scale`
+> transform. Default triplanar scale is `1.0`; default axis is `y`.
 
 - **`use_mesh` (UV mapping) — the low-warp answer. [implemented]** Reads OBJ `vt`,
   stores per-vertex UVs on `Tri`, barycentric-interpolates at the hit. **Crucial point:

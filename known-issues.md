@@ -276,11 +276,21 @@ as practical; this file is the fallback for what can't be addressed immediately.
      default. Because they fill the same per-vertex `Tri.uv{0,1,2}` slots as
      `use_mesh`, both tracers **and the GPU** interpolate them with no shading change
      (validated on `torus.obj`, which carries no `vt` — the checker maps onto the
-     torus via the spherical projection; `scraps/uvproc.ftsl`). **Still deferred:**
+     torus via the spherical projection; `scraps/uvproc.ftsl`). **DONE 2026-07-11:**
      `triplanar` — unlike the three analytic maps it can't be baked into per-vertex
-     UVs (it blends three planar samples per hit, weighted by the surface normal), so
-     it needs a per-hit texture-lookup change in `diffuseReflectance()` (CPU) and
-     `dTexReflAt()` (GPU), tracked with item 2 below.
+     UVs (it blends three world-axis planar samples per hit, weighted by |n|^4), so it
+     lives on the bound material as `Material::triplanarScale` (world->texture repeat
+     rate) and is evaluated per hit in `Texture::reflectanceTriplanar`, called from
+     `diffuseReflectance()` (CPU, shared by forward/backward/BDPT) and the device twin
+     `dTexReflTriplanar` from `dDiffuseRho()` (GPU) — the two agree by construction.
+     Parsed from `mesh { uv triplanar [<s>|scale=<s>] }` in `src/ftsl.h`. Validated by
+     `scenes/triplanar.ftsl`: CPU vs GPU exposures match to 3 digits (4.87e-13 vs
+     4.88e-13) and the box-projected checker is visually identical on both backends.
+     **Parser gotcha fixed:** the scale/axis argument must be a bare number or a
+     `key=val` param — a bareword `scale`/axis letter starts a *new* statement and
+     clobbered the mesh's own `scale` transform (this caused an all-black render while
+     the torus ballooned to 4x and occluded the box; the same fix now applies to
+     `uv planar axis=x`).
   2. **Non-albedo parameters.** A texture can only bind to diffuse `reflect` today.
      Spec §9.4 wants textures on roughness, mix weights, ior, thickness, etc. — each
      needs the corresponding material param to accept a per-hit texture lookup.
@@ -300,8 +310,8 @@ as practical; this file is the fallback for what can't be addressed immediately.
      not implemented.
 - **Status:** OPEN (acceptable) — base-color texturing + stb image import done
   2026-07-10; GPU port done 2026-07-11; **analytic UV projections (planar/spherical/
-  cylindrical) done 2026-07-11**; triplanar + non-albedo params + indexed palettes
-  (items 1-triplanar/2/4) deferred.
+  cylindrical) + triplanar box projection done 2026-07-11 (CPU + GPU)**; non-albedo
+  params + indexed palettes (items 2/4) deferred.
 
 ### Light shapes: sphere + spot done, HDRI environment deferred (Phase 3c partial)
 - **What (done 2026-07-10):** two new emitter shapes on the shared `Emitter`

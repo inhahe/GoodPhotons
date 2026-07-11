@@ -129,6 +129,26 @@ struct Texture {
         return upsample::reflAt(c, lambda);
     }
 
+    // Triplanar (box) projection reflectance at a world hit. Samples the texture
+    // from the three world axes — the plane perpendicular to X at (z,y), to Y at
+    // (x,z), to Z at (x,y), each world coordinate multiplied by `scale` (texture
+    // repeats per world unit) — and blends the three by the surface normal, weighted
+    // by |n|^4 componentwise (sharp seams, distortion-free). No per-vertex UVs are
+    // used; this is the renderer-side mapping for un-UV'd/organic meshes (spec §9.2).
+    // Mirrored on the GPU by dTexReflTriplanar in render_cuda.cu.
+    double reflectanceTriplanar(const Vec3& p, const Vec3& n, double scale, double lambda) const {
+        double ax = std::fabs(n.x), ay = std::fabs(n.y), az = std::fabs(n.z);
+        double wx = ax * ax * ax * ax, wy = ay * ay * ay * ay, wz = az * az * az * az;
+        double s = wx + wy + wz;
+        if (s <= 0.0) return reflectanceAt(p.x * scale, p.y * scale, lambda);
+        wx /= s; wy /= s; wz /= s;
+        double r = 0.0;
+        if (wx > 0.0) r += wx * reflectanceAt(p.z * scale, p.y * scale, lambda);
+        if (wy > 0.0) r += wy * reflectanceAt(p.x * scale, p.z * scale, lambda);
+        if (wz > 0.0) r += wz * reflectanceAt(p.x * scale, p.y * scale, lambda);
+        return r;
+    }
+
     // ---- loading ------------------------------------------------------------
     bool load(const std::string& path, std::string& err) {
         std::ifstream f(path, std::ios::binary);
