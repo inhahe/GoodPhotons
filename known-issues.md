@@ -386,7 +386,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
   `-checkfog` (deterministic transmittance / HG mean-cosine / phase-normalization
   self-test) is retained as a fast complementary check.
 
-### Model A redefined as the finite-lens physical camera (CPU-only) — GPU port is a follow-up
+### Model A redefined as the finite-lens physical camera (GPU port landed)
 - **What:** as of 2026-07-11 **mode A is the physical finite-lens camera**: a finite
   aperture + thin lens + film imaged by next-event estimation of the pupil
   (`Renderer::connectLens`/`camera.h::lensImage`). It replaces the old contact-sensor
@@ -394,38 +394,36 @@ as practical; this file is the fallback for what can't be addressed immediately.
   pixel and could not form an image; retired). Mode B is now the pinhole (`aperture→0`)
   limit; mode C is the brute-force forward-catch oracle A is validated against
   (matching framing/DOF/scale — auto-exposure within ~2.5% at equal aperture/focus).
-- **CPU-only:** the CUDA `DCamera` implements only the rectilinear pinhole, so the
-  lens splat has no device path; `runRender` forces the CPU for mode A (`-device gpu`
-  prints a notice). Proper fix (follow-up): add pupil sampling + `lensImage` (thin-lens
-  `u' = u − ρ/f`) to the device camera and a `connectLens`-equivalent splat in `kTrace`
-  under a new `camMode 'A'`, then validate GPU-vs-CPU as for B/C. Mode A is also
-  **rectilinear only** (a real fisheye needs a wide-angle lens element the single
-  thin-lens can't form) — a fisheye+A/C camera is rejected, directing the user to mode B.
-- **Vestigial GPU deposit path:** the CUDA kernel still contains the old contact-sensor
-  `deposit` under `camMode 'A'`, but `renderForward` no longer passes 'A' to the GPU
-  (`camMode = forwardCatch ? 'C' : 'B'`), so it is now unreachable. Remove it when the
-  finite-lens GPU port lands.
+- **GPU port (done):** the CUDA `DCamera` now has `lensImage` (thin-lens `u' = u − ρ/f`,
+  shared with the mode-C `catchPhoton`) and `kTrace` runs device `connectLens`/
+  `connectLensVolume` splats under `camMode 'A'` — emitter-direct, diffuse-vertex, and
+  fog-in-scatter, mirroring the CPU. `renderForward` selects `camMode 'A'` on the GPU
+  and `runRender` treats mode A as a GPU-forward mode. Validated vs CPU (Cornell, 192²,
+  wide aperture 0.25/focus 2.2, 40M photons): energy to 4 sig figs, auto-exposure 2.99e-8
+  GPU vs 2.95e-8 CPU (1.4%), image RMSE 2.6/255 (pure MC noise — the GPU is an
+  independent realization); the tiny-aperture A→B pinhole limit holds on-device (sharp,
+  RMSE 3.16/255 vs mode B). The old contact-sensor GPU `deposit` path was removed with
+  the port. Mode A remains **rectilinear only** (a real fisheye needs a wide-angle lens
+  element the single thin-lens can't form) — a fisheye+A/C camera is rejected, and a
+  fisheye lens still falls back to the CPU even on `-device gpu` (see GPU-fisheye entry).
 
-### GPU backend (`-device gpu`) covers forward camera models B/C
+### GPU backend (`-device gpu`) covers forward camera models A/B/C
 - **What:** the CUDA backend (`src/render_cuda.cu`, `renderForwardCuda`) implements
-  the pinhole splat (B) and the finite-aperture thin-lens forward catch (C), selected
-  by the `camMode` parameter. It is used for `-mode B/C` and the forward pass of
-  `-mode V`. (The finite-lens next-event mode A is CPU-only — see the entry above.)
-  It still falls back to the CPU for mode R (backward reference) and the mode-P
-  camera-side/backward layer (no backward tracer on-device). Fluorescent scenes are
-  rejected on-device (fall back to CPU) because the emission-sampler reradiation
-  path is not ported — `cudaForwardSupported()` checks whether any *geometry* uses a
-  Fluorescent material (not just the palette, which buildCornell always populates).
+  the finite-lens next-event splat (A), the pinhole splat (B), and the finite-aperture
+  thin-lens forward catch (C), selected by the `camMode` parameter. It is used for
+  `-mode A/B/C` and the forward pass of `-mode V`. It still falls back to the CPU for
+  mode R (backward reference) and the mode-P camera-side/backward layer (no backward
+  tracer on-device). Fluorescent scenes are rejected on-device (fall back to CPU)
+  because the emission-sampler reradiation path is not ported —
+  `cudaForwardSupported()` checks whether any *geometry* uses a Fluorescent material
+  (not just the palette, which buildCornell always populates).
 - **Why acceptable / validated:** model B is the default and the one mode V
   validates. The kernel `kTrace` mirrors `Renderer::tracePhoton` exactly and gates the
-  camera-specific work on `camMode`: emitter→pinhole connect, in-scatter
-  `connectVolume`, and diffuse-vertex `connect` run only for B; `catchPhoton` (thin
-  lens `u' = u - rho/f`) runs only for C. (The kernel still contains a `camMode 'A'`
-  branch that runs the retired contact-sensor `deposit`, but `renderForward` now
-  selects only `'C'`/`'B'` for the GPU — see the vestigial-path note in the entry
-  above — so that branch is unreachable. The **Mode A validation bullet below is a
-  historical record of that retired contact-sensor GPU path**, not of the current
-  finite-lens next-event mode A, which is CPU-only.)
+  camera-specific work on `camMode`: emitter/diffuse/in-scatter `connectLens` runs for
+  A, the pinhole `connect`/`connectVolume` for B, and `catchPhoton` (thin lens
+  `u' = u - rho/f`) for C. (Mode A validation is in the redefinition entry above; the
+  historical **Mode A bullet below** records the now-removed contact-sensor GPU
+  `deposit` path, not the current finite-lens next-event mode A.)
   Validation vs CPU (Cornell, 128²):
   - **Mode B:** image RMSE ≈ 0.85/255 at 200M photons (pure MC noise); `-mode V
     -device gpu` PASSes vs the backward reference (bulk RMSE 4.17% ≈ CPU 4.22%);
@@ -434,8 +432,8 @@ as practical; this file is the fallback for what can't be addressed immediately.
     to 4 sig figs (sensor 0.3298 vs 0.3299); image RMSE scaled as √N — 11.18/255 @40M
     → 5.11/255 @200M (5× photons, ideal 2.24×, measured 2.19×), proving variance not
     bias. This validated the old flat-film-wall mode A, which has since been replaced
-    by the CPU-only finite-lens next-event camera; it is retained only as a record of
-    the now-unreachable device `deposit` path.
+    by the finite-lens next-event camera (validated separately above); the device
+    `deposit` path it exercised has been removed. Retained only as a historical record.
   - **Mode C:** energy report matches to 4 sig figs; with a wide aperture (0.25,
     focus 2.2) the caught fraction matches exactly (sensor=0.0058) and per-image
     auto-exposure agrees (1.60e-8 vs 1.59e-8). Image RMSE scales as √N —

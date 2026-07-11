@@ -284,7 +284,7 @@ struct DCamera {
     DVec3  eye, u, v, w;
     double tanHalfX, tanHalfY;
     int    resX, resY;
-    double apertureR, filmDist, lensF;   // model C finite aperture / thin lens
+    double apertureR, filmDist, lensF;   // models A/C finite aperture + thin lens
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
     // pinhole importance normalises by a single pixel's area (see camera.h). This
@@ -305,9 +305,37 @@ struct DCamera {
         cosCam = cz / sqrt(dist2);
         return true;
     }
-    // Model A/C perspective catch: does this photon fly through the finite aperture
+    // Image a pupil point A along direction dir onto a film cell (port of
+    // Camera::lensImage). With a thin lens the direction is refracted by the paraxial
+    // ray transfer u' = u - rho/f. Shared by the model-C brute-force catch and the
+    // model-A next-event splat.
+    HD bool lensImage(const DVec3& A, const DVec3& dir, int& px, int& py) const {
+        DVec3 nAxis = w * (Real)-1;
+        DVec3 rho = A - eye;
+        DVec3 d = dir;
+        if (lensF > 0.0) {
+            Real dax = dot(d, nAxis);
+            if (dax <= (Real)1e-9) return false;
+            DVec3 slope = (d - nAxis * dax) / dax;
+            DVec3 slopeP = slope - rho * (Real)(1.0 / lensF);
+            d = normalize(nAxis + slopeP);
+        }
+        Real ddax = dot(d, nAxis);
+        if (ddax <= (Real)1e-9) return false;
+        Real s = (Real)filmDist / ddax;
+        DVec3 Fcenter = eye + nAxis * (Real)filmDist;
+        DVec3 Q = A + d * s;
+        DVec3 rel = Q - Fcenter;
+        Real ix = -dot(rel, u) / (Real)(filmDist * tanHalfX);
+        Real iy = -dot(rel, v) / (Real)(filmDist * tanHalfY);
+        if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
+        px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
+        py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+        return true;
+    }
+    // Model C perspective catch: does this photon fly through the finite aperture
     // disc (before hitting the scene, within hitDist) and land on the film? Port of
-    // Camera::catchPhoton, including the thin-lens paraxial refraction u' = u - rho/f.
+    // Camera::catchPhoton.
     HD bool catchPhoton(const DVec3& ro, const DVec3& rd, Real hitDist, int& px, int& py) const {
         Real dw = dot(rd, w);
         if (dw >= (Real)-1e-9) return false;
@@ -316,26 +344,7 @@ struct DCamera {
         DVec3 P = ro + rd * tAp;
         DVec3 rho = P - eye;
         if (dot(rho, rho) > (Real)(apertureR * apertureR)) return false;
-        DVec3 nAxis = w * (Real)-1;
-        DVec3 dir = rd;
-        if (lensF > 0.0) {
-            Real dax = dot(dir, nAxis);
-            DVec3 slope = (dir - nAxis * dax) / dax;
-            DVec3 slopeP = slope - rho * (Real)(1.0 / lensF);
-            dir = normalize(nAxis + slopeP);
-        }
-        Real ddax = dot(dir, nAxis);
-        if (ddax <= (Real)1e-9) return false;
-        Real s = (Real)filmDist / ddax;
-        DVec3 Fcenter = eye + nAxis * (Real)filmDist;
-        DVec3 Q = P + dir * s;
-        DVec3 rel = Q - Fcenter;
-        Real ix = -dot(rel, u) / (Real)(filmDist * tanHalfX);
-        Real iy = -dot(rel, v) / (Real)(filmDist * tanHalfY);
-        if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
-        px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
-        py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
-        return true;
+        return lensImage(P, rd, px, py);
     }
 };
 
@@ -801,16 +810,6 @@ __device__ static void filmAdd(double* film, int resX, int px, int py, Real lamb
     atomicAdd(&film[idx + 1], (double)(cieY(lambda) * w));
     atomicAdd(&film[idx + 2], (double)(cieZ(lambda) * w));
 }
-// Model A: map a contact-sensor hit to a pixel on the output film and deposit.
-__device__ static void deposit(const DScene& sc, double* film, int resX, int resY,
-                               const DVec3& p, Real lambda, Real beta) {
-    DVec3 rel = p - sc.sensorOrigin;
-    Real uu = dot(rel, sc.sensorUAxis) / dot(sc.sensorUAxis, sc.sensorUAxis);
-    Real vv = dot(rel, sc.sensorVAxis) / dot(sc.sensorVAxis, sc.sensorVAxis);
-    if (uu < 0 || uu >= 1 || vv < 0 || vv >= 1) return;
-    int px = (int)(uu * resX), py = (int)(vv * resY);
-    filmAdd(film, resX, px, py, lambda, beta);
-}
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film,
                                const DVec3& p, const DVec3& n, Real lambda, Real beta, Real rho) {
     DVec3 toCam = cam.eye - p;
@@ -841,6 +840,59 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
     Real G = cosCam / dist2;
     Real We = (Real)1 / ((Real)cam.pixelPlaneArea() * cosCam * cosCam * cosCam * cosCam);
     Real contrib = beta * Lambda * ph * G * We;
+    contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
+    filmAdd(film, cam.resX, px, py, lambda, contrib);
+}
+// Model A (physical camera): next-event splat through the finite lens pupil. Sample a
+// point A uniformly on the aperture disc, connect the surface vertex to A, refract
+// through the thin lens and splat onto the film cell A images to. Port of
+// Renderer::connectLens — the importance-sampled form of model C's brute-force catch,
+// so A and C share both scale and shape. Weight beta*rho*cosSurf*cosLens*R^2/dist^2
+// (the BRDF's 1/pi cancels the pupil pdf's pi R^2).
+__device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film,
+                                   const DVec3& p, const DVec3& n, Real lambda, Real beta,
+                                   Real rho, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;                        // pupil behind the surface
+    Real cosLens = -dot(wdir, cam.w);                // cosine at the lens (w faces scene)
+    if (cosLens <= (Real)1e-6) return;               // not heading toward the film
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
+    if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
+    filmAdd(film, cam.resX, px, py, lambda, contrib);
+}
+// Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
+// surface BRDF*cosSurf is replaced by albedo*phase; the phase carries no 1/pi, so the
+// pupil pdf's pi R^2 stays. Port of Renderer::connectLensVolume.
+__device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, double* film,
+                                         const DVec3& p, const DVec3& wIn, Real lambda,
+                                         Real beta, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosLens = -dot(wdir, cam.w);
+    if (cosLens <= (Real)1e-6) return;
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real ph = hgPhase(dot(wIn, wdir), (Real)sc.medium.g);
+    Real Lambda = medAlbedo(sc.medium, lambda);
+    Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
     filmAdd(film, cam.resX, px, py, lambda, contrib);
 }
@@ -996,11 +1048,14 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         }
         eEmitted += beta;
 
-        // Model B: connect the emitter itself to the pinhole (makes the source
-        // visible). Modes A/C instead catch photons that physically arrive. A spot
-        // is a point light with no projected area, so it has no direct term.
-        if (camMode == CAM_B && em.shape != 2 && em.shape != 3)
-            connect(sc, cam, film, origin, emitN, lambda, beta, (Real)1);
+        // Connect the emitter itself to the camera (makes the source visible): model
+        // B splats to the pinhole, model A splats through the finite lens pupil. Model
+        // C instead catches photons that physically arrive. A spot is a point light
+        // with no projected area, so it has no direct term.
+        if (em.shape != 2 && em.shape != 3) {
+            if (camMode == CAM_B) connect(sc, cam, film, origin, emitN, lambda, beta, (Real)1);
+            else if (camMode == CAM_A) connectLens(sc, cam, film, origin, emitN, lambda, beta, (Real)1, rng);
+        }
 
         DVec3 ro = origin + dir * RAY_EPS, rd = dir;
         bool done = false;
@@ -1030,6 +1085,7 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
 
             if (mediumEvent) {
                 if (camMode == CAM_B) connectVolume(sc, cam, film, mp, rd, lambda, beta);
+                else if (camMode == CAM_A) connectLensVolume(sc, cam, film, mp, rd, lambda, beta, rng);
                 if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; done = true; break; }
                 DVec3 nd = sampleHG(rd, (Real)sc.medium.g, rng);
                 ro = mp; rd = nd;
@@ -1038,7 +1094,8 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
 
             if (!h.valid) { eEscaped += beta; done = true; break; }
             if (h.sensorId >= 0) {
-                if (camMode == CAM_A) deposit(sc, film, cam.resX, cam.resY, h.p, lambda, beta);
+                // Legacy contact sensor: no geometry carries a sensorId in the current
+                // camera modes, so this is inert (kept for absorption bookkeeping).
                 eSensor += beta; done = true; break;
             }
 
@@ -1089,6 +1146,7 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
                 // Diffuse (Fluorescent scenes are rejected on the host; never reached).
                 Real rho = clamp01(specLookup(m.reflect, lambda));
                 if (camMode == CAM_B) connect(sc, cam, film, h.p, h.n, lambda, beta, rho);
+                else if (camMode == CAM_A) connectLens(sc, cam, film, h.p, h.n, lambda, beta, rho, rng);
                 if (rng.uniform() >= rho) { eAbsorbed += beta; done = true; break; }
                 ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); continue;
             }

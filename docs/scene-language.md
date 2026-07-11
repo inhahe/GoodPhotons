@@ -757,7 +757,7 @@ photons where the brute-force catch needs billions.
 
 | `mode` | Model                              | Notes                                                                       |
 |--------|------------------------------------|-----------------------------------------------------------------------------|
-| `A`    | Physical camera (finite-lens NEE)  | The real camera: finite aperture + thin lens + film, real depth of field from `aperture`/`fstop`/`focus`. Splats every diffuse bounce through a sampled pupil point, so it converges fast. **CPU-only; rectilinear only** (author a fisheye/panoramic lens with mode B). |
+| `A`    | Physical camera (finite-lens NEE)  | The real camera: finite aperture + thin lens + film, real depth of field from `aperture`/`fstop`/`focus`. Splats every diffuse bounce through a sampled pupil point, so it converges fast. GPU-accelerated. **Rectilinear only** (author a fisheye/panoramic lens with mode B). |
 | `B`    | Pinhole limit (connect/splat, default) | The `aperture → 0` limit of A: infinitely sharp (no DOF), fastest, GPU-accelerated. Ignores `aperture`/`focus`. Handles fisheye/panoramic projections (§8.5). |
 | `C`    | Brute-force catch (oracle)         | Same physical lens as A, but only photons that *physically* fly through the pupil are caught — unbiased but very slow (billions of photons). Mainly a validation oracle for A. |
 

@@ -957,12 +957,11 @@ static Film renderForward(const Scene& scene, const Camera* cam, int res, long l
                           EnergyReport& eOut, bool diffraction = true, bool useGpu = false,
                           uint64_t seedBase = 0) {
 #ifdef HAVE_CUDA
-    // GPU path covers the pinhole splat (model B) and the brute-force catch (model
-    // C). The model-A finite-lens next-event splat is CPU-only for now (the CUDA
-    // DCamera implements only the rectilinear pinhole), so lensMode never reaches
-    // here — runRender forces the CPU for it. Fluorescent scenes fall back too.
-    if (useGpu && cam && !lensMode && cudaAvailable() && cudaForwardSupported(scene)) {
-        char camMode = forwardCatch ? 'C' : 'B';
+    // GPU path covers all three finite-lens camera models: the pinhole splat (B), the
+    // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
+    // scenes fall back to the CPU (the reradiation sampler is not ported).
+    if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
+        char camMode = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
         return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode, seedBase);
     }
 #else
@@ -1313,13 +1312,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
-    // covers the forward light trace (models B/C, the forward pass of mode V, and
+    // covers the forward light trace (models A/B/C, the forward pass of mode V, and
     // the forward layer of the mode-P composite); the backward tracer (mode R, the
-    // mode-P camera-side layer) and fluorescent scenes always run on the CPU. Model A
-    // (the finite-lens next-event splat) is CPU-only for now — the CUDA DCamera has
-    // only the rectilinear pinhole, so the lens splat has no device path yet.
+    // mode-P camera-side layer) and fluorescent scenes always run on the CPU. A
+    // fisheye lens is still CPU-only (the device camera is rectilinear-only).
     const bool gpuForwardMode =
-        (mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
+        (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
@@ -1359,11 +1357,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] non-rectilinear (fisheye) lens "
                                               "is CPU-only; using CPU\n");
             else         std::printf("[device] auto -> CPU (fisheye lens is CPU-only)\n");
-        } else if (lensMode) {
-            if (wantGpu) std::fprintf(stderr, "[device] mode A (finite-lens physical camera) "
-                                              "is CPU-only; using CPU (use mode B for the GPU "
-                                              "pinhole limit)\n");
-            else         std::printf("[device] auto -> CPU (mode A finite-lens camera is CPU-only)\n");
         } else if (gpuBdptMode) {
             // Mode D has its own (stricter) GPU support check: BDPT scope only.
             if (!cudaBdptSupported(scene)) {
