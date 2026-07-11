@@ -27,11 +27,26 @@
 // the mode-P camera-side layer) and fluorescent scenes. The CUDA backend is optional
 // at build time (see CMakeLists.txt / FTRACE_CUDA_ARCH); without a CUDA toolkit the
 // renderer is CPU-only and -device gpu/auto use the CPU.
+//
+// Progressive rendering (forward modes A/B/C only; brightness is photon-count-
+// independent, so more photons only reduce graininess):
+//   -n <photons>   trace exactly this many photons (default).
+//   -time <sec>    trace in batches until the wall-clock budget elapses (-n is the
+//                  batch/checkpoint granularity).
+//   -resume        reload the accumulated film from the "<out>.ftbuf" checkpoint and
+//                  keep adding photons (with -n more, or -time more seconds).
+//   -checkpoint    on a plain -n render, also write the checkpoint so a later -resume
+//                  can continue it (-time/-resume imply it). Each batch/resume draws an
+//                  independent RNG stream (seed offset = cumulative photons), so the
+//                  result matches a single render of the combined count; a fresh -n
+//                  render (offset 0) is bit-identical to the historical single-shot path.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <cstdint>
+#include <chrono>
 #include <fstream>
 #include <vector>
 #include <algorithm>
@@ -845,9 +860,15 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 // Forward photon trace (models A/B/C) into a merged film. Accumulates the energy
 // report across threads. Factored out so mode V can reuse it alongside the
 // backward reference.
+// `seedBase` offsets the per-thread RNG streams so that rendering the image in
+// several accumulation passes (a wall-clock time budget, or resuming a saved film)
+// draws statistically-independent photons each pass; pass the cumulative photon
+// count already traced. seedBase==0 reproduces the original single-shot streams
+// bit-for-bit, so a plain `-n` render is unchanged.
 static Film renderForward(const Scene& scene, const Camera* cam, int res, long long N,
                           int nThreads, bool forwardCatch, bool useCamera, EnergyReport& eOut,
-                          bool diffraction = true, bool useGpu = false) {
+                          bool diffraction = true, bool useGpu = false,
+                          uint64_t seedBase = 0) {
 #ifdef HAVE_CUDA
     // GPU path covers all three forward camera models: A (contact-sensor deposit,
     // useCamera==false), B (connect/splat to the pinhole), C (finite-aperture
@@ -856,7 +877,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int res, long l
     // frame is unused; the sensor plane is baked from scene.sensor).
     if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
         char camMode = forwardCatch ? 'C' : (useCamera ? 'B' : 'A');
-        return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode);
+        return renderForwardCuda(scene, *cam, res, N, eOut, diffraction, camMode, seedBase);
     }
 #else
     (void)useGpu;
@@ -867,7 +888,8 @@ static Film renderForward(const Scene& scene, const Camera* cam, int res, long l
 
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
+                            (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         Film* sensorFilm = useCamera ? nullptr : &films[tid];
         const Camera* camPtr = useCamera ? cam : nullptr;
@@ -1078,6 +1100,92 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
                 : "review: residual above 5% — increase -n/-spp (if firefly-dominated) or investigate transport.");
 }
 
+// --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
+// A forward render accumulates radiance photon-by-photon into a Film, so it can be
+// stopped and continued: brightness scales with photon count and only graininess
+// changes. The 8-bit tone-mapped image cannot be resumed from faithfully (it is
+// exposure-anchored and gamma-quantised), so alongside `-o out.png` we persist the
+// raw linear film + cumulative photon count + energy tally to `out.png.ftbuf`.
+// `-resume` reloads it and keeps adding photons; a fresh render overwrites it.
+static_assert(sizeof(Vec3) == 3 * sizeof(double), "Film XYZ blob assumes packed Vec3");
+
+struct Checkpoint {
+    Film film;
+    long long N = 0;          // cumulative photons already accumulated in `film`
+    EnergyReport energy;      // cumulative energy tally
+};
+
+// A cheap identity hash so a resume refuses to blend photons from a different scene,
+// mode, or resolution into the saved film (which would silently corrupt the result).
+static uint64_t checkpointGuard(const Scene& scene, char mode, int res) {
+    uint64_t h = 14695981039346656037ULL;                 // FNV-1a offset basis
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+    mix((uint64_t)scene.tris.size());
+    mix((uint64_t)scene.spheres.size());
+    mix((uint64_t)scene.emitters.size());
+    uint64_t tp; std::memcpy(&tp, &scene.totalPower, sizeof tp); mix(tp);
+    mix((uint64_t)(unsigned char)mode);
+    mix((uint64_t)(unsigned)res);
+    return h;
+}
+
+static std::string checkpointPath(const std::string& outPath) { return outPath + ".ftbuf"; }
+
+static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
+                            uint64_t guard, char mode) {
+    std::ofstream o(checkpointPath(outPath), std::ios::binary);
+    if (!o) return false;
+    const char magic[8] = {'F','T','B','U','F','0','1','\n'};
+    int32_t rx = c.film.resX, ry = c.film.resY, m = (int32_t)(unsigned char)mode;
+    o.write(magic, 8);
+    o.write((const char*)&rx, 4); o.write((const char*)&ry, 4); o.write((const char*)&m, 4);
+    o.write((const char*)&c.N, 8);
+    double en[5] = {c.energy.emitted, c.energy.absorbed, c.energy.sensor,
+                    c.energy.escaped, c.energy.residual};
+    o.write((const char*)en, sizeof en);
+    o.write((const char*)&guard, 8);
+    o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
+    o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
+    return (bool)o;
+}
+
+// Load a checkpoint for resume. Returns false (leaving `c` untouched) if the sidecar
+// is missing, malformed, or its identity guard/resolution disagrees with this render
+// (a clear message is printed for the mismatch cases so a stale file never silently
+// poisons the image).
+static bool readCheckpoint(const std::string& outPath, int res, uint64_t guard,
+                           char mode, Checkpoint& c) {
+    std::ifstream in(checkpointPath(outPath), std::ios::binary);
+    if (!in) return false;
+    char magic[8];
+    in.read(magic, 8);
+    if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0) {
+        std::fprintf(stderr, "[resume] %s is not a recognised checkpoint; ignoring\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    int32_t rx = 0, ry = 0, m = 0; long long N = 0;
+    in.read((char*)&rx, 4); in.read((char*)&ry, 4); in.read((char*)&m, 4);
+    in.read((char*)&N, 8);
+    double en[5] = {0,0,0,0,0}; in.read((char*)en, sizeof en);
+    uint64_t g = 0; in.read((char*)&g, 8);
+    if (!in) return false;
+    if (rx != res || ry != res || m != (int32_t)(unsigned char)mode || g != guard) {
+        std::fprintf(stderr, "[resume] checkpoint %s does not match this render "
+                             "(scene/mode/resolution differ); starting fresh\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    c.film.resX = rx; c.film.resY = ry; c.film.alloc();
+    c.N = N;
+    c.energy = {en[0], en[1], en[2], en[3], en[4]};
+    in.read((char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
+    in.read((char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
+    if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
+                            checkpointPath(outPath).c_str()); return false; }
+    return true;
+}
+
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
 // runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
@@ -1087,10 +1195,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, long long spp, int nThreads,
                      const char* device, bool diffraction,
                      const char* lightLabel, const std::string& outPath,
-                     double manualExposure = 0.0) {
+                     double manualExposure = 0.0,
+                     double timeBudgetSec = 0.0, bool resume = false,
+                     bool wantCheckpointFlag = false) {
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
+
+    // -time / -resume / -checkpoint accumulate a photon-count film, which only the
+    // pure forward camera models (A/B/C) do. Other modes accumulate differently
+    // (spp-based reference/BDPT, or the P composite) and are not resumable here.
+    if ((timeBudgetSec > 0.0 || resume || wantCheckpointFlag) &&
+        !(mode == 'A' || mode == 'B' || mode == 'C')) {
+        std::fprintf(stderr, "[render] -time/-resume/-checkpoint apply only to forward "
+                             "camera modes A/B/C; ignoring for mode %c\n", mode);
+        timeBudgetSec = 0.0; resume = false; wantCheckpointFlag = false;
+    }
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
@@ -1232,16 +1352,93 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         return 0;
     }
 
-    std::printf("mode %c: tracing %lld photons at %dx%d on %d threads (light=%s) ...\n",
-                mode, N, res, res, nThreads, lightLabel);
-    EnergyReport e;
-    Film out_film = renderForward(scene, &cam, res, N, nThreads, forwardCatch, useCamera, e, diffraction, useGpu);
-    if (useCamera && !forwardCatch) addEnvBackground(out_film, scene, cam, N); // sky (env scenes)
-    double tot = e.absorbed + e.sensor + e.escaped + e.residual;
-    std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
-                e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
-                e.residual / e.emitted, tot / e.emitted);
-    writeFilm(outPath.c_str(), out_film, (double)N, manualExposure);
+    // --- Forward camera models A/B/C ---------------------------------------
+    // These accumulate radiance photon-by-photon, so the render can be split into
+    // batches for a wall-clock time budget (-time) and/or resumed from a saved film
+    // (-resume): brightness tracks the cumulative photon count and only graininess
+    // changes. Every batch uses seedBase = cumulative photons so it draws an
+    // independent stream; the checkpoint stores the PURE-photon film (the direct view
+    // of the sky is re-added deterministically at write time, never accumulated, so a
+    // resume can't double-count it).
+    const bool wantCheckpoint = resume || timeBudgetSec > 0.0 || wantCheckpointFlag;
+    const uint64_t guard = checkpointGuard(scene, mode, res);
+    const std::string backend = useGpu ? std::string("GPU")
+                                       : (std::to_string(nThreads) + " CPU threads");
+
+    Checkpoint acc;
+    acc.film.resX = res; acc.film.resY = res; acc.film.alloc();
+    if (resume && readCheckpoint(outPath, res, guard, mode, acc))
+        std::printf("[resume] loaded %s: %lld photons accumulated so far\n",
+                    checkpointPath(outPath).c_str(), acc.N);
+
+    auto writeOut = [&](bool announceCheckpoint) {
+        Film disp = acc.film;                        // display copy (+ direct sky view)
+        if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
+        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure);
+        if (wantCheckpoint) {
+            if (writeCheckpoint(outPath, acc, guard, mode)) {
+                if (announceCheckpoint)
+                    std::printf("[checkpoint] wrote %s (%lld photons) — rerun with -resume to continue\n",
+                                checkpointPath(outPath).c_str(), acc.N);
+            } else {
+                std::fprintf(stderr, "[checkpoint] could not write %s\n",
+                             checkpointPath(outPath).c_str());
+            }
+        }
+    };
+
+    auto runBatch = [&](long long batchN) {
+        EnergyReport e;
+        Film b = renderForward(scene, &cam, res, batchN, nThreads, forwardCatch,
+                               useCamera, e, diffraction, useGpu, (uint64_t)acc.N);
+        acc.film.merge(b);
+        acc.N += batchN;
+        acc.energy.emitted  += e.emitted;  acc.energy.absorbed += e.absorbed;
+        acc.energy.sensor   += e.sensor;   acc.energy.escaped  += e.escaped;
+        acc.energy.residual += e.residual;
+    };
+
+    using clk = std::chrono::steady_clock;
+    if (timeBudgetSec > 0.0) {
+        long long batchN = (N > 0) ? N : 2'000'000;  // -n is the per-batch granularity
+        std::printf("mode %c: tracing for %.3gs in %lld-photon batches at %dx%d on %s (light=%s)%s ...\n",
+                    mode, timeBudgetSec, batchN, res, res, backend.c_str(), lightLabel,
+                    (resume && acc.N > 0) ? " [resuming]" : "");
+        auto t0 = clk::now();
+        auto lastSave = t0;
+        long long batches = 0;
+        for (;;) {
+            runBatch(batchN); ++batches;
+            double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+            double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
+            bool done = elapsed >= timeBudgetSec;
+            if (done || sinceSave >= 15.0) {          // periodic crash-safe checkpoint
+                writeOut(/*announceCheckpoint*/false);
+                lastSave = clk::now();
+                std::printf("[time] %.1fs / %.3gs elapsed, %lld batches, %lld photons total\n",
+                            elapsed, timeBudgetSec, batches, acc.N);
+            }
+            if (done) break;
+        }
+        if (wantCheckpoint)
+            std::printf("[checkpoint] %s holds %lld photons — rerun with -resume to add more\n",
+                        checkpointPath(outPath).c_str(), acc.N);
+    } else {
+        // Fixed photon count: one batch of N. A fresh (non-resumed) render uses
+        // seedBase 0, so it is bit-identical to the historical single-shot path.
+        std::printf("mode %c: tracing %lld photons at %dx%d on %s (light=%s)%s ...\n",
+                    mode, N, res, res, backend.c_str(), lightLabel,
+                    (resume && acc.N > 0) ? " [resuming]" : "");
+        runBatch(N);
+        writeOut(/*announceCheckpoint*/true);
+    }
+
+    double tot = acc.energy.absorbed + acc.energy.sensor + acc.energy.escaped + acc.energy.residual;
+    if (acc.energy.emitted > 0.0)
+        std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                    acc.energy.absorbed / acc.energy.emitted, acc.energy.sensor / acc.energy.emitted,
+                    acc.energy.escaped / acc.energy.emitted, acc.energy.residual / acc.energy.emitted,
+                    tot / acc.energy.emitted);
     return 0;
 }
 
@@ -1277,6 +1474,9 @@ int main(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
+    double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
+    bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint
+    bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o
     bool modeFromCli = false;     // did the CLI force a global -mode? (else per-camera)
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
 
@@ -1340,6 +1540,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
+        else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-resume")) resume = true;
+        else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
     if (nThreads < 1) nThreads = 1;
@@ -1469,7 +1672,8 @@ int main(int argc, char** argv) {
             std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
                         rc.name.c_str(), rc.mode, rc.res, rc.res, outFor(rc.name).c_str());
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, spp, nThreads,
-                           device, diffraction, lightLabel, outFor(rc.name), rc.exposure);
+                           device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
+                           timeBudgetSec, resume, wantCheckpointFlag);
         if (rv != 0) return rv;
     }
     return 0;

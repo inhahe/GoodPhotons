@@ -36,9 +36,13 @@ bool cudaForwardSupported(const Scene& scene);
 // writeFilm(film, N) and the mode-V comparison work unchanged. Fills eOut with the
 // same energy report. Requires cudaAvailable() && cudaForwardSupported(scene);
 // otherwise returns an empty film.
+// `seedBase` offsets the RNG stream so successive calls (render-in-chunks for a time
+// budget, or resuming an accumulated film) draw statistically-independent photons;
+// pass the cumulative photon count already traced. seedBase==0 reproduces the
+// original single-shot stream bit-for-bit.
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode);
+                       char camMode, unsigned long long seedBase = 0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

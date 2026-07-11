@@ -1916,7 +1916,7 @@ static void buildUpload(const Scene& scene, const Camera& cam, int res, DUpload&
 
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode) {
+                       char camMode, unsigned long long seedBase) {
     using namespace gpu;
     Film out; out.resX = res; out.resY = res; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -1933,8 +1933,11 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
 
     int blockSize = 128;
     int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
+    // seedBase==0 keeps the original single-shot seed exactly; each accumulation
+    // chunk passes a distinct cumulative-photon offset for an independent stream.
+    unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
     kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_energy, N, diffraction ? 1 : 0,
-                                     0x9e3779b97f4a7c15ULL, 32, camModeInt);
+                                     kseed, 32, camModeInt);
     cudaError_t kerr = cudaGetLastError();
     if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
     if (kerr != cudaSuccess) {

@@ -772,6 +772,44 @@ diffuse bounce to *every* frame/camera's pupil (mode B) in one trace — a natur
 extension of the existing `connect()` since photons are camera-independent until
 the splat.
 
+### 8.4 Progressive rendering — photon budget, time budget, and resume
+
+The forward camera models (`mode A/B/C`) accumulate radiance one photon at a time,
+so the render can be sized three ways and picked up again later. **Brightness is
+independent of the photon count** — `writeFilm` divides the film by the cumulative
+photons — so adding photons only *lowers the graininess*; it never changes exposure.
+
+| CLI flag | Meaning |
+|---|---|
+| `-n <photons>` | Trace exactly this many photons, then stop (the default sizing). |
+| `-time <seconds>` | Trace in batches until the wall-clock budget elapses. `-n` becomes the **batch size** (checkpoint granularity; default 2 000 000). Runs at least one batch and stops on the first batch boundary past the budget. |
+| `-resume` | Before rendering, reload the accumulated film from the checkpoint sidecar (below) and keep adding photons to it — combine with `-n` (add that many more) or `-time` (render that many more seconds). |
+| `-checkpoint` | On a plain `-n` render, also write the checkpoint sidecar so a later `-resume` can continue it. (`-time` and `-resume` imply checkpointing.) |
+
+**Checkpoint sidecar.** Because the 8-bit tone-mapped image is exposure-anchored and
+gamma-quantised, it cannot be resumed from faithfully. Alongside `-o out.png` the
+renderer therefore writes `out.png.ftbuf`: the raw linear XYZ film, the per-pixel hit
+counts, the cumulative photon count, the energy tally, and a small identity hash of
+the scene/mode/resolution. `-resume` reloads it; if the hash or resolution disagrees
+with the current invocation it refuses to blend (printing a message and starting
+fresh) so a stale file can never silently corrupt an image. During a `-time` render
+the sidecar (and preview image) are re-written at least every ~15 s, so an
+interrupted run loses at most that much work.
+
+Each accumulation batch is seeded with an RNG offset equal to the cumulative photon
+count, so every batch — and every resume — draws a **statistically independent**
+photon stream: doubling the total photons drops RMSE by ~√2, exactly as a single
+render of the combined count would. A fresh (non-resumed) `-n` render uses offset 0
+and is bit-for-bit identical to the historical single-shot path. These flags apply
+only to the forward models `A/B/C`; the spp-based reference/BDPT (`R/V/D`) and the
+`P` composite are not resumable this way (they warn and ignore the flags).
+
+```
+# render for two minutes, then add another minute later:
+ftrace -in scene.ftsl -mode B -time 120 -o out.png
+ftrace -in scene.ftsl -mode B -time 60  -o out.png -resume   # out.png now = 180 s of photons
+```
+
 ---
 
 ## 9. Skins / textures — import, mapping, and spectral color
