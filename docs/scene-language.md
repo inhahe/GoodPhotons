@@ -463,10 +463,13 @@ those scenes stay bit-identical). The directly-viewed background uses each texel
 spectrally-integrated XYZ, matching the backward camera-ray miss term. Validated by
 `scenes/envmap.ftsl` + `scenes/sky.pfm` (mode V: forward converges to the backward
 reference on a unit radiance scale). Direction convention: `θ` from `+y` (up), row 0
-at the top; `φ = atan2(z,x)`, `u = φ/2π + ½`. **The image environment currently runs
-on the CPU only** (the device kernel handles the *constant* env; the lat-long
-sampler's GPU port is a follow-up), so image-env scenes auto-fall-back to the CPU
-forward tracer. The backward reference does **env next-event estimation** at every
+at the top; `φ = atan2(z,x)`, `u = φ/2π + ½`. The image environment runs on the
+**GPU forward tracer** as well: the per-texel JH coeff/scale, the mean coeff/scale,
+and the flattened 2D luminance CDF (marginal + per-row conditional) are uploaded, and
+the direction sampler + beta reweight are ported to the device (the reweight's shared
+illuminant cancels in `L/avgSpd`, so no illuminant table is needed on-device). GPU and
+CPU agree to Monte-Carlo noise (energy conserves, mean RGB within ~0.5%). The backward
+reference does **env next-event estimation** at every
 diffuse and fog-scatter vertex — it samples a sky direction from the map's luminance
 CDF, shadow-rays past the scene bounds, and **MIS-combines** (balance heuristic) that
 connection with the BSDF-sampled continuation that reaches the sky on a ray miss (the
@@ -506,8 +509,8 @@ Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 - **Multiple / typed lights.** **[done — Phase 2b]** Any number of `light` blocks
   accumulate; the forward tracer uses a power-weighted selection CDF in the photon
   spawn path (CPU and CUDA), and the backward reference sums NEE over all emitters.
-  Sphere area lights, spotlights, and a uniform constant environment are done
-  (Phase 3c); image-based HDRI environments are still future — see below.
+  Sphere area lights, spotlights, a uniform constant environment, and image-based
+  HDRI environments are all done (Phase 3c) — see below.
 - **Absolute power / units.** **[needs engine work]** Today emission is normalized by the SPD integral
   and the light area — good enough for relative imagery, but there is no
   radiometric "this bulb is 800 lumens / 10 W". A `power <watts>` (radiant) or
@@ -516,9 +519,9 @@ Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 - **Other shapes.** Sphere area lights **[done — Phase 3c]** (`light sphere {
   center … radius … }`), point spotlights **[done — Phase 3c]** (`light spot {
   dir … inner_angle … outer_angle … }`), and a uniform constant environment
-  **[done — Phase 3c]** (`light env { spd … }`). Image-based HDRI environments
-  (`light env { file "sky.hdr" }` with a 2D CDF + spectral upsampling) are the
-  next step.
+  **[done — Phase 3c]** (`light env { spd … }`), and image-based HDRI environments
+  **[done — Phase 3c]** (`light env { file "sky.hdr" }` with a 2D luminance CDF +
+  per-texel JH spectral upsampling, on both the CPU and GPU forward tracers).
 
 ---
 

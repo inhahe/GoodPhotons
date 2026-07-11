@@ -186,16 +186,23 @@ as practical; this file is the fallback for what can't be addressed immediately.
     conserves, residual broadly distributed). All env-NEE work is gated on
     `scene.envIndex >= 0`, so non-env scenes keep a **bit-identical** RNG stream /
     backward image (cornell mode V unchanged).
-  - **Remaining (increment 2c):** GPU port of the lat-long sampler (upload the RGB/
-    coeff tables + marginal/conditional CDFs; port `sample`/`pdf`/`radiance`). Until
-    then `cudaForwardSupported()` returns false when `scene.envMap` is set, so image-env
-    scenes auto-fall-back to the CPU forward tracer (the **constant** env still runs on
-    the GPU).
+  - **Increment 2c — DONE (2026-07-10):** GPU port of the lat-long sampler
+    (`render_cuda.cu`). The host flattens the EnvMap into device buffers — per-texel JH
+    `coeff`/`scale`, the mean `avgCoeff`/`avgScale`, and the 2D luminance CDF (marginal
+    `Distribution1D` over rows + one conditional per row) — and the device gets
+    `dReflAt`/`dSample1D`/`dEnvSample`/`dEnvTexel` so the `shape==3` emission branch
+    importance-samples the map and reweights beta by `L(dir,λ)/(4π·pdfW·avgSpd)`. The
+    reweight's shared illuminant cancels in `L/avgSpd`, so no illuminant table is
+    uploaded. `cudaForwardSupported()` now returns true for image env; the constant-env
+    device path is untouched (`sc.env.scale == nullptr`). Verified: GPU vs CPU forward on
+    `envmap.ftsl` agree — energy conserves (sum/emitted=1.0, escaped 0.8893 vs 0.8894),
+    mean RGB within ~0.5%, auto-exposure 53.5 vs 53.8; constant env + all other GPU
+    scenes unchanged.
 - **Deferred (still future):**
-  1. **HDRI env follow-ups** — increments 2b (backward NEE) and 2c (GPU port) above.
-     Original 7-step plan (steps 1,3,4,5,6 done for constant env in 1a/1b; step 2 +
-     image parts of 3/4/5 done for the image env in 2a; NEE part of step 3 + GPU part
-     of step 6/7 remain):
+  1. **HDRI env** — image-based environment lighting (`light env { file … }`) is fully
+     done: increments 2a (CPU forward + backward miss/background), 2b (backward env-NEE
+     with MIS), and 2c (GPU forward port) are all complete. Original 7-step plan below,
+     all steps done, kept for reference:
      **Concrete plan (each sub-step
      independently
      buildable + validatable):**
@@ -246,10 +253,10 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; **constant
   environment (`light env { spd … }`) done 2026-07-10 (increments 1a CPU + 1b GPU)**
   incl. the absolute-radiance We fix and on-device env emission; **image-based HDRI
-  (`light env { file … }`, 2D luminance CDF + per-texel JH spectral upsampling) done
-  2026-07-10 (increments 2a CPU forward+backward miss/background + 2b backward
-  env-NEE with MIS)**; only the GPU port of the lat-long sampler (2c) still deferred
-  (see the plan above); sphere/spot importance-sampling also deferred.
+  (`light env { file … }`, 2D luminance CDF + per-texel JH spectral upsampling) fully
+  done 2026-07-10 (increments 2a CPU forward+backward miss/background + 2b backward
+  env-NEE with MIS + 2c GPU forward port)**; sphere/spot importance-sampling still
+  deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

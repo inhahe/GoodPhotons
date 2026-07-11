@@ -192,6 +192,28 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
     }
 }
 
+// Image-based (lat-long) environment tables (mirrors host EnvMap). Its pointers are
+// non-null only when scene.envMap is set; the constant-env path never touches these.
+// The 2D luminance sampler is flattened: a marginal Distribution1D over rows (h bins)
+// plus one conditional Distribution1D per row (w bins), row v's slice at the v-th
+// offset. The forward reweight needs radiance(dir,lambda)/avgSpd(lambda), in which
+// the shared illuminant factor cancels, so only the per-texel JH coeff/scale and the
+// mean coeff/scale are uploaded — no illuminant table on the device.
+struct DEnvMap {
+    int    w = 0, h = 0;                  // == nu, nv of the 2D distribution
+    double rot = 0.0;                     // horizontal rotation in [0,1) turns
+    const double* coeff = nullptr;        // 3*w*h : texel i -> coeff[3i .. 3i+2]
+    const double* scale = nullptr;        // w*h   : per-texel brightness (non-null => image env)
+    double avgCoeff[3] = {0, 0, 0};
+    double avgScale = 0.0;
+    const double* margCdf     = nullptr;  // h+1
+    const double* margFunc    = nullptr;  // h
+    double        margFuncInt = 0.0;
+    const double* condCdf     = nullptr;  // h*(w+1) : row v at v*(w+1)
+    const double* condFunc    = nullptr;  // h*w     : row v at v*w
+    const double* condFuncInt = nullptr;  // h
+};
+
 struct DScene {
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
@@ -205,6 +227,7 @@ struct DScene {
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
+    DEnvMap env;                     // image env tables (env.scale null => constant env)
 };
 
 struct DCamera {
@@ -648,6 +671,61 @@ __device__ static int selectEmitter(const DScene& sc, double u) {
     return lo;
 }
 
+// --- image-environment device sampling / evaluation (mirror src/envmap.h) --------
+// Jakob-Hanika sigmoid reflectance at lambda (mirrors upsample::reflAt).
+__device__ static Real dReflAt(const double* c, Real lambda) {
+    double t = ((double)lambda - 595.0) / 235.0;
+    double p = c[0] * t * t + c[1] * t + c[2];
+    return (Real)(0.5 + 0.5 * p / sqrt(1.0 + p * p));
+}
+
+// Continuous 1D CDF sample (mirrors Distribution1D::sampleContinuous). Returns the
+// sample in [0,1); pdf is the density relative to funcInt, off the chosen bin.
+__device__ static double dSample1D(const double* cdf, const double* func,
+                                   double funcInt, int n, double u,
+                                   double& pdf, int& off) {
+    int lo = 0, hi = n;
+    while (lo + 1 < hi) { int m = (lo + hi) / 2; if (cdf[m] <= u) lo = m; else hi = m; }
+    off = lo;
+    double du = u - cdf[lo];
+    double d = cdf[lo + 1] - cdf[lo];
+    if (d > 0) du /= d;
+    pdf = (funcInt > 0) ? func[lo] / funcInt : 0.0;
+    return (lo + du) / (double)n;
+}
+
+// Importance-sample an env emission direction from the luminance CDF (mirrors
+// EnvMap::sample); fills dir and the solid-angle pdf pdfW.
+__device__ static void dEnvSample(const DEnvMap& e, double u0, double u1,
+                                  DVec3& dir, double& pdfW) {
+    const double PI = 3.14159265358979323846;
+    int vo = 0, uo = 0; double dv = 0, du = 0;
+    double v = dSample1D(e.margCdf, e.margFunc, e.margFuncInt, e.h, u1, dv, vo);
+    const double* cCdf  = e.condCdf  + (size_t)vo * (e.w + 1);
+    const double* cFunc = e.condFunc + (size_t)vo * e.w;
+    double uu = dSample1D(cCdf, cFunc, e.condFuncInt[vo], e.w, u0, du, uo);
+    double mapPdf = du * dv;
+    double theta = v * PI;
+    double sinT = sin(theta);
+    pdfW = (sinT > 0.0) ? mapPdf / (2.0 * PI * PI * sinT) : 0.0;
+    double phi = (uu - 0.5 + e.rot) * 2.0 * PI;          // uvToDir
+    dir = DVec3{(Real)(sinT * cos(phi)), (Real)cos(theta), (Real)(sinT * sin(phi))};
+}
+
+// Nearest texel index for a direction (mirrors EnvMap::texelOf / dirToUV).
+__device__ static int dEnvTexel(const DEnvMap& e, const DVec3& d) {
+    const double PI = 3.14159265358979323846;
+    double y = fmin(fmax((double)d.y, -1.0), 1.0);
+    double theta = acos(y);
+    double phi = atan2((double)d.z, (double)d.x);
+    double v = theta / PI;
+    double u = phi / (2.0 * PI) + 0.5 - e.rot;
+    u -= floor(u);
+    int col = (int)(u * e.w); if (col < 0) col = 0; if (col >= e.w) col = e.w - 1;
+    int row = (int)(v * e.h); if (row < 0) row = 0; if (row >= e.h) row = e.h - 1;
+    return row * e.w + col;
+}
+
 __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode) {
@@ -664,6 +742,7 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 origin, emitN, dir;
         Real spotW = (Real)1;                            // spot direction reweight (else 1)
+        bool envImage = false; double envPdfW = 0.0;     // image env: reweight below
         if (em.shape == 2) {
             // Point spot: uniform direction in the outer cone; reweight beta by
             // falloff*(Omega_outer/Omega_eff) to match the smoothstep profile.
@@ -677,16 +756,23 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
             double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
             spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
         } else if (em.shape == 3) {
-            // Infinite constant environment (mirrors CPU render.h). Sample the photon
-            // direction uniformly on the sphere (pdf 1/4pi) and its entry point on a
-            // disk of radius R perpendicular to `dir`, centered on the scene and pushed
-            // upstream so it starts just outside the bounding sphere (disk pdf 1/(pi R^2)).
-            // Joint pdf 1/(4pi^2 R^2) = 1/envGeom, so beta = emitIntegral*envGeom is
-            // exactly analog (spotW stays 1). Photons missing the geometry escape.
-            double z = 1.0 - 2.0 * (double)u1;
-            double sr = sqrt(fmax(0.0, 1.0 - z * z));
-            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
-            dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+            // Infinite environment (mirrors CPU render.h). Sample the photon direction
+            // — for a constant env uniformly on the sphere (pdf 1/4pi); for an image
+            // env importance-sampled from the luminance CDF (pdf envPdfW) — then its
+            // entry point on a disk of radius R perpendicular to `dir`, centered on the
+            // scene and pushed upstream so it starts just outside the bounding sphere
+            // (disk pdf 1/(pi R^2)). For the constant case the joint pdf 1/(4pi^2 R^2)
+            // = 1/envGeom makes beta = emitIntegral*envGeom exactly analog; the image
+            // case reweights beta below by L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)).
+            if (sc.env.scale != nullptr) {
+                dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
+                envImage = true;
+            } else {
+                double z = 1.0 - 2.0 * (double)u1;
+                double sr = sqrt(fmax(0.0, 1.0 - z * z));
+                double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+                dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+            }
             DVec3 t, b; onb(dir, t, b);
             double rd = sc.sceneRadius * sqrt((double)rng.uniform());
             double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
@@ -702,6 +788,16 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* energy,
         if (pdfL <= 0) continue;
         Real beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
         beta *= spotW;                                   // exactly 1 for non-spot
+        // Image env: reweight so the photon carries the radiance actually arriving
+        // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
+        // illuminant in L and avgSpd cancels, leaving the per-texel JH ratio.
+        if (envImage) {
+            int ti = dEnvTexel(sc.env, dir);
+            double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lambda);
+            double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lambda);
+            double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
+            beta = (denom > 0.0) ? (Real)((double)beta * rad / denom) : (Real)0;
+        }
         eEmitted += beta;
 
         // Model B: connect the emitter itself to the pinhole (makes the source
@@ -856,12 +952,12 @@ bool cudaForwardSupported(const Scene& scene) {
     };
     for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
-    // Constant environment lighting runs on-device (the kernel emits env photons from
-    // the scene bounding sphere, shape==3, and the background is added by the
-    // backend-agnostic addEnvBackground() pass). An IMAGE-based env (lat-long map with
-    // a 2D luminance CDF + per-texel spectral upsampling) is not ported to the device
-    // yet, so those scenes fall back to the CPU forward tracer.
-    if (scene.envMap) return false;
+    // Environment lighting runs on-device: the kernel emits env photons from the scene
+    // bounding sphere (shape==3) and the directly-viewed background is added by the
+    // backend-agnostic addEnvBackground() pass. Both a constant env and an IMAGE-based
+    // env (lat-long map: the 2D luminance CDF, per-texel JH coeff/scale, and mean
+    // coeff/scale are uploaded, and the sampler/reweight are ported to the device) are
+    // supported (increments 1b and 2c).
     return true;
 }
 
@@ -964,6 +1060,53 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     double*   d_cdfAll  = cdfAll.empty()  ? nullptr : uploadVec(cdfAll);
     double*   d_emitCdf = emitCdf.empty() ? nullptr : uploadVec(emitCdf);
 
+    // --- image environment tables (lat-long map, increment 2c) ------------------
+    // Flatten the host EnvMap into device buffers: the per-texel JH coeff/scale, the
+    // sin(theta)-weighted mean coeff/scale, and the 2D luminance sampler (a marginal
+    // Distribution1D over rows plus one conditional Distribution1D per row). Constant-
+    // env and non-env scenes leave every pointer null, so sc.env.scale stays null and
+    // the kernel takes the constant/no-env path unchanged.
+    double *d_envCoeff = nullptr, *d_envScale = nullptr;
+    double *d_margCdf = nullptr, *d_margFunc = nullptr;
+    double *d_condCdf = nullptr, *d_condFunc = nullptr, *d_condFuncInt = nullptr;
+    DEnvMap denv;
+    if (scene.envMap) {
+        const EnvMap& em = *scene.envMap;
+        const int w = em.w, h = em.h; const size_t nT = (size_t)w * h;
+        std::vector<double> coeffFlat(nT * 3);
+        for (size_t i = 0; i < nT; ++i) {
+            coeffFlat[3 * i + 0] = em.coeff[i][0];
+            coeffFlat[3 * i + 1] = em.coeff[i][1];
+            coeffFlat[3 * i + 2] = em.coeff[i][2];
+        }
+        std::vector<double> condCdf, condFunc, condFuncInt(h);
+        condCdf.reserve((size_t)h * (w + 1));
+        condFunc.reserve(nT);
+        for (int v = 0; v < h; ++v) {
+            const Distribution1D& c = em.dist.cond[v];
+            condCdf.insert(condCdf.end(), c.cdf.begin(), c.cdf.end());
+            condFunc.insert(condFunc.end(), c.func.begin(), c.func.end());
+            condFuncInt[v] = c.funcInt;
+        }
+        d_envCoeff    = uploadVec(coeffFlat);
+        d_envScale    = uploadVec(em.scaleT);
+        d_margCdf     = uploadVec(em.dist.marg.cdf);
+        d_margFunc    = uploadVec(em.dist.marg.func);
+        d_condCdf     = uploadVec(condCdf);
+        d_condFunc    = uploadVec(condFunc);
+        d_condFuncInt = uploadVec(condFuncInt);
+        denv.w = w; denv.h = h; denv.rot = em.rotOffset;
+        denv.coeff = d_envCoeff; denv.scale = d_envScale;
+        denv.avgCoeff[0] = em.avgCoeff[0];
+        denv.avgCoeff[1] = em.avgCoeff[1];
+        denv.avgCoeff[2] = em.avgCoeff[2];
+        denv.avgScale = em.avgScale;
+        denv.margCdf = d_margCdf; denv.margFunc = d_margFunc;
+        denv.margFuncInt = em.dist.marg.funcInt;
+        denv.condCdf = d_condCdf; denv.condFunc = d_condFunc;
+        denv.condFuncInt = d_condFuncInt;
+    }
+
     DScene sc;
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
@@ -983,6 +1126,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
     // Env bounding sphere (shape==3 disk emission). Harmless when no env light.
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
+    sc.env = denv;   // image-env tables (denv.scale null for constant/no-env scenes)
 
     DCamera dc;
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
@@ -1026,6 +1170,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int res,
 
     cudaFree(d_tris); cudaFree(d_sph); cudaFree(d_nodes); cudaFree(d_prim);
     cudaFree(d_mats); cudaFree(d_ems); cudaFree(d_cdfAll); cudaFree(d_emitCdf);
+    cudaFree(d_envCoeff); cudaFree(d_envScale); cudaFree(d_margCdf); cudaFree(d_margFunc);
+    cudaFree(d_condCdf); cudaFree(d_condFunc); cudaFree(d_condFuncInt);
     cudaFree(d_film); cudaFree(d_energy);
     return out;
 }
