@@ -288,6 +288,41 @@ struct Emitter {
         pdfW = 1.0 / (2.0 * PI * (1.0 - cosMax));      // uniform over the cone
         return true;
     }
+
+    // Area-measure importance sampling of a CYLINDER emitter's lateral surface as
+    // seen from a reference point `ref`: draw only the front-facing (visible) part,
+    // the analog of sampleSphereCone's visible cap. Because the lateral outward
+    // normal N(phi) is perpendicular to the axis, the front-facing test
+    //   dot(N, ref - Y) = rho*cos(phi) - r > 0   (rho = |ref's perpendicular offset|)
+    // depends only on the azimuth phi, NOT the axial position z. So the visible
+    // region is the simple strip z in [0,L], phi in (-phiMax, phiMax) with
+    // cos(phiMax) = r/rho, of area 2*r*L*phiMax. We sample it uniformly in area:
+    // z uniform along the axis, phi uniform in the visible arc, so every draw is
+    // front-facing (no wasted back-side samples). `pdfArea` = 1/visibleArea.
+    // Returns false when `ref` is within the tube radius (rho <= r), where the arc
+    // is undefined; the caller then falls back to the uniform samplePoint().
+    bool sampleCylinderVisible(const Vec3& ref, double u1, double u2,
+                               Vec3& y, Vec3& nOut, double& pdfArea) const {
+        double len = length(v);
+        if (len <= 0.0) return false;
+        Vec3 a = v / len;                              // axis unit
+        Vec3 p = ref - origin;
+        double pa = dot(p, a);
+        Vec3 pPerp = p - a * pa;
+        double rho = length(pPerp);
+        if (rho <= radius) return false;               // ref inside tube radius
+        Vec3 e1 = pPerp / rho;                          // toward ref's perpendicular projection
+        Vec3 e2 = cross(a, e1);                         // completes the radial frame
+        double phiMax = std::acos(std::min(1.0, radius / rho));
+        double phi = (2.0 * u2 - 1.0) * phiMax;         // uniform in (-phiMax, phiMax)
+        double z = u1 * len;                            // uniform along the axis
+        Vec3 nrm = e1 * std::cos(phi) + e2 * std::sin(phi);  // outward radial (front-facing)
+        y = origin + a * z + nrm * radius;
+        nOut = nrm;
+        double visibleArea = 2.0 * radius * len * phiMax;
+        pdfArea = (visibleArea > 0.0) ? 1.0 / visibleArea : 0.0;
+        return pdfArea > 0.0;
+    }
 };
 
 struct Scene {

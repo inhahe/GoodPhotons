@@ -87,6 +87,13 @@ struct BackwardRenderer {
             // keep the uniform area-measure estimator.
             bool coneSampled = (em.shape == EmitterShape::Sphere) &&
                                em.sampleSphereCone(h.p, u1, u2, y, nLight, wi, dist, pdfW);
+            // Cylinder: importance-sample only the front-facing lateral arc toward
+            // `h.p` (area measure). Every draw is front-facing, so effArea = 1/pdfArea
+            // (the visible area) replaces em.area and no samples land on the back side.
+            double effArea = em.area, pdfAreaCyl = 0.0;
+            bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
+                              em.sampleCylinderVisible(h.p, u1, u2, y, nLight, pdfAreaCyl);
+            if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             double cosSurf, contrib;
             double f = rho / PI;                          // Lambertian BRDF
             double emitW = em.spdFn(lambda) * invPdfLambda;   // Le(lambda)/pdf_lambda
@@ -96,7 +103,7 @@ struct BackwardRenderer {
                 if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
                 contrib = f * emitW * cosSurf / pdfW;     // solid-angle measure
             } else {
-                em.samplePoint(u1, u2, y, nLight);        // quad or interior-sphere point
+                if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
                 Vec3 toL = y - h.p;
                 double dist2 = dot(toL, toL);
                 dist = std::sqrt(dist2);
@@ -107,7 +114,7 @@ struct BackwardRenderer {
                 if (cosLight <= 0) continue;
                 if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
                 double G = cosSurf * cosLight / dist2;    // geometry term
-                contrib = f * emitW * G * em.area;        // pdf_area = 1/area
+                contrib = f * emitW * G * effArea;        // pdf_area = 1/effArea (visible area for cylinder)
             }
             if (scene.medium.enabled)                     // Beer-Lambert on the shadow ray
                 contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
@@ -147,6 +154,11 @@ struct BackwardRenderer {
             double dist = 0.0, pdfW = 0.0;
             bool coneSampled = (em.shape == EmitterShape::Sphere) &&
                                em.sampleSphereCone(p, u1, u2, y, nLight, wi, dist, pdfW);
+            // Cylinder: front-facing lateral-arc sampling (area measure) toward `p`.
+            double effArea = em.area, pdfAreaCyl = 0.0;
+            bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
+                              em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
+            if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             double albedo = scene.medium.albedo(lambda);
             double emitW = em.spdFn(lambda) * invPdfLambda;
             double contrib;
@@ -155,7 +167,7 @@ struct BackwardRenderer {
                 double phase = hgPhase(dot(wIn, wi), scene.medium.g);
                 contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
             } else {
-                em.samplePoint(u1, u2, y, nLight);         // quad or interior-sphere point
+                if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
                 Vec3 toL = y - p;
                 double dist2 = dot(toL, toL);
                 dist = std::sqrt(dist2);
@@ -165,7 +177,7 @@ struct BackwardRenderer {
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
                 double phase = hgPhase(dot(wIn, wi), scene.medium.g);
                 double G = cosLight / dist2;               // no surface cosine at a volume vertex
-                contrib = albedo * phase * emitW * G * em.area;
+                contrib = albedo * phase * emitW * G * effArea;
             }
             contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
             total += contrib;
