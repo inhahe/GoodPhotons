@@ -171,25 +171,38 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 §2.1 or a `spectrum:name` reference.
 
 > **Note on measured material spectra** (todo item "can we find spectral
-> envelopes for any common materials?"): **partly done** — built-in `metal:<name>`
+> envelopes for any common materials?"): **mostly done** — built-in `metal:<name>`
 > reflectances, an expanded `glass:<name>` dispersion set, `reflectance:<name>`
-> natural curves, and whole-material `preset`s (§3.1) now ship for common
-> materials. The `metal:<name>` reflectances for Au/Ag/Cu/Al/Cr are now computed
-> from published **measured** complex indices (Johnson & Christy 1972, Rakić
-> 1995/1998; CC0 via refractiveindex.info) and the glass IORs are real Sellmeier
-> data; `brass`, the natural reflectances, and the iridescent recipes remain
-> representative, not per-sample measurements (see known-issues.md).
+> natural curves, and whole-material `preset`s (§3.1) ship for common materials, and
+> most are now **real measured data**:
 >
-> Two stdlib-only converters in `tools/` ingest published data into scenes:
+> - `metal:Au|Ag|Cu|Al|Cr` — normal-incidence R computed from published complex
+>   indices (Johnson & Christy 1972, Rakić 1995/1998; CC0 via refractiveindex.info).
+> - `glass:*` — real Sellmeier / Cauchy dispersion.
+> - `reflectance:leaf|snow|brick|concrete` — measured samples from the USGS Spectral
+>   Library v7 (splib07, public domain, DOI 10.5066/F7RR1WDJ).
+>
+> Still representative (not per-sample measurements, see known-issues.md): `brass`,
+> `reflectance:skin|skin-dark|soil`, and the iridescent recipes.
+>
+> Three stdlib-only converters in `tools/` ingest published data into scenes — each
+> can emit an FTSL `table` block or a C++ `tabulatedSpectrum` initializer:
 >
 > `tools/ri_nk_to_reflectance.py` — refractiveindex.info tabulated-nk YAML →
-> normal-incidence reflectance `R=((n-1)²+k²)/((n+1)²+k²)`, as an FTSL `table`
-> block or a C++ `tabulatedSpectrum` initializer (this is exactly how the built-in
-> metals were generated):
+> normal-incidence reflectance `R=((n-1)²+k²)/((n+1)²+k²)` (how the built-in metals
+> were generated):
 >
 > ```
 > python tools/ri_nk_to_reflectance.py Au_Johnson.yml --name gold_measured
 > python tools/ri_nk_to_reflectance.py Al_Rakic.yml --format cpp --resample 20
+> ```
+>
+> `tools/splib_to_reflectance.py` — USGS splib07 spectrum + wavelength file →
+> reflectance (how the built-in leaf/snow/brick/concrete were generated):
+>
+> ```
+> python tools/splib_to_reflectance.py splib07a_Oak_Oak-Leaf-1_fresh_ASDFRa_AREF.txt \
+>     -w splib07a_Wavelengths_ASD_0.35-2.5_microns_2151_ch.txt --format cpp --resample 10
 > ```
 >
 > `tools/csv_to_table.py` — a generic two-column CSV/TSV of (wavelength, value) →

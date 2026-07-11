@@ -83,13 +83,23 @@ inline bool resolveMetalReflectance(const std::string& name, Spectrum& out) {
 }
 
 // --- Natural / everyday diffuse reflectances --------------------------------
-// Representative spectral SHAPES (see file header + known-issues). Range extends
-// to 830 nm so vegetation's red-edge NIR rise is captured.
-inline Spectrum reflectanceLeaf() {   // green vegetation: green bump, chlorophyll dip, red-edge
+// Four of these are measured samples from the USGS Spectral Library v7 (splib07,
+// public domain, DOI 10.5066/F7RR1WDJ), extracted via tools/splib_to_reflectance.py:
+//   leaf     = Oak_Oak-Leaf-1_fresh (ASD, 10 nm)   -- record 13172-ish, green leaf
+//   snow     = Melting_snow_mSnw01a (ASD, 20 nm)
+//   brick    = Brick_GDS353_Building_MedRed (ASD, 20 nm)
+//   concrete = Concrete_GDS375_Lt_Gry_Road (ASD, 20 nm)
+// skin (light/dark) and soil have no clean splib sample and remain representative
+// SHAPES (see file header + known-issues). Range extends to 830 nm so vegetation's
+// red-edge NIR rise is captured.
+inline Spectrum reflectanceLeaf() {   // USGS Oak green leaf: green bump, chlorophyll dip, red-edge
     return tabulatedSpectrum({
-        {400,0.05},{450,0.05},{500,0.08},{550,0.15},{570,0.13},{600,0.08},
-        {640,0.05},{670,0.04},{690,0.06},{700,0.22},{720,0.42},{750,0.50},
-        {780,0.52},{830,0.53}
+        {360,0.104},{370,0.099},{380,0.097},{390,0.096},{400,0.096},{410,0.095},{420,0.096},{430,0.096},
+        {440,0.097},{450,0.097},{460,0.097},{470,0.098},{480,0.098},{490,0.098},{500,0.099},{510,0.104},
+        {520,0.119},{530,0.144},{540,0.163},{550,0.173},{560,0.174},{570,0.16},{580,0.142},{590,0.131},
+        {600,0.127},{610,0.122},{620,0.115},{630,0.112},{640,0.11},{650,0.105},{660,0.101},{670,0.098},
+        {680,0.098},{690,0.104},{700,0.149},{710,0.263},{720,0.402},{730,0.546},{740,0.668},{750,0.752},
+        {760,0.798},{770,0.818},{780,0.828},{790,0.833},{800,0.837},{810,0.84},{820,0.843},{830,0.846}
     });
 }
 inline Spectrum reflectanceSkinLight() {   // haemoglobin W-dips at 540/576 nm
@@ -104,9 +114,11 @@ inline Spectrum reflectanceSkinDark() {
         {640,0.29},{680,0.34},{720,0.38},{780,0.42},{830,0.44}
     });
 }
-inline Spectrum reflectanceSnow() {   // near-flat high in visible, drops in NIR
+inline Spectrum reflectanceSnow() {   // USGS melting snow: high-flat in visible, drops in NIR
     return tabulatedSpectrum({
-        {400,0.95},{500,0.95},{600,0.94},{680,0.92},{720,0.86},{780,0.75},{830,0.60}
+        {360,0.821},{380,0.807},{400,0.819},{420,0.831},{440,0.834},{460,0.833},{480,0.833},{500,0.832},
+        {520,0.832},{540,0.832},{560,0.833},{580,0.833},{600,0.83},{620,0.827},{640,0.823},{660,0.82},
+        {680,0.817},{700,0.816},{720,0.813},{740,0.809},{760,0.799},{780,0.782},{800,0.772},{820,0.774}
     });
 }
 inline Spectrum reflectanceSoil() {   // smooth reddish-brown rise
@@ -115,16 +127,18 @@ inline Spectrum reflectanceSoil() {   // smooth reddish-brown rise
         {700,0.29},{750,0.33},{800,0.36},{830,0.37}
     });
 }
-inline Spectrum reflectanceRedBrick() {
+inline Spectrum reflectanceRedBrick() {   // USGS medium-red building brick
     return tabulatedSpectrum({
-        {400,0.06},{450,0.07},{500,0.09},{550,0.12},{600,0.20},{620,0.28},
-        {650,0.34},{700,0.40},{760,0.44},{830,0.46}
+        {360,0.082},{380,0.08},{400,0.078},{420,0.077},{440,0.078},{460,0.079},{480,0.08},{500,0.082},
+        {520,0.085},{540,0.091},{560,0.113},{580,0.167},{600,0.213},{620,0.229},{640,0.234},{660,0.238},
+        {680,0.243},{700,0.249},{720,0.253},{740,0.254},{760,0.253},{780,0.249},{800,0.244},{820,0.24}
     });
 }
-inline Spectrum reflectanceConcrete() {   // fairly flat mid-grey
+inline Spectrum reflectanceConcrete() {   // USGS light-grey road concrete
     return tabulatedSpectrum({
-        {400,0.30},{450,0.33},{500,0.36},{550,0.38},{600,0.40},{650,0.41},
-        {700,0.42},{760,0.43},{830,0.43}
+        {360,0.155},{380,0.168},{400,0.184},{420,0.199},{440,0.216},{460,0.229},{480,0.239},{500,0.251},
+        {520,0.266},{540,0.28},{560,0.292},{580,0.302},{600,0.308},{620,0.311},{640,0.313},{660,0.315},
+        {680,0.316},{700,0.317},{720,0.318},{740,0.318},{760,0.318},{780,0.318},{800,0.317},{820,0.316}
     });
 }
 

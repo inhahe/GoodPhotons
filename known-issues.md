@@ -344,7 +344,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 - **Status:** OPEN (acceptable) — feature works and looks right; accuracy of the
   underlying numbers is the tracked debt.
 
-### Built-in material presets: natural reflectances & iridescent recipes are representative (metals now measured)
+### Built-in material presets: skin/soil & iridescent recipes are representative (metals + most natural curves now measured)
 - **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
   and recipes, plus expanded glasses in `src/spectrum.h`:
   - **Metals** — `metal:Au|Ag|Cu|Al|Cr|brass` reflectance R(λ) (`metalGold()` etc.).
@@ -357,6 +357,8 @@ as practical; this file is the fallback for what can't be addressed immediately.
     (Sellmeier for glass/crystal, `cauchy()` fits for water/ice/plastics), unified
     behind `resolveGlassIor()`.
   - **Natural diffuse** — `reflectance:leaf|skin|skin-dark|snow|soil|brick|concrete`.
+    `leaf`/`snow`/`brick`/`concrete` are now measured USGS splib07 samples (see item 2);
+    `skin`/`skin-dark`/`soil` remain representative shapes.
   - **Whole-material recipes** — `material { preset <name> }` via
     `resolveMaterialPreset()`: metals (glossy), glasses (dielectric), and iridescent
     `soap-bubble`/`oil-slick`/`anodized-ti`/`morpho`/`beetle`/`nacre`.
@@ -368,11 +370,15 @@ as practical; this file is the fallback for what can't be addressed immediately.
      R=((n-1)²+k²)/((n+1)²+k²). Colours re-validated on diffuse-lit spheres
      (gold/copper/salmon/neutral-silver/neutral-chrome). Only `brass` remains an
      alloy fit — no single canonical dataset exists for it.
-  2. **The `reflectance:` natural curves are representative shapes, not a specific
-     measured sample** — a plausible "a leaf / some skin / snow," capturing the
-     characteristic features (chlorophyll dip + red-edge, haemoglobin W, flat snow),
-     hand-built rather than drawn from a spectral library. Skin/vegetation vary
-     enormously in reality.
+  2. *(PARTLY RESOLVED 2026-07-11)* Most `reflectance:` natural curves are now
+     measured samples from the USGS Spectral Library v7 (splib07, public domain,
+     DOI 10.5066/F7RR1WDJ), extracted with `tools/splib_to_reflectance.py`:
+     `leaf` = fresh green Oak leaf (ASD, 10 nm — captures the real chlorophyll dip
+     and steep red-edge), `snow` = melting snow mSnw01a, `brick` = medium-red
+     building brick GDS353, `concrete` = light-grey road concrete GDS375 (all ASD).
+     Still representative shapes: `skin`/`skin-dark` (human skin isn't in splib) and
+     `soil` (splib's Soils chapter is mineral mixtures/sand, not a generic loam).
+     Real vegetation/skin still vary enormously sample-to-sample.
   3. **The iridescent recipes (`soap-bubble`, `oil-slick`, `anodized-ti`, `morpho`,
      `beetle`, `nacre`) are physically-motivated film/stack *configurations*, not
      measured spectra** — layer indices/thicknesses tuned to give the right colour
@@ -383,14 +389,15 @@ as practical; this file is the fallback for what can't be addressed immediately.
   behaviour (same as the existing `mirror`/`glossy`/`dielectric` types); use mode A,
   an environment light, or surrounding geometry to see them. Their reflectance data
   is correct (verified by putting the same `metal:` spectra on a diffuse surface).
-- **Proper fix (remaining):** the loaders now exist — `tools/csv_to_table.py`
-  (generic CSV→`table`) and `tools/ri_nk_to_reflectance.py` (refractiveindex.info
-  n,k→reflectance). Metals are done. Remaining debt is ingesting a measured spectral
-  reflectance library (e.g. USGS/ECOSTRESS) for the `reflectance:` diffuse curves so
-  they too become verifiable data rather than representative shapes.
-- **Status:** OPEN (acceptable, reduced) — metals are now measured data; natural
-  reflectances and iridescent recipes remain representative. All presets load on
-  CPU==GPU and render the right colours.
+- **Proper fix (remaining):** three loaders now exist — `tools/csv_to_table.py`
+  (generic CSV→`table`), `tools/ri_nk_to_reflectance.py` (refractiveindex.info
+  n,k→reflectance), and `tools/splib_to_reflectance.py` (USGS splib07→reflectance).
+  Metals and leaf/snow/brick/concrete are done. Remaining debt is finding measured
+  samples for `skin`/`skin-dark` (a skin-optics dataset) and `soil` (a loam/dirt
+  reflectance), plus optionally validating the iridescent recipes against specimens.
+- **Status:** OPEN (acceptable, much reduced) — metals + 4 natural curves are now
+  measured data; skin/soil and iridescent recipes remain representative. All presets
+  load on CPU==GPU and render the right colours.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
