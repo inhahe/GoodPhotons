@@ -312,6 +312,38 @@ as practical; this file is the fallback for what can't be addressed immediately.
   in the backward reference done 2026-07-10**; only spot penumbra CDF sampling (item
   3) still deferred.
 
+### Built-in artificial-light SPDs: F-series transcribed from memory, discharge lamps are models not measurements
+- **What (added 2026-07-11):** `src/lights.h` now provides spectral envelopes for
+  artificial light sources, wired into `resolveLight()` / `preset:<name>`:
+  - **CIE F-series fluorescents** — `fluorescentF2/F7/F11()` (`f2`/`cool-white`,
+    `f7`/`daylight-fl`, `f11`/`triphosphor`), tabulated 380–780 nm at 5 nm via
+    `sampledSPD()` → `tabulatedSpectrum()`.
+  - **Gas-discharge lamps** — `sodiumHigh()` (`hps`/`sodium`), `sodiumLow()`
+    (`lps`/`sodium-low`), `mercuryVapor()` (`mercury`/`hg`), `metalHalide()`
+    (`metal-halide`/`mh`).
+  - **CCT-tuned phosphor LED** — `ledCCT(kelvin)` via the `led<K>k` name (e.g.
+    `led4000k`).
+- **The honesty caveats (tech debt, not a bug):**
+  1. **The F2/F7/F11 tables were transcribed from the canonical CIE 15 illuminant
+     data by hand/from memory, not ingested from an authoritative machine-readable
+     source.** The overall shapes are correct and render with the right colour cast
+     (validated 2026-07-11: F7 coolest/most-daylight, F2/F11 warm-white), but
+     individual 5 nm samples may carry small transcription errors. If
+     spectrophotometer-grade exactness is ever needed, diff these arrays against an
+     authoritative CIE table (or load from a data file via the Python tooling) and
+     correct any drift.
+  2. **The sodium / mercury / metal-halide entries are deliberately *illustrative*
+     spectroscopic models, not per-lamp measurements** — correct line positions and
+     plausible relative strengths (from spectroscopy references) over analytic
+     continua, tuned to give the right visual cast. They are not a specific
+     manufacturer's lamp and are not radiometrically calibrated. Same intended
+     upgrade path: swap for measured SPDs when the data-file loader lands.
+- **Proper fix (future):** route all of these through the planned measured-SPD data
+  loader (the same Python tooling earmarked for D65/solar/specific lamps) so the
+  built-ins become verifiable data rather than transcribed/analytic approximations.
+- **Status:** OPEN (acceptable) — feature works and looks right; accuracy of the
+  underlying numbers is the tracked debt.
+
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named
   child materials, weights ≤ 1, remainder absorbs) is implemented and validated
