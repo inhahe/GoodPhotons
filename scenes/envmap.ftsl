@@ -1,0 +1,36 @@
+# Image-based environment light — an open scene lit only by an equirectangular
+# (lat-long) HDR sky map, with no local lights. A diffuse grey ground plane and two
+# diffuse spheres sit under the sky (scenes/sky.pfm: a smooth blue->warm gradient
+# with a soft off-axis sun glow). Exercises the Phase 3c image environment: each
+# texel is upsampled to a physical emission spectrum, photon directions are
+# importance-sampled from the map's luminance, and the sky is visible directly in
+# the background. All surfaces diffuse, so mode V should agree (forward == backward,
+# up to Monte-Carlo variance), and the background reads as the sky behind the objects.
+#
+#   ftrace -in scenes/envmap.ftsl -mode V -n 40000000 -spp 512
+#   ftrace -in scenes/envmap.ftsl -n 40000000 -o envmap.ppm
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "grey"  { type diffuse reflect whitewall 0.6 }
+material "warm"  { type diffuse reflect rgb 0.7 0.45 0.25 }
+
+# --- ground plane (8 x 8 m); u,v ordered so the face normal points up (+y) ---
+quad { origin -4 0 -4   u 0 0 8   v 8 0 0   material grey }
+
+# --- two diffuse spheres resting on the ground ------------------------------
+sphere { center -0.7 0.6 0   radius 0.6   material warm }
+sphere { center  0.9 0.4 0.4 radius 0.4   material grey }
+
+# --- image-based environment (equirectangular HDR sky) ----------------------
+light env { file "scenes/sky.pfm"  rotate 0  intensity 1 }
+
+# --- camera ----------------------------------------------------------------
+camera "cam" {
+    eye 0 1.1 3.4   look_at 0 0.5 0   up 0 1 0   fov_y 45
+    mode B
+    film { res 256 256 }
+}

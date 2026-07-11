@@ -856,10 +856,12 @@ bool cudaForwardSupported(const Scene& scene) {
     };
     for (const auto& t : scene.tris)    if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres) if (unsupported(s.matId)) return false;
-    // Environment lighting: the device kernel now emits env photons from the scene
-    // bounding sphere (shape==3), and the directly-viewed background sky is added by
-    // the backend-agnostic addEnvBackground() pass in main.cpp — so env scenes run
-    // on the GPU just like local-light scenes.
+    // Constant environment lighting runs on-device (the kernel emits env photons from
+    // the scene bounding sphere, shape==3, and the background is added by the
+    // backend-agnostic addEnvBackground() pass). An IMAGE-based env (lat-long map with
+    // a 2D luminance CDF + per-texel spectral upsampling) is not ported to the device
+    // yet, so those scenes fall back to the CPU forward tracer.
+    if (scene.envMap) return false;
     return true;
 }
 

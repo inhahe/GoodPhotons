@@ -716,10 +716,11 @@ static void thinFilmSwatch(double n1, double n2) {
 }
 
 // Add the directly-viewed environment background to a forward (model-B) film. For
-// each pixel whose pixel-center camera ray escapes all geometry, deposit N*envXYZ,
-// so that after writePPM's 1/(N*cieYIntegral) normalisation the pixel shows the
-// environment radiance in XYZ — matching the backward tracer's ray-miss term (which
-// adds L_env*invPdfLambda). Forward photons carry the env *illumination* of
+// each pixel whose pixel-center camera ray escapes all geometry, deposit N times the
+// escape direction's env XYZ (constant for a flat env, the lat-long map colour for
+// an image env), so that after writePPM's 1/(N*cieYIntegral) normalisation the pixel
+// shows the environment radiance in XYZ — matching the backward tracer's ray-miss
+// term (which adds L_env(dir)*invPdfLambda). Forward photons carry the env *illumination* of
 // surfaces; this pass supplies the *direct view* of the sky behind the geometry.
 // No-op unless the scene has an env light. Silhouette pixels are classified by the
 // pixel center (a sub-pixel edge approximation, like mode P's classifier).
@@ -729,7 +730,7 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
             Hit h = scene.closestHit(r);
-            if (!h.valid) film.add(px, py, scene.envXYZ * (double)N);
+            if (!h.valid) film.add(px, py, scene.envXYZForDir(r.d) * (double)N);
         }
 }
 
@@ -964,10 +965,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         } else if (!cudaForwardSupported(scene)) {
             if (wantGpu) std::fprintf(stderr, "[device] scene has a GPU-unsupported "
                                               "feature (fluorescent, textured, or "
-                                              "oversized-mix material); using CPU\n");
+                                              "oversized-mix material, or an image "
+                                              "environment); using CPU\n");
             else         std::printf("[device] auto -> CPU (GPU-unsupported feature: "
                                      "fluorescent, textured, or oversized-mix "
-                                     "material)\n");
+                                     "material, or an image environment)\n");
         } else {
             useGpu = true;
             std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",

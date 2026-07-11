@@ -172,12 +172,13 @@ struct BackwardRenderer {
                 }
             }
 
-            // Ray escaped the scene: pick up the constant environment radiance (0 if
-            // no env light). Added unconditionally (no env NEE yet), the same
-            // spdFn*invPdfLambda form as surface emission, so forward and backward
-            // agree on env illumination and directly-viewed background by construction.
+            // Ray escaped the scene: pick up the environment radiance from the escape
+            // direction (0 if no env light; constant env ignores the direction, an
+            // image env samples the lat-long map). Added unconditionally (no env NEE
+            // yet), the same spdFn*invPdfLambda form as surface emission, so forward
+            // and backward agree on env illumination and directly-viewed background.
             if (!h.valid) {
-                L += thr * scene.envRadiance(lambda) * invPdfLambda;
+                L += thr * scene.envRadiance(ray.d, lambda) * invPdfLambda;
                 return L;
             }
             const Material* mp = &scene.mats[h.matId];

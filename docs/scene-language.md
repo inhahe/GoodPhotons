@@ -437,8 +437,37 @@ isotropic and most photons miss an open scene, forward (mode B) env images are
 the backward reference on a unit radiance scale; CPU and GPU energy agree). The
 constant environment runs on the **GPU** forward tracer as well (the device kernel
 emits env photons from the bounding sphere and the directly-viewed sky is added by
-the backend-agnostic background pass); image-based HDRI (`light env { file
-"sky.hdr" }`) is the next step.
+the backend-agnostic background pass).
+
+```
+light env { file "sky.hdr"  rotate 30  intensity 1.5 }   # image-based (lat-long)
+```
+
+Giving `light env` a **`file`** instead of an `spd` registers an **image-based
+environment**: an equirectangular (lat-long) HDR map — a Radiance `.hdr`, a float
+`.pfm`, or any LDR image the texture loader handles — becomes an infinite directional
+emitter. Each texel's linear RGB is upsampled to a physical emission spectrum
+`L(λ) = scale · S_JH(chroma)(λ) · illum(λ)`, where `S_JH` is the texel's Jakob-Hanika
+sigmoid fit and `illum` is a normalized 6504 K illuminant (so the spectrum reproduces
+the texel colour under the CIE observer, PBRT's RGB-illuminant convention); `scale`
+carries the HDR brightness. `rotate` spins the map about the vertical axis (degrees)
+and `intensity` scales its brightness. Directions are **importance-sampled** from a 2D
+luminance CDF over the map (marginal over rows × conditional over columns, each
+weighted by `sin θ`), so forward photons and the backward miss/NEE draw bright parts
+of the sky in proportion to the radiance they carry — the key variance reduction for
+peaked skies (a sun). The emitter's power and wavelength CDF use the map's
+`sin θ`-weighted **mean** radiance spectrum, and the forward photon's flat power is
+reweighted by `L(dir,λ)/(4π·pdf_ω·meanSpd(λ))` so it represents the radiance actually
+arriving from the sampled direction (this factor is exactly 1 for a constant env, so
+those scenes stay bit-identical). The directly-viewed background uses each texel's
+spectrally-integrated XYZ, matching the backward camera-ray miss term. Validated by
+`scenes/envmap.ftsl` + `scenes/sky.pfm` (mode V: forward converges to the backward
+reference on a unit radiance scale). Direction convention: `θ` from `+y` (up), row 0
+at the top; `φ = atan2(z,x)`, `u = φ/2π + ½`. **The image environment currently runs
+on the CPU only** (the device kernel handles the *constant* env; the lat-long
+sampler's GPU port is a follow-up), so image-env scenes auto-fall-back to the CPU
+forward tracer. Backward env **NEE** is not yet added (the miss term alone covers env
+illumination), so a strongly peaked map is noisier in the reference than a smooth one.
 
 > **Absolute-radiance camera convention.** The model-B forward light tracer now
 > measures **absolute radiance** — a pixel viewing radiance `L` reads `L` (the

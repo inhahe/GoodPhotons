@@ -2,11 +2,13 @@
 #pragma once
 #include <vector>
 #include <algorithm>
+#include <memory>
 #include "geometry.h"
 #include "bvh.h"
 #include "spectrum.h"
 #include "scene_film.h"
 #include "texture.h"
+#include "envmap.h"
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix };
 
@@ -239,19 +241,33 @@ struct Scene {
     EmissionSampler emitSampler;
     double emitG = 0.0;
 
-    // Environment lighting (constant infinite-radiance emitter). envIndex is the
-    // index into `emitters` of the single Env emitter (or -1 if none). The scene
-    // bounding sphere (sceneCenter, sceneRadius, from the BVH root) sizes forward
-    // env photon emission; envXYZ = integral of L_env(lambda)*CIE(lambda) dlambda
-    // is the directly-viewed background colour (used by the forward background pass
-    // — see main.cpp — and normalised the same way as connect()'s splats).
+    // Environment lighting. envIndex is the index into `emitters` of the single Env
+    // emitter (or -1 if none). The scene bounding sphere (sceneCenter, sceneRadius,
+    // from the BVH root) sizes forward env photon emission. `envMap` is non-null for
+    // an image-based (lat-long) environment and null for a constant one; when present
+    // it supplies the direction-dependent radiance/background/sampler. envXYZ is the
+    // directly-viewed background colour for the CONSTANT case = integral of
+    // L_env(lambda)*CIE(lambda) dlambda (the image case uses envMap->xyz(dir)).
     int envIndex = -1;
     Vec3 sceneCenter{0, 0, 0};
     double sceneRadius = 0.0;
     Vec3 envXYZ{0, 0, 0};
+    std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
 
-    // Constant environment radiance at wavelength lambda (0 if no env emitter).
-    double envRadiance(double lambda) const {
+    // Environment radiance from direction `d` at wavelength lambda (0 if no env).
+    // Constant env ignores `d`; an image env samples the lat-long map.
+    double envRadiance(const Vec3& d, double lambda) const {
+        if (envIndex < 0) return 0.0;
+        return envMap ? envMap->radiance(d, lambda) : emitters[envIndex].spdFn(lambda);
+    }
+    // Directly-viewed background XYZ in direction `d` (integral of CIE*L dlambda).
+    Vec3 envXYZForDir(const Vec3& d) const {
+        if (envIndex < 0) return Vec3{0, 0, 0};
+        return envMap ? envMap->xyz(d) : envXYZ;
+    }
+    // Reciprocal of the sampled-wavelength pdf-weighted mean env radiance shape used
+    // by the forward emission reweight (== the env emitter's spdFn).
+    double envAvgSpd(double lambda) const {
         return (envIndex >= 0) ? emitters[envIndex].spdFn(lambda) : 0.0;
     }
 
@@ -304,6 +320,36 @@ struct Scene {
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         envIndex = (int)emitters.size();
         emitters.push_back(std::move(e));
+    }
+
+    // Register an image-based environment. The emitter's SPD is the map's mean
+    // radiance spectrum (sin(theta)-weighted average), which drives the power
+    // (emitIntegral*envGeom) and the wavelength importance CDF exactly like a
+    // constant env; the per-direction radiance comes from `map` at trace time.
+    void addEnvLight(std::shared_ptr<EnvMap> map, double stepNm) {
+        Emitter e;
+        e.shape = EmitterShape::Env;
+        Spectrum mean = [map](double lambda) { return map->avgSpd(lambda); };
+        e.spd.build(mean, stepNm); e.spdFn = mean; e.emitIntegral = e.spd.integral;
+        envIndex = (int)emitters.size();
+        envMap = std::move(map);
+        emitters.push_back(std::move(e));
+    }
+
+    // Importance-sample an env emission/NEE direction. For an image env this draws
+    // from the map's luminance CDF (pdfW = solid-angle density); for a constant env
+    // it is a uniform sphere direction (pdfW = 1/4pi).
+    Vec3 sampleEnvDir(Pcg32& rng, double& pdfW) const {
+        if (envMap) return envMap->sample(rng.uniform(), rng.uniform(), pdfW);
+        double u1 = rng.uniform(), u2 = rng.uniform();
+        double z = 1.0 - 2.0 * u1;
+        double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+        double phi = 2.0 * PI * u2;
+        pdfW = 1.0 / (4.0 * PI);
+        return Vec3{r * std::cos(phi), r * std::sin(phi), z};
+    }
+    double envPdfDir(const Vec3& d) const {
+        return envMap ? envMap->pdf(d) : 1.0 / (4.0 * PI);
     }
 
     // Compute per-emitter power, the selection CDF, and the combined backward

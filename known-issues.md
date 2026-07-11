@@ -156,22 +156,41 @@ as practical; this file is the fallback for what can't be addressed immediately.
     is the camera-side layer for S* paths), so env + mode P is niche; the proper fix
     (add the background to the composite's forward layer, mindful of the best-fit
     `s` interaction — now easy since the We fix makes s≈1) is deferred.
+- **Image-based HDRI environment (2026-07-10, increment 2a — DONE, CPU):** `light env
+  { file "sky.hdr"  rotate deg  intensity s }` registers an equirectangular (lat-long)
+  environment. `src/envmap.h` (`EnvMap`) loads the map (via the existing `Texture`
+  loader — `.hdr`/`.pfm`/LDR), upsamples each texel to a physical emission spectrum
+  `L(λ) = scale·S_JH(chroma)(λ)·illum(λ)` (Jakob-Hanika chroma fit × normalized 6504 K
+  illuminant, PBRT RGB-illuminant convention; `scale` carries HDR brightness), and
+  builds a 2D luminance CDF (`Distribution2D`: marginal rows × conditional cols,
+  `sin θ`-weighted) for importance-sampled directions. Wired through `Scene`
+  (`envMap` shared_ptr, `addEnvLight(map)`, direction-dependent `envRadiance(dir,λ)` /
+  `envXYZForDir(dir)` / `sampleEnvDir`), `render.h` (forward emission importance-samples
+  the direction and reweights the flat power by `L(dir,λ)/(4π·pdf_ω·meanSpd(λ))` — a
+  factor that is exactly 1 for a constant env, so those stay bit-identical), `backward.h`
+  (miss term uses the escape direction), `main.cpp` (`addEnvBackground` uses per-texel
+  spectral XYZ), and `ftsl.h` (`file`/`rotate`/`intensity` parse). The emitter power +
+  wavelength CDF use the map's `sin θ`-weighted mean radiance spectrum. Validated by
+  `scenes/envmap.ftsl` + `scenes/sky.pfm` (mode V: best-fit s→~0.95 and climbing with
+  samples — the residual is Monte-Carlo variance from the sun glow, not bias;
+  forward/backward auto-exposure agree to ~3%; energy conserves). Constant env
+  (`envlight.ftsl`) stays **bit-identical** (mode-V scale 0.971252, unchanged).
+  - **Remaining (increment 2b):** backward env **NEE** at diffuse/volume vertices
+    (sample `ω~envPdf`, shadow-ray to `sceneRadius`) so a strongly peaked map (sun) is
+    clean in the reference — currently the unconditional miss term alone covers env
+    illumination (unbiased but noisy for peaked maps). Adding NEE requires gating the
+    miss term on `specularArrival` to avoid double-counting.
+  - **Remaining (increment 2c):** GPU port of the lat-long sampler (upload the RGB/
+    coeff tables + marginal/conditional CDFs; port `sample`/`pdf`/`radiance`). Until
+    then `cudaForwardSupported()` returns false when `scene.envMap` is set, so image-env
+    scenes auto-fall-back to the CPU forward tracer (the **constant** env still runs on
+    the GPU).
 - **Deferred (still future):**
-  1. **Image-based HDRI environment** — an image-based infinite emitter (`light env
-     { file "sky.hdr"  rotate deg }`) on top of the constant-env plumbing now in
-     place. Remaining work is the directional structure: a 2D luminance CDF over the
-     lat-long map (marginal rows × conditional columns, `sin θ` weighted) for
-     importance-sampled emission/NEE, per-texel Jakob-Hanika spectral upsampling of
-     the RGB map, and the GPU port of the sampler. The `.hdr` loader already exists
-     (stb float path in
-     `src/texture.h`), and the Jakob-Hanika RGB→reflectance upsampler
-     (`src/upsample.h`) gives the per-direction spectral emission. **Progress
-     (increments 1a+1b, 2026-07-10):** steps 1 (bounding sphere), 3 (backward
-     ray-miss term — NEE not needed for a constant env), 4 (forward emission — analog
-     uniform variant, no importance sampling yet), 5 (mode-B background), and 6 (CUDA
-     env emission — the disk-emission branch is on-device; the mode-B background pass
-     is backend-agnostic) are DONE for the **constant** env; step 2 (2D CDF + per-texel
-     JH) and the image-based part of step 7 remain. **Concrete plan (each sub-step
+  1. **HDRI env follow-ups** — increments 2b (backward NEE) and 2c (GPU port) above.
+     Original 7-step plan (steps 1,3,4,5,6 done for constant env in 1a/1b; step 2 +
+     image parts of 3/4/5 done for the image env in 2a; NEE part of step 3 + GPU part
+     of step 6/7 remain):
+     **Concrete plan (each sub-step
      independently
      buildable + validatable):**
      1. *Scene bounding sphere.* Add `Vec3 sceneCenter; double sceneRadius;`
@@ -220,9 +239,11 @@ as practical; this file is the fallback for what can't be addressed immediately.
      be lower-variance but needs a quartic inverse; uniform+reweight is correct.
 - **Status:** OPEN (acceptable) — sphere + spot done 2026-07-10; **constant
   environment (`light env { spd … }`) done 2026-07-10 (increments 1a CPU + 1b GPU)**
-  incl. the absolute-radiance We fix and on-device env emission; image-based HDRI (2D
-  CDF + per-texel JH) deferred (see the plan above); sphere/spot importance-sampling
-  also deferred.
+  incl. the absolute-radiance We fix and on-device env emission; **image-based HDRI
+  (`light env { file … }`, 2D luminance CDF + per-texel JH spectral upsampling) done
+  2026-07-10 (increment 2a, CPU forward+backward miss/background)**; backward env-NEE
+  (2b) and GPU port of the lat-long sampler (2c) still deferred (see the plan above);
+  sphere/spot importance-sampling also deferred.
 
 ### Full physical `layered` material not yet implemented (`mix` is)
 - **What:** the FTSL `type mix` material (stochastic per-photon pick among named

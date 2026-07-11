@@ -227,6 +227,7 @@ struct Renderer {
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 origin, emitN, dir;
         double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
+        double envPdfW = 0.0;                    // env: solid-angle pdf of the sampled dir
         if (em.shape == EmitterShape::Spot) {
             // Point spot: sample a direction uniformly in the outer cone, then
             // reweight beta by falloff*(Omega_outer/Omega_eff) so the emitted
@@ -241,17 +242,24 @@ struct Renderer {
             double omegaOuter = 2.0 * PI * (1.0 - em.spotCosOuter);
             spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
         } else if (em.shape == EmitterShape::Env) {
-            // Infinite constant environment. Sample the incoming photon direction
-            // `dir` uniformly on the sphere (pdf 1/4pi) and its entry point on a
-            // disk of radius R perpendicular to `dir`, centered on the scene and
-            // pushed upstream so the photon starts just outside the bounding sphere
-            // (disk pdf 1/(pi R^2)). The joint pdf 1/(4pi^2 R^2) = 1/envGeom, so the
-            // per-photon power beta = emitIntegral*envGeom is exactly analog — no
-            // reweight (spotW stays 1). Photons that miss the geometry escape.
-            double z = 1.0 - 2.0 * u1;
-            double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
-            double phi = 2.0 * PI * u2;
-            dir = Vec3{sr * std::cos(phi), sr * std::sin(phi), z};
+            // Infinite environment. Sample the incoming photon direction `dir` — for
+            // a constant env uniformly on the sphere (pdf 1/4pi); for an image env
+            // importance-sampled from the map's luminance CDF (pdf envPdfW) — then its
+            // entry point on a disk of radius R perpendicular to `dir`, centered on
+            // the scene and pushed upstream so the photon starts just outside the
+            // bounding sphere (disk pdf 1/(pi R^2)). For a constant env the joint pdf
+            // 1/(4pi^2 R^2) = 1/envGeom makes beta = emitIntegral*envGeom exactly
+            // analog (no reweight); an image env reweights beta below by
+            // L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)) — which is 1 in the constant
+            // case, keeping constant-env scenes bit-identical.
+            if (scene.envMap) {
+                dir = scene.envMap->sample(u1, u2, envPdfW);
+            } else {
+                double z = 1.0 - 2.0 * u1;
+                double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
+                double phi = 2.0 * PI * u2;
+                dir = Vec3{sr * std::cos(phi), sr * std::sin(phi), z};
+            }
             Vec3 t, b; onb(dir, t, b);
             double rd = scene.sceneRadius * std::sqrt(rng.uniform());
             double pd = 2.0 * PI * rng.uniform();
@@ -269,6 +277,14 @@ struct Renderer {
         // Multiple: beta = totalPower (see selection note above).
         double beta = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
         beta *= spotW;   // exactly 1.0 for non-spot emitters (no bit change)
+        // Image env: replace the flat power with the directional estimator. The base
+        // beta carries the mean env power; multiply by L(dir,lambda)/(4pi*pdfW*mean)
+        // so the photon represents the radiance actually arriving from `dir`. (No-op
+        // for a constant env, so those scenes stay bit-identical.)
+        if (em.shape == EmitterShape::Env && scene.envMap) {
+            double denom = 4.0 * PI * envPdfW * em.spdFn(lambda);
+            beta = (denom > 0.0) ? beta * (scene.envMap->radiance(dir, lambda) / denom) : 0.0;
+        }
         e.emitted += beta;
 
         // Direct light -> camera: makes the source itself visible. The Lambertian

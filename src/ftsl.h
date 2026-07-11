@@ -19,6 +19,7 @@
 //   light sphere     { center x y z  radius r  spd <spectrum-expr> }  # glowing ball
 //   light spot       { origin x y z  dir x y z  inner_angle d  outer_angle d  spd … }
 //   light env        { spd <spectrum-expr> }   # constant infinite environment
+//   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
 //                   film { res W H } }
@@ -700,9 +701,22 @@ private:
             return true;
         }
         if (b.subtype == "env") {
-            // Constant environment: uniform radiance `spd` from every direction (an
-            // infinitely-distant sphere). No geometry; sized by the scene bounds in
-            // Scene::build(). Illuminates open scenes and shows as the background.
+            // Environment light. With a `file` it is an image-based (lat-long) env:
+            // each texel is upsampled to a physical emission spectrum and directions
+            // are importance-sampled from the map's luminance. `rotate` spins the map
+            // about the vertical axis (degrees); `intensity` scales its brightness.
+            // Without a `file` it is a constant env: uniform radiance `spd` from every
+            // direction. Either way it is sized by the scene bounds in Scene::build().
+            std::string file = strOf(b, "file");
+            if (!file.empty()) {
+                auto map = std::make_shared<EnvMap>();
+                std::string eerr;
+                if (!map->load(file, dblOf(b, "rotate", 0.0), dblOf(b, "intensity", 1.0), eerr)) {
+                    fail("env light: " + eerr); return false;
+                }
+                L.scene.addEnvLight(std::move(map), binWidth_);
+                return true;
+            }
             L.scene.addEnvLight(spd, binWidth_);
             return true;
         }
