@@ -43,7 +43,8 @@ inline Spectrum ledWhite(double warm = 0.3) {
 }
 
 // Trichromatic fluorescent: a low phosphor continuum with mercury emission lines.
-// Illustrative model of the spiky spectrum, not a measured F-series.
+// Illustrative model of the spiky spectrum, not a measured F-series. For real
+// tabulated fluorescent SPDs use the CIE F-series builders below (f2/f7/f11).
 inline Spectrum fluorescent() {
     return [](double w) {
         double cont = 0.08 + 0.05 * gaussLobe(w, 560.0, 120.0);
@@ -52,6 +53,147 @@ inline Spectrum fluorescent() {
                      + 0.75 * gaussLobe(w, 611.0, 6.0)   // phosphor red
                      + 0.35 * gaussLobe(w, 488.0, 6.0);
         return cont + lines;
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Measured / spectroscopic artificial sources
+// ---------------------------------------------------------------------------
+
+// Build a piecewise-linear SPD from evenly-spaced samples starting at `startNm`
+// with spacing `stepNm`. Used to embed measured tables (CIE F-series below).
+inline Spectrum sampledSPD(double startNm, double stepNm, const std::vector<double>& v) {
+    std::vector<std::pair<double, double>> pairs;
+    pairs.reserve(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        pairs.emplace_back(startNm + stepNm * static_cast<double>(i), v[i]);
+    return tabulatedSpectrum(std::move(pairs));
+}
+
+// Sum of narrow emission lines: (center nm, relative peak) pairs, each a Gaussian
+// of width `sigma` nm. Gas-discharge lamps (sodium, mercury, metal halide) are
+// dominated by such lines; positions and relative strengths are from spectroscopy.
+inline Spectrum emissionLines(std::vector<std::pair<double, double>> lines, double sigma = 3.0) {
+    return [lines, sigma](double w) {
+        double s = 0.0;
+        for (const auto& L : lines) s += L.second * gaussLobe(w, L.first, sigma);
+        return s;
+    };
+}
+
+// CIE Standard Illuminant F-series: real tabulated relative SPDs, 380-780 nm at
+// 5 nm. F2 = cool white halophosphate (CCT ~4230 K, CRI ~64); F7 = broadband
+// "daylight" fluorescent, a D65 simulator (CCT ~6500 K, CRI ~90); F11 = narrow-band
+// triphosphor (CCT ~4000 K, CRI ~83). Source: CIE 15 tabulated illuminant data.
+inline Spectrum fluorescentF2() {
+    static const std::vector<double> d = {
+        1.18, 1.48, 1.84, 2.15, 3.44, 15.69, 3.85, 3.74, 4.19, 4.62,   // 380-425
+        5.06, 34.98, 11.81, 6.27, 6.63, 6.93, 7.19, 7.40, 7.54, 7.62,  // 430-475
+        7.65, 7.62, 7.62, 7.45, 7.28, 7.15, 7.05, 7.04, 7.16, 7.47,    // 480-525
+        8.04, 8.88, 10.01, 24.88, 16.64, 14.59, 16.16, 17.56, 18.62, 21.47, // 530-575
+        22.79, 19.29, 18.66, 17.73, 16.54, 15.21, 13.80, 12.36, 10.95, 9.65, // 580-625
+        8.40, 7.32, 6.31, 5.43, 4.68, 4.02, 3.45, 2.96, 2.55, 2.19,    // 630-675
+        1.89, 1.64, 1.53, 1.27, 1.10, 0.99, 0.88, 0.76, 0.68, 0.61,    // 680-725
+        0.56, 0.54, 0.51, 0.47, 0.47, 0.43, 0.46, 0.47, 0.40, 0.33, 0.27 // 730-780
+    };
+    return sampledSPD(380.0, 5.0, d);
+}
+inline Spectrum fluorescentF7() {
+    static const std::vector<double> d = {
+        2.56, 3.18, 3.84, 4.53, 6.15, 19.37, 7.37, 7.05, 7.71, 8.41,   // 380-425
+        9.15, 44.14, 17.52, 11.35, 12.00, 12.58, 13.08, 13.45, 13.71, 13.88, // 430-475
+        13.95, 13.93, 13.82, 13.64, 13.43, 13.25, 13.08, 12.93, 12.78, 12.60, // 480-525
+        12.44, 12.33, 12.26, 29.52, 17.05, 12.44, 12.58, 12.72, 12.83, 15.46, // 530-575
+        16.75, 12.83, 12.67, 12.45, 12.19, 11.89, 11.60, 11.35, 11.12, 10.95, // 580-625
+        10.76, 10.42, 10.11, 10.04, 10.02, 10.11, 9.87, 8.65, 7.27, 6.44, // 630-675
+        5.83, 5.56, 5.52, 5.44, 5.29, 5.45, 4.71, 3.94, 3.94, 4.03,    // 680-725
+        4.09, 3.90, 3.55, 3.44, 3.29, 2.85, 3.68, 4.34, 3.94, 2.63, 1.83 // 730-780
+    };
+    return sampledSPD(380.0, 5.0, d);
+}
+inline Spectrum fluorescentF11() {
+    static const std::vector<double> d = {
+        0.91, 0.63, 0.46, 0.37, 1.29, 12.68, 1.59, 1.79, 2.46, 3.33,   // 380-425
+        4.49, 33.94, 12.13, 6.95, 7.19, 7.12, 6.72, 6.13, 5.46, 4.79,  // 430-475
+        5.66, 14.29, 14.96, 8.97, 4.72, 2.33, 1.47, 1.10, 0.89, 0.83,  // 480-525
+        1.18, 4.90, 39.59, 72.84, 32.61, 7.52, 2.83, 1.96, 1.67, 4.43, // 530-575
+        11.28, 14.76, 12.73, 9.74, 7.33, 9.72, 55.27, 42.58, 13.18, 13.16, // 580-625
+        12.26, 5.11, 2.07, 2.34, 3.58, 3.01, 2.48, 2.14, 1.54, 1.33,   // 630-675
+        1.46, 1.94, 2.00, 1.20, 1.35, 4.10, 5.58, 2.51, 0.57, 0.27,    // 680-725
+        0.23, 0.21, 0.24, 0.24, 0.20, 0.24, 0.32, 0.26, 0.16, 0.12, 0.09 // 730-780
+    };
+    return sampledSPD(380.0, 5.0, d);
+}
+
+// Low-pressure sodium (LPS/SOX): the near-monochromatic sodium D doublet at 589.0 /
+// 589.6 nm — the classic deep-orange streetlight, essentially zero colour rendering.
+inline Spectrum sodiumLow() {
+    return [](double w) {
+        return 1.00 * gaussLobe(w, 589.0, 1.2)
+             + 0.60 * gaussLobe(w, 589.6, 1.2)
+             + 0.004;                             // faint background
+    };
+}
+
+// High-pressure sodium (HPS/SON): the sodium D resonance is pressure-broadened and
+// self-reversed (a central dip) into a wide warm band, with weaker Na lines and a
+// rising red continuum — the amber-white streetlight, low but non-zero CRI.
+inline Spectrum sodiumHigh() {
+    return [](double w) {
+        double dband = 1.00 * gaussLobe(w, 589.0, 9.0)
+                     - 0.55 * gaussLobe(w, 589.3, 2.0);   // self-reversal notch
+        double lines = 0.22 * gaussLobe(w, 568.5, 3.0)
+                     + 0.18 * gaussLobe(w, 615.7, 3.5)
+                     + 0.10 * gaussLobe(w, 498.3, 3.0)
+                     + 0.10 * gaussLobe(w, 515.4, 3.0);
+        double cont  = 0.05 + 0.10 / (1.0 + std::exp(-(w - 600.0) * 0.02)); // warm rise
+        return std::max(0.0, dband) + lines + cont;
+    };
+}
+
+// Mercury vapour: strong discrete lines at 405/436 (violet-blue), 546 (green) and
+// the 577/579 yellow doublet, with almost no red — the cold blue-green cast of
+// older street/industrial lamps.
+inline Spectrum mercuryVapor() {
+    return [](double w) {
+        double lines = 0.40 * gaussLobe(w, 405.0, 2.5)
+                     + 1.00 * gaussLobe(w, 436.0, 2.5)
+                     + 1.10 * gaussLobe(w, 546.0, 2.5)
+                     + 0.55 * gaussLobe(w, 577.0, 2.0)
+                     + 0.55 * gaussLobe(w, 579.0, 2.0);
+        return lines + 0.03;                      // weak continuum (poor red)
+    };
+}
+
+// Metal halide: mercury lines plus additive-metal lines (In ~451, Tl ~535, Na ~589)
+// over a broad rare-earth quasi-continuum — much whiter and higher-CRI than plain
+// mercury vapour.
+inline Spectrum metalHalide() {
+    return [](double w) {
+        double lines = 0.50 * gaussLobe(w, 436.0, 3.0)   // Hg blue
+                     + 0.45 * gaussLobe(w, 451.0, 3.0)   // In blue
+                     + 0.70 * gaussLobe(w, 535.0, 3.0)   // Tl green
+                     + 0.60 * gaussLobe(w, 546.0, 3.0)   // Hg green
+                     + 0.55 * gaussLobe(w, 589.0, 3.0)   // Na yellow
+                     + 0.30 * gaussLobe(w, 611.0, 4.0);
+        double cont  = 0.20 + 0.18 * gaussLobe(w, 560.0, 130.0); // Dy/Ho/Tm haze
+        return lines + cont;
+    };
+}
+
+// White phosphor LED tuned to a target correlated colour temperature. Blue InGaN
+// pump (~455-465 nm) plus a broad YAG:Ce phosphor hump; cooler CCT raises the blue
+// peak and shifts the phosphor bluer, warmer CCT lowers it and shifts it redder.
+inline Spectrum ledCCT(double kelvin) {
+    double warm = (6500.0 - kelvin) / (6500.0 - 2700.0);
+    warm = std::max(0.0, std::min(1.2, warm));
+    double bluePeak = 465.0 - 8.0 * warm;
+    double blueAmp  = 1.0 - 0.45 * warm;
+    double phosMu   = 555.0 + 45.0 * warm;
+    double phosSig  = 95.0 + 10.0 * warm;
+    return [=](double w) {
+        return blueAmp * gaussLobe(w, bluePeak, 17.0)
+             + 1.0     * gaussLobe(w, phosMu, phosSig);
     };
 }
 

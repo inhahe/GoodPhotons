@@ -546,7 +546,21 @@ All resolve through the existing `-light` presets (`src/lights.h`,
 | `a` / `incandescent`               | 2856 K tungsten (CIE Illuminant A)                     |
 | `led`                              | Blue pump 460 nm + phosphor 560 nm                     |
 | `led-warm`                         | Redshifted phosphor (~600 nm)                          |
-| `fluorescent` / `cfl`              | Mercury lines (436/546/611 nm) + continuum            |
+| `led<K>k` (e.g. `preset:led4000k`) | Phosphor LED tuned to K kelvin (blue pump + YAG hump)   |
+| `fluorescent` / `cfl`              | Mercury lines (436/546/611 nm) + continuum (illustrative) |
+| `f2` / `cool-white`                | **CIE F2** cool-white fluorescent — measured SPD (~4230 K) |
+| `f7` / `daylight-fl`               | **CIE F7** broadband daylight fluorescent — measured SPD (~6500 K, D65 sim) |
+| `f11` / `triphosphor`              | **CIE F11** narrow-band triphosphor — measured SPD (~4000 K) |
+| `hps` / `sodium`                   | High-pressure sodium — broadened, self-reversed Na D band + warm continuum |
+| `lps` / `sodium-low`               | Low-pressure sodium — near-monochromatic Na D doublet (589 nm) |
+| `mercury` / `hg`                   | Mercury vapour — 405/436/546/577/579 nm lines, red-deficient |
+| `metal-halide` / `mh`              | Metal halide — Hg + In/Tl/Na additive lines over a rare-earth continuum |
+
+The `f2` / `f7` / `f11` entries are **real tabulated CIE illuminant data** (380–780 nm
+at 5 nm); the sodium / mercury / metal-halide entries are **spectroscopic line models**
+(accurate line positions and relative strengths, analytic continua). The plain
+`fluorescent` / `cfl` model remains an illustrative approximation — prefer `f2`/`f7`/`f11`
+for a faithful fluorescent SPD.
 
 Or supply any `<spectrum>` directly (`spd blackbody 3000`, `spd spectrum:myLED`,
 `spd table { … }`).
