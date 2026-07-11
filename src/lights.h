@@ -8,6 +8,7 @@
 // lamps) are intended to load from data files via the Python tooling later.
 #pragma once
 #include <cmath>
+#include <string>
 #include "spectrum.h"
 #include "color.h"
 
@@ -195,6 +196,45 @@ inline Spectrum ledCCT(double kelvin) {
         return blueAmp * gaussLobe(w, bluePeak, 17.0)
              + 1.0     * gaussLobe(w, phosMu, phosSig);
     };
+}
+
+// Resolve a light/illuminant preset name to an emission SPD. Returns true and sets
+// `out` if the name is recognized; returns false for unknown names so each caller
+// picks its own fallback (main.cpp -> 6500 K blackbody; FTSL loader -> parse error).
+// This is the single source of truth shared by the `-light` CLI flag and the FTSL
+// `preset:<name>` expression — keep new sources here, not duplicated per caller.
+inline bool resolveLightPreset(const std::string& name, Spectrum& out) {
+    auto num = [](const std::string& s) -> double {
+        try { return std::stod(s); } catch (...) { return 0.0; }
+    };
+    // "bbNNNN" -> Planckian at NNNN K (e.g. bb3200).
+    if (name.rfind("bb", 0) == 0 && name.size() > 2) {
+        double k = num(name.substr(2));
+        if (k > 0) { out = blackbody(k); return true; }
+    }
+    // "ledNNNNk" / "led-NNNNk" -> phosphor LED at a colour temperature (e.g. led4000k).
+    if (name.rfind("led", 0) == 0 && name.size() > 3) {
+        std::string p = name.substr(3);
+        if (!p.empty() && p[0] == '-') p.erase(0, 1);
+        double k = num(p);                       // stod stops at trailing 'k'
+        if (k > 100.0) { out = ledCCT(k); return true; }
+    }
+    if (name == "sun")                          { out = sunlight();       return true; }
+    if (name == "daylight" || name == "d65")    { out = daylight(6504.0); return true; }
+    if (name == "a" || name == "incandescent")  { out = illuminantA();    return true; }
+    if (name == "led")                          { out = ledWhite(0.3);    return true; }
+    if (name == "led-warm")                     { out = ledWhite(1.0);    return true; }
+    if (name == "fluorescent" || name == "cfl") { out = fluorescent();    return true; }
+    // CIE F-series fluorescents (measured tabulated SPDs).
+    if (name == "f2"  || name == "cool-white")  { out = fluorescentF2();  return true; }
+    if (name == "f7"  || name == "daylight-fl") { out = fluorescentF7();  return true; }
+    if (name == "f11" || name == "triphosphor") { out = fluorescentF11(); return true; }
+    // Gas-discharge lamps (spectroscopic line models).
+    if (name == "hps" || name == "sodium")      { out = sodiumHigh();     return true; }
+    if (name == "lps" || name == "sodium-low")  { out = sodiumLow();      return true; }
+    if (name == "mercury" || name == "hg")      { out = mercuryVapor();   return true; }
+    if (name == "metal-halide" || name == "mh") { out = metalHalide();    return true; }
+    return false;
 }
 
 // Scale an SPD so its integral over the visible range is 1 (comparable brightness

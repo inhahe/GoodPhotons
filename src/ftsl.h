@@ -417,6 +417,11 @@ public:
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         if (!haveLight) { fail("scene has no 'light' block"); return false; }
+        // Catch errors recorded via fail() inside add* helpers that returned true
+        // without re-checking `err` (e.g. an unknown `spd preset:`/`spectrum:` name
+        // in a light or material silently falls back otherwise). Any recorded error
+        // is fatal — surface it instead of rendering a wrong scene.
+        if (!err.empty()) return false;
 
         // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
@@ -503,15 +508,11 @@ private:
         return constantSpectrum(0);
     }
 
-    // Illuminant presets, mirroring src/main.cpp resolveLight.
+    // Illuminant presets. Delegates to the shared resolver in lights.h (the same one
+    // the `-light` CLI flag uses) so the two never drift apart.
     Spectrum resolvePreset(const std::string& nm) {
-        if (nm.rfind("bb", 0) == 0 && nm.size() > 2) { double k = num(nm.substr(2)); if (k > 0) return blackbody(k); }
-        if (nm == "sun")                       return sunlight();
-        if (nm == "daylight" || nm == "d65")   return daylight(6504.0);
-        if (nm == "a" || nm == "incandescent") return illuminantA();
-        if (nm == "led")                       return ledWhite(0.3);
-        if (nm == "led-warm")                  return ledWhite(1.0);
-        if (nm == "fluorescent" || nm == "cfl") return fluorescent();
+        Spectrum s;
+        if (resolveLightPreset(nm, s)) return s;
         fail("unknown preset '" + nm + "'"); return blackbody(6500.0);
     }
 

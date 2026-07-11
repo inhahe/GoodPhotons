@@ -118,47 +118,13 @@ static bool writeImage(const std::string& path, int W, int H, const std::vector<
     return (bool)fo;
 }
 
-// Resolve a -light name to an emission SPD. "bbNNNN" means a Planckian at NNNN K
-// (e.g. bb3200), and "ledNNNNk" a phosphor LED at NNNN K (e.g. led4000k). Unknown
-// names fall back to a 6500 K blackbody.
+// Resolve a -light name to an emission SPD. Delegates to the shared resolver in
+// lights.h (the same one the FTSL `preset:<name>` expression uses); unknown names
+// fall back to a 6500 K blackbody.
 static Spectrum resolveLight(const char* name) {
     if (!name) return blackbody(6500.0);
-    if (!std::strncmp(name, "bb", 2) && name[2]) {
-        double k = std::atof(name + 2);
-        if (k > 0) return blackbody(k);
-    }
-    // "ledNNNNk" / "led-NNNNk": phosphor LED tuned to a colour temperature.
-    if (!std::strncmp(name, "led", 3)) {
-        const char* p = name + 3;
-        if (*p == '-') ++p;
-        double k = std::atof(p);
-        if (k > 100.0) return ledCCT(k);
-    }
-    if (!std::strcmp(name, "sun"))          return sunlight();
-    if (!std::strcmp(name, "daylight") ||
-        !std::strcmp(name, "d65"))          return daylight(6504.0);
-    if (!std::strcmp(name, "a") ||
-        !std::strcmp(name, "incandescent")) return illuminantA();
-    if (!std::strcmp(name, "led"))          return ledWhite(0.3);
-    if (!std::strcmp(name, "led-warm"))     return ledWhite(1.0);
-    if (!std::strcmp(name, "fluorescent") ||
-        !std::strcmp(name, "cfl"))          return fluorescent();
-    // CIE F-series fluorescents (measured tabulated SPDs).
-    if (!std::strcmp(name, "f2") ||
-        !std::strcmp(name, "cool-white"))   return fluorescentF2();
-    if (!std::strcmp(name, "f7") ||
-        !std::strcmp(name, "daylight-fl"))  return fluorescentF7();
-    if (!std::strcmp(name, "f11") ||
-        !std::strcmp(name, "triphosphor"))  return fluorescentF11();
-    // Gas-discharge lamps (spectroscopic line models).
-    if (!std::strcmp(name, "hps") ||
-        !std::strcmp(name, "sodium"))       return sodiumHigh();
-    if (!std::strcmp(name, "lps") ||
-        !std::strcmp(name, "sodium-low"))   return sodiumLow();
-    if (!std::strcmp(name, "mercury") ||
-        !std::strcmp(name, "hg"))           return mercuryVapor();
-    if (!std::strcmp(name, "metal-halide") ||
-        !std::strcmp(name, "mh"))           return metalHalide();
+    Spectrum s;
+    if (resolveLightPreset(name, s)) return s;
     return blackbody(6500.0);
 }
 
