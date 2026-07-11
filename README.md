@@ -83,7 +83,7 @@ paths they can capture at all**.
 
 | Mode | Name | What it does | Backend |
 |---|---|---|---|
-| `A` | Contact sensor | Pure forward photon catch on a front-wall sensor (no lens/optics) | CPU + GPU |
+| `A` | Finite-lens camera | Forward next-event splat through a finite aperture + thin lens (true depth of field, efficient) | CPU + GPU |
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
@@ -100,14 +100,19 @@ paths they can capture at all**.
   **cannot render specular-first pixels** (a mirror/glass surface seen directly
   splats nothing and stays black — use `P`, `D`, or `R` for those). Best default
   for diffuse and caustic-heavy scenes.
-- **`A` — contact sensor (simple, no optics).** A forward catch straight onto a
-  sensor plane; no lens, no pinhole projection, so framing is limited to the sensor
-  rectangle. Simplest measurement, mainly a physics baseline.
-- **`C` — finite-aperture catch (accurate DoF, slow).** Photons must physically
-  pass through the aperture to be counted, giving true thin-lens depth of field and
-  bokeh — but it is **catch-starved** (most photons miss the aperture), so it is
-  **much noisier / slower** than `B` for the same photon budget. Use when you
-  specifically want forward-simulated DoF.
+- **`A` — finite-lens camera (efficient depth of field).** A physical finite
+  aperture + thin lens + film, but imaged by **next-event splatting** each photon to
+  the lens pupil (like `B`'s splat, through a real aperture instead of a pinhole).
+  This gives **true thin-lens depth of field and bokeh** at a fraction of `C`'s cost,
+  because photons don't have to physically hit the aperture. `B` is the `aperture→0`
+  pinhole limit of this camera; rectilinear only (a fisheye needs a wide-angle element
+  the single thin lens can't form). Use when you want DoF without `C`'s noise.
+- **`C` — finite-aperture catch (brute-force DoF oracle, slow).** Photons must
+  physically pass through the aperture to be counted, giving true thin-lens depth of
+  field and bokeh — but it is **catch-starved** (most photons miss the aperture), so
+  it is **much noisier / slower** than `A`/`B` for the same photon budget. Mainly the
+  ground-truth `A` is validated against; use directly only when you want the
+  unapproximated forward-catch.
 - **`R` — backward reference (unbiased, general).** Traces from the camera, so it
   renders **any** first-hit surface including specular, and is the **quiet, reliable
   reference** for camera-visible lighting. GPU-accelerated (its own backward

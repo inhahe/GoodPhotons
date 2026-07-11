@@ -12,6 +12,9 @@
 *.ckpt
 /renders/
 
+# Scratch / throwaway scripts and test outputs
+/scraps/
+
 # Editor / IDE
 .vs/
 .vscode/

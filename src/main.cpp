@@ -1,5 +1,6 @@
 // Forward spectral photon tracer — Phase 0 (+ model B camera).
-//   -mode A : contact sensor on the front wall (pure forward catch, no lens)
+//   -mode A : finite-lens physical camera — forward next-event splat through a finite
+//             aperture + thin lens (true DoF; B is the aperture->0 pinhole limit)
 //   -mode B : pinhole camera outside the box, light-tracing splat (default)
 //   -mode C : finite-aperture forward catch (thin-lens depth of field)
 //   -mode R : backward path-traced reference (independent validation)
@@ -277,7 +278,7 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
 // pinhole (the SDS limitation, same as the glass sphere in the Cornell scene).
 // The physics is still exercised — photons reflect off them and illuminate the
 // diffuse walls, and energy conserves — but seeing the spheres' mirrored image
-// directly requires the future camera-side ray path (or model A's contact catch).
+// directly requires a camera-side ray path (mode R/P/D).
 static Scene buildMaterials(int res, const Spectrum& lightSpd) {
     (void)res;
     Scene s;
