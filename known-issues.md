@@ -160,10 +160,11 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   render loop + `_<name>` file naming).
 - **Implementation:** `ftsl.h` `addCameraOrbit` (basis vectors U,W ⟂ axis; eye = center +
   axis·height + (U·cosθ + W·sinθ)·radius) + dispatch entry. Demo: `scenes/showcase_orbit.ftsl`
-  (orbit tuned so its circle flies straight through the glass sphere). NOTE: the GPU
-  forward megakernel still renders one camera per launch (see the shared multi-camera
-  entry below); an orbit on `-mode R`/`-device gpu` renders frames sequentially, which is
-  fine — the per-frame cost dominates.
+  (orbit tuned so its circle flies straight through the glass sphere). NOTE: the forward
+  splat models A/B share one photon set across all frames (see the shared multi-camera
+  entry below), but `-mode R` is camera-anchored (it traces *from* each camera) so an orbit
+  on `-mode R`/`-device gpu` renders frames sequentially — which is fine, the per-frame
+  cost dominates.
 
 ### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
 - **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
@@ -291,7 +292,7 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   dielectric translucency (5c) all landed the same day. Full §1–4 GPU forward/backward parity
   achieved; only GPU BDPT retains feature-scoped fallbacks (patterns, frosted/colored glass).
 
-### Multi-camera renders re-trace photons per camera (no shared pass yet)
+### Multi-camera renders re-trace photons per camera (RESOLVED — shared pass for modes A/B, CPU + GPU)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render
   invocation emits one image per camera (`scenes/twocam.ftsl`), with `-camera
   <name>` selection and per-camera film resolution + mode. But each camera is a
@@ -306,22 +307,35 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   overload is bit-identical to the old path, and an N-camera shared pass reproduces N
   independent single-camera renders exactly. `renderForwardShared()` (src/main.cpp) runs
   one CPU photon trace feeding one film per camera; the multi-camera loop groups the
-  eligible cameras (plain `-n`, model B, per-frame auto-exposure, CPU device) into that
-  single pass and renders the rest per-camera as before. **Validated:** `twocam.ftsl`
+  eligible cameras (plain `-n`, per-frame auto-exposure) into that single pass and renders
+  the rest per-camera as before (the GPU shared pass, below, later removed the CPU-only
+  restriction). **Validated:** `twocam.ftsl`
   `-device cpu` shared vs. per-`-camera` solo renders are pixel-identical (max abs diff
   0, both films). The fluoro reradiation λ' is sampled once (camera-independent), and
   mode-A aperture RNG is drawn once, so those single-camera streams are preserved too.
-- **Remaining (deferred):** (1) **GPU shared pass** — the forward megakernel still
-  renders one camera per launch; it takes a single `DCamera`/film/`camMode`, so the
-  shared pass would need a `DCamera` array + N device film buffers threaded through
-  `emitPhoton`/`shadeStep`/`connect`. This is why the CPU shared pass only triggers when
-  the forward-GPU path *isn't* used (`-device cpu`, or a GPU-unsupported scene). (2)
-  **Mode A** (finite-lens splat) could join the shared pass but draws an aperture sample
-  per camera, so an N-camera mode-A trace perturbs the RNG stream — it would need its
-  own validation; mode C (forward catch) is inherently per-camera (a photon is consumed
-  by one aperture).
-- **Status:** OPEN (much reduced) — CPU shared pass done + validated; GPU shared pass
-  and mode-A sharing are the tracked remainder.
+- **GPU shared pass — DONE 2026-07-12.** The forward device code was refactored around a
+  `DCamSet` (device pointer to a `DCamera` array + per-camera film/hit buffer arrays +
+  `nCam`) that unifies single- and multi-camera tracing, so the ~240-line `shadeStep`
+  isn't duplicated (single-camera is just `nCam==1`, bit-identical). `genPhoton`/`shadeStep`
+  splat via `splatSurfaceAll`/`splatVolumeAll`; `buildUpload` was split into a scene-only
+  bake plus a per-camera `bakeCamera`, and `renderForwardSharedCuda()` (render_cuda.cu)
+  bakes the scene once, bakes N cameras, allocates one film/hit buffer per camera, and
+  launches a single trace. **Validated 2026-07-12:** GPU model-B shared vs. single-camera
+  GPU render pixel-identical (`cmp` clean); CPU model-B shared vs. single also identical;
+  the megakernel and wavefront backends both drive the shared pass.
+- **Mode A shared pass — DONE 2026-07-12.** Mode A (finite-lens splat) now joins the
+  shared pass on both CPU and GPU. Because `connectLens()` draws an aperture sample per
+  camera, an N-camera mode-A trace perturbs the RNG stream, so it is **unbiased per camera
+  but matches a standalone render in distribution, not bit-for-bit** (validated: shared vs.
+  standalone auto-exposure agree to noise). The A- and B-cameras run as **separate** shared
+  passes (mode A draws RNG mid-trace, mode B doesn't, so their photon paths diverge). Mode
+  C (forward catch) stays inherently per-camera (a photon is consumed by one aperture), and
+  the dispatch (`main.cpp`) partitions eligible cameras into A- and B-groups, sharing only
+  when a group has ≥2 members.
+- **Status:** DONE 2026-07-12 — CPU + GPU shared pass for both forward splat models
+  (A and B), validated. Mode C and the camera-anchored modes (R/D/P/V) render per camera
+  by construction (documented in README: "Other modes do NOT save time with multiple
+  cameras").
 
 ### Absolute-EV film sensitivity, non-square films, shared multi-camera pass
 - **What (remaining):** three camera/film pieces are still open:

@@ -51,6 +51,24 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
                        char camMode, unsigned long long seedBase = 0,
                        bool wavefront = false);
 
+// GPU multi-camera shared forward trace (models A and B — the device twin of the CPU
+// renderForwardShared). Traces ONE set of N photons and splats each vertex to ALL
+// cameras at once, returning one film per camera (each at its own resX[c] x resY[c]).
+// This is the "many cameras for one photon set" win — the whole scene is baked and the
+// photons flown once, instead of re-tracing per camera. camMode must be 'A' or 'B' (mode
+// C consumes the photon per camera and can't share). Model B is bit-identical to
+// per-camera renders (connect draws no RNG); model A shares the photon flight but each
+// camera samples its own pupil (connectLens draws RNG), so its images match a standalone
+// render in distribution, not bit-for-bit. eOut is the single shared-pass energy report.
+// Requires cudaAvailable() && cudaForwardSupported(scene); otherwise returns empty films.
+std::vector<Film> renderForwardSharedCuda(const Scene& scene,
+                                          const std::vector<Camera>& cams,
+                                          const std::vector<int>& resX,
+                                          const std::vector<int>& resY,
+                                          long long N, EnergyReport& eOut, bool diffraction,
+                                          char camMode, unsigned long long seedBase = 0,
+                                          bool wavefront = false);
+
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
 // cylinder Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the

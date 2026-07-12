@@ -598,6 +598,34 @@ extension), which ffmpeg concatenates into a video.
   slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
   `look_at`, or at a second `look curve`.
 
+### Multi-camera shared photon pass (modes `A` and `B`)
+
+When several cameras render at once (multiple `camera` blocks, or the frames a
+`camera_path`/`orbit`/`curve` expands into) in a **forward next-event** mode, the
+tracer flies **one** photon set and splats every vertex to **all** cameras of that
+mode at once, instead of re-flying the photons per camera. This is the "many cameras
+for one photon set" win — emission, BVH traversal, and scattering are paid once. It
+runs on **both the CPU and the GPU** (`-device gpu`), and applies to the two forward
+splat models:
+
+- **`B` (pinhole splat)** — `connect()` draws no random numbers, so the shared pass is
+  **bit-identical** to rendering each camera on its own.
+- **`A` (finite-lens camera)** — each camera samples its own aperture pupil (draws
+  RNG), so the shared photon flight is **unbiased per camera** but matches a standalone
+  render **in distribution**, not bit-for-bit. Rectilinear cameras only.
+
+The `A` and `B` cameras form **separate** shared passes (mode `A` perturbs the RNG
+stream during the trace; mode `B` doesn't). Sharing applies to plain `-n` renders with
+per-frame auto-exposure; exposure-locked animation paths and the budget flags
+(`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera.
+
+> **Other modes do NOT save time with multiple cameras.** `C` (finite-aperture catch)
+> consumes each photon at the first aperture it hits, so it can't share a photon set; and
+> `R`, `D`, `P`, and `V` are camera-anchored estimators that trace **from** each camera —
+> a multi-camera render of those modes simply renders **each camera independently**
+> (re-tracing the full sample budget per camera), so it costs the same as running them
+> one at a time. Only `A` and `B` amortise the trace across cameras.
+
 ### Importing Mitsuba scenes
 
 `tools/mitsuba_to_ftsl.py` converts a Mitsuba (0.6 / 2 / 3) XML scene to FTSL:
@@ -684,4 +712,4 @@ deterministically.
 
 Open limitations and technical debt are tracked in `known-issues.md` — including
 the physical-lens camera's remaining gaps (inter-element flare/ghosting,
-shaped-iris bokeh) and the shared multi-camera pass.
+shaped-iris bokeh).

@@ -1413,6 +1413,45 @@ __device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, d
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
+// A set of cameras sharing ONE photon trace (the multi-camera forward pass). The
+// forward tracer only ever SPLATS to a camera (project/connect); it never generates
+// camera rays, so a single photon path can deposit into every camera at once — the
+// "many cameras for the price of one photon set" win, the device twin of the CPU
+// renderForwardShared. films[c] / hits[c] are camera c's own device buffers (each
+// camera keeps its resolution/projection/exposure). nCam==1 is the ordinary single-
+// camera render. Model B's connect() draws no RNG, so a multi-camera model-B pass is
+// bit-identical to per-camera renders; model A's connectLens() samples each pupil (it
+// draws RNG), so its per-camera images match a standalone render in distribution only.
+struct DCamSet {
+    const DCamera* cams;      // nCam cameras
+    double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
+    double* const* hits;      // nCam per-pixel hit-count buffers
+    int nCam;
+};
+
+// Splat a surface vertex to every camera (model B pinhole connect, or model A finite-
+// lens next-event splat). Device twin of Renderer::camSplatAll. Model C never shares
+// (it consumes the photon per camera), so this is a no-op for CAM_C. For model A each
+// camera draws its own aperture sample, so the loop consumes RNG proportional to nCam
+// (deterministic given the camera order).
+__device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int camMode,
+                                        const DVec3& p, const DVec3& n, Real lambda,
+                                        Real beta, Real rho, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho);
+        else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
+    }
+}
+// Volume (fog) analogue of splatSurfaceAll.
+__device__ static void splatVolumeAll(const DScene& sc, const DCamSet& cs, int camMode,
+                                       const DVec3& p, const DVec3& wIn, Real lambda,
+                                       Real beta, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connectVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta);
+        else if (camMode == CAM_A) connectLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+    }
+}
+
 // ============================ megakernel ============================
 
 __device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
@@ -1737,7 +1776,7 @@ enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 // Sample one photon from the emitters: fills ro/rd/beta/lambda, accumulates the
 // emitted energy, and performs the direct emitter->camera connection (models A/B).
 // Returns false when the wavelength draw yields a zero pdf (skip this photon).
-__device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* film, double* hits,
+__device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted) {
     // Power-weighted emitter selection (single emitter draws no randomness).
@@ -1808,10 +1847,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* f
     // B splats to the pinhole, model A splats through the finite lens pupil. Model
     // C instead catches photons that physically arrive. A spot is a point light
     // with no projected area, so it has no direct term.
-    if (em.shape != 2 && em.shape != 3) {
-        if (camMode == CAM_B) connect(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1);
-        else if (camMode == CAM_A) connectLens(sc, cam, film, hits, origin, emitN, lambda, beta, (Real)1, rng);
-    }
+    if (em.shape != 2 && em.shape != 3)
+        splatSurfaceAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
 
     ro = origin + dir * RAY_EPS; rd = dir;
     return true;
@@ -1821,7 +1858,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamera& cam, double* f
 // ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
 // when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
 // with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
-__device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* film, double* hits,
+__device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
@@ -1842,8 +1879,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     // nearer than the surface/fog event, it lands on the film. Analog physics.
     if (camMode == CAM_C) {
         int px, py;
-        if (cam.catchPhoton(ro, rd, dEvent, px, py)) {
-            filmAdd(film, hits, cam.resX, px, py, lambda, beta);
+        // Model C never shares a trace (it consumes the photon), so nCam==1 here.
+        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
+            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta);
             eSensor += beta; return WF_TERMINATE;
         }
     }
@@ -1857,8 +1895,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     }
 
     if (mediumEvent) {
-        if (camMode == CAM_B) connectVolume(sc, cam, film, hits, mp, rd, lambda, beta);
-        else if (camMode == CAM_A) connectLensVolume(sc, cam, film, hits, mp, rd, lambda, beta, rng);
+        splatVolumeAll(sc, cs, camMode, mp, rd, lambda, beta, rng);
         if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 nd = sampleHG(rd, (Real)sc.medium.g, rng);
         ro = mp; rd = nd;
@@ -1928,17 +1965,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
         Real oneMinusRho = (Real)1 - rho; if (oneMinusRho < 0) oneMinusRho = 0;
         Real aEff = eps < oneMinusRho ? eps : oneMinusRho;
         bool canGlow = (aEff > 0 && m.fluoYield > 0 && m.fluoCdfN > 0);
-        if (camMode == CAM_B) {
-            connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
+        // Elastic splat at the incoming lambda, then a glow splat at a Stokes-shifted
+        // lambda' drawn ONCE (camera-independent) — matching the CPU camSplatAll order,
+        // so a multi-camera model-B pass stays bit-identical. Skipped for model C.
+        if (camMode == CAM_A || camMode == CAM_B) {
+            splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
             if (canGlow) {
                 Real lp = sampleFluoEmit(sc, m, rng);
-                connect(sc, cam, film, hits, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield));
-            }
-        } else if (camMode == CAM_A) {
-            connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
-            if (canGlow) {
-                Real lp = sampleFluoEmit(sc, m, rng);
-                connectLens(sc, cam, film, hits, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield), rng);
+                splatSurfaceAll(sc, cs, camMode, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield), rng);
             }
         }
         // Stochastic interaction (fluoroInteract): elastic / reemit / absorb. Beta is
@@ -1956,14 +1990,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamera& cam, double* fi
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
-        if (camMode == CAM_B) connect(sc, cam, film, hits, h.p, h.n, lambda, beta, rho);
-        else if (camMode == CAM_A) connectLens(sc, cam, film, hits, h.p, h.n, lambda, beta, rho, rng);
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
     }
 }
 
-__global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, double* energy,
+__global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1974,12 +2007,12 @@ __global__ void kTrace(DScene sc, DCamera cam, double* film, double* hits, doubl
 
     for (long long i = g; i < N; i += G) {
         DVec3 ro, rd; Real beta, lambda;
-        if (!genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
+        if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
         int interior = -1;   // dielectric the photon is currently inside (-1 = vacuum)
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             DHit h = closestHit(sc, ro, rd);
-            if (shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
+            if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, interior) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
@@ -2028,14 +2061,14 @@ struct WFState {
 // so the total genPhoton count is exactly N across the whole render. Returns true and
 // fills the slot (alive=1, bounce=0) on success; false when the budget is spent (the
 // caller marks the slot dead). Emitted energy accrues into energy[0].
-__device__ static bool wfSpawn(const DScene& sc, const DCamera& cam, double* film, double* hits,
+__device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
                                double* energy, int camMode, long long N,
                                unsigned long long* dispatched, WFState st, int slot, DRng& rng) {
     for (;;) {
         unsigned long long idx = atomicAdd(dispatched, 1ULL);
         if (idx >= (unsigned long long)N) return false;
         DVec3 ro, rd; Real beta, lambda; double eEm = 0;
-        if (genPhoton(sc, cam, film, hits, camMode, rng, ro, rd, beta, lambda, eEm)) {
+        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
             st.bounce[slot] = 0; st.alive[slot] = 1; st.interior[slot] = -1;
@@ -2047,13 +2080,13 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamera& cam, double* fil
 }
 
 // Seed each slot's RNG and fill it with a first photon.
-__global__ void kWfInit(DScene sc, DCamera cam, double* film, double* hits, double* energy,
+__global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
                         WFState st, long long N, int W, unsigned long long* dispatched,
                         int* liveCount, unsigned long long seedBase, int camMode) {
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W) return;
     DRng rng; rng.seed((unsigned long long)(slot * 2 + 1), seedBase ^ (unsigned long long)slot);
-    bool live = wfSpawn(sc, cam, film, hits, energy, camMode, N, dispatched, st, slot, rng);
+    bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng);
     st.rng[slot] = rng;
     if (live) atomicAdd(liveCount, 1);
     else st.alive[slot] = 0;
@@ -2067,7 +2100,7 @@ __global__ void kWfExtend(DScene sc, WFState st, int W) {
 }
 
 // Shade: advance each live slot by one bounce; regenerate on termination / bounce cap.
-__global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, double* energy,
+__global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
                          WFState st, int W, long long N, int diffraction, int maxBounce,
                          unsigned long long* dispatched, int* liveCount, int camMode) {
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2078,7 +2111,7 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
     DHit h = st.hit[slot];
     int interior = st.interior[slot];
     double eAbs = 0, eSen = 0, eEsc = 0;
-    int res = shadeStep(sc, cam, film, hits, camMode, diffraction, h, ro, rd, beta, lambda, rng,
+    int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, interior);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
@@ -2096,7 +2129,7 @@ __global__ void kWfShade(DScene sc, DCamera cam, double* film, double* hits, dou
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
-    bool live = wfSpawn(sc, cam, film, hits, energy, camMode, N, dispatched, st, slot, rng);
+    bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng);
     st.rng[slot] = rng;
     if (!live) { st.alive[slot] = 0; atomicSub(liveCount, 1); }
 }
@@ -3102,15 +3135,19 @@ struct DUpload {
     gpu::DScene  sc{};
     gpu::DCamera dc{};
     std::vector<void*> frees;
+    // Record a device allocation for later freeUpload(); returns it for chaining.
+    void* keep(void* p) { if (p) frees.push_back(p); return p; }
 };
 static void freeUpload(DUpload& up) {
     for (void* p : up.frees) cudaFree(p);
     up.frees.clear();
 }
 
-// Bake the std::function Scene + Camera into POD device tables and upload them.
-// Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up) when done.
-static void buildUpload(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
+// Bake the std::function Scene into POD device tables and upload them (camera-
+// independent). Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up)
+// when done. The camera is baked separately (bakeCamera) so one baked scene can serve a
+// whole multi-camera shared pass.
+static void buildUploadScene(const Scene& scene, DUpload& up) {
     using namespace gpu;
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
 
@@ -3381,8 +3418,14 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
+}
 
-    DCamera& dc = up.dc;
+// Bake one Camera into a POD DCamera for the given film resolution. Any device memory
+// (the realistic-lens index tables) is recorded in up.frees. Split out of the scene
+// bake so a multi-camera shared pass can bake N cameras against one uploaded scene.
+static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int resX, int resY, DUpload& up) {
+    using namespace gpu;
+    DCamera dc{};
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
     dc.u = {cam.u.x, cam.u.y, cam.u.z};
     dc.v = {cam.v.x, cam.v.y, cam.v.z};
@@ -3418,15 +3461,38 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
                     iorAll[(size_t)j * SPEC_N + i] = L.surf[j].ior ? L.surf[j].ior(w) : 1.0;
                 }
             }
-            dc.lens.iorAll = (const double*)keep(uploadVec(iorAll));
+            dc.lens.iorAll = (const double*)up.keep(uploadVec(iorAll));
         }
     }
+    return dc;
+}
+
+// Bake scene + one camera and upload them (the historical single-camera entry point).
+// Fills up.dc for callers (renderBdptCuda / renderBackwardCuda) that key off it.
+static void buildUpload(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
+    buildUploadScene(scene, up);
+    up.dc = bakeCamera(scene, cam, resX, resY, up);
+}
+
+// Assemble a device DCamSet: upload the DCamera array plus the arrays of per-camera
+// film / hits device pointers. All three device arrays are recorded in up.frees; the
+// film/hits buffers themselves stay owned by the caller.
+static gpu::DCamSet makeCamSet(DUpload& up, const std::vector<gpu::DCamera>& hcams,
+                               const std::vector<double*>& films,
+                               const std::vector<double*>& hits) {
+    using namespace gpu;
+    DCamSet cs{};
+    cs.nCam  = (int)hcams.size();
+    cs.cams  = (const DCamera*)up.keep(uploadVec(hcams));
+    cs.films = (double* const*)up.keep(uploadVec(films));
+    cs.hits  = (double* const*)up.keep(uploadVec(hits));
+    return cs;
 }
 
 // Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
 // runs extend/shade passes until every slot has drained the N-photon budget. Writes into
 // the same d_film / d_hits / d_energy buffers as the megakernel path.
-static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* d_energy,
+static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                            long long N, int diffraction, unsigned long long kseed,
                            int maxBounce, int camModeInt) {
     using namespace gpu;
@@ -3456,7 +3522,7 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     int bs = 128;
     int gb = (W + bs - 1) / bs;
 
-    kWfInit<<<gb, bs>>>(up.sc, up.dc, d_film, d_hits, d_energy, st, N, W,
+    kWfInit<<<gb, bs>>>(up.sc, cs, d_energy, st, N, W,
                         d_dispatched, d_live, kseed, camModeInt);
     cudaCheckKernel("wavefront-init");
 
@@ -3467,7 +3533,7 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     long long maxPasses = (N / W + 2) * (long long)(maxBounce + 1) + 16;
     for (long long pass = 0; pass < maxPasses; ++pass) {
         kWfExtend<<<gb, bs>>>(up.sc, st, W);
-        kWfShade<<<gb, bs>>>(up.sc, up.dc, d_film, d_hits, d_energy, st, W, N,
+        kWfShade<<<gb, bs>>>(up.sc, cs, d_energy, st, W, N,
                              diffraction, maxBounce, d_dispatched, d_live, camModeInt);
         cudaCheckKernel("wavefront-pass");
         int live = 0;
@@ -3478,6 +3544,29 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
     cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.interior); cudaFree(st.hit);
     cudaFree(d_dispatched); cudaFree(d_live);
+}
+
+// Launch the forward trace (megakernel or wavefront backend) over the baked scene `up`
+// and camera set `cs`, accumulating into cs.films/cs.hits and d_energy. Shared by the
+// single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
+static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
+                          long long N, bool diffraction, unsigned long long seedBase,
+                          bool wavefront, int camModeInt) {
+    using namespace gpu;
+    // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
+    // passes a distinct cumulative-photon offset for an independent stream.
+    unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
+    if (wavefront) {
+        // Streaming backend: identical physics, path-regeneration scheduling. Same
+        // maxBounce (32) and camera mode/set as the megakernel.
+        wavefrontTrace(up, cs, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
+    } else {
+        int blockSize = 128;
+        int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
+        kTrace<<<numBlocks, blockSize>>>(up.sc, cs, d_energy, N, diffraction ? 1 : 0,
+                                         kseed, 32, camModeInt);
+    }
+    cudaCheckKernel("forward");
 }
 
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
@@ -3500,20 +3589,12 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
 
     int camModeInt = (camMode == 'A') ? CAM_A : (camMode == 'C') ? CAM_C : CAM_B;
 
-    int blockSize = 128;
-    int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
-    // seedBase==0 keeps the original single-shot seed exactly; each accumulation
-    // chunk passes a distinct cumulative-photon offset for an independent stream.
-    unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
-    if (wavefront) {
-        // Streaming backend: identical physics, path-regeneration scheduling (see the
-        // wavefront section above). Same maxBounce (32) and camera mode as the megakernel.
-        wavefrontTrace(up, d_film, d_hits, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
-    } else {
-        kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_hits, d_energy, N, diffraction ? 1 : 0,
-                                         kseed, 32, camModeInt);
-    }
-    cudaCheckKernel("forward");
+    // One-camera DCamSet: the multi-camera code path with nCam==1 (bit-identical to the
+    // old single-camera launch — connect draws no RNG and the loop runs exactly once).
+    std::vector<DCamera> hc{ up.dc };
+    std::vector<double*> fp{ d_film }, hp{ d_hits };
+    DCamSet cs = makeCamSet(up, hc, fp, hp);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt);
 
     // --- download ---
     std::vector<double> film(npix * 3);
@@ -3531,6 +3612,66 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
 
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits); cudaFree(d_energy);
+    return out;
+}
+
+std::vector<Film> renderForwardSharedCuda(const Scene& scene,
+                                          const std::vector<Camera>& cams,
+                                          const std::vector<int>& resX,
+                                          const std::vector<int>& resY,
+                                          long long N, EnergyReport& eOut, bool diffraction,
+                                          char camMode, unsigned long long seedBase,
+                                          bool wavefront) {
+    using namespace gpu;
+    int nc = (int)cams.size();
+    std::vector<Film> out(nc);
+    for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
+    if (nc == 0 || !cudaAvailable() || !cudaForwardSupported(scene)) return out;
+
+    // Bake the scene ONCE, then bake every camera against it (the win: one photon set,
+    // splat to all cameras). Shared pass is model A or B only (C consumes the photon).
+    DUpload up;
+    buildUploadScene(scene, up);
+    std::vector<DCamera> hcams(nc);
+    for (int c = 0; c < nc; ++c) hcams[c] = bakeCamera(scene, cams[c], resX[c], resY[c], up);
+
+    // Per-camera film / hits device buffers (each camera keeps its own resolution).
+    std::vector<double*> d_films(nc, nullptr), d_hits(nc, nullptr);
+    std::vector<size_t>  npix(nc);
+    for (int c = 0; c < nc; ++c) {
+        npix[c] = (size_t)resX[c] * resY[c];
+        CUDA_CHECK(cudaMalloc(&d_films[c], npix[c] * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_films[c], 0, npix[c] * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&d_hits[c], npix[c] * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_hits[c], 0, npix[c] * sizeof(double)));
+    }
+    double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
+
+    int camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
+    DCamSet cs = makeCamSet(up, hcams, d_films, d_hits);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt);
+
+    // --- download each camera's film ---
+    for (int c = 0; c < nc; ++c) {
+        std::vector<double> film(npix[c] * 3);
+        CUDA_CHECK(cudaMemcpy(film.data(), d_films[c], film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits[c], npix[c] * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix[c]; ++i)
+            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+    }
+    // The photon trace is shared, so energy is counted once for the whole pass.
+    double energy[5] = {0,0,0,0,0};
+    CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
+    eOut.emitted  += energy[0];
+    eOut.absorbed += energy[1];
+    eOut.sensor   += energy[2];
+    eOut.escaped  += energy[3];
+    eOut.residual += energy[4];
+
+    freeUpload(up);
+    for (int c = 0; c < nc; ++c) { cudaFree(d_films[c]); cudaFree(d_hits[c]); }
+    cudaFree(d_energy);
     return out;
 }
 
