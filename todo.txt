@@ -1,3 +1,14 @@
+"Mature renderers reflect this by combining them (VCM/UPS = BDPT ∪ photon mapping under MIS), which is the real endgame."
+^ doing, plus more analytic specular connections for more modes
+
+/graphify when done.
+
+when you get a chance, let's solve both the tech debt problems. but regarding the  fog, i'd take it a step further: allow a way to define blobs of fog with unclear boundaries. what would be a good way to do that? an isosurface with a definabl fall-off with distance from the surface? even define the fall-off based on U-V map of the isosurface? a formala determining fog density via x-y-z location?
+^ done
+
+in addition to the fog isosurface-like function possibilities i described, let's also have fog determinable simply per object/medium like you said earlier. (for example, the whole inside of a glass sphere)
+^ doing
+
 forward renderer
 - one photon at a time, selected from one of the light sources, at one of its component frequencies (configurable frequency bin size?), at random using the proper distribution
 - light sources defined by spectral envelope too; built-in common types (sunlight / color temperature) plus artificial sources (incandescent, LED, fluorescent)
@@ -22,8 +33,6 @@ forward renderer
 The subtlety — and it's important given your physical-lens goal: you cannot connect a diffuse bounce through the lens glass, because refractive lens elements are specular (delta BSDF) and the connection probability is zero (this is the SDS problem again). The fix: connect to the entrance pupil (the front of the lens system), and once you have a position+direction hitting the pupil, the path through the lens elements is deterministic (specular refraction is deterministic given a ray) — trace it through the elements, and if it lands on the film, splat. So (B) works even with a full physical multi-element lens; you're just importance-sampling the pupil instead of praying a photon flies into it. Crucially, each photon is still independent → still GPU-friendly.
 - forward-only rendering (including supporting mirrors, etc.) if the user opts out of connect/splat
 
-how much more computationally expensive would it be for the entire thing to use wave mechanics instead of photons?
-
 ok, let's add some native primitives to our renderer! metaballs, whatever those are, i especially like the idea of isosurfaces (and let the math define more than just boundaries, but transparency, iridescence, fluorescence, transparency, translucency, mirror?), and what other useful primitives does pov-ray have? and how about pov-ray's rounded intersections of primitives?
 ^ doing
 
@@ -33,8 +42,23 @@ let's have both isosurface algorithms, selectable within the isosurface language
 Isosurfaces — the general case: any scalar field f(x,y,z), surface = {p : f(p)=0}. Metaballs, gyroids, tori, hearts, noise-perturbed spheres all fall out of the function. Two ways to intersect a ray:
 Sphere-tracing an SDF (signed distance function): step by the field value, guaranteed not to overshoot. Fast, robust, but the field must be a true distance (or Lipschitz-bounded).
 Root-finding a general f along the ray: sample f at intervals, bracket a sign change, bisect/regula-falsi. Handles arbitrary f (POV-Ray's approach) but needs a max_gradient/step budget to not miss thin features. 
+^ done
 
-^^ did you make both of those options for generalized isosurface expressions?
+is there any way we can have the UV map for the custom expressions determining material composition for native objects as well as mesh objects, so that we can include U-V variable support? Just use the same algorithm used to wrap UV around meshes but adapted to wrap around native objects?
+^ done
 
+maybe we could provide a primitive to specify a bunch of cameras in a pattern: a 3d curve  specified by points the curve passes through, plus a number of cameras per unit length? but how would the user specify "speed" of the camera moving (as in number of cameras per unit length that varies over the curve, according to a separate curve)?
+can you convert mirror_selfie.ftsl to a png? what's the command to do that? is it in the readme?
+^ done
+
+"I can implement this now — it's pure ftsl.h (a new addCameraCurve next to the two I just wrote), and it'll compile and test in the same build cycle that's currently blocked by your renders. Want me to build it with the density/density_at + look tangent|look_at|look_curve grammar above? I'll fold it into the pending commit alongside camera_orbit and the UV work." yes. don't forget to add it to the language ref.
+^ done
+
+"Still pending (blocked on the two 8192-spp renders that lock the main ftrace.exe): the build2 compile will validate the CPU side of the UV + orbit changes; the CUDA render_cuda.cu path can't be built here (nvcc isn't on this shell's PATH) and will need a rebuild in the CUDA-configured build/ once the renders release the exe. Then: commit the whole batch, and verify the final showcase.png/mirror_selfie.png."
+
+make a new showcase.png with the new wall that gets rid of the dark spots in the gold structure and also has enough photons for zero graininess after, this one renders.
+
+please make the proper fix now (detect NaN framebuffer post-kernel and fail loudly instead of writing a black PNG)
+"Good idea to do this properly. Let me study the code first — the auto-exposure fallback and the GPU render output path. (I'll do all the code work now, but hold any GPU testing until the showcase render finishes, to avoid the very contention that causes this bug.)"
 
 

@@ -12,7 +12,7 @@
 #include "texture.h"
 #include "envmap.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -39,6 +39,13 @@ struct Material {
     // attenuating glass; also the `absorb` target a field_material can drive). 0 =
     // colorless (default, bit-identical to before). Only consulted for Dielectric.
     Spectrum absorb  = constantSpectrum(0.0);
+    // Diffuse TRANSMISSION albedo vs lambda (MatType::DiffuseTransmit only). The
+    // translucent material is a two-lobe Lambertian: `reflect` scatters cosine-
+    // distributed into the FRONT hemisphere (+n), `transmit` into the BACK hemisphere
+    // (-n). reflect+transmit must be <= 1 per wavelength (the rest is absorbed). Because
+    // both lobes are non-specular, a directly-viewed translucent solid CONNECTS to the
+    // pinhole and is visible in mode B (unlike clear dielectric, which stays black).
+    Spectrum transmit = constantSpectrum(0.0);
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;
@@ -187,11 +194,49 @@ inline Material makeFluoroMaterial() {
 // Monte Carlo), so photon throughput stays unchanged — matching the rest of the
 // renderer. Coefficients are spectral, so wavelength-dependent (e.g. Rayleigh
 // ~1/lambda^4) fog that scatters blue and transmits red works for free.
+// Shape of a medium's optional spatial bound: an axis-aligned box or a sphere. A
+// sphere bound fills exactly an object-shaped region (e.g. "the whole inside of a
+// glass sphere") — author the same center/radius as the sphere geometry.
+enum class MediumBound { Box, Sphere, Implicit };
+
 struct Medium {
     bool enabled = false;
     Spectrum sigma_a = constantSpectrum(0.0); // absorption coefficient vs lambda
     Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
     double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
+
+    // --- Optional heterogeneous density field (fuzzy / bounded fog) ----------
+    // When `density` is non-empty, the base coefficients sigma_a/sigma_s are
+    // MULTIPLIED by a dimensionless scalar field density(x,y,z) >= 0 evaluated per
+    // point (a compiled pattern program over x y z r, §6.1 of FTSL.md). This shapes
+    // the haze into blobs with soft, formula-defined boundaries. Empty => density
+    // is 1 everywhere (the classic homogeneous medium; unchanged behaviour).
+    std::vector<PatNode> density;
+    double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
+
+    // --- Optional spatial bound (localized / per-object fog) ----------------
+    // When `bounded`, the medium exists only inside a region: an axis-aligned box
+    // [bmin,bmax] (`boundShape == Box`) or a sphere centered `bcenter` radius
+    // `bradius` (`boundShape == Sphere`, e.g. the interior of a glass sphere). A
+    // photon's fog interaction and connect-transmittance are clipped to the ray's
+    // overlap with the region. Unbounded => the medium fills the whole scene. For a
+    // sphere bound, bmin/bmax hold the sphere's AABB (used by the density majorant
+    // grid estimate) so heterogeneous density fields work inside a sphere too.
+    bool bounded = false;
+    MediumBound boundShape = MediumBound::Box;
+    Vec3 bmin{0, 0, 0}, bmax{0, 0, 0};
+    Vec3 bcenter{0, 0, 0};
+    double bradius = 0.0;
+
+    // --- Optional implicit/isosurface bound (fog shaped by a named field) ------
+    // When `boundShape == Implicit`, the medium fills the region inside a compiled
+    // scalar field program: a point p is INSIDE when fieldEval(p) < 0 (if
+    // boundInsideNeg) or > 0 (otherwise). bmin/bmax hold the field's AABB (for the
+    // majorant grid and ray clipping). This lets fog take the exact shape of a
+    // metaball / SDF isosurface authored elsewhere in the scene by name.
+    std::vector<FieldNode> boundField;      // compiled field nodes (world-space)
+    std::vector<PatNode>   boundFieldExpr;  // shared expression pool for the field
+    bool boundInsideNeg = true;             // inside test: fieldEval < 0 (true) or > 0
 
     double sigmaT(double lambda) const {
         return std::max(0.0, sigma_a(lambda) + sigma_s(lambda));
@@ -200,6 +245,69 @@ struct Medium {
         double s = std::max(0.0, sigma_s(lambda));
         double t = s + std::max(0.0, sigma_a(lambda));
         return t > 0.0 ? s / t : 0.0;
+    }
+
+    // Inside-test for an implicit-shaped bound: is world point p within the field?
+    bool insideField(const Vec3& p) const {
+        double f = fieldEval(boundField.data(), (int)boundField.size(), p,
+                             boundFieldExpr.data());
+        return boundInsideNeg ? (f < 0.0) : (f > 0.0);
+    }
+
+    // A medium is "heterogeneous" (needs delta/ratio tracking rather than an exact
+    // analytic free-flight) when it has a density field OR an implicit bound, since
+    // an implicit membership makes the effective density spatially varying (1 inside,
+    // 0 outside) even when the base coefficients are constant.
+    bool heterogeneous() const {
+        return !density.empty() || boundShape == MediumBound::Implicit;
+    }
+
+    // Dimensionless density multiplier at a world point (>= 0). 1 for a homogeneous
+    // medium. Evaluated by the shared pattern VM (x y z r live; f/normal/uv read 0).
+    // For an implicit bound the multiplier is 0 outside the field (the medium simply
+    // does not exist there), so delta/ratio tracking carves out the exact iso-shape.
+    double densityAt(const Vec3& p) const {
+        if (boundShape == MediumBound::Implicit && !insideField(p)) return 0.0;
+        if (density.empty()) return 1.0;
+        PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        double d = patternEval(density.data(), (int)density.size(), c);
+        return d > 0.0 ? d : 0.0;
+    }
+
+    // Clip a ray (o + t*d, t in [t0,t1]) to the bound, returning the sub-interval
+    // [ta,tb] that lies inside the medium. Returns false if the ray misses the box.
+    // Unbounded media pass the interval through unchanged.
+    bool clipToBounds(const Vec3& o, const Vec3& d, double t0, double t1,
+                      double& ta, double& tb) const {
+        if (!bounded) { ta = t0; tb = t1; return t1 > t0; }
+        if (boundShape == MediumBound::Sphere) {
+            // Ray (o + t*d) ∩ sphere → the [ta,tb] chord inside the sphere, intersected
+            // with [t0,t1]. Origins inside the sphere give a negative near root (clamped
+            // to t0). No hit / chord outside [t0,t1] => the ray never enters the fog.
+            Vec3 oc = o - bcenter;
+            double A = dot(d, d);
+            double B = 2.0 * dot(oc, d);
+            double C = dot(oc, oc) - bradius * bradius;
+            double disc = B * B - 4.0 * A * C;
+            if (disc <= 0.0 || A <= 0.0) return false;
+            double sd = std::sqrt(disc);
+            double s0 = (-B - sd) / (2.0 * A), s1 = (-B + sd) / (2.0 * A);
+            double lo = std::max(t0, s0), hi = std::min(t1, s1);
+            if (lo > hi) return false;
+            ta = lo; tb = hi; return tb > ta;
+        }
+        double lo = t0, hi = t1;
+        for (int a = 0; a < 3; ++a) {
+            double oa = (&o.x)[a], da = (&d.x)[a];
+            double mn = (&bmin.x)[a], mx = (&bmax.x)[a];
+            if (std::fabs(da) < 1e-12) { if (oa < mn || oa > mx) return false; continue; }
+            double inv = 1.0 / da;
+            double s0 = (mn - oa) * inv, s1 = (mx - oa) * inv;
+            if (s0 > s1) std::swap(s0, s1);
+            lo = std::max(lo, s0); hi = std::min(hi, s1);
+            if (lo > hi) return false;
+        }
+        ta = lo; tb = hi; return tb > ta;
     }
 };
 
@@ -408,7 +516,24 @@ struct Scene {
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
     Sensor sensor;
-    Medium medium;   // optional global fog / participating medium (disabled by default)
+    // Participating media. Zero or more independent regions (global haze, bounded
+    // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
+    // them as superposed: extinction adds (sigma_t = sum over media containing the
+    // point), so transmittance is the product of per-medium transmittances and a
+    // collision is the earliest of the media's independent free-flight samples (with
+    // the scattering medium chosen by the Poisson superposition theorem). Empty =>
+    // vacuum. (The backward/BDPT modes are homogeneous-only and use backwardMedium().)
+    std::vector<Medium> media;
+
+    // Backward/BDPT (modes R/V/D and the P composite) support only a single GLOBAL
+    // HOMOGENEOUS haze; they ignore density/bounds. This returns the medium they use
+    // as that haze — the first authored medium — or a disabled default if there is
+    // none. main.cpp warns when an authored medium carries density/bounds for these modes.
+    const Medium& backwardMedium() const {
+        static const Medium none;   // disabled (enabled=false) sentinel
+        return media.empty() ? none : media.front();
+    }
+    bool anyMedium() const { return !media.empty(); }
 
     // Emitters. Forward tracing selects one per photon with probability
     // proportional to power (so every photon carries beta = totalPower, keeping
@@ -727,7 +852,7 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
 
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
 // implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
-inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n); }
+inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern
 // value, or `dflt` if `pat` is out of range.

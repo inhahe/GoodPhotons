@@ -15,9 +15,14 @@
 // Material scope: Diffuse and Glossy are CONNECTIBLE (non-delta) vertices; the
 // specular family (Dielectric, Mirror, HalfMirror, ThinFilm, Multilayer, Grating)
 // are delta pass-through vertices that carry a chain but never connect (their
-// connection pdf is zero). Emission comes from area/sphere quad lights. Fluorescence,
-// participating media, spot and environment lights are NOT handled here (a scene
-// using them should be rendered with mode B/P/R instead); see the guard in main.cpp.
+// connection pdf is zero). Emission comes from area/sphere quad lights. HOMOGENEOUS
+// participating media ARE handled: a subpath can scatter at a volume (Medium) vertex
+// via the HG phase function, connections carry a transmittance factor, and the
+// balance-heuristic MIS uses cosine-free phase densities (the σt·exp free-flight and
+// transmittance terms cancel pairwise for homogeneous media, so this is exactly
+// unbiased). Heterogeneous / density-field / implicit-bounded media, fluorescence,
+// spot and environment lights are NOT handled here (use mode B/P/R instead); see the
+// guard in main.cpp.
 #pragma once
 #include <vector>
 #include <algorithm>
@@ -45,7 +50,29 @@ inline double glossyExponent(double roughness) {
 // the specular family is delta (zero connection pdf) and only forms chains.
 inline bool isConnectibleMat(const Material& m) {
     return m.type == MatType::Diffuse || m.type == MatType::Glossy ||
-           m.type == MatType::Fluorescent;   // fluoro's elastic base is diffuse-like
+           m.type == MatType::Fluorescent ||   // fluoro's elastic base is diffuse-like
+           m.type == MatType::DiffuseTransmit;  // two-sided Lambertian (finite BSDF both sides)
+}
+
+// A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
+// connection edge on the side OPPOSITE the shading normal is legal (transmit lobe).
+// Reflect-only materials require the edge on the +ns side; the surface-cosine sign guards
+// in connectBDPT must not reject the back hemisphere for these materials — bsdfF (which
+// returns 0 for unsupported directions) is the real validity gate, and the geometry term
+// uses |cos| accordingly.
+inline bool isTwoSidedMat(const Material& m) {
+    return m.type == MatType::DiffuseTransmit;
+}
+
+// Clamped reflect/transmit albedos of a DiffuseTransmit vertex (energy guard shared by
+// bsdfF / bsdfPdf / the scatter switch so MIS densities stay consistent).
+inline void diffuseTransmitAlbedos(const Material& m, double lambda, const Scene& scene,
+                                   const Hit* hitForTex, double& rhoR, double& rhoT) {
+    rhoR = hitForTex ? clamp01(diffuseReflectance(scene, m, *hitForTex, lambda))
+                     : clamp01(m.reflect(lambda));
+    rhoT = clamp01(m.transmit(lambda));
+    double sum = rhoR + rhoT;
+    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
 
 // Evaluate the BSDF value f at a surface vertex for the pair (wo, wi), both unit
@@ -84,6 +111,14 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             double lobe = (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
             return r * lobe / cosWi;   // denom = sampled-direction cosine (see header)
         }
+        case MatType::DiffuseTransmit: {
+            // Two-sided Lambertian: same-hemisphere pair (wo,wi) -> reflect albedo,
+            // opposite hemispheres -> transmit albedo. Symmetric in wo<->wi.
+            double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
+            bool sameSide = (cosWi * cosWo) > 0.0;
+            double rho = sameSide ? rhoR : rhoT;
+            return rho / PI;
+        }
         default: return 0.0;   // delta materials have no finite BSDF value
     }
 }
@@ -95,7 +130,7 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // bound, so the density matches the sampling that used the same textured roughness —
 // essential for unbiased MIS. Pass nullptr where no hit UV is available (constant).
 inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
-                      const Scene& scene, const Hit* hitForTex) {
+                      double lambda, const Scene& scene, const Hit* hitForTex) {
     double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
     switch (m.type) {
         case MatType::Diffuse:
@@ -111,6 +146,18 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
             double cosLobe = dot(wi, mdir);
             if (cosLobe <= 0) return 0.0;
             return (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
+        }
+        case MatType::DiffuseTransmit: {
+            // Directional pdf of the lobe-selected cosine sampling: the reflect lobe is
+            // chosen with prob rhoR/(rhoR+rhoT) and cosine-samples the same hemisphere as
+            // wo; the transmit lobe (prob rhoT/(rhoR+rhoT)) cosine-samples the opposite
+            // hemisphere. For a given wi only one lobe applies (by its sign vs wo).
+            double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
+            double tot = rhoR + rhoT;
+            if (tot <= 0.0) return 0.0;
+            bool sameSide = (cosWi * cosWo) > 0.0;
+            double pSel = sameSide ? rhoR / tot : rhoT / tot;
+            return pSel * std::fabs(cosWi) / PI;
         }
         default: return 0.0;
     }
@@ -139,7 +186,11 @@ inline double cameraPdfDir(const Camera& cam, double cosCam) {
 }
 
 // --- Path vertex -----------------------------------------------------------------
-enum class VType { Camera, Light, Surface };
+// A Medium vertex is a volume in-scatter point (participating media): it has no
+// surface (no ns/ng, no material), scatters via the HG phase function, and is always
+// connectible. onSurface() is false for it, so ConvertDensity omits the cosine (the
+// area density at a medium interaction is cosine-free) — see the MIS notes below.
+enum class VType { Camera, Light, Surface, Medium };
 
 struct Vertex {
     VType type = VType::Surface;
@@ -161,10 +212,16 @@ struct Vertex {
     // Light data (type == Light, or a Surface that is emissive)
     const Emitter* light = nullptr;
 
+    // Medium data (type == Medium): HG anisotropy g and index into scene.media of the
+    // medium that scattered here (for the phase function value and pdf).
+    double mediumG = 0.0;
+    int mediumId = -1;
+
     bool onSurface() const { return type == VType::Surface || type == VType::Light; }
     bool isConnectible() const {
         if (type == VType::Camera) return true;      // pinhole connects (delta pos handled)
         if (type == VType::Light)  return light && !light->collimated;
+        if (type == VType::Medium) return true;      // volume in-scatter always connects
         return mat && !delta && isConnectibleMat(*mat);
     }
     // Emitted radiance (single wavelength) leaving this vertex toward direction w,
@@ -179,9 +236,38 @@ struct Vertex {
     }
 };
 
+// Henyey-Greenstein phase function value AND sampling pdf at a medium vertex `v`, for
+// an incoming subpath direction `wo` (toward the previous vertex) and an outgoing /
+// connection direction `wi` (both unit, both pointing AWAY from v). The propagation
+// direction INTO v is -wo; the scattered direction is wi; the phase cosine is therefore
+//   cosTheta = dot(-wo, wi) = -dot(wo, wi).
+// hgPhase is normalized over the sphere, so it is its own pdf (sampleHG draws from it):
+// phaseF == phasePdf. Two names are kept for readability at the call sites (BSDF value
+// vs BSDF pdf on the surface side map to these on the medium side).
+inline double phaseF(const Vertex& v, const Vec3& wo, const Vec3& wi) {
+    return hgPhase(-dot(wo, wi), v.mediumG);
+}
+inline double phasePdf(const Vertex& v, const Vec3& wo, const Vec3& wi) {
+    return hgPhase(-dot(wo, wi), v.mediumG);
+}
+
+// In-scatter CONNECTION response at a medium vertex = single-scattering albedo (σs/σt)
+// times the phase function. The albedo factor is the fraction of the σt-sampled
+// collision that scatters (rather than absorbs); the subpath continuation applies the
+// same albedo implicitly via Russian-roulette survival, so a medium vertex carries the
+// albedo exactly once — through RR when the path passes through it, or through this
+// factor when the path connects at it. This mirrors the forward connectVolume and the
+// backward volume-NEE (render.h / backward.h), which both use albedo*phase. Note this
+// is a THROUGHPUT factor, not a density: MIS pdfs use the phase pdf alone (no albedo).
+inline double mediumScatterF(const Vertex& v, const Vec3& wo, const Vec3& wi,
+                             double lambda, const Scene& scene) {
+    return scene.media[v.mediumId].albedo(lambda) * phaseF(v, wo, wi);
+}
+
 // Convert a solid-angle pdf `pdfW` of leaving `from` toward `to` into an area-
 // measure density at `to` (PBRT's Vertex::ConvertDensity). Surfaces pick up the
-// projected-cosine Jacobian; the 1/dist^2 is always applied.
+// projected-cosine Jacobian; the 1/dist^2 is always applied. A Medium `to` is NOT
+// onSurface(), so it stays cosine-free (correct volume area density).
 inline double convertDensity(double pdfW, const Vertex& from, const Vertex& to) {
     Vec3 w = to.p - from.p;
     double d2 = dot(w, w);
@@ -220,7 +306,8 @@ inline double camCos(const Camera& cam, const Vec3& p) {
 // Area-measure pdf of sampling `next` by scattering at `cur` (arriving from `prev`),
 // PBRT's Vertex::Pdf. For a Light `cur` this is the emission density (pdfLight).
 inline double vertexPdf(const Scene& scene, const Camera& cam,
-                        const Vertex* prev, const Vertex& cur, const Vertex& next);
+                        const Vertex* prev, const Vertex& cur, const Vertex& next,
+                        double lambda);
 inline double vertexPdfLight(const Camera& cam, const Vertex& cur, const Vertex& next);
 
 // Emission directional density at a light vertex `cur` toward `next`, area measure.
@@ -239,7 +326,8 @@ inline double vertexPdfLight(const Camera& /*cam*/, const Vertex& cur, const Ver
 }
 
 inline double vertexPdf(const Scene& scene, const Camera& cam,
-                        const Vertex* prev, const Vertex& cur, const Vertex& next) {
+                        const Vertex* prev, const Vertex& cur, const Vertex& next,
+                        double lambda) {
     if (cur.type == VType::Light) return vertexPdfLight(cam, cur, next);
     Vec3 wn = next.p - cur.p;
     if (dot(wn, wn) == 0.0) return 0.0;
@@ -247,12 +335,18 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
     double pdfW = 0.0;
     if (cur.type == VType::Camera) {
         pdfW = cameraPdfDir(cam, camCos(cam, next.p));
+    } else if (cur.type == VType::Medium) {          // volume in-scatter: HG phase pdf
+        if (!prev) return 0.0;
+        Vec3 wp = prev->p - cur.p;
+        if (dot(wp, wp) == 0.0) return 0.0;
+        wp = normalize(wp);
+        pdfW = phasePdf(cur, wp, wn);
     } else {                                         // Surface
         if (!prev || !cur.mat) return 0.0;
         Vec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.0) return 0.0;
         wp = normalize(wp);
-        pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn, scene, &cur.hit);
+        pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn, lambda, scene, &cur.hit);
     }
     return convertDensity(pdfW, cur, next);
 }
@@ -270,8 +364,9 @@ inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is
 // the first ray leaving that endpoint; `beta` the throughput carried along it;
 // `pdfDir` the solid-angle density of that first direction; `mode` the transport
-// direction. Appends surface vertices until a miss, absorption, or maxDepth. No
-// environment/medium handling (BDPT scope). Uses `mats` for specular primitives.
+// direction. Appends surface AND medium (volume in-scatter) vertices until a miss,
+// absorption, or maxDepth. No environment handling (BDPT scope). Uses `mats` for
+// specular primitives and participating-media collision sampling.
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, double lambda,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path) {
@@ -281,16 +376,67 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
     const Material* interior = nullptr;   // dielectric the subpath is inside (colored glass)
     for (int bounces = 0;;) {
         Hit h = scene.closestHit(ray);
-        if (!h.valid) return;                        // escaped (no env in BDPT scope)
-        if (h.sensorId >= 0) return;                 // model-A sensor: not used in BDPT
+        if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
+        double dSurf = h.valid ? h.t : 1e30;
 
-        // Beer-Lambert attenuation over the in-glass segment just traversed. NOTE:
-        // this attenuates only the *subpath walk*; connection edges (connectBDPT)
-        // that cross glass are NOT absorption-weighted (see known-issues.md).
+        // Participating media: sample the earliest real collision along the ray up to
+        // the surface (or 1e30 in open space). A homogeneous medium draws one exact
+        // free-flight; its transmittance is implicit in that exponential so beta is
+        // unchanged (analog MC), exactly matching modes B/C. With no media this call
+        // draws no RNG and returns false, so vacuum walks are bit-identical.
+        double dEvent = dSurf;
+        bool mediumEvent = false;
+        int scatterMed = -1;
+        double tMed = 0.0;
+        if (!scene.media.empty()) {
+            int which;
+            if (mats.sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda,
+                                          rng, tMed, which)) {
+                dEvent = tMed; mediumEvent = true; scatterMed = which;
+            }
+        }
+
+        // Beer-Lambert attenuation over the in-glass segment just traversed, up to the
+        // event (surface hit OR medium collision, whichever is nearer). NOTE: this
+        // attenuates only the *subpath walk*; connection edges (connectBDPT) that cross
+        // glass are NOT absorption-weighted (see known-issues.md).
         if (interior) {
             double a = interior->absorb(lambda);
-            if (a > 0.0) beta *= std::exp(-a * h.t);
+            if (a > 0.0) beta *= std::exp(-a * dEvent);
         }
+
+        // A medium collision precedes the surface: append a volume in-scatter vertex,
+        // then scatter (prob = single-scattering albedo) or absorb. Throughput is
+        // unchanged on scatter; the HG sampling pdf equals the phase value, so the
+        // f*cos/pdf factor collapses to 1 (analog MC), matching the forward tracer.
+        // The stored area densities are cosine-free (Medium is not onSurface()) and
+        // carry ONLY the phase direction density — the free-flight distance pdf and
+        // transmittance are omitted here AND in vertexPdf, so they cancel pairwise in
+        // every balance-heuristic ratio (exact for homogeneous media).
+        if (mediumEvent) {
+            const Medium& sm = scene.media[scatterMed];
+            Vec3 mpos = ray.o + ray.d * tMed;
+            size_t prevIdx = path.size() - 1;
+            Vertex v;
+            v.type = VType::Medium;
+            v.p = mpos; v.beta = beta;
+            v.mediumG = sm.g; v.mediumId = scatterMed;
+            v.pdfFwd = convertDensity(pdfFwd, path[prevIdx], v);
+            path.push_back(v);
+            if (++bounces >= maxDepth) return;
+            if (rng.uniform() >= sm.albedo(lambda)) return;   // absorbed (vertex retained)
+            Vertex& cur = path.back();
+            Vec3 wo = normalize(path[prevIdx].p - cur.p);     // toward the previous vertex
+            Vec3 wi = sampleHG(ray.d, sm.g, rng);             // scattered propagation dir
+            double pdfW    = phasePdf(cur, wo, wi);           // HG is its own pdf
+            double pdfRevW = phasePdf(cur, wi, wo);
+            path[prevIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevIdx]);
+            ray = Ray{mpos, wi};
+            pdfFwd = pdfW;
+            continue;
+        }
+
+        if (!h.valid) return;                        // escaped (no env in BDPT scope)
 
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
@@ -323,8 +469,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = cosineHemisphere(cur.ns, rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
-                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, scene, &h);
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, scene, &h);
+                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = rho;                     // f*cos/pdf = rho
                 if (rho <= 0) terminate = true;
                 break;
@@ -334,10 +480,27 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(mp->reflect(lambda));
-                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, scene, &h);
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, scene, &h);
+                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = r;                       // f*cos/pdf = r
                 if (r <= 0 || pdfW <= 0) terminate = true;
+                break;
+            }
+            case MatType::DiffuseTransmit: {
+                // Pick the reflect or transmit lobe in proportion to their albedos, then
+                // cosine-sample the corresponding hemisphere (front = +ns, back = -ns).
+                // f*cos/pdf collapses to the TOTAL albedo (rhoR+rhoT) either way, so the
+                // throughput darkens by the total albedo per bounce (expected-value, like
+                // the Diffuse case). MIS densities come from bsdfPdf (lobe-select * cos/PI).
+                double rhoR, rhoT; diffuseTransmitAlbedos(*mp, lambda, scene, &h, rhoR, rhoT);
+                double tot = rhoR + rhoT;
+                if (tot <= 0.0) { terminate = true; break; }
+                if (rng.uniform() * tot < rhoR) wi = cosineHemisphere(cur.ns, rng);   // reflect
+                else                            wi = cosineHemisphere(cur.ns * -1.0, rng); // transmit
+                pdfW    = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
+                betaFactor = tot;                     // f*cos/pdf = rhoR+rhoT
+                if (pdfW <= 0) terminate = true;
                 break;
             }
             case MatType::Mirror: {
@@ -513,7 +676,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
 // are mutated in place but restored by the ScopedAssigns before returning.
 inline double misWeight(const Scene& scene, const Camera& cam,
                         std::vector<Vertex>& light, std::vector<Vertex>& eye,
-                        Vertex& sampled, int s, int t) {
+                        Vertex& sampled, int s, int t, double lambda) {
     if (s + t == 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
     Vertex* qs  = s > 0 ? &light[s - 1] : nullptr;
@@ -534,22 +697,22 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     // Reverse density of the eye connection vertex pt.
     ScopedAssign<double> a4;
     if (pt) {
-        double val = (s > 0) ? vertexPdf(scene, cam, qsM, *qs, *pt)
+        double val = (s > 0) ? vertexPdf(scene, cam, qsM, *qs, *pt, lambda)
                              : vertexPdfLightOrigin(scene, *pt);
         a4 = ScopedAssign<double>(&pt->pdfRev, val);
     }
     // Reverse density of pt's predecessor.
     ScopedAssign<double> a5;
     if (ptM) {
-        double val = (s > 0) ? vertexPdf(scene, cam, qs, *pt, *ptM)
+        double val = (s > 0) ? vertexPdf(scene, cam, qs, *pt, *ptM, lambda)
                              : vertexPdfLight(cam, *pt, *ptM);
         a5 = ScopedAssign<double>(&ptM->pdfRev, val);
     }
     // Reverse density of the light connection vertex qs and its predecessor.
     ScopedAssign<double> a6;
-    if (qs) a6 = ScopedAssign<double>(&qs->pdfRev, vertexPdf(scene, cam, ptM, *pt, *qs));
+    if (qs) a6 = ScopedAssign<double>(&qs->pdfRev, vertexPdf(scene, cam, ptM, *pt, *qs, lambda));
     ScopedAssign<double> a7;
-    if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM));
+    if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM, lambda));
 
     double sumRi = 0.0, ri = 1.0;
     for (int i = t - 1; i > 0; --i) {                // hypothetical camera strategies
@@ -576,6 +739,14 @@ inline Vec3 offsetOrigin(const Vertex& v, const Vec3& dir) {
     return v.p + v.ng * (sgn * 1e-6);
 }
 
+// Connection-ray origin at a connectible vertex. A surface offsets off its geometric
+// normal (above); a medium in-scatter point has no surface to self-occlude against, so
+// the exact point is used (the transmittance factor accounts for the fog it sits in).
+inline Vec3 connOrigin(const Vertex& v, const Vec3& dir) {
+    if (v.type == VType::Medium) return v.p;
+    return offsetOrigin(v, dir);
+}
+
 // --- Connect one strategy (s,t) --------------------------------------------------
 // Returns the MIS-weighted radiance contribution of connecting the s-vertex light
 // subpath with the t-vertex eye subpath. For t==1 the contribution is a light-image
@@ -585,7 +756,6 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                           std::vector<Vertex>& light, std::vector<Vertex>& eye,
                           int s, int t, double lambda, double invPdfLambda,
                           Pcg32& rng, int& outPx, int& outPy, bool& isSplat) {
-    (void)mats;
     isSplat = false;
     // Can't connect ONTO a vertex that already sits on a light (PBRT guard).
     if (t > 1 && s != 0 && eye[t - 1].isLightVertex()) return 0.0;
@@ -618,14 +788,26 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (!cam.project(qs.p, px, py, cosCam, dist2)) return 0.0;
         double dist = std::sqrt(dist2);
         Vec3 wcam = (cam.eye - qs.p) / dist;
-        double cosSurf = dot(qs.ns, wcam);
-        if (cosSurf <= 0.0) return 0.0;
         Vec3 wo = normalize(light[s - 2].p - qs.p);
-        double f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
+        // Scattering value f and the endpoint cosine. A medium vertex has no surface:
+        // its phase function replaces the BSDF and the geometry cosine is 1.
+        double cosSurf, f;
+        if (qs.type == VType::Medium) {
+            cosSurf = 1.0;
+            f = mediumScatterF(qs, wo, wcam, lambda, scene);
+        } else {
+            cosSurf = dot(qs.ns, wcam);
+            // Reflect-only vertices require the +ns side; a two-sided vertex may connect on
+            // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
+            if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
+            f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
+        }
         if (f <= 0.0) return 0.0;
-        if (scene.occluded(offsetOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
-        double G = cosSurf * cosCam / dist2;
-        L = qs.beta * f * G * cameraWe(cam, cosCam);
+        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
+        // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
+        double Tr = mats.mediaTransmittance(scene.media, qs.p, wcam, dist, lambda, rng);
+        double G = std::fabs(cosSurf) * cosCam / dist2;
+        L = qs.beta * f * G * cameraWe(cam, cosCam) * Tr;
         if (L <= 0.0) return 0.0;
         sampled.type = VType::Camera; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
         sampled.beta = 1.0; sampled.delta = false;
@@ -644,19 +826,28 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (dist2 <= 0.0) return 0.0;
         double dist = std::sqrt(dist2); Vec3 wi = toL / dist;
         double cosLight = dot(nOut, wi * -1.0);
-        double cosSurf  = dot(pt.ns, wi);
-        if (cosLight <= 0.0 || cosSurf <= 0.0) return 0.0;
+        if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
+        Vec3 wo = normalize(eye[t - 2].p - pt.p);
+        // Scattering value f and endpoint cosine (phase / cos=1 at a medium vertex).
+        double cosSurf, f;
+        if (pt.type == VType::Medium) {
+            cosSurf = 1.0;
+            f = mediumScatterF(pt, wo, wi, lambda, scene);
+        } else {
+            cosSurf = dot(pt.ns, wi);
+            if (cosSurf == 0.0 || (!isTwoSidedMat(*pt.mat) && cosSurf < 0.0)) return 0.0;
+            f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
+        }
+        if (f <= 0.0) return 0.0;
         double Le = em.spdFn(lambda) * invPdfLambda;
         if (Le <= 0.0) return 0.0;
-        if (scene.occluded(offsetOrigin(pt, wi), wi, dist - 2e-6)) return 0.0;
-        Vec3 wo = normalize(eye[t - 2].p - pt.p);
-        double f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
-        if (f <= 0.0) return 0.0;
+        if (scene.occluded(connOrigin(pt, wi), wi, dist - 2e-6)) return 0.0;
         double pdfChoice = em.power / scene.totalPower;
         double pdfA = pdfChoice / em.area;             // area-measure light pdf
         if (pdfA <= 0.0) return 0.0;
-        double G = cosSurf * cosLight / dist2;
-        L = pt.beta * f * Le * G / pdfA;
+        double Tr = mats.mediaTransmittance(scene.media, pt.p, wi, dist, lambda, rng);
+        double G = std::fabs(cosSurf) * cosLight / dist2;
+        L = pt.beta * f * Le * G / pdfA * Tr;
         if (L <= 0.0) return 0.0;
         sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.light = &em; sampled.matId = em.matId;
@@ -670,19 +861,32 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         Vec3 d = qs.p - pt.p; double dist2 = dot(d, d);
         if (dist2 <= 0.0) return 0.0;
         double dist = std::sqrt(dist2); Vec3 w = d / dist;   // pt -> qs
-        double cosE = dot(pt.ns, w), cosL = dot(qs.ns, w * -1.0);
-        if (cosE <= 0.0 || cosL <= 0.0) return 0.0;
         Vec3 woE = normalize(eye[t - 2].p - pt.p);
         Vec3 woL = normalize(light[s - 2].p - qs.p);
-        double fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
-        double fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
+        // Each endpoint is a surface (BSDF, cosine) or a medium (phase, cos=1).
+        double cosE, cosL, fE, fL;
+        if (pt.type == VType::Medium) {
+            cosE = 1.0; fE = mediumScatterF(pt, woE, w, lambda, scene);
+        } else {
+            cosE = dot(pt.ns, w);
+            if (cosE == 0.0 || (!isTwoSidedMat(*pt.mat) && cosE < 0.0)) return 0.0;
+            fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
+        }
+        if (qs.type == VType::Medium) {
+            cosL = 1.0; fL = mediumScatterF(qs, woL, w * -1.0, lambda, scene);
+        } else {
+            cosL = dot(qs.ns, w * -1.0);
+            if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
+            fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
+        }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
-        if (scene.occluded(offsetOrigin(pt, w), w, dist - 2e-6)) return 0.0;
-        double G = cosE * cosL / dist2;
-        L = pt.beta * fE * fL * qs.beta * G;
+        if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6)) return 0.0;
+        double Tr = mats.mediaTransmittance(scene.media, pt.p, w, dist, lambda, rng);
+        double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
+        L = pt.beta * fE * fL * qs.beta * G * Tr;
     }
     if (L <= 0.0) return 0.0;
-    return L * misWeight(scene, cam, light, eye, sampled, s, t);
+    return L * misWeight(scene, cam, light, eye, sampled, s, t, lambda);
 }
 
 // --- Renderer --------------------------------------------------------------------

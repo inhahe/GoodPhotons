@@ -98,43 +98,8 @@ using MtlResolver = std::function<int(const std::string&)>;
 // UVs). `axis` (0=x,1=y,2=z) is the projection/up axis. Coordinates are normalised
 // to [0,1] across the mesh AABB so the map wraps once over the object by default;
 // `repeat` wrap + a texture-space `scale` tile it further.
-enum class UvProjection { None = 0, Planar, Spherical, Cylindrical };
-
-inline UvProjection parseUvProjection(const std::string& s) {
-    if (s == "planar")      return UvProjection::Planar;
-    if (s == "spherical")   return UvProjection::Spherical;
-    if (s == "cylindrical") return UvProjection::Cylindrical;
-    return UvProjection::None;
-}
-
-// Project one world-space point to (u,v) given the mesh AABB (lo..hi), its centre,
-// the projection kind and the up/projection axis (0/1/2). Returns {u,v,0}.
-inline Vec3 projectUV(const Vec3& p, const Vec3& lo, const Vec3& hi,
-                      const Vec3& ctr, UvProjection proj, int axis) {
-    auto comp = [](const Vec3& v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); };
-    // The two axes orthogonal to `axis`, in a stable (right-handed-ish) order.
-    int a0 = (axis + 1) % 3, a1 = (axis + 2) % 3;
-    auto norm01 = [&](double val, int i) {
-        double l = comp(lo, i), h = comp(hi, i);
-        double d = h - l;
-        return d > 1e-12 ? (val - l) / d : 0.5;
-    };
-    if (proj == UvProjection::Planar) {
-        return Vec3{norm01(comp(p, a0), a0), norm01(comp(p, a1), a1), 0};
-    }
-    // Direction from the mesh centre (spherical/cylindrical share the azimuth).
-    Vec3 d = p - ctr;
-    double dz = comp(d, axis);
-    double dx = comp(d, a0), dy = comp(d, a1);
-    double azim = 0.5 + std::atan2(dy, dx) / (2.0 * PI);   // [0,1)
-    if (proj == UvProjection::Cylindrical) {
-        return Vec3{azim, norm01(comp(p, axis), axis), 0};
-    }
-    // Spherical: polar angle from the up axis.
-    double r = std::sqrt(dx * dx + dy * dy + dz * dz);
-    double v = (r > 1e-12) ? std::acos(std::max(-1.0, std::min(1.0, dz / r))) / PI : 0.5;
-    return Vec3{azim, v, 0};
-}
+// (UvProjection / parseUvProjection / projectUV now live in geometry.h so native
+// primitives can reuse the identical wrap — see there.)
 
 // Load an OBJ into the scene as triangles of material `matId`, applying the full
 // affine transform `xf` (translate + rotation + non-uniform scale). When `loadUV`

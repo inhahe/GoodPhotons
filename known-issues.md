@@ -3,7 +3,358 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Open bugs
+
+### `light cylinder` emits no illumination (tube is visible but lights nothing) — 2026-07-11
+
+A `light cylinder` renders as visible glowing emissive geometry (the tessellated
+lateral wall shows up when a camera ray hits it directly), but it does **not
+illuminate any other surface** — neither via next-event estimation nor via BSDF
+bounce. Reproduced with an isolation scene (`scraps/cyl_test.ftsl`): a white
+diffuse wall lit *only* by a `light cylinder` renders pure black behind the visibly-
+glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposure
+1.54e-14, i.e. zero contribution from the light). Contrast: `light sphere` and
+`light area` both illuminate correctly.
+
+- **Where:** `ftsl.h` `addLight` cylinder branch (~line 1496) calls
+  `L.scene.addCylinderLight(...)`, so the light is registered for sampling. The bug
+  is downstream in the light-sampling / direct-lighting path (`scene.h` /
+  `render.h` / `render_cuda.cu`) — the cylinder light is likely missing from (or
+  mis-weighted in) the NEE light-sampling switch, and its emissive tris are probably
+  excluded from BSDF-hit emission accounting (to avoid double counting) so both
+  contributions vanish.
+- **Repro:** `ftrace -in scraps/cyl_test.ftsl -mode R -device cpu -spp 128 -r 200 -o png/cyl_test.png` → wall is black.
+- **Proper fix:** ensure `sampleLight`/`lightPdf` (CPU and GPU) handle the cylinder
+  light type and return correct radiance+pdf, and/or let BSDF rays that hit the
+  cylinder's emissive tris contribute their emission with proper MIS. Then re-test
+  with `scraps/cyl_test.ftsl` (wall should light up).
+- **Workaround in scenes:** use `light sphere` (rings/stacks) or `light area` for
+  tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
+  accents + colored walls for this reason.
+
+## Tech debt
+
+### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU + GPU forward DONE 2026-07-12 (box/sphere/implicit bounds, density fields, multi-medium superposition, object-name bounds)
+**Resolved on the CPU forward tracer.** The `medium` block now takes an optional
+`bounds { min/max }` box (AABB the fog is clipped to) and an optional `density <expr>`
+scalar field (same infix expression VM as isosurface `function` fields — variables
+`x y z r`, constant `pi`) that multiplies `sigma_t` per point, so fog forms blobs with
+soft, formula-defined boundaries. Majorant is `density_max` (explicit or auto-estimated
+on a 24³ grid over `bounds`). Sampling uses unbiased **delta (Woodcock) tracking** for
+scattering and **ratio tracking** for shadow transmittance; a plain homogeneous medium is
+bit-identical to before (one RNG draw in the free-flight, exact `exp` transmittance).
+Implemented in `scene.h` (`Medium` struct: `density`/`densityMax`/`bounded`/`bmin`/`bmax`
++ `densityAt`/`clipToBounds`/`heterogeneous`), `ftsl.h` `addMedium` (bounds/density/
+density_max parsing), `render.h` (`sampleMediumCollision`/`mediumTransmittance` + connect
+updates). Validated with `scraps/fogblob.ftsl` (a soft glowing sphere blob, mode B).
+
+**GPU forward — DONE 2026-07-12.** The density field + bounds + delta/ratio tracking are
+now ported to `render_cuda.cu`: `DMedium` carries `heterogeneous`/`density` (a device
+`PatNode` pool + `densityN`)/`densityMax`/`bounded`/`bmin`/`bmax`; `dMedDensityAt` (postfix
+VM twin of `densityAt`), `dMedClip` (twin of `clipToBounds`), `dMedSampleCollision` (delta/
+Woodcock tracking twin of `sampleMediumCollision`), and `dMedTransmittance` (ratio-tracking
+twin of `mediumTransmittance`) drive the forward `shadeStep` free-flight and every camera
+splat (`connect`/`connectVolume`/`connectLens`/`connectLensVolume` — the two RNG-less
+connects now take `rng` for ratio tracking). A homogeneous medium keeps the exact analytic
+path (no extra RNG draw). Validated on an RTX 4090 mode B: `scraps/fogblob.ftsl` GPU-vs-CPU
+16×16-block RMSE 1.07/255 with ~0 bias (per-pixel diff is pure MC noise from the 0.95-albedo
+fog; means 38.57 vs 38.56), and a homogeneous regression (`scraps/foghom.ftsl`) block RMSE
+2.45/255, bias −0.009.
+
+**Per-object (sphere) fog bound — DONE 2026-07-12.** `bounds` now also accepts
+`{ center <x y z> radius <r> }`, confining the fog to a **sphere** region — the simple
+per-object case ("the whole inside of a glass sphere"): author the same center/radius as
+the object. Added `MediumBound { Box, Sphere }` + `boundShape`/`bcenter`/`bradius` to the
+`Medium` struct with a ray∩sphere interval in `clipToBounds` (heterogeneous density works
+inside a sphere too — the majorant grid uses the sphere's AABB, filled in by the parser).
+Mirrored on the GPU (`DMedium.boundShape`/`bcenter`/`bradius`, `dMedClip` sphere branch,
+upload path). Validated on an RTX 4090 mode B: open glowing orb `scraps/fogorb.ftsl`
+GPU-vs-CPU block RMSE 0.96/255 (bias 0.024), glass-shell `scraps/fogsphere.ftsl` block RMSE
+0.57/255 (bias −0.010); box/heterogeneous path unchanged (fogblob block RMSE still 1.07).
+*Limitations:* (1) **Fog inside a `dielectric` shell is not imaged directly by the
+next-event modes — an accuracy (bias) issue, empirically confirmed 2026-07-12.** The
+direct view of the fog is a specular↔volume (SDS-type) path: the camera sees the fog
+*through* the curved glass, i.e. along a *refracted* line. The next-event/splat modes
+connect a fog vertex to the camera with a **straight** ray, which (a) is occluded by the
+glass surface (`occluded()` treats every surface as opaque) and (b) could not bend even if
+it weren't — so the contribution is structurally **zero**, not merely noisy. This affects
+both the **pinhole splat (`B`)** and the **finite-lens splat (`A`)** — both are NEE-based,
+and both render the fog-through-glass as **black** (verified: `scraps/fogsphere.ftsl` mode
+B whole-image mean 6.6 but the fog-sphere center box mean 0.000; mode A identical). Only the
+**physically-tracing modes** — photon-catch (`C`) and BDPT (`D`) — can sample the path at
+all, because a real photon scatters in the fog, **refracts** out through the glass, and
+lands on a finite aperture. For `C` that path is extraordinarily improbable (a fog-scattered
+photon must exit heading almost exactly at the pupil), so at practical sample counts `C` is
+effectively black too (60 M photons, aperture 0.45: fog-sphere center still mean 0.000) — an
+**efficiency** problem on top of the accuracy one. **BDPT `D` — RESOLVED 2026-07-12** (volumetric
+BDPT, below): its camera subpath refracts through the shell (specular vertices) to a volume
+in-scatter vertex, then MIS-connects to the light, so a lantern inside a fogged glass sphere
+images as a bright disc — `scraps/fogsphere.ftsl` mode D fog-sphere center box mean 0.22
+(saturating) vs mode B's 0.00, at the same absolute exposure.
+The fog still correctly **lights the surrounding room** (indirect, via NEE off the walls),
+and an **open** fog sphere (no glass shell) is directly viewable in every forward mode
+(`scraps/fogorb.ftsl` mode B center box mean 135.8). A proper fix is refractive/manifold
+next-event estimation (specular connections through the glass) — genuine research-grade work,
+out of scope; a naive "let connect rays pass through glass" hack is wrong (it draws the fog
+along a straight line, with no lensing, in the wrong place) and is deliberately avoided.
+
+**Multiple coexisting media (superposition) — DONE 2026-07-12.** `Scene::medium` is now a
+vector `Scene::media` of independent, possibly overlapping media; several `medium {}` blocks
+coexist (e.g. two tinted fog orbs + a global haze). The forward tracer superposes them
+physically: extinction adds, so total transmittance is the **product** of the per-medium
+transmittances (`Renderer::mediaTransmittance` / `dMediaTransmittance`), and the first
+collision is the **earliest** of the media's independent free-flights, with the winning
+medium's albedo/`g` driving the scatter (`sampleMediaCollision` / `dMediaSampleCollision` —
+Poisson superposition). A single-medium scene stays bit-identical. `Scene::backwardMedium()`
+returns the first medium for the homogeneous-only backward/BDPT path. Implemented in
+`scene.h`, `render.h`, `ftsl.h` (`addMedium` appends), `render_cuda.cu` (`DScene.media`/
+`mediaN` + a `DMedium` array). Validated on an RTX 4090 mode B: `scraps/fogmulti.ftsl`
+(warm + cool disjoint orbs + global haze) GPU-vs-CPU 16×16-block RMSE 1.40/255 (bias 0.012,
+means match to 0.02%); single-medium regression (`scraps/fogorb.ftsl`) block RMSE 1.07,
+unchanged.
+
+**Object-name / implicit-shape fog bounds — DONE 2026-07-12.** `bounds { object "<name>" }`
+shapes the fog to a **named** scene object: a named `sphere` → its exact analytic sphere
+bound; a named `isosurface` → **field membership** (a new `MediumBound::Implicit`: the fog
+fills the field interior via `fieldEval < 0` — inside-sign auto-detected from the field's
+value at its AABB center — carved per-point inside delta/ratio tracking over the field's
+AABB, reusing the same field VM as isosurface rendering); a named `mesh` → the mesh's world
+**AABB** (box approximation; true mesh containment deferred). Media are resolved in a
+deferred second sweep so the object may be authored anywhere. Implemented in `scene.h`
+(`Medium::boundField`/`boundFieldExpr`/`boundInsideNeg` + `insideField`/`densityAt`/
+`heterogeneous`), `ftsl.h` (name registries populated by `addSphere`/`addIsosurface`/
+`addMesh`; `object` branch in `addMedium`), `render_cuda.cu` (`DMedium.boundField`/
+`boundFieldN`/`boundFieldExpr`/`boundInsideNeg`, `dMedDensityAt` membership carve-out,
+`appendFieldProgram` bakes the medium field into the shared device field pool). Validated on
+an RTX 4090 mode B: metaball-`blob`-shaped glowing fog in a glass shell (`scraps/fogimplicit.ftsl`)
+GPU-vs-CPU energy identical (absorbed 0.9978) and indirect room lighting agreeing within the
+(large) dim-caustic noise floor. *(Same fog-inside-glass direct-view limitation as above
+applies — an implicit-shaped fog is enclosed by its own isosurface, so its direct camera view
+is a refracted SDS path; it lights the room correctly.)*
+
+**Remaining gap (BDPT fully closed):**
+- **BDPT (mode D) — ALL media DONE 2026-07-12 (CPU + GPU), incl. heterogeneous.** `bdpt.h`
+  and the GPU BDPT megakernel (`render_cuda.cu` `kBdpt`) handle media of every kind —
+  global haze, multiple superposed media, box/sphere/object-**bounded** fog, **and
+  heterogeneous `density`-field blobs** — with volume in-scatter (`VType::Medium` /
+  `BV_MEDIUM`) vertices, HG-phase connections and transmittance-weighted edges. Both
+  `bdptUnsupportedFeature` (CPU) and `cudaBdptSupported` (GPU) now accept any medium.
+  Validation (homogeneous): global haze CPU-vs-GPU whole-image mean 0.04698 vs 0.04702
+  (+0.09%); bounded fog-through-glass (`scraps/fogsphere.ftsl`) CPU-vs-GPU center 0.237 vs
+  0.242. Validation (heterogeneous): `scraps/fogblob.ftsl` (soft-edged density blob) mode D
+  GPU vs mode B forward reference mean 0.04213 vs 0.04247 (−0.8%), centerMean 0.30009 vs
+  0.30211 (−0.7%) — within the ~6% MC noise floor, confirming unbiased. See the resolved
+  entry below for why the homogeneous cancellation is *not* required for correctness.
+- **Backward modes (R/V) + P camera layer still treat it as homogeneous** (on BOTH
+  backends). `backward.h` (modes R/V) and the camera-side layer of the P composite still
+  use the medium as a single global homogeneous haze and ignore `density`/`bounds`; on the
+  GPU, `cudaBackwardSupported` rejects *any* medium so R/V fall back to the CPU tracer,
+  which shares that homogeneous-only limitation. `main.cpp` `runRender` **warns** when a
+  heterogeneous/bounded medium is rendered in R/V/P. Proper fix: port delta/ratio tracking
+  into the backward volume march too (then mirror it on the GPU).
+
+### Heterogeneous (density-field) media in BDPT (mode D) — DONE 2026-07-12 (CPU + GPU)
+**What:** BDPT (mode D) now renders **heterogeneous** (`density`-field) media unbiasedly on
+both backends, using the *same* code path as homogeneous/bounded media — no null-scattering
+rewrite was needed. Both `bdptUnsupportedFeature` (CPU) and `cudaBdptSupported` (GPU) accept
+any medium; the heterogeneous rejections were removed.
+
+**Why the earlier "cancellation breaks → biased" reasoning was wrong (corrected):** the
+balance-heuristic MIS weights `w_s = p̂_s / Σ_i p̂_i` are a **partition of unity for any
+consistent positive pdfs** — `Σ_s w_s = 1` holds identically, regardless of what each `p̂_i`
+is. The estimator `E[ Σ_s w_s · f/p_s ] = ∫ f · (Σ_s w_s) dx = ∫ f dx` is therefore
+**unbiased** whenever (a) the *sampled* strategy's throughput `f/p_s` is exact, and (b) the
+weights sum to 1. Omitting the heterogeneous distance-pdf / transmittance from the MIS
+weights (the homogeneous bookkeeping we reuse) only makes the `p̂_i` a *different but still
+consistent* set of positive numbers — it changes the **variance**, never the bias. This is
+exactly what PBRT-v3 does for heterogeneous media. The homogeneous σt·exp/transmittance
+cancellation is a variance nicety, **not** a correctness requirement.
+
+**Why the sampled-strategy throughput stays exact:** subpath medium vertices are placed by
+**delta (Woodcock) tracking** (`sampleMediaCollision`) with **analog throughput** (β
+unchanged; RR-absorb on albedo) — the same unbiased sampler validated mode B uses.
+Connection edges are weighted by **ratio-tracking transmittance** (`mediaTransmittance`),
+which appears *linearly* in the connection throughput, so its unbiased estimate keeps the
+connection estimate unbiased. Albedo and phase `g` are spatially constant (only density
+varies), so a medium vertex's `mediumId`/`mediumG` fully determine phase + albedo and
+`vertexPdf` recomputes the cosine-free phase-direction density consistently forward/reverse
+regardless of heterogeneity.
+
+**Implementation:** removed the `heterogeneous()` guards in `bdptUnsupportedFeature`
+(`main.cpp`) and `cudaBdptSupported` (`render_cuda.cu`); the existing `randomWalk` /
+`dRandomWalk` medium-event blocks and `connectBDPT` / `dConnectBDPT` transmittance-weighted
+connections already handle spatially-varying σt (they call the same delta/ratio-tracking
+helpers the forward tracer uses). No path-budget or MIS changes were required.
+
+**Validation:** `scraps/fogblob.ftsl` (soft-edged density blob, absolute exposure): mode D
+GPU vs mode B forward reference — mean 0.04213 vs 0.04247 (−0.8%), centerMean(30%) 0.30009 vs
+0.30211 (−0.7%); mode D CPU vs GPU — mean 0.04204 vs 0.04213 (−0.2%), centerMean 0.29972 vs
+0.30009 (−0.1%). All within the ~6–9% MC noise floor → unbiased and backend-consistent.
+
+**Optional future variance work (not correctness):** the null-scattering path-integral
+formulation (Miller/Georgiev/Jarosz 2019; UPBP, Křivánek et al. 2014) would put the omitted
+heterogeneous transmittance *into* the MIS weights, reducing variance in optically-thick
+heterogeneous media. Purely a variance optimization — the current estimator is already
+unbiased.
+
+### Diffuse-transmission material — CPU DONE 2026-07-12 (GPU port pending)
+Added `type translucent` (alias `diffuse_transmit`): a two-sided Lambertian BSDF — the
+front hemisphere scatters the `reflect` albedo, the back hemisphere scatters the `transmit`
+albedo, so light diffuses THROUGH the surface (soft "waxy"/"paper"/thin-skin look). Because
+both lobes are non-specular it renders/connects in **every** CPU mode: forward A/B/C
+(`render.h` two-sided `camSplatAll` — flip the normal, wrong side self-rejects), backward
+R/V (`backward.h` two NEE calls, one per hemisphere via a normal-flipped `Hit`), and BDPT D
+(`bdpt.h` — added to `isConnectibleMat`, `bsdfF`/`bsdfPdf` two-lobe eval, scatter lobe
+selection, and — critically — the connection cosine guards in `connectBDPT` now allow the
+back hemisphere for two-sided materials via `isTwoSidedMat`, using `|cos|` in the geometry
+term with `bsdfF>0` as the real gate; `lambda` is now threaded through
+`bsdfPdf`→`vertexPdf`→`misWeight` so the wavelength-dependent lobe-selection pdf is exact).
+`reflect`+`transmit` are energy-clamped so their sum ≤ 1. Validated: `scraps/translucent_panel.ftsl`
+(backlit warm panel) renders consistently across modes B, R, and D.
+**GPU — DONE 2026-07-12.** `render_cuda.cu` now handles `translucent`: `D_DIFFUSETRANSMIT`
+(enum aligned to `MatType` with a `D_LAYERED` placeholder), a `DMaterial::transmit[SPEC_N]`
+field baked on upload, the two-lobe splat/scatter in the forward `shadeStep` (megakernel +
+wavefront share it) and the backward reference `bkRadiance` (GPU mode R). The restricted GPU
+BDPT kernel (`kBdpt`) has no two-sided strategy, so translucent scenes fall back to the
+validated CPU BDPT via `cudaBdptSupported` (same pattern as frosted glass / textures /
+fluorescence). Validated on an RTX 4090: forward B and backward R GPU-vs-CPU RMSE = 3.82/255
+(pure MC noise, matching means), and GPU mode D renders the panel correctly through the CPU
+fallback.
+**Remaining:** a true **BSSRDF / dipole / random-walk subsurface** model (for thick solid SSS
+with proper mean-free-path blurring) is still not implemented — this material is a thin
+diffuse-transmission approximation, not volumetric SSS.
+
+### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
+The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now
+covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` backward,
+`D` BDPT) on both CPU and GPU. Two gaps remain:
+- **Mode `P` (composite) is still single-shot.** `renderComposite` (`main.cpp` ~line 1246)
+  couples a forward pass (`N` photons) and a backward pass (`spp`) with a **best-fit scale
+  `s`** solved once over the diffuse-side pixels, then classifies pixels and blends. Making
+  it progressive means chunking *both* passes, re-fitting `s` and recomputing the residual
+  each chunk (pixel classification is fixed and can be cached), and reporting the blended
+  frame — doable but a real design task, deferred. `-time`/etc. are currently rejected for
+  mode `P` with a warning.
+- **`R`/`D` accumulate chunks in memory only.** They get live progress and can stop on a
+  budget, but there's no `.ftbuf` disk checkpoint, so `-resume`/`-checkpoint` stay
+  forward-mode-only. A resumable spp film would need an spp-count checkpoint format
+  (the forward one stores a photon count) — proper fix is a small variant of
+  `writeCheckpoint`/`readCheckpoint` keyed on spp.
+
 ## Resolved
+
+### Unified live progress across all image modes (`R`/`D` join `A`/`B`/`C`) — DONE 2026-07-12
+- **What:** modes `R` (backward reference) and `D` (BDPT) previously ran as a single
+  monolithic launch with **no progress output, no periodic image write, and no way to stop
+  early** — a multi-hour reference render showed nothing until it finished (and a killed
+  render lost everything). Now every image-forming mode shares one progress driver: a
+  status line (or `-preview` ANSI thumbnail) with a `~noise%` estimate, a periodic
+  crash-safe image rewrite every `-interval` seconds, and `-time`/`-noise`/`-forever`
+  budgeting with clean Ctrl-C — on both CPU and GPU.
+- **How:** `R`/`D` films accumulate a **SUM over samples-per-pixel** (CPU `renderBdpt` was
+  changed from ÷spp to SUM to match `renderBackward`/the GPU), so they chunk exactly like
+  the forward photon-count films. The GPU kernels (`kBackward`/`kBdpt`) take
+  `chunkSpp`/`sppTotal`/`sampleBase` and seed the RNG on the **global sample index**
+  (`gidx = pix*sppTotal + sampleBase + local`), so any chunking draws the same union of
+  streams as one `sppTotal` pass — **bit-identical** to the old single-shot for a given spp.
+  `gpuSppChunks` (device) and `cpuSppChunks` (host, via a `seedOffset` on the CPU renderers)
+  own the chunk loop; `runSppProgressive` (`main.cpp`) is the shared reporter, reused by the
+  mode-`R` and mode-`D` dispatch. A time/noise/forever budget opens the spp target to a
+  capped `UNBOUNDED_SPP=1e9` (keeps `pix*sppTotal` inside int64). New: `render_progress.h`
+  (`SppProgress` callback).
+
+### Concurrent GPU renders silently wrote a black PNG (all-black, `auto-exposure=1`) — DONE 2026-07-11
+- **What:** running two or more `ftrace ... -device gpu` processes at once could make
+  one emit a **completely black** image logging `auto-exposure=1` (the fallback used
+  when the 99th-percentile luminance comes back zero), with exit code 0 — silently.
+  The symptom was non-deterministic and non-monotonic in spp (e.g. for
+  `scenes/mirror_selfie.ftsl`: 512 spp OK, 2048 spp black, 4096 spp OK), depending on
+  which renders happened to overlap on the GPU. Re-running the black case **alone**
+  renders correctly.
+- **Root cause (our bug, not a driver mystery):** `render_cuda.cu` never checked the
+  return codes of its ~15 `cudaMalloc` / `cudaMemset` / download `cudaMemcpy` calls
+  nor the kernel-launch status on every path. Under contention an alloc or copy fails
+  (or a launch returns `unspecified launch failure`), but the code carried on and wrote
+  the zero-initialized host film out as a black PNG — no error printed because the
+  failing call's status was never inspected. Earlier notes claiming "CUDA still reported
+  `cudaSuccess`" were wrong: the errors were there, we just weren't reading them. This
+  is process-local — MMU/context isolation means it cannot corrupt another process's GPU
+  state.
+- **Fix (root cause):** every CUDA call in `render_cuda.cu` is now wrapped in a
+  `CUDA_CHECK(...)` macro (checks the returned `cudaError_t`, and on failure prints
+  `[cuda] <call> failed at <file>:<line>: <msg>` and `std::exit(EXIT_FAILURE)`), and
+  every kernel launch is followed by `cudaCheckKernel(<what>)`
+  (`cudaGetLastError` + `cudaDeviceSynchronize`, same loud-exit on error). This covers
+  `uploadVec`, the wavefront path, and the forward/BDPT/backward render entries — so a
+  failed alloc/copy/launch aborts **before** any framebuffer is downloaded or written.
+- **Verified:** built and reproduced contention by running 4 concurrent
+  `-device gpu -mode R` renders of `mirror_selfie.ftsl` at 2048 spp — three rendered
+  correctly (valid `auto-exposure`), one hit contention and failed loudly with
+  `[cuda] backward kernel failed: unspecified launch failure` + exit 1 and wrote **no**
+  PNG. No silent black image.
+- **Safety net removed:** the earlier `filmIsValid()` gate in `writeFilm`
+  (`src/main.cpp`) — which rejected all-zero/NaN framebuffers before tone-mapping — was
+  removed now that failures are caught at the source. `writeFilm` still returns a bool
+  and callers still propagate a non-zero exit, but only for a genuine image-encoder
+  failure. **Tradeoff:** `CUDA_CHECK` catches CUDA-reported errors, not a numerically
+  produced NaN that returns `cudaSuccess`; if such a case ever appears it would tonemap
+  to black again, and the fix would be a targeted NaN check, not the blanket gate.
+- **Residual caveat:** contention still wastes work (one job aborts). Prefer to
+  **render GPU jobs one at a time**; the difference is a contended render now fails
+  loudly (non-zero exit, no PNG) instead of silently overwriting a good image with black.
+
+### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
+- **What:** the procedural-pattern math VM now exposes the surface texture coordinates
+  `u`,`v` (previously mesh-only) to expressions on **native** objects too, so a UV-space
+  checker/stripe wraps *around* a sphere/box/isosurface instead of slicing through world
+  space. Native `sphere {}` (equirectangular) and `quad {}` (edge-mapped) already filled
+  `hit.u/v`; an `isosurface` now accepts `uv planar|spherical|cylindrical [axis=x|y|z]`
+  to synthesize a wrap from its world bounds using the **same `projectUV` used for
+  un-`vt`'d meshes**.
+- **Implementation:** `pattern.h` — added `PatOp::VarU/VarV`, `PatCtx.u/v`, `makePatCtx`
+  u/v params, `patternEval` cases, and `u`/`v` in `varOp`. `geometry.h` — hoisted
+  `UvProjection`/`parseUvProjection`/`projectUV` out of `mesh.h` (both include geometry.h)
+  so implicits reuse them. `implicit.h` — `Implicit.uvProj/uvAxis/uvBounds`; `intersectImplicit`
+  projects UV at the hit when enabled. `scene.h` — `patCtxFromHit` threads `h.u/h.v`.
+  `ftsl.h` — `addIsosurface` parses `uv <mode> [axis=]`. GPU twins in `render_cuda.cu`:
+  `DImplicit.uvProj/uvAxis/uvLo/uvHi`, device `dProjectUV`, `dPatternEval`/`dPatternScalarAt`
+  thread `u,v` (and the DF_EXPR field call passes 0,0). Demo: `scenes/uv_native.ftsl`.
+
+### `camera_curve` block (spline fly-through with variable speed) — DONE 2026-07-11
+- **What:** a new top-level `camera_curve "name" { point … [frames N] [density <ρ> |
+  density_at <t> <ρ> …] [look tangent|look_at|curve+look_point] [closed] [exposure_lock] … }`
+  expands into N CamSpec frames whose eye rides a **Catmull-Rom spline** through the
+  `point` control points (interpolating — passes through each). Placement is either a
+  fixed `frames` count (uniform arc length) or a **density** (cameras per unit length)
+  that can vary via `density_at` keyframes — the camera's *speed*: high density = many
+  closely-spaced frames = slow dwell; low density = fast. This answers the original
+  "how do you specify camera speed as a separate curve" question: density ρ(t) is
+  integrated over arc length to a cumulative count C, and camera i is placed by
+  inverting C at the target fraction. Orientation: travel tangent (default), a fixed
+  `look_at`, or a second `look curve` (its own spline sampled in step).
+- **Implementation:** `ftsl.h` `catmullRomAt()` (interpolating spline eval, open clamps
+  neighbours / closed wraps) + `addCameraCurve()` (dense arc-length + density sampling,
+  cumulative-count inversion for placement, tangent/fixed/curve look) + dispatch entry.
+  Reuses the `camera_path`/`camera_orbit` machinery (shared CamSpec, `base<NNN>` naming,
+  `pathGroup`/`exposureLock`, multi-camera render loop). Validated on CPU
+  (`scraps/curve_test.ftsl`, 3 frames — eye rides the spline, holds the look_at). Same
+  GPU caveat as `camera_orbit`: one camera per launch, frames render sequentially (fine).
+
+### `camera_orbit` block (turntable / fly-around for MP4s) — DONE 2026-07-11
+- **What:** a new top-level `camera_orbit "name" { center radius [height] [axis] frames
+  [start_deg] [sweep_deg] [look_at] [exposure_lock] … }` expands into N CamSpec frames
+  whose eye rides a circle around `center` (the default look_at), for stitching an orbit
+  MP4. A full 360° sweep samples `i/frames` (frame N == frame 0, seamless loop); a partial
+  sweep spans endpoints via `i/(frames-1)`. Reuses the `camera_path` machinery (shared
+  CamSpec, per-frame naming `base<NNN>`, `pathGroup`/`exposureLock`, the multi-camera
+  render loop + `_<name>` file naming).
+- **Implementation:** `ftsl.h` `addCameraOrbit` (basis vectors U,W ⟂ axis; eye = center +
+  axis·height + (U·cosθ + W·sinθ)·radius) + dispatch entry. Demo: `scenes/showcase_orbit.ftsl`
+  (orbit tuned so its circle flies straight through the glass sphere). NOTE: the forward
+  splat models A/B share one photon set across all frames (see the shared multi-camera
+  entry below), but `-mode R` is camera-anchored (it traces *from* each camera) so an orbit
+  on `-mode R`/`-device gpu` renders frames sequentially — which is fine, the per-frame
+  cost dominates.
 
 ### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
 - **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
@@ -131,7 +482,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
   dielectric translucency (5c) all landed the same day. Full §1–4 GPU forward/backward parity
   achieved; only GPU BDPT retains feature-scoped fallbacks (patterns, frosted/colored glass).
 
-### Multi-camera renders re-trace photons per camera (no shared pass yet)
+### Multi-camera renders re-trace photons per camera (RESOLVED — shared pass for modes A/B, CPU + GPU)
 - **What:** Phase 3a implements multiple named `camera` blocks: one render
   invocation emits one image per camera (`scenes/twocam.ftsl`), with `-camera
   <name>` selection and per-camera film resolution + mode. But each camera is a
@@ -146,22 +497,35 @@ as practical; this file is the fallback for what can't be addressed immediately.
   overload is bit-identical to the old path, and an N-camera shared pass reproduces N
   independent single-camera renders exactly. `renderForwardShared()` (src/main.cpp) runs
   one CPU photon trace feeding one film per camera; the multi-camera loop groups the
-  eligible cameras (plain `-n`, model B, per-frame auto-exposure, CPU device) into that
-  single pass and renders the rest per-camera as before. **Validated:** `twocam.ftsl`
+  eligible cameras (plain `-n`, per-frame auto-exposure) into that single pass and renders
+  the rest per-camera as before (the GPU shared pass, below, later removed the CPU-only
+  restriction). **Validated:** `twocam.ftsl`
   `-device cpu` shared vs. per-`-camera` solo renders are pixel-identical (max abs diff
   0, both films). The fluoro reradiation λ' is sampled once (camera-independent), and
   mode-A aperture RNG is drawn once, so those single-camera streams are preserved too.
-- **Remaining (deferred):** (1) **GPU shared pass** — the forward megakernel still
-  renders one camera per launch; it takes a single `DCamera`/film/`camMode`, so the
-  shared pass would need a `DCamera` array + N device film buffers threaded through
-  `emitPhoton`/`shadeStep`/`connect`. This is why the CPU shared pass only triggers when
-  the forward-GPU path *isn't* used (`-device cpu`, or a GPU-unsupported scene). (2)
-  **Mode A** (finite-lens splat) could join the shared pass but draws an aperture sample
-  per camera, so an N-camera mode-A trace perturbs the RNG stream — it would need its
-  own validation; mode C (forward catch) is inherently per-camera (a photon is consumed
-  by one aperture).
-- **Status:** OPEN (much reduced) — CPU shared pass done + validated; GPU shared pass
-  and mode-A sharing are the tracked remainder.
+- **GPU shared pass — DONE 2026-07-12.** The forward device code was refactored around a
+  `DCamSet` (device pointer to a `DCamera` array + per-camera film/hit buffer arrays +
+  `nCam`) that unifies single- and multi-camera tracing, so the ~240-line `shadeStep`
+  isn't duplicated (single-camera is just `nCam==1`, bit-identical). `genPhoton`/`shadeStep`
+  splat via `splatSurfaceAll`/`splatVolumeAll`; `buildUpload` was split into a scene-only
+  bake plus a per-camera `bakeCamera`, and `renderForwardSharedCuda()` (render_cuda.cu)
+  bakes the scene once, bakes N cameras, allocates one film/hit buffer per camera, and
+  launches a single trace. **Validated 2026-07-12:** GPU model-B shared vs. single-camera
+  GPU render pixel-identical (`cmp` clean); CPU model-B shared vs. single also identical;
+  the megakernel and wavefront backends both drive the shared pass.
+- **Mode A shared pass — DONE 2026-07-12.** Mode A (finite-lens splat) now joins the
+  shared pass on both CPU and GPU. Because `connectLens()` draws an aperture sample per
+  camera, an N-camera mode-A trace perturbs the RNG stream, so it is **unbiased per camera
+  but matches a standalone render in distribution, not bit-for-bit** (validated: shared vs.
+  standalone auto-exposure agree to noise). The A- and B-cameras run as **separate** shared
+  passes (mode A draws RNG mid-trace, mode B doesn't, so their photon paths diverge). Mode
+  C (forward catch) stays inherently per-camera (a photon is consumed by one aperture), and
+  the dispatch (`main.cpp`) partitions eligible cameras into A- and B-groups, sharing only
+  when a group has ≥2 members.
+- **Status:** DONE 2026-07-12 — CPU + GPU shared pass for both forward splat models
+  (A and B), validated. Mode C and the camera-anchored modes (R/D/P/V) render per camera
+  by construction (documented in README: "Other modes do NOT save time with multiple
+  cameras").
 
 ### Absolute-EV film sensitivity, non-square films, shared multi-camera pass
 - **What (remaining):** three camera/film pieces are still open:

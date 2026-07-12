@@ -11,9 +11,11 @@
 //   -mode D : bidirectional path tracing (BDPT) — one unbiased estimator that traces
 //             a light AND a camera subpath and MIS-combines every connection. Renders
 //             specular-first pixels directly (no composite seam) AND diffuse caustics
-//             in a single pass, on the absolute-radiance scale. GPU-accelerated (its
-//             own BDPT megakernel; see renderBdptCuda). Does not support fluorescence /
-//             participating media / spot & env lights (use B/P or R for those). See
+//             in a single pass, on the absolute-radiance scale. Renders participating
+//             media of every kind — global haze, bounded, and heterogeneous density
+//             fields (volume in-scatter vertices + transmittance-weighted connections).
+//             GPU-accelerated (its own BDPT megakernel; see renderBdptCuda). Does not
+//             support fluorescence / spot & env lights (use B/P or R for those). See
 //             renderBdpt / bdpt.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
@@ -40,34 +42,43 @@
 // usually faster on shallow, uniform scenes on a big GPU (its default). The RNG stream
 // differs, so images match the megakernel only to within Monte-Carlo noise.
 //
-// Progressive rendering (forward modes A/B/C only; brightness is photon-count-
-// independent, so more photons only reduce graininess):
-//   -n <photons>   trace exactly this many photons (default).
-//   -time <sec>    trace in batches until the wall-clock budget elapses (-n is the
-//                  batch/checkpoint granularity).
-//   -noise <pct>   trace in batches until the estimated graininess falls to <= pct
-//                  percent (the same "~X% noise" figure the progress line reports:
-//                  100/sqrt(mean per-lit-pixel photon count)), then stop and save.
+// Progressive rendering & live progress. Every image-forming mode — the forward camera
+// models A/B/C (photon-count-independent brightness), the backward reference R, and the
+// bidirectional D (both accumulate a SUM over samples-per-pixel) — refines an image whose
+// brightness is fixed and whose graininess only falls with more samples. So all of them
+// report the same live progress (periodic crash-safe image write, a status line or
+// -preview thumbnail, and a ~noise% estimate) and accept the same budget flags:
+//   -n <photons>   forward A/B/C: trace exactly this many photons (default). For R/D the
+//                  sample budget is -spp; -n is only the forward batch granularity.
+//   -time <sec>    render until the wall-clock budget elapses, then stop and save. Works
+//                  for A/B/C (photon batches) and R/D (spp chunks) alike.
+//   -noise <pct>   render until the estimated graininess falls to <= pct percent (the same
+//                  "~X% noise" figure the progress line reports: for A/B/C 100/sqrt(mean
+//                  per-lit-pixel photon count); for R/D 100/sqrt(spp done)), then stop.
 //                  Combine with -time to also cap the wall-clock ("stop at whichever
 //                  comes first"); alone it traces until converged (Ctrl-C stops early).
-//   -forever       trace indefinitely, refining the image, until interrupted (Ctrl-C):
-//                  the first Ctrl-C finishes the current batch, writes a final image +
-//                  checkpoint, and exits cleanly (a second Ctrl-C force-quits). Implies
-//                  the checkpoint, so a later -resume picks up where you stopped.
-//   -resume        reload the accumulated film from the "<out>.ftbuf" checkpoint and
-//                  keep adding photons (with -n more, -time more seconds, or -forever).
-//   -checkpoint    on a plain -n render, also write the checkpoint so a later -resume
-//                  can continue it (-time/-forever/-resume imply it). Each batch/resume
-//                  draws an independent RNG stream (seed offset = cumulative photons), so
-//                  the result matches a single render of the combined count; a fresh -n
-//                  render (offset 0) is bit-identical to the historical single-shot path.
-//   -preview       during -time/-noise/-forever, redraw a live ANSI colour thumbnail of
-//                  the current image in the terminal at each periodic update (in place).
-//   -interval <s>  seconds between periodic image writes / preview refreshes during
-//                  -time/-noise/-forever (default 15). The output image file is rewritten at
-//                  this cadence, so an auto-reloading image viewer is also a live display.
+//   -forever       render indefinitely, refining, until interrupted (Ctrl-C): the first
+//                  Ctrl-C finishes the current batch/chunk, writes a final image, and
+//                  exits cleanly (a second Ctrl-C force-quits). For A/B/C it implies the
+//                  checkpoint, so a later -resume picks up where you stopped.
+//   -resume        (forward A/B/C only) reload the accumulated film from the "<out>.ftbuf"
+//                  checkpoint and keep adding photons (with -n/-time/-forever).
+//   -checkpoint    (forward A/B/C only) on a plain -n render, also write the checkpoint so
+//                  a later -resume can continue it (-time/-forever/-resume imply it). Each
+//                  batch/resume draws an independent RNG stream (seed offset = cumulative
+//                  photons), so the result matches a single render of the combined count; a
+//                  fresh -n render (offset 0) is bit-identical to the historical path. (R/D
+//                  are not disk-resumable yet — their chunks accumulate only in memory.)
+//   -preview       during a progress render, redraw a live ANSI colour thumbnail of the
+//                  current image in the terminal at each periodic update (in place).
+//   -interval <s>  seconds between periodic image writes / preview refreshes (default 15).
+//                  The output image file is rewritten at this cadence, so an auto-reloading
+//                  image viewer is also a live display. Applies to every mode above (a plain
+//                  fixed -spp R/D render also rewrites the image and prints "[spp] x/total"
+//                  progress as its chunks land).
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
@@ -87,6 +98,9 @@
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
+#include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
+#include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
+                               // header also pulls it in, but CPU-only builds need it too
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
 #endif
@@ -859,7 +873,13 @@ static int checkUpsample() {
 // and iso/shutter/exposure give exact photographic stops on top.
 constexpr double ABS_EXPOSURE_GAIN = 6.0;
 
-static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
+// Returns true on success, false if the image encoder failed. Callers that own the
+// process exit code should propagate a non-zero status on false. (GPU renders that
+// fail — driver TDR, device-memory/scheduling contention — are now caught at the
+// source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
+// which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
+// all-zero/black film never reaches this function.)
+static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
                       bool quiet = false, double* lockAnchor = nullptr,
                       bool absolute = false) {
     const int W = f.resX, H = f.resY;
@@ -901,9 +921,9 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
     }
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
-        return;
+        return false;
     }
-    if (quiet) return;
+    if (quiet) return true;
     if (absolute)
         std::printf("wrote %s (%dx%d), exposure=%.3g (absolute: gain %.3g x %.3g comp)\n",
                     path, W, H, exposure, eAuto, (expComp > 0.0 ? expComp : 1.0));
@@ -912,6 +932,7 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
                     path, W, H, exposure, eAuto, expComp);
     else
         std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
+    return true;
 }
 
 // --- Live terminal preview ----------------------------------------------------
@@ -1089,21 +1110,24 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     return out;
 }
 
-// Shared multi-camera forward pass (model B only). Traces ONE set of N photons and
+// Shared multi-camera forward pass (models A and B). Traces ONE set of N photons and
 // splats every diffuse/emitter/volume vertex to *all* cameras at once, returning one
 // film per camera — the "many cameras for 1x photon work" win instead of re-tracing
-// per camera. Because model-B connect() draws no RNG, the per-thread RNG streams and
-// photon paths are identical to a single-camera renderForward, so camera c's film here
-// is bit-for-bit the same as an independent renderForward for camera c (validated).
-// CPU only for now; the GPU megakernel still renders one camera per launch (its
-// device kernel would need the DCamera array + N film buffers — tracked in
-// known-issues). Each camera keeps its own resolution/projection/exposure.
+// per camera. With `lensMode` false (model B) connect() draws no RNG, so the per-thread
+// RNG streams and photon paths are identical to a single-camera renderForward and each
+// camera's film is bit-for-bit an independent renderForward for that camera (validated).
+// With `lensMode` true (model A) each camera samples its own aperture (connectLens draws
+// RNG), so the shared photon flight is still a valid unbiased estimate for every camera
+// but the per-camera images match a standalone render in distribution only, not bit-for-
+// bit. Model C is never shared (it consumes the photon per camera). The GPU twin is
+// renderForwardSharedCuda; each camera keeps its own resolution/projection/exposure.
 static std::vector<Film> renderForwardShared(const Scene& scene,
                                              const std::vector<Camera>& cams,
                                              const std::vector<int>& resX,
                                              const std::vector<int>& resY,
                                              long long N, int nThreads,
-                                             EnergyReport& eOut, bool diffraction = true) {
+                                             EnergyReport& eOut, bool diffraction = true,
+                                             bool lensMode = false) {
     int nc = (int)cams.size();
     // Per-thread × per-camera films (each thread accumulates into its own copies to
     // avoid shared-pixel races; merged per camera at the end).
@@ -1113,9 +1137,10 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
         for (int c = 0; c < nc; ++c) { films[t][c].resX = resX[c]; films[t][c].resY = resY[c]; films[t][c].alloc(); }
 
     auto worker = [&](int tid) {
-        Renderer r; r.forwardCatch = false; r.lensMode = false; r.diffraction = diffraction;
-        // Identical seeding to renderForward (seedBase 0) so each camera's shared film
-        // matches its standalone single-camera render bit-for-bit.
+        Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
+        // Identical seeding to renderForward (seedBase 0). For model B this makes each
+        // camera's shared film bit-identical to its standalone single-camera render; for
+        // model A the aperture draws perturb the stream, so it matches in distribution.
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
@@ -1141,12 +1166,18 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 
 // Backward reference: `spp` samples per pixel, threads render disjoint row bands
 // of a shared film (no shared-pixel writes, so no race).
+// `seedOffset` decorrelates the RNG stream so a chunked/progressive render can call
+// this repeatedly (each chunk with a distinct offset) and merge the SUM films for an
+// independent, ever-refining estimate. seedOffset==0 reproduces the original stream.
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
-                           long long spp, int nThreads, bool diffraction = true) {
+                           long long spp, int nThreads, bool diffraction = true,
+                           unsigned long long seedOffset = 0) {
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7, 0xD1B54A32D192ED03ULL ^ (uint64_t)tid);
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7,
+                            0xD1B54A32D192ED03ULL ^ (uint64_t)tid
+                              ^ (seedOffset * 0x9E3779B97F4A7C15ULL));
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, rng);
     };
@@ -1165,11 +1196,14 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // two normalised films sum to the final radiance; writeFilm(...,1.0) then only divides
 // by cieYIntegral for display, exactly like mode P's composite.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
-                       long long spp, int nThreads, int maxDepth, bool diffraction = true) {
+                       long long spp, int nThreads, int maxDepth, bool diffraction = true,
+                       unsigned long long seedOffset = 0) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11, 0x9E3779B97F4A7C15ULL ^ (uint64_t)tid);
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11,
+                            0x9E3779B97F4A7C15ULL ^ (uint64_t)tid
+                              ^ (seedOffset * 0xD1B54A32D192ED03ULL));
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -1183,16 +1217,16 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
     Film splat_film; splat_film.resX = resX; splat_film.resY = resY; splat_film.alloc();
     for (int t = 0; t < nThreads; ++t) { cam_film.merge(camBands[t]); splat_film.merge(splatBands[t]); }
 
-    // Combine onto one radiance scale. Both halves are normalised by the per-pixel
-    // sample count spp: the camera image (t>=2) is a per-pixel radiance estimate; the
-    // light image (t==1 splats) uses the full-image-plane camera importance We (see
-    // bdpt.h cameraWe), for which (1/spp)*We(A_full) is exactly the light-tracing scale
-    // (equivalently (1/(W*H*spp))*We(A_pixel) — the mode-B convention).
-    const double invCam = 1.0 / (double)spp;
-    const double invSplat = 1.0 / (double)spp;
+    // Combine onto one radiance scale as a SUM over samples (display divides by spp via
+    // writeFilm(out, spp), matching the GPU renderBdptCuda convention and letting a
+    // chunked/progressive render accumulate batches by summing). Both halves share the
+    // per-pixel sample count spp: the camera image (t>=2) is a per-pixel radiance
+    // estimate; the light image (t==1 splats) uses the full-image-plane camera importance
+    // We (see bdpt.h cameraWe), for which (1/spp)*We(A_full) is exactly the light-tracing
+    // scale (equivalently (1/(W*H*spp))*We(A_pixel) — the mode-B convention).
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     for (size_t i = 0; i < out.xyz.size(); ++i)
-        out.xyz[i] = cam_film.xyz[i] * invCam + splat_film.xyz[i] * invSplat;
+        out.xyz[i] = cam_film.xyz[i] + splat_film.xyz[i];
     return out;
 }
 
@@ -1459,6 +1493,99 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     return true;
 }
 
+// --- Standalone artifact -> PNG conversion (`-topng`) --------------------------
+// Turn an existing render artifact into a 24-bit PNG without re-rendering, so the
+// ppm/ outputs and *.ftbuf resume checkpoints can be shared as PNGs with the same
+// binary. Dispatched from main() before any scene/CLI setup, so it is a pure,
+// dependency-free utility path. Handles:
+//   * .ppm  — binary P6, 8-bit — re-encoded as PNG (a lossless RGB copy).
+//   * .ftbuf — the raw linear film checkpoint — loaded and tone-mapped to PNG. The
+//     sidecar does not persist the exposure mode, so this uses the same p99 auto-
+//     exposure as a non-absolute render; an absolute (power/lumens) scene may look
+//     brighter/darker than its original -o image. Re-run the render for an
+//     exposure-exact PNG.
+//   * .ftsl — NOT handled here (it is a scene, not an image): render it with -in.
+
+// Read a binary P6 (8-bit) PPM into a top-row-first RGB byte buffer. Returns false
+// for ASCII (P3), non-8-bit (maxval != 255) or malformed files.
+static bool readBinaryPPM(const std::string& path, int& W, int& H,
+                          std::vector<uint8_t>& rgb) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char m0 = 0, m1 = 0;
+    in.get(m0); in.get(m1);
+    if (!in || m0 != 'P' || m1 != '6') return false;
+    // Read an unsigned int, skipping leading whitespace and '#' comments (PPM grammar).
+    auto readUInt = [&](int& v) -> bool {
+        int c;
+        for (;;) {
+            c = in.get();
+            if (c == EOF) return false;
+            if (c == '#') { while ((c = in.get()) != EOF && c != '\n') {} continue; }
+            if (std::isspace((unsigned char)c)) continue;
+            break;
+        }
+        if (!std::isdigit((unsigned char)c)) return false;
+        v = 0;
+        do { v = v * 10 + (c - '0'); c = in.get(); }
+        while (c != EOF && std::isdigit((unsigned char)c));
+        return true;   // the one trailing non-digit byte consumed here is the single
+                       // whitespace separator before the pixel data (P6 convention).
+    };
+    int maxv = 0;
+    if (!readUInt(W) || !readUInt(H) || !readUInt(maxv)) return false;
+    if (W <= 0 || H <= 0 || maxv != 255) return false;   // only 8-bit binary PPM
+    rgb.assign((size_t)W * H * 3, 0);
+    in.read((char*)rgb.data(), (std::streamsize)rgb.size());
+    return (bool)in && in.gcount() == (std::streamsize)rgb.size();
+}
+
+static int convertToPng(const std::string& inPath, const std::string& outPath) {
+    if (endsWithCI(inPath, ".ppm")) {
+        int W = 0, H = 0; std::vector<uint8_t> rgb;
+        if (!readBinaryPPM(inPath, W, H, rgb)) {
+            std::fprintf(stderr, "error: %s is not a readable binary (P6) 8-bit PPM\n",
+                         inPath.c_str());
+            return 1;
+        }
+        if (!writeImage(outPath, W, H, rgb)) return 1;
+        std::printf("converted %s -> %s (%dx%d, 24-bit RGB)\n",
+                    inPath.c_str(), outPath.c_str(), W, H);
+        return 0;
+    }
+    if (endsWithCI(inPath, ".ftbuf")) {
+        std::ifstream in(inPath, std::ios::binary);
+        if (!in) { std::fprintf(stderr, "error: cannot open %s\n", inPath.c_str()); return 1; }
+        char magic[8]; in.read(magic, 8);
+        if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0) {
+            std::fprintf(stderr, "error: %s is not a recognised FTBUF checkpoint\n",
+                         inPath.c_str());
+            return 1;
+        }
+        int32_t rx = 0, ry = 0, m = 0; long long Nph = 0;
+        in.read((char*)&rx, 4); in.read((char*)&ry, 4); in.read((char*)&m, 4);
+        in.read((char*)&Nph, 8);
+        double en[5]; in.read((char*)en, sizeof en);
+        uint64_t g = 0; in.read((char*)&g, 8);
+        if (!in || rx <= 0 || ry <= 0) {
+            std::fprintf(stderr, "error: %s header malformed\n", inPath.c_str());
+            return 1;
+        }
+        Film f; f.resX = rx; f.resY = ry; f.alloc();
+        in.read((char*)f.xyz.data(),  (std::streamsize)(f.xyz.size()  * sizeof(Vec3)));
+        in.read((char*)f.hits.data(), (std::streamsize)(f.hits.size() * sizeof(double)));
+        if (!in) { std::fprintf(stderr, "error: %s truncated\n", inPath.c_str()); return 1; }
+        // Tone-map with the default p99 auto-exposure (see note above). writeFilm prints
+        // the "wrote <out> ..." line.
+        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1)) ? 0 : 1;
+    }
+    std::fprintf(stderr,
+        "error: -topng converts .ppm and .ftbuf inputs; got '%s'.\n"
+        "       A .ftsl is a scene, not an image — render it with: "
+        "ftrace -in scene.ftsl -o out.png\n", inPath.c_str());
+    return 1;
+}
+
 // Is anything in this scene outside BDPT's (mode D) transport scope? Returns a human
 // description of the first unsupported feature, or nullptr if the scene is fully BDPT-
 // renderable. BDPT here covers Lambertian/glossy scatter + quad/sphere area emission
@@ -1468,7 +1595,14 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
 // referenced by geometry are flagged (built-in palettes carry spare unused entries);
 // Mix children are expanded since a used Mix can pick e.g. a fluorescent child.
 static const char* bdptUnsupportedFeature(const Scene& scene) {
-    if (scene.medium.enabled) return "participating media (fog)";
+    // Participating media — homogeneous AND heterogeneous (density-field / bounded) — are
+    // supported by volumetric BDPT. Subpath medium vertices are placed by delta (Woodcock)
+    // tracking with analog throughput and connection edges are weighted by ratio-tracking
+    // transmittance (both unbiased estimators, exactly as the forward tracer does). The MIS
+    // weights omit the heterogeneous distance-pdf / transmittance — a variance-only
+    // simplification (PBRT-v3 convention): the balance heuristic is a partition of unity for
+    // any consistent pdfs, so the estimator stays unbiased regardless (only the sampled
+    // strategy's throughput must be exact, which analog + ratio tracking guarantee).
     std::vector<char> matUsed(scene.mats.size(), 0);
     // Mark a material and (one level, since Mix children can't themselves be Mix) its
     // Mix children, which a used Mix can pick at runtime.
@@ -1493,6 +1627,131 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     return nullptr;
 }
 
+// CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
+// in adaptive chunks so a CPU mode-R/D render gets the same live progress as the GPU.
+// `renderOne(chunkSpp, seedOffset)` renders one chunk and returns its SUM film; the
+// chunks are merged into a running SUM and reported after each. A null/empty prog does
+// the historical single-shot render. Returns the accumulated SUM film (writeFilm divides
+// by the completed spp). Chunk size adapts toward ~0.4s so early frames appear quickly
+// and the per-chunk thread-spawn overhead stays negligible.
+static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX, int resY,
+                         const std::function<Film(long long, unsigned long long)>& renderOne) {
+    if (!prog || !prog->report) return renderOne(sppTarget, 0);
+    using clk = std::chrono::steady_clock;
+    Film acc; acc.resX = resX; acc.resY = resY; acc.alloc();
+    long long done = 0, chunk = 1;
+    while (done < sppTarget) {
+        long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
+        auto t0 = clk::now();
+        Film f = renderOne(c, (unsigned long long)(done + 1));
+        acc.merge(f);
+        done += c;
+        double dt = std::chrono::duration<double>(clk::now() - t0).count();
+        if (dt > 1e-4) {                       // retarget chunk toward ~0.4s of work
+            long long next = (long long)((double)c * (0.4 / dt));
+            if (next < 1) next = 1;
+            if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
+            chunk = next;
+        }
+        if (prog->report(acc, done, done >= sppTarget)) break;
+    }
+    return acc;
+}
+
+// Unified progress driver for the samples-per-pixel image modes (R backward reference,
+// D bidirectional). `renderChunked(sppTarget, prog)` is the mode-specific renderer that
+// accumulates a SUM film in chunks and calls prog->report() after each; this function
+// supplies that callback so every mode gets the SAME live progress as the forward camera
+// models: a periodic image rewrite (crash-safe), a status line (or -preview ANSI
+// thumbnail) every `intervalSec`, a ~noise% estimate, and clean Ctrl-C / -time / -noise /
+// -forever stopping. `sppReq` is the requested spp; when a time/noise/forever budget is
+// set the target is opened up (UNBOUNDED_SPP) and the stop is driven by the budget. The
+// display divides the SUM film by the spp completed, so brightness is constant and only
+// graininess falls as more samples land. Returns the process exit code (0 ok, 1 on a
+// write failure).
+static int runSppProgressive(
+        const std::string& outPath, long long sppReq,
+        double manualExposure, double* exposureAnchor, bool absolute,
+        double timeBudgetSec, double noiseTarget, bool runForever,
+        double intervalSec, bool preview,
+        const std::function<Film(long long, const SppProgress*)>& renderChunked) {
+    using clk = std::chrono::steady_clock;
+    // A time/noise/forever budget renders "until the budget", so open the spp target to a
+    // large-but-safe cap (keeps pixel*sppTotal seed indices well inside int64). A plain
+    // fixed-spp render just targets sppReq and still shows progress along the way.
+    const long long UNBOUNDED_SPP = 1'000'000'000LL;
+    const bool budgeted = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever);
+    const long long sppTarget = budgeted ? UNBOUNDED_SPP : sppReq;
+    if (intervalSec <= 0.0) intervalSec = 15.0;
+
+    if (preview) { enableAnsiTerminal(); g_previewRows = 0; }
+    // Trap Ctrl-C (and Windows Ctrl-Break) so a long render stops cleanly with the
+    // accumulated image saved, instead of losing everything since the last periodic write.
+    auto prev = std::signal(SIGINT, onInterrupt);
+#ifdef SIGBREAK
+    auto prevBrk = std::signal(SIGBREAK, onInterrupt);
+#endif
+
+    const auto t0 = clk::now();
+    auto lastSave = t0;
+    bool writeOk = true;
+    bool metNoise = false;
+    long long finalSpp = 0;
+
+    SppProgress prog;
+    prog.report = [&](const Film& film, long long sppDone, bool final) -> bool {
+        finalSpp = sppDone;
+        double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+        double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
+        // Every pixel receives exactly sppDone samples, so the Monte-Carlo relative error
+        // ~ 1/sqrt(samples) gives an honest graininess ballpark straight from the count.
+        double noisePct = sppDone > 0 ? 100.0 / std::sqrt((double)sppDone) : 0.0;
+        bool stopped  = g_stopRequested != 0;
+        bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
+        bool noiseMet = (noiseTarget > 0.0 && sppDone > 0 && noisePct <= noiseTarget);
+        if (noiseMet) metNoise = true;
+        bool stop = stopped || timeUp || noiseMet;
+        bool done = stop || final;
+        if (done || sinceSave >= intervalSec) {
+            // The converged/stopping frame owns the exposure anchor; intermediate frames
+            // auto-expose independently (they only refine, never lock the anchor).
+            writeOk = writeFilm(outPath.c_str(), film, (double)sppDone, manualExposure,
+                                /*quiet*/preview, done ? exposureAnchor : nullptr, absolute);
+            lastSave = clk::now();
+            const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
+            char st[220];
+            if (runForever)
+                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, ~%.2f%% noise%s",
+                              elapsed, sppDone, noisePct, why);
+            else if (timeBudgetSec > 0.0)
+                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, ~%.2f%% noise%s",
+                              elapsed, timeBudgetSec, sppDone, noisePct, why);
+            else if (noiseTarget > 0.0)
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, ~%.2f%% noise%s",
+                              noiseTarget, elapsed, sppDone, noisePct, why);
+            else
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, ~%.2f%% noise",
+                              sppDone, sppReq, elapsed, noisePct);
+            if (preview) ansiPreview(film, (double)sppDone, manualExposure, st);
+            else { std::printf("%s\n", st); std::fflush(stdout); }
+        }
+        return stop;
+    };
+
+    renderChunked(sppTarget, &prog);
+
+    std::signal(SIGINT, prev);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, prevBrk);
+#endif
+    if (g_stopRequested)
+        std::printf("\n[stop] interrupted at %lld spp — image saved.\n", finalSpp);
+    else if (metNoise)
+        std::printf("[noise] reached the ~%.2g%% target at %lld spp — image saved.\n",
+                    noiseTarget, finalSpp);
+    return writeOk ? 0 : 1;
+}
+
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
 // runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
@@ -1513,16 +1772,48 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool forwardCatch = (mode == 'C');
     const bool lensMode     = (mode == 'A');   // finite-lens next-event splat (physical camera)
 
-    // -time / -noise / -resume / -checkpoint accumulate a photon-count film, which only
-    // the pure forward camera models (A/B/C) do. Other modes accumulate differently
-    // (spp-based reference/BDPT, or the P composite) and are not resumable here.
-    if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume || wantCheckpointFlag || runForever) &&
-        !(mode == 'A' || mode == 'B' || mode == 'C')) {
-        std::fprintf(stderr, "[render] -time/-noise/-forever/-resume/-checkpoint apply only to "
-                             "forward camera modes A/B/C; ignoring for mode %c\n", mode);
-        timeBudgetSec = 0.0; noiseTarget = 0.0; resume = false; wantCheckpointFlag = false; runForever = false;
+    // -time / -noise / -forever now drive progress for the spp image modes too (R
+    // backward reference, D bidirectional): those accumulate a SUM-over-samples film in
+    // chunks, so a wall-clock/noise/indefinite budget just keeps adding samples exactly
+    // like the forward camera models. -resume / -checkpoint, however, still apply only to
+    // the forward models A/B/C (their photon-count checkpoint format); the spp modes are
+    // not resumable from disk yet, so keep those gated with a warning.
+    if ((resume || wantCheckpointFlag) && !(mode == 'A' || mode == 'B' || mode == 'C')) {
+        std::fprintf(stderr, "[render] -resume/-checkpoint apply only to forward camera modes "
+                             "A/B/C; ignoring for mode %c\n", mode);
+        resume = false; wantCheckpointFlag = false;
+    }
+    if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D')) {
+        std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward) "
+                             "and R/D (reference/BDPT); ignoring for mode %c\n", mode);
+        timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
+
+    // Heterogeneous / bounded participating media (a `density` field or a `bounds`
+    // box on `medium`) are honored only by the FORWARD light tracer (modes A/B/C, and
+    // the forward layers of V/P). The backward reference (R/V) and the camera-side layer
+    // of the P composite still treat the medium as a single global HOMOGENEOUS haze —
+    // they ignore the density field and the bounds box. Warn loudly rather than silently
+    // render a different fog than authored. (Tracked in known-issues.md: heterogeneous
+    // media in backward modes.) Mode D (volumetric BDPT) is EXCLUDED here: it handles
+    // multiple superposed, box/sphere/object-bounded AND heterogeneous (density-field)
+    // media correctly (over the full scene.media vector) — subpath medium vertices are
+    // placed by delta tracking and connections weighted by ratio-tracking transmittance —
+    // so it never needs this "single global haze" warning.
+    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium is forward-only (R/V/P)
+    for (const Medium& m : scene.media)
+        if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
+    if (scene.anyMedium() && mediaNeedForward &&
+        (mode == 'R' || mode == 'V' || mode == 'P')) {
+        std::fprintf(stderr,
+            "[medium] mode %c uses the backward tracer, which treats participating "
+            "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
+            "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
+            "IGNORED here. Render multi/heterogeneous/bounded fog with a forward mode "
+            "(A/B/C) or volumetric BDPT (mode D) for correct results.\n", mode);
+    }
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
@@ -1638,24 +1929,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "GPU render (megakernel/CPU otherwise)\n");
     }
 
-    // --- Backward reference (mode R) and validation (mode V) ---
-    if (refMode) {
-        // Mode R can run on the GPU (backward reference megakernel, incl. the physical
-        // lens); mode V keeps its backward reference on the CPU as the stable ground
-        // truth while its forward cross-check pass uses the GPU (useGpu below).
-        const bool gpuBackward = (mode == 'R' && useGpu);
-        std::printf("mode %c: backward reference %lld spp at %dx%d on %s (light=%s) ...\n",
-                    mode, spp, res, resY,
+    // --- Backward reference (mode R) ---
+    // Renders through the unified progress driver: the reference film accumulates as a
+    // SUM over samples-per-pixel, so it chunks exactly like the forward camera models and
+    // gets the same live status line / -preview thumbnail / periodic crash-safe write and
+    // -time / -noise / -forever budgeting. GPU when in scope (backward megakernel, incl.
+    // the physical lens), CPU otherwise — both chunk internally.
+    if (mode == 'R') {
+        const bool gpuBackward = useGpu;
+        std::printf("mode R: backward reference at %dx%d on %s (light=%s) ...\n",
+                    res, resY,
                     gpuBackward ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                     lightLabel);
-        Film ref;
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-        if (gpuBackward) ref = renderBackwardCuda(scene, cam, res, resY, spp, diffraction);
-        else             ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
-#else
-        ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
+            if (gpuBackward) return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p);
 #endif
-        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor, scene.absolute); return 0; }
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderBackward(scene, cam, res, resY, c, nThreads, diffraction, off);
+                });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
+    // --- Validation (mode V) ---
+    // Mode V keeps its backward reference single-shot on the CPU as the stable ground
+    // truth, then cross-checks it against a forward light-trace pass. No progressive
+    // budgeting here (it renders a fixed spp / photon count to compare).
+    if (mode == 'V') {
+        std::printf("mode V: backward reference %lld spp at %dx%d on %d CPU threads (light=%s) ...\n",
+                    spp, res, resY, nThreads, lightLabel);
+        Film ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -1684,18 +1991,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return 1;
         }
         int maxDepth = 8;   // path length in edges; connection cost grows ~depth^2
-        std::printf("mode D: bidirectional path tracing, %lld spp at %dx%d on %s "
-                    "(maxDepth=%d, light=%s) ...\n", spp, res, resY,
-                    useGpu ? "GPU" : "CPU threads", maxDepth, lightLabel);
-        Film img;
+        std::printf("mode D: bidirectional path tracing at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
+                    res, resY, useGpu ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
+                    maxDepth, lightLabel);
+        // BDPT accumulates a SUM over spp (cam image + light-splat image), so it chunks
+        // through the same unified progress driver as the forward and mode-R renders.
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-        if (useGpu) img = renderBdptCuda(scene, cam, res, resY, spp, maxDepth, diffraction);
-        else        img = renderBdpt(scene, cam, res, resY, spp, nThreads, maxDepth, diffraction);
-#else
-        img = renderBdpt(scene, cam, res, resY, spp, nThreads, maxDepth, diffraction);
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p);
 #endif
-        writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor, scene.absolute);
-        return 0;
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth, diffraction, off);
+                });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
     }
 
     // --- Forward + camera-side composite (mode P) ---
@@ -1704,8 +2016,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, resY, nThreads, lightLabel);
         Film comp = renderComposite(scene, cam, res, resY, N, spp, nThreads, diffraction, useGpu, wavefront);
-        writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor, scene.absolute);
-        return 0;
+        return writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1;
     }
 
     // --- Forward camera models A/B/C ---------------------------------------
@@ -1731,10 +2042,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // `useAnchor` gates the camera_path exposure-lock: only the final converged write
     // should set/reuse the shared anchor (a premature intermediate save would lock in
     // a noisy anchor for the frame and every later path frame).
+    bool writeOk = true;   // tracks the most recent writeFilm result (drives exit code)
     auto writeOut = [&](bool announceCheckpoint, bool quiet = false, bool useAnchor = true) {
         Film disp = acc.film;                        // display copy (+ direct sky view)
         if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
+        writeOk = writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
                   useAnchor ? exposureAnchor : nullptr, scene.absolute);
         if (wantCheckpoint) {
             if (writeCheckpoint(outPath, acc, guard, mode)) {
@@ -1865,10 +2177,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     acc.energy.absorbed / acc.energy.emitted, acc.energy.sensor / acc.energy.emitted,
                     acc.energy.escaped / acc.energy.emitted, acc.energy.residual / acc.energy.emitted,
                     tot / acc.energy.emitted);
-    return 0;
+    return writeOk ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
+    // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
+    // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
+    // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
+    if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
+        if (argc < 4) {
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> <output.png>\n",
+                         argv[0]);
+            return 2;
+        }
+        return convertToPng(argv[2], argv[3]);
+    }
     long long N = 2'000'000;
     int res = 256;
     char mode = 'B';
@@ -1903,12 +2226,12 @@ int main(int argc, char** argv) {
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
     bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
-    double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
-    double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (forward A/B/C)
-    bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint
-    bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o
-    bool runForever = false;      // -forever: trace until Ctrl-C (forward modes A/B/C)
-    bool preview = false;         // -preview: live ANSI thumbnail during -time/-forever
+    double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (modes A/B/C forward, R/D spp)
+    double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (A/B/C, R/D)
+    bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint (A/B/C)
+    bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o (A/B/C)
+    bool runForever = false;      // -forever: trace until Ctrl-C (modes A/B/C forward, R/D spp)
+    bool preview = false;         // -preview: live ANSI thumbnail during a progress render
     double intervalSec = 15.0;    // -interval <sec>: periodic image-write / preview cadence
     bool modeFromCli = false;     // did the CLI force a global -mode? (else per-camera)
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
@@ -2030,16 +2353,18 @@ int main(int argc, char** argv) {
     // the scattering coefficient varies as (550/lambda)^4, so short wavelengths
     // scatter far more — a bluish haze that transmits red (a spectral sky/sunset).
     if (fogSigmaT > 0.0) {
-        scene.medium.enabled = true;
-        scene.medium.g = fogG;
+        Medium fog;
+        fog.enabled = true;
+        fog.g = fogG;
         double ss = fogAlbedo * fogSigmaT, sa = (1.0 - fogAlbedo) * fogSigmaT;
         if (fogRayleigh) {
-            scene.medium.sigma_s = [ss](double w) { double r = 550.0 / w; double r2 = r * r; return ss * r2 * r2; };
-            scene.medium.sigma_a = constantSpectrum(sa);
+            fog.sigma_s = [ss](double w) { double r = 550.0 / w; double r2 = r * r; return ss * r2 * r2; };
+            fog.sigma_a = constantSpectrum(sa);
         } else {
-            scene.medium.sigma_s = constantSpectrum(ss);
-            scene.medium.sigma_a = constantSpectrum(sa);
+            fog.sigma_s = constantSpectrum(ss);
+            fog.sigma_a = constantSpectrum(sa);
         }
+        scene.media.push_back(std::move(fog));
     }
 
     if (checkBvhOnly) {
@@ -2176,60 +2501,89 @@ int main(int argc, char** argv) {
     // in the same group reuse it (no dolly flicker). A null anchor = per-frame auto.
     std::map<int, double> expAnchors;
 
-    // Shared multi-camera model-B pass. When several plain-`-n` model-B cameras render
-    // on the CPU (either -device cpu, or a scene the forward-GPU path can't accelerate),
-    // trace ONE photon set and splat it to all of them at once (renderForwardShared)
-    // instead of re-tracing per camera. This is the "many cameras for 1x photon work"
-    // win; it is CPU-only for now (the GPU megakernel still renders one camera per
-    // launch — tracked in known-issues), and applies only to per-frame-auto-exposed
-    // cameras (an exposure-locked camera_path is an animation, better left un-shared so
-    // its frames don't all carry the same fixed noise realisation).
-    bool sceneGpuForwardB = false;
+    // Shared multi-camera forward pass. When several plain-`-n` forward cameras of the
+    // same camera model render at once, trace ONE photon set and splat every vertex to
+    // all of them (renderForwardShared / renderForwardSharedCuda) instead of re-tracing
+    // per camera — the "many cameras for 1x photon work" win. It applies to the two
+    // forward next-event models:
+    //   * model B (pinhole splat): connect() draws no RNG, so a shared pass is
+    //     bit-identical to per-camera renders.
+    //   * model A (finite-lens physical camera): connectLens() samples each camera's own
+    //     pupil (draws RNG), so the shared photon flight is un-biased per camera but
+    //     matches a standalone render in distribution, not bit-for-bit. Rectilinear only
+    //     (the thin-lens model can't form a fisheye — see the mode A/C guard in runRender).
+    // Model C consumes the photon at the first aperture it hits, so it can't be shared.
+    // The A- and B-groups are SEPARATE passes: mode A perturbs the RNG stream during the
+    // trace and mode B does not, so their photon paths diverge and can't ride one flight.
+    // Both groups run on the GPU when the device/scene allow (renderForwardSharedCuda),
+    // else on the CPU. Sharing applies only to per-frame-auto-exposed cameras (an
+    // exposure-locked camera_path is an animation, better left un-shared so its frames
+    // don't all carry the same fixed noise realisation).
+    bool useGpuForward = false;
 #ifdef HAVE_CUDA
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
         if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
-            sceneGpuForwardB = true;
+            useGpuForward = true;
     }
 #endif
+    (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
     const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume ||
                                wantCheckpointFlag || runForever || preview);
-    std::vector<int> sharedIdx, restIdx;
+    std::vector<int> groupB, groupA, restIdx;
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
-        bool eligible = (rc.mode == 'B') && (rc.expGroup < 0) && plainRender && !sceneGpuForwardB;
-        (eligible ? sharedIdx : restIdx).push_back(i);
+        bool base = (rc.expGroup < 0) && plainRender;
+        if (base && rc.mode == 'B')                                           groupB.push_back(i);
+        else if (base && rc.mode == 'A' && rc.cam.projection == CAM_RECTILINEAR) groupA.push_back(i);
+        else                                                                  restIdx.push_back(i);
     }
-    if (sharedIdx.size() < 2) {                 // one (or zero) camera: nothing to share
-        restIdx.clear();
-        for (int i = 0; i < (int)toRender.size(); ++i) restIdx.push_back(i);
-        sharedIdx.clear();
-    }
+    // A single-camera group has nothing to share — fold it back into the per-camera path.
+    if (groupB.size() < 2) { for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
+    if (groupA.size() < 2) { for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
+    std::sort(restIdx.begin(), restIdx.end());
 
-    if (!sharedIdx.empty()) {
+    bool sharedWriteFail = false;
+    auto runSharedGroup = [&](const std::vector<int>& idx, char groupMode) {
+        if (idx.empty()) return;
         std::vector<Camera> cams; std::vector<int> rxs, rys;
-        for (int i : sharedIdx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
-        std::printf("[camera] shared model-B pass: %zu cameras, %lld photons on %d CPU threads (light=%s) ...\n",
-                    cams.size(), N, nThreads, lightLabel);
+        for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
+#ifdef HAVE_CUDA
+        if (useGpuForward)
+            std::printf("[camera] shared model-%c pass: %zu cameras, %lld photons on %s (light=%s) ...\n",
+                        groupMode, cams.size(), N, cudaDeviceName(), lightLabel);
+        else
+#endif
+            std::printf("[camera] shared model-%c pass: %zu cameras, %lld photons on %d CPU threads (light=%s) ...\n",
+                        groupMode, cams.size(), N, nThreads, lightLabel);
         EnergyReport e;
-        std::vector<Film> films = renderForwardShared(scene, cams, rxs, rys, N, nThreads, e, diffraction);
+        std::vector<Film> films;
+#ifdef HAVE_CUDA
+        if (useGpuForward)
+            films = renderForwardSharedCuda(scene, cams, rxs, rys, N, e, diffraction, groupMode, 0, wavefront);
+        else
+#endif
+            films = renderForwardShared(scene, cams, rxs, rys, N, nThreads, e, diffraction, groupMode == 'A');
         double tot = e.absorbed + e.sensor + e.escaped + e.residual;
         if (e.emitted > 0.0)
             std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                         e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                         e.residual / e.emitted, tot / e.emitted);
-        for (size_t k = 0; k < sharedIdx.size(); ++k) {
-            const RenderCam& rc = toRender[sharedIdx[k]];
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const RenderCam& rc = toRender[idx[k]];
             Film disp = films[k];
             addEnvBackground(disp, scene, rc.cam, N);     // directly-viewed sky (env scenes)
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)
-                std::printf("[camera] '%s' (mode B, %dx%d) -> %s\n",
-                            rc.name.c_str(), rc.res, rc.resY, op.c_str());
-            writeFilm(op.c_str(), disp, (double)N, rc.exposure, false, nullptr, scene.absolute);
+                std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
+                            rc.name.c_str(), groupMode, rc.res, rc.resY, op.c_str());
+            if (!writeFilm(op.c_str(), disp, (double)N, rc.exposure, false, nullptr, scene.absolute))
+                sharedWriteFail = true;
         }
-    }
+    };
+    runSharedGroup(groupB, 'B');
+    runSharedGroup(groupA, 'A');
 
     for (int i : restIdx) {
         const RenderCam& rc = toRender[i];
@@ -2243,5 +2597,5 @@ int main(int argc, char** argv) {
                            preview, intervalSec, noiseTarget, wavefront, anchor);
         if (rv != 0) return rv;
     }
-    return 0;
+    return sharedWriteFail ? 1 : 0;
 }

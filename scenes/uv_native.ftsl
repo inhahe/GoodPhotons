@@ -1,0 +1,56 @@
+# UV coordinates on NATIVE primitives (spec §9.2 wrap, adapted off meshes). Pattern
+# expressions now see `u` and `v` — the surface texture coordinates — on native objects
+# just like on meshes, so a checker/stripe authored in UV space wraps AROUND the object
+# instead of slicing through world space. Three demos:
+#   * a native `sphere {}` (equirectangular lat/long UV, built in) driving a globe checker
+#   * an `isosurface` box with `uv planar`   — a grid projected flat onto the faces
+#   * an `isosurface` sphere with `uv spherical` — lat/long tiles that converge at the poles
+# Each material is a 2-child `mix` whose child-0 probability is a UV-space checker
+# pattern, so the tile colour (not just a texture) follows the wrap.
+#   ftrace -in scenes/uv_native.ftsl -mode R -device gpu -spp 512 -o png/uv_native.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "ink"   { type diffuse reflect rgb 0.05 0.06 0.09 }
+material "cyan"  { type diffuse reflect rgb 0.15 0.55 0.62 }
+material "gold"  { type diffuse reflect rgb 0.82 0.62 0.20 }
+
+# --- UV-space patterns (0/1 checkers in the (u,v) unit square) ---
+pattern "uvcheck8" { expr "(floor(u*8) + floor(v*4)) % 2" }    # globe: 8 columns x 4 bands
+pattern "uvgrid"   { expr "(floor(u*6) + floor(v*6)) % 2" }    # box: 6x6 planar grid
+pattern "uvtiles"  { expr "(floor(u*12) + floor(v*6)) % 2" }   # sphere: fine lat/long tiles
+
+# --- materials whose per-hit A/B choice follows the UV checker ---
+material "globe" { type mix  layer "ink"  0.5  layer "cyan" 0.5  weight_map pattern:uvcheck8 }
+material "grid"  { type mix  layer "white" 0.5 layer "red"  0.5  weight_map pattern:uvgrid }
+material "tiles" { type mix  layer "gold" 0.5  layer "ink"  0.5  weight_map pattern:uvtiles }
+
+# Room (unit-ish Cornell box, floor x[0,1.6], depth z[0,1.2]).
+quad { origin 0 0 0     u 1.6 0 0   v 0 0 1.2   material white }   # floor
+quad { origin 0 1 0     u 0 0 1.2   v 1.6 0 0   material white }   # ceiling
+quad { origin 0 0 0     u 0 1 0     v 1.6 0 0   material white }   # back
+quad { origin 0 0 0     u 0 0 1.2   v 0 1 0     material red   }   # left
+quad { origin 1.6 0 0   u 0 1 0     v 0 0 1.2   material green }   # right
+
+# 1) Native sphere primitive: equirectangular UV is built in — the checker wraps as a globe.
+sphere { center 0.35 0.28 0.55   radius 0.24   material globe }
+
+# 2) Isosurface box with a PLANAR UV wrap (grid projected down the y axis onto the faces).
+isosurface { material grid  box { translate 0.85 0.20 0.60  size 0.17 0.17 0.17  round 0.02 }  uv planar axis=y }
+
+# 3) Isosurface sphere with a SPHERICAL UV wrap (lat/long tiles converging at the poles).
+isosurface { material tiles  sphere { center 1.30 0.24 0.55   radius 0.22 }  uv spherical axis=y }
+
+light area {
+    origin 0.5 0.999 0.4   u 0.6 0 0   v 0 0 0.5   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.8 0.62 2.35   look_at 0.8 0.28 0.55   up 0 1 0   fov_y 42
+    mode R
+    film { res 900 600 }
+}

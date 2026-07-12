@@ -299,6 +299,105 @@ struct Renderer {
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
     }
 
+    // --- Participating-media sampling helpers --------------------------------
+    // These cover the homogeneous, bounded-homogeneous, and heterogeneous (density-
+    // field) media in one place. A homogeneous medium keeps the exact analytic
+    // behaviour and draws exactly the same RNG as before (bit-identical to the
+    // pre-heterogeneous engine); a density field switches to delta / ratio tracking
+    // with the majorant sigma_max = sigmaT(lambda) * densityMax.
+
+    // Sample the next real collision along (o,dir) within [0,dMax]. Returns true and
+    // sets tHit at a real scattering/absorption event; false if the photon reaches
+    // dMax first. Delta (Woodcock) tracking for a heterogeneous medium: candidate
+    // collisions at rate sigma_max, accepted as real with prob sigmaT(x)/sigma_max
+    // (a rejected "null collision" just continues) — unbiased, throughput unchanged.
+    bool sampleMediumCollision(const Medium& med, const Vec3& o, const Vec3& dir,
+                               double dMax, double lambda, Pcg32& rng, double& tHit) const {
+        double stBase = med.sigmaT(lambda);
+        if (stBase <= 0.0) return false;
+        double ta, tb;
+        if (!med.clipToBounds(o, dir, 0.0, dMax, ta, tb)) return false;
+        if (!med.heterogeneous()) {                       // exact free-flight (one draw)
+            double t = ta - std::log(1.0 - rng.uniform()) / stBase;
+            if (t < tb) { tHit = t; return true; }
+            return false;
+        }
+        double sigMax = stBase * med.densityMax;
+        if (sigMax <= 0.0) return false;
+        double t = ta;
+        for (;;) {
+            t += -std::log(1.0 - rng.uniform()) / sigMax;
+            if (t >= tb) return false;
+            double sigT = stBase * med.densityAt(o + dir * t);
+            if (rng.uniform() * sigMax < sigT) { tHit = t; return true; }  // real collision
+        }                                                                 // else null collision
+    }
+
+    // Unbiased transmittance along [o, o+dir*dist] through the medium. Exact exp for a
+    // homogeneous medium (clipped to its bound); ratio tracking otherwise (candidate
+    // collisions at rate sigma_max, each scaling the estimate by 1 - sigmaT(x)/sigma_max).
+    double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
+                               double dist, double lambda, Pcg32& rng) const {
+        double stBase = med.sigmaT(lambda);
+        if (stBase <= 0.0) return 1.0;
+        double ta, tb;
+        if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 1.0;   // ray never enters fog
+        if (!med.heterogeneous())
+            return std::exp(-stBase * (tb - ta));
+        double sigMax = stBase * med.densityMax;
+        if (sigMax <= 0.0) return 1.0;
+        double Tr = 1.0, t = ta;
+        for (;;) {
+            t += -std::log(1.0 - rng.uniform()) / sigMax;
+            if (t >= tb) break;
+            double sigT = stBase * med.densityAt(o + dir * t);
+            Tr *= 1.0 - sigT / sigMax;
+        }
+        return Tr;
+    }
+
+    // --- Multi-medium (superposition) forward helpers ------------------------
+    // The scene may hold several independent media (Scene::media) that overlap. Two
+    // facts make combining them exact and per-medium bit-identity-preserving:
+    //   * Extinction adds:  T_total = exp(-INT (sig1+sig2+..)) = PROD exp(-INT sig_i),
+    //     so the total transmittance is the PRODUCT of the per-medium transmittances,
+    //     each estimated independently (product of independent unbiased estimators is
+    //     unbiased for the product).
+    //   * Collisions superpose:  the union of independent Poisson collision processes
+    //     with rates sig_i(x) is a Poisson process with rate SUM sig_i(x), whose first
+    //     event is the EARLIEST of the components' first events, and the component that
+    //     produced it (the scattering medium) is picked with the correct probability.
+    // So we sample each medium's first collision independently and take the minimum.
+    // With a single medium these reduce to the exact single-medium paths above (same
+    // RNG draws), so existing scenes are unchanged.
+
+    // Earliest real collision across all media within [0,dMax]. On a hit, `tHit` is the
+    // distance and `whichMed` the index of the scattering medium. false if none.
+    bool sampleMediaCollision(const std::vector<Medium>& media, const Vec3& o,
+                              const Vec3& dir, double dMax, double lambda, Pcg32& rng,
+                              double& tHit, int& whichMed) const {
+        double best = dMax; int which = -1;
+        for (int i = 0; i < (int)media.size(); ++i) {
+            double t;
+            if (sampleMediumCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+                best = t; which = i;
+            }
+        }
+        if (which < 0) return false;
+        tHit = best; whichMed = which; return true;
+    }
+
+    // Combined transmittance through all media = product of per-medium transmittances.
+    double mediaTransmittance(const std::vector<Medium>& media, const Vec3& o,
+                              const Vec3& dir, double dist, double lambda, Pcg32& rng) const {
+        double Tr = 1.0;
+        for (const Medium& m : media) {
+            Tr *= mediumTransmittance(m, o, dir, dist, lambda, rng);
+            if (Tr <= 0.0) break;
+        }
+        return Tr;
+    }
+
     // Model B: connect a surface vertex to the pinhole and splat onto the film.
     // f = rho/pi (Lambertian). The measurement contribution of a surface patch into
     // one pixel is  beta * f * cosSurf / (dist^2 * Omega_pix), where Omega_pix is the
@@ -306,7 +405,8 @@ struct Renderer {
     // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
-                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho) const {
+                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
+                 Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
@@ -319,9 +419,10 @@ struct Renderer {
         double f = rho / PI;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * f * cosSurf / (dist2 * omega);
-        // Beer-Lambert attenuation of the shadow ray through a global fog.
-        if (scene.medium.enabled)
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
+        // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
+        if (!scene.media.empty())
+            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -330,8 +431,9 @@ struct Renderer {
     // single-scattering albedo; there is no surface normal. wIn is the photon's
     // propagation direction into the collision.
     //   contrib = beta * albedo * p_HG(cos) / (dist^2 * Omega_pix) * T_fog
-    void connectVolume(const Scene& scene, const Camera& cam, Film& film,
-                       const Vec3& p, const Vec3& wIn, double lambda, double beta) const {
+    void connectVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
+                       const Vec3& p, const Vec3& wIn, double lambda, double beta,
+                       Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
@@ -339,11 +441,11 @@ struct Renderer {
         if (!cam.project(p, px, py, cosCam, dist2)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
-        double Lambda = scene.medium.albedo(lambda);
+        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);   // fog transmittance
+        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -384,15 +486,15 @@ struct Renderer {
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
-        if (scene.medium.enabled)
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        if (!scene.media.empty())
+            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
     // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
     // surface BRDF*cosSurf is replaced by albedo*phase; the phase function carries no
     // 1/pi, so the pupil pdf's pi R^2 stays. wIn is the photon's incoming direction.
-    void connectLensVolume(const Scene& scene, const Camera& cam, Film& film,
+    void connectLensVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
                            const Vec3& p, const Vec3& wIn, double lambda, double beta,
                            Pcg32& rng) const {
         double R = cam.apertureR;
@@ -409,10 +511,10 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
-        double Lambda = scene.medium.albedo(lambda);
+        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double Lambda = med.albedo(lambda);
         double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
-        contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // all media
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -420,7 +522,7 @@ struct Renderer {
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                   const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
         if (lensMode) connectLens(scene, cam, film, p, n, lambda, beta, rho, rng);
-        else          connect(scene, cam, film, p, n, lambda, beta, rho);
+        else          connect(scene, cam, film, p, n, lambda, beta, rho, rng);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
@@ -433,13 +535,424 @@ struct Renderer {
                 camSplat(scene, *cams[c].cam, *cams[c].film, p, n, lambda, beta, rho, rng);
     }
 
-    // Volume (fog) analogue of camSplatAll.
-    void camSplatVolumeAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
-                           const Vec3& wIn, double lambda, double beta, Pcg32& rng) const {
+    // ===================================================================
+    //  Analytic specular connection through a smooth dielectric SPHERE.
+    //  (Manifold next-event estimation, specialised to an analytic sphere.)
+    //
+    //  Mode B normally skips specular vertices for the camera connection, so a
+    //  directly-viewed clear sphere is black (the SDS limitation). This routine
+    //  restores the missing paths: a diffuse/emissive vertex p that lies behind
+    //  the sphere is connected to the pinhole along the refracted chain
+    //      eye -> P1 -> (glass) -> P2 -> p
+    //  obeying Snell at both interfaces. The chain is found by a 1-D root solve in
+    //  the plane(eye, p, centre) — a sphere's refraction path is planar by
+    //  symmetry — and there may be several roots (multiple refracted images).
+    //  The radiometric weight uses a ray-differential geometry factor (the
+    //  footprint the pixel's beam covers at p), which is the specular Jacobian and
+    //  reduces EXACTLY to connect()'s cosSurf/dist^2 as n->1 (verified in code).
+    //  Smooth spheres only (a rough sphere reopens the lobe -> not a point path).
+    // ===================================================================
+    struct SphereRefr { Vec3 P1, P2, exitDir; double Tf = 0, innerLen = 0; };
+
+    // Describes the photon vertex being connected through the glass: a diffuse
+    // surface (Lambertian rho, normal np) or a volume in-scatter (medium albedo,
+    // HG phase g, incoming dir wIn). The connection geometry is identical for both;
+    // only the throughput term at the vertex differs (rho/pi*cosSurf vs albedo*phase),
+    // exactly mirroring connect() vs connectVolume().
+    struct SpecVtx {
+        bool  volume = false;
+        Vec3  np;                 // surface normal (surface vertices)
+        Vec3  wIn;                // incoming photon direction (volume vertices)
+        double g = 0;             // HG asymmetry (volume vertices)
+        double weight = 0;        // surface: Lambertian rho ; volume: single-scatter albedo
+        // Throughput at the vertex for a connection leaving toward `wP` (unit, toward
+        // the sphere). Returns <0 to signal "reject" (camera-side behind a surface).
+        double term(const Vec3& wP) const {
+            if (volume) return weight * hgPhase(dot(wIn, wP), g);
+            double cosSurf = dot(np, wP);
+            return cosSurf <= 0.0 ? -1.0 : (weight / PI) * cosSurf;
+        }
+    };
+
+    // Trace a ray from `o` (outside sphere S) that ENTERS S, crosses the glass, and
+    // EXITS. Fills P1 (entry), P2 (exit), exitDir (outward), the product of the two
+    // Fresnel transmittances Tf, and the internal path length. False on miss / TIR.
+    static bool traceThroughSphere2(const Vec3& o, const Vec3& d, const Sphere& S,
+                                    double n, SphereRefr& out) {
+        Vec3 oc = o - S.c;
+        double b = dot(oc, d), c = dot(oc, oc) - S.r * S.r;
+        double disc = b * b - c;
+        if (disc < 0.0) return false;
+        double sq = std::sqrt(disc);
+        double t1 = -b - sq;
+        if (t1 < 1e-7) return false;                    // entry must be ahead & outside
+        Vec3 P1 = o + d * t1;
+        Vec3 N1 = (P1 - S.c) * (1.0 / S.r);             // outward normal
+        double cosI = -dot(d, N1);
+        if (cosI <= 1e-6) return false;                 // must hit the front face
+        double eta = 1.0 / n;
+        double sin2t = eta * eta * (1.0 - cosI * cosI);
+        if (sin2t >= 1.0) return false;                 // (cannot TIR entering a denser medium)
+        double cosT = std::sqrt(1.0 - sin2t);
+        Vec3 tin = normalize(d * eta + N1 * (eta * cosI - cosT));
+        double rs = (cosI - n * cosT) / (cosI + n * cosT);
+        double rp = (cosT - n * cosI) / (cosT + n * cosI);
+        double Fe = 0.5 * (rs * rs + rp * rp);          // Fresnel reflectance, entry
+        double sInner = -2.0 * dot(P1 - S.c, tin);      // second intersection param
+        if (sInner <= 1e-9) return false;
+        Vec3 P2 = P1 + tin * sInner;
+        Vec3 N2 = (P2 - S.c) * (1.0 / S.r);             // outward normal at exit
+        double cosI2 = dot(tin, N2);                    // incidence cosine inside (>0)
+        if (cosI2 <= 1e-6) return false;
+        double sin2t2 = n * n * (1.0 - cosI2 * cosI2);
+        if (sin2t2 >= 1.0) return false;                // total internal reflection -> no exit
+        double cosT2 = std::sqrt(1.0 - sin2t2);
+        Vec3 exitDir = normalize(tin * n + N2 * (-(n * cosI2 - cosT2)));
+        double rs2 = (n * cosI2 - cosT2) / (n * cosI2 + cosT2);
+        double rp2 = (n * cosT2 - cosI2) / (n * cosT2 + cosI2);
+        double Fx = 0.5 * (rs2 * rs2 + rp2 * rp2);      // Fresnel reflectance, exit
+        out.P1 = P1; out.P2 = P2; out.exitDir = exitDir;
+        out.Tf = (1.0 - Fe) * (1.0 - Fx);
+        out.innerLen = sInner;
+        return true;
+    }
+
+    // Connect vertex p (normal np, Lambertian weight rho) to the pinhole `cam`
+    // THROUGH one smooth dielectric sphere S (glass index n). Adds the refracted
+    // image of p seen in the sphere. Pinhole (mode B) only.
+    void connectSpecularSphere(const Scene& scene, const Camera& cam, Film& film,
+                               const Sphere& S, const Material& glass, double n,
+                               const Vec3& p, const SpecVtx& vt, double lambda,
+                               double beta, Pcg32& rng) const {
+        const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
+        double dEyeO = length(eye - O);
+        double dPO   = length(p - O);
+        if (dPO   <  r * 0.9999) return;   // vertex inside the glass -> skip (MVP)
+        if (dEyeO <= r * 0.9999) {         // eye inside the glass -> single-refraction path
+            connectSpecularSphereInside(scene, cam, film, S, glass, n, p, vt, lambda,
+                                        beta, rng);
+            return;
+        }
+        if (dEyeO <= r * 1.0001) return;   // eye ~on the surface -> degenerate, skip
+
+        // Plane(eye, p, O) with ex toward the eye; p has 2-D coords (px2,py2).
+        Vec3 ex = (eye - O) * (1.0 / dEyeO);
+        Vec3 ap = p - O;
+        Vec3 perp = ap - ex * dot(ap, ex);
+        double perpLen = length(perp);
+        Vec3 ey;
+        if (perpLen < 1e-9) { Vec3 tb; onb(ex, ey, tb); }   // axial: pick any perpendicular
+        else                ey = perp * (1.0 / perpLen);
+        double ex_e = dEyeO;                                // eye 2-D = (ex_e, 0)
+        double px2 = dot(ap, ex), py2 = dot(ap, ey);        // p   2-D
+
+        // In-plane trace: signed perpendicular distance of p from the exit ray, for
+        // entry angle phi (measured in (ex,ey)). Sets valid on a real forward exit.
+        auto trace2D = [&](double phi, bool& valid) -> double {
+            valid = false;
+            double c1 = std::cos(phi), s1 = std::sin(phi);
+            double P1x = r * c1, P1y = r * s1;
+            double dinx = P1x - ex_e, diny = P1y;
+            double dl = std::sqrt(dinx * dinx + diny * diny);
+            if (dl < 1e-12) return 0.0;
+            dinx /= dl; diny /= dl;
+            double cosI = -(dinx * c1 + diny * s1);
+            if (cosI <= 1e-6) return 0.0;                   // front-facing entry only
+            double eta = 1.0 / n, sin2t = eta * eta * (1.0 - cosI * cosI);
+            if (sin2t >= 1.0) return 0.0;
+            double cosT = std::sqrt(1.0 - sin2t);
+            double tinx = eta * dinx + (eta * cosI - cosT) * c1;
+            double tiny = eta * diny + (eta * cosI - cosT) * s1;
+            double tl = std::sqrt(tinx * tinx + tiny * tiny); tinx /= tl; tiny /= tl;
+            double sInner = -2.0 * (P1x * tinx + P1y * tiny);
+            if (sInner <= 1e-9) return 0.0;
+            double P2x = P1x + tinx * sInner, P2y = P1y + tiny * sInner;
+            double n2x = P2x / r, n2y = P2y / r;
+            double cosI2 = tinx * n2x + tiny * n2y;
+            if (cosI2 <= 1e-6) return 0.0;
+            double sin2t2 = n * n * (1.0 - cosI2 * cosI2);
+            if (sin2t2 >= 1.0) return 0.0;                  // TIR
+            double cosT2 = std::sqrt(1.0 - sin2t2);
+            double doutx = n * tinx - (n * cosI2 - cosT2) * n2x;
+            double douty = n * tiny - (n * cosI2 - cosT2) * n2y;
+            double dl2 = std::sqrt(doutx * doutx + douty * douty); doutx /= dl2; douty /= dl2;
+            double fw = (px2 - P2x) * doutx + (py2 - P2y) * douty;
+            if (fw <= 0.0) return 0.0;                      // p must be on the forward side
+            valid = true;
+            return doutx * (py2 - P2y) - douty * (px2 - P2x);
+        };
+
+        // Scan the front arc; bisect sign changes into chief entry angles (<=4 roots).
+        const int NS = 96; double roots[4]; int nroot = 0;
+        double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
+        for (int i = 0; i <= NS && nroot < 4; ++i) {
+            double phi = -PI + (2.0 * PI) * i / NS;
+            bool v; double mss = trace2D(phi, v);
+            if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
+                double a = prevPhi, b = phi, fa = prevMiss;
+                for (int k = 0; k < 40; ++k) {
+                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(mid, vm);
+                    if (!vm) break;
+                    if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
+                }
+                roots[nroot++] = 0.5 * (a + b);
+            }
+            prevMiss = mss; prevValid = v; prevPhi = phi;
+        }
+
+        for (int ri = 0; ri < nroot; ++ri) {
+            double phi = roots[ri];
+            Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
+            Vec3 d0 = normalize(P1chief - eye);
+            SphereRefr ch;
+            if (!traceThroughSphere2(eye, d0, S, n, ch)) continue;
+
+            // Ray-differential geometry factor: perturb the eye direction by eps in
+            // two orthogonal directions, trace both through the same interfaces, and
+            // measure the footprint they cover on the plane through p (normal =
+            // chief exit dir). G = dOmega_eye / dA_p = eps^2 / |dA x dB|.
+            Vec3 a1, a2; onb(d0, a1, a2);
+            const double eps = 2e-4;
+            SphereRefr rA, rB;
+            if (!traceThroughSphere2(eye, normalize(d0 + a1 * eps), S, n, rA)) continue;
+            if (!traceThroughSphere2(eye, normalize(d0 + a2 * eps), S, n, rB)) continue;
+            Vec3 e1, e2; onb(ch.exitDir, e1, e2);
+            auto planeOff = [&](const SphereRefr& R, double& ox, double& oy) {
+                double denom = dot(R.exitDir, ch.exitDir);
+                if (std::fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
+                double s = dot(p - R.P2, ch.exitDir) / denom;
+                Vec3 off = (R.P2 + R.exitDir * s) - p;
+                ox = dot(off, e1); oy = dot(off, e2);
+            };
+            double ax, ay, bx, by;
+            planeOff(rA, ax, ay); planeOff(rB, bx, by);
+            double jac = std::fabs(ax * by - ay * bx);
+            if (jac < 1e-24) continue;                      // caustic singularity guard
+            double G = (eps * eps) / jac;
+
+            int px, py; double cosCam, dist2e;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
+            double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) continue;
+
+            Vec3 wP = ch.P2 - p; double dP2 = length(wP);
+            if (dP2 < 1e-9) continue;
+            wP = wP * (1.0 / dP2);
+            double term = vt.term(wP);
+            if (term < 0.0) continue;                       // camera side behind the surface
+
+            double contrib = beta * term * G * ch.Tf / omega;
+            if (contrib <= 0.0) continue;
+            double aGlass = glass.absorb(lambda);           // Beer-Lambert inside the glass
+            if (aGlass > 0.0) contrib *= std::exp(-aGlass * ch.innerLen);
+
+            // Visibility on the two outer segments (the connecting sphere's own
+            // surface is excluded by shortening maxDist just short of the endpoint).
+            if (scene.occluded(p + wP * 1e-6, wP, dP2 - 2e-6)) continue;
+            Vec3 wE = eye - ch.P1; double dE = length(wE); wE = wE * (1.0 / dE);
+            if (scene.occluded(ch.P1 + wE * 1e-6, wE, dE - 2e-6)) continue;
+
+            // Fog transmittance on the two outer (vacuum-side) segments only; the
+            // interior segment is solid glass (its absorption is the Beer-Lambert above).
+            if (!scene.media.empty()) {
+                contrib *= mediaTransmittance(scene.media, p,     wP, dP2, lambda, rng);
+                contrib *= mediaTransmittance(scene.media, ch.P1, wE, dE,  lambda, rng);
+            }
+            film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+        }
+    }
+
+    // Single-interface refraction datum: exit surface point, refracted (outward)
+    // direction, Fresnel transmittance, and the interior path length eye->P1.
+    struct SphereRefr1 { Vec3 P1, exitDir; double Tf = 0, innerLen = 0; };
+
+    // Trace a ray from `o` (INSIDE sphere S) to its exit through the surface, refract
+    // glass->vacuum. False on TIR / degenerate. (Sign convention matches the exit
+    // interface of traceThroughSphere2.)
+    static bool traceOutOfSphere(const Vec3& o, const Vec3& d, const Sphere& S,
+                                 double n, SphereRefr1& out) {
+        Vec3 oc = o - S.c;
+        double b = dot(oc, d), c = dot(oc, oc) - S.r * S.r;
+        double disc = b * b - c;
+        if (disc <= 0.0) return false;                  // (o inside => c<0 => disc>0)
+        double sq = std::sqrt(disc);
+        double t1 = -b + sq;                            // far root: the exit ahead
+        if (t1 < 1e-7) return false;
+        Vec3 P1 = o + d * t1;
+        Vec3 N1 = (P1 - S.c) * (1.0 / S.r);             // outward normal
+        double cosI = dot(d, N1);                       // outgoing (>0)
+        if (cosI <= 1e-6) return false;
+        double sin2t = n * n * (1.0 - cosI * cosI);     // glass -> vacuum
+        if (sin2t >= 1.0) return false;                 // total internal reflection
+        double cosT = std::sqrt(1.0 - sin2t);
+        Vec3 exitDir = normalize(d * n - N1 * (n * cosI - cosT));
+        double rs = (n * cosI - cosT) / (n * cosI + cosT);
+        double rp = (n * cosT - cosI) / (n * cosT + cosI);
+        double F = 0.5 * (rs * rs + rp * rp);
+        out.P1 = P1; out.exitDir = exitDir; out.Tf = 1.0 - F; out.innerLen = t1;
+        return true;
+    }
+
+    // Connect an EXTERIOR vertex p to a pinhole whose eye sits INSIDE dielectric
+    // sphere S: light travels p -> P1 (surface) -> refracts once -> eye. This is the
+    // path the camera sees while flying THROUGH the glass. Planar in plane(eye,p,O).
+    void connectSpecularSphereInside(const Scene& scene, const Camera& cam, Film& film,
+                                     const Sphere& S, const Material& glass, double n,
+                                     const Vec3& p, const SpecVtx& vt, double lambda,
+                                     double beta, Pcg32& rng) const {
+        const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
+        double dEyeO = length(eye - O);
+
+        // Plane(eye, p, O): ex toward the eye (or any axis if eye ~at center).
+        Vec3 ex, ey;
+        if (dEyeO < 1e-9) { Vec3 tb; onb(normalize(p - O), ex, tb); }
+        else              ex = (eye - O) * (1.0 / dEyeO);
+        Vec3 ap = p - O;
+        Vec3 perp = ap - ex * dot(ap, ex);
+        double perpLen = length(perp);
+        if (perpLen < 1e-9) { Vec3 tb; onb(ex, ey, tb); }
+        else                ey = perp * (1.0 / perpLen);
+        double ex_e = dot(eye - O, ex), ey_e = dot(eye - O, ey);   // eye 2-D
+        double px2 = dot(ap, ex), py2 = dot(ap, ey);               // p   2-D
+
+        // In-plane trace: signed perp distance of p from the once-refracted exit ray
+        // leaving the surface point at angle phi. valid on a real forward exit.
+        auto trace2D = [&](double phi, bool& valid) -> double {
+            valid = false;
+            double c1 = std::cos(phi), s1 = std::sin(phi);
+            double P1x = r * c1, P1y = r * s1;
+            double dinx = P1x - ex_e, diny = P1y - ey_e;
+            double dl = std::sqrt(dinx * dinx + diny * diny);
+            if (dl < 1e-12) return 0.0;
+            dinx /= dl; diny /= dl;
+            double cosI = dinx * c1 + diny * s1;            // outgoing across surface (>0)
+            if (cosI <= 1e-6) return 0.0;
+            double sin2t = n * n * (1.0 - cosI * cosI);
+            if (sin2t >= 1.0) return 0.0;                   // TIR
+            double cosT = std::sqrt(1.0 - sin2t);
+            double k = n * cosI - cosT;
+            double doutx = n * dinx - k * c1, douty = n * diny - k * s1;
+            double dl2 = std::sqrt(doutx * doutx + douty * douty); doutx /= dl2; douty /= dl2;
+            double fw = (px2 - P1x) * doutx + (py2 - P1y) * douty;
+            if (fw <= 0.0) return 0.0;
+            valid = true;
+            return doutx * (py2 - P1y) - douty * (px2 - P1x);
+        };
+
+        // Scan the full circle; bisect sign changes into chief exit angles (<=2 roots).
+        const int NS = 96; double roots[4]; int nroot = 0;
+        double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
+        for (int i = 0; i <= NS && nroot < 4; ++i) {
+            double phi = -PI + (2.0 * PI) * i / NS;
+            bool v; double mss = trace2D(phi, v);
+            if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
+                double a = prevPhi, b = phi, fa = prevMiss;
+                for (int k = 0; k < 40; ++k) {
+                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(mid, vm);
+                    if (!vm) break;
+                    if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
+                }
+                roots[nroot++] = 0.5 * (a + b);
+            }
+            prevMiss = mss; prevValid = v; prevPhi = phi;
+        }
+
+        for (int ri = 0; ri < nroot; ++ri) {
+            double phi = roots[ri];
+            Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
+            Vec3 d0 = normalize(P1chief - eye);
+            SphereRefr1 ch;
+            if (!traceOutOfSphere(eye, d0, S, n, ch)) continue;
+
+            // Ray-differential geometry factor G = dOmega_eye / dA_p.
+            Vec3 a1, a2; onb(d0, a1, a2);
+            const double eps = 2e-4;
+            SphereRefr1 rA, rB;
+            if (!traceOutOfSphere(eye, normalize(d0 + a1 * eps), S, n, rA)) continue;
+            if (!traceOutOfSphere(eye, normalize(d0 + a2 * eps), S, n, rB)) continue;
+            Vec3 e1, e2; onb(ch.exitDir, e1, e2);
+            auto planeOff = [&](const SphereRefr1& R, double& ox, double& oy) {
+                double denom = dot(R.exitDir, ch.exitDir);
+                if (std::fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
+                double s = dot(p - R.P1, ch.exitDir) / denom;
+                Vec3 off = (R.P1 + R.exitDir * s) - p;
+                ox = dot(off, e1); oy = dot(off, e2);
+            };
+            double ax, ay, bx, by;
+            planeOff(rA, ax, ay); planeOff(rB, bx, by);
+            double jac = std::fabs(ax * by - ay * bx);
+            if (jac < 1e-24) continue;                      // caustic singularity guard
+            double G = (eps * eps) / jac;
+
+            int px, py; double cosCam, dist2e;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
+            double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) continue;
+
+            Vec3 wP = ch.P1 - p; double dP = length(wP);
+            if (dP < 1e-9) continue;
+            wP = wP * (1.0 / dP);
+            double term = vt.term(wP);
+            if (term < 0.0) continue;
+
+            double contrib = beta * term * G * ch.Tf / omega;
+            if (contrib <= 0.0) continue;
+            double aGlass = glass.absorb(lambda);           // Beer-Lambert eye->P1 (in glass)
+            if (aGlass > 0.0) contrib *= std::exp(-aGlass * ch.innerLen);
+
+            // Visibility on the exterior segment p -> P1 only (eye -> P1 is inside glass).
+            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
+
+            // Fog transmittance on the exterior segment only (interior is solid glass).
+            if (!scene.media.empty())
+                contrib *= mediaTransmittance(scene.media, p, wP, dP, lambda, rng);
+
+            film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+        }
+    }
+
+    // Splat vertex p to every camera through every smooth dielectric sphere (the
+    // refracted image of p). Mode B (pinhole) only; draws no aperture RNG.
+    void camSpecularSplatAllVtx(const Scene& scene, const CamTarget* cams, int nCam,
+                                const Vec3& p, const SpecVtx& vt, double lambda,
+                                double beta, Pcg32& rng) const {
+        if (lensMode || forwardCatch) return;               // finite-lens/catch not supported
+        for (const Sphere& S : scene.spheres) {
+            const Material& gm = scene.mats[S.matId];
+            if (gm.type != MatType::Dielectric) continue;
+            double ng = gm.ior(lambda);
+            for (int c = 0; c < nCam; ++c)
+                if (cams[c].cam && cams[c].film)
+                    connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
+                                          p, vt, lambda, beta, rng);
+        }
+    }
+    // Surface vertex: refract the Lambertian reflection of p through every glass sphere.
+    void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
+                             const Vec3& p, const Vec3& n, double lambda, double beta,
+                             double rho, Pcg32& rng) const {
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
+        camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
+    }
+    // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
+    // glowing haze itself bends through the glass the camera flies through.
+    void camSpecularSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
+                                   int nCam, const Vec3& p, const Vec3& wIn, double lambda,
+                                   double beta, Pcg32& rng) const {
+        SpecVtx vt; vt.volume = true; vt.wIn = wIn; vt.g = med.g; vt.weight = med.albedo(lambda);
+        camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
+    }
+
+    // Volume (fog) analogue of camSplatAll. `med` is the medium that scattered the
+    // photon here (its phase/albedo drive the in-scatter term); transmittance still
+    // accounts for all media (product) inside the volume connect functions.
+    void camSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
+                           int nCam, const Vec3& p, const Vec3& wIn, double lambda,
+                           double beta, Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
-                if (lensMode) connectLensVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
-                else          connectVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta);
+                if (lensMode) connectLensVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
+                else          connectVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
             }
     }
 
@@ -535,8 +1048,10 @@ struct Renderer {
         // A spot is a point light with no projected area, so it has no such direct
         // term (its cone illuminates surfaces, which then connect to the camera).
         if (nCam > 0 && !forwardCatch &&
-            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env)
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
             camSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
+            camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
+        }
 
         Ray ray{origin + dir * 1e-6, dir};
         // Dielectric the photon is currently INSIDE (for Beer-Lambert interior
@@ -553,12 +1068,12 @@ struct Renderer {
             // the exponential free-flight, so beta is unchanged (analog MC).
             double dEvent = dSurf;
             bool mediumEvent = false;
+            int scatterMed = -1;   // which medium scattered (index into scene.media)
             Vec3 mp;
-            if (scene.medium.enabled) {
-                double st = scene.medium.sigmaT(lambda);
-                if (st > 0.0) {
-                    double tMed = -std::log(1.0 - rng.uniform()) / st;
-                    if (tMed < dSurf) { dEvent = tMed; mediumEvent = true; mp = ray.o + ray.d * tMed; }
+            if (!scene.media.empty()) {
+                double tMed; int which;
+                if (sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
+                    dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
                 }
             }
 
@@ -580,11 +1095,14 @@ struct Renderer {
             }
 
             if (mediumEvent) {
-                if (nCam > 0 && !forwardCatch)
-                    camSplatVolumeAll(scene, cams, nCam, mp, ray.d, lambda, beta, rng);
+                const Medium& sm = scene.media[scatterMed];
+                if (nCam > 0 && !forwardCatch) {
+                    camSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
+                    camSpecularSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
+                }
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
-                if (rng.uniform() >= scene.medium.albedo(lambda)) { e.absorbed += beta; return; }
-                ray = Ray{mp, sampleHG(ray.d, scene.medium.g, rng)};
+                if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
+                ray = Ray{mp, sampleHG(ray.d, sm.g, rng)};
                 continue;
             }
 
@@ -713,10 +1231,38 @@ struct Renderer {
                     ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
                     continue;                           // beta unchanged (see above)
                 }
+                case MatType::DiffuseTransmit: {
+                    // Two-lobe Lambertian: reflect albedo into the front hemisphere
+                    // (+h.n, the incoming side) and transmit albedo into the back
+                    // hemisphere (-h.n). Splat BOTH lobes to the camera — the wrong-side
+                    // lobe self-rejects inside connect() (cosSurf<=0), so passing the
+                    // flipped normal for the transmit lobe just images whichever side the
+                    // camera is on. Because both lobes are non-specular, a directly-viewed
+                    // translucent solid is VISIBLE in mode B (unlike clear dielectric).
+                    double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    double rhoT = clamp01(m.transmit(lambda));
+                    double sum = rhoR + rhoT;
+                    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
+                    if (nCam > 0 && !forwardCatch) {
+                        camSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
+                        camSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
+                        camSpecularSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
+                        camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
+                    }
+                    // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else
+                    // absorb — throughput unchanged on a scatter.
+                    double u = rng.uniform();
+                    if (u < rhoR)      { ray = Ray{h.p + h.n * 1e-6, cosineHemisphere( h.n, rng)}; continue; }
+                    else if (u < sum)  { ray = Ray{h.p - h.n * 1e-6, cosineHemisphere(-h.n, rng)}; continue; }
+                    e.absorbed += beta; return;
+                }
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-                    if (nCam > 0 && !forwardCatch) camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                    if (nCam > 0 && !forwardCatch) {
+                        camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                        camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                    }
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.

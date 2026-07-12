@@ -27,7 +27,7 @@
 //                continuation. This is the unbiased backward adjoint of the forward
 //                tracer's fluoroInteract(), so -scene fluoro now validates with modes
 //                R/V (previously fluoro was forward-only).
-// Participating media (scene.medium / -fog) IS supported here: camera and
+// Participating media (scene.backwardMedium() / -fog) IS supported here: camera and
 // scattered rays sample volume free-flight, and volume vertices do phase-function
 // NEE to the light (neeVolume). So -fog CAN be combined with modes R/V, which is
 // how the forward fog transport is cross-validated.
@@ -75,8 +75,8 @@ struct BackwardRenderer {
                 double f = rho / PI;
                 double emitW = em.spdFn(lambda) * invPdfLambda;
                 double contrib = f * emitW * fall * cosSurf / dist2;  // I(w)/dist^2
-                if (scene.medium.enabled)
-                    contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+                if (scene.backwardMedium().enabled)
+                    contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 total += contrib;
                 continue;
             }
@@ -120,8 +120,8 @@ struct BackwardRenderer {
                 double G = cosSurf * cosLight / dist2;    // geometry term
                 contrib = f * emitW * G * effArea;        // pdf_area = 1/effArea (visible area for cylinder)
             }
-            if (scene.medium.enabled)                     // Beer-Lambert on the shadow ray
-                contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+            if (scene.backwardMedium().enabled)                     // Beer-Lambert on the shadow ray
+                contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
             total += contrib;
         }
         return total;
@@ -146,9 +146,9 @@ struct BackwardRenderer {
                 double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase  = hgPhase(dot(wIn, wi), scene.medium.g);
-                double albedo = scene.medium.albedo(lambda);
-                double T = std::exp(-scene.medium.sigmaT(lambda) * dist);
+                double phase  = hgPhase(dot(wIn, wi), scene.backwardMedium().g);
+                double albedo = scene.backwardMedium().albedo(lambda);
+                double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = em.spdFn(lambda) * invPdfLambda;
                 total += albedo * phase * emitW * fall / dist2 * T;
                 continue;
@@ -164,12 +164,12 @@ struct BackwardRenderer {
                               !em.caps &&   // capped tubes: uniform samplePoint covers the caps too
                               em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
-            double albedo = scene.medium.albedo(lambda);
+            double albedo = scene.backwardMedium().albedo(lambda);
             double emitW = em.spdFn(lambda) * invPdfLambda;
             double contrib;
             if (coneSampled) {
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase = hgPhase(dot(wIn, wi), scene.medium.g);
+                double phase = hgPhase(dot(wIn, wi), scene.backwardMedium().g);
                 contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
             } else {
                 if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
@@ -180,11 +180,11 @@ struct BackwardRenderer {
                 double cosLight = dot(nLight, -wi);        // light is one-sided
                 if (cosLight <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase = hgPhase(dot(wIn, wi), scene.medium.g);
+                double phase = hgPhase(dot(wIn, wi), scene.backwardMedium().g);
                 double G = cosLight / dist2;               // no surface cosine at a volume vertex
                 contrib = albedo * phase * emitW * G * effArea;
             }
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+            contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
             total += contrib;
         }
         return total;
@@ -214,8 +214,8 @@ struct BackwardRenderer {
         double pdfBsdf = cosSurf / PI;                  // cosine-hemisphere pdf for wi
         double wMis = pdfW / (pdfW + pdfBsdf);          // balance heuristic
         double contrib = f * Lenv * cosSurf * invPdfLambda / pdfW * wMis;
-        if (scene.medium.enabled)                       // Beer-Lambert to the scene exit
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * farDist);
+        if (scene.backwardMedium().enabled)                       // Beer-Lambert to the scene exit
+            contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
         return contrib;
     }
 
@@ -232,10 +232,10 @@ struct BackwardRenderer {
         if (scene.occluded(p + wi * 1e-6, wi, farDist)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
-        double phase  = hgPhase(dot(wIn, wi), scene.medium.g);  // == BSDF pdf here
-        double albedo = scene.medium.albedo(lambda);
+        double phase  = hgPhase(dot(wIn, wi), scene.backwardMedium().g);  // == BSDF pdf here
+        double albedo = scene.backwardMedium().albedo(lambda);
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
-        double T = std::exp(-scene.medium.sigmaT(lambda) * farDist);
+        double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
         return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T;
     }
 
@@ -261,8 +261,8 @@ struct BackwardRenderer {
             // the surface. On a volume collision, estimate direct light via phase-
             // function NEE, then scatter (HG) or absorb — analog, throughput
             // unchanged. Mirrors the forward tracer exactly, so the two agree.
-            if (scene.medium.enabled) {
-                double st = scene.medium.sigmaT(lambda);
+            if (scene.backwardMedium().enabled) {
+                double st = scene.backwardMedium().sigmaT(lambda);
                 if (st > 0.0) {
                     double tMed = -std::log(1.0 - rng.uniform()) / st;
                     if (tMed < dSurf) {
@@ -275,9 +275,9 @@ struct BackwardRenderer {
                         L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
                         if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                             L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
-                        if (rng.uniform() >= scene.medium.albedo(lambda)) return L; // absorbed
-                        Vec3 wOut = sampleHG(ray.d, scene.medium.g, rng);
-                        contBsdfPdf = hgPhase(dot(ray.d, wOut), scene.medium.g);
+                        if (rng.uniform() >= scene.backwardMedium().albedo(lambda)) return L; // absorbed
+                        Vec3 wOut = sampleHG(ray.d, scene.backwardMedium().g, rng);
+                        contBsdfPdf = hgPhase(dot(ray.d, wOut), scene.backwardMedium().g);
                         ray = Ray{p, wOut};
                         specularArrival = false;   // phase-NEE covered the direct light
                         continue;
@@ -481,6 +481,40 @@ struct BackwardRenderer {
                         break;
                     }
                     return L;                                    // absorbed / terminated
+                }
+                case MatType::DiffuseTransmit: {
+                    // Two-lobe Lambertian (backward adjoint of render.h DiffuseTransmit):
+                    // NEE the reflect lobe against lights in the front (+h.n) hemisphere
+                    // and the transmit lobe against lights in the back (-h.n) hemisphere
+                    // (a normal-flipped Hit copy reuses neeLight/neeEnv for the back side).
+                    // The continuation picks reflect / transmit / absorb analogously to a
+                    // Russian-roulette diffuse bounce, throughput unchanged on survival.
+                    double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    double rhoT = clamp01(m.transmit(lambda));
+                    double sum = rhoR + rhoT;
+                    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
+                    L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng);
+                    if (scene.envIndex >= 0)
+                        L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
+                    Hit hb = h; hb.n = -h.n;                 // back hemisphere for the transmit lobe
+                    L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                    if (scene.envIndex >= 0)
+                        L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                    double u = rng.uniform();
+                    if (u < rhoR) {                          // reflect continuation (front)
+                        Vec3 wOut = cosineHemisphere(h.n, rng);
+                        contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
+                        ray = Ray{h.p + h.n * 1e-6, wOut};
+                        specularArrival = false;
+                        break;
+                    } else if (u < sum) {                    // transmit continuation (back)
+                        Vec3 wOut = cosineHemisphere(-h.n, rng);
+                        contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
+                        ray = Ray{h.p - h.n * 1e-6, wOut};
+                        specularArrival = false;
+                        break;
+                    }
+                    return L;                                // absorbed / terminated
                 }
                 case MatType::Diffuse:
                 default: {

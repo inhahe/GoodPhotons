@@ -1,0 +1,86 @@
+# Lantern hall — a mode-B (forward pinhole splat) showcase built around the thing that
+# mode does better than any backward tracer: VOLUMETRIC SCATTERING.
+#
+# A long, dark hall is filled with a global scattering haze (`medium`). Three bright
+# colored sphere lights hang in the haze; because the fog scatters their light back
+# toward the pinhole, each reads as a soft GLOWING TRANSLUCENT ORB — a discrete volume
+# the camera weaves straight through. (FTSL has no bounded/per-object medium yet — see
+# known-issues.md — so the "translucent object" is a lit region of the global haze,
+# which is exactly the shape mode B images for free.)
+#
+# The flight deliberately never traverses OR directly views any transparent surface: a
+# directly-viewed dielectric renders black in mode B (a delta BSDF has no forward camera
+# connection — the SDS limitation), so the scene contains NO dielectric at all. Every
+# surface is diffuse and the volumetric glow is the sole star — exactly the regime mode
+# B nails and a backward tracer struggles with (it would fight to find the haze glow).
+#
+# The three lanterns use `lumens` (photometric power), so each reads at the SAME
+# perceived brightness despite very different color temperatures — otherwise the
+# unnormalized blackbody SPDs would make the warm 2700 K lantern far dimmer than the
+# cool ones. `lumens` also forces ABSOLUTE exposure: one fixed sensor gain across every
+# frame, so the fly-through has rock-steady exposure and zero video flicker for free.
+# The `film { exposure 28 }` is the compensation that lifts that fixed gain to a good
+# working brightness.
+#
+# The `camera_curve` rides a CLOSED Catmull-Rom loop: it weaves down the hall skimming
+# each glowing orb in turn, sweeps across the far end, and returns down the right side.
+# Aimed along its own tangent (`look tangent`) it always flies *into* the glow. 240
+# tightly-spaced frames + `closed` make a seamless, endlessly-loopable fly-through.
+#
+#   ftrace -in scenes/lanterns.ftsl -mode B -device gpu -n 4000000000 -o png/lanterns.png
+#   ffmpeg -framerate 30 -i png/lanterns_fly%03d.png -c:v libx264 -pix_fmt yuv420p \
+#          -crf 18 png/lanterns.mp4
+
+scene { units meters  spectral 360 830 1 }
+
+# Slightly cool walls and a warmer floor: the colored haze and lantern glow carry the
+# image, while the floor picks up the lantern pools of light.
+material "wall"  { type diffuse    reflect rgb 0.50 0.50 0.56 }
+material "floor" { type diffuse    reflect rgb 0.68 0.62 0.52 }
+
+# --- Hall enclosure: floor x[0,3.2], height y[0,2.6], length z[0,7] -------------
+quad { origin 0 0 0     u 3.2 0 0   v 0 0 7    material floor }   # floor
+quad { origin 0 2.6 0   u 0 0 7     v 3.2 0 0  material wall  }   # ceiling
+quad { origin 0 0 0     u 0 2.6 0   v 3.2 0 0  material wall  }   # back  (z=0)
+quad { origin 0 0 7     u 0 2.6 0   v 3.2 0 0  material wall  }   # front (z=7)
+quad { origin 0 0 0     u 0 0 7     v 0 2.6 0  material wall  }   # left  (x=0)
+quad { origin 3.2 0 0   u 0 2.6 0   v 0 0 7    material wall  }   # right (x=3.2)
+
+# --- Glowing lantern orbs: bright sphere lights suspended in the haze -----------
+# Warm amber, cool blue, neutral white — small emitters, but the fog turns each into a
+# broad glowing halo. `lumens` equalizes perceived brightness across color temps.
+light sphere { center 1.0 1.50 1.8   radius 0.16   spd preset:bb2700   lumens 600 }
+light sphere { center 2.3 1.15 3.6   radius 0.16   spd preset:bb8500   lumens 600 }
+light sphere { center 1.3 1.80 5.4   radius 0.16   spd preset:bb5200   lumens 600 }
+
+# --- Global scattering haze the whole flight is immersed in. Mildly forward-peaked
+# (g 0.35) so the glow biases toward the camera; albedo 0.93 keeps it luminous. -----
+medium { sigma_t 0.35   albedo 0.93   g 0.35 }
+
+# --- Seamless closed fly-through. It weaves down the hall skimming each orb from one
+# side, sweeps around the far end, and returns skimming every orb again from the OTHER
+# side — so a glow stays in frame almost the whole loop. `look tangent` flies straight
+# into the glow. The seam (last point -> first point) sits by the warm orb, so the loop
+# never cuts from black. -----------------------------------------------------------
+camera_curve "fly" {
+    # forward leg (looking +z): skim each orb, passing just to its right
+    point 1.5  1.35 0.6      # enter, low and near the back
+    point 1.3  1.45 1.8      # skim the warm orb    (light 1.0,1.50,1.8)
+    point 1.9  1.30 2.7
+    point 2.6  1.20 3.6      # skim the neutral orb (light 2.3,1.15,3.6)
+    point 2.0  1.55 4.5
+    point 1.6  1.65 5.4      # skim the cool orb    (light 1.3,1.80,5.4)
+    point 1.5  1.55 6.4      # sweep across the far end
+    # return leg (looking -z): skim each orb again, passing to its left
+    point 0.9  1.55 5.9      # turn back down the left side
+    point 0.9  1.70 5.4      # skim the cool orb from the left
+    point 1.5  1.40 4.5
+    point 1.9  1.20 3.6      # skim the neutral orb from the left
+    point 1.3  1.45 2.6
+    point 0.8  1.50 1.8      # skim the warm orb from the left
+    point 1.1  1.40 1.0      # close the loop back by the entrance
+
+    up 0 1 0   fov_y 62   mode B   frames 240   closed
+    look tangent            # fly into the glow — looking where we're going
+    film { res 960 540   exposure 28 }   # absolute exposure (lumens) -> no flicker
+}

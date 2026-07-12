@@ -1,0 +1,79 @@
+# Orbit fly-around of the gold gyroid ball — a turntable that stitches into an MP4.
+# A single `camera_orbit` block expands into N frames whose eye rides a circle around
+# the gold orb (also the look_at target); the render loop writes one PNG per frame
+# (out_<name>.png) which ffmpeg concatenates into a video.
+#
+# The orbit is deliberately TIGHT so its circle punches straight THROUGH the clear
+# glass sphere: the orbit centre is the gold orb at (0.40,0.37,0.45) and the glass
+# sphere sits at (0.77,0.17,0.70). The eye rides at y=0.17 (the glass sphere's height)
+# with radius 0.45 — and the xz-distance from the orbit centre to the glass centre is
+# 0.4466, so the circle passes ~3 mm from the glass centre. Near azimuth ~34deg the
+# camera flies INSIDE the glass sphere and sees the gold orb refracted through it.
+#
+# The Cornell room is widened (x[-0.4,1.4], z[-0.4,2.0]) so the whole 0.45 m orbit
+# stays safely enclosed by real walls for every frame (a specular gold ball needs a
+# lit surround to mirror). `exposure_lock` anchors every frame's exposure to frame 0
+# so the video does not flicker.
+#
+# A multi-camera render writes one file per frame, inserting `_<camname>` before the
+# extension — so `-o png/orbit.png` yields png/orbit_spin000.png .. png/orbit_spin119.png.
+#   ftrace -in scenes/showcase_orbit.ftsl -mode R -device gpu -spp 512 -o png/orbit.png
+#   ffmpeg -framerate 30 -i png/orbit_spin%03d.png -c:v libx264 -pix_fmt yuv420p \
+#          -crf 18 png/showcase_orbit.mp4
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "gold"  { preset gold }
+material "glass" { type dielectric ior 1.5 }
+
+# Widened closed Cornell box: floor x[-0.4,1.4], depth z[-0.4,2.0], height y[0,1.2].
+quad { origin -0.4 0 -0.4   u 1.8 0 0    v 0 0 2.4    material white }   # floor
+quad { origin -0.4 1.2 -0.4 u 0 0 2.4    v 1.8 0 0    material white }   # ceiling
+quad { origin -0.4 0 -0.4   u 0 1.2 0    v 1.8 0 0    material white }   # back
+quad { origin -0.4 0 2.0    u 0 1.2 0    v 1.8 0 0    material white }   # front
+quad { origin -0.4 0 -0.4   u 0 0 2.4    v 0 1.2 0    material red   }   # left
+quad { origin 1.4 0 -0.4    u 0 1.2 0    v 0 0 2.4    material green }   # right
+
+# --- Hero: gold gyroid lattice ball (thickened TPMS sheet, clipped to a sphere) ---
+isosurface {
+    material gold
+    intersect {
+        function {
+            translate 0.40 0.37 0.45
+            expr "abs(sin(40*x)*cos(40*y) + sin(40*y)*cos(40*z) + sin(40*z)*cos(40*x)) - 0.5"
+        }
+        sphere { center 0.40 0.37 0.45   radius 0.32 }
+    }
+    contained_by { min 0.06 0.03 0.11   max 0.74 0.71 0.79 }
+    max_gradient 80
+}
+
+# --- Clear glass sphere the orbit path flies straight through ---
+# Native sphere so refraction uses the exact analytic normal (an isosurface wrapper
+# would use the numerical gradient and visibly distort the refracted image).
+sphere { center 0.77 0.17 0.70   radius 0.17   material glass }
+
+# Key light over the hero + a second fill so gold's camera-facing facets stay lit
+# from every orbit angle.
+light area { origin 0.22 1.199 0.22   u 0.56 0 0   v 0 0 0.56   normal 0 -1 0   spd preset:bb6500 }
+light area { origin 0.25 1.199 1.05   u 0.50 0 0   v 0 0 0.45   normal 0 -1 0   spd preset:bb6500 }
+
+# Orbit fly-around: 120 frames, full 360deg seamless loop, eye circling the gold orb
+# at radius 0.45 and height y=0.17 (0.20 below the orb centre) so it punches through
+# the glass sphere. look_at defaults to the orbit centre (the gold orb).
+camera_orbit "spin" {
+    center 0.40 0.37 0.45
+    radius 0.45
+    height -0.20
+    axis y
+    frames 120
+    sweep_deg 360
+    up 0 1 0
+    fov_y 78
+    mode R
+    exposure_lock
+    film { res 900 900 }
+}

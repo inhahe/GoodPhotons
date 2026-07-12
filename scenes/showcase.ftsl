@@ -1,0 +1,69 @@
+# Showcase / GitHub hero render. A gold gyroid lattice ball — the triply-periodic
+# minimal surface  sin x cos y + sin y cos z + sin z cos x = 0  thickened into a sheet
+# (|g| - t < 0) and clipped to a sphere via CSG intersect — sits in a CLOSED Cornell
+# box next to a clear glass sphere that refracts the colored walls. Exercises:
+# arbitrary-formula `function` isosurfaces, CSG of an expression leaf with an analytic
+# SDF, spectral gold, and dielectric refraction.
+#
+# The box is a real six-walled room (the depth is stretched to z=1.5 so the camera can
+# sit INSIDE it with a genuine white front wall behind the lens). This matters because
+# gold is a specular conductor: it mirrors its surroundings rather than scattering
+# light diffusely. With an open front the camera-facing facets reflected empty black
+# space; the front wall + a front fill light give them a lit surface to mirror, so the
+# ball now reads as gold from every angle.
+#   ftrace -in scenes/showcase.ftsl -mode R -device gpu -spp 16384 -o png/showcase.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "gold"  { preset gold }
+material "glass" { type dielectric ior 1.5 }
+
+# Closed Cornell box, floor x[0,1] and depth stretched to z[0,1.65].
+quad { origin 0 0 0      u 1 0 0      v 0 0 1.65   material white }   # floor
+quad { origin 0 1 0      u 0 0 1.65   v 1 0 0      material white }   # ceiling
+quad { origin 0 0 0      u 0 1 0      v 1 0 0      material white }   # back
+quad { origin 0 0 1.65   u 0 1 0      v 1 0 0      material white }   # front (behind camera)
+quad { origin 0 0 0      u 0 0 1.65   v 0 1 0      material red   }   # left
+quad { origin 1 0 0      u 0 1 0      v 0 0 1.65   material green }   # right
+
+# --- Hero: gold gyroid lattice ball (thickened TPMS sheet, clipped to a sphere) ---
+isosurface {
+    material gold
+    intersect {
+        function {
+            translate 0.40 0.37 0.45
+            expr "abs(sin(40*x)*cos(40*y) + sin(40*y)*cos(40*z) + sin(40*z)*cos(40*x)) - 0.5"
+        }
+        sphere { center 0.40 0.37 0.45   radius 0.32 }
+    }
+    contained_by { min 0.06 0.03 0.11   max 0.74 0.71 0.79 }
+    max_gradient 80          # gyroid |grad| ~ 40*1.5; explicit bound keeps the march safe
+}
+
+# --- Accent: clear glass sphere refracting the walls, nearer the camera ---
+# Native sphere (not an isosurface) so refraction uses the exact analytic normal
+# normalize(p-center). Wrapping it in `isosurface` would fall back to the numerical
+# finite-difference gradient, whose small errors visibly distort the dielectric.
+sphere { center 0.77 0.17 0.70   radius 0.17   material glass }
+
+# Key light over the hero (unchanged from the original showcase).
+light area {
+    origin 0.22 0.999 0.22   u 0.56 0 0   v 0 0 0.56   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# Front fill light: lights the new front wall and, crucially, gives the gold's
+# camera-facing facets a bright source to reflect so they read as gold, not black.
+light area {
+    origin 0.25 0.999 1.05   u 0.50 0 0   v 0 0 0.45   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.47 0.55 1.50   look_at 0.40 0.37 0.45   up 0 1 0   fov_y 58
+    mode R
+    film { res 900 900 }
+}

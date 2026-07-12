@@ -25,8 +25,11 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   diffraction gratings, fluorescence, and stochastic mixes.
 - **Wave-optical effects** — thin-film Airy interference, Abelès multilayer
   stacks, and reflective diffraction gratings.
-- **Participating media** — homogeneous fog with Henyey–Greenstein or Rayleigh
-  scattering.
+- **Participating media** — one or many coexisting (superposed) fog regions with
+  Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
+  (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
+  **density fields** (formula-defined blobs with soft edges) via unbiased delta/ratio
+  tracking on the forward modes.
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), megakernel or
   wavefront, with CPU fallback.
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
@@ -144,18 +147,28 @@ paths they can capture at all**.
   It also supports the **physical (realistic) lens on its camera subpath** — the
   camera ray is traced through the real glass while forward light transport keeps its
   caustic efficiency (the light-image splat strategy is disabled, since a multi-element
-  lens has no closed-form sensor projection; runs on the CPU **and GPU**). *Cost:* highest
-  cost per sample, and it **does not support fluorescence, participating media, or
-  spot & env lights** (use `B`/`P` or `R` for those).
+  lens has no closed-form sensor projection; runs on the CPU **and GPU**). It renders
+  **participating media of every kind** — global haze, multiple superposed media,
+  box/sphere/object-bounded fog, and **heterogeneous `density`-field blobs** — with volume
+  in-scatter vertices, HG-phase connections and transmittance-weighted edges (subpath
+  medium vertices placed by delta tracking, connections weighted by ratio-tracking
+  transmittance), so fog *inside a glass shell* images correctly here (a case the
+  next-event modes leave dark). *Cost:* highest cost per sample, and it **does not support
+  fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
 
-The **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are progressive and
-GPU-eligible, **`D` has its own GPU BDPT megakernel**, and **`R` (including the
-physical-lens camera) has its own GPU backward megakernel** — which the **`P`
-composite reuses for its camera-side layer**, so both of `P`'s layers run on the GPU
-when the scene is within the backward-GPU scope. Brightness is photon-count-
-independent, so more photons only reduce graininess. Outside that scope `P`'s
-camera-side layer, and `V`'s backward reference (kept on the CPU as a stable ground
-truth), remain CPU-only.
+The **image-forming modes are all progressive** — the forward camera models
+(`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
+refine an image whose brightness is fixed while only graininess falls, so they share the
+same live progress and budget flags (`-time` / `-noise` / `-forever` / `-preview` /
+`-interval`, and periodic crash-safe writes) on **both** the CPU and the GPU. They're all
+GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via the forward megakernel,
+**`D`** via its own GPU BDPT megakernel, and **`R` (including the physical-lens camera)**
+via its own GPU backward megakernel — which the **`P` composite reuses for its camera-side
+layer**, so both of `P`'s layers run on the GPU when the scene is within the backward-GPU
+scope. Outside that scope `P`'s camera-side layer, and `V`'s backward reference (kept on
+the CPU as a stable ground truth), remain CPU-only. `R`/`D` accumulate their sample chunks
+in memory only (no disk `-resume`/`-checkpoint`; those stay forward-mode `A`/`B`/`C`), and
+the `P` composite is not progressive.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
@@ -166,8 +179,10 @@ truth), remain CPU-only.
   mode-`P` composite); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
-  forward scenes. Implicit surfaces / `isosurface`, **procedural patterns**, and
+  (env/spot/collimated lights, fluorescence; any fog for `R`), and for
+  fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
+  **all** participating media — haze, superposed, bounded, and heterogeneous
+  `density`-field fog — directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
   **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
   GPU-accelerated now — the device sphere-traces the same field expressions, runs the
   same pattern VM, and threads the interior-absorption medium through both the forward
@@ -271,6 +286,7 @@ Declared with `material "name" { type <type> … }`.
 | Type | Description | Key parameters |
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
+| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). CPU only. Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
 | `dielectric` | Refractive glass with dispersion, optional **frosting** and **colored-glass tint** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
@@ -503,8 +519,9 @@ A `pattern "name" { … }` block compiles a **scalar field** — a function of t
 point evaluated per shading sample — that can drive any scalar material parameter
 *procedurally*, without a texture image. The variables available to a pattern are the
 world-space position `x y z`, the implicit field value `f` (the SDF value at the hit,
-`~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, and
-the radius `r = √(x²+y²+z²)`. Two authoring forms:
+`~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, the
+radius `r = √(x²+y²+z²)`, and the **surface UV coordinates `u v`** (mesh-interpolated,
+or a native-primitive wrap — see below). Two authoring forms:
 
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
@@ -532,25 +549,160 @@ paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
 exception — its MIS kernel falls back to the CPU for any pattern or frosted/colored
 glass.)*
 
+**UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
+A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`
+maps its `u`/`v` edges to (0,0)→(1,1), and an `isosurface` can request a procedural
+wrap with `uv planar|spherical|cylindrical [axis=x|y|z]` — the **same projection used
+for un-`vt`'d meshes**, referenced to the surface's world bounds. So a checker or
+stripe authored in `(u,v)` space wraps *around* the object (a globe, tiles converging
+at the poles, a grid on box faces) instead of slicing through world space. See
+`scenes/uv_native.ftsl`.
+
 ## Participating media / fog
 
 `medium { sigma_t <v> albedo <v> g <v> rayleigh <bool> }`, or from the CLI with
 `-fog <sigma_t> -fogalbedo <a> -fogg <g> [-fograyleigh]`. Henyey–Greenstein phase
 function by default; Rayleigh optional.
 
+**Multiple, overlapping media.** Author as many `medium` blocks as you like — they
+coexist as independent regions (e.g. two differently-tinted fog orbs plus a faint
+global haze). The forward tracer superposes them physically: extinction adds (total
+transmittance is the *product* of the per-medium transmittances) and each scatter is
+drawn from the *earliest* of the media's independent free-flights. A single-`medium`
+scene is bit-identical to before.
+
+**Bounded, heterogeneous fog (blobs).** The medium isn't limited to a single global
+haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box —
+or `bounds { center <x y z> radius <r> }` to confine it to a **sphere** region, i.e.
+simple *per-object* fog like **the whole inside of a glass sphere** (author the same
+center/radius as the sphere). Or shape the fog to a **named object** with
+`bounds { object "<name>" }`: a named `sphere` gives its exact analytic bound, a named
+`isosurface` fills the field's interior (the fog takes the metaball/SDF silhouette
+exactly, carved per-point during tracking), and a named `mesh` uses the mesh's world
+AABB (a box approximation; true mesh containment is deferred). An *open* fog sphere is directly viewable in every mode.
+Fog inside an actual **glass shell** is *not imaged directly* by the next-event modes
+`A`/`B` — an accuracy limitation, not a speed one: seeing the fog through the curved glass
+is a refracted (specular↔volume) path, and the pinhole splat `B` and finite-lens splat `A`
+connect the fog to the camera with a **straight** ray that the glass occludes (and could not
+bend anyway), so that view renders black. The fog still correctly **lights the surrounding
+room** indirectly in those modes. **BDPT `D` images fog-through-glass correctly**: its
+camera subpath refracts through the shell (specular vertices) to a volume in-scatter vertex,
+then MIS-connects bidirectionally to the light, so a lantern glowing inside a fogged glass
+sphere renders as a bright disc rather than black. Photon-catch `C` traces the same path but
+far more slowly (the fog-scattered photon must refract out and hit the pupil).
+Add `density "<expr>"` (or `density pattern:<name>`) —
+a scalar field over world `x y z` (the same infix expression language as isosurface
+`function` fields) that scales `sigma_t` per point — for **fog blobs with soft, formula-defined
+boundaries**: e.g. a smooth radial falloff `pow(saturate(1 - dist/R), 2)` renders a
+glowing sphere of haze whose edge fades gradually instead of a hard surface. Sampling is
+unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for shadow
+transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
+`bounds` (or set explicitly). Heterogeneous/bounded fog is honored by the **forward**
+modes (A/B/C) on **both the CPU and the GPU** (the device runs the identical density VM +
+delta/ratio tracking). **BDPT `D`** renders media of **every kind** — global haze,
+multiple superposed media, box/sphere/object-**bounded** fog, and **heterogeneous
+`density`-field blobs** — unbiased on both the CPU and the GPU: subpath medium vertices are
+placed by delta tracking (analog throughput) and connection edges weighted by ratio-tracking
+transmittance, exactly as the forward tracer samples them. (The MIS weights omit the
+heterogeneous distance-pdf / transmittance — a variance-only simplification per PBRT-v3;
+the balance heuristic is a partition of unity so the estimator stays unbiased regardless.)
+The backward reference (R/V) and the P composite treat the medium as a single global homogeneous haze
+and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
+
 ---
 
 ## Scene language (FTSL)
+
+> **Full reference: [`FTSL.md`](FTSL.md)** — the complete grammar (every block, key,
+> default, spectrum/pattern/material form, and parsing quirk). The overview below is a
+> quick tour; `FTSL.md` is the authoritative spec.
 
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
 field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
 surface / CSG / metaballs / arbitrary `function` formulas), `light`, `group`, `medium`,
-`camera`, `camera_path` (keyframed camera animation), and `render` (render-setting
-overrides). See the `scenes/` directory for worked examples (`cornell.ftsl`,
-`fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`,
-`realcam.ftsl`, `implicit.ftsl`, `function.ftsl`, `procedural.ftsl`,
-`translucency.ftsl`, …).
+`camera`, `camera_path` (keyframed camera animation), `camera_orbit` (turntable /
+fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_curve`
+(spline fly-through with variable speed), and `render` (render-setting overrides). See the `scenes/` directory for worked examples
+(`cornell.ftsl`, `fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`,
+`material_presets.ftsl`, `realcam.ftsl`, `implicit.ftsl`, `function.ftsl`,
+`procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`, …).
+
+### Camera animation (`camera_path`, `camera_orbit`)
+
+Both expand into a sequence of frames sharing look_at/up/fov/mode/film/lens; a
+multi-camera render writes one file per frame (`_<name>` inserted before the
+extension), which ffmpeg concatenates into a video.
+
+- **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
+  keyframed fly-through: the eye (and optionally look_at / fov) is linearly
+  interpolated across `key` frames. Optional `dolly_zoom` holds the subject's
+  on-screen size (Vertigo effect); optional `exposure_lock` shares frame 0's exposure.
+- **`camera_orbit "name" { center <x y z> radius <m> [height <m>] [axis x|y|z] frames N
+  [start_deg <d>] [sweep_deg <d>] [look_at <x y z>] [exposure_lock] }`** — a turntable /
+  fly-around whose eye rides a circle around `center` (the default look_at). The circle
+  lies in the plane perpendicular to `axis` (default y); `height` offsets the eye along
+  the axis. A full 360° sweep is sampled so frame N == frame 0 (seamless loop); a
+  partial sweep spans its endpoints. See `scenes/showcase_orbit.ftsl` (an orbit tuned
+  to fly straight *through* a glass sphere).
+- **`camera_curve "name" { point <x y z> … [frames N] [density <ρ> | density_at <t> <ρ> …]
+  [look tangent | look_at <x y z> | look curve + look_point <x y z> …] [closed] }`** — a
+  fly-through along a **Catmull-Rom spline** that passes through the `point` control
+  points. Camera placement is either a fixed `frames` count (uniform arc length) or a
+  **density** (cameras per unit length) that can vary along the curve via `density_at`
+  keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
+  slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
+  `look_at`, or at a second `look curve`.
+
+### Multi-camera shared photon pass (modes `A` and `B`)
+
+When several cameras render at once (multiple `camera` blocks, or the frames a
+`camera_path`/`orbit`/`curve` expands into) in a **forward next-event** mode, the
+tracer flies **one** photon set and splats every vertex to **all** cameras of that
+mode at once, instead of re-flying the photons per camera. This is the "many cameras
+for one photon set" win — emission, BVH traversal, and scattering are paid once. It
+runs on **both the CPU and the GPU** (`-device gpu`), and applies to the two forward
+splat models:
+
+- **`B` (pinhole splat)** — `connect()` draws no random numbers, so the shared pass is
+  **bit-identical** to rendering each camera on its own.
+- **`A` (finite-lens camera)** — each camera samples its own aperture pupil (draws
+  RNG), so the shared photon flight is **unbiased per camera** but matches a standalone
+  render **in distribution**, not bit-for-bit. Rectilinear cameras only.
+
+The `A` and `B` cameras form **separate** shared passes (mode `A` perturbs the RNG
+stream during the trace; mode `B` doesn't). Sharing applies to plain `-n` renders with
+per-frame auto-exposure; exposure-locked animation paths and the budget flags
+(`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera.
+
+**Shared vs. independent randomness across cameras (matters for video and for
+side-by-side cameras).** This is the key per-mode difference in how randomness is
+distributed *between* cameras. Note that **a "frame" here is simply a camera in the same
+scene**: a `camera_path`/`orbit`/`curve` expands into one `camera` per frame, and they all
+render together in a single scene exactly like several hand-authored `camera` blocks — so
+everything below applies identically whether you wrote the cameras out by hand or generated
+them as animation frames:
+
+- **`B`** — every camera is splatted from the *same* photon set, so they share identical
+  random paths: a camera's noise is **correlated** with every other camera's (and a camera
+  rendered in the group is bit-identical to rendering it alone). Across an animation the
+  grain drifts coherently frame-to-frame rather than reshuffling.
+- **`A`** — cameras share the photon *flight* but each draws its own aperture-pupil
+  samples, so each carries **independent** randomness on top of the shared paths (unbiased
+  per camera; correlated only through the shared flight).
+- **`C`/`R`/`D`/`P`/`V`** — each camera is traced **fully independently** with its own
+  sample budget, so their randomness (and noise) is **uncorrelated** by construction.
+
+Mode `B`'s correlation is usually invisible (and cheaper), but if you want independent,
+film-grain-like noise per camera/frame, render them separately (e.g. via a budget flag,
+which falls back to per-camera passes) so each draws its own photons.
+
+> **Other modes do NOT save time with multiple cameras.** `C` (finite-aperture catch)
+> consumes each photon at the first aperture it hits, so it can't share a photon set; and
+> `R`, `D`, `P`, and `V` are camera-anchored estimators that trace **from** each camera —
+> a multi-camera render of those modes simply renders **each camera independently**
+> (re-tracing the full sample budget per camera), so it costs the same as running them
+> one at a time. Only `A` and `B` amortise the trace across cameras.
 
 ### Importing Mitsuba scenes
 
@@ -587,6 +739,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
+| `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-mode <A..D>` | Render mode (default `B`) |
 | `-camera <name>` | Select a named camera |
 | `-t <threads>` | CPU thread count |
@@ -603,9 +756,11 @@ add-on), this doubles as a Blender → FTSL path.
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
-| `-spp <n>` | Samples per pixel for mode `V` |
+| `-spp <n>` | Samples per pixel for modes `R`, `D`, and `V` |
 
-**Long-running / output**
+**Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-interval`
+apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`), on both
+CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
 
 | Flag | Meaning |
 |---|---|
@@ -614,7 +769,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-interval <s>` | Periodic image write / preview refresh (default 15 s) |
-| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint |
+| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (forward `A`/`B`/`C` only) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
@@ -625,10 +780,24 @@ add-on), this doubles as a Blender → FTSL path.
 
 ## Output
 
-Images are written as **PNG**, **JPEG** (q95), or binary **PPM (P6)**, chosen by
-the output file extension, tone-mapped from the internal linear spectral film to
-8-bit sRGB. Long renders can checkpoint to `<out>.ftbuf` and resume
-deterministically.
+Images are written as **PNG** (24-bit RGB, 8 bits/channel — no alpha), **JPEG**
+(q95), or binary **PPM (P6)**, chosen by the output file extension, tone-mapped from
+the internal linear spectral film to 8-bit sRGB. Long renders can checkpoint to
+`<out>.ftbuf` and resume deterministically.
+
+**Converting existing artifacts to PNG** — `ftrace -topng <in> <out.png>` re-encodes
+an artifact to a 24-bit PNG *without re-rendering*:
+
+- a **`.ppm`** (binary P6, 8-bit) is copied to PNG losslessly;
+- a **`.ftbuf`** resume-checkpoint has its raw linear film tone-mapped (with the
+  default p99 auto-exposure — the sidecar doesn't store the exposure mode, so an
+  absolute/lumens scene may read brighter or darker than its original `-o` image;
+  re-render for an exposure-exact PNG).
+
+A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
+Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
+**`ftbuf_to_png.bat`** (both call `-topng`), and **`ftsl_to_png.bat`** (renders the
+scene). Drop a file on one, or run `ppm_to_png.bat input.ppm [output.png]`.
 
 ---
 
@@ -636,4 +805,4 @@ deterministically.
 
 Open limitations and technical debt are tracked in `known-issues.md` — including
 the physical-lens camera's remaining gaps (inter-element flare/ghosting,
-shaped-iris bokeh) and the shared multi-camera pass.
+shaped-iris bokeh).
