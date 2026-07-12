@@ -12,7 +12,7 @@
 #include "texture.h"
 #include "envmap.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -39,6 +39,13 @@ struct Material {
     // attenuating glass; also the `absorb` target a field_material can drive). 0 =
     // colorless (default, bit-identical to before). Only consulted for Dielectric.
     Spectrum absorb  = constantSpectrum(0.0);
+    // Diffuse TRANSMISSION albedo vs lambda (MatType::DiffuseTransmit only). The
+    // translucent material is a two-lobe Lambertian: `reflect` scatters cosine-
+    // distributed into the FRONT hemisphere (+n), `transmit` into the BACK hemisphere
+    // (-n). reflect+transmit must be <= 1 per wavelength (the rest is absorbed). Because
+    // both lobes are non-specular, a directly-viewed translucent solid CONNECTS to the
+    // pinhole and is visible in mode B (unlike clear dielectric, which stays black).
+    Spectrum transmit = constantSpectrum(0.0);
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;

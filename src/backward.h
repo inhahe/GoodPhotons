@@ -482,6 +482,40 @@ struct BackwardRenderer {
                     }
                     return L;                                    // absorbed / terminated
                 }
+                case MatType::DiffuseTransmit: {
+                    // Two-lobe Lambertian (backward adjoint of render.h DiffuseTransmit):
+                    // NEE the reflect lobe against lights in the front (+h.n) hemisphere
+                    // and the transmit lobe against lights in the back (-h.n) hemisphere
+                    // (a normal-flipped Hit copy reuses neeLight/neeEnv for the back side).
+                    // The continuation picks reflect / transmit / absorb analogously to a
+                    // Russian-roulette diffuse bounce, throughput unchanged on survival.
+                    double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    double rhoT = clamp01(m.transmit(lambda));
+                    double sum = rhoR + rhoT;
+                    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
+                    L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng);
+                    if (scene.envIndex >= 0)
+                        L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
+                    Hit hb = h; hb.n = -h.n;                 // back hemisphere for the transmit lobe
+                    L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                    if (scene.envIndex >= 0)
+                        L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                    double u = rng.uniform();
+                    if (u < rhoR) {                          // reflect continuation (front)
+                        Vec3 wOut = cosineHemisphere(h.n, rng);
+                        contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
+                        ray = Ray{h.p + h.n * 1e-6, wOut};
+                        specularArrival = false;
+                        break;
+                    } else if (u < sum) {                    // transmit continuation (back)
+                        Vec3 wOut = cosineHemisphere(-h.n, rng);
+                        contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
+                        ray = Ray{h.p - h.n * 1e-6, wOut};
+                        specularArrival = false;
+                        break;
+                    }
+                    return L;                                // absorbed / terminated
+                }
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));

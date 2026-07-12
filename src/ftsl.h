@@ -848,6 +848,15 @@ private:
             // fallback used where UVs are unavailable (e.g. the CUDA bake path).
             if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.75);
             else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.75));
+        } else if (type == "translucent" || type == "diffuse_transmit") {
+            // Two-lobe Lambertian: `reflect` (front-hemisphere diffuse albedo) +
+            // `transmit` (back-hemisphere diffuse albedo). Both non-specular, so a
+            // directly-viewed solid is visible in mode B. reflect+transmit is clamped
+            // to <= 1 per wavelength at render time (the remainder is absorbed).
+            m.type = MatType::DiffuseTransmit;
+            if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.5);
+            else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.4));
+            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.4));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
             m.ior = spectrumParam(b, "ior", iorBK7());

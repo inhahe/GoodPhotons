@@ -772,6 +772,29 @@ struct Renderer {
                     ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
                     continue;                           // beta unchanged (see above)
                 }
+                case MatType::DiffuseTransmit: {
+                    // Two-lobe Lambertian: reflect albedo into the front hemisphere
+                    // (+h.n, the incoming side) and transmit albedo into the back
+                    // hemisphere (-h.n). Splat BOTH lobes to the camera — the wrong-side
+                    // lobe self-rejects inside connect() (cosSurf<=0), so passing the
+                    // flipped normal for the transmit lobe just images whichever side the
+                    // camera is on. Because both lobes are non-specular, a directly-viewed
+                    // translucent solid is VISIBLE in mode B (unlike clear dielectric).
+                    double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    double rhoT = clamp01(m.transmit(lambda));
+                    double sum = rhoR + rhoT;
+                    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
+                    if (nCam > 0 && !forwardCatch) {
+                        camSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
+                        camSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
+                    }
+                    // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else
+                    // absorb — throughput unchanged on a scatter.
+                    double u = rng.uniform();
+                    if (u < rhoR)      { ray = Ray{h.p + h.n * 1e-6, cosineHemisphere( h.n, rng)}; continue; }
+                    else if (u < sum)  { ray = Ray{h.p - h.n * 1e-6, cosineHemisphere(-h.n, rng)}; continue; }
+                    e.absorbed += beta; return;
+                }
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));

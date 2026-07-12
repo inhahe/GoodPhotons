@@ -59,14 +59,25 @@ updates). Validated with `scraps/fogblob.ftsl` (a soft glowing sphere blob, mode
   now **warns** when a heterogeneous/bounded medium is rendered in R/V/D/P. Proper fix:
   port delta/ratio tracking into the backward volume march too.
 
-### No diffuse-transmission / subsurface (SSS) material — 2026-07-12
-Translucency is available only as a **rough dielectric** (`roughness` on `type dielectric`)
-plus **Beer–Lambert interior tint** (`absorb <spectrum>`) — there is no diffuse-transmission
-BSDF or BSSRDF, so soft "waxy"/"jade"/"skin" translucency (light diffusing through a solid)
-can't be authored. Note this compounds the mode-B limitation: a rough/clear dielectric is
-still specular-first, so a directly-viewed translucent solid stays dark in the pinhole-splat
-mode. **Proper fix:** add a diffuse-transmission material (Lambertian BTDF) and/or a
-dipole/random-walk subsurface model. Deferred.
+### Diffuse-transmission material — CPU DONE 2026-07-12 (GPU port pending)
+Added `type translucent` (alias `diffuse_transmit`): a two-sided Lambertian BSDF — the
+front hemisphere scatters the `reflect` albedo, the back hemisphere scatters the `transmit`
+albedo, so light diffuses THROUGH the surface (soft "waxy"/"paper"/thin-skin look). Because
+both lobes are non-specular it renders/connects in **every** CPU mode: forward A/B/C
+(`render.h` two-sided `camSplatAll` — flip the normal, wrong side self-rejects), backward
+R/V (`backward.h` two NEE calls, one per hemisphere via a normal-flipped `Hit`), and BDPT D
+(`bdpt.h` — added to `isConnectibleMat`, `bsdfF`/`bsdfPdf` two-lobe eval, scatter lobe
+selection, and — critically — the connection cosine guards in `connectBDPT` now allow the
+back hemisphere for two-sided materials via `isTwoSidedMat`, using `|cos|` in the geometry
+term with `bsdfF>0` as the real gate; `lambda` is now threaded through
+`bsdfPdf`→`vertexPdf`→`misWeight` so the wavelength-dependent lobe-selection pdf is exact).
+`reflect`+`transmit` are energy-clamped so their sum ≤ 1. Validated: `scraps/translucent_panel.ftsl`
+(backlit warm panel) renders consistently across modes B, R, and D.
+**Remaining:** (1) **GPU port** — `render_cuda.cu` has no `DiffuseTransmit` case, so the
+material is silently ignored on the GPU; add the DMaterial `transmit` field + the two-lobe
+splat/scatter to the CUDA kernels. (2) A true **BSSRDF / dipole / random-walk subsurface**
+model (for thick solid SSS with proper mean-free-path blurring) is still not implemented —
+this material is a thin diffuse-transmission approximation, not volumetric SSS.
 
 ### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
 The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now

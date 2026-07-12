@@ -45,7 +45,29 @@ inline double glossyExponent(double roughness) {
 // the specular family is delta (zero connection pdf) and only forms chains.
 inline bool isConnectibleMat(const Material& m) {
     return m.type == MatType::Diffuse || m.type == MatType::Glossy ||
-           m.type == MatType::Fluorescent;   // fluoro's elastic base is diffuse-like
+           m.type == MatType::Fluorescent ||   // fluoro's elastic base is diffuse-like
+           m.type == MatType::DiffuseTransmit;  // two-sided Lambertian (finite BSDF both sides)
+}
+
+// A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
+// connection edge on the side OPPOSITE the shading normal is legal (transmit lobe).
+// Reflect-only materials require the edge on the +ns side; the surface-cosine sign guards
+// in connectBDPT must not reject the back hemisphere for these materials — bsdfF (which
+// returns 0 for unsupported directions) is the real validity gate, and the geometry term
+// uses |cos| accordingly.
+inline bool isTwoSidedMat(const Material& m) {
+    return m.type == MatType::DiffuseTransmit;
+}
+
+// Clamped reflect/transmit albedos of a DiffuseTransmit vertex (energy guard shared by
+// bsdfF / bsdfPdf / the scatter switch so MIS densities stay consistent).
+inline void diffuseTransmitAlbedos(const Material& m, double lambda, const Scene& scene,
+                                   const Hit* hitForTex, double& rhoR, double& rhoT) {
+    rhoR = hitForTex ? clamp01(diffuseReflectance(scene, m, *hitForTex, lambda))
+                     : clamp01(m.reflect(lambda));
+    rhoT = clamp01(m.transmit(lambda));
+    double sum = rhoR + rhoT;
+    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
 
 // Evaluate the BSDF value f at a surface vertex for the pair (wo, wi), both unit
@@ -84,6 +106,14 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             double lobe = (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
             return r * lobe / cosWi;   // denom = sampled-direction cosine (see header)
         }
+        case MatType::DiffuseTransmit: {
+            // Two-sided Lambertian: same-hemisphere pair (wo,wi) -> reflect albedo,
+            // opposite hemispheres -> transmit albedo. Symmetric in wo<->wi.
+            double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
+            bool sameSide = (cosWi * cosWo) > 0.0;
+            double rho = sameSide ? rhoR : rhoT;
+            return rho / PI;
+        }
         default: return 0.0;   // delta materials have no finite BSDF value
     }
 }
@@ -95,7 +125,7 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // bound, so the density matches the sampling that used the same textured roughness —
 // essential for unbiased MIS. Pass nullptr where no hit UV is available (constant).
 inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
-                      const Scene& scene, const Hit* hitForTex) {
+                      double lambda, const Scene& scene, const Hit* hitForTex) {
     double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
     switch (m.type) {
         case MatType::Diffuse:
@@ -111,6 +141,18 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
             double cosLobe = dot(wi, mdir);
             if (cosLobe <= 0) return 0.0;
             return (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
+        }
+        case MatType::DiffuseTransmit: {
+            // Directional pdf of the lobe-selected cosine sampling: the reflect lobe is
+            // chosen with prob rhoR/(rhoR+rhoT) and cosine-samples the same hemisphere as
+            // wo; the transmit lobe (prob rhoT/(rhoR+rhoT)) cosine-samples the opposite
+            // hemisphere. For a given wi only one lobe applies (by its sign vs wo).
+            double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
+            double tot = rhoR + rhoT;
+            if (tot <= 0.0) return 0.0;
+            bool sameSide = (cosWi * cosWo) > 0.0;
+            double pSel = sameSide ? rhoR / tot : rhoT / tot;
+            return pSel * std::fabs(cosWi) / PI;
         }
         default: return 0.0;
     }
@@ -220,7 +262,8 @@ inline double camCos(const Camera& cam, const Vec3& p) {
 // Area-measure pdf of sampling `next` by scattering at `cur` (arriving from `prev`),
 // PBRT's Vertex::Pdf. For a Light `cur` this is the emission density (pdfLight).
 inline double vertexPdf(const Scene& scene, const Camera& cam,
-                        const Vertex* prev, const Vertex& cur, const Vertex& next);
+                        const Vertex* prev, const Vertex& cur, const Vertex& next,
+                        double lambda);
 inline double vertexPdfLight(const Camera& cam, const Vertex& cur, const Vertex& next);
 
 // Emission directional density at a light vertex `cur` toward `next`, area measure.
@@ -239,7 +282,8 @@ inline double vertexPdfLight(const Camera& /*cam*/, const Vertex& cur, const Ver
 }
 
 inline double vertexPdf(const Scene& scene, const Camera& cam,
-                        const Vertex* prev, const Vertex& cur, const Vertex& next) {
+                        const Vertex* prev, const Vertex& cur, const Vertex& next,
+                        double lambda) {
     if (cur.type == VType::Light) return vertexPdfLight(cam, cur, next);
     Vec3 wn = next.p - cur.p;
     if (dot(wn, wn) == 0.0) return 0.0;
@@ -252,7 +296,7 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
         Vec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.0) return 0.0;
         wp = normalize(wp);
-        pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn, scene, &cur.hit);
+        pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn, lambda, scene, &cur.hit);
     }
     return convertDensity(pdfW, cur, next);
 }
@@ -323,8 +367,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = cosineHemisphere(cur.ns, rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
-                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, scene, &h);
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, scene, &h);
+                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = rho;                     // f*cos/pdf = rho
                 if (rho <= 0) terminate = true;
                 break;
@@ -334,10 +378,27 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(mp->reflect(lambda));
-                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, scene, &h);
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, scene, &h);
+                pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = r;                       // f*cos/pdf = r
                 if (r <= 0 || pdfW <= 0) terminate = true;
+                break;
+            }
+            case MatType::DiffuseTransmit: {
+                // Pick the reflect or transmit lobe in proportion to their albedos, then
+                // cosine-sample the corresponding hemisphere (front = +ns, back = -ns).
+                // f*cos/pdf collapses to the TOTAL albedo (rhoR+rhoT) either way, so the
+                // throughput darkens by the total albedo per bounce (expected-value, like
+                // the Diffuse case). MIS densities come from bsdfPdf (lobe-select * cos/PI).
+                double rhoR, rhoT; diffuseTransmitAlbedos(*mp, lambda, scene, &h, rhoR, rhoT);
+                double tot = rhoR + rhoT;
+                if (tot <= 0.0) { terminate = true; break; }
+                if (rng.uniform() * tot < rhoR) wi = cosineHemisphere(cur.ns, rng);   // reflect
+                else                            wi = cosineHemisphere(cur.ns * -1.0, rng); // transmit
+                pdfW    = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
+                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
+                betaFactor = tot;                     // f*cos/pdf = rhoR+rhoT
+                if (pdfW <= 0) terminate = true;
                 break;
             }
             case MatType::Mirror: {
@@ -513,7 +574,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
 // are mutated in place but restored by the ScopedAssigns before returning.
 inline double misWeight(const Scene& scene, const Camera& cam,
                         std::vector<Vertex>& light, std::vector<Vertex>& eye,
-                        Vertex& sampled, int s, int t) {
+                        Vertex& sampled, int s, int t, double lambda) {
     if (s + t == 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
     Vertex* qs  = s > 0 ? &light[s - 1] : nullptr;
@@ -534,22 +595,22 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     // Reverse density of the eye connection vertex pt.
     ScopedAssign<double> a4;
     if (pt) {
-        double val = (s > 0) ? vertexPdf(scene, cam, qsM, *qs, *pt)
+        double val = (s > 0) ? vertexPdf(scene, cam, qsM, *qs, *pt, lambda)
                              : vertexPdfLightOrigin(scene, *pt);
         a4 = ScopedAssign<double>(&pt->pdfRev, val);
     }
     // Reverse density of pt's predecessor.
     ScopedAssign<double> a5;
     if (ptM) {
-        double val = (s > 0) ? vertexPdf(scene, cam, qs, *pt, *ptM)
+        double val = (s > 0) ? vertexPdf(scene, cam, qs, *pt, *ptM, lambda)
                              : vertexPdfLight(cam, *pt, *ptM);
         a5 = ScopedAssign<double>(&ptM->pdfRev, val);
     }
     // Reverse density of the light connection vertex qs and its predecessor.
     ScopedAssign<double> a6;
-    if (qs) a6 = ScopedAssign<double>(&qs->pdfRev, vertexPdf(scene, cam, ptM, *pt, *qs));
+    if (qs) a6 = ScopedAssign<double>(&qs->pdfRev, vertexPdf(scene, cam, ptM, *pt, *qs, lambda));
     ScopedAssign<double> a7;
-    if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM));
+    if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM, lambda));
 
     double sumRi = 0.0, ri = 1.0;
     for (int i = t - 1; i > 0; --i) {                // hypothetical camera strategies
@@ -619,12 +680,14 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         double dist = std::sqrt(dist2);
         Vec3 wcam = (cam.eye - qs.p) / dist;
         double cosSurf = dot(qs.ns, wcam);
-        if (cosSurf <= 0.0) return 0.0;
+        // Reflect-only vertices require the +ns side; a two-sided vertex may connect on
+        // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
+        if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
         Vec3 wo = normalize(light[s - 2].p - qs.p);
         double f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
         if (f <= 0.0) return 0.0;
         if (scene.occluded(offsetOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
-        double G = cosSurf * cosCam / dist2;
+        double G = std::fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * cameraWe(cam, cosCam);
         if (L <= 0.0) return 0.0;
         sampled.type = VType::Camera; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
@@ -645,7 +708,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         double dist = std::sqrt(dist2); Vec3 wi = toL / dist;
         double cosLight = dot(nOut, wi * -1.0);
         double cosSurf  = dot(pt.ns, wi);
-        if (cosLight <= 0.0 || cosSurf <= 0.0) return 0.0;
+        // Emitter stays one-sided; the surface vertex may be two-sided (transmit lobe).
+        if (cosLight <= 0.0) return 0.0;
+        if (cosSurf == 0.0 || (!isTwoSidedMat(*pt.mat) && cosSurf < 0.0)) return 0.0;
         double Le = em.spdFn(lambda) * invPdfLambda;
         if (Le <= 0.0) return 0.0;
         if (scene.occluded(offsetOrigin(pt, wi), wi, dist - 2e-6)) return 0.0;
@@ -655,7 +720,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         double pdfChoice = em.power / scene.totalPower;
         double pdfA = pdfChoice / em.area;             // area-measure light pdf
         if (pdfA <= 0.0) return 0.0;
-        double G = cosSurf * cosLight / dist2;
+        double G = std::fabs(cosSurf) * cosLight / dist2;
         L = pt.beta * f * Le * G / pdfA;
         if (L <= 0.0) return 0.0;
         sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
@@ -671,18 +736,20 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (dist2 <= 0.0) return 0.0;
         double dist = std::sqrt(dist2); Vec3 w = d / dist;   // pt -> qs
         double cosE = dot(pt.ns, w), cosL = dot(qs.ns, w * -1.0);
-        if (cosE <= 0.0 || cosL <= 0.0) return 0.0;
+        // Either endpoint may be two-sided; reflect-only endpoints keep the +ns guard.
+        if (cosE == 0.0 || (!isTwoSidedMat(*pt.mat) && cosE < 0.0)) return 0.0;
+        if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
         Vec3 woE = normalize(eye[t - 2].p - pt.p);
         Vec3 woL = normalize(light[s - 2].p - qs.p);
         double fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
         double fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
         if (scene.occluded(offsetOrigin(pt, w), w, dist - 2e-6)) return 0.0;
-        double G = cosE * cosL / dist2;
+        double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G;
     }
     if (L <= 0.0) return 0.0;
-    return L * misWeight(scene, cam, light, eye, sampled, s, t);
+    return L * misWeight(scene, cam, light, eye, sampled, s, t, lambda);
 }
 
 // --- Renderer --------------------------------------------------------------------

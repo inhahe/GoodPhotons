@@ -220,6 +220,7 @@ Fills a complete material; a few knobs may be overridden afterward
 | type | key params (defaults) |
 |---|---|
 | `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo |
+| `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed. Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
 | `mirror` | `reflect <spec>`(0.95) |
 | `halfmirror` | `reflect <spec>`(0.5) |
 | `glossy` | `reflect <spec>`(0.9); `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
