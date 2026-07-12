@@ -619,6 +619,15 @@ stream during the trace; mode `B` doesn't). Sharing applies to plain `-n` render
 per-frame auto-exposure; exposure-locked animation paths and the budget flags
 (`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera.
 
+**Noise correlation across frames (matters for video).** Because the shared pass splats
+**one** photon set to every frame at once, mode `B`'s residual grain is *correlated*
+between neighbouring frames — the same photon paths light every camera, so the noise
+drifts coherently rather than reshuffling each frame. This is usually invisible (and
+cheaper), but if you want independent, film-grain-like noise per frame, render the frames
+separately (e.g. via a budget flag, which falls back to per-camera passes) so each draws
+its own photons. The camera-anchored modes (`R`/`D`/`P`/`V`) always trace independently
+per frame, so their noise is uncorrelated by construction.
+
 > **Other modes do NOT save time with multiple cameras.** `C` (finite-aperture catch)
 > consumes each photon at the first aperture it hits, so it can't share a photon set; and
 > `R`, `D`, `P`, and `V` are camera-anchored estimators that trace **from** each camera —

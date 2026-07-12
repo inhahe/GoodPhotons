@@ -34,6 +34,30 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
 
 ## Tech debt
 
+### No bounded / per-object participating medium (fog is global-only) — 2026-07-12
+The `medium` block (`ftsl.h` `addMedium` ~1607; `scene.h` struct ~190) fills the
+**entire scene** with one homogeneous medium — there is no way to bound a medium to a
+region or attach it to an object (a "translucent blob": a box/sphere of scattering
+medium the camera can fly through). This limits volumetric scenes to whole-scene haze,
+which must be made to *read* as localized purely via lighting contrast (a bright shaft
+or an embedded light in an otherwise dark room). **Proper fix:** allow a `medium { ... }`
+nested inside a primitive (or a standalone bounded `medium { bounds min/max ... }` /
+`medium { sphere {...} }`) that sets `sigma_t` only inside that region; the ray-march
+would clip the medium interval to the object's entry/exit. Both the CPU (`render.h`
+volume march) and GPU (`render_cuda.cu` `connectVolume`/media march) tracers would need
+the region test. Logged while authoring a mode-B volumetric fly-through scene
+(`scenes/lanterns.ftsl`), which works around it with a global haze + embedded sphere
+lights that glow as discrete volumetric orbs.
+
+### No diffuse-transmission / subsurface (SSS) material — 2026-07-12
+Translucency is available only as a **rough dielectric** (`roughness` on `type dielectric`)
+plus **Beer–Lambert interior tint** (`absorb <spectrum>`) — there is no diffuse-transmission
+BSDF or BSSRDF, so soft "waxy"/"jade"/"skin" translucency (light diffusing through a solid)
+can't be authored. Note this compounds the mode-B limitation: a rough/clear dielectric is
+still specular-first, so a directly-viewed translucent solid stays dark in the pinhole-splat
+mode. **Proper fix:** add a diffuse-transmission material (Lambertian BTDF) and/or a
+dipole/random-walk subsurface model. Deferred.
+
 ### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
 The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now
 covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` backward,
