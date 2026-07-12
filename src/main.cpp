@@ -1703,7 +1703,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::fprintf(stderr,
             "[medium] mode %c uses the backward/BDPT tracer, which treats participating "
             "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
-            "additional media, `density` fields and `bounds` regions (box/sphere) are "
+            "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
             "IGNORED here. Render multi/heterogeneous/bounded fog with a forward mode "
             "(A/B/C) for correct results.\n", mode);
     }
