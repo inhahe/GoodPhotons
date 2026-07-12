@@ -580,15 +580,21 @@ center/radius as the sphere). Or shape the fog to a **named object** with
 `isosurface` fills the field's interior (the fog takes the metaball/SDF silhouette
 exactly, carved per-point during tracking), and a named `mesh` uses the mesh's world
 AABB (a box approximation; true mesh containment is deferred). An *open* fog sphere is directly viewable in every mode.
-Fog inside an actual **glass shell** is *not imaged directly* by the next-event modes
-`A`/`B` — an accuracy limitation, not a speed one: seeing the fog through the curved glass
-is a refracted (specular↔volume) path, and the pinhole splat `B` and finite-lens splat `A`
-connect the fog to the camera with a **straight** ray that the glass occludes (and could not
-bend anyway), so that view renders black. The fog still correctly **lights the surrounding
-room** indirectly in those modes. **BDPT `D` images fog-through-glass correctly**: its
+Fog (and any diffuse surface) seen through a **glass sphere** *is* imaged directly by the
+pinhole splat `B`, via the **analytic specular connection**: for each glowing haze in-scatter
+(or Lambertian surface) vertex the renderer solves the refracted eye ray that reaches the
+camera through the sphere in closed form (a planar reduction to a 1-D root solve, with a
+ray-differential Jacobian for the splat weight), so a lantern glowing inside a fogged glass
+orb — and the fly-through *through* that orb — renders correctly rather than black. The
+solve evaluates the ior at the photon's own wavelength, so the refraction is dispersive for
+free. It runs on both CPU and GPU. This currently covers **glass spheres in mode `B`** (both
+surface and volume vertices); the finite-lens splat `A`, photon-catch `C`, and non-spherical
+dielectric shells are not yet covered by the analytic path — for those, seeing the fog
+through the curved glass is a refracted (specular↔volume) path that the straight camera
+connection can't bend, so that direct view renders black (the fog still correctly **lights
+the surrounding room** indirectly). **BDPT `D` images fog-through-glass for any shape**: its
 camera subpath refracts through the shell (specular vertices) to a volume in-scatter vertex,
-then MIS-connects bidirectionally to the light, so a lantern glowing inside a fogged glass
-sphere renders as a bright disc rather than black. Photon-catch `C` traces the same path but
+then MIS-connects bidirectionally to the light. Photon-catch `C` traces the same path but
 far more slowly (the fog-scattered photon must refract out and hit the pupil).
 Add `density "<expr>"` (or `density pattern:<name>`) —
 a scalar field over world `x y z` (the same infix expression language as isosurface
@@ -758,9 +764,9 @@ add-on), this doubles as a Blender → FTSL path.
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
 | `-spp <n>` | Samples per pixel for modes `R`, `D`, and `V` |
 
-**Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-interval`
-apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`), on both
-CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
+**Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
+`-interval` apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`),
+on both CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
 
 | Flag | Meaning |
 |---|---|
@@ -768,7 +774,8 @@ CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-interval <s>` | Periodic image write / preview refresh (default 15 s) |
+| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). |
+| `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (forward `A`/`B`/`C` only) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 

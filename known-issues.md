@@ -93,10 +93,30 @@ images as a bright disc — `scraps/fogsphere.ftsl` mode D fog-sphere center box
 (saturating) vs mode B's 0.00, at the same absolute exposure.
 The fog still correctly **lights the surrounding room** (indirect, via NEE off the walls),
 and an **open** fog sphere (no glass shell) is directly viewable in every forward mode
-(`scraps/fogorb.ftsl` mode B center box mean 135.8). A proper fix is refractive/manifold
-next-event estimation (specular connections through the glass) — genuine research-grade work,
-out of scope; a naive "let connect rays pass through glass" hack is wrong (it draws the fog
-along a straight line, with no lensing, in the wrong place) and is deliberately avoided.
+(`scraps/fogorb.ftsl` mode B center box mean 135.8). A naive "let connect rays pass through
+glass" hack is wrong (it draws the fog along a straight line, with no lensing, in the wrong
+place) and is deliberately avoided — the correct fix is the analytic specular connection below.
+
+**Mode-B analytic specular connection through glass SPHERES — DONE 2026-07-12.** The proper
+refractive/manifold next-event estimation is now implemented for the tractable case: a
+**glass sphere** in the **pinhole splat (`B`)**. For each fog in-scatter vertex (and each
+diffuse surface vertex), the renderer solves — in closed form — the refracted eye ray that
+leaves the vertex, bends through the sphere, and reaches the pinhole: a planar reduction of
+the two-refraction manifold to a **1-D root solve**, with a ray-differential Jacobian
+(`G = eps²/|ax·by − ay·bx|`) supplying the splat weight, and Fresnel-transmittance ×
+Beer-Lambert interior absorption × medium transmittance along the two glass segments. The
+sphere's ior is evaluated at the photon's **own wavelength**, so the refraction is dispersive
+for free. Unified surface/volume vertices via a `SpecVtx`/`DSpecVtx` `term(wP)` (Lambertian
+`rho/π·cosSurf` vs HG-phase·albedo). Implemented on **CPU** (`render.h`:
+`connectSpecularSphere`/`connectSpecularSphereInside`, `camSpecularSplatAll`/`…VolumeAll`)
+and **GPU** (`render_cuda.cu`: `dConnectSpecularSphere`/`…Inside`, `camSpecularSplatAll`/
+`camSpecularSplatVolumeAll`), validated GPU-vs-CPU and vs BDPT/mode-P ground truth. So a
+lantern glowing inside — and a fly-through *through* — a clear glass orb now images correctly
+in mode B (see `scenes/lanterns.ftsl`). *Still out of scope for now:* the finite-lens splat
+(`A`), photon-catch (`C`), and **non-spherical** dielectric shells — those still render the
+direct fog-through-glass view black in the forward splat modes (use BDPT `D`, which handles
+any shape). Mode A and flat-plane (window/pane) analytic connections are the next tracked
+items.
 
 **Multiple coexisting media (superposition) — DONE 2026-07-12.** `Scene::medium` is now a
 vector `Scene::media` of independent, possibly overlapping media; several `medium {}` blocks

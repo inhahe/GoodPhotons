@@ -23,6 +23,7 @@ endif()
 add_executable(ftrace
     src/main.cpp
     src/stb_image_impl.cpp   # compiles vendored stb_image (texture load) + stb_image_write (PNG/JPG output) once
+    src/livewindow.cpp       # -window live-preview OS window (Win32 GDI; no-op stub off Windows)
 )
 target_include_directories(ftrace PRIVATE src)
 

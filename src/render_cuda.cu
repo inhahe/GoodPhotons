@@ -1667,6 +1667,24 @@ __device__ static inline void d3onb(const D3& n, D3& t, D3& b) {
     b = D3(d, sign + n.y * n.y * a, -n.y);
 }
 
+// Describes the photon vertex being connected through the glass: a diffuse
+// surface (Lambertian weight=rho, normal np) or a volume in-scatter (weight=albedo,
+// HG phase g, incoming dir wIn). Device twin of Renderer::SpecVtx.
+struct DSpecVtx {
+    bool   volume;
+    D3     np;                 // surface normal (surface vertices)
+    D3     wIn;                // incoming photon direction (volume vertices)
+    double g;                  // HG asymmetry (volume vertices)
+    double weight;             // surface: Lambertian rho ; volume: single-scatter albedo
+    // Throughput at the vertex for a connection leaving toward `wP` (unit, toward the
+    // sphere). Returns <0 to signal "reject" (camera-side behind a surface).
+    __device__ double term(const D3& wP) const {
+        if (volume) return weight * (double)hgPhase((Real)d3dot(wIn, wP), (Real)g);
+        double cosSurf = d3dot(np, wP);
+        return cosSurf <= 0.0 ? -1.0 : (weight / DPI) * cosSurf;
+    }
+};
+
 struct DSphereRefr { D3 P1, P2, exitDir; double Tf, innerLen; };
 
 // Trace a ray from `o` (outside sphere S) that ENTERS S, crosses the glass, and
@@ -1745,7 +1763,7 @@ __device__ static bool dTraceOutOfSphere(const D3& o, const D3& d, const DSphere
 // Renderer::connectSpecularSphereInside.
 __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const DMaterial& glass, double n,
-        const D3& p, const D3& np, Real lambda, double beta, double rho, DRng& rng) {
+        const D3& p, const DSpecVtx& vt, Real lambda, double beta, DRng& rng) {
     D3 O(S.c); double r = S.r; D3 eye(cam.eye);
     double dEyeO = d3len(eye - O);
 
@@ -1843,10 +1861,10 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         D3 wP = ch.P1 - p; double dP = d3len(wP);
         if (dP < 1e-9) continue;
         wP = wP * (1.0 / dP);
-        double cosSurf = d3dot(np, wP);
-        if (cosSurf <= 0.0) continue;
+        double term = vt.term(wP);
+        if (term < 0.0) continue;
 
-        double contrib = beta * (rho / DPI) * cosSurf * G * ch.Tf / omega;
+        double contrib = beta * term * G * ch.Tf / omega;
         if (contrib <= 0.0) continue;
         double aGlass = (double)specLookup(glass.absorb, lambda);
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
@@ -1865,13 +1883,13 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
 // single-refraction path when the eye is inside the glass.
 __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const DMaterial& glass, double n,
-        const D3& p, const D3& np, Real lambda, double beta, double rho, DRng& rng) {
+        const D3& p, const DSpecVtx& vt, Real lambda, double beta, DRng& rng) {
     D3 O(S.c); double r = S.r; D3 eye(cam.eye);
     double dEyeO = d3len(eye - O);
     double dPO   = d3len(p - O);
     if (dPO   <  r * 0.9999) return;                 // vertex inside glass -> skip
     if (dEyeO <= r * 0.9999) {                        // eye inside -> single refraction
-        dConnectSpecularSphereInside(sc, cam, film, hits, S, glass, n, p, np, lambda, beta, rho, rng);
+        dConnectSpecularSphereInside(sc, cam, film, hits, S, glass, n, p, vt, lambda, beta, rng);
         return;
     }
     if (dEyeO <= r * 1.0001) return;                  // eye ~on surface -> degenerate
@@ -1982,10 +2000,10 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         D3 wP = ch.P2 - p; double dP2 = d3len(wP);
         if (dP2 < 1e-9) continue;
         wP = wP * (1.0 / dP2);
-        double cosSurf = d3dot(np, wP);
-        if (cosSurf <= 0.0) continue;
+        double term = vt.term(wP);
+        if (term < 0.0) continue;
 
-        double contrib = beta * (rho / DPI) * cosSurf * G * ch.Tf / omega;
+        double contrib = beta * term * G * ch.Tf / omega;
         if (contrib <= 0.0) continue;
         double aGlass = (double)specLookup(glass.absorb, lambda);
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
@@ -2005,12 +2023,11 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
 }
 
 // Splat vertex p to every camera through every smooth dielectric sphere (the
-// refracted image of p). Device twin of Renderer::camSpecularSplatAll. Mode B only.
-__device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode,
-                                           const DVec3& p, const DVec3& n, Real lambda,
-                                           Real beta, Real rho, DRng& rng) {
+// refracted image of p). Device twin of Renderer::camSpecularSplatAllVtx. Mode B only.
+__device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& cs, int camMode,
+                                              const D3& pd, const DSpecVtx& vt, Real lambda,
+                                              Real beta, DRng& rng) {
     if (camMode != CAM_B) return;
-    D3 pd(p), nd(n);
     for (int si = 0; si < sc.nSph; ++si) {
         const DSphere& S = sc.sph[si];
         const DMaterial& gm = sc.mats[S.matId];
@@ -2018,8 +2035,24 @@ __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, 
         double ng = (double)specLookup(gm.ior, lambda);
         for (int c = 0; c < cs.nCam; ++c)
             dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
-                                   pd, nd, lambda, (double)beta, (double)rho, rng);
+                                   pd, vt, lambda, (double)beta, rng);
     }
+}
+// Surface vertex: refract the Lambertian reflection of p through every glass sphere.
+__device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode,
+                                           const DVec3& p, const DVec3& n, Real lambda,
+                                           Real beta, Real rho, DRng& rng) {
+    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho; vt.g = 0;
+    camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
+}
+// Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
+// glowing haze itself bends through the glass the camera flies through.
+__device__ static void camSpecularSplatVolumeAll(const DScene& sc, const DMedium& med,
+                                                 const DCamSet& cs, int camMode, const DVec3& p,
+                                                 const DVec3& wIn, Real lambda, Real beta, DRng& rng) {
+    DSpecVtx vt; vt.volume = true; vt.wIn = D3(wIn); vt.g = med.g;
+    vt.weight = (double)medAlbedo(med, lambda);
+    camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
 }
 
 // ============================ megakernel ============================
@@ -2471,6 +2504,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     if (mediumEvent) {
         const DMedium& sm = sc.media[scatterMed];
         splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+        camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
         if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
         ro = mp; rd = nd;

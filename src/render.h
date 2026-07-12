@@ -554,6 +554,26 @@ struct Renderer {
     // ===================================================================
     struct SphereRefr { Vec3 P1, P2, exitDir; double Tf = 0, innerLen = 0; };
 
+    // Describes the photon vertex being connected through the glass: a diffuse
+    // surface (Lambertian rho, normal np) or a volume in-scatter (medium albedo,
+    // HG phase g, incoming dir wIn). The connection geometry is identical for both;
+    // only the throughput term at the vertex differs (rho/pi*cosSurf vs albedo*phase),
+    // exactly mirroring connect() vs connectVolume().
+    struct SpecVtx {
+        bool  volume = false;
+        Vec3  np;                 // surface normal (surface vertices)
+        Vec3  wIn;                // incoming photon direction (volume vertices)
+        double g = 0;             // HG asymmetry (volume vertices)
+        double weight = 0;        // surface: Lambertian rho ; volume: single-scatter albedo
+        // Throughput at the vertex for a connection leaving toward `wP` (unit, toward
+        // the sphere). Returns <0 to signal "reject" (camera-side behind a surface).
+        double term(const Vec3& wP) const {
+            if (volume) return weight * hgPhase(dot(wIn, wP), g);
+            double cosSurf = dot(np, wP);
+            return cosSurf <= 0.0 ? -1.0 : (weight / PI) * cosSurf;
+        }
+    };
+
     // Trace a ray from `o` (outside sphere S) that ENTERS S, crosses the glass, and
     // EXITS. Fills P1 (entry), P2 (exit), exitDir (outward), the product of the two
     // Fresnel transmittances Tf, and the internal path length. False on miss / TIR.
@@ -602,15 +622,15 @@ struct Renderer {
     // image of p seen in the sphere. Pinhole (mode B) only.
     void connectSpecularSphere(const Scene& scene, const Camera& cam, Film& film,
                                const Sphere& S, const Material& glass, double n,
-                               const Vec3& p, const Vec3& np, double lambda,
-                               double beta, double rho, Pcg32& rng) const {
+                               const Vec3& p, const SpecVtx& vt, double lambda,
+                               double beta, Pcg32& rng) const {
         const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
         double dEyeO = length(eye - O);
         double dPO   = length(p - O);
         if (dPO   <  r * 0.9999) return;   // vertex inside the glass -> skip (MVP)
         if (dEyeO <= r * 0.9999) {         // eye inside the glass -> single-refraction path
-            connectSpecularSphereInside(scene, cam, film, S, glass, n, p, np, lambda,
-                                        beta, rho, rng);
+            connectSpecularSphereInside(scene, cam, film, S, glass, n, p, vt, lambda,
+                                        beta, rng);
             return;
         }
         if (dEyeO <= r * 1.0001) return;   // eye ~on the surface -> degenerate, skip
@@ -718,10 +738,10 @@ struct Renderer {
             Vec3 wP = ch.P2 - p; double dP2 = length(wP);
             if (dP2 < 1e-9) continue;
             wP = wP * (1.0 / dP2);
-            double cosSurf = dot(np, wP);
-            if (cosSurf <= 0.0) continue;                   // camera side is behind the surface
+            double term = vt.term(wP);
+            if (term < 0.0) continue;                       // camera side behind the surface
 
-            double contrib = beta * (rho / PI) * cosSurf * G * ch.Tf / omega;
+            double contrib = beta * term * G * ch.Tf / omega;
             if (contrib <= 0.0) continue;
             double aGlass = glass.absorb(lambda);           // Beer-Lambert inside the glass
             if (aGlass > 0.0) contrib *= std::exp(-aGlass * ch.innerLen);
@@ -778,8 +798,8 @@ struct Renderer {
     // path the camera sees while flying THROUGH the glass. Planar in plane(eye,p,O).
     void connectSpecularSphereInside(const Scene& scene, const Camera& cam, Film& film,
                                      const Sphere& S, const Material& glass, double n,
-                                     const Vec3& p, const Vec3& np, double lambda,
-                                     double beta, double rho, Pcg32& rng) const {
+                                     const Vec3& p, const SpecVtx& vt, double lambda,
+                                     double beta, Pcg32& rng) const {
         const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
         double dEyeO = length(eye - O);
 
@@ -872,10 +892,10 @@ struct Renderer {
             Vec3 wP = ch.P1 - p; double dP = length(wP);
             if (dP < 1e-9) continue;
             wP = wP * (1.0 / dP);
-            double cosSurf = dot(np, wP);
-            if (cosSurf <= 0.0) continue;
+            double term = vt.term(wP);
+            if (term < 0.0) continue;
 
-            double contrib = beta * (rho / PI) * cosSurf * G * ch.Tf / omega;
+            double contrib = beta * term * G * ch.Tf / omega;
             if (contrib <= 0.0) continue;
             double aGlass = glass.absorb(lambda);           // Beer-Lambert eye->P1 (in glass)
             if (aGlass > 0.0) contrib *= std::exp(-aGlass * ch.innerLen);
@@ -893,9 +913,9 @@ struct Renderer {
 
     // Splat vertex p to every camera through every smooth dielectric sphere (the
     // refracted image of p). Mode B (pinhole) only; draws no aperture RNG.
-    void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
-                             const Vec3& p, const Vec3& n, double lambda, double beta,
-                             double rho, Pcg32& rng) const {
+    void camSpecularSplatAllVtx(const Scene& scene, const CamTarget* cams, int nCam,
+                                const Vec3& p, const SpecVtx& vt, double lambda,
+                                double beta, Pcg32& rng) const {
         if (lensMode || forwardCatch) return;               // finite-lens/catch not supported
         for (const Sphere& S : scene.spheres) {
             const Material& gm = scene.mats[S.matId];
@@ -904,8 +924,23 @@ struct Renderer {
             for (int c = 0; c < nCam; ++c)
                 if (cams[c].cam && cams[c].film)
                     connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
-                                          p, n, lambda, beta, rho, rng);
+                                          p, vt, lambda, beta, rng);
         }
+    }
+    // Surface vertex: refract the Lambertian reflection of p through every glass sphere.
+    void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
+                             const Vec3& p, const Vec3& n, double lambda, double beta,
+                             double rho, Pcg32& rng) const {
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
+        camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
+    }
+    // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
+    // glowing haze itself bends through the glass the camera flies through.
+    void camSpecularSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
+                                   int nCam, const Vec3& p, const Vec3& wIn, double lambda,
+                                   double beta, Pcg32& rng) const {
+        SpecVtx vt; vt.volume = true; vt.wIn = wIn; vt.g = med.g; vt.weight = med.albedo(lambda);
+        camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
     }
 
     // Volume (fog) analogue of camSplatAll. `med` is the medium that scattered the
@@ -1061,8 +1096,10 @@ struct Renderer {
 
             if (mediumEvent) {
                 const Medium& sm = scene.media[scatterMed];
-                if (nCam > 0 && !forwardCatch)
+                if (nCam > 0 && !forwardCatch) {
                     camSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
+                    camSpecularSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
+                }
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
                 if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
                 ray = Ray{mp, sampleHG(ray.d, sm.g, rng)};

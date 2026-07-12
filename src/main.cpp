@@ -71,6 +71,12 @@
 //                  are not disk-resumable yet — their chunks accumulate only in memory.)
 //   -preview       during a progress render, redraw a live ANSI colour thumbnail of the
 //                  current image in the terminal at each periodic update (in place).
+//   -window        open a real OS window (Win32 GDI on Windows; no-op elsewhere) that shows
+//                  the actual tone-mapped pixels, refreshed at each -interval tick. Unlike
+//                  -preview's coarse terminal thumbnail this is the full-resolution image.
+//                  A plain fixed -n forward render with -window is auto-chunked so the view
+//                  updates as it converges; closing the window stops the render (final image
+//                  is still written). Runs on its own UI thread, so it stays responsive.
 //   -interval <s>  seconds between periodic image writes / preview refreshes (default 15).
 //                  The output image file is rewritten at this cadence, so an auto-reloading
 //                  image viewer is also a live display. Applies to every mode above (a plain
@@ -90,6 +96,7 @@
 #include <algorithm>
 #include <thread>
 #include <map>
+#include <memory>
 #include "scene.h"
 #include "camera.h"
 #include "render.h"
@@ -98,6 +105,7 @@
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
+#include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
 #ifdef HAVE_CUDA
@@ -872,15 +880,15 @@ static int checkUpsample() {
 // and iso/shutter/exposure give exact photographic stops on top.
 constexpr double ABS_EXPOSURE_GAIN = 6.0;
 
-// Returns true on success, false if the image encoder failed. Callers that own the
-// process exit code should propagate a non-zero status on false. (GPU renders that
-// fail — driver TDR, device-memory/scheduling contention — are now caught at the
-// source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
-// which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
-// all-zero/black film never reaches this function.)
-static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
-                      bool quiet = false, double* lockAnchor = nullptr,
-                      bool absolute = false) {
+// Tone-map a film into an 8-bit RGB buffer (W*H*3, row 0 = image top; +y flipped to
+// image-top to match writeImage). Shared by writeFilm (PNG/PPM output) and the live
+// preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
+// absolute EV uses a fixed sensor gain; otherwise a p99 anchor (locked via lockAnchor
+// if non-null, else recomputed per frame). Optionally reports the chosen gain/exposure.
+static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
+                                       bool absolute, double* lockAnchor,
+                                       double* outEAuto = nullptr,
+                                       double* outExposure = nullptr) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -918,6 +926,24 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
             img[dst + c] = (uint8_t)std::clamp(srgbGamma(v) * 255.0 + 0.5, 0.0, 255.0);
         }
     }
+    if (outEAuto)    *outEAuto = eAuto;
+    if (outExposure) *outExposure = exposure;
+    return img;
+}
+
+// Returns true on success, false if the image encoder failed. Callers that own the
+// process exit code should propagate a non-zero status on false. (GPU renders that
+// fail — driver TDR, device-memory/scheduling contention — are now caught at the
+// source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
+// which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
+// all-zero/black film never reaches this function.)
+static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
+                      bool quiet = false, double* lockAnchor = nullptr,
+                      bool absolute = false) {
+    const int W = f.resX, H = f.resY;
+    double eAuto = 0.0, exposure = 0.0;
+    std::vector<uint8_t> img = filmToRgb8(f, N, expComp, absolute, lockAnchor,
+                                          &eAuto, &exposure);
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
@@ -1405,6 +1431,25 @@ static void onInterrupt(int sig) {
     g_stopRequested = 1;
 }
 
+// --- Live preview window (-window) --------------------------------------------
+// When enabled, the render drivers periodically push the current tone-mapped frame
+// to a real OS window (Win32 GDI; no-op stub off Windows) so the image is watched as
+// it converges, instead of only landing in a PNG. The window is created lazily on the
+// first update at the film's resolution and torn down at process exit. Closing the
+// window sets g_stopRequested so the render stops cleanly (writing its final image).
+static bool                        g_showWindow = false;
+static std::unique_ptr<LiveWindow> g_liveWin;
+static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute) {
+    if (!g_showWindow || N <= 0.0) return;
+    if (!g_liveWin)
+        g_liveWin = std::make_unique<LiveWindow>(f.resX, f.resY, "ftrace — live preview");
+    // Per-frame auto-expose (nullptr anchor) so the live view tracks the converging
+    // image the same way the ANSI preview does.
+    std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
+    g_liveWin->update(f.resX, f.resY, rgb);
+    if (g_liveWin->closed()) g_stopRequested = 1;
+}
+
 // --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
 // A forward render accumulates radiance photon-by-photon into a Film, so it can be
 // stopped and continued: brightness scales with photon count and only graininess
@@ -1733,6 +1778,7 @@ static int runSppProgressive(
                               sppDone, sppReq, elapsed, noisePct);
             if (preview) ansiPreview(film, (double)sppDone, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
+            liveWindowUpdate(film, (double)sppDone, manualExposure, absolute);
         }
         return stop;
     };
@@ -2071,13 +2117,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     };
 
     using clk = std::chrono::steady_clock;
-    if (progressive) {
-        long long batchN = (N > 0) ? N : 2'000'000;  // -n is the per-batch granularity
+    // A plain fixed-N render with -window (no time/noise/forever budget) still wants a
+    // live view, so chunk N into pieces and stop at the total. `chunkFixed` marks that
+    // mode: the batch loop runs but the stop is the fixed photon total, not a budget.
+    const bool chunkFixed = !progressive && g_showWindow;
+    if (progressive || chunkFixed) {
+        long long batchN = chunkFixed ? std::max(1LL, ((N > 0) ? N : 2'000'000) / 16)
+                                      : ((N > 0) ? N : 2'000'000);  // -n is the granularity
         const char* resumeTag = (resume && acc.N > 0) ? " [resuming]" : "";
         char noiseSuffix[64] = "";                    // appended when -noise adds a floor
         if (noiseTarget > 0.0)
             std::snprintf(noiseSuffix, sizeof noiseSuffix, " or until ~%.2g%% noise", noiseTarget);
-        if (runForever)
+        if (chunkFixed)
+            std::printf("mode %c: tracing %lld photons in %lld-photon batches at %dx%d on %s "
+                        "(light=%s)%s — live window; Ctrl-C to stop early ...\n",
+                        mode, N, batchN, res, resY, backend.c_str(), lightLabel, resumeTag);
+        else if (runForever)
             std::printf("mode %c: tracing indefinitely in %lld-photon batches at %dx%d on %s "
                         "(light=%s)%s%s — press Ctrl-C to stop ...\n",
                         mode, batchN, res, resY, backend.c_str(), lightLabel, resumeTag, noiseSuffix);
@@ -2126,14 +2181,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // black frame from "converging" at 0% on the very first batch).
             bool noiseMet = (noiseTarget > 0.0 && meanHits > 0.0 && noisePct <= noiseTarget);
             if (noiseMet) metNoise = true;
-            bool done = stopped || timeUp || noiseMet;
+            bool totalDone = chunkFixed && N > 0 && acc.N >= N;   // fixed-N window render
+            bool done = stopped || timeUp || noiseMet || totalDone;
             if (done || wantStatus) {   // periodic crash-safe checkpoint + preview
                 writeOut(/*announceCheckpoint*/false, /*quiet*/preview, /*useAnchor*/done);
                 lastSave = clk::now();
                 const char* why = stopped ? " (stopping)"
-                                : noiseMet ? " (noise target met)" : "";
+                                : noiseMet ? " (noise target met)"
+                                : totalDone ? " (done)" : "";
                 char st[220];
-                if (runForever)
+                if (chunkFixed)
+                    std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, ~%.1f%% noise%s",
+                                  elapsed, acc.N, N, noisePct, why);
+                else if (runForever)
                     std::snprintf(st, sizeof st, "[forever] %.1fs elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   elapsed, batches, acc.N, noisePct, why);
                 else if (timeBudgetSec > 0.0)
@@ -2142,10 +2202,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else
                     std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   noiseTarget, elapsed, batches, acc.N, noisePct, why);
-                if (preview) {
+                if (preview || g_showWindow) {
                     Film disp = acc.film;
                     if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-                    ansiPreview(disp, (double)acc.N, manualExposure, st);
+                    if (preview) ansiPreview(disp, (double)acc.N, manualExposure, st);
+                    else { std::printf("%s\n", st); std::fflush(stdout); }
+                    liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute);
                 } else { std::printf("%s\n", st); std::fflush(stdout); }
             }
             if (done) break;
@@ -2307,6 +2369,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
+        else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
