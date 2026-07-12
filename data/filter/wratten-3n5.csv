@@ -1,0 +1,37 @@
+# Kodak Wratten 3N5: No.3 plus 0.5 neutral density.
+# aliases: wratten3n5
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; visually transcribed from the table image (no text layer).
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0159
+460,0.0940
+470,0.1850
+480,0.2350
+490,0.2550
+500,0.2630
+510,0.2670
+520,0.2700
+530,0.2720
+540,0.2750
+550,0.2780
+560,0.2790
+570,0.2800
+580,0.2840
+590,0.2900
+600,0.2950
+610,0.2930
+620,0.2900
+630,0.2900
+640,0.2900
+650,0.2940
+660,0.2960
+670,0.2980
+680,0.3000
+690,0.3020
+700,0.3100

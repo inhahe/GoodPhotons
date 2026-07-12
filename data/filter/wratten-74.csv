@@ -1,0 +1,37 @@
+# Kodak Wratten 74: dark green (Hg green).
+# aliases: wratten74
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0000
+480,0.0000
+490,0.0000
+500,0.0000
+510,0.0096
+520,0.0795
+530,0.1460
+540,0.0290
+550,0.0760
+560,0.0306
+570,0.0083
+580,0.0012
+590,0.0000
+600,0.0000
+610,0.0000
+620,0.0000
+630,0.0000
+640,0.0000
+650,0.0000
+660,0.0000
+670,0.0000
+680,0.0000
+690,0.0000
+700,0.0000

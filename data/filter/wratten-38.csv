@@ -1,0 +1,37 @@
+# Kodak Wratten 38: blue (minus red).
+# aliases: wratten38
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.6050
+410,0.6650
+420,0.7250
+430,0.7530
+440,0.7620
+450,0.7590
+460,0.7480
+470,0.7340
+480,0.7160
+490,0.6950
+500,0.6670
+510,0.6390
+520,0.6080
+530,0.5700
+540,0.5260
+550,0.4800
+560,0.4280
+570,0.3700
+580,0.3060
+590,0.2550
+600,0.2090
+610,0.1680
+620,0.1290
+630,0.1000
+640,0.0779
+650,0.0668
+660,0.0620
+670,0.0591
+680,0.0541
+690,0.0490
+700,0.0500

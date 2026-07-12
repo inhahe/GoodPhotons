@@ -101,14 +101,20 @@ illuminant tables via colour-science (github.com/colour-science/colour, BSD-3; t
 CIE tables themselves are public reference data).
 
 ### `filter/*.csv` — gel / Wratten filter transmittance T(λ)
-red-25 (`red`), deep-red-29, orange-21, yellow-12, green-58, blue-47, deep-blue-47b:
-the classic Kodak Wratten set, consumed by a `filter` material's `transmit`. These are
-**digitized from the numeric transmittance tables** in *Kodak Wratten Filters for
-Scientific and Technical Use*, 22nd ed. (Eastman Kodak, pub. B-3) — 400–700 nm at 10 nm,
-with book dashes ("negligible") read as 0. The FTSL loader interpolates linearly and
-clamps outside the tabulated range. A `filter` material is a thin non-scattering absorber
-(`src/render.h` MatType::Filter): the transmittance is data, the straight-through
-absorption is the algorithm.
+The **complete Kodak Wratten set** — 84 gels, one CSV each, named `wratten-<n>.csv`
+(letter suffixes lowercased, e.g. `wratten-25`, `wratten-34a`, `wratten-47b`, `wratten-3n5`).
+Consumed by a `filter` material's `transmit`. Each file carries an `# aliases:` header
+so the common descriptive names still resolve: `red-25` (also `red`), `deep-red-29`,
+`orange-21`, `yellow-12`, `green-58`, `blue-47`, `deep-blue-47b`, `magenta`, `cyan`, etc.
+These are **digitized from the numeric percent-transmittance tables** in *Kodak Wratten
+Filters for Scientific and Technical Use*, 22nd ed. (Eastman Kodak, pub. B-3) — 400–700 nm
+at 10 nm (31 samples), with book dashes ("negligible") read as 0. Most pages have a PDF
+text layer and were **coordinate-extracted** (word x → filter column, y → wavelength row);
+the eight image-only pages (28, 29, 31, 33, 35, 38, 41, 47) have no text layer and were
+**visually transcribed** from high-DPI table crops. Each CSV's provenance line notes which
+method produced it. The FTSL loader interpolates linearly and clamps outside the tabulated
+range. A `filter` material is a thin non-scattering absorber (`src/render.h`
+MatType::Filter): the transmittance is data, the straight-through absorption is the algorithm.
 
 ### `material/*.material` — whole-material recipe bundles
 The iridescent structural-colour materials: soap-bubble (`bubble`), oil-slick
@@ -159,12 +165,14 @@ shoulder. To swap in a measurement, drop a die SPD into `illuminant/` (e.g.
 - **OSRAM / Lumileds / Cree datasheets** publish per-die relative SPD plots (digitize
   to `wavelength_nm,value`).
 
-### Gel / Wratten filter transmittances (`red-25`, `green-58`, `blue-47`, …) — DONE
-`filter/*.csv` are now digitized from the numeric tables in *Kodak Wratten Filters for
-Scientific and Technical Use*, 22nd ed. (pub. B-3), 400–700 nm at 10 nm. To add more gels
-or finer spacing, drop a `wavelength_nm,transmittance` CSV into `filter/` (overwrite by
-name) — no rebuild. Further sources: **Rosco/LEE** swatch books (Rosco `.sed` spectral
-files; LEE T(λ) plots) and the CRC Handbook "Transmission of Wratten filters" tables.
+### Gel / Wratten filter transmittances (`wratten-<n>`) — DONE
+The full 84-filter Kodak Wratten set (`filter/wratten-*.csv`) is digitized from the
+numeric tables in *Kodak Wratten Filters for Scientific and Technical Use*, 22nd ed.
+(pub. B-3), 400–700 nm at 10 nm — text-layer pages coordinate-extracted, eight image-only
+pages visually transcribed. To add more gels or finer spacing, drop a
+`wavelength_nm,transmittance` CSV into `filter/` (overwrite by name) — no rebuild. Further
+sources: **Rosco/LEE** swatch books (Rosco `.sed` spectral files; LEE T(λ) plots) and the
+CRC Handbook "Transmission of Wratten filters" tables.
 
 ### Human skin reflectance (`skin`, `skin-dark`)
 Currently `reflectance/skin-light.csv` / `skin-dark.csv` are representative

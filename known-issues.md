@@ -1236,13 +1236,18 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   CPU (`backward.h`) + GPU, and BDPT CPU (`bdpt.h`) + GPU (delta vertex, throughput
   ×= T). `type filter` in FTSL (ftsl.h) reads `transmit`; `parseMatType` adds it for
   bundles. New `filter/` data category + `filter:<name>` token + `resolveFilterTransmittance`.
-- **Data (RESOLVED 2026-07-12):** `data/filter/*.csv` (red-25, deep-red-29, orange-21,
-  yellow-12, green-58, blue-47, deep-blue-47b) are now **digitized from the numeric
-  transmittance tables** in *Kodak Wratten Filters for Scientific and Technical Use*,
-  22nd ed. (pub. B-3), 400–700 nm at 10 nm (book dashes = negligible → 0). Transcribed
-  via `scraps/extract_wratten.py` (which renders the table pages with `scraps/pdf_to_img.py`).
-  No longer a representative curve. Finer spacing/more gels can drop into `filter/` later
-  (Rosco `.sed` / LEE / CRC), no rebuild.
+- **Data (RESOLVED 2026-07-12; full set digitized 2026-07-12):** `data/filter/wratten-*.csv`
+  is now the **complete 84-filter Kodak Wratten set**, each **digitized from the numeric
+  percent-transmittance tables** in *Kodak Wratten Filters for Scientific and Technical Use*,
+  22nd ed. (pub. B-3), 400–700 nm at 10 nm, 31 samples (book dashes = negligible → 0).
+  Files are named `wratten-<n>` (letter suffix lowercased) with `# aliases:` headers keeping
+  the old descriptive names (red-25, deep-red-29, orange-21, yellow-12, green-58, blue-47,
+  deep-blue-47b, …) resolvable; the 7 old descriptive-named CSVs were deleted. Text-layer
+  pages were coordinate-extracted (word x → column, y → row); the eight image-only pages
+  (28,29,31,33,35,38,41,47) were visually transcribed from high-DPI crops. Extraction/
+  transcription scripts live in `scraps/` (`wratten_extract.py`, `wratten_manual.py`,
+  `wratten_all.py`; gitignored). Renders confirm correct per-filter tints. Finer spacing/
+  more gels can drop into `filter/` later (Rosco `.sed` / LEE / CRC), no rebuild.
 
 ### Full physical `layered` material [IMPLEMENTED 2026-07-11]
 - **What:** both the FTSL `type mix` material (stochastic per-photon pick among named

@@ -1,0 +1,37 @@
+# Kodak Wratten 97: dichroic blue viewing.
+# aliases: wratten97
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0022
+480,0.0043
+490,0.0039
+500,0.0015
+510,0.0000
+520,0.0000
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0000
+610,0.0000
+620,0.0000
+630,0.0000
+640,0.0000
+650,0.0000
+660,0.0000
+670,0.0000
+680,0.0044
+690,0.0502
+700,0.1870

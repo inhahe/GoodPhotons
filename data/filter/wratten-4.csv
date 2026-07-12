@@ -1,0 +1,37 @@
+# Kodak Wratten 4: light yellow.
+# aliases: wratten4
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; visually transcribed from the table image (no text layer).
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0690
+470,0.4200
+480,0.7400
+490,0.8470
+500,0.8750
+510,0.8850
+520,0.8910
+530,0.8940
+540,0.8960
+550,0.8980
+560,0.9000
+570,0.9020
+580,0.9040
+590,0.9060
+600,0.9080
+610,0.9090
+620,0.9100
+630,0.9110
+640,0.9120
+650,0.9130
+660,0.9140
+670,0.9150
+680,0.9150
+690,0.9160
+700,0.9160

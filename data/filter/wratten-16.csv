@@ -1,0 +1,37 @@
+# Kodak Wratten 16: orange-yellow.
+# aliases: wratten16
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; visually transcribed from the table image (no text layer).
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0000
+480,0.0000
+490,0.0000
+500,0.0000
+510,0.0000
+520,0.0300
+530,0.2200
+540,0.4800
+550,0.6950
+560,0.7950
+570,0.8400
+580,0.8630
+590,0.8780
+600,0.8900
+610,0.8960
+620,0.9000
+630,0.9020
+640,0.9030
+650,0.9040
+660,0.9050
+670,0.9060
+680,0.9070
+690,0.9080
+700,0.9080

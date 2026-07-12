@@ -1,0 +1,37 @@
+# Kodak Wratten 52: light green.
+# aliases: wratten52 light-green
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0218
+410,0.0151
+420,0.0080
+430,0.0044
+440,0.0041
+450,0.0069
+460,0.0145
+470,0.0270
+480,0.0490
+490,0.0850
+500,0.1330
+510,0.1820
+520,0.2370
+530,0.2850
+540,0.3210
+550,0.3310
+560,0.3100
+570,0.2560
+580,0.1910
+590,0.1260
+600,0.0778
+610,0.0700
+620,0.0234
+630,0.0138
+640,0.0080
+650,0.0054
+660,0.0036
+670,0.0027
+680,0.0023
+690,0.0019
+700,0.0017

@@ -1,0 +1,37 @@
+# Kodak Wratten 92: red (densitometry).
+# aliases: wratten92
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0000
+480,0.0000
+490,0.0000
+500,0.0000
+510,0.0000
+520,0.0000
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0000
+610,0.0000
+620,0.0040
+630,0.1740
+640,0.5120
+650,0.7220
+660,0.8070
+670,0.8480
+680,0.8650
+690,0.8740
+700,0.8800

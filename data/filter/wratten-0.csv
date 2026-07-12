@@ -1,0 +1,37 @@
+# Kodak Wratten 0: optically clear attenuator base.
+# aliases: wratten0
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.8800
+410,0.8850
+420,0.8890
+430,0.8930
+440,0.8960
+450,0.8980
+460,0.8990
+470,0.9010
+480,0.9030
+490,0.9040
+500,0.9050
+510,0.9060
+520,0.9070
+530,0.9070
+540,0.9080
+550,0.9080
+560,0.9090
+570,0.9090
+580,0.9090
+590,0.9100
+600,0.9100
+610,0.9100
+620,0.9100
+630,0.9100
+640,0.9110
+650,0.9110
+660,0.9110
+670,0.9110
+680,0.9110
+690,0.9110
+700,0.9110

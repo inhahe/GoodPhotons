@@ -1,0 +1,37 @@
+# Kodak Wratten 34A: violet.
+# aliases: wratten34a
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0000
+410,0.0450
+420,0.4000
+430,0.6970
+440,0.6870
+450,0.5620
+460,0.4050
+470,0.2380
+480,0.0920
+490,0.0230
+500,0.0033
+510,0.0000
+520,0.0000
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0000
+610,0.0013
+620,0.0100
+630,0.0630
+640,0.2200
+650,0.4500
+660,0.6500
+670,0.7730
+680,0.8500
+690,0.8820
+700,0.8980

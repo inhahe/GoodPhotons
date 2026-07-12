@@ -1,0 +1,37 @@
+# Kodak Wratten 8N5: No.8 (K2) plus 0.5 neutral density.
+# aliases: wratten8n5
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; visually transcribed from the table image (no text layer).
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0016
+470,0.0200
+480,0.0630
+490,0.1320
+500,0.2000
+510,0.2430
+520,0.2670
+530,0.2800
+540,0.2860
+550,0.2900
+560,0.2920
+570,0.2950
+580,0.2950
+590,0.2980
+600,0.2990
+610,0.2960
+620,0.2940
+630,0.2910
+640,0.2880
+650,0.2890
+660,0.2950
+670,0.2940
+680,0.2950
+690,0.2970
+700,0.3020

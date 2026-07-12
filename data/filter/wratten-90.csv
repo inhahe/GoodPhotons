@@ -1,0 +1,37 @@
+# Kodak Wratten 90: dark grayed amber (viewing filter).
+# aliases: wratten90
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0000
+480,0.0000
+490,0.0000
+500,0.0000
+510,0.0000
+520,0.0000
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0900
+570,0.3050
+580,0.3430
+590,0.2520
+600,0.1610
+610,0.1130
+620,0.0740
+630,0.0294
+640,0.0076
+650,0.0029
+660,0.0041
+670,0.0230
+680,0.0952
+690,0.2850
+700,0.5190

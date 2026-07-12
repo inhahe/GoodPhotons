@@ -1,0 +1,37 @@
+# Kodak Wratten 24: red.
+# aliases: wratten24
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; visually transcribed from the table image (no text layer).
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0000
+480,0.0000
+490,0.0000
+500,0.0000
+510,0.0000
+520,0.0000
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0455
+590,0.3730
+600,0.7230
+610,0.8290
+620,0.8640
+630,0.8780
+640,0.8850
+650,0.8900
+660,0.8930
+670,0.8970
+680,0.8990
+690,0.9020
+700,0.9030

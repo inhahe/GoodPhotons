@@ -1,8 +1,8 @@
-# Kodak Wratten 29 (deep red): cut ~610 nm, narrower/redder than 25.
-# aliases: deep-red wratten29
-# Digitized from Kodak Wratten Filters for Scientific and Technical Use,
-# 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance tables.
-# 400-700 nm at 10 nm; book dashes = negligible -> 0. Loader clamps outside range.
+# Kodak Wratten 29: deep red (F), cut ~610 nm.
+# aliases: wratten29 deep-red deep-red-29
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
 wavelength_nm,transmittance
 400,0.0000
 410,0.0000

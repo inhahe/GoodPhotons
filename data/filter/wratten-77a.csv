@@ -1,0 +1,37 @@
+# Kodak Wratten 77A: green (photometric).
+# aliases: wratten77a
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.0000
+410,0.0000
+420,0.0000
+430,0.0000
+440,0.0000
+450,0.0000
+460,0.0000
+470,0.0000
+480,0.0000
+490,0.0000
+500,0.0000
+510,0.0010
+520,0.0535
+530,0.0190
+540,0.3500
+550,0.7180
+560,0.6310
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0160
+610,0.3210
+620,0.7800
+630,0.7950
+640,0.8650
+650,0.8920
+660,0.8900
+670,0.7950
+680,0.6250
+690,0.6240
+700,0.8300

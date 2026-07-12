@@ -370,8 +370,10 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   `leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`, `soil`/`dirt`,
   `brick`/`red-brick`, `concrete`.
 - **`filter:<name>`** — gel/Wratten filter transmittances T(λ) (for a `filter`
-  material's `transmit`): `red-25`, `deep-red-29`, `orange-21`, `yellow-12`,
-  `green-58`, `blue-47`, `deep-blue-47b`.
+  material's `transmit`): the **complete 84-filter Kodak Wratten set**, named
+  `wratten-<n>` (e.g. `wratten-25`, `wratten-34a`, `wratten-47b`). Descriptive
+  aliases resolve too: `red-25` (`red`), `deep-red-29`, `orange-21`, `yellow-12`,
+  `green-58`, `blue-47`, `deep-blue-47b`, `magenta`, `cyan`, ….
 - **`spectrum "name" { … }`** blocks to define and reuse a named SPD.
 
 The `glass:`, `metal:`, `reflectance:`, `filter:` and `preset:` (illuminant) presets —

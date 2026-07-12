@@ -1,0 +1,37 @@
+# Kodak Wratten 47A: light blue.
+# aliases: wratten47a light-blue
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.2640
+410,0.4030
+420,0.5450
+430,0.6210
+440,0.6350
+450,0.6180
+460,0.5820
+470,0.5300
+480,0.4640
+490,0.3860
+500,0.2950
+510,0.2030
+520,0.1190
+530,0.0544
+540,0.0195
+550,0.0058
+560,0.0018
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0000
+610,0.0000
+620,0.0000
+630,0.0000
+640,0.0000
+650,0.0000
+660,0.0000
+670,0.0016
+680,0.0033
+690,0.0059
+700,0.0096

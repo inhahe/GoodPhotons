@@ -1,0 +1,37 @@
+# Kodak Wratten 32: magenta (minus green).
+# aliases: wratten32
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; visually transcribed from the table image (no text layer).
+wavelength_nm,transmittance
+400,0.3800
+410,0.3790
+420,0.4000
+430,0.4300
+440,0.5550
+450,0.6600
+460,0.6600
+470,0.5700
+480,0.4000
+490,0.2100
+500,0.0956
+510,0.0251
+520,0.0013
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0604
+610,0.4100
+620,0.7500
+630,0.8610
+640,0.8900
+650,0.9060
+660,0.9060
+670,0.9070
+680,0.9080
+690,0.9090
+700,0.9100

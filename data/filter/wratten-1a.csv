@@ -1,0 +1,37 @@
+# Kodak Wratten 1A: skylight (pale pink).
+# aliases: wratten1a
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.5900
+410,0.7600
+420,0.8200
+430,0.8460
+440,0.8600
+450,0.8680
+460,0.8720
+470,0.8750
+480,0.8730
+490,0.8680
+500,0.8630
+510,0.8550
+520,0.8480
+530,0.8430
+540,0.8400
+550,0.8390
+560,0.8410
+570,0.8480
+580,0.8600
+590,0.8740
+600,0.8850
+610,0.8950
+620,0.9020
+630,0.9060
+640,0.9080
+650,0.9100
+660,0.9110
+670,0.9110
+680,0.9110
+690,0.9110
+700,0.9110

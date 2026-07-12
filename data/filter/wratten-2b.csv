@@ -1,0 +1,37 @@
+# Kodak Wratten 2B: pale yellow, UV absorbing.
+# aliases: wratten2b
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.1900
+410,0.4800
+420,0.6700
+430,0.7530
+440,0.8000
+450,0.8300
+460,0.8520
+470,0.8670
+480,0.8810
+490,0.8880
+500,0.8950
+510,0.8990
+520,0.9030
+530,0.9050
+540,0.9060
+550,0.9070
+560,0.9080
+570,0.9090
+580,0.9090
+590,0.9100
+600,0.9110
+610,0.9120
+620,0.9130
+630,0.9130
+640,0.9140
+650,0.9140
+660,0.9150
+670,0.9150
+680,0.9160
+690,0.9170
+700,0.9180

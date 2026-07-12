@@ -1,0 +1,37 @@
+# Kodak Wratten 2C: pale yellow, deeper UV cut.
+# aliases: wratten2c
+# Digitized from Kodak Wratten Filters for Scientific and Technical
+# Use, 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance
+# tables, 400-700 nm @ 10 nm; coordinate-extracted from the PDF text layer.
+wavelength_nm,transmittance
+400,0.3800
+410,0.6050
+420,0.7420
+430,0.7980
+440,0.8310
+450,0.8510
+460,0.8650
+470,0.8780
+480,0.8850
+490,0.8920
+500,0.8980
+510,0.9000
+520,0.9020
+530,0.9040
+540,0.9050
+550,0.9060
+560,0.9070
+570,0.9080
+580,0.9090
+590,0.9100
+600,0.9110
+610,0.9120
+620,0.9130
+630,0.9140
+640,0.9150
+650,0.9150
+660,0.9160
+670,0.9160
+680,0.9170
+690,0.9170
+700,0.9170
