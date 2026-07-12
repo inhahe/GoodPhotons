@@ -1,0 +1,85 @@
+# Mirror selfie — "a mirror that can see the camera". A studio room whose entire back
+# wall is a silver mirror; a DSLR-style camera on a stand stands in the room with its
+# lens pointed at the mirror. Rendered through a real PHYSICAL LENS — an achromatic
+# 50 mm doublet at f/2.8 (the `lens {}` prescription forces the backward realistic-
+# camera path, mode R) — focused on the mirror image so the reflected camera staring
+# back out of the glass is sharp while the near foreground melts into bokeh. The camera
+# prop is assembled from analytic isosurface SDF leaves (rounded box body, silver
+# cylinder lens barrel, torus lens ring, glass front element, stand) grouped by
+# material. Exercises: physical multi-element lens DoF, perfect-mirror reflection,
+# spectral metals.
+#   ftrace -in scenes/mirror_selfie.ftsl -mode R -device gpu -spp 8192 -o png/mirror_selfie.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "mirror"   { type mirror reflect metal:silver }
+material "floor"    { type diffuse reflect 0.35 }
+material "white"    { type diffuse reflect whitewall 0.7 }
+material "bluewall" { type diffuse reflect rgb 0.18 0.32 0.68 }
+material "warmwall" { type diffuse reflect rgb 0.80 0.42 0.22 }
+material "body"     { type diffuse reflect 0.03 }
+material "barrel"   { type glossy  reflect metal:silver roughness 0.06 }
+material "glass"    { type dielectric ior 1.5 }
+
+# --- Studio room: x[0,2] wide, y[0,1.6] tall, z[0,3] deep. Mirror on the back wall. ---
+quad { origin 0 0 0    u 2 0 0    v 0 0 3    material floor }    # floor
+quad { origin 0 1.6 0  u 0 0 3    v 2 0 0    material white }    # ceiling
+quad { origin 0 0 0    u 0 1.6 0  v 2 0 0    material mirror }   # back wall = mirror
+quad { origin 0 0 3    u 2 0 0    v 0 1.6 0  material white }    # front backdrop (behind camera)
+quad { origin 0 0 0    u 0 0 3    v 0 1.6 0  material bluewall } # left
+quad { origin 2 0 0    u 0 1.6 0  v 0 0 3    material warmwall } # right
+
+# --- The camera prop. Lens points toward the mirror (-z). Body centred at
+#     (1.0, 0.78, 0.78); each part is a separate isosurface so it can have its own
+#     material. Parts use `translate` for position and `rotate` for orientation. ---
+
+# Body + viewfinder hump (matte black). Body sits close to the mirror so its reflected
+# twin stands right beside it, lens meeting lens.
+isosurface { material body  box { translate 1.0 0.72 0.50  size 0.26 0.18 0.16  round 0.022 } }
+isosurface { material body  box { translate 1.0 0.83 0.52  size 0.10 0.055 0.08  round 0.011 } }
+
+# Silver lens barrel (cylinder, axis rotated from local-y to +z) + front ring
+isosurface { material barrel  cylinder { translate 1.0 0.72 0.31  rotate 90 0 0  radius 0.068  height 0.20 } }
+isosurface { material barrel  torus    { translate 1.0 0.72 0.21  rotate 90 0 0  major 0.068  minor 0.015 } }
+
+# Glass front lens element (bulging forward out of the ring, toward the mirror)
+isosurface { material glass  sphere { center 1.0 0.72 0.23  radius 0.065 } }
+
+# Stand: centre post down to a base plate on the floor
+isosurface { material barrel  cylinder { translate 1.0 0.31 0.50  radius 0.026  height 0.62 } }
+isosurface { material barrel  cylinder { translate 1.0 0.02 0.50  radius 0.15   height 0.04 } }
+
+# --- Accent: a glass sphere on the floor for the mirror to pick up ---
+isosurface { material glass  sphere { center 1.62 0.20 1.15  radius 0.20 } }
+
+# Big soft key light overhead; warm accent from the right rim-lights the silver.
+light area {
+    origin 0.5 1.599 0.3   u 1.0 0 0   v 0 0 1.0   normal 0 -1 0
+    spd preset:bb6500
+}
+light area {
+    origin 1.999 0.9 0.5   u 0 0.5 0   v 0 0 0.6   normal -1 0 0
+    spd preset:bb3200
+}
+# Fill aimed at the prop's front/lens (emits down-and-toward-camera) so the face that
+# points at the mirror is lit and reads clearly in the reflection.
+light area {
+    origin 0.6 1.55 0.7   u 0.8 0 0   v 0 0 0.4   normal 0 -0.6 0.8
+    spd preset:bb5500
+}
+
+# Physical camera: achromatic 50 mm doublet at f/2.8, focused on the mirror image of
+# the prop. The prop lens front sits ~0.42 m from the mirror at z=0, and the eye is at
+# z=2.05, so the reflected (virtual) camera is ~2.6 m away: focus there so the lens
+# staring back is sharp and the near foreground camera body blurs into bokeh.
+camera "cam" {
+    eye 0.62 0.92 1.95   look_at 1.02 0.74 0.0   up 0 1 0
+    focus 2.3
+    film { res 1200 800   format full-frame }
+    lens {
+        preset achromat
+        focal 50
+        fstop 2.8
+        glass BK7
+    }
+}

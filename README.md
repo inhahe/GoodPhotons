@@ -503,8 +503,9 @@ A `pattern "name" { … }` block compiles a **scalar field** — a function of t
 point evaluated per shading sample — that can drive any scalar material parameter
 *procedurally*, without a texture image. The variables available to a pattern are the
 world-space position `x y z`, the implicit field value `f` (the SDF value at the hit,
-`~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, and
-the radius `r = √(x²+y²+z²)`. Two authoring forms:
+`~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, the
+radius `r = √(x²+y²+z²)`, and the **surface UV coordinates `u v`** (mesh-interpolated,
+or a native-primitive wrap — see below). Two authoring forms:
 
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
@@ -532,6 +533,15 @@ paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
 exception — its MIS kernel falls back to the CPU for any pattern or frosted/colored
 glass.)*
 
+**UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
+A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`
+maps its `u`/`v` edges to (0,0)→(1,1), and an `isosurface` can request a procedural
+wrap with `uv planar|spherical|cylindrical [axis=x|y|z]` — the **same projection used
+for un-`vt`'d meshes**, referenced to the surface's world bounds. So a checker or
+stripe authored in `(u,v)` space wraps *around* the object (a globe, tiles converging
+at the poles, a grid on box faces) instead of slicing through world space. See
+`scenes/uv_native.ftsl`.
+
 ## Participating media / fog
 
 `medium { sigma_t <v> albedo <v> g <v> rayleigh <bool> }`, or from the CLI with
@@ -542,15 +552,46 @@ function by default; Rayleigh optional.
 
 ## Scene language (FTSL)
 
+> **Full reference: [`FTSL.md`](FTSL.md)** — the complete grammar (every block, key,
+> default, spectrum/pattern/material form, and parsing quirk). The overview below is a
+> quick tour; `FTSL.md` is the authoritative spec.
+
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
 field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
 surface / CSG / metaballs / arbitrary `function` formulas), `light`, `group`, `medium`,
-`camera`, `camera_path` (keyframed camera animation), and `render` (render-setting
-overrides). See the `scenes/` directory for worked examples (`cornell.ftsl`,
-`fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`, `material_presets.ftsl`,
-`realcam.ftsl`, `implicit.ftsl`, `function.ftsl`, `procedural.ftsl`,
-`translucency.ftsl`, …).
+`camera`, `camera_path` (keyframed camera animation), `camera_orbit` (turntable /
+fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_curve`
+(spline fly-through with variable speed), and `render` (render-setting overrides). See the `scenes/` directory for worked examples
+(`cornell.ftsl`, `fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`,
+`material_presets.ftsl`, `realcam.ftsl`, `implicit.ftsl`, `function.ftsl`,
+`procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`, …).
+
+### Camera animation (`camera_path`, `camera_orbit`)
+
+Both expand into a sequence of frames sharing look_at/up/fov/mode/film/lens; a
+multi-camera render writes one file per frame (`_<name>` inserted before the
+extension), which ffmpeg concatenates into a video.
+
+- **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
+  keyframed fly-through: the eye (and optionally look_at / fov) is linearly
+  interpolated across `key` frames. Optional `dolly_zoom` holds the subject's
+  on-screen size (Vertigo effect); optional `exposure_lock` shares frame 0's exposure.
+- **`camera_orbit "name" { center <x y z> radius <m> [height <m>] [axis x|y|z] frames N
+  [start_deg <d>] [sweep_deg <d>] [look_at <x y z>] [exposure_lock] }`** — a turntable /
+  fly-around whose eye rides a circle around `center` (the default look_at). The circle
+  lies in the plane perpendicular to `axis` (default y); `height` offsets the eye along
+  the axis. A full 360° sweep is sampled so frame N == frame 0 (seamless loop); a
+  partial sweep spans its endpoints. See `scenes/showcase_orbit.ftsl` (an orbit tuned
+  to fly straight *through* a glass sphere).
+- **`camera_curve "name" { point <x y z> … [frames N] [density <ρ> | density_at <t> <ρ> …]
+  [look tangent | look_at <x y z> | look curve + look_point <x y z> …] [closed] }`** — a
+  fly-through along a **Catmull-Rom spline** that passes through the `point` control
+  points. Camera placement is either a fixed `frames` count (uniform arc length) or a
+  **density** (cameras per unit length) that can vary along the curve via `density_at`
+  keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
+  slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
+  `look_at`, or at a second `look curve`.
 
 ### Importing Mitsuba scenes
 

@@ -316,6 +316,38 @@ inline int projectionFromName(const std::string& raw) {
     return -1;
 }
 
+// Catmull-Rom spline through control points (an INTERPOLATING spline: the curve
+// passes through every control point). `g` is the global parameter in [0, nSeg],
+// where nSeg = closed ? n : n-1; segment = floor(g) and the local t is its
+// fraction. Segment `seg` blends points [seg-1, seg, seg+1, seg+2]; an open curve
+// clamps the out-of-range neighbours (so the end tangents point straight down the
+// last edge), a closed curve wraps them modulo n. Used by `camera_curve`.
+inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
+    int n = (int)p.size();
+    if (n == 1) return p[0];
+    int nSeg = closed ? n : n - 1;
+    if (g < 0) g = 0;
+    if (g > nSeg) g = nSeg;
+    int seg = (int)std::floor(g);
+    if (seg >= nSeg) seg = nSeg - 1;
+    double t = g - seg;
+    auto idx = [&](int i) -> const Vec3& {
+        if (closed) { i = ((i % n) + n) % n; return p[(size_t)i]; }
+        if (i < 0) i = 0;
+        if (i > n - 1) i = n - 1;
+        return p[(size_t)i];
+    };
+    const Vec3& P0 = idx(seg - 1);
+    const Vec3& P1 = idx(seg);
+    const Vec3& P2 = idx(seg + 1);
+    const Vec3& P3 = idx(seg + 2);
+    double t2 = t * t, t3 = t2 * t;
+    return (P1 * 2.0
+          + (P2 - P0) * t
+          + (P0 * 2.0 - P1 * 5.0 + P2 * 4.0 - P3) * t2
+          + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
+}
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -475,6 +507,8 @@ public:
             else if (b.type == "medium")   { if (!addMedium(b, L)) return false; }
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
             else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
+            else if (b.type == "camera_orbit") { if (!addCameraOrbit(b, L)) return false; }
+            else if (b.type == "camera_curve") { if (!addCameraCurve(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern") { /* handled */ }
@@ -1365,6 +1399,22 @@ private:
         if (ref == "regula_falsi" || ref == "falsi" || ref == "secant") im.refine = RootRefine::RegulaFalsi;
         else if (ref == "bisect") im.refine = RootRefine::Bisect;
         else { fail("isosurface `refine` must be `bisect` or `regula_falsi` (got '" + ref + "')"); return false; }
+        // Procedural UV wrap for pattern/expression materials on this native surface:
+        // `uv planar|spherical|cylindrical [axis=x|y|z]`. Exposes `u`,`v` to material
+        // expressions using the SAME projection meshes use (geometry.h projectUV),
+        // referenced to the primitive's world bounds. Default up/projection axis is y.
+        const std::string uvMode = strOf(b, "uv");
+        im.uvProj = parseUvProjection(uvMode);
+        im.uvAxis = 1;
+        if (const Stmt* uvs = find(b, "uv")) {
+            for (size_t i = 1; i < uvs->val.words.size(); ++i) {
+                std::string k, a;
+                if (!splitEq(uvs->val.words[i], k, a) || k != "axis") continue;
+                if (a == "x") im.uvAxis = 0; else if (a == "z") im.uvAxis = 2; else im.uvAxis = 1;
+            }
+        }
+        im.uvBounds = im.bounds;
+        im.uvBoundsSet = true;
         L.scene.implicits.push_back(std::move(im));
         return true;
     }
@@ -1880,6 +1930,269 @@ private:
                 double di = length(cs.eye - cs.look);
                 if (refHalf < 0.0) refHalf = di * std::tan(0.5 * cs.fov * DEG);   // anchor on frame 0
                 if (di > 1e-9) cs.fov = 2.0 * std::atan(refHalf / di) / DEG;
+            }
+            char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
+            cs.name = base + num5;
+            cs.pathGroup = pathGroup;
+            cs.exposureLock = pathLock;
+            L.cameras.push_back(cs);
+            if (!L.hasCamera) {
+                L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
+                L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
+                if (cs.mode) L.mode = cs.mode;
+                if (cs.res > 0) L.res = cs.res;
+                L.hasCamera = true;
+            }
+        }
+        return true;
+    }
+
+    // A `camera_orbit` expands into N CamSpec frames whose eye rides a circle around a
+    // fixed `center` (also the default look_at), producing a turntable / fly-around that
+    // stitches straight into an MP4. The circle lies in the plane perpendicular to `axis`
+    // (default y -> circle in the xz-plane); `radius` is its radius and `height` offsets
+    // the eye along the axis from the centre. The sweep runs `sweep_deg` degrees (default
+    // 360) starting at `start_deg`; a full 360 sweep is sampled at i/frames (frame N ==
+    // frame 0, so it is NOT duplicated) to make a seamless loop, while a partial sweep
+    // spans its endpoints via i/(frames-1). All frames share look_at/up/fov/mode/film/lens.
+    // Grammar:
+    //   camera_orbit "spin" {
+    //       center 0.40 0.37 0.45   radius 0.45   height -0.05   axis y
+    //       up 0 1 0   fov_y 58   mode R   frames 120
+    //       look_at 0.40 0.37 0.45           # optional, defaults to center
+    //       start_deg 0   sweep_deg 360       # optional
+    //       exposure_lock                     # optional (flicker-free)
+    //       film { res 900 900 }
+    //   }
+    bool addCameraOrbit(const Block& b, Loaded& L) {
+        std::string base = b.name.empty() ? ("orbit" + std::to_string(L.cameras.size())) : b.name;
+        CamSpec shared;
+        vec3Of(b, "up", shared.up);
+        shared.fov = dblOf(b, "fov_y", 40.0);
+        shared.aperture = Len(dblOf(b, "aperture", 0.02));
+        shared.focus = Len(dblOf(b, "focus", 0.0));
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
+        if (!readProjection(b, shared)) return false;     // projection/fisheye
+        if (!readLens(b, shared)) return false;           // optional physical `lens { ... }` block
+
+        Vec3 center{0, 0, 0};
+        if (!vec3Of(b, "center", center)) { fail("camera_orbit '" + base + "' needs a `center`"); return false; }
+        center = P(center);
+        Vec3 look = center;                               // look_at defaults to the orbit centre
+        if (find(b, "look_at")) { Vec3 lv{0,0,0}; vec3Of(b, "look_at", lv); look = P(lv); }
+        shared.look = look;
+
+        double radius = Len(dblOf(b, "radius", 0.0));
+        if (radius <= 0.0) { fail("camera_orbit '" + base + "' needs radius > 0"); return false; }
+        double height = Len(dblOf(b, "height", 0.0));     // offset along the axis from centre
+        int frames = (int)dblOf(b, "frames", 0.0);
+        if (frames < 1) { fail("camera_orbit '" + base + "' needs frames >= 1"); return false; }
+        double startDeg = dblOf(b, "start_deg", 0.0);
+        double sweepDeg = dblOf(b, "sweep_deg", 360.0);
+
+        // Orbit axis + an orthonormal basis (U, W) spanning the plane perpendicular to it.
+        std::string axisW = strOf(b, "axis", "y");
+        Vec3 A = (axisW == "x") ? Vec3{1, 0, 0} : (axisW == "z") ? Vec3{0, 0, 1} : Vec3{0, 1, 0};
+        Vec3 ref = (std::fabs(A.y) < 0.9) ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+        Vec3 U = normalize(cross(ref, A));
+        Vec3 W = normalize(cross(A, U));
+
+        bool pathLock = false;
+        if (const Stmt* el = find(b, "exposure_lock")) {
+            if (el->val.words.empty()) pathLock = true;
+            else { const std::string& v = el->val.words[0]; pathLock = !(v == "off" || v == "false" || v == "0"); }
+        }
+        const int pathGroup = (int)L.cameras.size();
+        const double DEG = 3.141592653589793 / 180.0;
+
+        bool fullLoop = std::fabs(std::fabs(sweepDeg) - 360.0) < 1e-6;
+        int pad = 1; for (int f = frames - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
+        for (int i = 0; i < frames; ++i) {
+            double frac = (frames <= 1) ? 0.0
+                        : fullLoop    ? ((double)i / frames)
+                                      : ((double)i / (frames - 1));
+            double ang = (startDeg + sweepDeg * frac) * DEG;
+            CamSpec cs = shared;
+            cs.eye = center + A * height + (U * std::cos(ang) + W * std::sin(ang)) * radius;
+            char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
+            cs.name = base + num5;
+            cs.pathGroup = pathGroup;
+            cs.exposureLock = pathLock;
+            L.cameras.push_back(cs);
+            if (!L.hasCamera) {
+                L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
+                L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
+                if (cs.mode) L.mode = cs.mode;
+                if (cs.res > 0) L.res = cs.res;
+                L.hasCamera = true;
+            }
+        }
+        return true;
+    }
+
+    // A `camera_curve` expands into N CamSpec frames whose eye rides a smooth 3D
+    // Catmull-Rom spline through the authored `point` control points (the curve passes
+    // THROUGH each). Where cameras sit along the curve is set either by a fixed count
+    // (`frames N`, uniform arc-length spacing) or by a DENSITY — cameras per unit
+    // length — that may itself vary along the curve, giving the camera a "speed": high
+    // density = many closely-spaced frames = slow motion through that stretch; low
+    // density = fast. `density <rho>` is constant; `density_at <t> <rho>` keyframes it
+    // (piecewise-linear over the normalized position t in [0,1], t=0 first point, t=1
+    // last). The number of cameras placed with local spacing 1/rho follows from
+    // integrating rho over arc length; `frames N` (if also given) instead fixes the
+    // count and only uses the density to DISTRIBUTE those N cameras. Orientation:
+    //   look tangent    (default) — aim along the direction of travel
+    //   look_at x y z             — a fixed target for every frame
+    //   look curve + look_point.. — aim at a SECOND Catmull-Rom spline, sampled in step
+    // `closed` loops the curve (seamless). All frames share up/fov/mode/film/lens.
+    // Grammar:
+    //   camera_curve "fly" {
+    //       point 0 1 3   point 1 1 1   point 2 1 3   point 1 1 5   # >= 2 control points
+    //       up 0 1 0   fov_y 50   mode R   frames 90
+    //       density 20                       # OR density_at 0 5  density_at 0.5 40  density_at 1 5
+    //       look tangent                     # OR look_at 1 1 3   OR look curve + look_point ...
+    //       closed   exposure_lock
+    //       film { res 900 600 }
+    //   }
+    bool addCameraCurve(const Block& b, Loaded& L) {
+        std::string base = b.name.empty() ? ("curve" + std::to_string(L.cameras.size())) : b.name;
+        CamSpec shared;
+        vec3Of(b, "up", shared.up);
+        shared.fov = dblOf(b, "fov_y", 40.0);
+        shared.aperture = Len(dblOf(b, "aperture", 0.02));
+        shared.focus = Len(dblOf(b, "focus", 0.0));
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
+        if (!readProjection(b, shared)) return false;     // projection/fisheye
+        if (!readLens(b, shared)) return false;           // optional physical `lens { ... }` block
+
+        // Control points (>= 2), in file order; the spline passes through each.
+        std::vector<Vec3> pts;
+        for (const auto& s : b.stmts) {
+            if (s.key != "point") continue;
+            if (s.val.words.size() < 3) { fail("camera_curve '" + base + "' point needs x y z"); return false; }
+            pts.push_back(P(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])}));
+        }
+        if (pts.size() < 2) { fail("camera_curve '" + base + "' needs >= 2 `point` control points"); return false; }
+
+        bool closed = false;
+        if (const Stmt* c = find(b, "closed")) {
+            if (c->val.words.empty()) closed = true;
+            else { const std::string& v = c->val.words[0]; closed = !(v == "off" || v == "false" || v == "0"); }
+        }
+
+        // Density = cameras per unit LENGTH (1/authored-unit -> 1/metre). `density_at`
+        // keyframes it (piecewise-linear over normalized position t in [0,1]); a bare
+        // `density` is constant. Either drives BOTH the camera count (integral of rho
+        // over the curve) and the local spacing (1/rho).
+        struct DKey { double t, rho; };
+        std::vector<DKey> dkeys;
+        for (const auto& s : b.stmts) {
+            if (s.key != "density_at") continue;
+            if (s.val.words.size() < 2) { fail("camera_curve '" + base + "' density_at needs: <t> <rho>"); return false; }
+            dkeys.push_back({num(s.val.words[0]), num(s.val.words[1]) / L_});
+        }
+        std::sort(dkeys.begin(), dkeys.end(), [](const DKey& a, const DKey& b2){ return a.t < b2.t; });
+        double constDensity = find(b, "density") ? dblOf(b, "density", 0.0) / L_ : -1.0;
+        bool haveDensity = !dkeys.empty() || constDensity > 0.0;
+
+        int framesReq = (int)dblOf(b, "frames", 0.0);
+        if (framesReq < 1 && !haveDensity) {
+            fail("camera_curve '" + base + "' needs `frames N` or a `density`/`density_at <t> <rho>`");
+            return false;
+        }
+
+        auto densityAt = [&](double u) -> double {
+            if (!dkeys.empty()) {
+                if (u <= dkeys.front().t) return dkeys.front().rho;
+                if (u >= dkeys.back().t)  return dkeys.back().rho;
+                for (size_t j = 0; j + 1 < dkeys.size(); ++j)
+                    if (u >= dkeys[j].t && u <= dkeys[j + 1].t) {
+                        double sp = dkeys[j + 1].t - dkeys[j].t;
+                        double f = (sp > 1e-12) ? (u - dkeys[j].t) / sp : 0.0;
+                        return dkeys[j].rho + (dkeys[j + 1].rho - dkeys[j].rho) * f;
+                    }
+                return dkeys.back().rho;
+            }
+            return (constDensity > 0.0) ? constDensity : 1.0;
+        };
+
+        // Densely sample the spline; build a cumulative "count" table C(g) = INT rho ds.
+        // For a constant/absent density this is just arc length, so the same inversion
+        // yields uniform arc-length spacing.
+        int nSeg = closed ? (int)pts.size() : (int)pts.size() - 1;
+        int M = std::max(64, 64 * nSeg);
+        std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1);
+        Vec3 prev = catmullRomAt(pts, closed, 0.0);
+        sampG[0] = 0.0; sampC[0] = 0.0;
+        for (int k = 1; k <= M; ++k) {
+            double g = nSeg * (double)k / M;
+            Vec3 pcur = catmullRomAt(pts, closed, g);
+            double ds = length(pcur - prev);
+            double rho = densityAt(g / nSeg);
+            sampC[k] = sampC[k - 1] + rho * ds;
+            sampG[k] = g;
+            prev = pcur;
+        }
+        double Cmax = sampC[M];
+        if (Cmax <= 0.0) { fail("camera_curve '" + base + "' has zero length or density"); return false; }
+
+        int N = (framesReq >= 1) ? framesReq : std::max(1, (int)std::llround(Cmax));
+
+        auto invertC = [&](double target) -> double {   // count-value -> global param g
+            if (target <= 0.0) return 0.0;
+            if (target >= Cmax) return (double)nSeg;
+            int lo = 0, hi = M;
+            while (lo + 1 < hi) { int mid = (lo + hi) / 2; (sampC[(size_t)mid] <= target ? lo : hi) = mid; }
+            double c0 = sampC[(size_t)lo], c1 = sampC[(size_t)lo + 1];
+            double f = (c1 > c0) ? (target - c0) / (c1 - c0) : 0.0;
+            return sampG[(size_t)lo] + (sampG[(size_t)lo + 1] - sampG[(size_t)lo]) * f;
+        };
+
+        // Orientation. Gather optional look-curve control points first.
+        std::vector<Vec3> lookPts;
+        for (const auto& s : b.stmts) {
+            if (s.key != "look_point") continue;
+            if (s.val.words.size() < 3) { fail("camera_curve '" + base + "' look_point needs x y z"); return false; }
+            lookPts.push_back(P(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])}));
+        }
+        std::string lookKw = strOf(b, "look", "tangent");
+        bool lookCurve = (!lookPts.empty() || lookKw == "curve" || lookKw == "look_curve" || find(b, "look_curve"));
+        bool lookFixed = !lookCurve && (find(b, "look_at") || lookKw == "look_at");
+        if (lookCurve && lookPts.size() < 2) {
+            fail("camera_curve '" + base + "' look curve needs >= 2 `look_point` control points"); return false;
+        }
+        Vec3 fixedLook{0, 0, 0};
+        if (lookFixed) { vec3Of(b, "look_at", fixedLook); fixedLook = P(fixedLook); }
+        int lookSeg = lookCurve ? (closed ? (int)lookPts.size() : (int)lookPts.size() - 1) : 0;
+
+        bool pathLock = false;
+        if (const Stmt* el = find(b, "exposure_lock")) {
+            if (el->val.words.empty()) pathLock = true;
+            else { const std::string& v = el->val.words[0]; pathLock = !(v == "off" || v == "false" || v == "0"); }
+        }
+        const int pathGroup = (int)L.cameras.size();
+
+        int pad = 1; for (int f = N - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
+        for (int i = 0; i < N; ++i) {
+            // A closed loop samples i/N (frame N == frame 0, not duplicated); an open
+            // curve spans both endpoints via i/(N-1).
+            double fr = closed ? ((double)i / N)
+                               : (N == 1 ? 0.5 : (double)i / (N - 1));
+            double g = invertC(fr * Cmax);
+            CamSpec cs = shared;
+            cs.eye = catmullRomAt(pts, closed, g);
+            if (lookCurve) {
+                cs.look = catmullRomAt(lookPts, closed, fr * lookSeg);
+            } else if (lookFixed) {
+                cs.look = fixedLook;
+            } else {   // tangent: aim one finite-difference step ahead along the curve
+                double dg = (double)nSeg / (M * 4.0);
+                Vec3 a = catmullRomAt(pts, closed, g - dg);
+                Vec3 c = catmullRomAt(pts, closed, g + dg);
+                Vec3 tan = c - a;
+                cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});
             }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;

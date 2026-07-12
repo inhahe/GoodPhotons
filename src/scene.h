@@ -727,7 +727,7 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
 
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
 // implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
-inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n); }
+inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern
 // value, or `dflt` if `pat` is out of range.

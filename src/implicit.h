@@ -222,6 +222,14 @@ struct Implicit {
     MarchMethod method = MarchMethod::Adaptive;
     RootRefine  refine = RootRefine::Bisect;
     double sampleStep = 0.0;
+    // Procedural UV wrap for pattern/expression materials (spec §9.2, native-object
+    // adaptation). When uvProj != None the hit's (u,v) are projected from the world
+    // hit point across `uvBounds` (defaults to `bounds`) using `uvAxis` as the
+    // up/projection axis — the same algorithm meshes use. None leaves (u,v)=(0,0).
+    UvProjection uvProj = UvProjection::None;
+    int  uvAxis = 1;             // 0=x, 1=y, 2=z
+    Aabb uvBounds;               // reference box for the [0,1] wrap (set by builder)
+    bool uvBoundsSet = false;
 
     double eval(const Vec3& pw) const {
         return fieldEval(nodes.data(), (int)nodes.size(), pw, exprNodes.data());
@@ -323,7 +331,16 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             hit.ng = g;
             hit.n = (dot(r.d, g) < 0.0) ? g : -g;
             hit.matId = im.matId; hit.sensorId = -1;
-            hit.u = 0.0; hit.v = 0.0;   // procedural materials use hit.p directly
+            if (im.uvProj != UvProjection::None) {
+                // Wrap UV from the world hit point across the reference box (same
+                // planar/spherical/cylindrical projection meshes use).
+                const Aabb& b = im.uvBoundsSet ? im.uvBounds : im.bounds;
+                Vec3 ctr = (b.lo + b.hi) * 0.5;
+                Vec3 uv = projectUV(p, b.lo, b.hi, ctr, im.uvProj, im.uvAxis);
+                hit.u = uv.x; hit.v = uv.y;
+            } else {
+                hit.u = 0.0; hit.v = 0.0;   // procedural materials use hit.p directly
+            }
             return true;
         }
         if (last) return false;

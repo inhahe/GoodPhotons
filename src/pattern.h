@@ -32,6 +32,7 @@ enum class PatOp : int {
     VarF,                            // implicit field value at the hit (~0 on a surface)
     VarNx, VarNy, VarNz,             // surface normal (oriented against the ray)
     VarR,                            // radius = sqrt(x*x+y*y+z*z)
+    VarU, VarV,                      // surface UV coordinates (mesh or native-primitive wrap)
     // unary: pop 1, push 1
     Neg, Abs, Sqrt, Sin, Cos, Tan, Exp, Log, Floor, Fract, Sign, Saturate,
     // binary: pop 2 (a below b), push 1
@@ -55,14 +56,16 @@ struct PatCtx {
     double f = 0;                 // implicit field value (0 for non-implicit hits)
     double nx = 0, ny = 0, nz = 0;// surface normal
     double r = 0;                 // radius |p|
+    double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
 };
 
-inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n) {
+inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0) {
     PatCtx c;
     c.x = p.x; c.y = p.y; c.z = p.z;
     c.f = f;
     c.nx = n.x; c.ny = n.y; c.nz = n.z;
     c.r = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+    c.u = u; c.v = v;
     return c;
 }
 
@@ -116,6 +119,8 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarNy:    st[sp++] = c.ny; break;
             case PatOp::VarNz:    st[sp++] = c.nz; break;
             case PatOp::VarR:     st[sp++] = c.r;  break;
+            case PatOp::VarU:     st[sp++] = c.u;  break;
+            case PatOp::VarV:     st[sp++] = c.v;  break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = std::fabs(st[sp-1]); break;
             case PatOp::Sqrt:     st[sp-1] = std::sqrt(std::fmax(0.0, st[sp-1])); break;
@@ -161,7 +166,7 @@ struct Pattern {
 
 // ---------------------------------------------------------------------------
 // (B) Expression compiler: infix math -> postfix, over the pattern variables.
-// Supports: literals, constant `pi`; variables x y z f nx ny nz r; unary + -;
+// Supports: literals, constant `pi`; variables x y z f nx ny nz r u v; unary + -;
 // binary + - * / % ^ (^ = pow, right-assoc); functions abs sqrt sin cos tan exp
 // log floor fract sign saturate min max pow atan2 step clamp mix smoothstep noise.
 // Returns false + fills `err` on a parse error. Shunting-yard with an operator and
@@ -190,6 +195,8 @@ inline bool varOp(const std::string& s, PatOp& out) {
     if (s == "ny") { out = PatOp::VarNy; return true; }
     if (s == "nz") { out = PatOp::VarNz; return true; }
     if (s == "r")  { out = PatOp::VarR;  return true; }
+    if (s == "u")  { out = PatOp::VarU;  return true; }
+    if (s == "v")  { out = PatOp::VarV;  return true; }
     return false;
 }
 

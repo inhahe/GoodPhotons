@@ -1,0 +1,55 @@
+# Spline fly-through with a variable-speed camera — a `camera_curve` demo that
+# stitches into an MP4. The eye rides a smooth Catmull-Rom spline that PASSES THROUGH
+# the authored `point` control points, swooping in from the doorway, curving around
+# the gold hero ball, and pulling back out. The whole path aims at a fixed `look_at`
+# (the hero), so the ball stays centred while the world sweeps past it.
+#
+# The camera's SPEED is authored as a separate density curve: `density_at <t> <rho>`
+# gives cameras-per-metre at normalized position t along the curve. Here density peaks
+# near t=0.5 (the close pass by the ball) and is low at the ends — so the fly-through
+# DWELLS on the hero (many closely-spaced frames = slow motion) and moves briskly
+# through the approach and exit (few frames = fast). `frames 120` fixes the total
+# count; the density only distributes those 120 cameras along the curve.
+#
+#   ftrace -in scenes/flythrough.ftsl -mode R -device gpu -spp 512 -o png/fly.png
+#   ffmpeg -framerate 30 -i png/fly_swoop%03d.png -c:v libx264 -pix_fmt yuv420p \
+#          -crf 18 png/flythrough.mp4
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "gold"  { preset gold }
+material "glass" { type dielectric ior 1.5 }
+
+# Wide Cornell room: floor x[0,2.0], depth z[0,2.4], height y[0,1.4].
+quad { origin 0 0 0     u 2.0 0 0   v 0 0 2.4   material white }   # floor
+quad { origin 0 1.4 0   u 0 0 2.4   v 2.0 0 0   material white }   # ceiling
+quad { origin 0 0 0     u 0 1.4 0   v 2.0 0 0   material white }   # back
+quad { origin 0 0 0     u 0 0 2.4   v 0 1.4 0   material red   }   # left
+quad { origin 2.0 0 0   u 0 1.4 0   v 0 0 2.4   material green }   # right
+
+# Hero: gold ball the fly-through curves around, with a glass sphere companion.
+sphere { center 1.0 0.35 1.1   radius 0.30   material gold }
+isosurface { material glass  sphere { center 0.55 0.22 1.6   radius 0.18 } }
+
+light area { origin 0.7 1.399 0.8   u 0.6 0 0   v 0 0 0.6   normal 0 -1 0   spd preset:bb6500 }
+
+# Fly-through: a spline that enters high on the right, sweeps down and around the gold
+# ball, and lifts back out on the left. 120 frames, aimed at the hero throughout.
+# The density curve makes the camera slow to a crawl during the close pass (t~0.5).
+camera_curve "swoop" {
+    point 1.7 0.9 2.2      # enter, high and back
+    point 1.5 0.5 1.5      # descend toward the ball
+    point 1.0 0.45 0.7     # close pass in front of the hero
+    point 0.5 0.55 1.5     # arc around the far side
+    point 0.4 1.0 2.2      # lift back out
+
+    up 0 1 0   fov_y 52   mode R   frames 120
+    density_at 0.0 8   density_at 0.5 40   density_at 1.0 8   # slow dwell mid-curve
+
+    look_at 1.0 0.35 1.1                                       # hold the gold hero
+    exposure_lock
+    film { res 900 600 }
+}

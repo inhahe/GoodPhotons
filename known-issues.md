@@ -5,6 +5,58 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Resolved
 
+### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
+- **What:** the procedural-pattern math VM now exposes the surface texture coordinates
+  `u`,`v` (previously mesh-only) to expressions on **native** objects too, so a UV-space
+  checker/stripe wraps *around* a sphere/box/isosurface instead of slicing through world
+  space. Native `sphere {}` (equirectangular) and `quad {}` (edge-mapped) already filled
+  `hit.u/v`; an `isosurface` now accepts `uv planar|spherical|cylindrical [axis=x|y|z]`
+  to synthesize a wrap from its world bounds using the **same `projectUV` used for
+  un-`vt`'d meshes**.
+- **Implementation:** `pattern.h` — added `PatOp::VarU/VarV`, `PatCtx.u/v`, `makePatCtx`
+  u/v params, `patternEval` cases, and `u`/`v` in `varOp`. `geometry.h` — hoisted
+  `UvProjection`/`parseUvProjection`/`projectUV` out of `mesh.h` (both include geometry.h)
+  so implicits reuse them. `implicit.h` — `Implicit.uvProj/uvAxis/uvBounds`; `intersectImplicit`
+  projects UV at the hit when enabled. `scene.h` — `patCtxFromHit` threads `h.u/h.v`.
+  `ftsl.h` — `addIsosurface` parses `uv <mode> [axis=]`. GPU twins in `render_cuda.cu`:
+  `DImplicit.uvProj/uvAxis/uvLo/uvHi`, device `dProjectUV`, `dPatternEval`/`dPatternScalarAt`
+  thread `u,v` (and the DF_EXPR field call passes 0,0). Demo: `scenes/uv_native.ftsl`.
+
+### `camera_curve` block (spline fly-through with variable speed) — DONE 2026-07-11
+- **What:** a new top-level `camera_curve "name" { point … [frames N] [density <ρ> |
+  density_at <t> <ρ> …] [look tangent|look_at|curve+look_point] [closed] [exposure_lock] … }`
+  expands into N CamSpec frames whose eye rides a **Catmull-Rom spline** through the
+  `point` control points (interpolating — passes through each). Placement is either a
+  fixed `frames` count (uniform arc length) or a **density** (cameras per unit length)
+  that can vary via `density_at` keyframes — the camera's *speed*: high density = many
+  closely-spaced frames = slow dwell; low density = fast. This answers the original
+  "how do you specify camera speed as a separate curve" question: density ρ(t) is
+  integrated over arc length to a cumulative count C, and camera i is placed by
+  inverting C at the target fraction. Orientation: travel tangent (default), a fixed
+  `look_at`, or a second `look curve` (its own spline sampled in step).
+- **Implementation:** `ftsl.h` `catmullRomAt()` (interpolating spline eval, open clamps
+  neighbours / closed wraps) + `addCameraCurve()` (dense arc-length + density sampling,
+  cumulative-count inversion for placement, tangent/fixed/curve look) + dispatch entry.
+  Reuses the `camera_path`/`camera_orbit` machinery (shared CamSpec, `base<NNN>` naming,
+  `pathGroup`/`exposureLock`, multi-camera render loop). Validated on CPU
+  (`scraps/curve_test.ftsl`, 3 frames — eye rides the spline, holds the look_at). Same
+  GPU caveat as `camera_orbit`: one camera per launch, frames render sequentially (fine).
+
+### `camera_orbit` block (turntable / fly-around for MP4s) — DONE 2026-07-11
+- **What:** a new top-level `camera_orbit "name" { center radius [height] [axis] frames
+  [start_deg] [sweep_deg] [look_at] [exposure_lock] … }` expands into N CamSpec frames
+  whose eye rides a circle around `center` (the default look_at), for stitching an orbit
+  MP4. A full 360° sweep samples `i/frames` (frame N == frame 0, seamless loop); a partial
+  sweep spans endpoints via `i/(frames-1)`. Reuses the `camera_path` machinery (shared
+  CamSpec, per-frame naming `base<NNN>`, `pathGroup`/`exposureLock`, the multi-camera
+  render loop + `_<name>` file naming).
+- **Implementation:** `ftsl.h` `addCameraOrbit` (basis vectors U,W ⟂ axis; eye = center +
+  axis·height + (U·cosθ + W·sinθ)·radius) + dispatch entry. Demo: `scenes/showcase_orbit.ftsl`
+  (orbit tuned so its circle flies straight through the glass sphere). NOTE: the GPU
+  forward megakernel still renders one camera per launch (see the shared multi-camera
+  entry below); an orbit on `-mode R`/`-device gpu` renders frames sequentially, which is
+  fine — the per-frame cost dominates.
+
 ### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
 - **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
   renders the zero set of a hand-typed equation (gyroid, Goursat, etc.), distinct from

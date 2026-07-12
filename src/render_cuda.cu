@@ -233,6 +233,9 @@ struct DImplicit {
     int    method;           // 0 = adaptive (|f|/lipschitz), 1 = fixed-step sample
     int    refine;           // 0 = bisect, 1 = regula-falsi (Illinois)
     double sampleStep;       // fixed world march step for method==1
+    int    uvProj;           // 0 none, 1 planar, 2 spherical, 3 cylindrical (UvProjection)
+    int    uvAxis;           // 0=x, 1=y, 2=z (projection/up axis)
+    double uvLo[3], uvHi[3]; // reference box for the [0,1] UV wrap
 };
 
 // Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
@@ -801,7 +804,8 @@ __device__ static inline double dSmax(double a, double b, double k) { return -dS
 // defined further down (dPatternEval). The field VM only needs it for the Expr case.
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
-                                      double nx, double ny, double nz, double r);
+                                      double nx, double ny, double nz, double r,
+                                      double u, double v);
 
 __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
                                        const PatNode* exprPool) {
@@ -812,7 +816,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -893,6 +897,34 @@ __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
     if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
     else           { gx = 0.0; gy = 0.0; gz = 1.0; }
 }
+// Device twin of geometry.h projectUV: wrap a world point to (u,v) over box lo..hi.
+// proj: 1 planar, 2 spherical, 3 cylindrical. axis 0/1/2 = up/projection axis.
+__device__ static inline double dNorm01(double val, double lo, double hi) {
+    double d = hi - lo;
+    return d > 1e-12 ? (val - lo) / d : 0.5;
+}
+__device__ static void dProjectUV(double px, double py, double pz,
+                                  const double* lo, const double* hi,
+                                  int proj, int axis, double& outU, double& outV) {
+    double p[3] = {px, py, pz};
+    int a0 = (axis + 1) % 3, a1 = (axis + 2) % 3;
+    if (proj == 1) {   // planar
+        outU = dNorm01(p[a0], lo[a0], hi[a0]);
+        outV = dNorm01(p[a1], lo[a1], hi[a1]);
+        return;
+    }
+    double ctr[3] = {0.5*(lo[0]+hi[0]), 0.5*(lo[1]+hi[1]), 0.5*(lo[2]+hi[2])};
+    double dvec[3] = {p[0]-ctr[0], p[1]-ctr[1], p[2]-ctr[2]};
+    double dz = dvec[axis], dx = dvec[a0], dy = dvec[a1];
+    double azim = 0.5 + atan2(dy, dx) / (2.0 * DPI);
+    if (proj == 3) {   // cylindrical
+        outU = azim; outV = dNorm01(p[axis], lo[axis], hi[axis]); return;
+    }
+    double r = sqrt(dx*dx + dy*dy + dz*dz);   // spherical
+    outU = azim;
+    outV = (r > 1e-12) ? acos(fmax(-1.0, fmin(1.0, dz / r))) / DPI : 0.5;
+}
+
 // Sphere-trace one implicit; writes into `hit` (respecting hit.t). Mirrors intersectImplicit.
 __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                                           const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
@@ -958,7 +990,11 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             double side = dx*gx + dy*gy + dz*gz;
             hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
             hit.matId = im.matId; hit.sensorId = -1;
-            hit.u = 0; hit.v = 0;
+            if (im.uvProj != 0) {
+                double uu, vv;
+                dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
+                hit.u = (Real)uu; hit.v = (Real)vv;
+            } else { hit.u = 0; hit.v = 0; }
             return true;
         }
         if (last) return false;
@@ -1484,7 +1520,8 @@ __device__ static double dPatValueNoise(double x, double y, double z) {
 // POD host types (pattern.h), uploaded verbatim; variables come in as scalar args.
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
-                                      double nx, double ny, double nz, double r) {
+                                      double nx, double ny, double nz, double r,
+                                      double u, double v) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
@@ -1498,6 +1535,8 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
             case PatOp::VarNy:    st[sp++] = ny; break;
             case PatOp::VarNz:    st[sp++] = nz; break;
             case PatOp::VarR:     st[sp++] = r;  break;
+            case PatOp::VarU:     st[sp++] = u;  break;
+            case PatOp::VarV:     st[sp++] = v;  break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
             case PatOp::Sqrt:     st[sp-1] = sqrt(fmax(0.0, st[sp-1])); break;
@@ -1542,7 +1581,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
 }
 
 // Per-hit glossy roughness / thin-film thickness (device twins of materialRoughness
@@ -3068,6 +3107,12 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
         d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
         d.lipschitz = im.lipschitz; d.minStep = im.minStep;
         d.method = (int)im.method; d.refine = (int)im.refine; d.sampleStep = im.sampleStep;
+        d.uvProj = (int)im.uvProj; d.uvAxis = im.uvAxis;
+        {
+            const Aabb& ub = im.uvBoundsSet ? im.uvBounds : im.bounds;
+            d.uvLo[0] = ub.lo.x; d.uvLo[1] = ub.lo.y; d.uvLo[2] = ub.lo.z;
+            d.uvHi[0] = ub.hi.x; d.uvHi[1] = ub.hi.y; d.uvHi[2] = ub.hi.z;
+        }
         // Rebase this implicit's expr programs into the shared device pool. Each Implicit
         // owns a private exprNodes vector on the host (FieldNode.exprOff indexes it), so we
         // add the running base and copy the programs into fieldExprNodes.

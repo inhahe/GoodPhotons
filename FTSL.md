@@ -1,0 +1,636 @@
+# FTSL — the Forward-Tracer Scene Language
+
+FTSL is the block-structured text format the raytracer loads with `-in scene.ftsl`.
+It populates the in-memory `Scene` + `Camera(s)` instead of a hand-written C++ builder.
+This is the complete reference; the loader lives in `src/ftsl.h`.
+
+> **Scope note.** This documents what the parser in `src/ftsl.h` actually accepts.
+> Where a keyword is easy to get subtly wrong (value continuations, `key=val` vs
+> bareword, `mod` not being a function, …) it is called out explicitly.
+
+---
+
+## 1. Lexical structure
+
+- **Comments**: `#` to end of line (anywhere).
+- **Whitespace**: spaces / tabs / newlines separate tokens. Newlines terminate
+  statements, but several `key value` pairs may share one line.
+- **Strings**: `"double quoted"` — used for block names and quoted expressions.
+- **Braces**: `{ … }` open a block body or a nested sub-block.
+- **Barewords**: any run of non-space, non-brace, non-quote, non-`#` characters. A
+  bareword is a *number* iff `strtod` consumes all of it (`-1`, `0.999`, `1e30`).
+
+### 1.1 Statements and value continuations
+
+A statement is `key value…`. The parser reads the **first** value token
+unconditionally, then keeps consuming *continuation* tokens — a token that is a
+**number** or contains an `=` (a `key=val` named param) — and stops at the next
+bareword, which begins the next statement's key.
+
+Consequences you must know:
+
+- Vectors work because they are numbers: `origin 0 0 0  u 1 0 0` parses as two
+  statements on one line.
+- A trailing option that is a **bareword** starts a *new* statement and will NOT be
+  folded back into the previous one. This is why axis/scale options use `key=val`
+  form: `uv planar axis=y` (correct) vs `uv planar y` (the `y` is silently a stray
+  statement). See §9.
+- A `{` after a value opens a nested block whose *type* is the preceding word (or the
+  statement key if none): `film { … }`, `table { … }`, `coat { … }`, `lens { … }`.
+
+### 1.2 Top-level block syntax
+
+```
+blocktype ["name"] [subtype] { … }
+```
+
+- `spectrum` is special: `spectrum "name" = <spectrum-expr>` (needs the `=`, no braces).
+- `light` takes a **subtype** bareword: `light area { … }`, `light spot { … }`, etc.
+- All other blocks are `type ["name"] { … }`.
+
+---
+
+## 2. Units and the `scene` block
+
+```
+scene { units meters  spectral 360 830 1 }
+```
+
+| key | values | default | meaning |
+|---|---|---|---|
+| `units` | `meters`/`m`, `centimeters`/`cm`, `millimeters`/`mm`, `inches`/`in`, `feet`/`ft` | `meters` | all authored **lengths/positions** are scaled to internal metres at load time |
+| `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
+
+Directions (`up`, `normal`, `dir`, `axis`) are **not** unit-scaled — only points and
+lengths are. There is one `scene` block (extra ones are also scanned but the last
+`units`/`spectral` win).
+
+---
+
+## 3. Spectrum expressions
+
+A spectrum expression appears after `spd`, `reflect`, `ior`, `absorb`, `emit`,
+`substrate_k`, `sigma_a`, `sigma_s`, and in `spectrum "name" = …`.
+
+| form | meaning |
+|---|---|
+| `<number>` | constant (flat) spectrum |
+| `blackbody <K>` | Planckian radiator at K kelvin (default 6500) |
+| `ior <n>` | constant index of refraction (default 1.5) |
+| `whitewall [r]` | neutral diffuse reflectance (default 0.75) |
+| `redwall` / `greenwall` | the Cornell-box side-wall reflectances |
+| `gaussian center=<nm> sigma=<nm> amp=<a>` | a Gaussian emission/reflectance band |
+| `shortpass edge=<nm> slope=<nm> amp=<a>` | a soft short-pass edge |
+| `rgb <r> <g> <b>` | sRGB-linear triple → reflectance via Jakob-Hanika upsampling |
+| `glass:<name>` | dispersive glass IOR curve (see §3.1) |
+| `metal:<name>` | measured metal reflectance (see §3.2) |
+| `reflectance:<name>` | measured natural diffuse reflectance (see §3.3) |
+| `preset:<illuminant>` | a named light SPD (see §3.4) |
+| `spectrum:<name>` | reference to a previously declared `spectrum "name"` |
+| `file:<path>` | a measured CSV curve `wavelength_nm,value` (comma or whitespace, `#` comments, header rows skipped) |
+| `table { <λ>:<v> <λ>:<v> … }` | inline piecewise-linear tabulated curve |
+
+`gaussian`/`shortpass` use `key=val` params (their values are continuations). The
+`table` body is a flat list of `λ:value` tokens.
+
+### 3.1 `glass:<name>` IOR curves
+
+`BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`, `sapphire`,
+`diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`.
+
+### 3.2 `metal:<name>` reflectances
+
+`Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`/`aluminum`,
+`Cr`/`chromium`/`chrome`, `brass`.
+
+### 3.3 `reflectance:<name>` natural diffuse
+
+`leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`, `soil`/`dirt`,
+`brick`/`red-brick`, `concrete`.
+
+### 3.4 `preset:<illuminant>` light SPDs
+
+- Parametric: `bb<K>` (e.g. `bb6500`, Planckian), `led<K>k` / `led-<K>k` (phosphor LED
+  at a colour temperature, e.g. `led4000k`).
+- Named: `sun`, `daylight`/`d65`, `a`/`incandescent`, `led`, `led-warm`,
+  `fluorescent`/`cfl`, `f2`/`cool-white`, `f7`/`daylight-fl`, `f11`/`triphosphor`,
+  `hps`/`sodium`, `lps`/`sodium-low`, `mercury`/`hg`, `metal-halide`/`mh`.
+
+---
+
+## 4. `spectrum` — named reusable curves
+
+```
+spectrum "warm" = blackbody 3200
+spectrum "leafy" = reflectance:leaf
+```
+
+Reference it anywhere a spectrum is expected with `spectrum:warm`. References resolve
+lazily (a spectrum may be declared after its use); cycles up to depth 16 are caught.
+
+---
+
+## 5. `texture` — image maps
+
+```
+texture "wood" {
+    file "maps/wood.png"
+    encoding srgb            # srgb (default) | linear
+    filter bilinear          # bilinear (default) | nearest
+    wrap repeat              # repeat (default) | clamp | mirror
+    palette { 0 spectrum:navy  1 metal:gold  2 rgb 0.8 0.1 0.1 }   # optional §9.3
+}
+```
+
+- `file` is required; the path resolves relative to the working directory.
+- Reflectance coefficients (Jakob-Hanika) are precomputed at load.
+- `palette { <index> <spectrum-expr> … }` turns the texture's red channel into an
+  indexed spectral lookup (nearest, no upsampling). Indices 0–255.
+
+Bind a texture to a material with `reflect texture:wood` (albedo), or to a scalar
+parameter with `roughness texture:<name>` / `film_thickness_map texture:<name>` /
+`weight_map texture:<name>`.
+
+---
+
+## 6. `pattern` — procedural scalar fields
+
+Two authoring forms:
+
+**Infix formula (must be quoted):**
+```
+pattern "waves" { expr "0.5 + 0.5*sin(20*x)" }
+```
+
+**Named generator:**
+```
+pattern "stripes" { type bands axis x freq 8 phase 0 }
+```
+
+| `type` | params (defaults) |
+|---|---|
+| `axis` | `axis <x\|y\|z>` `scale`(1) `offset`(0) |
+| `radial` | `center <x y z>`(0,0,0) `scale`(1) |
+| `bands` | `axis <x\|y\|z>` `freq`(1) `phase`(0) |
+| `checker` | `size`(1) |
+| `noise` | `freq`(1) |
+| `field` | `scale`(1) |
+
+### 6.1 Expression language
+
+Bind a pattern to a scalar material parameter with `pattern:<name>` (roughness,
+film thickness, mix weight). Patterns are evaluated per hit.
+
+**Variables:** `x y z` (world position), `f` (field value, for isosurfaces),
+`nx ny nz` (surface normal), `r` (`|p|`), `u v` (surface texture coordinates — on
+meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi`.
+
+**Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
+`min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
+
+**Operators:** `+ - * / % ^` and unary `-`. `%` is floating-point modulo.
+
+> **There is no `mod()` function** — use the `%` operator: `(floor(u*8)+floor(v*4)) % 2`.
+> Unknown identifiers are a hard error ("unknown identifier '…'").
+
+---
+
+## 7. `material` — surfaces
+
+```
+material "name" { type <kind>  <params> }
+material "name" { preset <recipe>  [overrides] }
+```
+
+### 7.1 `preset <recipe>` (whole-material recipes)
+
+Fills a complete material; a few knobs may be overridden afterward
+(`roughness`, `film_ior`, `film_thickness`, `film_thickness_map`, `reflect`, `ior`).
+
+- **Metals** (glossy, roughness 0.05): every `metal:` name — `gold`, `silver`,
+  `copper`, `aluminium`, `chromium`/`chrome`, `brass` (also `Au`/`Ag`/`Cu`/… ).
+- **Glass** (dielectric): `glass` (=BK7) and every `glass:` name (`BK7`, `SF10`,
+  `diamond`, `water`, …).
+- **Structural colour**: `soap-bubble`/`bubble`, `oil-slick`/`oil`,
+  `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
+  `nacre`/`mother-of-pearl`.
+
+### 7.2 `type <kind>`
+
+| type | key params (defaults) |
+|---|---|
+| `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo |
+| `mirror` | `reflect <spec>`(0.95) |
+| `halfmirror` | `reflect <spec>`(0.5) |
+| `glossy` | `reflect <spec>`(0.9); `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
+| `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
+| `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0) |
+| `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
+| `fluorescent` | `reflect`(0.1); `absorb <spec>`; `emit <spec>`; `yield`(1) |
+| `multilayer` | `ior`(1.5); `substrate_k`(0); ordered `layer <n> <k> <thickness_nm>` list (outermost first) |
+| `mix` | stochastic blend of children — see §7.3 |
+| `layered` | specular coat over a weighted body — see §7.4 |
+
+Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
+`pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map).
+
+### 7.3 `mix` — stochastic material blend
+
+```
+material "speckle" {
+    type mix
+    layer "gold" 0.5
+    layer "ink"  0.5
+    weight_map pattern:uvcheck    # optional, requires exactly 2 layers
+}
+```
+
+- Each `layer "child" weight` names another material and its selection probability;
+  weights must be ≥ 0 and sum to ≤ 1.
+- Children may be declared before or after the mix (resolved in a second pass).
+  **Nesting is not allowed** (a layer may not itself be a mix/layered).
+- `weight_map pattern:/texture:<n>` drives child-0's probability per hit (child 1 =
+  1 − map); requires **exactly two** layers.
+
+### 7.4 `layered` — physical coat + body
+
+```
+material "carpaint" {
+    type layered
+    ior 1.5                       # body / effective index
+    coat {
+        reflectance fresnel       # fresnel (default) | thinfilm | manual
+        roughness 0.05            # glossy coat lobe; map allowed
+        ior glass:BK7             # coat index (fresnel/thinfilm)
+        film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
+        specular 0.05             # flat reflectance (manual model)
+    }
+    layer "base" 1.0              # body lobes, resolved like a mix
+}
+```
+
+---
+
+## 8. Geometry primitives
+
+Positions are unit-scaled; direction/edge vectors (`u`, `v`, `normal`) are scaled as
+directions. Every primitive needs a `material "name"` (declared earlier or later).
+
+### 8.1 `sphere`
+```
+sphere { center 0 0 0  radius 1  material white }
+```
+Only translate + rotation + **uniform** scale is allowed on a sphere (a non-uniform
+scale would need an ellipsoid — use an `isosurface { ellipsoid … }` or a mesh).
+
+### 8.2 `quad`
+```
+quad { origin 0 0 0  u 1 0 0  v 0 0 1  material white }
+```
+A parallelogram from `origin` spanning edge vectors `u`, `v`. Emits two triangles with
+UVs origin=(0,0), +u=(1,0), +v=(0,1).
+
+### 8.3 `triangle`
+```
+triangle { v0 0 0 0  v1 1 0 0  v2 0 1 0  material white }
+```
+
+### 8.4 `mesh`
+```
+mesh "bunny" {
+    file "meshes/bunny.obj"
+    material white
+    translate 0 0 0   rotate 0 45 0   scale 1        # scale: uniform value or `sx sy sz`
+    uv use_mesh            # use OBJ vt coords; or planar|spherical|cylindrical|triplanar (§9)
+    usemtl use_names       # switch material per OBJ usemtl group by name match
+}
+```
+
+---
+
+## 9. UV wraps on native primitives and meshes
+
+Pattern/texture expressions can see surface texture coordinates `u`, `v`. Where they
+come from:
+
+- **`quad` / `triangle`**: built-in UVs (parallelogram / barycentric).
+- **native `sphere`**: built-in equirectangular (lat/long) UV.
+- **`mesh`**: `uv use_mesh` (OBJ `vt`), or a synthesized projection
+  `uv planar|spherical|cylindrical [axis=x|y|z]`, or `uv triplanar [scale=<s>]`.
+- **`isosurface`**: `uv planar|spherical|cylindrical [axis=x|y|z]` — the SAME
+  projection meshes use, referenced to the primitive's world AABB. Default axis `y`.
+
+> The projection **axis must be `key=val`**: `uv planar axis=z`. A bareword
+> (`uv planar z`) would be parsed as a separate statement and the axis silently
+> ignored (§1.1). Likewise `uv triplanar scale=4` (or a bare number `uv triplanar 4`).
+
+---
+
+## 10. `isosurface` — analytic SDFs, CSG, and functions
+
+An `isosurface { material <m>  <one root field element> }` builds an implicit surface.
+The root is **exactly one** leaf or CSG combinator (wrap multiple shapes in a
+`union { … }`). Every element may carry `translate`/`rotate`/`scale` that composes
+down the tree.
+
+### 10.1 Leaves
+| leaf | params |
+|---|---|
+| `sphere` | `center` `radius`(1) |
+| `ellipsoid` | `center` `radius <rx ry rz>` |
+| `box` | `size <x y z>`(1,1,1) `round`(0 corner radius) |
+| `torus` | `major`(1) `minor`(0.25) |
+| `cylinder` | `radius`(0.5) `height`(1) — axis = local y |
+| `cone` | `radius`(0.5 bottom) `radius2`(0 top) `height`(1) |
+| `plane` | `normal <x y z>`(0,1,0) `offset`(0) |
+| `function` | `expr "f(x,y,z)"` — needs `contained_by` (see §10.3) |
+
+### 10.2 Combinators
+`union`, `intersect`/`intersection`, `difference`/`subtract`, and the smooth
+variants `smooth_union`, `smooth_intersect`, `smooth_difference` (each takes a blend
+radius `k <len>`), plus `blob` (= smooth union). Children are nested blocks; they fold
+pairwise in order.
+
+```
+isosurface {
+    material gold
+    intersect {
+        function { translate 0.4 0.37 0.45
+                   expr "abs(sin(40*x)*cos(40*y)+sin(40*y)*cos(40*z)+sin(40*z)*cos(40*x)) - 0.5" }
+        sphere { center 0.4 0.37 0.45  radius 0.32 }
+    }
+    contained_by { min 0.06 0.03 0.11  max 0.74 0.71 0.79 }
+    max_gradient 80
+}
+```
+
+### 10.3 Marching controls
+| key | values | notes |
+|---|---|---|
+| `contained_by` | `{ min <x y z>  max <x y z> }` | **required** for any `function` field (marched only inside it) |
+| `max_gradient` | `<L>` | Lipschitz bound for a function field (else auto-estimated ×1.3) |
+| `accuracy` | `<len>` | min march step (function fields) / fixed step (sample method) |
+| `method` | `adaptive`(default) / `sample`(=`fixed`) | POV-Ray-style fixed marching for untrusted bounds |
+| `samples` | `<n>` | intervals across the box diagonal (sample method) |
+| `refine` | `bisect`(default) / `regula_falsi`(=`falsi`/`secant`) | root refinement once bracketed |
+| `uv` | `planar\|spherical\|cylindrical [axis=…]` | §9 UV wrap |
+
+Analytic SDF leaves + CSG stay unit-Lipschitz; only `function` fields need
+`contained_by` + a gradient bound.
+
+---
+
+## 11. `light` — emitters
+
+Every scene needs at least one `light`. All lights take `spd <spectrum-expr>`
+(default `blackbody 6500`). Surface/tube/spot emitters can be given an absolute flux
+with `power <watts>` (radiant) or `lumens <lm>` (photometric) — this flips the whole
+scene to fixed-exposure output (`power` wins if both given). Env lights reject
+`power`/`lumens`.
+
+| subtype | keys (defaults) |
+|---|---|
+| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd` — a rectangle |
+| `collimated` | `dir`(0,0,-1) `origin`(0.5,0.5,0.95) `spd` — a thin pencil beam |
+| `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
+| `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
+| `spot` | `origin`(0.5,0.99,0.5) `dir`(0,-1,0) `inner_angle`(20°) `outer_angle`(30°) `spd` |
+| `env` | constant: `spd`. Image-based: `file "sky.hdr"` `rotate`(0°) `intensity`(1) |
+
+`caps on`/`true`/`yes` closes the cylinder (emissive end discs). `spot` angles are
+half-angles in degrees with a smoothstep penumbra between inner and outer.
+
+---
+
+## 12. `medium` — participating volume
+
+```
+medium { sigma_t 0.5  albedo 0.9  g 0  rayleigh false }
+medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
+```
+
+- `sigma_t` + `albedo` splits into scattering/absorption; or give spectral
+  `sigma_a`/`sigma_s` directly (per authored-unit length; converted to 1/metre).
+- `g` is the Henyey-Greenstein anisotropy; `rayleigh true` gives a λ⁻⁴ scattering
+  tilt (blue-sky falloff).
+
+---
+
+## 13. `group` — transform hierarchy
+
+```
+group {
+    translate 0 0.5 0   rotate 0 30 0   scale 2      # scale: uniform or `sx sy sz`
+    sphere { center 0 0 0  radius 0.2  material gold }
+    group { translate 0.5 0 0   mesh "m" { … } }     # nesting recurses
+    light area { … }
+}
+```
+
+A group's transform composes with its parent's (parent applied last) and is baked
+into every child at load time (no runtime scene graph). Allowed children: `sphere`,
+`quad`, `triangle`, `mesh`, `light`, nested `group`. A light anywhere in the tree
+satisfies the "scene needs a light" check.
+
+---
+
+## 14. Cameras
+
+Any number of `camera` blocks accumulate. The CLI selects one (or renders all).
+Multi-camera renders write one file per camera, inserting `_<camname>` before the
+output extension (`-o png/out.png` → `png/out_<name>.png`).
+
+### 14.1 `camera`
+```
+camera "cam" {
+    eye 0.8 0.62 2.35   look_at 0.8 0.28 0.55   up 0 1 0
+    fov_y 42            # vertical field of view (degrees)
+    aperture 0.02       # thin-lens aperture radius (legacy DoF)
+    focus 2.3           # focus distance (0 = infinity)
+    mode R              # A|B|C|R|D — per-camera measurement model
+    lens 50  fstop 2.8  zoom 1    # photographic authoring (overrides fov_y/aperture)
+    projection rectilinear        # or `fisheye [type]` (§14.4)
+    film { res 1200 800  format full-frame  iso 100 shutter 1 exposure 1 }
+    lens { … }          # optional physical multi-element lens (§14.5)
+}
+```
+
+| key | default | notes |
+|---|---|---|
+| `eye` / `look_at` / `up` | (0,1,3)/(0,1,0)/(0,1,0) | `up` is a direction (unscaled) |
+| `fov_y` | 40 | vertical FOV in degrees |
+| `aperture` | 0.02 | thin-lens radius (metres) |
+| `focus` | 0 (∞) | focus distance |
+| `mode` | inherit CLI | `A` finite-lens forward splat, `B` pinhole splat, `C` finite-aperture catch, `R` backward reference, `D` BDPT |
+| `lens <mm>` | — | focal length; sets fov_y = 2·atan(filmH/2f); overrides `fov_y` |
+| `fstop <N>` | — | aperture radius = focal/2N; seats film at image distance for A/C DoF |
+| `zoom <x>` | 1 | multiplies focal length (x>1 tele/narrower) |
+
+### 14.2 `film { … }`
+
+| key | notes |
+|---|---|
+| `res W [H]` | resolution; `res W` is square (H=W). CLI `-r` can override |
+| `format <name>` | named sensor → physical mm (see §14.3); `size` overrides it |
+| `size <Wmm> <Hmm>` | explicit physical sensor in millimetres |
+| `iso` / `shutter` / `exposure` | exposure *compensation* on top of auto-exposure: `comp = exposure·(iso/100)·shutter` |
+
+### 14.3 Film formats
+`full-frame`/`35mm`/`135`/`ff`, `half-frame`, `super35`/`s35`, `academy`,
+`aps-c`, `aps-h`, `micro-four-thirds`/`mft`/`m43`/`four-thirds`, `1-inch`/`1in`,
+`medium-format`/`645`/`6x45`, `6x6`, `6x7`, `6x9`, `digital-medium-format`/`gfx`,
+`large-format`/`4x5`/`5x4`, `8x10`. (Case/space/underscore/hyphen-insensitive.)
+
+### 14.4 Lens projection
+`projection <name>` or the `fisheye [type]` shorthand (bare `fisheye` = equisolid).
+Names: `rectilinear`/`perspective`/`normal`/`pinhole`, `equidistant`/`fisheye`,
+`equisolid`/`equal-area`, `stereographic`, `orthographic`/`ortho`. The fisheye modes
+allow `fov_y ≥ 180`.
+
+### 14.5 Physical `lens { … }` block
+
+Renders through the backward realistic-camera path (mode R), tracing real glass
+interfaces (radii/thicknesses/apertures in **millimetres**).
+
+```
+lens { preset achromat  focal 50  fstop 2.8  glass BK7 }
+lens { surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]  … }
+```
+
+- Explicit `surface` lines take priority (paste a real prescription; `ior` = glass
+  name or a number; `stop` marks the aperture stop).
+- Otherwise a `preset`: `singlet`/`biconvex`/`simple`, `achromat`/`doublet`,
+  `telephoto`, `wide` (default = achromatic doublet at the derived focal/f-number).
+- Sensor size comes from the camera `film` (default full-frame); autofocuses at `focus`.
+
+---
+
+## 15. Camera animation
+
+Both expand into N `CamSpec` frames sharing `look_at`/`up`/`fov_y`/`mode`/`film`/
+`lens`. Each frame's output file is `<base><zero-padded index>`, so a multi-camera
+render writes one PNG per frame ready for ffmpeg.
+
+### 15.1 `camera_path` — keyframed dolly
+```
+camera_path "dolly" {
+    look_at 0 1 0   up 0 1 0   fov_y 40   mode B   frames 60
+    film { res 256 256 }
+    key <t> <ex ey ez> [<lx ly lz>] [<fov>]      # >= 2 keys, t in [0,1]
+    dolly_zoom            # optional: hold subject size (Vertigo), trade fov vs distance
+    exposure_lock         # optional: share frame-0 auto-exposure anchor (no flicker)
+}
+```
+Keyframe field count disambiguates: `4`=t,eye · `5`=t,eye,fov · `7`=t,eye,look ·
+`8`=t,eye,look,fov. Frame i samples t = i/(frames−1) with piecewise-linear
+interpolation between bracketing keys.
+
+### 15.2 `camera_orbit` — turntable / fly-around
+```
+camera_orbit "spin" {
+    center 0.40 0.37 0.45   radius 0.45   height -0.20   axis y
+    up 0 1 0   fov_y 78   mode R   frames 120
+    look_at 0.40 0.37 0.45      # optional (defaults to center)
+    start_deg 0   sweep_deg 360 # optional
+    exposure_lock               # optional
+    film { res 900 900 }
+}
+```
+The eye rides a circle of `radius` in the plane perpendicular to `axis` (`x|y|z`,
+default y), offset `height` along the axis from `center`. A full 360° sweep is sampled
+at i/frames (frame N == frame 0, not duplicated → seamless loop); a partial sweep
+spans its endpoints via i/(frames−1). `center` and `radius > 0` are required.
+
+### 15.3 `camera_curve` — spline fly-through with variable speed
+```
+camera_curve "fly" {
+    point 0.3 0.6 2.2   point 0.8 0.6 1.6   point 1.3 0.6 2.2   point 0.8 0.6 2.6
+    up 0 1 0   fov_y 45   mode R
+    frames 90                   # fixed count (uniform arc length if no density)
+    density 20                  # OR: cameras per unit length (constant)
+    density_at 0 6   density_at 0.5 30   density_at 1 6    # OR: variable density
+    look_at 0.8 0.3 0.6         # orientation: fixed target
+    closed                      # optional: loop the curve seamlessly
+    exposure_lock               # optional
+    film { res 900 600 }
+}
+```
+The eye rides a **Catmull-Rom spline** that passes through every `point` control point
+(≥ 2 required). Where cameras sit is set by:
+
+- **`frames N`** — a fixed count. With no density, they are spaced at **uniform arc
+  length** (constant speed). With a density, `frames` still fixes the count but the
+  density **distributes** those N cameras (more where density is high).
+- **`density <ρ>`** / **`density_at <t> <ρ>`** — cameras per unit length. `density`
+  is constant; `density_at` keyframes it (piecewise-linear over normalized position
+  `t ∈ [0,1]`, t=0 first point, t=1 last). Without `frames`, the count is the integral
+  of ρ over the curve. **High density = many closely-spaced frames = slow dwell**
+  through that stretch; low density = fast. This is the camera's "speed" curve.
+
+**Orientation** (`look …`):
+
+| mode | how |
+|---|---|
+| `look tangent` (default) | aim along the direction of travel (curve tangent) |
+| `look_at <x y z>` | a fixed target for every frame |
+| `look curve` + `look_point <x y z> …` | aim at a **second** Catmull-Rom spline (≥ 2 `look_point`s), sampled in step with the eye |
+
+`closed` loops the curve (wrap-around Catmull-Rom, sampled i/N so frame N == frame 0);
+an open curve spans both endpoints via i/(N−1). All frames share
+up/fov/mode/film/lens; `exposure_lock` shares the frame-0 exposure anchor.
+
+---
+
+## 16. `render` — defaults (CLI overrides)
+
+```
+render { photons 1000000  device gpu  mode R  out png/out.png  res 900 }
+```
+
+| key | meaning |
+|---|---|
+| `photons` | photon budget (forward modes) |
+| `device` | `cpu` / `gpu` / `auto` |
+| `mode` | global measurement mode (per-camera `mode` still wins for that camera) |
+| `out` | output path (`.png` → `png/`, `.ppm` → `ppm/` per repo convention) |
+| `res` | global resolution |
+
+Any of these are overridden by the matching CLI flag.
+
+---
+
+## 17. Load order and validation
+
+The loader runs in passes: scene units/spectral → spectra → textures → patterns →
+materials (+ mix/layered resolve) → geometry/lights/medium/cameras/render →
+`Scene::build()`. Notable hard errors: unknown block/material/type/preset, a scene
+with **no light**, a `mix` with nested children or weights summing > 1, a `function`
+isosurface without `contained_by`, an isosurface without exactly one root element, and
+any unknown spectrum/preset/identifier.
+
+---
+
+## 18. Worked example
+
+```
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "gold"  { preset gold }
+material "glass" { type dielectric ior 1.5 }
+
+quad { origin -0.4 0 -0.4  u 1.8 0 0  v 0 0 2.4  material white }   # floor
+# … remaining Cornell walls …
+
+isosurface { material glass  sphere { center 0.77 0.17 0.70  radius 0.17 } }
+
+light area { origin 0.22 1.199 0.22  u 0.56 0 0  v 0 0 0.56  normal 0 -1 0  spd preset:bb6500 }
+
+camera "cam" {
+    eye 0.8 0.62 2.35  look_at 0.8 0.28 0.55  up 0 1 0  fov_y 42
+    mode R  film { res 900 600 }
+}
+```
+
+See `scenes/` for complete examples (`showcase.ftsl`, `uv_native.ftsl`,
+`showcase_orbit.ftsl`, `mirror_selfie.ftsl`, and many feature demos).
