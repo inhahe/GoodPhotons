@@ -155,6 +155,42 @@ is a refracted SDS path; it lights the room correctly.)*
   heterogeneous/bounded medium is rendered in R/V/P. Proper fix: port delta/ratio tracking
   into the backward volume march too (then mirror it on the GPU).
 
+### Heterogeneous (density-field) media in BDPT (mode D) — DEFERRED (needs null-scattering rewrite) — 2026-07-12
+**What:** BDPT (mode D) renders only **homogeneous** media (done, CPU+GPU). A `density`-field
+(heterogeneous) medium is explicitly **rejected** (`bdptUnsupportedFeature` CPU message;
+`cudaBdptSupported` GPU fallback) rather than rendered — because the homogeneous MIS in
+`bdpt.h`/`kBdpt` relies on a cancellation that **breaks** for heterogeneous media, and no
+biased shortcut is acceptable (CLAUDE.md "proper fix only").
+
+**Why the current approach can't extend:** for a homogeneous medium the free-flight distance
+pdf `σt·exp(-σt·d)` and the transmittance `exp(-σt·d)` cancel pairwise in every balance-
+heuristic ratio, so both are omitted from the sampling side (`randomWalk`) **and** the
+recompute side (`vertexPdf`) — exactly PBRT-v3's convention. For a heterogeneous medium the
+transmittance is a **path integral** estimated stochastically (ratio/Woodcock tracking), the
+collision pdf is `σt(x_t)·T(x_0→x_t)`, and the reverse-direction pdf that `vertexPdf` must
+recompute needs the reverse heterogeneous transmittance — these **no longer cancel**, so the
+MIS weights would be wrong (biased) if we reused the homogeneous bookkeeping.
+
+**Proper fix (feasible, but a major rewrite):** the **null-scattering path-integral
+formulation** (Miller, Georgiev & Jarosz, SIGGRAPH 2019) — augment path space with
+null-scattering (fictitious) collisions at the majorant `σ_maj`, so the medium is effectively
+*homogeneous at σ_maj* and the distance pdfs become analytic again; real/null events are
+discrete, both subpaths agree on the pdf, and the pairwise cancellation is restored →
+unbiased. (UPBP, Křivánek et al. 2014, is the fuller BDPT+beams treatment.) Implementation
+scope: (1) record the majorant-homogeneous collision pdf + real/null probabilities during
+`randomWalk`; (2) make `vertexPdf` recompute them consistently in reverse; (3) express the
+connection-edge transmittance as the matching null-scattering expected-value estimator; (4)
+either materialise null vertices (blows the fixed `BDPT_MAXV` path budget — heterogeneous
+media can spawn many null collisions) **or** use the collision-free transmittance-estimator
+form; (5) mirror all of it in the GPU megakernel (`kBdpt`) within fixed-size per-thread path
+arrays. This is a dedicated multi-part effort with real correctness pitfalls, on the order of
+the whole homogeneous Phase 1 again (×2 for CPU+GPU).
+
+**Recommendation / workaround:** render heterogeneous fog with a **forward** mode (A/B/C) —
+they already support density fields + bounds unbiasedly via delta/ratio tracking on both CPU
+and GPU (see the media tech-debt entry above). Deferred until heterogeneous BDPT is actually
+needed; do **not** attempt a partial/biased MIS in the meantime.
+
 ### Diffuse-transmission material — CPU DONE 2026-07-12 (GPU port pending)
 Added `type translucent` (alias `diffuse_transmit`): a two-sided Lambertian BSDF — the
 front hemisphere scatters the `reflect` albedo, the back hemisphere scatters the `transmit`
