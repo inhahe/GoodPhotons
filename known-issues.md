@@ -34,20 +34,30 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
 
 ## Tech debt
 
-### No bounded / per-object participating medium (fog is global-only) — 2026-07-12
-The `medium` block (`ftsl.h` `addMedium` ~1607; `scene.h` struct ~190) fills the
-**entire scene** with one homogeneous medium — there is no way to bound a medium to a
-region or attach it to an object (a "translucent blob": a box/sphere of scattering
-medium the camera can fly through). This limits volumetric scenes to whole-scene haze,
-which must be made to *read* as localized purely via lighting contrast (a bright shaft
-or an embedded light in an otherwise dark room). **Proper fix:** allow a `medium { ... }`
-nested inside a primitive (or a standalone bounded `medium { bounds min/max ... }` /
-`medium { sphere {...} }`) that sets `sigma_t` only inside that region; the ray-march
-would clip the medium interval to the object's entry/exit. Both the CPU (`render.h`
-volume march) and GPU (`render_cuda.cu` `connectVolume`/media march) tracers would need
-the region test. Logged while authoring a mode-B volumetric fly-through scene
-(`scenes/lanterns.ftsl`), which works around it with a global haze + embedded sphere
-lights that glow as discrete volumetric orbs.
+### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU DONE 2026-07-12
+**Resolved on the CPU forward tracer.** The `medium` block now takes an optional
+`bounds { min/max }` box (AABB the fog is clipped to) and an optional `density <expr>`
+scalar field (same infix expression VM as isosurface `function` fields — variables
+`x y z r`, constant `pi`) that multiplies `sigma_t` per point, so fog forms blobs with
+soft, formula-defined boundaries. Majorant is `density_max` (explicit or auto-estimated
+on a 24³ grid over `bounds`). Sampling uses unbiased **delta (Woodcock) tracking** for
+scattering and **ratio tracking** for shadow transmittance; a plain homogeneous medium is
+bit-identical to before (one RNG draw in the free-flight, exact `exp` transmittance).
+Implemented in `scene.h` (`Medium` struct: `density`/`densityMax`/`bounded`/`bmin`/`bmax`
++ `densityAt`/`clipToBounds`/`heterogeneous`), `ftsl.h` `addMedium` (bounds/density/
+density_max parsing), `render.h` (`sampleMediumCollision`/`mediumTransmittance` + connect
+updates). Validated with `scraps/fogblob.ftsl` (a soft glowing sphere blob, mode B).
+
+**Remaining gaps (still open):**
+- **GPU port pending.** `render_cuda.cu` `DMedium` is still homogeneous-only; the
+  density field + bounds + delta/ratio tracking need to be ported to the megakernels
+  (extend `DMedium` with a PatNode slice + bounds + majorant, upload path, device
+  delta/ratio tracking). Until then `-device gpu` ignores `density`/`bounds`.
+- **Backward/BDPT modes treat it as homogeneous.** `backward.h` (modes R/V), `bdpt.h`
+  (mode D), and the camera-side layer of the P composite still use the medium as a
+  single global homogeneous haze and ignore `density`/`bounds`. `main.cpp` `runRender`
+  now **warns** when a heterogeneous/bounded medium is rendered in R/V/D/P. Proper fix:
+  port delta/ratio tracking into the backward volume march too.
 
 ### No diffuse-transmission / subsurface (SSS) material — 2026-07-12
 Translucency is available only as a **rough dielectric** (`roughness` on `type dielectric`)

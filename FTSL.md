@@ -345,6 +345,35 @@ down the tree.
 | `plane` | `normal <x y z>`(0,1,0) `offset`(0) |
 | `function` | `expr "f(x,y,z)"` — needs `contained_by` (see §10.3) |
 
+#### The `function` expression language
+
+`expr "…"` is compiled by the **same** math parser as material patterns (§6.1) — a
+full infix expression compiler (`src/pattern.h`, shunting-yard → a flat postfix VM that
+runs identically on CPU and GPU). The surface is the zero set `f = 0`; the value is a
+raw field (not necessarily a true distance), so a `function` leaf needs `contained_by`
+and a Lipschitz bound (`max_gradient`, see §10.3).
+
+- **Variables (live in a field expression):** `x y z` (leaf-local position, after any
+  `translate`/`rotate`/`scale`), `r` = `sqrt(x²+y²+z²)`, and the constant `pi`. The
+  other pattern variables (`f`, the normal `nx ny nz`, and UV `u v`) are meaningless
+  when *defining* a surface and read `0`.
+- **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
+  `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args). `noise` is
+  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU).
+- **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is
+  floating-point modulo. There is **no** `mod()` function — use `%`. Unknown
+  identifiers are a hard error.
+
+```
+# a gyroid shell, and a noise-warped sphere
+isosurface { material gold
+    function { expr "abs(sin(6*x)*cos(6*y)+sin(6*y)*cos(6*z)+sin(6*z)*cos(6*x)) - 0.4" }
+    contained_by { min -1 -1 -1  max 1 1 1 }  max_gradient 12 }
+isosurface { material wax
+    function { expr "r - 0.8 - 0.15*noise(3*x, 3*y, 3*z)" }
+    contained_by { min -1.2 -1.2 -1.2  max 1.2 1.2 1.2 }  max_gradient 3 }
+```
+
 ### 10.2 Combinators
 `union`, `intersect`/`intersection`, `difference`/`subtract`, and the smooth
 variants `smooth_union`, `smooth_intersect`, `smooth_difference` (each takes a blend
@@ -413,6 +442,49 @@ medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
   `sigma_a`/`sigma_s` directly (per authored-unit length; converted to 1/metre).
 - `g` is the Henyey-Greenstein anisotropy; `rayleigh true` gives a λ⁻⁴ scattering
   tilt (blue-sky falloff).
+
+### 12.1 Bounded and heterogeneous fog (blobs)
+
+By default the medium is a single global homogeneous haze filling the whole scene.
+Two optional sub-parts localize it and give it internal structure, so the fog forms
+discrete **blobs with soft, formula-defined boundaries**:
+
+```
+medium {
+    sigma_t 4.0   albedo 0.95   g 0.0
+    bounds  { min 0.7 0.1 1.9   max 3.3 2.7 4.5 }        # (alias: contained_by)
+    density "pow( saturate( 1 - sqrt((x-2)^2+(y-1.4)^2+(z-3.2)^2)/1.2 ), 2 )"
+}
+```
+
+- **`bounds { min <x y z>  max <x y z> }`** — an axis-aligned box (authored units →
+  metres) that the fog is confined to. A ray's fog interaction is clipped to its
+  overlap with the box, so nothing scatters outside it. (Alias: `contained_by`.)
+- **`density <expr>`** or **`density pattern:<name>`** — a scalar field, ≥ 0, that
+  multiplies `sigma_t` (and hence both `sigma_a` and `sigma_s`) at each point. Uses
+  the same infix expression language as isosurface `function` fields and `pattern`
+  leaves (§6.1 / §10.1): variables `x y z` (world position, metres), `r` (distance
+  from the world origin), and the constant `pi` are live; `f`, the normals, and `u v`
+  read 0. A smooth radial falloff like the example above gives a blob whose edge fades
+  gradually rather than a hard surface. Albedo stays spatially constant (density scales
+  absorption and scattering together), so only the *amount* of fog varies in space,
+  not its color.
+- **`density_max <v>`** — the delta/ratio-tracking majorant (an upper bound on the
+  density over the region). If omitted it is auto-estimated on a 24³ grid over
+  `bounds` (×1.3 safety), so a heterogeneous medium needs either a `bounds` box or an
+  explicit `density_max`. Set it explicitly if your field can spike between grid
+  samples.
+
+The sampler uses unbiased **delta (Woodcock) tracking** for scattering and **ratio
+tracking** for shadow-ray transmittance, so the result is exact (no voxelization). A
+plain homogeneous `medium` (no `density`, no `bounds`) is unchanged and bit-identical
+to before.
+
+> **Mode support:** heterogeneous / bounded fog is honored only by the **forward**
+> light tracer — modes **A/B/C** (and the forward layers of V/P). The backward
+> reference (R/V), BDPT (D), and the camera-side layer of the P composite treat the
+> medium as a single global homogeneous haze and **ignore** `density` and `bounds`
+> (the renderer warns when you do this). Render fog blobs with a forward mode.
 
 ---
 

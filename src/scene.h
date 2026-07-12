@@ -193,6 +193,22 @@ struct Medium {
     Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
     double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
 
+    // --- Optional heterogeneous density field (fuzzy / bounded fog) ----------
+    // When `density` is non-empty, the base coefficients sigma_a/sigma_s are
+    // MULTIPLIED by a dimensionless scalar field density(x,y,z) >= 0 evaluated per
+    // point (a compiled pattern program over x y z r, §6.1 of FTSL.md). This shapes
+    // the haze into blobs with soft, formula-defined boundaries. Empty => density
+    // is 1 everywhere (the classic homogeneous medium; unchanged behaviour).
+    std::vector<PatNode> density;
+    double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
+
+    // --- Optional spatial bound (localized fog) -----------------------------
+    // When `bounded`, the medium exists only inside the world AABB [bmin,bmax];
+    // a photon's fog interaction and connect-transmittance are clipped to the
+    // ray's overlap with the box. Unbounded => the medium fills the whole scene.
+    bool bounded = false;
+    Vec3 bmin{0, 0, 0}, bmax{0, 0, 0};
+
     double sigmaT(double lambda) const {
         return std::max(0.0, sigma_a(lambda) + sigma_s(lambda));
     }
@@ -200,6 +216,37 @@ struct Medium {
         double s = std::max(0.0, sigma_s(lambda));
         double t = s + std::max(0.0, sigma_a(lambda));
         return t > 0.0 ? s / t : 0.0;
+    }
+
+    bool heterogeneous() const { return !density.empty(); }
+
+    // Dimensionless density multiplier at a world point (>= 0). 1 for a homogeneous
+    // medium. Evaluated by the shared pattern VM (x y z r live; f/normal/uv read 0).
+    double densityAt(const Vec3& p) const {
+        if (density.empty()) return 1.0;
+        PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        double d = patternEval(density.data(), (int)density.size(), c);
+        return d > 0.0 ? d : 0.0;
+    }
+
+    // Clip a ray (o + t*d, t in [t0,t1]) to the bound, returning the sub-interval
+    // [ta,tb] that lies inside the medium. Returns false if the ray misses the box.
+    // Unbounded media pass the interval through unchanged.
+    bool clipToBounds(const Vec3& o, const Vec3& d, double t0, double t1,
+                      double& ta, double& tb) const {
+        if (!bounded) { ta = t0; tb = t1; return t1 > t0; }
+        double lo = t0, hi = t1;
+        for (int a = 0; a < 3; ++a) {
+            double oa = (&o.x)[a], da = (&d.x)[a];
+            double mn = (&bmin.x)[a], mx = (&bmax.x)[a];
+            if (std::fabs(da) < 1e-12) { if (oa < mn || oa > mx) return false; continue; }
+            double inv = 1.0 / da;
+            double s0 = (mn - oa) * inv, s1 = (mx - oa) * inv;
+            if (s0 > s1) std::swap(s0, s1);
+            lo = std::max(lo, s0); hi = std::min(hi, s1);
+            if (lo > hi) return false;
+        }
+        ta = lo; tb = hi; return tb > ta;
     }
 };
 

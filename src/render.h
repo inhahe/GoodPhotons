@@ -299,6 +299,63 @@ struct Renderer {
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
     }
 
+    // --- Participating-media sampling helpers --------------------------------
+    // These cover the homogeneous, bounded-homogeneous, and heterogeneous (density-
+    // field) media in one place. A homogeneous medium keeps the exact analytic
+    // behaviour and draws exactly the same RNG as before (bit-identical to the
+    // pre-heterogeneous engine); a density field switches to delta / ratio tracking
+    // with the majorant sigma_max = sigmaT(lambda) * densityMax.
+
+    // Sample the next real collision along (o,dir) within [0,dMax]. Returns true and
+    // sets tHit at a real scattering/absorption event; false if the photon reaches
+    // dMax first. Delta (Woodcock) tracking for a heterogeneous medium: candidate
+    // collisions at rate sigma_max, accepted as real with prob sigmaT(x)/sigma_max
+    // (a rejected "null collision" just continues) — unbiased, throughput unchanged.
+    bool sampleMediumCollision(const Medium& med, const Vec3& o, const Vec3& dir,
+                               double dMax, double lambda, Pcg32& rng, double& tHit) const {
+        double stBase = med.sigmaT(lambda);
+        if (stBase <= 0.0) return false;
+        double ta, tb;
+        if (!med.clipToBounds(o, dir, 0.0, dMax, ta, tb)) return false;
+        if (!med.heterogeneous()) {                       // exact free-flight (one draw)
+            double t = ta - std::log(1.0 - rng.uniform()) / stBase;
+            if (t < tb) { tHit = t; return true; }
+            return false;
+        }
+        double sigMax = stBase * med.densityMax;
+        if (sigMax <= 0.0) return false;
+        double t = ta;
+        for (;;) {
+            t += -std::log(1.0 - rng.uniform()) / sigMax;
+            if (t >= tb) return false;
+            double sigT = stBase * med.densityAt(o + dir * t);
+            if (rng.uniform() * sigMax < sigT) { tHit = t; return true; }  // real collision
+        }                                                                 // else null collision
+    }
+
+    // Unbiased transmittance along [o, o+dir*dist] through the medium. Exact exp for a
+    // homogeneous medium (clipped to its bound); ratio tracking otherwise (candidate
+    // collisions at rate sigma_max, each scaling the estimate by 1 - sigmaT(x)/sigma_max).
+    double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
+                               double dist, double lambda, Pcg32& rng) const {
+        double stBase = med.sigmaT(lambda);
+        if (stBase <= 0.0) return 1.0;
+        double ta, tb;
+        if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 1.0;   // ray never enters fog
+        if (!med.heterogeneous())
+            return std::exp(-stBase * (tb - ta));
+        double sigMax = stBase * med.densityMax;
+        if (sigMax <= 0.0) return 1.0;
+        double Tr = 1.0, t = ta;
+        for (;;) {
+            t += -std::log(1.0 - rng.uniform()) / sigMax;
+            if (t >= tb) break;
+            double sigT = stBase * med.densityAt(o + dir * t);
+            Tr *= 1.0 - sigT / sigMax;
+        }
+        return Tr;
+    }
+
     // Model B: connect a surface vertex to the pinhole and splat onto the film.
     // f = rho/pi (Lambertian). The measurement contribution of a surface patch into
     // one pixel is  beta * f * cosSurf / (dist^2 * Omega_pix), where Omega_pix is the
@@ -306,7 +363,8 @@ struct Renderer {
     // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
-                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho) const {
+                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
+                 Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
@@ -319,9 +377,10 @@ struct Renderer {
         double f = rho / PI;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * f * cosSurf / (dist2 * omega);
-        // Beer-Lambert attenuation of the shadow ray through a global fog.
+        // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
+        // for a heterogeneous medium, exact exp for a homogeneous one).
         if (scene.medium.enabled)
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+            contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -331,7 +390,8 @@ struct Renderer {
     // propagation direction into the collision.
     //   contrib = beta * albedo * p_HG(cos) / (dist^2 * Omega_pix) * T_fog
     void connectVolume(const Scene& scene, const Camera& cam, Film& film,
-                       const Vec3& p, const Vec3& wIn, double lambda, double beta) const {
+                       const Vec3& p, const Vec3& wIn, double lambda, double beta,
+                       Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
@@ -343,7 +403,7 @@ struct Renderer {
         double Lambda = scene.medium.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);   // fog transmittance
+        contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);   // fog transmittance
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -385,7 +445,7 @@ struct Renderer {
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
         if (scene.medium.enabled)
-            contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+            contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -412,7 +472,7 @@ struct Renderer {
         double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
         double Lambda = scene.medium.albedo(lambda);
         double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
-        contrib *= std::exp(-scene.medium.sigmaT(lambda) * dist);
+        contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -420,7 +480,7 @@ struct Renderer {
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                   const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
         if (lensMode) connectLens(scene, cam, film, p, n, lambda, beta, rho, rng);
-        else          connect(scene, cam, film, p, n, lambda, beta, rho);
+        else          connect(scene, cam, film, p, n, lambda, beta, rho, rng);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
@@ -439,7 +499,7 @@ struct Renderer {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
                 if (lensMode) connectLensVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
-                else          connectVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta);
+                else          connectVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
             }
     }
 
@@ -555,10 +615,9 @@ struct Renderer {
             bool mediumEvent = false;
             Vec3 mp;
             if (scene.medium.enabled) {
-                double st = scene.medium.sigmaT(lambda);
-                if (st > 0.0) {
-                    double tMed = -std::log(1.0 - rng.uniform()) / st;
-                    if (tMed < dSurf) { dEvent = tMed; mediumEvent = true; mp = ray.o + ray.d * tMed; }
+                double tMed;
+                if (sampleMediumCollision(scene.medium, ray.o, ray.d, dSurf, lambda, rng, tMed)) {
+                    dEvent = tMed; mediumEvent = true; mp = ray.o + ray.d * tMed;
                 }
             }
 

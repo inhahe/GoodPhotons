@@ -1,5 +1,6 @@
 # Build output
 /build/
+/build_het/
 /out/
 *.ppm
 *.exr

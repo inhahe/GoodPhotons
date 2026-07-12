@@ -96,6 +96,8 @@
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
+#include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
+                               // header also pulls it in, but CPU-only builds need it too
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
 #endif
@@ -1685,6 +1687,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
+
+    // Heterogeneous / bounded participating media (a `density` field or a `bounds`
+    // box on `medium`) are honored only by the FORWARD light tracer (modes A/B/C, and
+    // the forward layers of V/P). The backward reference (R/V) and BDPT (D), and the
+    // camera-side layer of the P composite, still treat the medium as a single global
+    // HOMOGENEOUS haze — they ignore the density field and the bounds box. Warn loudly
+    // rather than silently render a different fog than authored. (Tracked in
+    // known-issues.md: heterogeneous media in backward/BDPT modes.)
+    if ((scene.medium.enabled) && (scene.medium.heterogeneous() || scene.medium.bounded) &&
+        (mode == 'R' || mode == 'V' || mode == 'D' || mode == 'P')) {
+        std::fprintf(stderr,
+            "[medium] mode %c uses the backward/BDPT tracer, which treats participating "
+            "media as a single global HOMOGENEOUS haze; the `density` field and `bounds` "
+            "box are IGNORED here. Render heterogeneous/bounded fog with a forward mode "
+            "(A/B/C) for correct results.\n", mode);
+    }
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and

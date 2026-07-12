@@ -1630,6 +1630,77 @@ private:
                 L.scene.medium.sigma_a = constantSpectrum(s_a);
             }
         }
+
+        // ---- Optional spatial bound: `bounds { min <x y z>  max <x y z> }` -------
+        // (accepts `contained_by` as an alias). Authored positions are unit-scaled to
+        // metres. Localizes the fog to an AABB; a photon's fog interaction is clipped
+        // to the ray's overlap with the box.
+        const Stmt* bd = find(b, "bounds");
+        if (!bd) bd = find(b, "contained_by");
+        if (bd && bd->val.block) {
+            Vec3 mn{0, 0, 0}, mx{0, 0, 0};
+            vec3Of(*bd->val.block, "min", mn);
+            vec3Of(*bd->val.block, "max", mx);
+            mn = P(mn); mx = P(mx);
+            for (int a = 0; a < 3; ++a) if ((&mn.x)[a] > (&mx.x)[a]) std::swap((&mn.x)[a], (&mx.x)[a]);
+            L.scene.medium.bounded = true;
+            L.scene.medium.bmin = mn;
+            L.scene.medium.bmax = mx;
+        }
+
+        // ---- Optional heterogeneous density field --------------------------------
+        // `density pattern:<name>` (a named pattern) or `density "<expr>"` (inline
+        // infix formula over world x y z r, §6.1). Multiplies sigma_a/sigma_s per
+        // point (>= 0) so the fog forms blobs with soft, formula-defined boundaries.
+        if (const Stmt* ds = find(b, "density")) {
+            if (!ds->val.words.empty()) {
+                const std::string& w0 = ds->val.words[0];
+                std::vector<PatNode> prog;
+                if (w0.rfind("pattern:", 0) == 0) {
+                    std::string nm = w0.substr(8);
+                    auto it = patternIndex_.find(nm);
+                    if (it == patternIndex_.end()) {
+                        fail("medium density references unknown pattern '" + nm + "'"); return false;
+                    }
+                    prog = L.scene.patterns[it->second].nodes;
+                } else {
+                    std::string expr;
+                    for (size_t k = 0; k < ds->val.words.size(); ++k) { if (k) expr += " "; expr += ds->val.words[k]; }
+                    std::string perr;
+                    if (!compilePatternExpr(expr, prog, perr)) {
+                        fail("medium density: " + perr); return false;
+                    }
+                }
+                L.scene.medium.density = std::move(prog);
+
+                // Majorant for delta/ratio tracking: explicit `density_max`, else a
+                // grid estimate over the bound (×1.3 safety), mirroring isosurface's
+                // `max_gradient`. A heterogeneous medium needs a finite region to
+                // estimate over, so require either `bounds` or an explicit `density_max`.
+                double dmax = dblOf(b, "density_max", 0.0);
+                if (dmax <= 0.0) {
+                    if (!L.scene.medium.bounded) {
+                        fail("a `medium` with a `density` field needs `bounds { min .. max .. }` "
+                             "or an explicit `density_max <v>` (the delta-tracking majorant)");
+                        return false;
+                    }
+                    const Vec3& lo = L.scene.medium.bmin;
+                    const Vec3& hi = L.scene.medium.bmax;
+                    const int NS = 24;
+                    double peak = 0.0;
+                    for (int iz = 0; iz <= NS; ++iz)
+                    for (int iy = 0; iy <= NS; ++iy)
+                    for (int ix = 0; ix <= NS; ++ix) {
+                        Vec3 p{ lo.x + (hi.x - lo.x) * ix / NS,
+                                lo.y + (hi.y - lo.y) * iy / NS,
+                                lo.z + (hi.z - lo.z) * iz / NS };
+                        peak = std::max(peak, L.scene.medium.densityAt(p));
+                    }
+                    dmax = 1.3 * peak;
+                }
+                L.scene.medium.densityMax = (dmax > 0.0) ? dmax : 1.0;
+            }
+        }
         return true;
     }
 
