@@ -565,7 +565,8 @@ glowing sphere of haze whose edge fades gradually instead of a hard surface. Sam
 unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for shadow
 transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
 `bounds` (or set explicitly). Heterogeneous/bounded fog is honored by the **forward**
-modes (A/B/C); the backward reference (R/V), BDPT (D), and the P composite treat the
+modes (A/B/C) on **both the CPU and the GPU** (the device runs the identical density VM +
+delta/ratio tracking); the backward reference (R/V), BDPT (D), and the P composite treat the
 medium as a global homogeneous haze and warn if you author `density`/`bounds` for them.
 See `FTSL.md` §12.1.
 

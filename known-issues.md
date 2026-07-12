@@ -34,7 +34,7 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
 
 ## Tech debt
 
-### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU DONE 2026-07-12
+### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU + GPU forward DONE 2026-07-12
 **Resolved on the CPU forward tracer.** The `medium` block now takes an optional
 `bounds { min/max }` box (AABB the fog is clipped to) and an optional `density <expr>`
 scalar field (same infix expression VM as isosurface `function` fields — variables
@@ -48,16 +48,27 @@ Implemented in `scene.h` (`Medium` struct: `density`/`densityMax`/`bounded`/`bmi
 density_max parsing), `render.h` (`sampleMediumCollision`/`mediumTransmittance` + connect
 updates). Validated with `scraps/fogblob.ftsl` (a soft glowing sphere blob, mode B).
 
-**Remaining gaps (still open):**
-- **GPU port pending.** `render_cuda.cu` `DMedium` is still homogeneous-only; the
-  density field + bounds + delta/ratio tracking need to be ported to the megakernels
-  (extend `DMedium` with a PatNode slice + bounds + majorant, upload path, device
-  delta/ratio tracking). Until then `-device gpu` ignores `density`/`bounds`.
-- **Backward/BDPT modes treat it as homogeneous.** `backward.h` (modes R/V), `bdpt.h`
-  (mode D), and the camera-side layer of the P composite still use the medium as a
-  single global homogeneous haze and ignore `density`/`bounds`. `main.cpp` `runRender`
-  now **warns** when a heterogeneous/bounded medium is rendered in R/V/D/P. Proper fix:
-  port delta/ratio tracking into the backward volume march too.
+**GPU forward — DONE 2026-07-12.** The density field + bounds + delta/ratio tracking are
+now ported to `render_cuda.cu`: `DMedium` carries `heterogeneous`/`density` (a device
+`PatNode` pool + `densityN`)/`densityMax`/`bounded`/`bmin`/`bmax`; `dMedDensityAt` (postfix
+VM twin of `densityAt`), `dMedClip` (twin of `clipToBounds`), `dMedSampleCollision` (delta/
+Woodcock tracking twin of `sampleMediumCollision`), and `dMedTransmittance` (ratio-tracking
+twin of `mediumTransmittance`) drive the forward `shadeStep` free-flight and every camera
+splat (`connect`/`connectVolume`/`connectLens`/`connectLensVolume` — the two RNG-less
+connects now take `rng` for ratio tracking). A homogeneous medium keeps the exact analytic
+path (no extra RNG draw). Validated on an RTX 4090 mode B: `scraps/fogblob.ftsl` GPU-vs-CPU
+16×16-block RMSE 1.07/255 with ~0 bias (per-pixel diff is pure MC noise from the 0.95-albedo
+fog; means 38.57 vs 38.56), and a homogeneous regression (`scraps/foghom.ftsl`) block RMSE
+2.45/255, bias −0.009.
+
+**Remaining gap (still open):**
+- **Backward/BDPT modes treat it as homogeneous** (on BOTH backends). `backward.h`
+  (modes R/V), `bdpt.h` (mode D), and the camera-side layer of the P composite still use
+  the medium as a single global homogeneous haze and ignore `density`/`bounds`; on the GPU,
+  `cudaBackwardSupported`/`cudaBdptSupported` reject *any* medium so R/V/D fall back to the
+  CPU tracer, which shares that homogeneous-only limitation. `main.cpp` `runRender` **warns**
+  when a heterogeneous/bounded medium is rendered in R/V/D/P. Proper fix: port delta/ratio
+  tracking into the backward volume march too (then mirror it on the GPU).
 
 ### Diffuse-transmission material — CPU DONE 2026-07-12 (GPU port pending)
 Added `type translucent` (alias `diffuse_transmit`): a two-sided Lambertian BSDF — the

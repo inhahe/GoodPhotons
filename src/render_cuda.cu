@@ -294,6 +294,19 @@ struct DMedium {
     double sigma_a[SPEC_N];
     double sigma_s[SPEC_N];
     double g;
+    // --- Optional heterogeneous density field + spatial bound (mirrors host Medium) ---
+    // When `heterogeneous`, sigma_a/sigma_s are multiplied per point by a dimensionless
+    // density(x,y,z) >= 0 evaluated by the postfix pattern VM over `density`[0..densityN).
+    // Sampling then switches to delta (Woodcock) tracking for collisions and ratio
+    // tracking for transmittance, with majorant sigma_max = sigmaT * densityMax. When
+    // `bounded`, the medium exists only inside the AABB [bmin,bmax]. A homogeneous
+    // unbounded medium keeps the exact analytic behaviour (bit-identical to before).
+    int              heterogeneous;   // 1 => density program present
+    const PatNode*   density;         // device pool for the density formula (or null)
+    int              densityN;        // node count of the density program
+    double           densityMax;      // majorant (sup of density over the bound)
+    int              bounded;         // 1 => clip to [bmin,bmax]
+    DVec3            bmin, bmax;
 };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
@@ -698,6 +711,94 @@ __device__ static Real medAlbedo(const DMedium& m, Real lambda) {
     Real s = fmax((Real)0, specLookup(m.sigma_s, lambda));
     Real t = s + fmax((Real)0, specLookup(m.sigma_a, lambda));
     return t > 0 ? s / t : 0;
+}
+
+// dPatternEval is defined further down; forward-declare for the density evaluator.
+__device__ static double dPatternEval(const PatNode* nodes, int n,
+                                      double x, double y, double z, double f,
+                                      double nx, double ny, double nz, double r,
+                                      double u, double v);
+
+// Dimensionless density multiplier at a world point (>= 0). Device twin of
+// Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
+__device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
+    if (!m.heterogeneous || !m.density) return 1.0;
+    double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
+    double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
+                            0.0, 0.0, 0.0, r, 0.0, 0.0);
+    return d > 0.0 ? d : 0.0;
+}
+
+// Clip ray (o + t*dir, t in [t0,t1]) to the medium bound. Device twin of
+// Medium::clipToBounds: returns the sub-interval [ta,tb] inside the box, or false on a
+// miss. Unbounded media pass the interval through unchanged.
+__device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                 double t0, double t1, double& ta, double& tb) {
+    if (!m.bounded) { ta = t0; tb = t1; return t1 > t0; }
+    double lo = t0, hi = t1;
+    const double oo[3] = { (double)o.x, (double)o.y, (double)o.z };
+    const double dd[3] = { (double)dir.x, (double)dir.y, (double)dir.z };
+    const double mn[3] = { (double)m.bmin.x, (double)m.bmin.y, (double)m.bmin.z };
+    const double mx[3] = { (double)m.bmax.x, (double)m.bmax.y, (double)m.bmax.z };
+    for (int a = 0; a < 3; ++a) {
+        double oa = oo[a], da = dd[a];
+        if (fabs(da) < 1e-12) { if (oa < mn[a] || oa > mx[a]) return false; continue; }
+        double inv = 1.0 / da;
+        double s0 = (mn[a] - oa) * inv, s1 = (mx[a] - oa) * inv;
+        if (s0 > s1) { double tmp = s0; s0 = s1; s1 = tmp; }
+        lo = fmax(lo, s0); hi = fmin(hi, s1);
+        if (lo > hi) return false;
+    }
+    ta = lo; tb = hi; return tb > ta;
+}
+
+// Sample the next real collision along (o,dir) within [0,dMax]. Device twin of
+// Renderer::sampleMediumCollision: exact analytic free-flight (one draw) for a
+// homogeneous medium (bit-identical to before), else delta (Woodcock) tracking.
+__device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                           Real dMax, Real lambda, DRng& rng, Real& tHit) {
+    double stBase = (double)medSigmaT(m, lambda);
+    if (stBase <= 0.0) return false;
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, (double)dMax, ta, tb)) return false;
+    if (!m.heterogeneous) {
+        double t = ta - log(1.0 - (double)rng.uniform()) / stBase;
+        if (t < tb) { tHit = (Real)t; return true; }
+        return false;
+    }
+    double sigMax = stBase * m.densityMax;
+    if (sigMax <= 0.0) return false;
+    double t = ta;
+    for (;;) {
+        t += -log(1.0 - (double)rng.uniform()) / sigMax;
+        if (t >= tb) return false;
+        DVec3 pp = o + dir * (Real)t;
+        double sigT = stBase * dMedDensityAt(m, pp);
+        if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
+    }
+}
+
+// Unbiased transmittance along [o, o+dir*dist]. Device twin of
+// Renderer::mediumTransmittance: exact exp for a homogeneous medium (no RNG draw), else
+// ratio tracking. Homogeneous scenes therefore keep the exact analytic transmittance.
+__device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                         Real dist, Real lambda, DRng& rng) {
+    double stBase = (double)medSigmaT(m, lambda);
+    if (stBase <= 0.0) return (Real)1;
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, (double)dist, ta, tb)) return (Real)1;
+    if (!m.heterogeneous) return (Real)exp(-stBase * (tb - ta));
+    double sigMax = stBase * m.densityMax;
+    if (sigMax <= 0.0) return (Real)1;
+    double Tr = 1.0, t = ta;
+    for (;;) {
+        t += -log(1.0 - (double)rng.uniform()) / sigMax;
+        if (t >= tb) break;
+        DVec3 pp = o + dir * (Real)t;
+        double sigT = stBase * dMedDensityAt(m, pp);
+        Tr *= 1.0 - sigT / sigMax;
+    }
+    return (Real)Tr;
 }
 
 // Minimal device complex (host uses std::complex; not available in device code).
@@ -1332,7 +1433,8 @@ __device__ static void filmAdd(double* film, double* hits, int resX, int px, int
     if (hits) atomicAdd(&hits[pix], 1.0);
 }
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
-                               const DVec3& p, const DVec3& n, Real lambda, Real beta, Real rho) {
+                               const DVec3& p, const DVec3& n, Real lambda, Real beta, Real rho,
+                               DRng& rng) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
@@ -1347,11 +1449,12 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     // classic 1/(A_pix cos^4) form; fisheye/panoramic uses the remapped solid angle.
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f * cosSurf / (Real)((double)dist2 * solidAngle);
-    if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
+    if (sc.medium.enabled) contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 __device__ static void connectVolume(const DScene& sc, const DCamera& cam, double* film, double* hits,
-                                      const DVec3& p, const DVec3& wIn, Real lambda, Real beta) {
+                                      const DVec3& p, const DVec3& wIn, Real lambda, Real beta,
+                                      DRng& rng) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
@@ -1364,7 +1467,7 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
     // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * Lambda * ph / (Real)((double)dist2 * solidAngle);
-    contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
+    contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (physical camera): next-event splat through the finite lens pupil. Sample a
@@ -1392,7 +1495,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
-    if (sc.medium.enabled) contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
+    if (sc.medium.enabled) contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
@@ -1417,7 +1520,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, d
     Real ph = hgPhase(dot(wIn, wdir), (Real)sc.medium.g);
     Real Lambda = medAlbedo(sc.medium, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
-    contrib *= exp(-medSigmaT(sc.medium, lambda) * dist);
+    contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
@@ -1427,9 +1530,12 @@ __device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, d
 // "many cameras for the price of one photon set" win, the device twin of the CPU
 // renderForwardShared. films[c] / hits[c] are camera c's own device buffers (each
 // camera keeps its resolution/projection/exposure). nCam==1 is the ordinary single-
-// camera render. Model B's connect() draws no RNG, so a multi-camera model-B pass is
-// bit-identical to per-camera renders; model A's connectLens() samples each pupil (it
-// draws RNG), so its per-camera images match a standalone render in distribution only.
+// camera render. Model B's connect() draws no RNG in a homogeneous medium, so a multi-
+// camera model-B pass is bit-identical to per-camera renders there; model A's
+// connectLens() samples each pupil (it draws RNG), so its per-camera images match a
+// standalone render in distribution only. (A HETEROGENEOUS medium adds a ratio-tracking
+// transmittance draw per connect, so multi-cam model-B also matches only in distribution
+// then — inherent to the estimator, and consistent with the CPU tracer.)
 struct DCamSet {
     const DCamera* cams;      // nCam cameras
     double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
@@ -1446,7 +1552,7 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
                                         const DVec3& p, const DVec3& n, Real lambda,
                                         Real beta, Real rho, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho);
+        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
         else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
     }
 }
@@ -1455,7 +1561,7 @@ __device__ static void splatVolumeAll(const DScene& sc, const DCamSet& cs, int c
                                        const DVec3& p, const DVec3& wIn, Real lambda,
                                        Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connectVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta);
+        if (camMode == CAM_B) connectVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
         else if (camMode == CAM_A) connectLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
     }
 }
@@ -1876,10 +1982,11 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
     bool mediumEvent = false; DVec3 mp; Real dEvent = dSurf;
     if (sc.medium.enabled) {
-        Real st = medSigmaT(sc.medium, lambda);
-        if (st > 0) {
-            Real tMed = -log((Real)1 - rng.uniform()) / st;
-            if (tMed < dSurf) { mediumEvent = true; mp = ro + rd * tMed; dEvent = tMed; }
+        // Delta (Woodcock) tracking for a heterogeneous/bounded medium, exact analytic
+        // free-flight for a plain homogeneous one (dMedSampleCollision handles both).
+        Real tMed;
+        if (dMedSampleCollision(sc.medium, ro, rd, dSurf, lambda, rng, tMed)) {
+            mediumEvent = true; mp = ro + rd * tMed; dEvent = tMed;
         }
     }
 
@@ -3458,6 +3565,15 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.medium.g = scene.medium.g;
     bakeSpec(scene.medium.sigma_a, sc.medium.sigma_a);
     bakeSpec(scene.medium.sigma_s, sc.medium.sigma_s);
+    // Heterogeneous density field + spatial bound (delta/ratio tracking on device).
+    sc.medium.heterogeneous = scene.medium.heterogeneous() ? 1 : 0;
+    sc.medium.density  = scene.medium.density.empty()
+                         ? nullptr : (const PatNode*)keep(uploadVec(scene.medium.density));
+    sc.medium.densityN = (int)scene.medium.density.size();
+    sc.medium.densityMax = scene.medium.densityMax;
+    sc.medium.bounded  = scene.medium.bounded ? 1 : 0;
+    sc.medium.bmin = {scene.medium.bmin.x, scene.medium.bmin.y, scene.medium.bmin.z};
+    sc.medium.bmax = {scene.medium.bmax.x, scene.medium.bmax.y, scene.medium.bmax.z};
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};

@@ -482,9 +482,10 @@ plain homogeneous `medium` (no `density`, no `bounds`) is unchanged and bit-iden
 to before.
 
 > **Mode support:** heterogeneous / bounded fog is honored only by the **forward**
-> light tracer — modes **A/B/C** (and the forward layers of V/P). The backward
-> reference (R/V), BDPT (D), and the camera-side layer of the P composite treat the
-> medium as a single global homogeneous haze and **ignore** `density` and `bounds`
+> light tracer — modes **A/B/C** (and the forward layers of V/P), on **both the CPU and
+> the GPU** (`-device gpu` runs the identical density VM + delta/ratio tracking). The
+> backward reference (R/V), BDPT (D), and the camera-side layer of the P composite treat
+> the medium as a single global homogeneous haze and **ignore** `density` and `bounds`
 > (the renderer warns when you do this). Render fog blobs with a forward mode.
 
 ---
