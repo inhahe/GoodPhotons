@@ -495,7 +495,11 @@ public:
         }
 
         // Pass 3: geometry, lights, medium, camera, render.
+        // `medium` blocks are DEFERRED to a second sweep so `bounds { object "name" }`
+        // can reference any named sphere / isosurface / mesh regardless of authoring
+        // order (the object registries are populated by the geometry builders below).
         bool haveLight = false;
+        std::vector<const Block*> mediaBlocks;
         for (const auto& b : blocks) {
             if      (b.type == "sphere")   { if (!addSphere(b, L)) return false; }
             else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
@@ -504,7 +508,7 @@ public:
             else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
-            else if (b.type == "medium")   { if (!addMedium(b, L)) return false; }
+            else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
             else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
             else if (b.type == "camera_orbit") { if (!addCameraOrbit(b, L)) return false; }
@@ -514,6 +518,8 @@ public:
                      b.type == "texture" || b.type == "pattern") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
+        // Deferred medium sweep (object-name bounds resolve against the registries).
+        for (const Block* mb : mediaBlocks) { if (!addMedium(*mb, L)) return false; }
         if (!haveLight) { fail("scene has no 'light' block"); return false; }
         // Catch errors recorded via fail() inside add* helpers that returned true
         // without re-checking `err` (e.g. an unknown `spd preset:`/`spectrum:` name
@@ -534,6 +540,14 @@ private:
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
+
+    // Named-object registries for `medium { bounds { object "name" } }` resolution.
+    // Populated by the geometry builders during Pass 3; read by addMedium afterwards.
+    struct NamedSphere { Vec3 center; double radius; };
+    std::unordered_map<std::string, NamedSphere> sphereByName_;   // named sphere -> world center/radius
+    std::unordered_map<std::string, int>         implicitByName_; // named isosurface -> Scene::implicits index
+    std::unordered_map<std::string, Aabb>        meshAabbByName_; // named mesh -> world AABB
+
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
 
@@ -1024,7 +1038,10 @@ private:
         // cannot represent (see known-issues.md — true instancing/quadrics).
         bool nonUniform = false; double s = xf.uniformScale(nonUniform);
         if (nonUniform) { fail("sphere under non-uniform scale would be an ellipsoid; use translate + uniform scale (or a mesh)"); return false; }
-        L.scene.spheres.push_back(Sphere{P(xf.apply(c)), Len(r) * s, id});
+        Vec3 wc = P(xf.apply(c));
+        double wr = Len(r) * s;
+        L.scene.spheres.push_back(Sphere{wc, wr, id});
+        if (!b.name.empty()) sphereByName_[b.name] = NamedSphere{wc, wr};
         return true;
     }
     bool addQuad(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
@@ -1133,8 +1150,21 @@ private:
             auto it = matIndex_.find(nm);
             return (it == matIndex_.end()) ? -1 : it->second;
         };
+        size_t triStart = L.scene.tris.size();
         loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
                 uvProj, uvAxis);
+        // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
+        // is approximated by its box — true containment is deferred, see known-issues).
+        if (!b.name.empty() && L.scene.tris.size() > triStart) {
+            Aabb box; bool first = true;
+            for (size_t t = triStart; t < L.scene.tris.size(); ++t) {
+                const Tri& tr = L.scene.tris[t];
+                for (const Vec3& v : {tr.v0, tr.v1, tr.v2}) {
+                    if (first) { box.lo = v; box.hi = v; first = false; } else box.expand(v);
+                }
+            }
+            meshAabbByName_[b.name] = box;
+        }
         return true;
     }
 
@@ -1425,6 +1455,7 @@ private:
         im.uvBounds = im.bounds;
         im.uvBoundsSet = true;
         L.scene.implicits.push_back(std::move(im));
+        if (!b.name.empty()) implicitByName_[b.name] = (int)L.scene.implicits.size() - 1;
         return true;
     }
 
@@ -1656,7 +1687,45 @@ private:
         if (!bd) bd = find(b, "contained_by");
         if (bd && bd->val.block) {
             const Block& bb = *bd->val.block;
-            if (find(bb, "center") || find(bb, "radius")) {       // sphere-shaped region
+            // `bounds { object "name" }` shapes the fog to a NAMED scene object:
+            //   • sphere     -> exact analytic sphere bound (center/radius)
+            //   • isosurface -> field membership (fog fills the field's interior,
+            //                   carved per-point by fieldEval inside the field AABB)
+            //   • mesh       -> the mesh's world AABB (box approximation; true mesh
+            //                   containment is deferred — see known-issues.md)
+            if (const std::string onm = strOf(bb, "object"); !onm.empty()) {
+                if (auto sit = sphereByName_.find(onm); sit != sphereByName_.end()) {
+                    const NamedSphere& ns = sit->second;
+                    med.bounded = true;
+                    med.boundShape = MediumBound::Sphere;
+                    med.bcenter = ns.center;
+                    med.bradius = ns.radius;
+                    med.bmin = ns.center - Vec3{ns.radius, ns.radius, ns.radius};
+                    med.bmax = ns.center + Vec3{ns.radius, ns.radius, ns.radius};
+                } else if (auto iit = implicitByName_.find(onm); iit != implicitByName_.end()) {
+                    const Implicit& im = L.scene.implicits[iit->second];
+                    med.bounded = true;
+                    med.boundShape = MediumBound::Implicit;
+                    med.boundField = im.nodes;         // world-space field program
+                    med.boundFieldExpr = im.exprNodes; // shared expression pool
+                    med.bmin = im.bounds.lo;
+                    med.bmax = im.bounds.hi;
+                    // Inside-sign auto-detect: SDF/CSG fields are negative inside, so a
+                    // point deep in the AABB (its center) reads f<0 => inside == (f<0).
+                    Vec3 ctr = (im.bounds.lo + im.bounds.hi) * 0.5;
+                    med.boundInsideNeg = (im.eval(ctr) <= 0.0);
+                } else if (auto mit = meshAabbByName_.find(onm); mit != meshAabbByName_.end()) {
+                    const Aabb& box = mit->second;
+                    med.bounded = true;
+                    med.boundShape = MediumBound::Box;
+                    med.bmin = box.lo;
+                    med.bmax = box.hi;
+                } else {
+                    fail("medium `bounds { object \"" + onm + "\" }` names no sphere, "
+                         "isosurface, or mesh (objects must have a \"name\")");
+                    return false;
+                }
+            } else if (find(bb, "center") || find(bb, "radius")) {  // sphere-shaped region
                 Vec3 ctr{0, 0, 0};
                 vec3Of(bb, "center", ctr);
                 double rad = Len(dblOf(bb, "radius", 0.0));

@@ -197,7 +197,7 @@ inline Material makeFluoroMaterial() {
 // Shape of a medium's optional spatial bound: an axis-aligned box or a sphere. A
 // sphere bound fills exactly an object-shaped region (e.g. "the whole inside of a
 // glass sphere") — author the same center/radius as the sphere geometry.
-enum class MediumBound { Box, Sphere };
+enum class MediumBound { Box, Sphere, Implicit };
 
 struct Medium {
     bool enabled = false;
@@ -228,6 +228,16 @@ struct Medium {
     Vec3 bcenter{0, 0, 0};
     double bradius = 0.0;
 
+    // --- Optional implicit/isosurface bound (fog shaped by a named field) ------
+    // When `boundShape == Implicit`, the medium fills the region inside a compiled
+    // scalar field program: a point p is INSIDE when fieldEval(p) < 0 (if
+    // boundInsideNeg) or > 0 (otherwise). bmin/bmax hold the field's AABB (for the
+    // majorant grid and ray clipping). This lets fog take the exact shape of a
+    // metaball / SDF isosurface authored elsewhere in the scene by name.
+    std::vector<FieldNode> boundField;      // compiled field nodes (world-space)
+    std::vector<PatNode>   boundFieldExpr;  // shared expression pool for the field
+    bool boundInsideNeg = true;             // inside test: fieldEval < 0 (true) or > 0
+
     double sigmaT(double lambda) const {
         return std::max(0.0, sigma_a(lambda) + sigma_s(lambda));
     }
@@ -237,11 +247,27 @@ struct Medium {
         return t > 0.0 ? s / t : 0.0;
     }
 
-    bool heterogeneous() const { return !density.empty(); }
+    // Inside-test for an implicit-shaped bound: is world point p within the field?
+    bool insideField(const Vec3& p) const {
+        double f = fieldEval(boundField.data(), (int)boundField.size(), p,
+                             boundFieldExpr.data());
+        return boundInsideNeg ? (f < 0.0) : (f > 0.0);
+    }
+
+    // A medium is "heterogeneous" (needs delta/ratio tracking rather than an exact
+    // analytic free-flight) when it has a density field OR an implicit bound, since
+    // an implicit membership makes the effective density spatially varying (1 inside,
+    // 0 outside) even when the base coefficients are constant.
+    bool heterogeneous() const {
+        return !density.empty() || boundShape == MediumBound::Implicit;
+    }
 
     // Dimensionless density multiplier at a world point (>= 0). 1 for a homogeneous
     // medium. Evaluated by the shared pattern VM (x y z r live; f/normal/uv read 0).
+    // For an implicit bound the multiplier is 0 outside the field (the medium simply
+    // does not exist there), so delta/ratio tracking carves out the exact iso-shape.
     double densityAt(const Vec3& p) const {
+        if (boundShape == MediumBound::Implicit && !insideField(p)) return 0.0;
         if (density.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
         double d = patternEval(density.data(), (int)density.size(), c);

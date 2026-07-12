@@ -34,7 +34,7 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
 
 ## Tech debt
 
-### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU + GPU forward DONE 2026-07-12
+### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU + GPU forward DONE 2026-07-12 (box/sphere/implicit bounds, density fields, multi-medium superposition, object-name bounds)
 **Resolved on the CPU forward tracer.** The `medium` block now takes an optional
 `bounds { min/max }` box (AABB the fog is clipped to) and an optional `density <expr>`
 scalar field (same infix expression VM as isosurface `function` fields — variables
@@ -92,11 +92,41 @@ and an **open** fog sphere (no glass shell) is directly viewable in every forwar
 (`scraps/fogorb.ftsl` mode B center box mean 135.8). A proper fix is refractive/manifold
 next-event estimation (specular connections through the glass) — genuine research-grade work,
 out of scope; a naive "let connect rays pass through glass" hack is wrong (it draws the fog
-along a straight line, with no lensing, in the wrong place) and is deliberately avoided. (2) Still a **single**
-global `scene.medium` — you get one bounded region, not a list of independent per-object media.
-A future extension would make `Scene::media` a vector (with per-segment medium resolution +
-a GPU medium array) so several differently-shaped fog objects can coexist; object-name /
-implicit-shape bounds (fog clipped to an arbitrary mesh/isosurface) would build on that.
+along a straight line, with no lensing, in the wrong place) and is deliberately avoided.
+
+**Multiple coexisting media (superposition) — DONE 2026-07-12.** `Scene::medium` is now a
+vector `Scene::media` of independent, possibly overlapping media; several `medium {}` blocks
+coexist (e.g. two tinted fog orbs + a global haze). The forward tracer superposes them
+physically: extinction adds, so total transmittance is the **product** of the per-medium
+transmittances (`Renderer::mediaTransmittance` / `dMediaTransmittance`), and the first
+collision is the **earliest** of the media's independent free-flights, with the winning
+medium's albedo/`g` driving the scatter (`sampleMediaCollision` / `dMediaSampleCollision` —
+Poisson superposition). A single-medium scene stays bit-identical. `Scene::backwardMedium()`
+returns the first medium for the homogeneous-only backward/BDPT path. Implemented in
+`scene.h`, `render.h`, `ftsl.h` (`addMedium` appends), `render_cuda.cu` (`DScene.media`/
+`mediaN` + a `DMedium` array). Validated on an RTX 4090 mode B: `scraps/fogmulti.ftsl`
+(warm + cool disjoint orbs + global haze) GPU-vs-CPU 16×16-block RMSE 1.40/255 (bias 0.012,
+means match to 0.02%); single-medium regression (`scraps/fogorb.ftsl`) block RMSE 1.07,
+unchanged.
+
+**Object-name / implicit-shape fog bounds — DONE 2026-07-12.** `bounds { object "<name>" }`
+shapes the fog to a **named** scene object: a named `sphere` → its exact analytic sphere
+bound; a named `isosurface` → **field membership** (a new `MediumBound::Implicit`: the fog
+fills the field interior via `fieldEval < 0` — inside-sign auto-detected from the field's
+value at its AABB center — carved per-point inside delta/ratio tracking over the field's
+AABB, reusing the same field VM as isosurface rendering); a named `mesh` → the mesh's world
+**AABB** (box approximation; true mesh containment deferred). Media are resolved in a
+deferred second sweep so the object may be authored anywhere. Implemented in `scene.h`
+(`Medium::boundField`/`boundFieldExpr`/`boundInsideNeg` + `insideField`/`densityAt`/
+`heterogeneous`), `ftsl.h` (name registries populated by `addSphere`/`addIsosurface`/
+`addMesh`; `object` branch in `addMedium`), `render_cuda.cu` (`DMedium.boundField`/
+`boundFieldN`/`boundFieldExpr`/`boundInsideNeg`, `dMedDensityAt` membership carve-out,
+`appendFieldProgram` bakes the medium field into the shared device field pool). Validated on
+an RTX 4090 mode B: metaball-`blob`-shaped glowing fog in a glass shell (`scraps/fogimplicit.ftsl`)
+GPU-vs-CPU energy identical (absorbed 0.9978) and indirect room lighting agreeing within the
+(large) dim-caustic noise floor. *(Same fog-inside-glass direct-view limitation as above
+applies — an implicit-shaped fog is enclosed by its own isosurface, so its direct camera view
+is a refracted SDS path; it lights the room correctly.)*
 
 **Remaining gap (still open):**
 - **Backward/BDPT modes treat it as homogeneous** (on BOTH backends). `backward.h`

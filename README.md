@@ -25,9 +25,11 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   diffraction gratings, fluorescence, and stochastic mixes.
 - **Wave-optical effects** — thin-film Airy interference, Abelès multilayer
   stacks, and reflective diffraction gratings.
-- **Participating media** — global or bounded fog with Henyey–Greenstein or Rayleigh
-  scattering; heterogeneous **density fields** (formula-defined blobs with soft edges)
-  via unbiased delta/ratio tracking on the forward modes.
+- **Participating media** — one or many coexisting (superposed) fog regions with
+  Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
+  (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
+  **density fields** (formula-defined blobs with soft edges) via unbiased delta/ratio
+  tracking on the forward modes.
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), megakernel or
   wavefront, with CPU fallback.
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
@@ -555,11 +557,22 @@ at the poles, a grid on box faces) instead of slicing through world space. See
 `-fog <sigma_t> -fogalbedo <a> -fogg <g> [-fograyleigh]`. Henyey–Greenstein phase
 function by default; Rayleigh optional.
 
+**Multiple, overlapping media.** Author as many `medium` blocks as you like — they
+coexist as independent regions (e.g. two differently-tinted fog orbs plus a faint
+global haze). The forward tracer superposes them physically: extinction adds (total
+transmittance is the *product* of the per-medium transmittances) and each scatter is
+drawn from the *earliest* of the media's independent free-flights. A single-`medium`
+scene is bit-identical to before.
+
 **Bounded, heterogeneous fog (blobs).** The medium isn't limited to a single global
 haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box —
 or `bounds { center <x y z> radius <r> }` to confine it to a **sphere** region, i.e.
 simple *per-object* fog like **the whole inside of a glass sphere** (author the same
-center/radius as the sphere). An *open* fog sphere is directly viewable in every mode.
+center/radius as the sphere). Or shape the fog to a **named object** with
+`bounds { object "<name>" }`: a named `sphere` gives its exact analytic bound, a named
+`isosurface` fills the field's interior (the fog takes the metaball/SDF silhouette
+exactly, carved per-point during tracking), and a named `mesh` uses the mesh's world
+AABB (a box approximation; true mesh containment is deferred). An *open* fog sphere is directly viewable in every mode.
 Fog inside an actual **glass shell**, however, is *not imaged directly* by the next-event
 modes — an accuracy limitation, not a speed one: seeing the fog through the curved glass is
 a refracted (specular↔volume) path, and the pinhole splat `B` and finite-lens splat `A`

@@ -444,6 +444,15 @@ medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
 - `g` is the Henyey-Greenstein anisotropy; `rayleigh true` gives a λ⁻⁴ scattering
   tilt (blue-sky falloff).
 
+**Multiple media.** You may author several `medium` blocks; they coexist as
+independent, possibly overlapping regions (e.g. two differently-tinted fog orbs plus
+a faint global haze). The forward tracer superposes them physically: extinction adds,
+so total transmittance is the *product* of the per-medium transmittances, and each
+collision is drawn from the *earliest* of the media's independent free-flights (with
+the winning medium's albedo/`g` driving the scatter). A scene with a single `medium`
+is bit-identical to before. *(Superposition is a forward-mode feature — see the mode
+note at the end of §12.1.)*
+
 ### 12.1 Bounded and heterogeneous fog (blobs)
 
 By default the medium is a single global homogeneous haze filling the whole scene.
@@ -474,6 +483,21 @@ medium {
   room**. Only the fully physical modes — photon-catch (`C`) and BDPT (`D`) — can trace the
   refracted view, and only very slowly. An *open* fog sphere (no glass shell) is directly
   viewable in every mode.
+- **`bounds { object "<name>" }`** — shape the fog to a **named scene object** instead
+  of authoring a box/sphere by hand. Give any `sphere`, `isosurface`, or `mesh` a
+  `"name"` and reference it here:
+  - a named **sphere** → the exact analytic sphere bound (its world center/radius);
+  - a named **isosurface** → **field membership** — the fog fills the field's interior
+    (a point is inside when the field is negative, auto-detected from the field's
+    sign at its bounding-box center), so the fog takes the metaball/SDF silhouette
+    exactly (carved per-point during delta/ratio tracking over the field's AABB). A
+    `density` field still multiplies on top, shaping the fog *within* the iso-shape.
+  - a named **mesh** → the mesh's world **AABB** (a box approximation; true mesh
+    containment is deferred — see `known-issues.md`).
+
+  The object may be authored anywhere in the file (media are resolved after all
+  geometry). The named object's own material/visibility is unaffected — only its
+  *shape* is borrowed for the fog bound.
 - **`density <expr>`** or **`density pattern:<name>`** — a scalar field, ≥ 0, that
   multiplies `sigma_t` (and hence both `sigma_a` and `sigma_s`) at each point. Uses
   the same infix expression language as isosurface `function` fields and `pattern`

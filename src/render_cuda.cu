@@ -306,10 +306,17 @@ struct DMedium {
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
     int              bounded;         // 1 => clip to the bound region
-    int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere (bcenter,bradius)
+    int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field
     DVec3            bmin, bmax;
     DVec3            bcenter;
     double           bradius;
+    // --- Optional implicit/isosurface bound (boundShape==2). The fog fills the field's
+    // interior: a point is inside when dFieldEval < 0 (boundInsideNeg) or > 0. The field
+    // program lives in its own device slice; bmin/bmax hold the field AABB (box clip). ---
+    const DFieldNode* boundField;     // implicit bound field nodes (or null)
+    int               boundFieldN;    // node count
+    const PatNode*    boundFieldExpr; // expr pool backing DF_EXPR leaves (or null)
+    int               boundInsideNeg; // 1 => inside when field < 0, else inside when > 0
 };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
@@ -717,15 +724,25 @@ __device__ static Real medAlbedo(const DMedium& m, Real lambda) {
     return t > 0 ? s / t : 0;
 }
 
-// dPatternEval is defined further down; forward-declare for the density evaluator.
+// dPatternEval / dFieldEval are defined further down; forward-declare for the density
+// evaluator (the implicit-bound membership test needs the field VM).
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v);
+__device__ static double dFieldEval(const DFieldNode* nodes, int n,
+                                    double pwx, double pwy, double pwz,
+                                    const PatNode* exprPool);
 
 // Dimensionless density multiplier at a world point (>= 0). Device twin of
 // Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
+// For an implicit bound the multiplier is 0 outside the field (medium absent there).
 __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
+    if (m.boundShape == 2 && m.boundField) {   // implicit-field membership carve-out
+        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
+        bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
+        if (!inside) return 0.0;
+    }
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
@@ -3393,11 +3410,32 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // slices it by [nodeOff, nodeOff+nodeN). BVH prims >= nTris+nSph index these.
     std::vector<DFieldNode> fieldNodes;
     std::vector<PatNode>    fieldExprNodes;   // flat pool for DF_EXPR formulas (all implicits)
+    // Append a host field program (FieldNode postfix + its private expr pool) into the
+    // shared device pools, rebasing DF_EXPR leaf offsets. Writes the slice [outOff,outN).
+    // Shared by isosurface geometry and implicit-shaped fog bounds so the conversion
+    // (and its expr-pool rebasing) lives in exactly one place.
+    auto appendFieldProgram = [&](const std::vector<FieldNode>& nodes,
+                                  const std::vector<PatNode>& expr,
+                                  int& outOff, int& outN) {
+        outOff = (int)fieldNodes.size();
+        outN   = (int)nodes.size();
+        int exprBase = (int)fieldExprNodes.size();
+        fieldExprNodes.insert(fieldExprNodes.end(), expr.begin(), expr.end());
+        for (const FieldNode& fn : nodes) {
+            DFieldNode dn;
+            dn.op = (int)fn.op;
+            dn.p[0] = fn.p[0]; dn.p[1] = fn.p[1]; dn.p[2] = fn.p[2]; dn.p[3] = fn.p[3];
+            for (int k = 0; k < 9; ++k) dn.inv[k] = fn.inv.m[k];
+            dn.tx = fn.inv.t.x; dn.ty = fn.inv.t.y; dn.tz = fn.inv.t.z;
+            dn.scale = fn.scale;
+            dn.exprOff = (fn.op == FieldOp::Expr) ? exprBase + fn.exprOff : -1;
+            dn.exprN   = (fn.op == FieldOp::Expr) ? fn.exprN : 0;
+            fieldNodes.push_back(dn);
+        }
+    };
     std::vector<DImplicit>  dimpl(scene.implicits.size());
     for (size_t i = 0; i < scene.implicits.size(); ++i) {
         const Implicit& im = scene.implicits[i]; DImplicit& d = dimpl[i];
-        d.nodeOff = (int)fieldNodes.size();
-        d.nodeN   = (int)im.nodes.size();
         d.matId   = im.matId;
         d.lo[0] = im.bounds.lo.x; d.lo[1] = im.bounds.lo.y; d.lo[2] = im.bounds.lo.z;
         d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
@@ -3409,22 +3447,20 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.uvLo[0] = ub.lo.x; d.uvLo[1] = ub.lo.y; d.uvLo[2] = ub.lo.z;
             d.uvHi[0] = ub.hi.x; d.uvHi[1] = ub.hi.y; d.uvHi[2] = ub.hi.z;
         }
-        // Rebase this implicit's expr programs into the shared device pool. Each Implicit
-        // owns a private exprNodes vector on the host (FieldNode.exprOff indexes it), so we
-        // add the running base and copy the programs into fieldExprNodes.
-        int exprBase = (int)fieldExprNodes.size();
-        fieldExprNodes.insert(fieldExprNodes.end(), im.exprNodes.begin(), im.exprNodes.end());
-        for (const FieldNode& fn : im.nodes) {
-            DFieldNode dn;
-            dn.op = (int)fn.op;
-            dn.p[0] = fn.p[0]; dn.p[1] = fn.p[1]; dn.p[2] = fn.p[2]; dn.p[3] = fn.p[3];
-            for (int k = 0; k < 9; ++k) dn.inv[k] = fn.inv.m[k];
-            dn.tx = fn.inv.t.x; dn.ty = fn.inv.t.y; dn.tz = fn.inv.t.z;
-            dn.scale = fn.scale;
-            dn.exprOff = (fn.op == FieldOp::Expr) ? exprBase + fn.exprOff : -1;
-            dn.exprN   = (fn.op == FieldOp::Expr) ? fn.exprN : 0;
-            fieldNodes.push_back(dn);
-        }
+        // Rebase this implicit's field program (and its private expr pool) into the
+        // shared device pools; sets d.nodeOff/d.nodeN.
+        appendFieldProgram(im.nodes, im.exprNodes, d.nodeOff, d.nodeN);
+    }
+
+    // Implicit-shaped fog bounds (Medium::boundShape == Implicit) carry a copy of a
+    // named isosurface's field program. Bake each into the SAME device field pools so
+    // the density evaluator can test membership on-device; record the per-medium slice.
+    struct MedFieldSlice { int off = -1, n = 0; };
+    std::vector<MedFieldSlice> medField(scene.media.size());
+    for (size_t i = 0; i < scene.media.size(); ++i) {
+        const Medium& m = scene.media[i];
+        if (m.boundShape != MediumBound::Implicit || m.boundField.empty()) continue;
+        appendFieldProgram(m.boundField, m.boundFieldExpr, medField[i].off, medField[i].n);
     }
 
     // --- bake procedural patterns (§4) ---
@@ -3637,11 +3673,19 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
             dm.bounded  = m.bounded ? 1 : 0;
-            dm.boundShape = (m.boundShape == MediumBound::Sphere) ? 1 : 0;
+            dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
+                          : (m.boundShape == MediumBound::Implicit) ? 2 : 0;
             dm.bmin = {m.bmin.x, m.bmin.y, m.bmin.z};
             dm.bmax = {m.bmax.x, m.bmax.y, m.bmax.z};
             dm.bcenter = {m.bcenter.x, m.bcenter.y, m.bcenter.z};
             dm.bradius = m.bradius;
+            // Implicit bound: point at this medium's slice of the shared field pool.
+            // exprOff is baked absolute into each node, so pass the whole expr pool.
+            const MedFieldSlice& fs = medField[i];
+            dm.boundField     = (fs.off >= 0 && d_fnodes) ? (d_fnodes + fs.off) : nullptr;
+            dm.boundFieldN    = fs.n;
+            dm.boundFieldExpr = d_fexpr;
+            dm.boundInsideNeg = m.boundInsideNeg ? 1 : 0;
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
