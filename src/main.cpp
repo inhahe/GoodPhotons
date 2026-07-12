@@ -11,9 +11,11 @@
 //   -mode D : bidirectional path tracing (BDPT) — one unbiased estimator that traces
 //             a light AND a camera subpath and MIS-combines every connection. Renders
 //             specular-first pixels directly (no composite seam) AND diffuse caustics
-//             in a single pass, on the absolute-radiance scale. GPU-accelerated (its
-//             own BDPT megakernel; see renderBdptCuda). Does not support fluorescence /
-//             participating media / spot & env lights (use B/P or R for those). See
+//             in a single pass, on the absolute-radiance scale. Renders participating
+//             media of every kind — global haze, bounded, and heterogeneous density
+//             fields (volume in-scatter vertices + transmittance-weighted connections).
+//             GPU-accelerated (its own BDPT megakernel; see renderBdptCuda). Does not
+//             support fluorescence / spot & env lights (use B/P or R for those). See
 //             renderBdpt / bdpt.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
@@ -1490,6 +1492,99 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     return true;
 }
 
+// --- Standalone artifact -> PNG conversion (`-topng`) --------------------------
+// Turn an existing render artifact into a 24-bit PNG without re-rendering, so the
+// ppm/ outputs and *.ftbuf resume checkpoints can be shared as PNGs with the same
+// binary. Dispatched from main() before any scene/CLI setup, so it is a pure,
+// dependency-free utility path. Handles:
+//   * .ppm  — binary P6, 8-bit — re-encoded as PNG (a lossless RGB copy).
+//   * .ftbuf — the raw linear film checkpoint — loaded and tone-mapped to PNG. The
+//     sidecar does not persist the exposure mode, so this uses the same p99 auto-
+//     exposure as a non-absolute render; an absolute (power/lumens) scene may look
+//     brighter/darker than its original -o image. Re-run the render for an
+//     exposure-exact PNG.
+//   * .ftsl — NOT handled here (it is a scene, not an image): render it with -in.
+
+// Read a binary P6 (8-bit) PPM into a top-row-first RGB byte buffer. Returns false
+// for ASCII (P3), non-8-bit (maxval != 255) or malformed files.
+static bool readBinaryPPM(const std::string& path, int& W, int& H,
+                          std::vector<uint8_t>& rgb) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char m0 = 0, m1 = 0;
+    in.get(m0); in.get(m1);
+    if (!in || m0 != 'P' || m1 != '6') return false;
+    // Read an unsigned int, skipping leading whitespace and '#' comments (PPM grammar).
+    auto readUInt = [&](int& v) -> bool {
+        int c;
+        for (;;) {
+            c = in.get();
+            if (c == EOF) return false;
+            if (c == '#') { while ((c = in.get()) != EOF && c != '\n') {} continue; }
+            if (std::isspace((unsigned char)c)) continue;
+            break;
+        }
+        if (!std::isdigit((unsigned char)c)) return false;
+        v = 0;
+        do { v = v * 10 + (c - '0'); c = in.get(); }
+        while (c != EOF && std::isdigit((unsigned char)c));
+        return true;   // the one trailing non-digit byte consumed here is the single
+                       // whitespace separator before the pixel data (P6 convention).
+    };
+    int maxv = 0;
+    if (!readUInt(W) || !readUInt(H) || !readUInt(maxv)) return false;
+    if (W <= 0 || H <= 0 || maxv != 255) return false;   // only 8-bit binary PPM
+    rgb.assign((size_t)W * H * 3, 0);
+    in.read((char*)rgb.data(), (std::streamsize)rgb.size());
+    return (bool)in && in.gcount() == (std::streamsize)rgb.size();
+}
+
+static int convertToPng(const std::string& inPath, const std::string& outPath) {
+    if (endsWithCI(inPath, ".ppm")) {
+        int W = 0, H = 0; std::vector<uint8_t> rgb;
+        if (!readBinaryPPM(inPath, W, H, rgb)) {
+            std::fprintf(stderr, "error: %s is not a readable binary (P6) 8-bit PPM\n",
+                         inPath.c_str());
+            return 1;
+        }
+        if (!writeImage(outPath, W, H, rgb)) return 1;
+        std::printf("converted %s -> %s (%dx%d, 24-bit RGB)\n",
+                    inPath.c_str(), outPath.c_str(), W, H);
+        return 0;
+    }
+    if (endsWithCI(inPath, ".ftbuf")) {
+        std::ifstream in(inPath, std::ios::binary);
+        if (!in) { std::fprintf(stderr, "error: cannot open %s\n", inPath.c_str()); return 1; }
+        char magic[8]; in.read(magic, 8);
+        if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0) {
+            std::fprintf(stderr, "error: %s is not a recognised FTBUF checkpoint\n",
+                         inPath.c_str());
+            return 1;
+        }
+        int32_t rx = 0, ry = 0, m = 0; long long Nph = 0;
+        in.read((char*)&rx, 4); in.read((char*)&ry, 4); in.read((char*)&m, 4);
+        in.read((char*)&Nph, 8);
+        double en[5]; in.read((char*)en, sizeof en);
+        uint64_t g = 0; in.read((char*)&g, 8);
+        if (!in || rx <= 0 || ry <= 0) {
+            std::fprintf(stderr, "error: %s header malformed\n", inPath.c_str());
+            return 1;
+        }
+        Film f; f.resX = rx; f.resY = ry; f.alloc();
+        in.read((char*)f.xyz.data(),  (std::streamsize)(f.xyz.size()  * sizeof(Vec3)));
+        in.read((char*)f.hits.data(), (std::streamsize)(f.hits.size() * sizeof(double)));
+        if (!in) { std::fprintf(stderr, "error: %s truncated\n", inPath.c_str()); return 1; }
+        // Tone-map with the default p99 auto-exposure (see note above). writeFilm prints
+        // the "wrote <out> ..." line.
+        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1)) ? 0 : 1;
+    }
+    std::fprintf(stderr,
+        "error: -topng converts .ppm and .ftbuf inputs; got '%s'.\n"
+        "       A .ftsl is a scene, not an image — render it with: "
+        "ftrace -in scene.ftsl -o out.png\n", inPath.c_str());
+    return 1;
+}
+
 // Is anything in this scene outside BDPT's (mode D) transport scope? Returns a human
 // description of the first unsupported feature, or nullptr if the scene is fully BDPT-
 // renderable. BDPT here covers Lambertian/glossy scatter + quad/sphere area emission
@@ -2085,6 +2180,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 }
 
 int main(int argc, char** argv) {
+    // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
+    // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
+    // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
+    if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
+        if (argc < 4) {
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> <output.png>\n",
+                         argv[0]);
+            return 2;
+        }
+        return convertToPng(argv[2], argv[3]);
+    }
     long long N = 2'000'000;
     int res = 256;
     char mode = 'B';

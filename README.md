@@ -726,6 +726,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
+| `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-mode <A..D>` | Render mode (default `B`) |
 | `-camera <name>` | Select a named camera |
 | `-t <threads>` | CPU thread count |
@@ -766,10 +767,24 @@ CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
 
 ## Output
 
-Images are written as **PNG**, **JPEG** (q95), or binary **PPM (P6)**, chosen by
-the output file extension, tone-mapped from the internal linear spectral film to
-8-bit sRGB. Long renders can checkpoint to `<out>.ftbuf` and resume
-deterministically.
+Images are written as **PNG** (24-bit RGB, 8 bits/channel — no alpha), **JPEG**
+(q95), or binary **PPM (P6)**, chosen by the output file extension, tone-mapped from
+the internal linear spectral film to 8-bit sRGB. Long renders can checkpoint to
+`<out>.ftbuf` and resume deterministically.
+
+**Converting existing artifacts to PNG** — `ftrace -topng <in> <out.png>` re-encodes
+an artifact to a 24-bit PNG *without re-rendering*:
+
+- a **`.ppm`** (binary P6, 8-bit) is copied to PNG losslessly;
+- a **`.ftbuf`** resume-checkpoint has its raw linear film tone-mapped (with the
+  default p99 auto-exposure — the sidecar doesn't store the exposure mode, so an
+  absolute/lumens scene may read brighter or darker than its original `-o` image;
+  re-render for an exposure-exact PNG).
+
+A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
+Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
+**`ftbuf_to_png.bat`** (both call `-topng`), and **`ftsl_to_png.bat`** (renders the
+scene). Drop a file on one, or run `ppm_to_png.bat input.ppm [output.png]`.
 
 ---
 
