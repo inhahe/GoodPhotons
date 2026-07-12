@@ -132,21 +132,19 @@ GPU-vs-CPU energy identical (absorbed 0.9978) and indirect room lighting agreein
 applies — an implicit-shaped fog is enclosed by its own isosurface, so its direct camera view
 is a refracted SDS path; it lights the room correctly.)*
 
-**Remaining gap (partly closed):**
-- **BDPT (mode D) — homogeneous media DONE 2026-07-12 (CPU + GPU).** `bdpt.h` and the GPU
-  BDPT megakernel (`render_cuda.cu` `kBdpt`) now handle **homogeneous** media of every
-  spatial kind — global haze, multiple superposed media, and box/sphere/object-**bounded**
-  fog — with volume in-scatter (`VType::Medium` / `BV_MEDIUM`) vertices, HG-phase
-  connections and transmittance-weighted edges. `cudaBdptSupported` now rejects only
-  *heterogeneous* (density-field) media, so a homogeneous bounded scene runs on-device.
-  A `density` field is still outside BDPT scope: `bdptUnsupportedFeature` (CPU) rejects it
-  with a clear message and `cudaBdptSupported` falls back / rejects. Validation: global
-  haze CPU-vs-GPU whole-image mean 0.04698 vs 0.04702 (+0.09%); bounded fog-through-glass
-  (`scraps/fogsphere.ftsl`) CPU-vs-GPU center 0.237 vs 0.242 (within MC noise), both a
-  bright glowing disc. Proper unbiased homogeneous MIS (the σt·exp distance pdf and
-  transmittance cancel pairwise on both the sampling and recompute sides — PBRT-v3
-  convention). *Heterogeneous BDPT would need a null-scattering / spectral-tracking MIS
-  rewrite; deferred.*
+**Remaining gap (BDPT fully closed):**
+- **BDPT (mode D) — ALL media DONE 2026-07-12 (CPU + GPU), incl. heterogeneous.** `bdpt.h`
+  and the GPU BDPT megakernel (`render_cuda.cu` `kBdpt`) handle media of every kind —
+  global haze, multiple superposed media, box/sphere/object-**bounded** fog, **and
+  heterogeneous `density`-field blobs** — with volume in-scatter (`VType::Medium` /
+  `BV_MEDIUM`) vertices, HG-phase connections and transmittance-weighted edges. Both
+  `bdptUnsupportedFeature` (CPU) and `cudaBdptSupported` (GPU) now accept any medium.
+  Validation (homogeneous): global haze CPU-vs-GPU whole-image mean 0.04698 vs 0.04702
+  (+0.09%); bounded fog-through-glass (`scraps/fogsphere.ftsl`) CPU-vs-GPU center 0.237 vs
+  0.242. Validation (heterogeneous): `scraps/fogblob.ftsl` (soft-edged density blob) mode D
+  GPU vs mode B forward reference mean 0.04213 vs 0.04247 (−0.8%), centerMean 0.30009 vs
+  0.30211 (−0.7%) — within the ~6% MC noise floor, confirming unbiased. See the resolved
+  entry below for why the homogeneous cancellation is *not* required for correctness.
 - **Backward modes (R/V) + P camera layer still treat it as homogeneous** (on BOTH
   backends). `backward.h` (modes R/V) and the camera-side layer of the P composite still
   use the medium as a single global homogeneous haze and ignore `density`/`bounds`; on the
@@ -155,41 +153,49 @@ is a refracted SDS path; it lights the room correctly.)*
   heterogeneous/bounded medium is rendered in R/V/P. Proper fix: port delta/ratio tracking
   into the backward volume march too (then mirror it on the GPU).
 
-### Heterogeneous (density-field) media in BDPT (mode D) — DEFERRED (needs null-scattering rewrite) — 2026-07-12
-**What:** BDPT (mode D) renders only **homogeneous** media (done, CPU+GPU). A `density`-field
-(heterogeneous) medium is explicitly **rejected** (`bdptUnsupportedFeature` CPU message;
-`cudaBdptSupported` GPU fallback) rather than rendered — because the homogeneous MIS in
-`bdpt.h`/`kBdpt` relies on a cancellation that **breaks** for heterogeneous media, and no
-biased shortcut is acceptable (CLAUDE.md "proper fix only").
+### Heterogeneous (density-field) media in BDPT (mode D) — DONE 2026-07-12 (CPU + GPU)
+**What:** BDPT (mode D) now renders **heterogeneous** (`density`-field) media unbiasedly on
+both backends, using the *same* code path as homogeneous/bounded media — no null-scattering
+rewrite was needed. Both `bdptUnsupportedFeature` (CPU) and `cudaBdptSupported` (GPU) accept
+any medium; the heterogeneous rejections were removed.
 
-**Why the current approach can't extend:** for a homogeneous medium the free-flight distance
-pdf `σt·exp(-σt·d)` and the transmittance `exp(-σt·d)` cancel pairwise in every balance-
-heuristic ratio, so both are omitted from the sampling side (`randomWalk`) **and** the
-recompute side (`vertexPdf`) — exactly PBRT-v3's convention. For a heterogeneous medium the
-transmittance is a **path integral** estimated stochastically (ratio/Woodcock tracking), the
-collision pdf is `σt(x_t)·T(x_0→x_t)`, and the reverse-direction pdf that `vertexPdf` must
-recompute needs the reverse heterogeneous transmittance — these **no longer cancel**, so the
-MIS weights would be wrong (biased) if we reused the homogeneous bookkeeping.
+**Why the earlier "cancellation breaks → biased" reasoning was wrong (corrected):** the
+balance-heuristic MIS weights `w_s = p̂_s / Σ_i p̂_i` are a **partition of unity for any
+consistent positive pdfs** — `Σ_s w_s = 1` holds identically, regardless of what each `p̂_i`
+is. The estimator `E[ Σ_s w_s · f/p_s ] = ∫ f · (Σ_s w_s) dx = ∫ f dx` is therefore
+**unbiased** whenever (a) the *sampled* strategy's throughput `f/p_s` is exact, and (b) the
+weights sum to 1. Omitting the heterogeneous distance-pdf / transmittance from the MIS
+weights (the homogeneous bookkeeping we reuse) only makes the `p̂_i` a *different but still
+consistent* set of positive numbers — it changes the **variance**, never the bias. This is
+exactly what PBRT-v3 does for heterogeneous media. The homogeneous σt·exp/transmittance
+cancellation is a variance nicety, **not** a correctness requirement.
 
-**Proper fix (feasible, but a major rewrite):** the **null-scattering path-integral
-formulation** (Miller, Georgiev & Jarosz, SIGGRAPH 2019) — augment path space with
-null-scattering (fictitious) collisions at the majorant `σ_maj`, so the medium is effectively
-*homogeneous at σ_maj* and the distance pdfs become analytic again; real/null events are
-discrete, both subpaths agree on the pdf, and the pairwise cancellation is restored →
-unbiased. (UPBP, Křivánek et al. 2014, is the fuller BDPT+beams treatment.) Implementation
-scope: (1) record the majorant-homogeneous collision pdf + real/null probabilities during
-`randomWalk`; (2) make `vertexPdf` recompute them consistently in reverse; (3) express the
-connection-edge transmittance as the matching null-scattering expected-value estimator; (4)
-either materialise null vertices (blows the fixed `BDPT_MAXV` path budget — heterogeneous
-media can spawn many null collisions) **or** use the collision-free transmittance-estimator
-form; (5) mirror all of it in the GPU megakernel (`kBdpt`) within fixed-size per-thread path
-arrays. This is a dedicated multi-part effort with real correctness pitfalls, on the order of
-the whole homogeneous Phase 1 again (×2 for CPU+GPU).
+**Why the sampled-strategy throughput stays exact:** subpath medium vertices are placed by
+**delta (Woodcock) tracking** (`sampleMediaCollision`) with **analog throughput** (β
+unchanged; RR-absorb on albedo) — the same unbiased sampler validated mode B uses.
+Connection edges are weighted by **ratio-tracking transmittance** (`mediaTransmittance`),
+which appears *linearly* in the connection throughput, so its unbiased estimate keeps the
+connection estimate unbiased. Albedo and phase `g` are spatially constant (only density
+varies), so a medium vertex's `mediumId`/`mediumG` fully determine phase + albedo and
+`vertexPdf` recomputes the cosine-free phase-direction density consistently forward/reverse
+regardless of heterogeneity.
 
-**Recommendation / workaround:** render heterogeneous fog with a **forward** mode (A/B/C) —
-they already support density fields + bounds unbiasedly via delta/ratio tracking on both CPU
-and GPU (see the media tech-debt entry above). Deferred until heterogeneous BDPT is actually
-needed; do **not** attempt a partial/biased MIS in the meantime.
+**Implementation:** removed the `heterogeneous()` guards in `bdptUnsupportedFeature`
+(`main.cpp`) and `cudaBdptSupported` (`render_cuda.cu`); the existing `randomWalk` /
+`dRandomWalk` medium-event blocks and `connectBDPT` / `dConnectBDPT` transmittance-weighted
+connections already handle spatially-varying σt (they call the same delta/ratio-tracking
+helpers the forward tracer uses). No path-budget or MIS changes were required.
+
+**Validation:** `scraps/fogblob.ftsl` (soft-edged density blob, absolute exposure): mode D
+GPU vs mode B forward reference — mean 0.04213 vs 0.04247 (−0.8%), centerMean(30%) 0.30009 vs
+0.30211 (−0.7%); mode D CPU vs GPU — mean 0.04204 vs 0.04213 (−0.2%), centerMean 0.29972 vs
+0.30009 (−0.1%). All within the ~6–9% MC noise floor → unbiased and backend-consistent.
+
+**Optional future variance work (not correctness):** the null-scattering path-integral
+formulation (Miller/Georgiev/Jarosz 2019; UPBP, Křivánek et al. 2014) would put the omitted
+heterogeneous transmittance *into* the MIS weights, reducing variance in optically-thick
+heterogeneous media. Purely a variance optimization — the current estimator is already
+unbiased.
 
 ### Diffuse-transmission material — CPU DONE 2026-07-12 (GPU port pending)
 Added `type translucent` (alias `diffuse_transmit`): a two-sided Lambertian BSDF — the

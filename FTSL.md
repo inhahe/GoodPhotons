@@ -520,15 +520,19 @@ tracking** for shadow-ray transmittance, so the result is exact (no voxelization
 plain homogeneous `medium` (no `density`, no `bounds`) is unchanged and bit-identical
 to before.
 
-> **Mode support:** *heterogeneous* (`density`-field) fog is honored only by the
-> **forward** light tracer — modes **A/B/C** (and the forward layers of V/P), on **both the
-> CPU and the GPU** (`-device gpu` runs the identical density VM + delta/ratio tracking).
-> **BDPT (D)** renders every kind of **homogeneous** medium — global haze, superposed
-> media, and box/sphere/object-**bounded** fog — unbiased on both the CPU and the GPU, but
-> a `density` field is outside its scope (it is rejected with a clear message; use a forward
-> mode). The backward reference (R/V) and the camera-side layer of the P composite treat the
-> medium as a single global homogeneous haze and **ignore** `density` and `bounds` (the
-> renderer warns when you do this). Render heterogeneous fog blobs with a forward mode.
+> **Mode support:** *heterogeneous* (`density`-field) fog is honored by the **forward**
+> light tracer — modes **A/B/C** (and the forward layers of V/P) — **and by BDPT (D)**, on
+> **both the CPU and the GPU** (`-device gpu` runs the identical density VM + delta/ratio
+> tracking). **BDPT (D)** renders every kind of medium — global haze, superposed media,
+> box/sphere/object-**bounded** fog, and **heterogeneous `density`-field blobs** — unbiased
+> on both the CPU and the GPU: subpath medium vertices are placed by delta tracking and
+> connections weighted by ratio-tracking transmittance, exactly as the forward tracer
+> samples them. (The MIS weights omit the heterogeneous transmittance — a variance-only
+> PBRT-v3 simplification; the balance heuristic is a partition of unity, so the estimator
+> stays unbiased regardless.) The backward reference (R/V) and the camera-side layer of the
+> P composite treat the medium as a single global homogeneous haze and **ignore** `density`
+> and `bounds` (the renderer warns when you do this). Render heterogeneous fog for those
+> modes with a forward mode instead.
 
 ---
 

@@ -4059,13 +4059,12 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
 
 bool cudaBdptSupported(const Scene& scene) {
     // BDPT-GPU needs the same POD-bakeable materials as the forward path, PLUS the
-    // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): only HOMOGENEOUS
-    // participating media (heterogeneous / density-field media are rejected, matching
-    // the CPU BDPT), and only area/sphere/cylinder Lambertian emitters (no spot/env/
-    // collimated).
+    // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): participating media
+    // — homogeneous AND heterogeneous (density-field / bounded) — are supported (device
+    // random walk places medium vertices by delta tracking and weights connections by
+    // ratio-tracking transmittance, matching the CPU BDPT), and only area/sphere/cylinder
+    // Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
-    for (const auto& m : scene.media)
-        if (m.heterogeneous()) return false;
     // Dielectric translucency (frosting + Beer-Lambert interior absorption) runs on the
     // device forward/backward tracers, but the BDPT kernel (kBdpt) treats every dielectric
     // as smooth & non-absorbing and its pdf/eval use constant params — a frosted or colored

@@ -1499,14 +1499,14 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
 // referenced by geometry are flagged (built-in palettes carry spare unused entries);
 // Mix children are expanded since a used Mix can pick e.g. a fluorescent child.
 static const char* bdptUnsupportedFeature(const Scene& scene) {
-    // Homogeneous participating media (box/sphere/object-bounded, constant coefficients,
-    // possibly several superposed) ARE supported by volumetric BDPT. Heterogeneous /
-    // density-field / implicit-bounded media need delta/ratio tracking whose distance-pdf
-    // and transmittance are estimators, not closed forms, which breaks the balance-
-    // heuristic MIS cancellation — those must use a forward mode (A/B/C) instead.
-    for (const auto& m : scene.media)
-        if (m.heterogeneous())
-            return "heterogeneous / density-field participating media";
+    // Participating media — homogeneous AND heterogeneous (density-field / bounded) — are
+    // supported by volumetric BDPT. Subpath medium vertices are placed by delta (Woodcock)
+    // tracking with analog throughput and connection edges are weighted by ratio-tracking
+    // transmittance (both unbiased estimators, exactly as the forward tracer does). The MIS
+    // weights omit the heterogeneous distance-pdf / transmittance — a variance-only
+    // simplification (PBRT-v3 convention): the balance heuristic is a partition of unity for
+    // any consistent pdfs, so the estimator stays unbiased regardless (only the sampled
+    // strategy's throughput must be exact, which analog + ratio tracking guarantee).
     std::vector<char> matUsed(scene.mats.size(), 0);
     // Mark a material and (one level, since Mix children can't themselves be Mix) its
     // Mix children, which a used Mix can pick at runtime.
@@ -1702,10 +1702,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // they ignore the density field and the bounds box. Warn loudly rather than silently
     // render a different fog than authored. (Tracked in known-issues.md: heterogeneous
     // media in backward modes.) Mode D (volumetric BDPT) is EXCLUDED here: it handles
-    // multiple superposed and box/sphere/object-bounded HOMOGENEOUS media correctly (over
-    // the full scene.media vector), and rejects heterogeneous/density-field media outright
-    // via bdptUnsupportedFeature above — so it never needs this "single global haze"
-    // warning.
+    // multiple superposed, box/sphere/object-bounded AND heterogeneous (density-field)
+    // media correctly (over the full scene.media vector) — subpath medium vertices are
+    // placed by delta tracking and connections weighted by ratio-tracking transmittance —
+    // so it never needs this "single global haze" warning.
     bool mediaNeedForward = scene.media.size() > 1;   // >1 medium is forward-only (R/V/P)
     for (const Medium& m : scene.media)
         if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
@@ -1716,7 +1716,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
             "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
             "IGNORED here. Render multi/heterogeneous/bounded fog with a forward mode "
-            "(A/B/C) or volumetric BDPT (mode D, homogeneous only) for correct results.\n", mode);
+            "(A/B/C) or volumetric BDPT (mode D) for correct results.\n", mode);
     }
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU

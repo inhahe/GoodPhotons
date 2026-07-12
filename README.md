@@ -148,12 +148,13 @@ paths they can capture at all**.
   camera ray is traced through the real glass while forward light transport keeps its
   caustic efficiency (the light-image splat strategy is disabled, since a multi-element
   lens has no closed-form sensor projection; runs on the CPU **and GPU**). It renders
-  **homogeneous participating media** (global haze, multiple superposed media, and
-  box/sphere/object-bounded fog) with volume in-scatter vertices, HG-phase connections
-  and transmittance-weighted edges — so fog *inside a glass shell* images correctly here
-  (a case the next-event modes leave dark). *Cost:* highest cost per sample, and it
-  **does not support fluorescence, heterogeneous/density-field media, or spot & env
-  lights** (use `B`/`P` or `R` for those).
+  **participating media of every kind** — global haze, multiple superposed media,
+  box/sphere/object-bounded fog, and **heterogeneous `density`-field blobs** — with volume
+  in-scatter vertices, HG-phase connections and transmittance-weighted edges (subpath
+  medium vertices placed by delta tracking, connections weighted by ratio-tracking
+  transmittance), so fog *inside a glass shell* images correctly here (a case the
+  next-event modes leave dark). *Cost:* highest cost per sample, and it **does not support
+  fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
@@ -178,10 +179,10 @@ the `P` composite is not progressive.
   mode-`P` composite); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (env/spot/collimated lights, fluorescence; heterogeneous/density-field fog for `D`,
-  any fog for `R`), and for fluorescent/oversized-mix forward scenes. Mode `D`'s GPU
-  BDPT megakernel now renders **homogeneous** participating media (haze, superposed and
-  bounded fog) directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
+  (env/spot/collimated lights, fluorescence; any fog for `R`), and for
+  fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
+  **all** participating media — haze, superposed, bounded, and heterogeneous
+  `density`-field fog — directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
   **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
   GPU-accelerated now — the device sphere-traces the same field expressions, runs the
   same pattern VM, and threads the interior-absorption medium through both the forward
@@ -598,11 +599,14 @@ unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for
 transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
 `bounds` (or set explicitly). Heterogeneous/bounded fog is honored by the **forward**
 modes (A/B/C) on **both the CPU and the GPU** (the device runs the identical density VM +
-delta/ratio tracking). **BDPT `D`** renders **homogeneous** media of every kind — global
-haze, multiple superposed media, and box/sphere/object-**bounded** fog — unbiased on both
-the CPU and the GPU, but a *heterogeneous* `density` field is outside its scope, so a
-density-field medium falls back / is rejected for `D` (use a forward mode). The backward
-reference (R/V) and the P composite treat the medium as a single global homogeneous haze
+delta/ratio tracking). **BDPT `D`** renders media of **every kind** — global haze,
+multiple superposed media, box/sphere/object-**bounded** fog, and **heterogeneous
+`density`-field blobs** — unbiased on both the CPU and the GPU: subpath medium vertices are
+placed by delta tracking (analog throughput) and connection edges weighted by ratio-tracking
+transmittance, exactly as the forward tracer samples them. (The MIS weights omit the
+heterogeneous distance-pdf / transmittance — a variance-only simplification per PBRT-v3;
+the balance heuristic is a partition of unity so the estimator stays unbiased regardless.)
+The backward reference (R/V) and the P composite treat the medium as a single global homogeneous haze
 and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
 
 ---
