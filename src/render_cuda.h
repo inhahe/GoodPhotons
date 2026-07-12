@@ -17,6 +17,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "render.h"   // EnergyReport, Film
+#include "render_progress.h"   // SppProgress (chunked progress for modes R/D)
 
 // True if a usable CUDA device is present (driver + at least one device). Cheap to
 // call; result is cached after the first query.
@@ -57,12 +58,18 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
 bool cudaBdptSupported(const Scene& scene);
 
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
-// resolution and returns the final absolute-radiance film (same units/convention as
-// the CPU renderBdpt, i.e. writeFilm(film, 1.0) for display). maxDepth is the maximum
-// path length in edges (clamped to the device capacity). Requires cudaAvailable() &&
-// cudaBdptSupported(scene); otherwise returns an empty film.
+// resolution and returns the film accumulated as a SUM over spp (display divides by
+// spp: writeFilm(film, spp)). maxDepth is the maximum path length in edges (clamped to
+// the device capacity). Requires cudaAvailable() && cudaBdptSupported(scene); otherwise
+// returns an empty film.
+// When `prog` is non-null the spp is rendered in chunks: after each chunk prog->report()
+// receives the running SUM film and the spp done so far, and can rewrite the image / show
+// progress / request an early stop. A null `prog` renders all spp in one launch (the
+// historical path). Either way the result is bit-identical for a given spp (the RNG is
+// seeded on the global sample index, so chunking never changes the image).
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                    long long spp, int maxDepth, bool diffraction);
+                    long long spp, int maxDepth, bool diffraction,
+                    const SppProgress* prog = nullptr);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
@@ -79,5 +86,11 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // cos^4*A/Z^2 radiometric weight). Requires cudaAvailable() && cudaBackwardSupported();
 // otherwise returns an empty film. The device RNG differs from the CPU, so the image is
 // an independent noise realization that agrees to within Monte-Carlo noise.
+// When `prog` is non-null the spp is rendered in chunks: after each chunk prog->report()
+// receives the running SUM film and the spp done so far, and can rewrite the image / show
+// progress / request an early stop. A null `prog` renders all spp in one launch (the
+// historical path). Either way the result is bit-identical for a given spp (the RNG is
+// seeded on the global sample index, so chunking never changes the image).
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                        long long spp, bool diffraction);
+                        long long spp, bool diffraction,
+                        const SppProgress* prog = nullptr);

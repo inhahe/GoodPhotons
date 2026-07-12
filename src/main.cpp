@@ -40,32 +40,40 @@
 // usually faster on shallow, uniform scenes on a big GPU (its default). The RNG stream
 // differs, so images match the megakernel only to within Monte-Carlo noise.
 //
-// Progressive rendering (forward modes A/B/C only; brightness is photon-count-
-// independent, so more photons only reduce graininess):
-//   -n <photons>   trace exactly this many photons (default).
-//   -time <sec>    trace in batches until the wall-clock budget elapses (-n is the
-//                  batch/checkpoint granularity).
-//   -noise <pct>   trace in batches until the estimated graininess falls to <= pct
-//                  percent (the same "~X% noise" figure the progress line reports:
-//                  100/sqrt(mean per-lit-pixel photon count)), then stop and save.
+// Progressive rendering & live progress. Every image-forming mode — the forward camera
+// models A/B/C (photon-count-independent brightness), the backward reference R, and the
+// bidirectional D (both accumulate a SUM over samples-per-pixel) — refines an image whose
+// brightness is fixed and whose graininess only falls with more samples. So all of them
+// report the same live progress (periodic crash-safe image write, a status line or
+// -preview thumbnail, and a ~noise% estimate) and accept the same budget flags:
+//   -n <photons>   forward A/B/C: trace exactly this many photons (default). For R/D the
+//                  sample budget is -spp; -n is only the forward batch granularity.
+//   -time <sec>    render until the wall-clock budget elapses, then stop and save. Works
+//                  for A/B/C (photon batches) and R/D (spp chunks) alike.
+//   -noise <pct>   render until the estimated graininess falls to <= pct percent (the same
+//                  "~X% noise" figure the progress line reports: for A/B/C 100/sqrt(mean
+//                  per-lit-pixel photon count); for R/D 100/sqrt(spp done)), then stop.
 //                  Combine with -time to also cap the wall-clock ("stop at whichever
 //                  comes first"); alone it traces until converged (Ctrl-C stops early).
-//   -forever       trace indefinitely, refining the image, until interrupted (Ctrl-C):
-//                  the first Ctrl-C finishes the current batch, writes a final image +
-//                  checkpoint, and exits cleanly (a second Ctrl-C force-quits). Implies
-//                  the checkpoint, so a later -resume picks up where you stopped.
-//   -resume        reload the accumulated film from the "<out>.ftbuf" checkpoint and
-//                  keep adding photons (with -n more, -time more seconds, or -forever).
-//   -checkpoint    on a plain -n render, also write the checkpoint so a later -resume
-//                  can continue it (-time/-forever/-resume imply it). Each batch/resume
-//                  draws an independent RNG stream (seed offset = cumulative photons), so
-//                  the result matches a single render of the combined count; a fresh -n
-//                  render (offset 0) is bit-identical to the historical single-shot path.
-//   -preview       during -time/-noise/-forever, redraw a live ANSI colour thumbnail of
-//                  the current image in the terminal at each periodic update (in place).
-//   -interval <s>  seconds between periodic image writes / preview refreshes during
-//                  -time/-noise/-forever (default 15). The output image file is rewritten at
-//                  this cadence, so an auto-reloading image viewer is also a live display.
+//   -forever       render indefinitely, refining, until interrupted (Ctrl-C): the first
+//                  Ctrl-C finishes the current batch/chunk, writes a final image, and
+//                  exits cleanly (a second Ctrl-C force-quits). For A/B/C it implies the
+//                  checkpoint, so a later -resume picks up where you stopped.
+//   -resume        (forward A/B/C only) reload the accumulated film from the "<out>.ftbuf"
+//                  checkpoint and keep adding photons (with -n/-time/-forever).
+//   -checkpoint    (forward A/B/C only) on a plain -n render, also write the checkpoint so
+//                  a later -resume can continue it (-time/-forever/-resume imply it). Each
+//                  batch/resume draws an independent RNG stream (seed offset = cumulative
+//                  photons), so the result matches a single render of the combined count; a
+//                  fresh -n render (offset 0) is bit-identical to the historical path. (R/D
+//                  are not disk-resumable yet — their chunks accumulate only in memory.)
+//   -preview       during a progress render, redraw a live ANSI colour thumbnail of the
+//                  current image in the terminal at each periodic update (in place).
+//   -interval <s>  seconds between periodic image writes / preview refreshes (default 15).
+//                  The output image file is rewritten at this cadence, so an auto-reloading
+//                  image viewer is also a live display. Applies to every mode above (a plain
+//                  fixed -spp R/D render also rewrites the image and prints "[spp] x/total"
+//                  progress as its chunks land).
 
 #include <cstdio>
 #include <cmath>
@@ -1149,12 +1157,18 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 
 // Backward reference: `spp` samples per pixel, threads render disjoint row bands
 // of a shared film (no shared-pixel writes, so no race).
+// `seedOffset` decorrelates the RNG stream so a chunked/progressive render can call
+// this repeatedly (each chunk with a distinct offset) and merge the SUM films for an
+// independent, ever-refining estimate. seedOffset==0 reproduces the original stream.
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
-                           long long spp, int nThreads, bool diffraction = true) {
+                           long long spp, int nThreads, bool diffraction = true,
+                           unsigned long long seedOffset = 0) {
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7, 0xD1B54A32D192ED03ULL ^ (uint64_t)tid);
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7,
+                            0xD1B54A32D192ED03ULL ^ (uint64_t)tid
+                              ^ (seedOffset * 0x9E3779B97F4A7C15ULL));
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, rng);
     };
@@ -1173,11 +1187,14 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // two normalised films sum to the final radiance; writeFilm(...,1.0) then only divides
 // by cieYIntegral for display, exactly like mode P's composite.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
-                       long long spp, int nThreads, int maxDepth, bool diffraction = true) {
+                       long long spp, int nThreads, int maxDepth, bool diffraction = true,
+                       unsigned long long seedOffset = 0) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11, 0x9E3779B97F4A7C15ULL ^ (uint64_t)tid);
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11,
+                            0x9E3779B97F4A7C15ULL ^ (uint64_t)tid
+                              ^ (seedOffset * 0xD1B54A32D192ED03ULL));
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -1191,16 +1208,16 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
     Film splat_film; splat_film.resX = resX; splat_film.resY = resY; splat_film.alloc();
     for (int t = 0; t < nThreads; ++t) { cam_film.merge(camBands[t]); splat_film.merge(splatBands[t]); }
 
-    // Combine onto one radiance scale. Both halves are normalised by the per-pixel
-    // sample count spp: the camera image (t>=2) is a per-pixel radiance estimate; the
-    // light image (t==1 splats) uses the full-image-plane camera importance We (see
-    // bdpt.h cameraWe), for which (1/spp)*We(A_full) is exactly the light-tracing scale
-    // (equivalently (1/(W*H*spp))*We(A_pixel) — the mode-B convention).
-    const double invCam = 1.0 / (double)spp;
-    const double invSplat = 1.0 / (double)spp;
+    // Combine onto one radiance scale as a SUM over samples (display divides by spp via
+    // writeFilm(out, spp), matching the GPU renderBdptCuda convention and letting a
+    // chunked/progressive render accumulate batches by summing). Both halves share the
+    // per-pixel sample count spp: the camera image (t>=2) is a per-pixel radiance
+    // estimate; the light image (t==1 splats) uses the full-image-plane camera importance
+    // We (see bdpt.h cameraWe), for which (1/spp)*We(A_full) is exactly the light-tracing
+    // scale (equivalently (1/(W*H*spp))*We(A_pixel) — the mode-B convention).
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     for (size_t i = 0; i < out.xyz.size(); ++i)
-        out.xyz[i] = cam_film.xyz[i] * invCam + splat_film.xyz[i] * invSplat;
+        out.xyz[i] = cam_film.xyz[i] + splat_film.xyz[i];
     return out;
 }
 
@@ -1501,6 +1518,131 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     return nullptr;
 }
 
+// CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
+// in adaptive chunks so a CPU mode-R/D render gets the same live progress as the GPU.
+// `renderOne(chunkSpp, seedOffset)` renders one chunk and returns its SUM film; the
+// chunks are merged into a running SUM and reported after each. A null/empty prog does
+// the historical single-shot render. Returns the accumulated SUM film (writeFilm divides
+// by the completed spp). Chunk size adapts toward ~0.4s so early frames appear quickly
+// and the per-chunk thread-spawn overhead stays negligible.
+static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX, int resY,
+                         const std::function<Film(long long, unsigned long long)>& renderOne) {
+    if (!prog || !prog->report) return renderOne(sppTarget, 0);
+    using clk = std::chrono::steady_clock;
+    Film acc; acc.resX = resX; acc.resY = resY; acc.alloc();
+    long long done = 0, chunk = 1;
+    while (done < sppTarget) {
+        long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
+        auto t0 = clk::now();
+        Film f = renderOne(c, (unsigned long long)(done + 1));
+        acc.merge(f);
+        done += c;
+        double dt = std::chrono::duration<double>(clk::now() - t0).count();
+        if (dt > 1e-4) {                       // retarget chunk toward ~0.4s of work
+            long long next = (long long)((double)c * (0.4 / dt));
+            if (next < 1) next = 1;
+            if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
+            chunk = next;
+        }
+        if (prog->report(acc, done, done >= sppTarget)) break;
+    }
+    return acc;
+}
+
+// Unified progress driver for the samples-per-pixel image modes (R backward reference,
+// D bidirectional). `renderChunked(sppTarget, prog)` is the mode-specific renderer that
+// accumulates a SUM film in chunks and calls prog->report() after each; this function
+// supplies that callback so every mode gets the SAME live progress as the forward camera
+// models: a periodic image rewrite (crash-safe), a status line (or -preview ANSI
+// thumbnail) every `intervalSec`, a ~noise% estimate, and clean Ctrl-C / -time / -noise /
+// -forever stopping. `sppReq` is the requested spp; when a time/noise/forever budget is
+// set the target is opened up (UNBOUNDED_SPP) and the stop is driven by the budget. The
+// display divides the SUM film by the spp completed, so brightness is constant and only
+// graininess falls as more samples land. Returns the process exit code (0 ok, 1 on a
+// write failure).
+static int runSppProgressive(
+        const std::string& outPath, long long sppReq,
+        double manualExposure, double* exposureAnchor, bool absolute,
+        double timeBudgetSec, double noiseTarget, bool runForever,
+        double intervalSec, bool preview,
+        const std::function<Film(long long, const SppProgress*)>& renderChunked) {
+    using clk = std::chrono::steady_clock;
+    // A time/noise/forever budget renders "until the budget", so open the spp target to a
+    // large-but-safe cap (keeps pixel*sppTotal seed indices well inside int64). A plain
+    // fixed-spp render just targets sppReq and still shows progress along the way.
+    const long long UNBOUNDED_SPP = 1'000'000'000LL;
+    const bool budgeted = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever);
+    const long long sppTarget = budgeted ? UNBOUNDED_SPP : sppReq;
+    if (intervalSec <= 0.0) intervalSec = 15.0;
+
+    if (preview) { enableAnsiTerminal(); g_previewRows = 0; }
+    // Trap Ctrl-C (and Windows Ctrl-Break) so a long render stops cleanly with the
+    // accumulated image saved, instead of losing everything since the last periodic write.
+    auto prev = std::signal(SIGINT, onInterrupt);
+#ifdef SIGBREAK
+    auto prevBrk = std::signal(SIGBREAK, onInterrupt);
+#endif
+
+    const auto t0 = clk::now();
+    auto lastSave = t0;
+    bool writeOk = true;
+    bool metNoise = false;
+    long long finalSpp = 0;
+
+    SppProgress prog;
+    prog.report = [&](const Film& film, long long sppDone, bool final) -> bool {
+        finalSpp = sppDone;
+        double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+        double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
+        // Every pixel receives exactly sppDone samples, so the Monte-Carlo relative error
+        // ~ 1/sqrt(samples) gives an honest graininess ballpark straight from the count.
+        double noisePct = sppDone > 0 ? 100.0 / std::sqrt((double)sppDone) : 0.0;
+        bool stopped  = g_stopRequested != 0;
+        bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
+        bool noiseMet = (noiseTarget > 0.0 && sppDone > 0 && noisePct <= noiseTarget);
+        if (noiseMet) metNoise = true;
+        bool stop = stopped || timeUp || noiseMet;
+        bool done = stop || final;
+        if (done || sinceSave >= intervalSec) {
+            // The converged/stopping frame owns the exposure anchor; intermediate frames
+            // auto-expose independently (they only refine, never lock the anchor).
+            writeOk = writeFilm(outPath.c_str(), film, (double)sppDone, manualExposure,
+                                /*quiet*/preview, done ? exposureAnchor : nullptr, absolute);
+            lastSave = clk::now();
+            const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
+            char st[220];
+            if (runForever)
+                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, ~%.2f%% noise%s",
+                              elapsed, sppDone, noisePct, why);
+            else if (timeBudgetSec > 0.0)
+                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, ~%.2f%% noise%s",
+                              elapsed, timeBudgetSec, sppDone, noisePct, why);
+            else if (noiseTarget > 0.0)
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, ~%.2f%% noise%s",
+                              noiseTarget, elapsed, sppDone, noisePct, why);
+            else
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, ~%.2f%% noise",
+                              sppDone, sppReq, elapsed, noisePct);
+            if (preview) ansiPreview(film, (double)sppDone, manualExposure, st);
+            else { std::printf("%s\n", st); std::fflush(stdout); }
+        }
+        return stop;
+    };
+
+    renderChunked(sppTarget, &prog);
+
+    std::signal(SIGINT, prev);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, prevBrk);
+#endif
+    if (g_stopRequested)
+        std::printf("\n[stop] interrupted at %lld spp — image saved.\n", finalSpp);
+    else if (metNoise)
+        std::printf("[noise] reached the ~%.2g%% target at %lld spp — image saved.\n",
+                    noiseTarget, finalSpp);
+    return writeOk ? 0 : 1;
+}
+
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
 // runs the mode dispatch (R/V backward+validate, P composite, or A/B/C forward),
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
@@ -1521,14 +1663,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool forwardCatch = (mode == 'C');
     const bool lensMode     = (mode == 'A');   // finite-lens next-event splat (physical camera)
 
-    // -time / -noise / -resume / -checkpoint accumulate a photon-count film, which only
-    // the pure forward camera models (A/B/C) do. Other modes accumulate differently
-    // (spp-based reference/BDPT, or the P composite) and are not resumable here.
-    if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume || wantCheckpointFlag || runForever) &&
-        !(mode == 'A' || mode == 'B' || mode == 'C')) {
-        std::fprintf(stderr, "[render] -time/-noise/-forever/-resume/-checkpoint apply only to "
-                             "forward camera modes A/B/C; ignoring for mode %c\n", mode);
-        timeBudgetSec = 0.0; noiseTarget = 0.0; resume = false; wantCheckpointFlag = false; runForever = false;
+    // -time / -noise / -forever now drive progress for the spp image modes too (R
+    // backward reference, D bidirectional): those accumulate a SUM-over-samples film in
+    // chunks, so a wall-clock/noise/indefinite budget just keeps adding samples exactly
+    // like the forward camera models. -resume / -checkpoint, however, still apply only to
+    // the forward models A/B/C (their photon-count checkpoint format); the spp modes are
+    // not resumable from disk yet, so keep those gated with a warning.
+    if ((resume || wantCheckpointFlag) && !(mode == 'A' || mode == 'B' || mode == 'C')) {
+        std::fprintf(stderr, "[render] -resume/-checkpoint apply only to forward camera modes "
+                             "A/B/C; ignoring for mode %c\n", mode);
+        resume = false; wantCheckpointFlag = false;
+    }
+    if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D')) {
+        std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward) "
+                             "and R/D (reference/BDPT); ignoring for mode %c\n", mode);
+        timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
@@ -1646,24 +1796,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "GPU render (megakernel/CPU otherwise)\n");
     }
 
-    // --- Backward reference (mode R) and validation (mode V) ---
-    if (refMode) {
-        // Mode R can run on the GPU (backward reference megakernel, incl. the physical
-        // lens); mode V keeps its backward reference on the CPU as the stable ground
-        // truth while its forward cross-check pass uses the GPU (useGpu below).
-        const bool gpuBackward = (mode == 'R' && useGpu);
-        std::printf("mode %c: backward reference %lld spp at %dx%d on %s (light=%s) ...\n",
-                    mode, spp, res, resY,
+    // --- Backward reference (mode R) ---
+    // Renders through the unified progress driver: the reference film accumulates as a
+    // SUM over samples-per-pixel, so it chunks exactly like the forward camera models and
+    // gets the same live status line / -preview thumbnail / periodic crash-safe write and
+    // -time / -noise / -forever budgeting. GPU when in scope (backward megakernel, incl.
+    // the physical lens), CPU otherwise — both chunk internally.
+    if (mode == 'R') {
+        const bool gpuBackward = useGpu;
+        std::printf("mode R: backward reference at %dx%d on %s (light=%s) ...\n",
+                    res, resY,
                     gpuBackward ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                     lightLabel);
-        Film ref;
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-        if (gpuBackward) ref = renderBackwardCuda(scene, cam, res, resY, spp, diffraction);
-        else             ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
-#else
-        ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
+            if (gpuBackward) return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p);
 #endif
-        if (mode == 'R') { return writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1; }
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderBackward(scene, cam, res, resY, c, nThreads, diffraction, off);
+                });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
+    // --- Validation (mode V) ---
+    // Mode V keeps its backward reference single-shot on the CPU as the stable ground
+    // truth, then cross-checks it against a forward light-trace pass. No progressive
+    // budgeting here (it renders a fixed spp / photon count to compare).
+    if (mode == 'V') {
+        std::printf("mode V: backward reference %lld spp at %dx%d on %d CPU threads (light=%s) ...\n",
+                    spp, res, resY, nThreads, lightLabel);
+        Film ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -1692,17 +1858,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return 1;
         }
         int maxDepth = 8;   // path length in edges; connection cost grows ~depth^2
-        std::printf("mode D: bidirectional path tracing, %lld spp at %dx%d on %s "
-                    "(maxDepth=%d, light=%s) ...\n", spp, res, resY,
-                    useGpu ? "GPU" : "CPU threads", maxDepth, lightLabel);
-        Film img;
+        std::printf("mode D: bidirectional path tracing at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
+                    res, resY, useGpu ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
+                    maxDepth, lightLabel);
+        // BDPT accumulates a SUM over spp (cam image + light-splat image), so it chunks
+        // through the same unified progress driver as the forward and mode-R renders.
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-        if (useGpu) img = renderBdptCuda(scene, cam, res, resY, spp, maxDepth, diffraction);
-        else        img = renderBdpt(scene, cam, res, resY, spp, nThreads, maxDepth, diffraction);
-#else
-        img = renderBdpt(scene, cam, res, resY, spp, nThreads, maxDepth, diffraction);
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p);
 #endif
-        return writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1;
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth, diffraction, off);
+                });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
     }
 
     // --- Forward + camera-side composite (mode P) ---
@@ -1910,12 +2082,12 @@ int main(int argc, char** argv) {
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
     bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
-    double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (forward modes A/B/C)
-    double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (forward A/B/C)
-    bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint
-    bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o
-    bool runForever = false;      // -forever: trace until Ctrl-C (forward modes A/B/C)
-    bool preview = false;         // -preview: live ANSI thumbnail during -time/-forever
+    double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (modes A/B/C forward, R/D spp)
+    double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (A/B/C, R/D)
+    bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint (A/B/C)
+    bool wantCheckpointFlag = false; // -checkpoint: save a resumable .ftbuf sidecar next to -o (A/B/C)
+    bool runForever = false;      // -forever: trace until Ctrl-C (modes A/B/C forward, R/D spp)
+    bool preview = false;         // -preview: live ANSI thumbnail during a progress render
     double intervalSec = 15.0;    // -interval <sec>: periodic image-write / preview cadence
     bool modeFromCli = false;     // did the CLI force a global -mode? (else per-camera)
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)

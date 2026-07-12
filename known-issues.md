@@ -32,7 +32,46 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
   tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
   accents + colored walls for this reason.
 
+## Tech debt
+
+### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
+The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now
+covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` backward,
+`D` BDPT) on both CPU and GPU. Two gaps remain:
+- **Mode `P` (composite) is still single-shot.** `renderComposite` (`main.cpp` ~line 1246)
+  couples a forward pass (`N` photons) and a backward pass (`spp`) with a **best-fit scale
+  `s`** solved once over the diffuse-side pixels, then classifies pixels and blends. Making
+  it progressive means chunking *both* passes, re-fitting `s` and recomputing the residual
+  each chunk (pixel classification is fixed and can be cached), and reporting the blended
+  frame — doable but a real design task, deferred. `-time`/etc. are currently rejected for
+  mode `P` with a warning.
+- **`R`/`D` accumulate chunks in memory only.** They get live progress and can stop on a
+  budget, but there's no `.ftbuf` disk checkpoint, so `-resume`/`-checkpoint` stay
+  forward-mode-only. A resumable spp film would need an spp-count checkpoint format
+  (the forward one stores a photon count) — proper fix is a small variant of
+  `writeCheckpoint`/`readCheckpoint` keyed on spp.
+
 ## Resolved
+
+### Unified live progress across all image modes (`R`/`D` join `A`/`B`/`C`) — DONE 2026-07-12
+- **What:** modes `R` (backward reference) and `D` (BDPT) previously ran as a single
+  monolithic launch with **no progress output, no periodic image write, and no way to stop
+  early** — a multi-hour reference render showed nothing until it finished (and a killed
+  render lost everything). Now every image-forming mode shares one progress driver: a
+  status line (or `-preview` ANSI thumbnail) with a `~noise%` estimate, a periodic
+  crash-safe image rewrite every `-interval` seconds, and `-time`/`-noise`/`-forever`
+  budgeting with clean Ctrl-C — on both CPU and GPU.
+- **How:** `R`/`D` films accumulate a **SUM over samples-per-pixel** (CPU `renderBdpt` was
+  changed from ÷spp to SUM to match `renderBackward`/the GPU), so they chunk exactly like
+  the forward photon-count films. The GPU kernels (`kBackward`/`kBdpt`) take
+  `chunkSpp`/`sppTotal`/`sampleBase` and seed the RNG on the **global sample index**
+  (`gidx = pix*sppTotal + sampleBase + local`), so any chunking draws the same union of
+  streams as one `sppTotal` pass — **bit-identical** to the old single-shot for a given spp.
+  `gpuSppChunks` (device) and `cpuSppChunks` (host, via a `seedOffset` on the CPU renderers)
+  own the chunk loop; `runSppProgressive` (`main.cpp`) is the shared reporter, reused by the
+  mode-`R` and mode-`D` dispatch. A time/noise/forever budget opens the spp target to a
+  capped `UNBOUNDED_SPP=1e9` (keeps `pix*sppTotal` inside int64). New: `render_progress.h`
+  (`SppProgress` callback).
 
 ### Concurrent GPU renders silently wrote a black PNG (all-black, `auto-exposure=1`) — DONE 2026-07-11
 - **What:** running two or more `ftrace ... -device gpu` processes at once could make

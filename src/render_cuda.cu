@@ -49,10 +49,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <chrono>
 #include <math.h>
 #include <float.h>
 
 #include "render_cuda.h"
+#include "render_progress.h"
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -2542,14 +2544,21 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 // each samples a wavelength, generates a camera ray (physical lens or pinhole/fisheye),
 // estimates radiance, and accumulates cieXYZ * (L * lensWeight) into the film. The film
 // holds the SUM over spp (writeFilm divides by spp), matching renderForwardCuda.
+// Renders `chunkSpp` samples-per-pixel for the chunk starting at sample `sampleBase`,
+// accumulating (atomicAdd) into `film`/`hits`. The RNG is seeded on the GLOBAL sample
+// index (pixel * sppTotal + sampleBase + localSample) so a render split into any number
+// of chunks draws exactly the same union of streams as one single-shot pass of sppTotal
+// samples — chunked progress is therefore bit-identical to the monolithic render.
 __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
-                          long long totalSamples, long long spp, int resX,
+                          long long totalSamples, long long chunkSpp, long long sppTotal,
+                          long long sampleBase, int resX,
                           int diffraction, unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
-        DRng rng; rng.seed((unsigned long long)(idx * 2 + 1), seedBase ^ (unsigned long long)idx);
-        long long pix = idx / spp;
+        long long pix = idx / chunkSpp;
+        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
 
@@ -2933,14 +2942,19 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // res*res*spp samples. t>=2 connections land on the sample's own pixel (camFilm);
 // t==1 splats land on the projected raster pixel (splatFilm). Both are normalised by
 // 1/spp on the host (bdpt.h renderBdpt convention).
+// Chunked exactly like kBackward: renders `chunkSpp` samples-per-pixel starting at
+// `sampleBase`, seeding on the global sample index (pixel*sppTotal + sampleBase + local)
+// so any chunking is bit-identical to a single sppTotal pass.
 __global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
-                      long long totalSamples, long long spp, int resX, int maxDepth,
+                      long long totalSamples, long long chunkSpp, long long sppTotal,
+                      long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
-        DRng rng; rng.seed((unsigned long long)(idx * 2 + 1), seedBase ^ (unsigned long long)idx);
-        long long pix = idx / spp;
+        long long pix = idx / chunkSpp;
+        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
 
@@ -3578,8 +3592,37 @@ bool cudaBdptSupported(const Scene& scene) {
     return true;
 }
 
+// Drives a chunked samples-per-pixel render for the GPU reference/BDPT paths. Repeatedly
+// renders `chunkSpp` more samples (via `launch(chunkSpp, sampleBase)`, which does the
+// kernel launch + cudaCheckKernel accumulating into the resident device buffers) and
+// downloads the running SUM film (via `download(out)`), reporting to `prog` after each
+// chunk. Stops when `prog.report` returns true or the requested `spp` is reached. Chunk
+// size adapts toward ~0.15 s of GPU work per launch so a wall-clock budget or Ctrl-C is
+// honoured promptly without paying per-launch overhead on fast scenes.
+template <class LaunchFn, class DownloadFn>
+static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
+                         LaunchFn&& launch, DownloadFn&& download) {
+    using clk = std::chrono::steady_clock;
+    long long done = 0, chunk = 1;
+    while (done < spp) {
+        long long c = chunk; if (c > spp - done) c = spp - done;
+        auto t0 = clk::now();
+        launch(c, done);
+        done += c;
+        double dt = std::chrono::duration<double>(clk::now() - t0).count();
+        if (dt > 1e-4) {                                   // retarget ~0.15 s per chunk
+            long long next = (long long)((double)c * (0.15 / dt));
+            if (next < 1)          next = 1;
+            if (next > c * 8 + 1)  next = c * 8 + 1;        // ramp up, but not explosively
+            chunk = next;
+        }
+        download(out);
+        if (prog.report(out, done, done >= spp)) break;
+    }
+}
+
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                    long long spp, int maxDepth, bool diffraction) {
+                    long long spp, int maxDepth, bool diffraction, const SppProgress* prog) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
@@ -3593,20 +3636,26 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
-
-    long long totalSamples = (long long)npix * spp;
-    kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, spp, resX,
-                         maxDepth, diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
-    cudaCheckKernel("bdpt");
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL;
 
     std::vector<double> camH(npix * 3), splatH(npix * 3);
-    CUDA_CHECK(cudaMemcpy(camH.data(),   d_cam,   npix * 3 * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(splatH.data(), d_splat, npix * 3 * sizeof(double), cudaMemcpyDeviceToHost));
-    const double inv = 1.0 / (double)spp;   // camera + light images share the 1/spp scale
-    for (size_t i = 0; i < npix; ++i)
-        out.xyz[i] = Vec3((camH[3 * i + 0] + splatH[3 * i + 0]) * inv,
-                          (camH[3 * i + 1] + splatH[3 * i + 1]) * inv,
-                          (camH[3 * i + 2] + splatH[3 * i + 2]) * inv);
+    auto download = [&](Film& o) {
+        CUDA_CHECK(cudaMemcpy(camH.data(),   d_cam,   npix * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(splatH.data(), d_splat, npix * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)   // SUM (cam+splat); writeFilm divides by spp
+            o.xyz[i] = Vec3(camH[3 * i + 0] + splatH[3 * i + 0],
+                            camH[3 * i + 1] + splatH[3 * i + 1],
+                            camH[3 * i + 2] + splatH[3 * i + 2]);
+    };
+    auto launch = [&](long long c, long long base) {
+        long long totalSamples = (long long)npix * c;
+        kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base, resX,
+                             maxDepth, diffraction ? 1 : 0, seed);
+        cudaCheckKernel("bdpt");
+    };
+
+    if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
     cudaFree(d_cam); cudaFree(d_splat);
@@ -3645,7 +3694,7 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
 }
 
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                        long long spp, bool diffraction) {
+                        long long spp, bool diffraction, const SppProgress* prog) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
@@ -3658,17 +3707,24 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
-
-    long long totalSamples = (long long)npix * spp;
-    kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, spp, resX,
-                             diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
-    cudaCheckKernel("backward");
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL;
 
     std::vector<double> film(npix * 3);
-    CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < npix; ++i)   // SUM over spp; writeFilm divides by spp
-        out.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+    auto download = [&](Film& o) {
+        CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(o.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)   // SUM over spp; writeFilm divides by spp
+            o.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+    };
+    auto launch = [&](long long c, long long base) {
+        long long totalSamples = (long long)npix * c;
+        kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
+                                 diffraction ? 1 : 0, seed);
+        cudaCheckKernel("backward");
+    };
+
+    if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits);

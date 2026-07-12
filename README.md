@@ -148,14 +148,19 @@ paths they can capture at all**.
   cost per sample, and it **does not support fluorescence, participating media, or
   spot & env lights** (use `B`/`P` or `R` for those).
 
-The **forward modes (`A`/`B`/`C`, and the forward pass of `V`)** are progressive and
-GPU-eligible, **`D` has its own GPU BDPT megakernel**, and **`R` (including the
-physical-lens camera) has its own GPU backward megakernel** — which the **`P`
-composite reuses for its camera-side layer**, so both of `P`'s layers run on the GPU
-when the scene is within the backward-GPU scope. Brightness is photon-count-
-independent, so more photons only reduce graininess. Outside that scope `P`'s
-camera-side layer, and `V`'s backward reference (kept on the CPU as a stable ground
-truth), remain CPU-only.
+The **image-forming modes are all progressive** — the forward camera models
+(`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
+refine an image whose brightness is fixed while only graininess falls, so they share the
+same live progress and budget flags (`-time` / `-noise` / `-forever` / `-preview` /
+`-interval`, and periodic crash-safe writes) on **both** the CPU and the GPU. They're all
+GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via the forward megakernel,
+**`D`** via its own GPU BDPT megakernel, and **`R` (including the physical-lens camera)**
+via its own GPU backward megakernel — which the **`P` composite reuses for its camera-side
+layer**, so both of `P`'s layers run on the GPU when the scene is within the backward-GPU
+scope. Outside that scope `P`'s camera-side layer, and `V`'s backward reference (kept on
+the CPU as a stable ground truth), remain CPU-only. `R`/`D` accumulate their sample chunks
+in memory only (no disk `-resume`/`-checkpoint`; those stay forward-mode `A`/`B`/`C`), and
+the `P` composite is not progressive.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
@@ -644,9 +649,11 @@ add-on), this doubles as a Blender → FTSL path.
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
-| `-spp <n>` | Samples per pixel for mode `V` |
+| `-spp <n>` | Samples per pixel for modes `R`, `D`, and `V` |
 
-**Long-running / output**
+**Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-interval`
+apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`), on both
+CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
 
 | Flag | Meaning |
 |---|---|
@@ -655,7 +662,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-interval <s>` | Periodic image write / preview refresh (default 15 s) |
-| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint |
+| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (forward `A`/`B`/`C` only) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
