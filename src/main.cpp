@@ -68,6 +68,7 @@
 //                  this cadence, so an auto-reloading image viewer is also a live display.
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
@@ -859,7 +860,13 @@ static int checkUpsample() {
 // and iso/shutter/exposure give exact photographic stops on top.
 constexpr double ABS_EXPOSURE_GAIN = 6.0;
 
-static void writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
+// Returns true on success, false if the image encoder failed. Callers that own the
+// process exit code should propagate a non-zero status on false. (GPU renders that
+// fail — driver TDR, device-memory/scheduling contention — are now caught at the
+// source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
+// which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
+// all-zero/black film never reaches this function.)
+static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
                       bool quiet = false, double* lockAnchor = nullptr,
                       bool absolute = false) {
     const int W = f.resX, H = f.resY;
@@ -901,9 +908,9 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
     }
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
-        return;
+        return false;
     }
-    if (quiet) return;
+    if (quiet) return true;
     if (absolute)
         std::printf("wrote %s (%dx%d), exposure=%.3g (absolute: gain %.3g x %.3g comp)\n",
                     path, W, H, exposure, eAuto, (expComp > 0.0 ? expComp : 1.0));
@@ -912,6 +919,7 @@ static void writeFilm(const char* path, const Film& f, double N, double expComp 
                     path, W, H, exposure, eAuto, expComp);
     else
         std::printf("wrote %s (%dx%d), auto-exposure=%.3g\n", path, W, H, exposure);
+    return true;
 }
 
 // --- Live terminal preview ----------------------------------------------------
@@ -1655,7 +1663,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
         ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
 #endif
-        if (mode == 'R') { writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor, scene.absolute); return 0; }
+        if (mode == 'R') { return writeFilm(outPath.c_str(), ref, (double)spp, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1; }
 
         std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
         EnergyReport e;
@@ -1694,8 +1702,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
         img = renderBdpt(scene, cam, res, resY, spp, nThreads, maxDepth, diffraction);
 #endif
-        writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor, scene.absolute);
-        return 0;
+        return writeFilm(outPath.c_str(), img, 1.0, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1;
     }
 
     // --- Forward + camera-side composite (mode P) ---
@@ -1704,8 +1711,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "at %dx%d on %d threads (light=%s) ...\n",
                     N, spp, res, resY, nThreads, lightLabel);
         Film comp = renderComposite(scene, cam, res, resY, N, spp, nThreads, diffraction, useGpu, wavefront);
-        writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor, scene.absolute);
-        return 0;
+        return writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1;
     }
 
     // --- Forward camera models A/B/C ---------------------------------------
@@ -1731,10 +1737,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // `useAnchor` gates the camera_path exposure-lock: only the final converged write
     // should set/reuse the shared anchor (a premature intermediate save would lock in
     // a noisy anchor for the frame and every later path frame).
+    bool writeOk = true;   // tracks the most recent writeFilm result (drives exit code)
     auto writeOut = [&](bool announceCheckpoint, bool quiet = false, bool useAnchor = true) {
         Film disp = acc.film;                        // display copy (+ direct sky view)
         if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-        writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
+        writeOk = writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
                   useAnchor ? exposureAnchor : nullptr, scene.absolute);
         if (wantCheckpoint) {
             if (writeCheckpoint(outPath, acc, guard, mode)) {
@@ -1865,7 +1872,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     acc.energy.absorbed / acc.energy.emitted, acc.energy.sensor / acc.energy.emitted,
                     acc.energy.escaped / acc.energy.emitted, acc.energy.residual / acc.energy.emitted,
                     tot / acc.energy.emitted);
-    return 0;
+    return writeOk ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
@@ -2207,6 +2214,7 @@ int main(int argc, char** argv) {
         sharedIdx.clear();
     }
 
+    bool sharedWriteFail = false;
     if (!sharedIdx.empty()) {
         std::vector<Camera> cams; std::vector<int> rxs, rys;
         for (int i : sharedIdx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
@@ -2227,7 +2235,8 @@ int main(int argc, char** argv) {
             if (toRender.size() > 1)
                 std::printf("[camera] '%s' (mode B, %dx%d) -> %s\n",
                             rc.name.c_str(), rc.res, rc.resY, op.c_str());
-            writeFilm(op.c_str(), disp, (double)N, rc.exposure, false, nullptr, scene.absolute);
+            if (!writeFilm(op.c_str(), disp, (double)N, rc.exposure, false, nullptr, scene.absolute))
+                sharedWriteFail = true;
         }
     }
 
@@ -2243,5 +2252,5 @@ int main(int argc, char** argv) {
                            preview, intervalSec, noiseTarget, wavefront, anchor);
         if (rv != 0) return rv;
     }
-    return 0;
+    return sharedWriteFail ? 1 : 0;
 }

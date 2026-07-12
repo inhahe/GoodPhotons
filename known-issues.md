@@ -32,30 +32,47 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
   tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
   accents + colored walls for this reason.
 
-### Concurrent GPU renders silently corrupt output (all-black, `auto-exposure=1`) — 2026-07-11
-
-Running two or more `ftrace ... -device gpu` processes at the same time can make one
-of them emit a **completely black** image whose log reports `auto-exposure=1` (the
-fallback the auto-exposure code uses when the 99th-percentile luminance comes back
-NaN/zero). A correct render of the same scene reports a tiny absolute exposure like
-`2.7e-12`. Symptom is **non-deterministic and non-monotonic in spp** — e.g. for
-`scenes/mirror_selfie.ftsl` a batch produced 512 spp OK, 2048 spp black, 4096 spp OK,
-purely depending on which renders happened to overlap on the GPU. Re-running the
-black case **alone** renders correctly, which is the tell that it's contention, not a
-scene/spp bug. Likely a Windows display-driver TDR (long kernel killed after the
-~2 s watchdog) or device-memory pressure when jobs overlap; either way the failure is
-silent (exit code 0, garbage/NaN framebuffer).
-
-- **Where:** GPU render entry (`render_cuda.cu`) + auto-exposure fallback in
-  `src/main.cpp` (~line 834, percentile→exposure). No error is surfaced when the
-  kernel output is NaN.
-- **Workaround:** render GPU jobs **one at a time**; if a render comes back black with
-  `auto-exposure=1`, just re-run it with the GPU otherwise idle.
-- **Proper fix:** detect a NaN/empty framebuffer after the GPU kernel and fail loudly
-  (non-zero exit + message) instead of writing a black PNG; optionally serialize GPU
-  work or check for CUDA launch/TDR errors explicitly.
-
 ## Resolved
+
+### Concurrent GPU renders silently wrote a black PNG (all-black, `auto-exposure=1`) — DONE 2026-07-11
+- **What:** running two or more `ftrace ... -device gpu` processes at once could make
+  one emit a **completely black** image logging `auto-exposure=1` (the fallback used
+  when the 99th-percentile luminance comes back zero), with exit code 0 — silently.
+  The symptom was non-deterministic and non-monotonic in spp (e.g. for
+  `scenes/mirror_selfie.ftsl`: 512 spp OK, 2048 spp black, 4096 spp OK), depending on
+  which renders happened to overlap on the GPU. Re-running the black case **alone**
+  renders correctly.
+- **Root cause (our bug, not a driver mystery):** `render_cuda.cu` never checked the
+  return codes of its ~15 `cudaMalloc` / `cudaMemset` / download `cudaMemcpy` calls
+  nor the kernel-launch status on every path. Under contention an alloc or copy fails
+  (or a launch returns `unspecified launch failure`), but the code carried on and wrote
+  the zero-initialized host film out as a black PNG — no error printed because the
+  failing call's status was never inspected. Earlier notes claiming "CUDA still reported
+  `cudaSuccess`" were wrong: the errors were there, we just weren't reading them. This
+  is process-local — MMU/context isolation means it cannot corrupt another process's GPU
+  state.
+- **Fix (root cause):** every CUDA call in `render_cuda.cu` is now wrapped in a
+  `CUDA_CHECK(...)` macro (checks the returned `cudaError_t`, and on failure prints
+  `[cuda] <call> failed at <file>:<line>: <msg>` and `std::exit(EXIT_FAILURE)`), and
+  every kernel launch is followed by `cudaCheckKernel(<what>)`
+  (`cudaGetLastError` + `cudaDeviceSynchronize`, same loud-exit on error). This covers
+  `uploadVec`, the wavefront path, and the forward/BDPT/backward render entries — so a
+  failed alloc/copy/launch aborts **before** any framebuffer is downloaded or written.
+- **Verified:** built and reproduced contention by running 4 concurrent
+  `-device gpu -mode R` renders of `mirror_selfie.ftsl` at 2048 spp — three rendered
+  correctly (valid `auto-exposure`), one hit contention and failed loudly with
+  `[cuda] backward kernel failed: unspecified launch failure` + exit 1 and wrote **no**
+  PNG. No silent black image.
+- **Safety net removed:** the earlier `filmIsValid()` gate in `writeFilm`
+  (`src/main.cpp`) — which rejected all-zero/NaN framebuffers before tone-mapping — was
+  removed now that failures are caught at the source. `writeFilm` still returns a bool
+  and callers still propagate a non-zero exit, but only for a genuine image-encoder
+  failure. **Tradeoff:** `CUDA_CHECK` catches CUDA-reported errors, not a numerically
+  produced NaN that returns `cudaSuccess`; if such a case ever appears it would tonemap
+  to black again, and the fix would be a targeted NaN check, not the blanket gate.
+- **Residual caveat:** contention still wastes work (one job aborts). Prefer to
+  **render GPU jobs one at a time**; the difference is a contended render now fails
+  loudly (non-zero exit, no PNG) instead of silently overwriting a good image with black.
 
 ### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
 - **What:** the procedural-pattern math VM now exposes the surface texture coordinates

@@ -46,12 +46,45 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <math.h>
 #include <float.h>
 
 #include "render_cuda.h"
+
+// Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
+// every kernel launch/sync return code MUST be checked: under GPU contention (a second
+// process pressuring device memory or scheduling) an allocation or copy can fail, and
+// silently ignoring that leaves a zero-initialised host buffer that gets written out as
+// a black image with no error. Checking every return turns "silently black" into a
+// precise, diagnosable failure (which call, where, and the CUDA error string), then
+// exits non-zero so no garbage image is produced. This is the root-cause fix for the
+// concurrent-GPU black-render bug (see known-issues.md).
+#define CUDA_CHECK(call) do {                                                    \
+        cudaError_t _cudaCheckErr = (call);                                      \
+        if (_cudaCheckErr != cudaSuccess) {                                      \
+            std::fprintf(stderr, "[cuda] %s failed at %s:%d: %s\n",              \
+                         #call, __FILE__, __LINE__,                              \
+                         cudaGetErrorString(_cudaCheckErr));                     \
+            std::fflush(stderr);                                                 \
+            std::exit(EXIT_FAILURE);                                             \
+        }                                                                        \
+    } while (0)
+
+// After a kernel launch, check both the launch (cudaGetLastError) and the execution
+// (cudaDeviceSynchronize) status; abort loudly on either. `what` names the kernel for
+// the diagnostic. A display-driver TDR or an out-of-resources launch surfaces here.
+static void cudaCheckKernel(const char* what) {
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "[cuda] %s kernel failed: %s\n", what, cudaGetErrorString(e));
+        std::fflush(stderr);
+        std::exit(EXIT_FAILURE);
+    }
+}
 
 // ============================ device-side scene ============================
 
@@ -3043,8 +3076,8 @@ static void bakeSpec(const Spectrum& s, double* tab) {
 template <class T>
 static T* uploadVec(const std::vector<T>& v) {
     T* d = nullptr;
-    cudaMalloc(&d, v.size() * sizeof(T));
-    cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d, v.size() * sizeof(T)));
+    CUDA_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
     return d;
 }
 
@@ -3388,29 +3421,30 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
     if (W < 1) W = 1;
 
     WFState st;
-    cudaMalloc(&st.ro,     (size_t)W * sizeof(DVec3));
-    cudaMalloc(&st.rd,     (size_t)W * sizeof(DVec3));
-    cudaMalloc(&st.beta,   (size_t)W * sizeof(Real));
-    cudaMalloc(&st.lambda, (size_t)W * sizeof(Real));
-    cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng));
-    cudaMalloc(&st.bounce, (size_t)W * sizeof(int));
-    cudaMalloc(&st.alive,  (size_t)W * sizeof(int));
-    cudaMalloc(&st.interior, (size_t)W * sizeof(int));
-    cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit));
-    cudaMemset(st.alive, 0, (size_t)W * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&st.ro,     (size_t)W * sizeof(DVec3)));
+    CUDA_CHECK(cudaMalloc(&st.rd,     (size_t)W * sizeof(DVec3)));
+    CUDA_CHECK(cudaMalloc(&st.beta,   (size_t)W * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&st.lambda, (size_t)W * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng)));
+    CUDA_CHECK(cudaMalloc(&st.bounce, (size_t)W * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.alive,  (size_t)W * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.interior, (size_t)W * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
+    CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
-    cudaMalloc(&d_dispatched, sizeof(unsigned long long));
-    cudaMemset(d_dispatched, 0, sizeof(unsigned long long));
+    CUDA_CHECK(cudaMalloc(&d_dispatched, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_dispatched, 0, sizeof(unsigned long long)));
     int* d_live = nullptr;
-    cudaMalloc(&d_live, sizeof(int));
-    cudaMemset(d_live, 0, sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_live, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_live, 0, sizeof(int)));
 
     int bs = 128;
     int gb = (W + bs - 1) / bs;
 
     kWfInit<<<gb, bs>>>(up.sc, up.dc, d_film, d_hits, d_energy, st, N, W,
                         d_dispatched, d_live, kseed, camModeInt);
+    cudaCheckKernel("wavefront-init");
 
     // Guard the pass loop against an unexpected non-terminating condition: the longest a
     // slot can stay busy is one path (<= maxBounce shades) before it must regenerate or
@@ -3421,8 +3455,9 @@ static void wavefrontTrace(DUpload& up, double* d_film, double* d_hits, double* 
         kWfExtend<<<gb, bs>>>(up.sc, st, W);
         kWfShade<<<gb, bs>>>(up.sc, up.dc, d_film, d_hits, d_energy, st, W, N,
                              diffraction, maxBounce, d_dispatched, d_live, camModeInt);
+        cudaCheckKernel("wavefront-pass");
         int live = 0;
-        cudaMemcpy(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost));
         if (live <= 0) break;
     }
 
@@ -3442,12 +3477,12 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     buildUpload(scene, cam, resX, resY, up);
 
     const size_t npix = (size_t)resX * resY;
-    double* d_film = nullptr;   cudaMalloc(&d_film, npix * 3 * sizeof(double));
-    cudaMemset(d_film, 0, npix * 3 * sizeof(double));
-    double* d_hits = nullptr;   cudaMalloc(&d_hits, npix * sizeof(double));
-    cudaMemset(d_hits, 0, npix * sizeof(double));
-    double* d_energy = nullptr; cudaMalloc(&d_energy, 5 * sizeof(double));
-    cudaMemset(d_energy, 0, 5 * sizeof(double));
+    double* d_film = nullptr;   CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
+    double* d_hits = nullptr;   CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+    double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
 
     int camModeInt = (camMode == 'A') ? CAM_A : (camMode == 'C') ? CAM_C : CAM_B;
 
@@ -3464,18 +3499,14 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
         kTrace<<<numBlocks, blockSize>>>(up.sc, up.dc, d_film, d_hits, d_energy, N, diffraction ? 1 : 0,
                                          kseed, 32, camModeInt);
     }
-    cudaError_t kerr = cudaGetLastError();
-    if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
-    if (kerr != cudaSuccess) {
-        std::fprintf(stderr, "[cuda] kernel error: %s\n", cudaGetErrorString(kerr));
-    }
+    cudaCheckKernel("forward");
 
     // --- download ---
     std::vector<double> film(npix * 3);
-    cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
     double energy[5] = {0,0,0,0,0};
-    cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < npix; ++i)
         out.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
     eOut.emitted  += energy[0];
@@ -3558,22 +3589,19 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     buildUpload(scene, cam, resX, resY, up);
 
     const size_t npix = (size_t)resX * resY;
-    double* d_cam   = nullptr; cudaMalloc(&d_cam,   npix * 3 * sizeof(double));
-    double* d_splat = nullptr; cudaMalloc(&d_splat, npix * 3 * sizeof(double));
-    cudaMemset(d_cam,   0, npix * 3 * sizeof(double));
-    cudaMemset(d_splat, 0, npix * 3 * sizeof(double));
+    double* d_cam   = nullptr; CUDA_CHECK(cudaMalloc(&d_cam,   npix * 3 * sizeof(double)));
+    double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
 
     long long totalSamples = (long long)npix * spp;
     kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, spp, resX,
                          maxDepth, diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
-    cudaError_t kerr = cudaGetLastError();
-    if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
-    if (kerr != cudaSuccess)
-        std::fprintf(stderr, "[cuda] bdpt kernel error: %s\n", cudaGetErrorString(kerr));
+    cudaCheckKernel("bdpt");
 
     std::vector<double> camH(npix * 3), splatH(npix * 3);
-    cudaMemcpy(camH.data(),   d_cam,   npix * 3 * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(splatH.data(), d_splat, npix * 3 * sizeof(double), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(camH.data(),   d_cam,   npix * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(splatH.data(), d_splat, npix * 3 * sizeof(double), cudaMemcpyDeviceToHost));
     const double inv = 1.0 / (double)spp;   // camera + light images share the 1/spp scale
     for (size_t i = 0; i < npix; ++i)
         out.xyz[i] = Vec3((camH[3 * i + 0] + splatH[3 * i + 0]) * inv,
@@ -3626,22 +3654,19 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     buildUpload(scene, cam, resX, resY, up);
 
     const size_t npix = (size_t)resX * resY;
-    double* d_film = nullptr; cudaMalloc(&d_film, npix * 3 * sizeof(double));
-    double* d_hits = nullptr; cudaMalloc(&d_hits, npix * sizeof(double));
-    cudaMemset(d_film, 0, npix * 3 * sizeof(double));
-    cudaMemset(d_hits, 0, npix * sizeof(double));
+    double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
+    double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
 
     long long totalSamples = (long long)npix * spp;
     kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, spp, resX,
                              diffraction ? 1 : 0, 0x9e3779b97f4a7c15ULL);
-    cudaError_t kerr = cudaGetLastError();
-    if (kerr == cudaSuccess) kerr = cudaDeviceSynchronize();
-    if (kerr != cudaSuccess)
-        std::fprintf(stderr, "[cuda] backward kernel error: %s\n", cudaGetErrorString(kerr));
+    cudaCheckKernel("backward");
 
     std::vector<double> film(npix * 3);
-    cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(out.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < npix; ++i)   // SUM over spp; writeFilm divides by spp
         out.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
 
