@@ -559,9 +559,16 @@ function by default; Rayleigh optional.
 haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box —
 or `bounds { center <x y z> radius <r> }` to confine it to a **sphere** region, i.e.
 simple *per-object* fog like **the whole inside of a glass sphere** (author the same
-center/radius as the sphere; an open fog sphere is directly viewable, while fog inside
-an actual glass shell is imaged directly by the finite-aperture modes `A`/`C` and lights
-the room in the pinhole mode `B`). Add `density "<expr>"` (or `density pattern:<name>`) —
+center/radius as the sphere). An *open* fog sphere is directly viewable in every mode.
+Fog inside an actual **glass shell**, however, is *not imaged directly* by the next-event
+modes — an accuracy limitation, not a speed one: seeing the fog through the curved glass is
+a refracted (specular↔volume) path, and the pinhole splat `B` and finite-lens splat `A`
+connect the fog to the camera with a **straight** ray that the glass occludes (and could not
+bend anyway), so that view renders black. The fog still correctly **lights the surrounding
+room** indirectly, and the fully physical modes — photon-catch `C` and BDPT `D` — can trace
+the refracted path but only extremely slowly (the fog-scattered photon must refract out and
+hit the pupil). A true fix needs refractive/manifold next-event estimation (out of scope).
+Add `density "<expr>"` (or `density pattern:<name>`) —
 a scalar field over world `x y z` (the same infix expression language as isosurface
 `function` fields) that scales `sigma_t` per point — for **fog blobs with soft, formula-defined
 boundaries**: e.g. a smooth radial falloff `pow(saturate(1 - dist/R), 2)` renders a

@@ -71,11 +71,28 @@ Mirrored on the GPU (`DMedium.boundShape`/`bcenter`/`bradius`, `dMedClip` sphere
 upload path). Validated on an RTX 4090 mode B: open glowing orb `scraps/fogorb.ftsl`
 GPU-vs-CPU block RMSE 0.96/255 (bias 0.024), glass-shell `scraps/fogsphere.ftsl` block RMSE
 0.57/255 (bias −0.010); box/heterogeneous path unchanged (fogblob block RMSE still 1.07).
-*Limitations:* (1) fog inside an actual `dielectric` shell is only lit **indirectly** in a
-pinhole mode (`B`) — the glass surface occludes the straight camera connection and the light
-tracer can't refract a next-event connection, so the fog lights the room but isn't imaged
-directly; the finite-aperture modes (`A`/`C`, real photon arrival) image it directly, and an
-open fog sphere (no shell) is directly viewable in every forward mode. (2) Still a **single**
+*Limitations:* (1) **Fog inside a `dielectric` shell is not imaged directly by the
+next-event modes — an accuracy (bias) issue, empirically confirmed 2026-07-12.** The
+direct view of the fog is a specular↔volume (SDS-type) path: the camera sees the fog
+*through* the curved glass, i.e. along a *refracted* line. The next-event/splat modes
+connect a fog vertex to the camera with a **straight** ray, which (a) is occluded by the
+glass surface (`occluded()` treats every surface as opaque) and (b) could not bend even if
+it weren't — so the contribution is structurally **zero**, not merely noisy. This affects
+both the **pinhole splat (`B`)** and the **finite-lens splat (`A`)** — both are NEE-based,
+and both render the fog-through-glass as **black** (verified: `scraps/fogsphere.ftsl` mode
+B whole-image mean 6.6 but the fog-sphere center box mean 0.000; mode A identical). Only the
+**physically-tracing modes** — photon-catch (`C`) and BDPT (`D`) — can sample the path at
+all, because a real photon scatters in the fog, **refracts** out through the glass, and
+lands on a finite aperture. But that path is extraordinarily improbable (a fog-scattered
+photon must exit heading almost exactly at the pupil), so at practical sample counts `C` is
+effectively black too (60 M photons, aperture 0.45: fog-sphere center still mean 0.000) — an
+**efficiency** problem on top of the accuracy one, and `D` doesn't support media at all yet.
+The fog still correctly **lights the surrounding room** (indirect, via NEE off the walls),
+and an **open** fog sphere (no glass shell) is directly viewable in every forward mode
+(`scraps/fogorb.ftsl` mode B center box mean 135.8). A proper fix is refractive/manifold
+next-event estimation (specular connections through the glass) — genuine research-grade work,
+out of scope; a naive "let connect rays pass through glass" hack is wrong (it draws the fog
+along a straight line, with no lensing, in the wrong place) and is deliberately avoided. (2) Still a **single**
 global `scene.medium` — you get one bounded region, not a list of independent per-object media.
 A future extension would make `Scene::media` a vector (with per-segment medium resolution +
 a GPU medium array) so several differently-shaped fog objects can coexist; object-name /

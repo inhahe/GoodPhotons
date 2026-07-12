@@ -466,11 +466,14 @@ medium {
   same `center`/`radius` as your sphere geometry and the fog is clipped precisely to
   that sphere (round silhouette). This is the simple *per-object* fog: co-locate the
   region with an object to fill it. (A `density` field works inside a sphere bound too —
-  its majorant grid uses the sphere's AABB.) *Note:* in a **pinhole** mode (`B`) the fog
-  inside an actual `dielectric` sphere is only lit indirectly (the glass surface occludes
-  the straight camera connection, and the light tracer can't refract a connection); the
-  fog still lights the surrounding room, and a **finite-aperture** mode (`A`/`C`) images
-  it directly. An *open* fog sphere (no glass shell) is directly viewable in every mode.
+  its majorant grid uses the sphere's AABB.) *Note (accuracy limitation):* fog inside an
+  actual `dielectric` shell is **not imaged directly** by the next-event modes — the
+  pinhole splat (`B`) *and* the finite-lens splat (`A`) connect the fog to the camera with a
+  **straight** ray, which the glass occludes (and could not refract anyway), so seeing the
+  fog *through* the glass renders black. The fog still correctly **lights the surrounding
+  room**. Only the fully physical modes — photon-catch (`C`) and BDPT (`D`) — can trace the
+  refracted view, and only very slowly. An *open* fog sphere (no glass shell) is directly
+  viewable in every mode.
 - **`density <expr>`** or **`density pattern:<name>`** — a scalar field, ≥ 0, that
   multiplies `sigma_t` (and hence both `sigma_a` and `sigma_s`) at each point. Uses
   the same infix expression language as isosurface `function` fields and `pattern`
