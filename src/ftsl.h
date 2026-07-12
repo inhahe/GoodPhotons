@@ -329,6 +329,41 @@ inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
           + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
 }
 
+// Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
+// `axis` is normalized internally; a zero-length axis returns `v` unchanged. Used
+// by `camera_curve` to apply a per-frame `roll` (bank about the view direction).
+inline Vec3 rotateAboutAxis(const Vec3& v, const Vec3& axis, double ang) {
+    double al = length(axis);
+    if (al < 1e-12) return v;
+    Vec3 k = axis * (1.0 / al);
+    double c = std::cos(ang), s = std::sin(ang);
+    return v * c + cross(k, v) * s + k * (dot(k, v) * (1.0 - c));
+}
+
+// A piecewise-linear animation track over a normalized timeline t in [0,1]: a sorted
+// list of `{t, value}` keyframes with flat clamping outside the first/last key. Used
+// by `camera_curve` to animate scalar camera properties (roll, fov, zoom, f-stop,
+// focus) frame-by-frame, mirroring how `density_at` keyframes camera speed.
+struct ScalarTrack {
+    struct Key { double t, v; };
+    std::vector<Key> keys;
+    bool active() const { return !keys.empty(); }
+    void sort() { std::sort(keys.begin(), keys.end(),
+                            [](const Key& a, const Key& b){ return a.t < b.t; }); }
+    double sample(double t, double fallback) const {
+        if (keys.empty()) return fallback;
+        if (t <= keys.front().t) return keys.front().v;
+        if (t >= keys.back().t)  return keys.back().v;
+        for (size_t j = 0; j + 1 < keys.size(); ++j)
+            if (t >= keys[j].t && t <= keys[j + 1].t) {
+                double sp = keys[j + 1].t - keys[j].t;
+                double f = (sp > 1e-12) ? (t - keys[j].t) / sp : 0.0;
+                return keys[j].v + (keys[j + 1].v - keys[j].v) * f;
+            }
+        return keys.back().v;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -1788,6 +1823,43 @@ private:
         return true;
     }
 
+    // Derive the optical quantities (focal length, resolved fov, aperture radius and
+    // physical-optics film distance) from the photographic controls, and write them into
+    // `cs`. `fovDeg` is the BASE vertical fov before zoom; `lensMM` a prime focal length
+    // in mm (>0 overrides fov); `zoom` a focal-length multiplier; `fstopN` the f-number;
+    // `hmm` the film height in mm; `focus_m` the focus distance in metres. Factored out of
+    // readFilmExposure so `camera_curve` can re-derive it per frame when fov/zoom/fstop/
+    // focus are animated by keyframe tracks (see ScalarTrack). Pure function of its args.
+    static void deriveCameraOptics(CamSpec& cs, double fovDeg, double lensMM,
+                                   double zoom, double fstopN, double hmm, double focus_m) {
+        const double DEG = 3.141592653589793 / 180.0;
+        if (zoom <= 0.0) zoom = 1.0;
+        cs.zoom = zoom;
+        double focalMM;
+        if (lensMM > 0.0) focalMM = lensMM;
+        else { double th = std::tan(0.5 * fovDeg * DEG); focalMM = (th > 1e-9) ? hmm / (2.0 * th) : 0.0; }
+        focalMM *= zoom;
+        cs.focal = focalMM / 1000.0;
+        // fov follows the (zoomed) focal length when a lens/zoom is in play; otherwise it
+        // stays the authored base fov.
+        if (lensMM > 0.0 || zoom != 1.0)
+            cs.fov = (focalMM > 1e-9) ? 2.0 * std::atan(hmm / (2.0 * focalMM)) / DEG : fovDeg;
+        else
+            cs.fov = fovDeg;
+        // f-stop: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides any `aperture`
+        // radius. Aperture radius is an internal (metre) length.
+        if (fstopN > 0.0 && cs.focal > 0.0) cs.aperture = cs.focal / (2.0 * fstopN);
+        // Physical-optics camera: when a lens/f-stop is authored, put the film at the real
+        // image distance and give the thin lens the true focal length, so the f-number
+        // yields correct depth of field in the catch modes (A/C). Thin-lens law
+        // 1/so + 1/si = 1/f; focus 0 (or beyond hyperfocal) means infinity -> si = f.
+        if ((lensMM > 0.0 || fstopN > 0.0) && cs.focal > 0.0) {
+            double f = cs.focal, so = focus_m;
+            cs.filmDist_m = (so > f) ? 1.0 / (1.0 / f - 1.0 / so) : f;
+            cs.lensF_m    = f;
+        }
+    }
+
     // Read the film sub-block + photographic exposure/f-stop/lens controls shared by
     // `camera` and `camera_path`, and resolve the film size (named format or explicit
     // mm), the focal length (from `lens <mm>` or `fov_y`), the f-stop -> aperture
@@ -1833,34 +1905,13 @@ private:
         // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a 35mm
         // full-frame 24mm height when no physical size is authored.
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
-        const double DEG = 3.141592653589793 / 180.0;
         double lensMM = dblOf(b, "lens", 0.0);     // focal length in mm (physical, unit-independent)
         // `zoom <x>` multiplies the focal length (x>1 = tele/narrower fov; x<1 = wider).
         // It is the animatable "zoom ring" and composes on top of `lens`/`fov_y`.
-        double zoom = dblOf(b, "zoom", 1.0); if (zoom <= 0.0) zoom = 1.0;
-        cs.zoom = zoom;
-        double focalMM;
-        if (lensMM > 0.0) focalMM = lensMM;
-        else { double th = std::tan(0.5 * cs.fov * DEG); focalMM = (th > 1e-9) ? hmm / (2.0 * th) : 0.0; }
-        focalMM *= zoom;
-        cs.focal = focalMM / 1000.0;
-        if (lensMM > 0.0 || zoom != 1.0)           // fov follows the (zoomed) focal length
-            cs.fov = (focalMM > 1e-9) ? 2.0 * std::atan(hmm / (2.0 * focalMM)) / DEG : cs.fov;
-        // f-stop authoring: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides
-        // any `aperture` radius. Aperture radius is an internal (metre) length.
+        double zoom  = dblOf(b, "zoom", 1.0);
         double fstop = dblOf(b, "fstop", 0.0);
-        if (fstop > 0.0 && cs.focal > 0.0) cs.aperture = cs.focal / (2.0 * fstop);
-        // Physical-optics camera: when a lens/f-stop is authored, put the film at the
-        // real image distance and give the thin lens the true focal length, so the
-        // f-number yields correct depth of field in the catch modes (A/C). Thin-lens
-        // law 1/so + 1/si = 1/f: a focus plane at so (metres) images at si; focus 0
-        // (or beyond hyperfocal) means infinity -> si = f. Legacy cameras (no lens /
-        // f-stop) leave these 0 and keep the unit-film-distance behaviour.
-        if ((lensMM > 0.0 || fstop > 0.0) && cs.focal > 0.0) {
-            double f = cs.focal, so = cs.focus;    // cs.focus already in metres (Len-scaled)
-            cs.filmDist_m = (so > f) ? 1.0 / (1.0 / f - 1.0 / so) : f;
-            cs.lensF_m    = f;
-        }
+        // Resolve focal/fov/aperture/film-distance. cs.focus is already in metres (Len-scaled).
+        deriveCameraOptics(cs, cs.fov, lensMM, zoom, fstop, hmm, cs.focus);
         // Manual exposure multiplier (see CamSpec). Active iff any control authored.
         if (cs.exposure > 0.0 || cs.iso > 0.0 || cs.shutter > 0.0) {
             double base = (cs.exposure > 0.0) ? cs.exposure : 1.0;
@@ -2200,13 +2251,27 @@ private:
     //   look tangent    (default) — aim along the direction of travel
     //   look_at x y z             — a fixed target for every frame
     //   look curve + look_point.. — aim at a SECOND Catmull-Rom spline, sampled in step
-    // `closed` loops the curve (seamless). All frames share up/fov/mode/film/lens.
+    // Roll and the lens scalars can be ANIMATED per frame over the normalized timeline
+    // t in [0,1] (t=0 first frame, t=1 last), each keyframed by `<name>_at <t> <value>`
+    // (piecewise-linear, flat-clamped outside the ends, exactly like `density_at`) or set
+    // constant with the bare keyword:
+    //   roll <deg> | roll_at t deg      — bank about the view axis (the third orientation DOF)
+    //   fov_at t deg                    — animate vertical field of view (a fov "zoom")
+    //   zoom_at t x                     — animate the focal-length multiplier
+    //   fstop_at t N                    — animate the f-number (aperture / depth of field)
+    //   focus_at t dist                 — animate the focus distance (authored units)
+    // (Lens PROJECTION / fisheye is a discrete mode, not a continuous track — set it once
+    // for the whole flight with `projection`/`fisheye`.) `closed` loops the curve
+    // (seamless). Frames share up/mode/film/lens and any un-animated lens scalars.
     // Grammar:
     //   camera_curve "fly" {
     //       point 0 1 3   point 1 1 1   point 2 1 3   point 1 1 5   # >= 2 control points
     //       up 0 1 0   fov_y 50   mode R   frames 90
     //       density 20                       # OR density_at 0 5  density_at 0.5 40  density_at 1 5
     //       look tangent                     # OR look_at 1 1 3   OR look curve + look_point ...
+    //       roll_at 0 0   roll_at 0.5 20   roll_at 1 0        # bank into the turn and back
+    //       fstop_at 0 8   fstop_at 1 1.4                     # rack the aperture open
+    //       focus_at 0 5   focus_at 1 1.5                     # pull focus toward the camera
     //       closed   exposure_lock
     //       film { res 900 600 }
     //   }
@@ -2322,6 +2387,47 @@ private:
         if (lookFixed) { vec3Of(b, "look_at", fixedLook); fixedLook = P(fixedLook); }
         int lookSeg = lookCurve ? (closed ? (int)lookPts.size() : (int)lookPts.size() - 1) : 0;
 
+        // ---- Animatable orientation + lens tracks ----------------------------------
+        // Roll (bank about the view axis) and the lens scalars (fov_y, zoom, f-stop,
+        // focus) can each be keyframed by `<name>_at <t> <value>` over the normalized
+        // timeline t in [0,1] (mirroring `density_at`), or set constant with the bare
+        // keyword. A bare keyword doubles as the flat fallback for its track.
+        bool trkOk = true;
+        auto readTrack = [&](const char* atKey) -> ScalarTrack {
+            ScalarTrack tk;
+            for (const auto& s : b.stmts) {
+                if (s.key != atKey) continue;
+                if (s.val.words.size() < 2) {
+                    fail("camera_curve '" + base + "' " + atKey + " needs: <t> <value>");
+                    trkOk = false; continue;
+                }
+                tk.keys.push_back({num(s.val.words[0]), num(s.val.words[1])});
+            }
+            tk.sort();
+            return tk;
+        };
+        ScalarTrack rollTrk  = readTrack("roll_at");
+        ScalarTrack fovTrk   = readTrack("fov_at");
+        ScalarTrack zoomTrk  = readTrack("zoom_at");
+        ScalarTrack fstopTrk = readTrack("fstop_at");
+        ScalarTrack focusTrk = readTrack("focus_at");
+        if (!trkOk) return false;
+
+        // Base (constant) values a track falls back to and that the whole-flight optics
+        // were derived from. Captured from the same keywords readFilmExposure consumed so
+        // per-frame re-derivation starts from the authored baseline (never double-applies).
+        double rollConst  = dblOf(b, "roll",  0.0);
+        double baseFovDeg = dblOf(b, "fov_y", 40.0);
+        double baseLensMM = dblOf(b, "lens",  0.0);
+        double baseZoom   = dblOf(b, "zoom",  1.0);
+        double baseFstop  = dblOf(b, "fstop", 0.0);
+        double hmm        = (shared.filmH_mm > 0.0) ? shared.filmH_mm : 24.0;
+        double baseFocus  = shared.focus;   // metres (Len-scaled)
+        bool haveRoll   = rollTrk.active() || find(b, "roll");
+        bool haveOptics = fovTrk.active() || zoomTrk.active() ||
+                          fstopTrk.active() || focusTrk.active();
+        const double DEG = 3.141592653589793 / 180.0;
+
         bool pathLock = false;
         if (const Stmt* el = find(b, "exposure_lock")) {
             if (el->val.words.empty()) pathLock = true;
@@ -2348,6 +2454,26 @@ private:
                 Vec3 c = catmullRomAt(pts, closed, g + dg);
                 Vec3 tan = c - a;
                 cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});
+            }
+            // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.
+            // cs starts as `shared`, so restore its aperture before re-deriving in case a
+            // static f-stop had already set it (a live fstop track will overwrite it).
+            if (haveOptics) {
+                double fov = fovTrk.sample(fr, baseFovDeg);
+                double zm  = zoomTrk.sample(fr, baseZoom);
+                double fs  = fstopTrk.sample(fr, baseFstop);
+                double fo  = focusTrk.active() ? Len(focusTrk.sample(fr, 0.0)) : baseFocus;
+                cs.aperture = shared.aperture;
+                cs.focus    = fo;
+                deriveCameraOptics(cs, fov, baseLensMM, zm, fs, hmm, fo);
+            }
+            // Per-frame roll: bank `up` about the view direction (Rodrigues). Applied after
+            // look so the axis is the final view ray; starts from the authored `up`.
+            if (haveRoll) {
+                double rollDeg = rollTrk.sample(fr, rollConst);
+                Vec3 w = cs.look - cs.eye;
+                if (length(w) > 1e-12)
+                    cs.up = rotateAboutAxis(shared.up, normalize(w), rollDeg * DEG);
             }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;

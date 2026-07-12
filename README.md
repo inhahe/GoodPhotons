@@ -666,7 +666,16 @@ extension), which ffmpeg concatenates into a video.
   **density** (cameras per unit length) that can vary along the curve via `density_at`
   keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
   slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
-  `look_at`, or at a second `look curve`.
+  `look_at`, or at a second `look curve`. **Orientation and lens can also be animated**
+  per frame over the normalized timeline `t ∈ [0,1]` (`t=0` first frame, `t=1` last),
+  each keyframed by `<name>_at <t> <value>` (piecewise-linear, flat-clamped at the ends,
+  just like `density_at`) or held constant by the bare keyword: **`roll[_at]`** banks the
+  camera about its view axis (the third orientation degree of freedom), and
+  **`fov_at` / `zoom_at` / `fstop_at` / `focus_at`** animate the vertical field of view,
+  focal-length multiplier, f-number, and focus distance. (`fstop`/`focus` change depth of
+  field only in the physical catch modes `A`/`C`; in the pinhole splat `B` the aperture is
+  virtual, so there `roll`/`fov`/`zoom` are the visible ones. Lens *projection*/fisheye is
+  a discrete whole-flight mode, not a continuous track — set it once with `projection`.)
 
 ### Multi-camera shared photon pass (modes `A` and `B`)
 

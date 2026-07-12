@@ -360,6 +360,26 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   (`scraps/curve_test.ftsl`, 3 frames — eye rides the spline, holds the look_at). Same
   GPU caveat as `camera_orbit`: one camera per launch, frames render sequentially (fine).
 
+### `camera_curve` animatable orientation + lens tracks — DONE 2026-07-12
+- **What:** `camera_curve` gained the two remaining animatable degrees of freedom it was
+  missing — **orientation roll** and **lens properties**. `roll[_at]` banks the camera
+  about its view axis (the third orientation DOF beyond eye position and look target);
+  `fov_at` / `zoom_at` / `fstop_at` / `focus_at` animate vertical field of view, focal
+  multiplier, f-number and focus distance. Each is a keyframe track over the normalized
+  timeline `t ∈ [0,1]` (piecewise-linear, flat-clamped at the ends — same idiom as
+  `density_at`), or a constant via the bare keyword. Lens *projection*/fisheye stays a
+  discrete whole-flight mode (not a continuous track), documented as such.
+- **Implementation:** `ftsl.h` — new `ScalarTrack` helper (sorted `{t,v}` keys +
+  flat-clamped `sample()`), `rotateAboutAxis()` (Rodrigues) for the roll bank, and a
+  static `deriveCameraOptics()` factored out of `readFilmExposure()` so the per-frame loop
+  can re-derive focal/fov/aperture/film-distance from the sampled tracks starting from the
+  authored base values (no double-apply of zoom). `addCameraCurve()` parses the tracks,
+  samples them at each frame's timeline `fr`, re-derives optics when any lens track is
+  active, and applies roll to `up` about the final view direction. Demoed in
+  `scenes/crystalloop.ftsl` (roll banks into the oval's turns; fov widens for the crystal
+  plunge). Note: `fstop`/`focus`/DoF only bite in the physical catch modes (A/C); in the
+  pinhole splat mode B the aperture is virtual, so roll/fov/zoom are the visible tracks.
+
 ### `camera_orbit` block (turntable / fly-around for MP4s) — DONE 2026-07-11
 - **What:** a new top-level `camera_orbit "name" { center radius [height] [axis] frames
   [start_deg] [sweep_deg] [look_at] [exposure_lock] … }` expands into N CamSpec frames
