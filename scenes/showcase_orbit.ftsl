@@ -52,7 +52,9 @@ isosurface {
 }
 
 # --- Clear glass sphere the orbit path flies straight through ---
-isosurface { material glass  sphere { center 0.77 0.17 0.70   radius 0.17 } }
+# Native sphere so refraction uses the exact analytic normal (an isosurface wrapper
+# would use the numerical gradient and visibly distort the refracted image).
+sphere { center 0.77 0.17 0.70   radius 0.17   material glass }
 
 # Key light over the hero + a second fill so gold's camera-facing facets stay lit
 # from every orbit angle.

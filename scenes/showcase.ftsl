@@ -44,10 +44,10 @@ isosurface {
 }
 
 # --- Accent: clear glass sphere refracting the walls, nearer the camera ---
-isosurface {
-    material glass
-    sphere { center 0.77 0.17 0.70   radius 0.17 }
-}
+# Native sphere (not an isosurface) so refraction uses the exact analytic normal
+# normalize(p-center). Wrapping it in `isosurface` would fall back to the numerical
+# finite-difference gradient, whose small errors visibly distort the dielectric.
+sphere { center 0.77 0.17 0.70   radius 0.17   material glass }
 
 # Key light over the hero (unchanged from the original showcase).
 light area {
