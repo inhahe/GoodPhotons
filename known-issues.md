@@ -32,6 +32,29 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
   tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
   accents + colored walls for this reason.
 
+### Concurrent GPU renders silently corrupt output (all-black, `auto-exposure=1`) — 2026-07-11
+
+Running two or more `ftrace ... -device gpu` processes at the same time can make one
+of them emit a **completely black** image whose log reports `auto-exposure=1` (the
+fallback the auto-exposure code uses when the 99th-percentile luminance comes back
+NaN/zero). A correct render of the same scene reports a tiny absolute exposure like
+`2.7e-12`. Symptom is **non-deterministic and non-monotonic in spp** — e.g. for
+`scenes/mirror_selfie.ftsl` a batch produced 512 spp OK, 2048 spp black, 4096 spp OK,
+purely depending on which renders happened to overlap on the GPU. Re-running the
+black case **alone** renders correctly, which is the tell that it's contention, not a
+scene/spp bug. Likely a Windows display-driver TDR (long kernel killed after the
+~2 s watchdog) or device-memory pressure when jobs overlap; either way the failure is
+silent (exit code 0, garbage/NaN framebuffer).
+
+- **Where:** GPU render entry (`render_cuda.cu`) + auto-exposure fallback in
+  `src/main.cpp` (~line 834, percentile→exposure). No error is surfaced when the
+  kernel output is NaN.
+- **Workaround:** render GPU jobs **one at a time**; if a render comes back black with
+  `auto-exposure=1`, just re-run it with the GPU otherwise idle.
+- **Proper fix:** detect a NaN/empty framebuffer after the GPU kernel and fail loudly
+  (non-zero exit + message) instead of writing a black PNG; optionally serialize GPU
+  work or check for CUDA launch/TDR errors explicitly.
+
 ## Resolved
 
 ### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
