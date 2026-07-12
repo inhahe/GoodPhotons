@@ -1,0 +1,4 @@
+# aliases: led_blue blue-led
+# Blue InGaN LED. Peak ~470 nm, FWHM ~25 nm (sigma = FWHM/2.355). Direct-emission
+# narrow band (no phosphor); a Gaussian is a good first-order model of the die SPD.
+spd gaussian center=470 sigma=10.6

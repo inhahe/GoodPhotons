@@ -109,11 +109,20 @@ a measured SPD), now expressed as data; the interference math stays in `src/rend
 Metals and glasses need no file here — they resolve via the generic convention above.
 
 ### `light/*.light` — illuminant recipe bundles
-sun, daylight (`d65`), incandescent (`a`), led, led-warm: each an `spd` binding to a
-native light model (`blackbody <K>` for the thermal/daylight sources, `led-white
-<warm>` for the phosphor LEDs). The parametric `bb<K>`/`led<K>k` names and the
-gas-discharge line models (`hps`/`sodium`, `lps`, `mercury`, `metal-halide`) stay in
-`src/lights.h`; the measured F-series lives in `illuminant/`.
+White sources: sun, daylight (`d65`), incandescent (`a`), led, led-warm — each an
+`spd` binding to a native light model (`blackbody <K>` for the thermal/daylight
+sources, `led-white <warm>` for the phosphor LEDs).
+
+Colored (single-die) LEDs: led-royal-blue (447 nm), led-blue (470), led-cyan (505),
+led-green (530), led-amber (590), led-red (627), led-deep-red (660). A direct-emission
+LED die is one narrow band, so each is just `spd gaussian center=<peak> sigma=<FWHM/2.355>`
+— a pure-data bundle reusing the existing `gaussian` primitive, no native model. Peaks
+are representative InGaN (blue/green) / AlInGaP (amber/red) dice; a Gaussian is a good
+first-order fit (a measured die SPD has a slight long-λ tail — see below to upgrade).
+
+The parametric `bb<K>`/`led<K>k` names and the gas-discharge line models
+(`hps`/`sodium`, `lps`, `mercury`, `metal-halide`) stay in `src/lights.h`; the measured
+F-series lives in `illuminant/`.
 
 ## Pending (loader exists; better data still to be fetched + wired)
 
@@ -128,6 +137,16 @@ measured SPD into `illuminant/` (e.g. `hps.csv`) and reference it as `preset:hps
 - **LSPDD** — Lamp Spectral Power Distribution Database (lspdd.org): measured SPDs
   of real market lamps; per-lamp CSV export.
 - **LICA-UCM lamps spectral database v2.6** (guaix.fis.ucm.es): measured lamp SPDs.
+
+### Colored-LED die SPDs (`led-red`, `led-green`, `led-blue`, …)
+Currently the colored LEDs (`light/led-*.light`) are single-Gaussian parametric bands
+(peak + FWHM). A real die is close to Gaussian but slightly asymmetric with a long-λ
+shoulder. To swap in a measurement, drop a die SPD into `illuminant/` (e.g.
+`led-red-627.csv`) and repoint the bundle's `spd` to `file:` / `illuminant:`.
+- **LSPDD** (lspdd.org) and **LICA-UCM** (guaix.fis.ucm.es) both carry monochromatic-LED
+  measurements alongside the lamps.
+- **OSRAM / Lumileds / Cree datasheets** publish per-die relative SPD plots (digitize
+  to `wavelength_nm,value`).
 
 ### Human skin reflectance (`skin`, `skin-dark`)
 Currently `reflectance/skin-light.csv` / `skin-dark.csv` are representative

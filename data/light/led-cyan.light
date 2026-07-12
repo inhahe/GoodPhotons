@@ -1,0 +1,4 @@
+# aliases: led_cyan cyan-led
+# Cyan InGaN LED. Peak ~505 nm, FWHM ~32 nm (sigma = FWHM/2.355). Wider band than
+# blue/red (InGaN greens broaden toward the "green gap").
+spd gaussian center=505 sigma=13.6

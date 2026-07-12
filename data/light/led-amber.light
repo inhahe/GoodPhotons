@@ -1,0 +1,4 @@
+# aliases: led_amber amber-led
+# Amber AlInGaP LED. Peak ~590 nm, FWHM ~17 nm (sigma = FWHM/2.355). AlInGaP dice
+# emit narrower bands than the InGaN blues/greens.
+spd gaussian center=590 sigma=7.2

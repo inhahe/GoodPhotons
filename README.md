@@ -342,8 +342,11 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 - **`preset:<name>`** — illuminants and light sources:
   - **Blackbody / daylight:** `bb<K>` Planckian (e.g. `bb6500`), `sun`,
     `d65`/`daylight`, `a`/`incandescent`.
-  - **LED:** `led` (neutral), `led-warm`, and `led<K>k` phosphor LED at a colour
+  - **White LED:** `led` (neutral), `led-warm`, and `led<K>k` phosphor LED at a colour
     temperature (e.g. `led4000k`).
+  - **Colored LED:** single-die narrow-band emitters `led-royal-blue`, `led-blue`,
+    `led-cyan`, `led-green`, `led-amber`, `led-red`, `led-deep-red` (Gaussian at the
+    die's peak/FWHM).
   - **Fluorescent:** `fluorescent`/`cfl` (generic compact-fluorescent model) plus the
     measured CIE F-series `f2`/`cool-white`, `f7`/`daylight-fl`, `f11`/`triphosphor`.
   - **Gas-discharge lamps:** `hps`/`sodium` (high-pressure sodium),
