@@ -61,6 +61,26 @@ path (no extra RNG draw). Validated on an RTX 4090 mode B: `scraps/fogblob.ftsl`
 fog; means 38.57 vs 38.56), and a homogeneous regression (`scraps/foghom.ftsl`) block RMSE
 2.45/255, bias −0.009.
 
+**Per-object (sphere) fog bound — DONE 2026-07-12.** `bounds` now also accepts
+`{ center <x y z> radius <r> }`, confining the fog to a **sphere** region — the simple
+per-object case ("the whole inside of a glass sphere"): author the same center/radius as
+the object. Added `MediumBound { Box, Sphere }` + `boundShape`/`bcenter`/`bradius` to the
+`Medium` struct with a ray∩sphere interval in `clipToBounds` (heterogeneous density works
+inside a sphere too — the majorant grid uses the sphere's AABB, filled in by the parser).
+Mirrored on the GPU (`DMedium.boundShape`/`bcenter`/`bradius`, `dMedClip` sphere branch,
+upload path). Validated on an RTX 4090 mode B: open glowing orb `scraps/fogorb.ftsl`
+GPU-vs-CPU block RMSE 0.96/255 (bias 0.024), glass-shell `scraps/fogsphere.ftsl` block RMSE
+0.57/255 (bias −0.010); box/heterogeneous path unchanged (fogblob block RMSE still 1.07).
+*Limitations:* (1) fog inside an actual `dielectric` shell is only lit **indirectly** in a
+pinhole mode (`B`) — the glass surface occludes the straight camera connection and the light
+tracer can't refract a next-event connection, so the fog lights the room but isn't imaged
+directly; the finite-aperture modes (`A`/`C`, real photon arrival) image it directly, and an
+open fog sphere (no shell) is directly viewable in every forward mode. (2) Still a **single**
+global `scene.medium` — you get one bounded region, not a list of independent per-object media.
+A future extension would make `Scene::media` a vector (with per-segment medium resolution +
+a GPU medium array) so several differently-shaped fog objects can coexist; object-name /
+implicit-shape bounds (fog clipped to an arbitrary mesh/isosurface) would build on that.
+
 **Remaining gap (still open):**
 - **Backward/BDPT modes treat it as homogeneous** (on BOTH backends). `backward.h`
   (modes R/V), `bdpt.h` (mode D), and the camera-side layer of the P composite still use

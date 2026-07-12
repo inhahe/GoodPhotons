@@ -461,6 +461,16 @@ medium {
 - **`bounds { min <x y z>  max <x y z> }`** — an axis-aligned box (authored units →
   metres) that the fog is confined to. A ray's fog interaction is clipped to its
   overlap with the box, so nothing scatters outside it. (Alias: `contained_by`.)
+- **`bounds { center <x y z>  radius <r> }`** — a **sphere** region instead of a box:
+  the fog fills exactly a ball, e.g. **the whole inside of a glass sphere**. Author the
+  same `center`/`radius` as your sphere geometry and the fog is clipped precisely to
+  that sphere (round silhouette). This is the simple *per-object* fog: co-locate the
+  region with an object to fill it. (A `density` field works inside a sphere bound too —
+  its majorant grid uses the sphere's AABB.) *Note:* in a **pinhole** mode (`B`) the fog
+  inside an actual `dielectric` sphere is only lit indirectly (the glass surface occludes
+  the straight camera connection, and the light tracer can't refract a connection); the
+  fog still lights the surrounding room, and a **finite-aperture** mode (`A`/`C`) images
+  it directly. An *open* fog sphere (no glass shell) is directly viewable in every mode.
 - **`density <expr>`** or **`density pattern:<name>`** — a scalar field, ≥ 0, that
   multiplies `sigma_t` (and hence both `sigma_a` and `sigma_s`) at each point. Uses
   the same infix expression language as isosurface `function` fields and `pattern`

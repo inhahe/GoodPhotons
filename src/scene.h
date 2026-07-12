@@ -194,6 +194,11 @@ inline Material makeFluoroMaterial() {
 // Monte Carlo), so photon throughput stays unchanged — matching the rest of the
 // renderer. Coefficients are spectral, so wavelength-dependent (e.g. Rayleigh
 // ~1/lambda^4) fog that scatters blue and transmits red works for free.
+// Shape of a medium's optional spatial bound: an axis-aligned box or a sphere. A
+// sphere bound fills exactly an object-shaped region (e.g. "the whole inside of a
+// glass sphere") — author the same center/radius as the sphere geometry.
+enum class MediumBound { Box, Sphere };
+
 struct Medium {
     bool enabled = false;
     Spectrum sigma_a = constantSpectrum(0.0); // absorption coefficient vs lambda
@@ -209,12 +214,19 @@ struct Medium {
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
 
-    // --- Optional spatial bound (localized fog) -----------------------------
-    // When `bounded`, the medium exists only inside the world AABB [bmin,bmax];
-    // a photon's fog interaction and connect-transmittance are clipped to the
-    // ray's overlap with the box. Unbounded => the medium fills the whole scene.
+    // --- Optional spatial bound (localized / per-object fog) ----------------
+    // When `bounded`, the medium exists only inside a region: an axis-aligned box
+    // [bmin,bmax] (`boundShape == Box`) or a sphere centered `bcenter` radius
+    // `bradius` (`boundShape == Sphere`, e.g. the interior of a glass sphere). A
+    // photon's fog interaction and connect-transmittance are clipped to the ray's
+    // overlap with the region. Unbounded => the medium fills the whole scene. For a
+    // sphere bound, bmin/bmax hold the sphere's AABB (used by the density majorant
+    // grid estimate) so heterogeneous density fields work inside a sphere too.
     bool bounded = false;
+    MediumBound boundShape = MediumBound::Box;
     Vec3 bmin{0, 0, 0}, bmax{0, 0, 0};
+    Vec3 bcenter{0, 0, 0};
+    double bradius = 0.0;
 
     double sigmaT(double lambda) const {
         return std::max(0.0, sigma_a(lambda) + sigma_s(lambda));
@@ -242,6 +254,22 @@ struct Medium {
     bool clipToBounds(const Vec3& o, const Vec3& d, double t0, double t1,
                       double& ta, double& tb) const {
         if (!bounded) { ta = t0; tb = t1; return t1 > t0; }
+        if (boundShape == MediumBound::Sphere) {
+            // Ray (o + t*d) ∩ sphere → the [ta,tb] chord inside the sphere, intersected
+            // with [t0,t1]. Origins inside the sphere give a negative near root (clamped
+            // to t0). No hit / chord outside [t0,t1] => the ray never enters the fog.
+            Vec3 oc = o - bcenter;
+            double A = dot(d, d);
+            double B = 2.0 * dot(oc, d);
+            double C = dot(oc, oc) - bradius * bradius;
+            double disc = B * B - 4.0 * A * C;
+            if (disc <= 0.0 || A <= 0.0) return false;
+            double sd = std::sqrt(disc);
+            double s0 = (-B - sd) / (2.0 * A), s1 = (-B + sd) / (2.0 * A);
+            double lo = std::max(t0, s0), hi = std::min(t1, s1);
+            if (lo > hi) return false;
+            ta = lo; tb = hi; return tb > ta;
+        }
         double lo = t0, hi = t1;
         for (int a = 0; a < 3; ++a) {
             double oa = (&o.x)[a], da = (&d.x)[a];

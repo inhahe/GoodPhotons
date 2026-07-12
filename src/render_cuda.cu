@@ -305,8 +305,11 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
-    int              bounded;         // 1 => clip to [bmin,bmax]
+    int              bounded;         // 1 => clip to the bound region
+    int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere (bcenter,bradius)
     DVec3            bmin, bmax;
+    DVec3            bcenter;
+    double           bradius;
 };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
@@ -735,6 +738,22 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
 __device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& dir,
                                  double t0, double t1, double& ta, double& tb) {
     if (!m.bounded) { ta = t0; tb = t1; return t1 > t0; }
+    if (m.boundShape == 1) {   // sphere region: ray∩sphere chord ∩ [t0,t1]
+        double ocx = (double)o.x - (double)m.bcenter.x;
+        double ocy = (double)o.y - (double)m.bcenter.y;
+        double ocz = (double)o.z - (double)m.bcenter.z;
+        double dx = (double)dir.x, dy = (double)dir.y, dz = (double)dir.z;
+        double A = dx * dx + dy * dy + dz * dz;
+        double B = 2.0 * (ocx * dx + ocy * dy + ocz * dz);
+        double C = ocx * ocx + ocy * ocy + ocz * ocz - m.bradius * m.bradius;
+        double disc = B * B - 4.0 * A * C;
+        if (disc <= 0.0 || A <= 0.0) return false;
+        double sd = sqrt(disc);
+        double s0 = (-B - sd) / (2.0 * A), s1 = (-B + sd) / (2.0 * A);
+        double lo = fmax(t0, s0), hi = fmin(t1, s1);
+        if (lo > hi) return false;
+        ta = lo; tb = hi; return tb > ta;
+    }
     double lo = t0, hi = t1;
     const double oo[3] = { (double)o.x, (double)o.y, (double)o.z };
     const double dd[3] = { (double)dir.x, (double)dir.y, (double)dir.z };
@@ -3572,8 +3591,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.medium.densityN = (int)scene.medium.density.size();
     sc.medium.densityMax = scene.medium.densityMax;
     sc.medium.bounded  = scene.medium.bounded ? 1 : 0;
+    sc.medium.boundShape = (scene.medium.boundShape == MediumBound::Sphere) ? 1 : 0;
     sc.medium.bmin = {scene.medium.bmin.x, scene.medium.bmin.y, scene.medium.bmin.z};
     sc.medium.bmax = {scene.medium.bmax.x, scene.medium.bmax.y, scene.medium.bmax.z};
+    sc.medium.bcenter = {scene.medium.bcenter.x, scene.medium.bcenter.y, scene.medium.bcenter.z};
+    sc.medium.bradius = scene.medium.bradius;
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};

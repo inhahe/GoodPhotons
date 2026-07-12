@@ -556,10 +556,14 @@ at the poles, a grid on box faces) instead of slicing through world space. See
 function by default; Rayleigh optional.
 
 **Bounded, heterogeneous fog (blobs).** The medium isn't limited to a single global
-haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box,
-and/or `density "<expr>"` (or `density pattern:<name>`) — a scalar field over world
-`x y z` (the same infix expression language as isosurface `function` fields) that
-scales `sigma_t` per point. This makes discrete **fog blobs with soft, formula-defined
+haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box —
+or `bounds { center <x y z> radius <r> }` to confine it to a **sphere** region, i.e.
+simple *per-object* fog like **the whole inside of a glass sphere** (author the same
+center/radius as the sphere; an open fog sphere is directly viewable, while fog inside
+an actual glass shell is imaged directly by the finite-aperture modes `A`/`C` and lights
+the room in the pinhole mode `B`). Add `density "<expr>"` (or `density pattern:<name>`) —
+a scalar field over world `x y z` (the same infix expression language as isosurface
+`function` fields) that scales `sigma_t` per point — for **fog blobs with soft, formula-defined
 boundaries**: e.g. a smooth radial falloff `pow(saturate(1 - dist/R), 2)` renders a
 glowing sphere of haze whose edge fades gradually instead of a hard surface. Sampling is
 unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for shadow

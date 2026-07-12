@@ -1640,21 +1640,40 @@ private:
             }
         }
 
-        // ---- Optional spatial bound: `bounds { min <x y z>  max <x y z> }` -------
-        // (accepts `contained_by` as an alias). Authored positions are unit-scaled to
-        // metres. Localizes the fog to an AABB; a photon's fog interaction is clipped
-        // to the ray's overlap with the box.
+        // ---- Optional spatial bound (localized / per-object fog) -----------------
+        // `bounds { min <x y z>  max <x y z> }` confines the fog to an AABB, while
+        // `bounds { center <x y z>  radius <r> }` confines it to a SPHERE — e.g. the
+        // whole inside of a glass sphere: author the same center/radius as the sphere
+        // geometry and the fog fills exactly that region. (`contained_by` is an alias.)
+        // Authored positions/radii are unit-scaled to metres. A photon's fog interaction
+        // is clipped to the ray's overlap with the region.
         const Stmt* bd = find(b, "bounds");
         if (!bd) bd = find(b, "contained_by");
         if (bd && bd->val.block) {
-            Vec3 mn{0, 0, 0}, mx{0, 0, 0};
-            vec3Of(*bd->val.block, "min", mn);
-            vec3Of(*bd->val.block, "max", mx);
-            mn = P(mn); mx = P(mx);
-            for (int a = 0; a < 3; ++a) if ((&mn.x)[a] > (&mx.x)[a]) std::swap((&mn.x)[a], (&mx.x)[a]);
-            L.scene.medium.bounded = true;
-            L.scene.medium.bmin = mn;
-            L.scene.medium.bmax = mx;
+            const Block& bb = *bd->val.block;
+            if (find(bb, "center") || find(bb, "radius")) {       // sphere-shaped region
+                Vec3 ctr{0, 0, 0};
+                vec3Of(bb, "center", ctr);
+                double rad = Len(dblOf(bb, "radius", 0.0));
+                ctr = P(ctr);
+                if (rad <= 0.0) { fail("medium `bounds { center .. radius .. }` needs a positive radius"); return false; }
+                L.scene.medium.bounded = true;
+                L.scene.medium.boundShape = MediumBound::Sphere;
+                L.scene.medium.bcenter = ctr;
+                L.scene.medium.bradius = rad;
+                L.scene.medium.bmin = ctr - Vec3{rad, rad, rad};  // AABB for the majorant grid
+                L.scene.medium.bmax = ctr + Vec3{rad, rad, rad};
+            } else {                                              // axis-aligned box region
+                Vec3 mn{0, 0, 0}, mx{0, 0, 0};
+                vec3Of(bb, "min", mn);
+                vec3Of(bb, "max", mx);
+                mn = P(mn); mx = P(mx);
+                for (int a = 0; a < 3; ++a) if ((&mn.x)[a] > (&mx.x)[a]) std::swap((&mn.x)[a], (&mx.x)[a]);
+                L.scene.medium.bounded = true;
+                L.scene.medium.boundShape = MediumBound::Box;
+                L.scene.medium.bmin = mn;
+                L.scene.medium.bmax = mx;
+            }
         }
 
         // ---- Optional heterogeneous density field --------------------------------
