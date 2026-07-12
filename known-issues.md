@@ -73,11 +73,18 @@ term with `bsdfF>0` as the real gate; `lambda` is now threaded through
 `bsdfPdf`→`vertexPdf`→`misWeight` so the wavelength-dependent lobe-selection pdf is exact).
 `reflect`+`transmit` are energy-clamped so their sum ≤ 1. Validated: `scraps/translucent_panel.ftsl`
 (backlit warm panel) renders consistently across modes B, R, and D.
-**Remaining:** (1) **GPU port** — `render_cuda.cu` has no `DiffuseTransmit` case, so the
-material is silently ignored on the GPU; add the DMaterial `transmit` field + the two-lobe
-splat/scatter to the CUDA kernels. (2) A true **BSSRDF / dipole / random-walk subsurface**
-model (for thick solid SSS with proper mean-free-path blurring) is still not implemented —
-this material is a thin diffuse-transmission approximation, not volumetric SSS.
+**GPU — DONE 2026-07-12.** `render_cuda.cu` now handles `translucent`: `D_DIFFUSETRANSMIT`
+(enum aligned to `MatType` with a `D_LAYERED` placeholder), a `DMaterial::transmit[SPEC_N]`
+field baked on upload, the two-lobe splat/scatter in the forward `shadeStep` (megakernel +
+wavefront share it) and the backward reference `bkRadiance` (GPU mode R). The restricted GPU
+BDPT kernel (`kBdpt`) has no two-sided strategy, so translucent scenes fall back to the
+validated CPU BDPT via `cudaBdptSupported` (same pattern as frosted glass / textures /
+fluorescence). Validated on an RTX 4090: forward B and backward R GPU-vs-CPU RMSE = 3.82/255
+(pure MC noise, matching means), and GPU mode D renders the panel correctly through the CPU
+fallback.
+**Remaining:** a true **BSSRDF / dipole / random-walk subsurface** model (for thick solid SSS
+with proper mean-free-path blurring) is still not implemented — this material is a thin
+diffuse-transmission approximation, not volumetric SSS.
 
 ### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
 The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now

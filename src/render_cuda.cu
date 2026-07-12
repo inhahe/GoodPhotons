@@ -153,7 +153,11 @@ HD static inline void onb(const DVec3& n, DVec3& t, DVec3& b) {
 HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
 // Material type tags (must match MatType order in scene.h).
-enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM, D_GRATING, D_MIX, D_MULTILAYER };
+// Values MUST match MatType (scene.h) 1:1 — the upload does d.type = (int)m.type. D_LAYERED
+// (MatType::Layered) has no device branch (Layered scenes fall back to the CPU tracer via
+// cudaForwardSupported), but the placeholder keeps D_DIFFUSETRANSMIT aligned at index 11.
+enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM,
+       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT };
 
 // Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
 // exceed this fall back to the CPU forward tracer (cudaForwardSupported).
@@ -188,6 +192,10 @@ struct DMaterial {
     // only for D_DIELECTRIC, via the `interior` material tracked through the transport
     // loop (device twin of Material::absorb).
     double absorb[SPEC_N];
+    // Diffuse-transmission albedo (D_DIFFUSETRANSMIT only): the back-hemisphere (-n)
+    // Lambertian lobe. `reflect` is the front (+n) lobe; reflect+transmit is energy-
+    // clamped to <= 1 per wavelength at shade time. Device twin of Material::transmit.
+    double transmit[SPEC_N];
     double roughness;
     double filmIor, filmThickness;
     // Spatially-varying diffuse albedo: index into DScene::textures (-1 = use the
@@ -1987,6 +1995,25 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             eAbsorbed += beta; return WF_TERMINATE;
         }
         ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
+    } else if (m.type == D_DIFFUSETRANSMIT) {
+        // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
+        // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
+        // lobes — connect()/connectLens() self-reject the wrong-side lobe (cosSurf<=0), so
+        // passing the flipped normal images whichever side the camera is on. Non-specular,
+        // so a directly-viewed translucent solid is VISIBLE in model B (unlike dielectric).
+        Real rhoR = dDiffuseRho(sc, m, h, lambda);
+        Real rhoT = clamp01(specLookup(m.transmit, lambda));
+        Real sum = rhoR + rhoT;
+        if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
+        DVec3 nb = h.n * (Real)(-1);
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
+        splatSurfaceAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
+        // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
+        // unchanged on a scatter (like the diffuse case).
+        Real u = rng.uniform();
+        if (u < rhoR)      { ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE; }
+        else if (u < sum)  { ro = h.p + nb  * RAY_EPS; rd = cosineHemisphere(nb,  rng); return WF_CONTINUE; }
+        eAbsorbed += beta; return WF_TERMINATE;
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
@@ -2558,6 +2585,24 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                 if (dot(o, h.n) <= 0) return L;
                 ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
+            }
+            case D_DIFFUSETRANSMIT: {
+                // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
+                // reflect lobe against lights in the front (+n) hemisphere and the transmit
+                // lobe in the back (-n) hemisphere (a normal-flipped Hit reuses bkNeeLight),
+                // then continue reflect / transmit / absorb (throughput unchanged on survival).
+                Real rhoR = clamp01(dDiffuseRho(sc, *mp, h, lambda));
+                Real rhoT = clamp01(specLookup(mp->transmit, lambda));
+                Real sum = rhoR + rhoT;
+                if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
+                DVec3 nb = h.n * (Real)(-1);
+                L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
+                DHit hb = h; hb.n = nb;
+                L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
+                Real u = rng.uniform();
+                if (u < rhoR)     { ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); specularArrival = false; break; }
+                else if (u < sum) { ro = h.p + nb  * RAY_EPS; rd = cosineHemisphere(nb,  rng); specularArrival = false; break; }
+                return L;                                // absorbed
             }
             case D_DIFFUSE:
             case D_FLUORESCENT:
@@ -3239,6 +3284,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(m.ior, d.ior);
         bakeSpec(m.substrateK, d.substrateK);
         bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
+        bakeSpec(m.transmit, d.transmit); // diffuse-transmission back-lobe albedo (translucent)
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
@@ -3704,6 +3750,11 @@ bool cudaBdptSupported(const Scene& scene) {
         const Material& m = scene.mats[matId];
         if (frostedOrColoredGlass(m)) return true;
         if (m.reflectTex >= 0 || m.type == MatType::Fluorescent) return true;
+        // Diffuse-transmission (two-sided Lambertian): the GPU BDPT kernel (dBsdfF /
+        // dBsdfPdf / dRandomWalk / dConnect) has no two-lobe / back-hemisphere strategy,
+        // so a translucent vertex would render black or bias MIS. The CPU BDPT (bdpt.h)
+        // handles it fully (isConnectibleMat + isTwoSidedMat), so fall back to it.
+        if (m.type == MatType::DiffuseTransmit) return true;
         // Non-albedo texture maps (roughness / film-thickness) drive the glossy/thin-film
         // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
         // which would bias MIS. Fall back to CPU BDPT (which threads the Hit through).
@@ -3718,6 +3769,7 @@ bool cudaBdptSupported(const Scene& scene) {
                 if (c >= 0 && c < (int)scene.mats.size() &&
                     (frostedOrColoredGlass(scene.mats[c]) ||
                      scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
+                     scene.mats[c].type == MatType::DiffuseTransmit ||
                      scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
                      scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
                      scene.mats[c].mixWeightPat >= 0))
