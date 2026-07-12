@@ -2353,34 +2353,56 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
 
 #define BDPT_MAXDEPTH 8
 #define BDPT_MAXV     (BDPT_MAXDEPTH + 3)   // path[0] endpoint + up to MAXDEPTH surfaces + slack
-enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2 };
+enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2, BV_MEDIUM = 3 };
 
 // A path vertex. Mirrors bdpt.h Vertex, but stores INDICES (matId into sc.mats,
 // lightIdx into sc.emitters) instead of pointers, and drops the Hit field (the GPU
 // rejects textured scenes, so albedo needs no surface-local (u,v)). pdfFwd/pdfRev/
 // beta stay double for MIS stability; geometry (p/ns/ng) is Real.
 struct DVertex {
-    int   type;                 // BV_CAMERA / BV_LIGHT / BV_SURFACE
+    int   type;                 // BV_CAMERA / BV_LIGHT / BV_SURFACE / BV_MEDIUM
     DVec3 p, ns, ng;            // position, shading normal, geometric normal
     double beta;                // throughput carried to this vertex
     double pdfFwd, pdfRev;      // area-measure densities (0 for delta vertices)
     int   delta;                // 1 => specular (skipped in connections/MIS)
     int   matId;                // sc.mats index (-1 for camera)
     int   lightIdx;             // sc.emitters index if emissive, else -1
+    double mediumG;             // HG asymmetry g at a BV_MEDIUM vertex
+    int   mediumId;             // sc.media index at a BV_MEDIUM vertex (-1 otherwise)
 };
 
 __device__ static inline double ddot(const DVec3& a, const DVec3& b) {
     return (double)a.x * b.x + (double)a.y * b.y + (double)a.z * b.z;
 }
-__device__ static inline bool dOnSurface(const DVertex& v) { return v.type != BV_CAMERA; }
+// Medium (volume) vertices carry no surface, so onSurface() is false — ConvertDensity
+// then omits the cosine Jacobian, giving the correct cosine-free volume area density.
+__device__ static inline bool dOnSurface(const DVertex& v) {
+    return v.type == BV_SURFACE || v.type == BV_LIGHT;
+}
 __device__ static inline bool dConnectibleType(int tp) {
     return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT;
 }
 __device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
     if (v.type == BV_CAMERA) return true;
+    if (v.type == BV_MEDIUM) return true;   // volume in-scatter always connects
     if (v.type == BV_LIGHT)  return v.lightIdx >= 0 && sc.emitters[v.lightIdx].collimated == 0;
     if (v.delta) return false;
     return dConnectibleType(sc.mats[v.matId].type);
+}
+// HG phase as the medium "BSDF": propagation INTO the vertex is -wo, scattered dir is wi
+// (both point away from v), so cosTheta = -dot(wo,wi). hgPhase is its own pdf, so
+// dPhaseF == dPhasePdf. mediumScatterF = albedo * phase is the CONNECTION response
+// (albedo corrects the sigma_t-rate collision to the sigma_s scatter rate; it enters the
+// throughput once, never the MIS density). Mirrors bdpt.h phaseF / mediumScatterF.
+__device__ static inline double dPhaseF(const DVertex& v, const DVec3& wo, const DVec3& wi) {
+    return (double)hgPhase((Real)(-ddot(wo, wi)), (Real)v.mediumG);
+}
+__device__ static inline double dPhasePdf(const DVertex& v, const DVec3& wo, const DVec3& wi) {
+    return (double)hgPhase((Real)(-ddot(wo, wi)), (Real)v.mediumG);
+}
+__device__ static inline double dMediumScatterF(const DScene& sc, const DVertex& v,
+                                                const DVec3& wo, const DVec3& wi, Real lambda) {
+    return (double)medAlbedo(sc.media[v.mediumId], lambda) * dPhaseF(v, wo, wi);
 }
 __device__ static inline bool dIsLightVertex(const DVertex& v) {
     return v.type == BV_LIGHT || (v.type == BV_SURFACE && v.lightIdx >= 0);
@@ -2478,6 +2500,12 @@ __device__ static double dVertexPdf(const DScene& sc, const DCamera& cam,
     double pdfW = 0.0;
     if (cur.type == BV_CAMERA) {
         pdfW = dCameraPdfDir(cam, dCamCos(cam, next.p));
+    } else if (cur.type == BV_MEDIUM) {          // volume in-scatter: HG phase pdf
+        if (!prev) return 0.0;
+        DVec3 wp = prev->p - cur.p;
+        if (ddot(wp, wp) == 0.0) return 0.0;
+        wp = normalize(wp);
+        pdfW = dPhasePdf(cur, wp, wn);
     } else {
         if (!prev) return 0.0;
         DVec3 wp = prev->p - cur.p;
@@ -2860,8 +2888,51 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
     double pdfFwd = pdfDir;
     for (int bounces = 0;;) {
         DHit h = closestHit(sc, ro, rd);
+        if (h.valid && h.sensorId >= 0) return;
+        double dSurf = h.valid ? (double)h.t : 1e30;
+
+        // Participating media: sample the earliest real collision up to the surface
+        // (or 1e30 in open space). Homogeneous free-flight — its transmittance is
+        // implicit in the exponential so beta is unchanged (analog MC). No media => no
+        // RNG draw, so vacuum walks stay bit-identical. Mirrors bdpt.h randomWalk.
+        double tMed = 0.0; bool mediumEvent = false; int scatterMed = -1;
+        if (sc.mediaN > 0) {
+            Real tm; int which;
+            if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, (Real)dSurf, lambda, rng, tm, which)) {
+                tMed = (double)tm; mediumEvent = true; scatterMed = which;
+            }
+        }
+
+        // Medium collision precedes the surface: append a volume in-scatter vertex, then
+        // scatter (prob = albedo) or absorb. Throughput unchanged on scatter (HG sampling
+        // pdf == phase value, analog MC). Stored area densities are cosine-free and carry
+        // only the phase direction density; the free-flight distance pdf and transmittance
+        // are omitted here AND in dVertexPdf, so they cancel pairwise in every MIS ratio.
+        if (mediumEvent) {
+            if (n >= BDPT_MAXV) return;
+            const DMedium& sm = sc.media[scatterMed];
+            DVec3 mpos = ro + rd * (Real)tMed;
+            int prevIdx = n - 1;
+            DVertex v;
+            v.type = BV_MEDIUM; v.p = mpos; v.ns = rd; v.ng = rd;
+            v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
+            v.matId = -1; v.lightIdx = -1;
+            v.mediumG = sm.g; v.mediumId = scatterMed;
+            v.pdfFwd = dConvertDensity(pdfFwd, path[prevIdx], v);
+            path[n] = v; int cur = n; n++;
+            if (++bounces >= maxDepth) return;
+            if (rng.uniform() >= (double)medAlbedo(sm, lambda)) return;   // absorbed (vertex retained)
+            DVec3 wo = normalize(path[prevIdx].p - path[cur].p);          // toward previous vertex
+            DVec3 wi = sampleHG(rd, (Real)sm.g, rng);                     // scattered propagation dir
+            double pdfW    = dPhasePdf(path[cur], wo, wi);
+            double pdfRevW = dPhasePdf(path[cur], wi, wo);
+            path[prevIdx].pdfRev = dConvertDensity(pdfRevW, path[cur], path[prevIdx]);
+            ro = mpos; rd = normalize(wi);
+            pdfFwd = pdfW;
+            continue;
+        }
+
         if (!h.valid) return;
-        if (h.sensorId >= 0) return;
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
@@ -2876,6 +2947,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
         v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
         v.matId = matId; v.lightIdx = dEmitterForMat(sc, matId);
+        v.mediumG = 0.0; v.mediumId = -1;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
         if (++bounces >= maxDepth) return;
@@ -2973,6 +3045,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     DVertex c;
     c.type = BV_CAMERA; c.ns = cam.w; c.ng = cam.w;
     c.beta = 1.0; c.pdfFwd = 0; c.pdfRev = 0; c.delta = 0; c.matId = -1; c.lightIdx = -1;
+    c.mediumG = 0.0; c.mediumId = -1;
     if (cam.hasLens) {
         Real jx = rng.uniform(), jy = rng.uniform();
         Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -3021,6 +3094,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     L0.type = BV_LIGHT; L0.p = y; L0.ns = nOut; L0.ng = nOut;
     L0.beta = Le; L0.pdfFwd = pdfChoice * pdfPos; L0.pdfRev = 0; L0.delta = 0;
     L0.matId = em.matId; L0.lightIdx = ei;
+    L0.mediumG = 0.0; L0.mediumId = -1;
     path[0] = L0; int n = 1;
     DVec3 dir = cosineHemisphere(nOut, rng);
     double cosLight = ddot(nOut, dir);
@@ -3109,6 +3183,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     DVertex sampled;
     sampled.type = BV_SURFACE; sampled.beta = 0; sampled.pdfFwd = 0; sampled.pdfRev = 0;
     sampled.delta = 0; sampled.matId = -1; sampled.lightIdx = -1;
+    sampled.mediumG = 0.0; sampled.mediumId = -1;
 
     if (s == 0) {
         if (t < 2) return 0.0;
@@ -3131,17 +3206,24 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         double dist2 = ddot(cam.eye - qs.p, cam.eye - qs.p);
         double dist = sqrt(dist2);
         DVec3 wcam = (cam.eye - qs.p) * (Real)(1.0 / dist);
-        double cosSurf = ddot(qs.ns, wcam);
-        if (cosSurf <= 0.0) return 0.0;
         DVec3 wo = normalize(light[s - 2].p - qs.p);
-        double f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
+        // Medium endpoint: phase*albedo, cosine 1, occlusion from the exact point.
+        double cosSurf, f; DVec3 o;
+        if (qs.type == BV_MEDIUM) {
+            cosSurf = 1.0; f = dMediumScatterF(sc, qs, wo, wcam, lambda); o = qs.p;
+        } else {
+            cosSurf = ddot(qs.ns, wcam);
+            if (cosSurf <= 0.0) return 0.0;
+            f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
+            double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
+            o = qs.p + qs.ng * (Real)(sgn * 1e-6);
+        }
         if (f <= 0.0) return 0.0;
-        double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
-        DVec3 o = qs.p + qs.ng * (Real)(sgn * 1e-6);
         if (occluded(sc, o, wcam, (Real)(dist - 2e-6))) return 0.0;
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
         double G = cosSurf * cosCam / dist2;
-        L = qs.beta * f * G * dCameraWe(cam, cosCam);
+        L = qs.beta * f * G * dCameraWe(cam, cosCam) * Tr;
         if (L <= 0.0) return 0.0;
         sampled.type = BV_CAMERA; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
         sampled.beta = 1.0;
@@ -3158,21 +3240,28 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (dist2 <= 0.0) return 0.0;
         double dist = sqrt(dist2); DVec3 wi = toL * (Real)(1.0 / dist);
         double cosLight = ddot(nOut, wi * (Real)-1);
-        double cosSurf = ddot(pt.ns, wi);
-        if (cosLight <= 0.0 || cosSurf <= 0.0) return 0.0;
+        if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
         double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         if (Le <= 0.0) return 0.0;
-        double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
-        DVec3 o = pt.p + pt.ng * (Real)(sgn * 1e-6);
-        if (occluded(sc, o, wi, (Real)(dist - 2e-6))) return 0.0;
         DVec3 wo = normalize(eye[t - 2].p - pt.p);
-        double f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda);
+        double cosSurf, f; DVec3 o;
+        if (pt.type == BV_MEDIUM) {
+            cosSurf = 1.0; f = dMediumScatterF(sc, pt, wo, wi, lambda); o = pt.p;
+        } else {
+            cosSurf = ddot(pt.ns, wi);
+            if (cosSurf <= 0.0) return 0.0;
+            f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda);
+            double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
+            o = pt.p + pt.ng * (Real)(sgn * 1e-6);
+        }
         if (f <= 0.0) return 0.0;
+        if (occluded(sc, o, wi, (Real)(dist - 2e-6))) return 0.0;
         double pdfChoice = em.power / sc.totalPower;
         double pdfA = pdfChoice / em.area;
         if (pdfA <= 0.0) return 0.0;
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
         double G = cosSurf * cosLight / dist2;
-        L = pt.beta * f * Le * G / pdfA;
+        L = pt.beta * f * Le * G / pdfA * Tr;
         if (L <= 0.0) return 0.0;
         sampled.type = BV_LIGHT; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.lightIdx = ei; sampled.matId = em.matId; sampled.beta = Le / pdfA; sampled.pdfFwd = pdfA;
@@ -3182,19 +3271,32 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (!dVertConnectible(sc, qs) || !dVertConnectible(sc, pt)) return 0.0;
         DVec3 d = qs.p - pt.p; double dist2 = ddot(d, d);
         if (dist2 <= 0.0) return 0.0;
-        double dist = sqrt(dist2); DVec3 w = d * (Real)(1.0 / dist);
-        double cosE = ddot(pt.ns, w), cosL = ddot(qs.ns, w * (Real)-1);
-        if (cosE <= 0.0 || cosL <= 0.0) return 0.0;
+        double dist = sqrt(dist2); DVec3 w = d * (Real)(1.0 / dist);   // pt -> qs
         DVec3 woE = normalize(eye[t - 2].p - pt.p);
         DVec3 woL = normalize(light[s - 2].p - qs.p);
-        double fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda);
-        double fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
+        // Each endpoint is a surface (BSDF, cosine) or a medium (phase*albedo, cos=1).
+        double cosE, cosL, fE, fL; DVec3 o;
+        if (pt.type == BV_MEDIUM) {
+            cosE = 1.0; fE = dMediumScatterF(sc, pt, woE, w, lambda); o = pt.p;
+        } else {
+            cosE = ddot(pt.ns, w);
+            if (cosE <= 0.0) return 0.0;
+            fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda);
+            double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
+            o = pt.p + pt.ng * (Real)(sgn * 1e-6);
+        }
+        if (qs.type == BV_MEDIUM) {
+            cosL = 1.0; fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
+        } else {
+            cosL = ddot(qs.ns, w * (Real)-1);
+            if (cosL <= 0.0) return 0.0;
+            fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
+        }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
-        double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
-        DVec3 o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, w, (Real)dist, lambda, rng) : 1.0;
         double G = cosE * cosL / dist2;
-        L = pt.beta * fE * fL * qs.beta * G;
+        L = pt.beta * fE * fL * qs.beta * G * Tr;
     }
     if (L <= 0.0) return 0.0;
     return L * dMisWeight(sc, cam, light, eye, sampled, s, t);
@@ -3957,10 +4059,13 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
 
 bool cudaBdptSupported(const Scene& scene) {
     // BDPT-GPU needs the same POD-bakeable materials as the forward path, PLUS the
-    // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): no participating
-    // media, and only area/sphere/cylinder Lambertian emitters (no spot/env/collimated).
+    // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): only HOMOGENEOUS
+    // participating media (heterogeneous / density-field media are rejected, matching
+    // the CPU BDPT), and only area/sphere/cylinder Lambertian emitters (no spot/env/
+    // collimated).
     if (!cudaForwardSupported(scene)) return false;
-    if (scene.anyMedium()) return false;
+    for (const auto& m : scene.media)
+        if (m.heterogeneous()) return false;
     // Dielectric translucency (frosting + Beer-Lambert interior absorption) runs on the
     // device forward/backward tracers, but the BDPT kernel (kBdpt) treats every dielectric
     // as smooth & non-absorbing and its pdf/eval use constant params — a frosted or colored

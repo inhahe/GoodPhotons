@@ -480,9 +480,11 @@ medium {
   pinhole splat (`B`) *and* the finite-lens splat (`A`) connect the fog to the camera with a
   **straight** ray, which the glass occludes (and could not refract anyway), so seeing the
   fog *through* the glass renders black. The fog still correctly **lights the surrounding
-  room**. Only the fully physical modes — photon-catch (`C`) and BDPT (`D`) — can trace the
-  refracted view, and only very slowly. An *open* fog sphere (no glass shell) is directly
-  viewable in every mode.
+  room** in those modes. **BDPT (`D`) images fog-through-glass correctly** — its camera
+  subpath refracts through the shell to a volume vertex and MIS-connects to the light, so a
+  lantern glowing inside a fogged glass sphere renders as a bright disc; photon-catch (`C`)
+  traces the same path but far more slowly. An *open* fog sphere (no glass shell) is
+  directly viewable in every mode.
 - **`bounds { object "<name>" }`** — shape the fog to a **named scene object** instead
   of authoring a box/sphere by hand. Give any `sphere`, `isosurface`, or `mesh` a
   `"name"` and reference it here:
@@ -518,12 +520,15 @@ tracking** for shadow-ray transmittance, so the result is exact (no voxelization
 plain homogeneous `medium` (no `density`, no `bounds`) is unchanged and bit-identical
 to before.
 
-> **Mode support:** heterogeneous / bounded fog is honored only by the **forward**
-> light tracer — modes **A/B/C** (and the forward layers of V/P), on **both the CPU and
-> the GPU** (`-device gpu` runs the identical density VM + delta/ratio tracking). The
-> backward reference (R/V), BDPT (D), and the camera-side layer of the P composite treat
-> the medium as a single global homogeneous haze and **ignore** `density` and `bounds`
-> (the renderer warns when you do this). Render fog blobs with a forward mode.
+> **Mode support:** *heterogeneous* (`density`-field) fog is honored only by the
+> **forward** light tracer — modes **A/B/C** (and the forward layers of V/P), on **both the
+> CPU and the GPU** (`-device gpu` runs the identical density VM + delta/ratio tracking).
+> **BDPT (D)** renders every kind of **homogeneous** medium — global haze, superposed
+> media, and box/sphere/object-**bounded** fog — unbiased on both the CPU and the GPU, but
+> a `density` field is outside its scope (it is rejected with a clear message; use a forward
+> mode). The backward reference (R/V) and the camera-side layer of the P composite treat the
+> medium as a single global homogeneous haze and **ignore** `density` and `bounds` (the
+> renderer warns when you do this). Render heterogeneous fog blobs with a forward mode.
 
 ---
 

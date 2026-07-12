@@ -83,10 +83,14 @@ and both render the fog-through-glass as **black** (verified: `scraps/fogsphere.
 B whole-image mean 6.6 but the fog-sphere center box mean 0.000; mode A identical). Only the
 **physically-tracing modes** — photon-catch (`C`) and BDPT (`D`) — can sample the path at
 all, because a real photon scatters in the fog, **refracts** out through the glass, and
-lands on a finite aperture. But that path is extraordinarily improbable (a fog-scattered
+lands on a finite aperture. For `C` that path is extraordinarily improbable (a fog-scattered
 photon must exit heading almost exactly at the pupil), so at practical sample counts `C` is
 effectively black too (60 M photons, aperture 0.45: fog-sphere center still mean 0.000) — an
-**efficiency** problem on top of the accuracy one, and `D` doesn't support media at all yet.
+**efficiency** problem on top of the accuracy one. **BDPT `D` — RESOLVED 2026-07-12** (volumetric
+BDPT, below): its camera subpath refracts through the shell (specular vertices) to a volume
+in-scatter vertex, then MIS-connects to the light, so a lantern inside a fogged glass sphere
+images as a bright disc — `scraps/fogsphere.ftsl` mode D fog-sphere center box mean 0.22
+(saturating) vs mode B's 0.00, at the same absolute exposure.
 The fog still correctly **lights the surrounding room** (indirect, via NEE off the walls),
 and an **open** fog sphere (no glass shell) is directly viewable in every forward mode
 (`scraps/fogorb.ftsl` mode B center box mean 135.8). A proper fix is refractive/manifold
@@ -128,14 +132,28 @@ GPU-vs-CPU energy identical (absorbed 0.9978) and indirect room lighting agreein
 applies — an implicit-shaped fog is enclosed by its own isosurface, so its direct camera view
 is a refracted SDS path; it lights the room correctly.)*
 
-**Remaining gap (still open):**
-- **Backward/BDPT modes treat it as homogeneous** (on BOTH backends). `backward.h`
-  (modes R/V), `bdpt.h` (mode D), and the camera-side layer of the P composite still use
-  the medium as a single global homogeneous haze and ignore `density`/`bounds`; on the GPU,
-  `cudaBackwardSupported`/`cudaBdptSupported` reject *any* medium so R/V/D fall back to the
-  CPU tracer, which shares that homogeneous-only limitation. `main.cpp` `runRender` **warns**
-  when a heterogeneous/bounded medium is rendered in R/V/D/P. Proper fix: port delta/ratio
-  tracking into the backward volume march too (then mirror it on the GPU).
+**Remaining gap (partly closed):**
+- **BDPT (mode D) — homogeneous media DONE 2026-07-12 (CPU + GPU).** `bdpt.h` and the GPU
+  BDPT megakernel (`render_cuda.cu` `kBdpt`) now handle **homogeneous** media of every
+  spatial kind — global haze, multiple superposed media, and box/sphere/object-**bounded**
+  fog — with volume in-scatter (`VType::Medium` / `BV_MEDIUM`) vertices, HG-phase
+  connections and transmittance-weighted edges. `cudaBdptSupported` now rejects only
+  *heterogeneous* (density-field) media, so a homogeneous bounded scene runs on-device.
+  A `density` field is still outside BDPT scope: `bdptUnsupportedFeature` (CPU) rejects it
+  with a clear message and `cudaBdptSupported` falls back / rejects. Validation: global
+  haze CPU-vs-GPU whole-image mean 0.04698 vs 0.04702 (+0.09%); bounded fog-through-glass
+  (`scraps/fogsphere.ftsl`) CPU-vs-GPU center 0.237 vs 0.242 (within MC noise), both a
+  bright glowing disc. Proper unbiased homogeneous MIS (the σt·exp distance pdf and
+  transmittance cancel pairwise on both the sampling and recompute sides — PBRT-v3
+  convention). *Heterogeneous BDPT would need a null-scattering / spectral-tracking MIS
+  rewrite; deferred.*
+- **Backward modes (R/V) + P camera layer still treat it as homogeneous** (on BOTH
+  backends). `backward.h` (modes R/V) and the camera-side layer of the P composite still
+  use the medium as a single global homogeneous haze and ignore `density`/`bounds`; on the
+  GPU, `cudaBackwardSupported` rejects *any* medium so R/V fall back to the CPU tracer,
+  which shares that homogeneous-only limitation. `main.cpp` `runRender` **warns** when a
+  heterogeneous/bounded medium is rendered in R/V/P. Proper fix: port delta/ratio tracking
+  into the backward volume march too (then mirror it on the GPU).
 
 ### Diffuse-transmission material — CPU DONE 2026-07-12 (GPU port pending)
 Added `type translucent` (alias `diffuse_transmit`): a two-sided Lambertian BSDF — the

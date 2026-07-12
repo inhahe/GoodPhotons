@@ -147,9 +147,13 @@ paths they can capture at all**.
   It also supports the **physical (realistic) lens on its camera subpath** — the
   camera ray is traced through the real glass while forward light transport keeps its
   caustic efficiency (the light-image splat strategy is disabled, since a multi-element
-  lens has no closed-form sensor projection; runs on the CPU **and GPU**). *Cost:* highest
-  cost per sample, and it **does not support fluorescence, participating media, or
-  spot & env lights** (use `B`/`P` or `R` for those).
+  lens has no closed-form sensor projection; runs on the CPU **and GPU**). It renders
+  **homogeneous participating media** (global haze, multiple superposed media, and
+  box/sphere/object-bounded fog) with volume in-scatter vertices, HG-phase connections
+  and transmittance-weighted edges — so fog *inside a glass shell* images correctly here
+  (a case the next-event modes leave dark). *Cost:* highest cost per sample, and it
+  **does not support fluorescence, heterogeneous/density-field media, or spot & env
+  lights** (use `B`/`P` or `R` for those).
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
@@ -174,8 +178,10 @@ the `P` composite is not progressive.
   mode-`P` composite); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (fog/env/spot/collimated lights, fluorescence), and for fluorescent/oversized-mix
-  forward scenes. Implicit surfaces / `isosurface`, **procedural patterns**, and
+  (env/spot/collimated lights, fluorescence; heterogeneous/density-field fog for `D`,
+  any fog for `R`), and for fluorescent/oversized-mix forward scenes. Mode `D`'s GPU
+  BDPT megakernel now renders **homogeneous** participating media (haze, superposed and
+  bounded fog) directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
   **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
   GPU-accelerated now — the device sphere-traces the same field expressions, runs the
   same pattern VM, and threads the interior-absorption medium through both the forward
@@ -573,14 +579,16 @@ center/radius as the sphere). Or shape the fog to a **named object** with
 `isosurface` fills the field's interior (the fog takes the metaball/SDF silhouette
 exactly, carved per-point during tracking), and a named `mesh` uses the mesh's world
 AABB (a box approximation; true mesh containment is deferred). An *open* fog sphere is directly viewable in every mode.
-Fog inside an actual **glass shell**, however, is *not imaged directly* by the next-event
-modes — an accuracy limitation, not a speed one: seeing the fog through the curved glass is
-a refracted (specular↔volume) path, and the pinhole splat `B` and finite-lens splat `A`
+Fog inside an actual **glass shell** is *not imaged directly* by the next-event modes
+`A`/`B` — an accuracy limitation, not a speed one: seeing the fog through the curved glass
+is a refracted (specular↔volume) path, and the pinhole splat `B` and finite-lens splat `A`
 connect the fog to the camera with a **straight** ray that the glass occludes (and could not
 bend anyway), so that view renders black. The fog still correctly **lights the surrounding
-room** indirectly, and the fully physical modes — photon-catch `C` and BDPT `D` — can trace
-the refracted path but only extremely slowly (the fog-scattered photon must refract out and
-hit the pupil). A true fix needs refractive/manifold next-event estimation (out of scope).
+room** indirectly in those modes. **BDPT `D` images fog-through-glass correctly**: its
+camera subpath refracts through the shell (specular vertices) to a volume in-scatter vertex,
+then MIS-connects bidirectionally to the light, so a lantern glowing inside a fogged glass
+sphere renders as a bright disc rather than black. Photon-catch `C` traces the same path but
+far more slowly (the fog-scattered photon must refract out and hit the pupil).
 Add `density "<expr>"` (or `density pattern:<name>`) —
 a scalar field over world `x y z` (the same infix expression language as isosurface
 `function` fields) that scales `sigma_t` per point — for **fog blobs with soft, formula-defined
@@ -590,9 +598,12 @@ unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for
 transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
 `bounds` (or set explicitly). Heterogeneous/bounded fog is honored by the **forward**
 modes (A/B/C) on **both the CPU and the GPU** (the device runs the identical density VM +
-delta/ratio tracking); the backward reference (R/V), BDPT (D), and the P composite treat the
-medium as a global homogeneous haze and warn if you author `density`/`bounds` for them.
-See `FTSL.md` §12.1.
+delta/ratio tracking). **BDPT `D`** renders **homogeneous** media of every kind — global
+haze, multiple superposed media, and box/sphere/object-**bounded** fog — unbiased on both
+the CPU and the GPU, but a *heterogeneous* `density` field is outside its scope, so a
+density-field medium falls back / is rejected for `D` (use a forward mode). The backward
+reference (R/V) and the P composite treat the medium as a single global homogeneous haze
+and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
 
 ---
 
