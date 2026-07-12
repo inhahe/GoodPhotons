@@ -1,0 +1,4 @@
+# Malitson Sellmeier (Al2O3, ordinary ray).
+form sellmeier
+B 1.4313493 0.65054713 5.3414021
+C 0.0052799261 0.0142382647 325.017834

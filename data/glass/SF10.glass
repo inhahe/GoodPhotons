@@ -1,0 +1,5 @@
+# Schott catalog Sellmeier (dense flint).
+# aliases: flint
+form sellmeier
+B 1.62153902 0.256287842 1.64447552
+C 0.0122241457 0.0595736775 147.468793

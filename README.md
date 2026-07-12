@@ -348,8 +348,8 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
   external CSV/whitespace data file (`#` comments, a header row, `wavelength_nm,value`
-  rows); the runtime ingestion point for the data mirrored under `data/`. E.g.
-  `spd file:data/spd/cie_f2.csv` (see `scenes/measured_spd.ftsl`).
+  rows); the runtime ingestion point for the data under `data/`. E.g.
+  `spd file:data/illuminant/f2.csv` (see `scenes/measured_spd.ftsl`).
 - **`glass:<name>`** — dispersive index via Sellmeier: `BK7`/crown, `SF10`/flint,
   `silica`/fused-silica, `sapphire`, `diamond`, plus Cauchy fits for `water`,
   `ice`, `acrylic`/PMMA, `polycarbonate`.
@@ -359,6 +359,14 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   `leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`, `soil`/`dirt`,
   `brick`/`red-brick`, `concrete`.
 - **`spectrum "name" { … }`** blocks to define and reuse a named SPD.
+
+The `glass:`, `metal:`, `reflectance:` and `preset:` (illuminant) presets are a
+**drop-in spectral asset library**: their measured data lives in external files under
+`data/{glass,metal,reflectance,illuminant}/`, loaded at runtime — add a file to a
+category directory and it resolves by name with **no rebuild** (the lowercased
+filename is the preset name; a `# aliases:` header line adds more). Only the data is
+external; the dispersion evaluators and light models stay in the renderer. See
+`data/README.md`.
 
 ---
 

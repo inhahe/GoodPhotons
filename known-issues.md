@@ -1081,32 +1081,35 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
     `led4000k`).
 - **The honesty caveats (tech debt, not a bug):**
   1. ~~**The F2/F7/F11 tables were transcribed from the canonical CIE 15 illuminant
-     data by hand/from memory.**~~ **VERIFIED & CORRECTED 2026-07-11.** The baked
-     tables were diffed against the authoritative CIE 15:2004 F-series (via
-     colour-science), which caught a real bug: `fluorescentF7()`'s tail (685–780 nm)
-     was wrong (it wiggled back up to 4.34 at 765 nm instead of decaying smoothly).
-     F7 is now corrected; F2/F11 already matched exactly. The authoritative tables
-     are committed to `data/spd/cie_f2.csv` / `cie_f7.csv` / `cie_f11.csv`. The
-     runtime measured-SPD loader now exists (`file:<path>`, DONE 2026-07-11 — see
-     below), so a scene can drive a light straight from those CSVs
-     (`spd file:data/spd/cie_f2.csv`, verified pixel-identical to `preset:f2` by
-     `scenes/measured_spd.ftsl`). Remaining sub-item: the *built-in* `preset:f2/f7/f11`
-     names are still baked in-source rather than reading the CSVs at startup (a minor
-     wiring change now that the loader exists).
+     data by hand/from memory.**~~ **VERIFIED & CORRECTED 2026-07-11; FULLY
+     EXTERNALIZED 2026-07-12.** The baked tables were diffed against the authoritative
+     CIE 15:2004 F-series (via colour-science), which caught a real bug:
+     `fluorescentF7()`'s tail (685–780 nm) was wrong (it wiggled back up to 4.34 at
+     765 nm instead of decaying smoothly). F7 was corrected; F2/F11 already matched
+     exactly. **As of 2026-07-12 the baked `fluorescentF2/F7/F11()` tables are DELETED
+     from `src/lights.h`** — the measured SPDs live only in
+     `data/illuminant/{f2,f7,f11}.csv` and `resolveLightPreset()` resolves the
+     `f2`/`f7`/`f11`/`cool-white`/`daylight-fl`/`triphosphor` names through
+     `resolveTabulatedIlluminant()` (spectral_library.h) at load time. `preset:f2`
+     and `spd file:data/illuminant/f2.csv` now load the *same file* — verified
+     identical by `scenes/measured_spd.ftsl`, and the loader round-trips the old baked
+     values exactly (e.g. F2 P(545 nm)=24.88). This sub-item is DONE.
   2. **The sodium / mercury / metal-halide entries are deliberately *illustrative*
      spectroscopic models, not per-lamp measurements** — correct line positions and
      plausible relative strengths (from spectroscopy references) over analytic
      continua, tuned to give the right visual cast. They are not a specific
      manufacturer's lamp and are not radiometrically calibrated. Same intended
      upgrade path: swap for measured SPDs when the data-file loader lands.
-- **Proper fix:** the measured-SPD data loader now exists (`file:<path>` — DONE
-  2026-07-11), so the path to fully closing this is (a) mirror measured lamp SPDs
-  (LSPDD / LICA-UCM, see `data/README.md`) into `data/spd/`, and (b) point the
-  built-in `preset:` names at those CSVs at load time instead of the baked/analytic
-  tables — turning the built-ins into verifiable data. The discharge lamps still need
-  their measured CSVs fetched; the F-series CSVs are already present.
-- **Status:** OPEN (acceptable, reduced) — loader + F-series data done; discharge-lamp
-  measurements and the preset-reads-CSV wiring are the tracked remainder.
+- **Proper fix:** the spectral asset library now exists (`data/<category>/<name>` +
+  `src/spectral_library.h`, DONE 2026-07-12), and `resolveLightPreset()` already reads
+  the F-series from `data/illuminant/`. To upgrade the discharge lamps to measurements:
+  drop a measured lamp SPD (LSPDD / LICA-UCM, see `data/README.md`) into
+  `data/illuminant/` (e.g. `hps.csv`, alias `sodium`) — it then resolves by name with
+  no rebuild, and can shadow the analytic model. Only the discharge-lamp measured CSVs
+  remain to be fetched; the preset-reads-CSV wiring is now generic and done.
+- **Status:** OPEN (acceptable, reduced) — library + F-series data done and the
+  built-in F-series presets now read the CSVs at load time; only discharge-lamp
+  measurements remain (the analytic line models stay as the default until then).
 
 ### Built-in material presets: skin/soil & iridescent recipes are representative (metals + most natural curves now measured)
 - **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
@@ -1157,14 +1160,30 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   (generic CSV→`table`), `tools/ri_nk_to_reflectance.py` (refractiveindex.info
   n,k→reflectance), and `tools/splib_to_reflectance.py` (USGS splib07→reflectance) —
   plus, as of 2026-07-11, a *runtime* `file:<path>` loader so a reflectance CSV can be
-  bound directly (`reflect file:data/reflectance/skin.csv`) without re-baking source.
-  Metals and leaf/snow/brick/concrete are done. Remaining debt is finding measured
-  samples for `skin`/`skin-dark` (a skin-optics dataset, e.g. NIST JRES 122.026) and
-  `soil` (a loam/dirt reflectance, e.g. ECOSTRESS/ISRIC) and dropping them into
-  `data/`, plus optionally validating the iridescent recipes against specimens.
+  bound directly (`reflect file:data/reflectance/skin-light.csv`) without re-baking
+  source. Metals and leaf/snow/brick/concrete are done. Remaining debt is finding
+  measured samples for `skin`/`skin-dark` (a skin-optics dataset, e.g. NIST JRES
+  122.026) and `soil` (a loam/dirt reflectance, e.g. ECOSTRESS/ISRIC) and overwriting
+  the placeholder files in `data/reflectance/`, plus optionally validating the
+  iridescent recipes against specimens.
+- **DATA EXTERNALIZED 2026-07-12:** the baked `metalGold()..metalBrass()`,
+  `reflectanceLeaf()..reflectanceConcrete()` tables (`src/materials.h`) and the
+  `iorBK7()..iorPolycarbonate()` dispersion functions (`src/spectrum.h`) are **deleted
+  from source**. They now live as data files — `data/metal/*.csv`,
+  `data/reflectance/*.csv`, `data/glass/*.glass` (Sellmeier/Cauchy coefficients) — and
+  are loaded by the same-named resolvers (`resolveMetalReflectance` /
+  `resolveNaturalReflectance` / `resolveGlassIor`) now living in
+  `src/spectral_library.h`. Every call site is unchanged (only the data source and
+  includes moved); a category is a directory of files keyed by lowercased filename
+  stem + `# aliases:` header, so new metals/glasses/reflectances drop in with no
+  rebuild. The `sellmeier()`/`cauchy()`/`tabulatedSpectrum()` evaluators and the
+  iridescent recipes stayed native (algorithms, not data). Verified: standalone loader
+  test round-trips n_d (BK7 1.5168, SF10 1.7283, water 1.333) and R(λ) (Au R(700)=0.970)
+  from the files, matching the old baked values.
 - **Status:** OPEN (acceptable, much reduced) — metals + 4 natural curves are now
-  measured data; skin/soil and iridescent recipes remain representative. All presets
-  load on CPU==GPU and render the right colours.
+  measured data, and ALL spectral data now loads from `data/` files rather than baked
+  source; skin/soil and iridescent recipes remain representative. All presets load on
+  CPU==GPU and render the right colours.
 
 ### Full physical `layered` material [IMPLEMENTED 2026-07-11]
 - **What:** both the FTSL `type mix` material (stochastic per-photon pick among named

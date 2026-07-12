@@ -1,0 +1,15 @@
+# Cu-Zn alloy fit (no single canonical dataset): a paler, less saturated gold.
+wavelength_nm,reflectance
+380.0,0.4
+420.0,0.41
+460.0,0.43
+500.0,0.5
+520.0,0.58
+540.0,0.68
+560.0,0.76
+580.0,0.8
+600.0,0.83
+640.0,0.85
+680.0,0.86
+720.0,0.87
+760.0,0.88

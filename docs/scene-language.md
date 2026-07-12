@@ -134,28 +134,36 @@ declared once as a named `spectrum` block and referenced as `spectrum:name`.
 | `blackbody 6500`                       | Planck's law at 6500 K (normalized)                            | `blackbody` — **[maps 1:1]**   |
 | `gaussian center=550 sigma=40 amp=0.8` | Gaussian band (emission lines, fluorescence)                   | `gaussianBand` — **[maps 1:1]** |
 | `shortpass edge=500 slope=0.2 amp=1`   | Logistic high-pass (excitation filters)                        | `shortPass` — **[maps 1:1]**   |
-| `glass:BK7`, `glass:diamond`, ...      | Named dispersion curve (refractive index) — see list below    | `resolveGlassIor`, `src/spectrum.h` — **[maps 1:1]** |
-| `metal:Au`, `metal:copper`, ...        | Named metal reflectance R(λ) from measured n,k                | `resolveMetalReflectance`, `src/materials.h` — **[maps 1:1]** |
-| `reflectance:leaf`, `reflectance:skin`, ... | Named natural diffuse reflectance (representative)        | `resolveNaturalReflectance`, `src/materials.h` — **[maps 1:1]** |
+| `glass:BK7`, `glass:diamond`, ...      | Named dispersion curve (refractive index) — loaded from `data/glass/` | `resolveGlassIor`, `src/spectral_library.h` — **[maps 1:1]** |
+| `metal:Au`, `metal:copper`, ...        | Named metal reflectance R(λ) from measured n,k — loaded from `data/metal/` | `resolveMetalReflectance`, `src/spectral_library.h` — **[maps 1:1]** |
+| `reflectance:leaf`, `reflectance:skin`, ... | Named natural diffuse reflectance — loaded from `data/reflectance/`  | `resolveNaturalReflectance`, `src/spectral_library.h` — **[maps 1:1]** |
 | `ior 1.5`                              | Constant refractive index                                     | `iorConstant` — **[maps 1:1]** |
 | `table { 400:0.05 450:0.12 ... }`      | Piecewise-linear measured curve (λnm:value pairs)             | `tabulatedSpectrum` — **[maps 1:1]** |
-| `file:data/spd/cie_f2.csv`             | Piecewise-linear curve loaded from an external data file (see below) | `loadSpdCsv` → `tabulatedSpectrum` — **[maps 1:1]** |
+| `file:data/illuminant/f2.csv`          | Piecewise-linear curve loaded from an external data file (see below) | `speclib::loadSpdCsv` → `tabulatedSpectrum` — **[maps 1:1]** |
 | `rgb 0.63 0.06 0.05`                   | Convenience: upsample an sRGB triple to a smooth reflectance   | `rgbToReflectanceJH` (Jakob-Hanika sigmoid fit, `src/upsample.h`) — **[maps 1:1]**; validated by `-checkupsample` |
 | `spectrum:name`                        | Reference a named `spectrum` block                            | name resolution                |
 | `preset:D65`, `preset:led`, ...        | Named illuminant SPD (see §5)                                 | `src/lights.h` — **[maps 1:1]** |
 
-**`glass:<name>` dispersion curves** (refractive index vs λ, `src/spectrum.h`):
-`BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`, `sapphire`,
-`diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`. Sellmeier for
-the glasses/crystals, Cauchy fits for water/ice/plastics.
+These three families are the **spectral asset library**: their data lives in external
+files under `data/{glass,metal,reflectance}/` and is loaded at runtime by
+`src/spectral_library.h` (the Sellmeier/Cauchy evaluators and the piecewise-linear
+curve builder stay native in `src/spectrum.h`). Each name resolves to a file whose
+lowercased stem matches, plus any `# aliases:` the file declares — so dropping a new
+file into a category directory adds a preset with **no rebuild**. See `data/README.md`.
+
+**`glass:<name>` dispersion curves** (refractive index vs λ, `data/glass/*.glass`
+dispersion coefficients): `BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`,
+`sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`. Sellmeier
+for the glasses/crystals, Cauchy fits for water/ice/plastics.
 
 **`metal:<name>` reflectances** (normal-incidence R(λ) from measured complex index,
-`src/materials.h`): `Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`,
+`data/metal/*.csv`): `Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`,
 `Cr`/`chrome`, `brass`. Feed a `mirror`/`glossy` `reflect`.
 
-**`reflectance:<name>` natural diffuse curves** (representative spectral shapes, *not*
-a specific measured sample — see known-issues): `leaf`/`vegetation`, `skin`/`skin-light`,
-`skin-dark`, `snow`, `soil`/`dirt`, `brick`/`red-brick`, `concrete`.
+**`reflectance:<name>` natural diffuse curves** (`data/reflectance/*.csv`;
+representative spectral shapes for skin/soil, measured USGS splib07 for the rest — see
+known-issues): `leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`,
+`soil`/`dirt`, `brick`/`red-brick`, `concrete`.
 
 **`file:<path>` — measured spectra from disk.** Any `<spectrum>` slot accepts
 `file:<path>` to load a piecewise-linear curve (an SPD, a reflectance, or an n(λ)
@@ -169,8 +177,8 @@ taken verbatim (an emission SPD's absolute scale is irrelevant — the power law
 renormalises it — and a reflectance file should already be in 0..1). Paths resolve
 relative to the current working directory (the same convention as `texture`/`mesh`
 file refs), and repeated references to one path share a cached curve. Because the
-built-in `preset:f2` blackbody-table was transcribed from `data/spd/cie_f2.csv`,
-`spd file:data/spd/cie_f2.csv` renders pixel-identically to `spd preset:f2` — the
+built-in `preset:f2` now *loads* `data/illuminant/f2.csv` (rather than a baked table),
+`spd file:data/illuminant/f2.csv` renders pixel-identically to `spd preset:f2` — the
 end-to-end loader proof (`scenes/measured_spd.ftsl`).
 
 ### 2.2 Named spectrum blocks
@@ -201,6 +209,14 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 >
 > Still representative (not per-sample measurements, see known-issues.md): `brass`,
 > `reflectance:skin|skin-dark|soil`, and the iridescent recipes.
+>
+> **All of this spectral data now lives in external files** under
+> `data/{glass,metal,reflectance,illuminant}/`, loaded at runtime by
+> `src/spectral_library.h` — not baked into the binary. Add a file to a category
+> directory (lowercased stem = the preset name, `# aliases:` header for extra names)
+> and it resolves with no rebuild. Only measured/tabulated *data* moved out; the
+> dispersion evaluators, blackbody/LED/discharge line models, and iridescent recipes
+> stay native as *algorithms*.
 >
 > Three stdlib-only converters in `tools/` ingest published data into scenes — each
 > can emit an FTSL `table` block or a C++ `tabulatedSpectrum` initializer:

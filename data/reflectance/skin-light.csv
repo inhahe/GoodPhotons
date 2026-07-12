@@ -1,0 +1,16 @@
+# Representative light-skin haemoglobin-dip shape (illustrative, not a measured sample).
+# aliases: skin
+wavelength_nm,reflectance
+400.0,0.2
+440.0,0.28
+480.0,0.36
+520.0,0.42
+540.0,0.4
+560.0,0.44
+576.0,0.41
+600.0,0.55
+640.0,0.63
+680.0,0.66
+720.0,0.68
+780.0,0.7
+830.0,0.71

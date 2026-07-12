@@ -1,0 +1,5 @@
+# Schott catalog Sellmeier (borosilicate crown).
+# aliases: crown
+form sellmeier
+B 1.03961212 0.231792344 1.01046945
+C 0.00600069867 0.0200179144 103.560653

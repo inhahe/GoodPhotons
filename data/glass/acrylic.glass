@@ -1,0 +1,5 @@
+# Cauchy fit, n_d ~ 1.491 (acrylic / PMMA).
+# aliases: pmma
+form cauchy
+A 1.4783
+B 0.00382

@@ -1,0 +1,4 @@
+# Cauchy fit, n_d ~ 1.333 (water).
+form cauchy
+A 1.324
+B 0.003

@@ -1,0 +1,4 @@
+# Peter Sellmeier fit (diamond).
+form sellmeier
+B 4.3356 0.3306 0.0
+C 0.011236 0.030625 1.0

@@ -1,0 +1,13 @@
+# Representative dark-skin shape (illustrative, not a measured sample).
+wavelength_nm,reflectance
+400.0,0.06
+440.0,0.08
+480.0,0.11
+520.0,0.14
+560.0,0.16
+600.0,0.22
+640.0,0.29
+680.0,0.34
+720.0,0.38
+780.0,0.42
+830.0,0.44

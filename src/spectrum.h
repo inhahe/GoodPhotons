@@ -69,43 +69,15 @@ inline Spectrum cauchy(double A, double B) {
     };
 }
 
-// Common optical glasses and crystals (Sellmeier, coefficients from the literature:
-// Malitson for fused silica & sapphire, Schott catalog for BK7/SF10, Peter for
-// diamond). "Free" dispersion — each single-wavelength photon bends by its own n.
-inline Spectrum iorBK7()  { return sellmeier(1.03961212, 0.231792344, 1.01046945,
-                                             0.00600069867, 0.0200179144, 103.560653); }
-inline Spectrum iorSF10() { return sellmeier(1.62153902, 0.256287842, 1.64447552,
-                                             0.0122241457, 0.0595736775, 147.468793); }
-inline Spectrum iorFusedSilica() { return sellmeier(0.6961663, 0.4079426, 0.8974794,
-                                             0.00467914826, 0.0135120631, 97.9340025); }
-inline Spectrum iorSapphire() { return sellmeier(1.4313493, 0.65054713, 5.3414021,
-                                             0.00527992610, 0.0142382647, 325.017834); } // Al2O3, ordinary ray
-inline Spectrum iorDiamond() { return sellmeier(4.3356, 0.3306, 0.0,
-                                             0.011236, 0.030625, 1.0); }
-// Weakly-dispersive materials via Cauchy fits (n_d ≈ water 1.333, ice 1.31,
-// acrylic/PMMA 1.491, polycarbonate 1.585).
-inline Spectrum iorWater()         { return cauchy(1.3240, 0.00300); }
-inline Spectrum iorIce()           { return cauchy(1.3030, 0.00300); }
-inline Spectrum iorAcrylic()       { return cauchy(1.4783, 0.00382); }
-inline Spectrum iorPolycarbonate() { return cauchy(1.5602, 0.00800); }
+// Constant (non-dispersive) index of refraction.
 inline Spectrum iorConstant(double n) { return [n](double) { return n; }; }
 
-// Resolve a `glass:<name>` IOR preset. Shared by the FTSL `glass:` expression and
-// the built-in material recipes so the two never diverge. Returns true and sets
-// `out` on a known name, false otherwise (caller decides the fallback/error).
-inline bool resolveGlassIor(const std::string& name, Spectrum& out) {
-    if (name == "BK7" || name == "crown")               { out = iorBK7();           return true; }
-    if (name == "SF10" || name == "flint")              { out = iorSF10();          return true; }
-    if (name == "silica" || name == "fused-silica" ||
-        name == "quartz")                               { out = iorFusedSilica();   return true; }
-    if (name == "sapphire")                             { out = iorSapphire();      return true; }
-    if (name == "diamond")                              { out = iorDiamond();       return true; }
-    if (name == "water")                                { out = iorWater();         return true; }
-    if (name == "ice")                                  { out = iorIce();           return true; }
-    if (name == "acrylic" || name == "pmma")            { out = iorAcrylic();       return true; }
-    if (name == "polycarbonate" || name == "pc")        { out = iorPolycarbonate(); return true; }
-    return false;
-}
+// NOTE: the per-glass dispersion DATA (Sellmeier/Cauchy coefficients for BK7, SF10,
+// fused silica, sapphire, diamond, water, ice, acrylic, polycarbonate) used to live
+// here as `iorBK7()` etc. + a `resolveGlassIor()` table. That DATA now lives in
+// external files (data/glass/*.glass) and is loaded by `resolveGlassIor()` in
+// spectral_library.h, which feeds the coefficients to the native `sellmeier()` /
+// `cauchy()` evaluators above. Only the data moved out; the evaluators stay here.
 
 // Piecewise-linear measured curve from (wavelength nm, value) pairs. The pairs are
 // sorted by wavelength at build time; sampling clamps to the endpoints outside the

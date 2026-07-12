@@ -74,38 +74,19 @@ inline bool isNumber(const std::string& s) {
 }
 inline double num(const std::string& s) { return std::strtod(s.c_str(), nullptr); }
 
-// Load a measured spectrum from a CSV/whitespace file into (wavelength_nm, value)
-// pairs. This is the runtime "measured-SPD loader": the ingestion point for the
-// authoritative data mirrored under data/ (see data/README.md). Format is liberal —
-// lines beginning with '#' are comments, fields are separated by comma OR whitespace,
-// and any line whose first two fields do not both parse as numbers (e.g. a
-// `wavelength_nm,relative_power` header row) is skipped. The first numeric field is
-// the wavelength in nanometres, the second is the (relative or absolute) value; extra
-// columns are ignored. Values are taken verbatim — an emission SPD's absolute scale is
-// irrelevant (the power law renormalises it), and a reflectance file should already be
-// in 0..1. Returns false with `err` set on an unreadable/empty file.
-inline bool loadSpdCsv(const std::string& path,
-                       std::vector<std::pair<double, double>>& out,
-                       std::string& err) {
-    std::ifstream f(path);
-    if (!f) { err = "cannot open spectrum file: " + path; return false; }
-    out.clear();
-    std::string line;
-    while (std::getline(f, line)) {
-        // Strip a trailing CR (CRLF files) and an inline '#' comment.
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        auto hash = line.find('#');
-        if (hash != std::string::npos) line.erase(hash);
-        // Turn commas into spaces so a single stream reader handles both delimiters.
-        for (char& c : line) if (c == ',' || c == '\t') c = ' ';
-        std::istringstream ss(line);
-        std::string a, b;
-        if (!(ss >> a >> b)) continue;                 // blank / single-field line
-        if (!isNumber(a) || !isNumber(b)) continue;    // header row or junk -> skip
-        out.push_back({num(a), num(b)});
-    }
-    if (out.empty()) { err = "spectrum file has no numeric rows: " + path; return false; }
-    return true;
+// NOTE: the measured-SPD CSV loader (`loadSpdCsv`) that used to live here now lives
+// in spectral_library.h as `speclib::loadSpdCsv` — a single implementation shared by
+// the FTSL `file:` expression (via loadSpdFile below) and the named-preset library
+// resolvers (metal/reflectance/illuminant). See data/README.md for the file format.
+
+// Resolve a named glass dispersion from the spectral library (data/glass/<name>.glass),
+// falling back to a constant index if that file is missing. Used for the built-in
+// BK7/SF10 defaults that back `dielectric`'s default IOR and the lens presets — the
+// dispersion DATA lives in files, but a sane default must survive a stripped data dir.
+inline Spectrum glassOrDefault(const char* name, double fallbackN) {
+    Spectrum s;
+    if (resolveGlassIor(name, s)) return s;
+    return iorConstant(fallbackN);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +588,7 @@ private:
             std::string g = h.substr(6);
             Spectrum ior;
             if (resolveGlassIor(g, ior)) return ior;
-            fail("unknown glass '" + g + "'"); return iorBK7();
+            fail("unknown glass '" + g + "'"); return glassOrDefault("BK7", 1.5168);
         }
         if (h.rfind("metal:", 0) == 0) {
             std::string mname = h.substr(6);
@@ -645,7 +626,7 @@ private:
         if (it != spdFileCache_.end()) return it->second;
         std::vector<std::pair<double, double>> pairs;
         std::string ferr;
-        if (!loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
+        if (!speclib::loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
         Spectrum s = tabulatedSpectrum(std::move(pairs));
         spdFileCache_[path] = s;
         return s;
@@ -873,7 +854,7 @@ private:
             m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.4));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
-            m.ior = spectrumParam(b, "ior", iorBK7());
+            m.ior = spectrumParam(b, "ior", glassOrDefault("BK7", 1.5168));
             // Frosted/rough transmission: 0 (default) = perfectly clear glass, bit-
             // identical to before; >0 roughens both the reflected and refracted lobes.
             // `roughness pattern:<name>` (§4) or `texture:<name>` binds a per-hit map.
@@ -1965,7 +1946,7 @@ private:
             if ((pk == "singlet" || pk == "biconvex" || pk == "simple")) {
                 Spectrum g;
                 if (!resolveGlassIor((glassName.rfind("glass:",0)==0?glassName.substr(6):glassName), g))
-                    g = iorBK7();
+                    g = glassOrDefault("BK7", 1.5168);
                 *sys = makeSinglet(focalMM, fstop, g);
             } else if (!preset.empty()) {
                 if (!resolveLensPreset(preset, focalMM, fstop, *sys)) {
@@ -1973,7 +1954,7 @@ private:
                          "' (singlet, achromat/doublet, telephoto, wide)"); return false;
                 }
             } else {
-                *sys = makeAchromat(focalMM, fstop, iorBK7(), iorSF10());
+                *sys = makeAchromat(focalMM, fstop, glassOrDefault("BK7", 1.5168), glassOrDefault("SF10", 1.7283));
             }
         }
         // Sensor size from the camera film (default full-frame 36x24 mm).

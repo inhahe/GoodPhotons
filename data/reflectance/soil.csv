@@ -1,0 +1,13 @@
+# Representative reddish-brown soil rise (illustrative, not a measured sample).
+# aliases: dirt
+wavelength_nm,reflectance
+400.0,0.05
+450.0,0.07
+500.0,0.1
+550.0,0.14
+600.0,0.19
+650.0,0.24
+700.0,0.29
+750.0,0.33
+800.0,0.36
+830.0,0.37
