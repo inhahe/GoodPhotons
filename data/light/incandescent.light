@@ -1,0 +1,3 @@
+# CIE Standard Illuminant A (tungsten filament), exactly Planckian at 2856 K.
+# aliases: a
+spd blackbody 2856

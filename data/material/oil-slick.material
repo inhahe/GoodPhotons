@@ -1,0 +1,7 @@
+# Oil slick: a thin oil film on dark wet asphalt (absorbing substrate).
+# aliases: oil_slick oil
+type thinfilm
+ior           const 1.5
+film_ior      1.47
+film_thickness 320
+substrate_k   const 2.0     # absorbing substrate -> opaque iridescence

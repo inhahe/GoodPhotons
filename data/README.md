@@ -7,10 +7,14 @@ names a file declares in a `# aliases: a b c` header line. The library is drop-i
 extensible: add a file to a category directory and it resolves by name with **no
 rebuild**. Loading is handled by `src/spectral_library.h`.
 
-Only measured/tabulated **data** lives here. The **algorithms** that consume it stay
-in the source: the Sellmeier/Cauchy dispersion evaluators (`src/spectrum.h`), the
+Only **data** lives here — measured/tabulated curves, dispersion coefficients, and
+*composite asset manifests* (bundles, below) that declare which curves and constants
+make up a named material or light. The **algorithms** that consume it stay in the
+source: the Sellmeier/Cauchy dispersion evaluators (`src/spectrum.h`), the
 piecewise-linear curve builder (`tabulatedSpectrum`), Planck blackbody, the LED /
-gas-discharge line models, and the BSDF / thin-film / iridescent recipes.
+gas-discharge line models, and the Fresnel / Airy-thin-film / Abeles-matrix BSDF
+evaluators (`src/render.h`). A bundle only names data for those evaluators to consume;
+it contains no algorithm.
 
 ## File formats
 
@@ -26,18 +30,38 @@ gas-discharge line models, and the BSDF / thin-film / iridescent recipes.
   - `form sellmeier` + `B b1 b2 b3` + `C c1 c2 c3`  → `sellmeier(B…,C…)`
   - `form cauchy` + `A a` + `B b`                    → `cauchy(a,b)`
   - `form constant` + `n 1.5`                        → `iorConstant(n)`
+- **Bundle files** (`.material`, `.light`, categories `material/`, `light/`): a
+  *composite asset* that groups several spectral envelopes plus intrinsic scalars
+  under one name — because a single material/light genuinely owns more than one curve
+  (a thin film has an `ior` curve **and** a substrate-extinction curve **and** film
+  thickness/index scalars). Each line is `key arg arg …` (in file order; `#` comments,
+  `# aliases:` header). Spectrum-valued fields (`reflect`, `ior`, `emit`, `absorb`,
+  `transmit`, `substrate_k`, `spd`, …) accept the **same primitive vocabulary as the
+  scene language** — `const N`, `metal:Au`, `glass:BK7`, `reflectance:leaf`,
+  `illuminant:f2`, `file:<path>`, `blackbody K`, `ior N`, `gaussian center=… sigma=…`
+  — so a bundle field just references a library primitive. Material bundles also take
+  `type <matType>`, `roughness`/`film_ior`/`film_thickness` scalars, and repeatable
+  `layer <n> <k> <thickness_nm>` rows (outer first) for multilayer stacks. Light
+  bundles currently take one `spd <expr>` (plus a light-only `led-white <warm>` /
+  `led-cct <K>` / gas-discharge model vocabulary). Interpreted by
+  `resolveMaterialBundle` (materials.h) / `resolveLightBundle` (lights.h).
 
 ## Categories & resolvers
 
-| Directory        | FTSL expression        | Resolver (spectral_library.h)   |
-|------------------|------------------------|---------------------------------|
-| `glass/`         | `glass:<name>`         | `resolveGlassIor`               |
-| `metal/`         | `metal:<name>`         | `resolveMetalReflectance`       |
-| `reflectance/`   | `reflectance:<name>`   | `resolveNaturalReflectance`     |
-| `illuminant/`    | `preset:<name>` (light)| `resolveTabulatedIlluminant`    |
+| Directory        | FTSL expression        | Resolver                          |
+|------------------|------------------------|-----------------------------------|
+| `glass/`         | `glass:<name>`         | `resolveGlassIor`                 |
+| `metal/`         | `metal:<name>`         | `resolveMetalReflectance`         |
+| `reflectance/`   | `reflectance:<name>`   | `resolveNaturalReflectance`       |
+| `illuminant/`    | `preset:<name>` (light)| `resolveTabulatedIlluminant`      |
+| `material/`      | `material { preset <name> }` | `resolveMaterialBundle`     |
+| `light/`         | `preset:<name>` (light)| `resolveLightBundle`              |
 
-`material { preset <name> }` and the built-in defaults (BK7/SF10 for `dielectric`
-and the lens presets) route through these same resolvers.
+`material { preset <name> }` resolves an explicit `material/` bundle first, then falls
+back to a generic **convention** for bare primitives: any `metal/` name becomes a
+lightly-polished glossy material and any `glass/` name a clear dielectric (so a new
+metal/glass file works as a `preset` with no bundle needed; `glass` aliases to BK7).
+The lens presets' BK7/SF10 defaults route through `resolveGlassIor` too.
 
 ### `file:<path>` — ad-hoc curves
 Any `<spectrum>` slot in FTSL also accepts `file:<path>`, which loads an arbitrary
@@ -75,6 +99,22 @@ F-series relative SPDs, 380-780 nm at 5 nm. Transcribed from CIE 15:2004 fluores
 illuminant tables via colour-science (github.com/colour-science/colour, BSD-3; the
 CIE tables themselves are public reference data).
 
+### `material/*.material` — whole-material recipe bundles
+The iridescent structural-colour materials: soap-bubble (`bubble`), oil-slick
+(`oil`), anodized-ti (`anodized-titanium`) — thin-film (Airy) coatings; morpho, beetle
+(`jewel-beetle`), nacre (`mother-of-pearl`) — Abeles multilayer Bragg stacks. Each
+groups a `type`, an `ior`/`substrate_k` envelope, and the tuned film/stack geometry
+(thickness/index or `layer` rows). These are hand-tuned interference *parameters* (not
+a measured SPD), now expressed as data; the interference math stays in `src/render.h`.
+Metals and glasses need no file here — they resolve via the generic convention above.
+
+### `light/*.light` — illuminant recipe bundles
+sun, daylight (`d65`), incandescent (`a`), led, led-warm: each an `spd` binding to a
+native light model (`blackbody <K>` for the thermal/daylight sources, `led-white
+<warm>` for the phosphor LEDs). The parametric `bb<K>`/`led<K>k` names and the
+gas-discharge line models (`hps`/`sodium`, `lps`, `mercury`, `metal-halide`) stay in
+`src/lights.h`; the measured F-series lives in `illuminant/`.
+
 ## Pending (loader exists; better data still to be fetched + wired)
 
 Closing each of these is just: drop a `wavelength_nm,value` CSV into the right
@@ -104,5 +144,7 @@ Currently `reflectance/soil.csv` is a representative reddish rise (USGS splib07'
 - **ISRIC Globally Distributed Soil Spectral Library** (data.isric.org).
 
 ### Iridescent recipes (`soap-bubble`, `oil-slick`, `anodized-ti`, `morpho`, …)
-These are thin-film-interference *models* (layer index/thickness), so there is no
-single measured SPD to mirror; they stay as native recipes in `src/materials.h`.
+Now externalized as `material/*.material` bundles (above). There is no single measured
+SPD to mirror — they are thin-film-interference geometries — but the tuned layer
+index/thickness parameters are data, so they live in files and can be retuned or added
+to with no rebuild. The interference evaluators stay native.

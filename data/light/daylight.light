@@ -1,0 +1,4 @@
+# Average daylight, approximated as a Planckian at the D65 correlated colour
+# temperature (~6504 K). For the measured CIE D-series swap in a file: curve.
+# aliases: d65
+spd blackbody 6504

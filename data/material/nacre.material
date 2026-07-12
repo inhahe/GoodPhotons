@@ -1,0 +1,16 @@
+# Nacre / mother-of-pearl: aragonite/conchiolin platelets -> pastel iridescence.
+# 5 bilayers over a translucent backing.
+# aliases: mother-of-pearl
+type multilayer
+ior         const 1.68
+substrate_k const 0.0       # translucent
+layer 1.68 0.0 300          # aragonite
+layer 1.53 0.0 120          # conchiolin
+layer 1.68 0.0 300
+layer 1.53 0.0 120
+layer 1.68 0.0 300
+layer 1.53 0.0 120
+layer 1.68 0.0 300
+layer 1.53 0.0 120
+layer 1.68 0.0 300
+layer 1.53 0.0 120

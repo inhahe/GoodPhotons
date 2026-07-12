@@ -310,6 +310,13 @@ Declared with `material "name" { type <type> … }`.
   `oil-slick`, `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
   `nacre`/`mother-of-pearl`.
 
+Each iridescent preset is a **bundle file** (`data/material/<name>.material`) that
+groups the material's several spectral envelopes (`ior`, `substrate_k`) and its tuned
+film/stack geometry (`film_thickness`/`film_ior` or `layer <n> <k> <nm>` rows) under
+one name — so new structural-colour materials drop in with **no rebuild**. Metals and
+glasses need no file: a bare `metal:`/`glass:` name resolves by the generic convention
+above. (The interference math stays native; only the parameters are data.)
+
 **Translucency (dielectrics).** Beyond perfectly clear glass, a `dielectric` supports
 two physically-motivated translucency controls (both compose with dispersion):
 
@@ -360,12 +367,16 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   `brick`/`red-brick`, `concrete`.
 - **`spectrum "name" { … }`** blocks to define and reuse a named SPD.
 
-The `glass:`, `metal:`, `reflectance:` and `preset:` (illuminant) presets are a
-**drop-in spectral asset library**: their measured data lives in external files under
-`data/{glass,metal,reflectance,illuminant}/`, loaded at runtime — add a file to a
-category directory and it resolves by name with **no rebuild** (the lowercased
-filename is the preset name; a `# aliases:` header line adds more). Only the data is
-external; the dispersion evaluators and light models stay in the renderer. See
+The `glass:`, `metal:`, `reflectance:` and `preset:` (illuminant) presets — plus the
+whole-material `preset <name>` recipes and the named light presets — are a **drop-in
+spectral asset library**: their data lives in external files under
+`data/{glass,metal,reflectance,illuminant,material,light}/`, loaded at runtime — add a
+file to a category directory and it resolves by name with **no rebuild** (the
+lowercased filename is the preset name; a `# aliases:` header line adds more). The
+`material/` and `light/` files are *bundles* that group several envelopes plus scalars
+into one named asset (a thin-film material owns an index curve, a substrate-extinction
+curve and film thickness/index at once). Only the data is external; the dispersion
+evaluators, interference/BSDF math and light models stay in the renderer. See
 `data/README.md`.
 
 ---

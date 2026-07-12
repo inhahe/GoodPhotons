@@ -211,12 +211,15 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 > `reflectance:skin|skin-dark|soil`, and the iridescent recipes.
 >
 > **All of this spectral data now lives in external files** under
-> `data/{glass,metal,reflectance,illuminant}/`, loaded at runtime by
+> `data/{glass,metal,reflectance,illuminant,material,light}/`, loaded at runtime by
 > `src/spectral_library.h` — not baked into the binary. Add a file to a category
 > directory (lowercased stem = the preset name, `# aliases:` header for extra names)
-> and it resolves with no rebuild. Only measured/tabulated *data* moved out; the
-> dispersion evaluators, blackbody/LED/discharge line models, and iridescent recipes
-> stay native as *algorithms*.
+> and it resolves with no rebuild. The `material/` and `light/` categories are
+> *bundles* — composite manifests that group several spectral envelopes plus intrinsic
+> scalars into one named asset (the iridescent `preset`s and named light presets moved
+> here as `.material` / `.light` files). Only *data* moved out; the dispersion
+> evaluators, blackbody/LED/discharge line models, and the interference/Abeles/Fresnel
+> BSDF math stay native as *algorithms* — a bundle just names data for them to consume.
 >
 > Three stdlib-only converters in `tools/` ingest published data into scenes — each
 > can emit an FTSL `table` block or a C++ `tabulatedSpectrum` initializer:

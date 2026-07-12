@@ -1,0 +1,17 @@
+# Morpho butterfly wing: a chitin/air quarter-wave stack tuned to ~450 nm blue.
+# 6 chitin/air bilayers over a melanin backing (opaque, saturated).
+type multilayer
+ior         const 1.56
+substrate_k const 0.5       # melanin backing -> opaque
+layer 1.56 0.0 72           # chitin
+layer 1.00 0.0 112          # air
+layer 1.56 0.0 72
+layer 1.00 0.0 112
+layer 1.56 0.0 72
+layer 1.00 0.0 112
+layer 1.56 0.0 72
+layer 1.00 0.0 112
+layer 1.56 0.0 72
+layer 1.00 0.0 112
+layer 1.56 0.0 72
+layer 1.00 0.0 112

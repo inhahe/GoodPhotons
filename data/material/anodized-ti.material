@@ -1,0 +1,7 @@
+# Anodised titanium: a TiO2 film grown on titanium metal.
+# aliases: anodized_ti anodized-titanium
+type thinfilm
+ior           const 2.5
+film_ior      2.30
+film_thickness 250
+substrate_k   const 3.0     # metallic substrate -> opaque structural colour

@@ -14,6 +14,12 @@
 // Parametric sources (blackbody, LED, gas-discharge line models, iridescent recipes)
 // are algorithms and remain in code.
 //
+// It also hosts the COMPOSITE-ASSET (bundle) reader — data/material/*.material and
+// data/light/*.light manifests that group several spectral envelopes plus intrinsic
+// scalars into one named material/light — via `loadBundle` + the shared flat-token
+// spectrum resolver `resolveSpectrumTokens` (interpreted into domain objects by
+// materials.h / lights.h).
+//
 // A category is just a directory of files. The lookup key is the lowercased filename
 // stem; a file may declare extra names with a `# aliases: a b c` header line. So the
 // library is drop-in extensible: add a file to data/<category>/ and it resolves by
@@ -152,6 +158,79 @@ inline bool loadGlass(const std::string& name, Spectrum& out) {
         s = iorConstant(N[0]);
     else return false;
     cache[path] = s; out = s; return true;
+}
+
+// ---------------------------------------------------------------------------
+// Flat-token spectrum resolver — the DATA-oriented primitive vocabulary shared by the
+// FTSL scene grammar (ftsl.h `evalSpectrum`) and the .material/.light bundle files
+// below. Given a whitespace-split token list (e.g. {"metal:Au"}, {"const","1.33"},
+// {"blackbody","6504"}, {"gaussian","center=560","sigma=25"}) it builds a Spectrum.
+// Handles only forms whose data lives in this library (curves, glass coeffs) or in the
+// native evaluators of spectrum.h (const/ior/blackbody/gaussian/shortpass). Returns
+// false (out untouched) on an unrecognized head so a caller can layer richer forms
+// (ftsl adds table blocks + spectrum:/preset: refs; lights.h adds its light models).
+inline bool resolveSpectrumTokens(const std::vector<std::string>& w, Spectrum& out) {
+    if (w.empty()) return false;
+    const std::string& h = w[0];
+    auto num = [](const std::string& s) { return std::strtod(s.c_str(), nullptr); };
+    if (isNumberTok(h) && w.size() == 1)     { out = constantSpectrum(num(h)); return true; }
+    if (h == "const" && w.size() > 1)        { out = constantSpectrum(num(w[1])); return true; }
+    if (h == "ior")                          { out = iorConstant(w.size() > 1 ? num(w[1]) : 1.5); return true; }
+    if (h == "blackbody")                    { out = blackbody(w.size() > 1 ? num(w[1]) : 6500.0); return true; }
+    if (h == "gaussian" || h == "shortpass") {
+        double a = 0, b = 0, c = 1.0;  // gaussian: center,sigma,amp ; shortpass: edge,slope,amp
+        for (size_t k = 1; k < w.size(); ++k) {
+            auto eq = w[k].find('='); if (eq == std::string::npos) continue;
+            std::string key = w[k].substr(0, eq); double x = num(w[k].substr(eq + 1));
+            if      (key == "center" || key == "edge")  a = x;
+            else if (key == "sigma"  || key == "slope") b = x;
+            else if (key == "amp")                      c = x;
+        }
+        out = (h == "gaussian") ? gaussianBand(a, b, c) : shortPass(a, b, c);
+        return true;
+    }
+    if (h.rfind("glass:", 0) == 0)       return loadGlass(h.substr(6), out);
+    if (h.rfind("metal:", 0) == 0)       return loadCurve("metal", h.substr(6), out);
+    if (h.rfind("reflectance:", 0) == 0) return loadCurve("reflectance", h.substr(12), out);
+    if (h.rfind("illuminant:", 0) == 0)  return loadCurve("illuminant", h.substr(11), out);
+    if (h.rfind("file:", 0) == 0) {
+        std::vector<std::pair<double, double>> p; std::string e;
+        if (!loadSpdCsv(h.substr(5), p, e)) return false;
+        out = tabulatedSpectrum(std::move(p)); return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Bundle (composite asset) manifest reader. A .material / .light file groups several
+// spectral envelopes plus intrinsic scalars into ONE named asset — the multi-envelope
+// grouping that a single Material/light already needs (e.g. a thin-film owns an ior
+// curve + substrate-extinction curve + film thickness/index scalars). This reader is
+// domain-agnostic: it just splits each non-comment line into `key arg arg …`, in file
+// order (so repeated keys like `layer` accumulate). materials.h / lights.h interpret
+// the fields into their own object, resolving spectrum-valued args via the shared
+// token resolver above. Aliases are handled by index() (the `# aliases:` header scan),
+// exactly like the curve/glass categories, so bundles are drop-in too.
+struct BundleField { std::string key; std::vector<std::string> args; };
+struct Bundle { std::vector<BundleField> fields; };
+
+inline bool loadBundle(const std::string& category, const std::string& name, Bundle& out) {
+    std::string path;
+    if (!findFile(category, name, path)) return false;
+    std::ifstream f(path);
+    if (!f) return false;
+    out.fields.clear();
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto h = line.find('#'); if (h != std::string::npos) line.erase(h);
+        std::istringstream ss(line); std::string key;
+        if (!(ss >> key)) continue;
+        BundleField fld; fld.key = key; std::string a;
+        while (ss >> a) fld.args.push_back(a);
+        out.fields.push_back(std::move(fld));
+    }
+    return !out.fields.empty();
 }
 
 } // namespace speclib

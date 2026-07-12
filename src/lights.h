@@ -165,11 +165,51 @@ inline Spectrum ledCCT(double kelvin) {
     };
 }
 
+// Resolve a light `spd <expr>` token list to an emission SPD. First tries the shared
+// data-oriented vocabulary (`blackbody K`, `const N`, `file:...`, `gaussian …` — see
+// spectral_library.h), then the native light MODELS defined above (which live here,
+// above the library, so they can't go in the shared resolver): the phosphor-LED and
+// gas-discharge line models. Returns false on an unrecognized head.
+inline bool resolveLightSpd(const std::vector<std::string>& w, Spectrum& out) {
+    if (speclib::resolveSpectrumTokens(w, out)) return true;
+    if (w.empty()) return false;
+    const std::string& h = w[0];
+    auto num = [](const std::string& s) -> double {
+        try { return std::stod(s); } catch (...) { return 0.0; }
+    };
+    if (h == "led-white")                        { out = ledWhite(w.size() > 1 ? num(w[1]) : 0.3); return true; }
+    if (h == "led-cct" && w.size() > 1)          { out = ledCCT(num(w[1]));  return true; }
+    if (h == "fluorescent")                      { out = fluorescent();      return true; }
+    if (h == "sodium-high" || h == "sodium")     { out = sodiumHigh();       return true; }
+    if (h == "sodium-low")                       { out = sodiumLow();        return true; }
+    if (h == "mercury")                          { out = mercuryVapor();     return true; }
+    if (h == "metal-halide")                     { out = metalHalide();      return true; }
+    return false;
+}
+
+// Interpret a data/light/<name>.light bundle into an emission SPD. A light asset
+// currently groups a single `spd <expr>` field (plus room for future intrinsic
+// fields — angular/goniometric envelope, size — grouped under one name). Aliases are
+// handled by the library's `# aliases:` header scan. Returns true when a file exists
+// and yields an SPD.
+inline bool resolveLightBundle(const std::string& name, Spectrum& out) {
+    speclib::Bundle b;
+    if (!speclib::loadBundle("light", name, b)) return false;
+    for (const auto& f : b.fields)
+        if (f.key == "spd") return resolveLightSpd(f.args, out);
+    return false;
+}
+
 // Resolve a light/illuminant preset name to an emission SPD. Returns true and sets
 // `out` if the name is recognized; returns false for unknown names so each caller
 // picks its own fallback (main.cpp -> 6500 K blackbody; FTSL loader -> parse error).
 // This is the single source of truth shared by the `-light` CLI flag and the FTSL
 // `preset:<name>` expression — keep new sources here, not duplicated per caller.
+//
+// Resolution order: parametric names (computed from the name) -> data/light/*.light
+// bundles (sun / daylight / incandescent / led / led-warm — simple parameter bindings
+// to the native models, now externalized) -> data/illuminant/*.csv measured SPDs ->
+// the native gas-discharge line models (analytic shaping = algorithm, kept in source).
 inline bool resolveLightPreset(const std::string& name, Spectrum& out) {
     auto num = [](const std::string& s) -> double {
         try { return std::stod(s); } catch (...) { return 0.0; }
@@ -186,16 +226,14 @@ inline bool resolveLightPreset(const std::string& name, Spectrum& out) {
         double k = num(p);                       // stod stops at trailing 'k'
         if (k > 100.0) { out = ledCCT(k); return true; }
     }
-    if (name == "sun")                          { out = sunlight();       return true; }
-    if (name == "daylight" || name == "d65")    { out = daylight(6504.0); return true; }
-    if (name == "a" || name == "incandescent")  { out = illuminantA();    return true; }
-    if (name == "led")                          { out = ledWhite(0.3);    return true; }
-    if (name == "led-warm")                     { out = ledWhite(1.0);    return true; }
+    // Externalized named presets (data/light/*.light) — sun / daylight / incandescent
+    // / led / led-warm and any drop-in additions.
+    if (resolveLightBundle(name, out)) return true;
     if (name == "fluorescent" || name == "cfl") { out = fluorescent();    return true; }
     // CIE F-series fluorescents (measured tabulated SPDs, loaded from
     // data/illuminant/*.csv via the spectral library — aliases handled there).
     if (resolveTabulatedIlluminant(name, out)) return true;
-    // Gas-discharge lamps (spectroscopic line models).
+    // Gas-discharge lamps (spectroscopic line models — analytic shaping stays native).
     if (name == "hps" || name == "sodium")      { out = sodiumHigh();     return true; }
     if (name == "lps" || name == "sodium-low")  { out = sodiumLow();      return true; }
     if (name == "mercury" || name == "hg")      { out = mercuryVapor();   return true; }

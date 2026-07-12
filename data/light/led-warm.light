@@ -1,0 +1,2 @@
+# Warm white phosphor LED (redward-shifted phosphor, lower blue peak).
+spd led-white 1.0

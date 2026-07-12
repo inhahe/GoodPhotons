@@ -1200,10 +1200,25 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   iridescent recipes stayed native (algorithms, not data). Verified: standalone loader
   test round-trips n_d (BK7 1.5168, SF10 1.7283, water 1.333) and R(λ) (Au R(700)=0.970)
   from the files, matching the old baked values.
+- **RECIPES EXTERNALIZED (bundles) 2026-07-12:** the whole-material `preset` recipes
+  and named light presets are now **composite asset bundle files**, not baked C++.
+  `data/material/*.material` (soap-bubble, oil-slick, anodized-ti, morpho, beetle,
+  nacre) and `data/light/*.light` (sun, daylight/d65, incandescent/a, led, led-warm)
+  group a `type` + several spectral envelopes (`ior`/`substrate_k`/`spd`…) + intrinsic
+  scalars (`film_ior`/`film_thickness`, `layer <n> <k> <nm>` rows) under one name.
+  `resolveMaterialBundle` (materials.h) / `resolveLightBundle` (lights.h) interpret the
+  manifest; spectrum-valued fields reuse the scene language's primitive vocabulary via
+  a new shared `speclib::resolveSpectrumTokens`. So the tuned iridescent layer stacks
+  are now DATA (retune/extend with no rebuild) while the interference/Abeles/Fresnel
+  evaluators (render.h) and the LED/gas-discharge line models (lights.h) stay native.
+  `resolveMaterialPreset` reads a bundle first, then a generic metal→glossy /
+  glass→dielectric convention so bare primitive names still resolve with no file. The
+  bit-for-bit faithfulness holds: `const N` == the old `iorConstant(N)`
+  (`[N](double){return N;}`), so the bundles reproduce the baked recipes exactly.
 - **Status:** OPEN (acceptable, much reduced) — metals + 4 natural curves are now
-  measured data, and ALL spectral data now loads from `data/` files rather than baked
-  source; skin/soil and iridescent recipes remain representative. All presets load on
-  CPU==GPU and render the right colours.
+  measured data, and ALL spectral data AND the whole-material / named-light recipes now
+  load from `data/` files rather than baked source; skin/soil and iridescent recipes
+  remain representative. All presets load on CPU==GPU and render the right colours.
 
 ### Full physical `layered` material [IMPLEMENTED 2026-07-11]
 - **What:** both the FTSL `type mix` material (stochastic per-photon pick among named

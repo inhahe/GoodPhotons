@@ -1,0 +1,18 @@
+# Jewel beetle elytra: a high/low chitin Bragg stack tuned to green.
+# 6 bilayers over a dark backing.
+# aliases: jewel-beetle
+type multilayer
+ior         const 1.6
+substrate_k const 0.4
+layer 1.70 0.0 75
+layer 1.40 0.0 95
+layer 1.70 0.0 75
+layer 1.40 0.0 95
+layer 1.70 0.0 75
+layer 1.40 0.0 95
+layer 1.70 0.0 75
+layer 1.40 0.0 95
+layer 1.70 0.0 75
+layer 1.40 0.0 95
+layer 1.70 0.0 75
+layer 1.40 0.0 95

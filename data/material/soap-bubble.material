@@ -1,0 +1,7 @@
+# Soap bubble: a thin water film in air, transparent on both sides.
+# aliases: soap_bubble bubble
+type thinfilm
+ior           const 1.0     # "substrate" behind the film is air
+film_ior      1.33
+film_thickness 380
+substrate_k   const 0.0     # transparent substrate -> lossless iridescence

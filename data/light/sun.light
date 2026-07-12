@@ -1,0 +1,2 @@
+# Direct sunlight, approximated as a Planckian radiator at ~5778 K.
+spd blackbody 5778

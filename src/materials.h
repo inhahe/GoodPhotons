@@ -1,28 +1,97 @@
-// Built-in material recipes for common real-world materials.
+// Whole-material presets for common real-world materials.
 //
-// NOTE: the measured spectral DATA that used to be baked here — the metal
-// reflectances (`metal:<name>`, Johnson & Christy / Rakic R(lambda) tables) and the
-// natural diffuse reflectances (`reflectance:<name>`, USGS splib07 curves) — now
-// lives in external files (data/metal/*.csv, data/reflectance/*.csv) and is loaded
-// at runtime by `resolveMetalReflectance()` / `resolveNaturalReflectance()` in
-// spectral_library.h. Only the DATA moved out; this file keeps the ALGORITHMIC
-// content:
-//   Whole-material recipes (`material { preset <name> }`) — a MatType plus tuned
-//   parameters, so one keyword yields a realistic gold / diamond / soap-film /
-//   Morpho material. Iridescent recipes are physically-motivated film/stack
-//   configurations (parameter recipes, not measured spectra), so they stay native.
+// NOTE: both the measured spectral DATA and the hand-tuned iridescent RECIPES that
+// used to be baked here now live in external files, loaded at runtime:
+//   - metal reflectances / natural reflectances -> data/metal/*.csv,
+//     data/reflectance/*.csv (resolveMetalReflectance / resolveNaturalReflectance).
+//   - whole-material recipes (`material { preset <name> }`) -> data/material/*.material
+//     bundle files (a MatType + spectral envelopes + intrinsic scalars grouped into
+//     one named asset). The soap-film / oil-slick / anodised-Ti / Morpho / beetle /
+//     nacre configs — layer stacks, film thickness/index, substrate extinction — are
+//     just tuned numeric parameters, so they are DATA and move out to files.
+// Only DATA moved out; the ALGORITHMS stay native — the interference / Abeles-matrix
+// / Fresnel evaluators (render.h) and the sellmeier/cauchy dispersion functions are
+// unchanged. This file now just interprets a bundle manifest into a Material.
 #pragma once
 #include <string>
 #include "spectrum.h"
 #include "spectral_library.h"
 #include "scene.h"
 
-// --- Whole-material recipes -------------------------------------------------
-// `material "x" { preset <name> }` fills a complete Material. Metals default to a
-// lightly-polished glossy lobe (override with `roughness`); iridescent recipes are
-// physically-motivated film/stack configs (override `film_thickness` to retune the
-// colour). Returns true and sets `out` on a known name.
+// Map a `type <name>` bundle field to a MatType. Returns false on an unknown type.
+inline bool parseMatType(const std::string& t, MatType& out) {
+    std::string s = speclib::lower(t);
+    if      (s == "diffuse")          out = MatType::Diffuse;
+    else if (s == "dielectric")       out = MatType::Dielectric;
+    else if (s == "mirror")           out = MatType::Mirror;
+    else if (s == "halfmirror")       out = MatType::HalfMirror;
+    else if (s == "glossy")           out = MatType::Glossy;
+    else if (s == "fluorescent")      out = MatType::Fluorescent;
+    else if (s == "thinfilm")         out = MatType::ThinFilm;
+    else if (s == "grating")          out = MatType::Grating;
+    else if (s == "multilayer")       out = MatType::Multilayer;
+    else if (s == "layered")          out = MatType::Layered;
+    else if (s == "diffusetransmit")  out = MatType::DiffuseTransmit;
+    else return false;
+    return true;
+}
+
+// --- Whole-material recipe bundles ------------------------------------------
+// Interpret a data/material/<name>.material manifest into a complete Material. A
+// bundle groups several spectral envelopes plus intrinsic scalars under one name:
+//   type <matType>                     required
+//   reflect|emit|ior|absorb|transmit|substrate_k  <spectrum expr>   (token resolver)
+//   roughness|film_ior|film_thickness  <number>
+//   layer <n> <k> <thickness_nm>       one per stack layer (accumulates, outer first)
+// Spectrum-valued fields accept the same primitive vocabulary as the scene language
+// (`const N`, `metal:Au`, `glass:BK7`, `reflectance:leaf`, `file:...`, `blackbody K`,
+// `ior N`, `gaussian …`). Returns true and fills `out` when a bundle file exists.
+inline bool resolveMaterialBundle(const std::string& name, Material& out) {
+    speclib::Bundle b;
+    if (!speclib::loadBundle("material", name, b)) return false;
+    Material m;
+    bool haveType = false;
+    auto num = [](const std::string& s) { return std::strtod(s.c_str(), nullptr); };
+    auto spec = [&](const std::vector<std::string>& a, Spectrum& dst) {
+        Spectrum s; if (speclib::resolveSpectrumTokens(a, s)) dst = s;
+    };
+    for (const auto& f : b.fields) {
+        const auto& a = f.args;
+        if (f.key == "type") {
+            if (a.empty() || !parseMatType(a[0], m.type)) return false;
+            haveType = true;
+        }
+        else if (f.key == "reflect")      spec(a, m.reflect);
+        else if (f.key == "emit")         spec(a, m.emit);
+        else if (f.key == "ior")          spec(a, m.ior);
+        else if (f.key == "absorb")       spec(a, m.absorb);
+        else if (f.key == "transmit")     spec(a, m.transmit);
+        else if (f.key == "substrate_k")  spec(a, m.substrateK);
+        else if (f.key == "roughness"      && !a.empty()) m.roughness     = num(a[0]);
+        else if (f.key == "film_ior"       && !a.empty()) m.filmIor       = num(a[0]);
+        else if (f.key == "film_thickness" && !a.empty()) m.filmThickness = num(a[0]);
+        else if (f.key == "layer" && a.size() >= 3) {
+            m.layerN.push_back(num(a[0]));
+            m.layerK.push_back(num(a[1]));
+            m.layerThick.push_back(num(a[2]));
+        }
+        // Unknown keys are ignored (forward-compatible with future material fields).
+    }
+    if (!haveType) return false;
+    out = m; return true;
+}
+
+// `material "x" { preset <name> }` fills a complete Material. Resolution order:
+//   1. an explicit data/material/<name>.material bundle (the curated recipes,
+//      including all iridescent structural-colour materials);
+//   2. a generic CONVENTION for bare primitives, so any metal/glass in the library
+//      (including future drop-in files) works as a material with no bundle needed:
+//      a metal name -> lightly-polished Glossy tinted by its reflectance; a glass
+//      name -> clear Dielectric with its dispersion (`glass` aliases to BK7).
+// Returns true and sets `out` on a known name. (Common knobs — roughness, film
+// thickness/index, reflect, ior — may still be overridden by the caller afterwards.)
 inline bool resolveMaterialPreset(const std::string& name, Material& out) {
+    if (resolveMaterialBundle(name, out)) return true;
     Material m;
     Spectrum s;
     // Polished metals -> glossy with the measured reflectance tint.
@@ -33,65 +102,11 @@ inline bool resolveMaterialPreset(const std::string& name, Material& out) {
         out = m; return true;
     }
     // Transparent dielectrics -> refractive glass with the right dispersion.
-    // (Map the material name to the glass IOR of the same substance.)
-    std::string glassName = name;
-    if (name == "glass") glassName = "BK7";
+    std::string glassName = (name == "glass") ? "BK7" : name;
     if (resolveGlassIor(glassName, s)) {
         m.type = MatType::Dielectric;
         m.ior = s;
         m.roughness = 0.0;                        // clear glass (opt into frosting explicitly)
-        out = m; return true;
-    }
-    // Iridescent / structural colour.
-    if (name == "soap-bubble" || name == "soap_bubble" || name == "bubble") {
-        m.type = MatType::ThinFilm;               // water film in air, both sides transparent
-        m.ior = iorConstant(1.0);                 // "substrate" = air behind the film
-        m.filmIor = 1.33; m.filmThickness = 380.0;
-        m.substrateK = constantSpectrum(0.0);
-        out = m; return true;
-    }
-    if (name == "oil-slick" || name == "oil_slick" || name == "oil") {
-        m.type = MatType::ThinFilm;               // oil film on dark wet asphalt (absorbing)
-        m.ior = iorConstant(1.5);
-        m.filmIor = 1.47; m.filmThickness = 320.0;
-        m.substrateK = constantSpectrum(2.0);     // absorbing substrate -> opaque iridescence
-        out = m; return true;
-    }
-    if (name == "anodized-ti" || name == "anodized_ti" || name == "anodized-titanium") {
-        m.type = MatType::ThinFilm;               // TiO2 film on titanium metal
-        m.ior = iorConstant(2.5);
-        m.filmIor = 2.30; m.filmThickness = 250.0;
-        m.substrateK = constantSpectrum(3.0);
-        out = m; return true;
-    }
-    if (name == "morpho") {
-        m.type = MatType::Multilayer;             // chitin/air quarter-wave stack tuned to ~450 nm blue
-        m.ior = iorConstant(1.56);
-        m.substrateK = constantSpectrum(0.5);     // melanin backing -> opaque, saturated
-        for (int i = 0; i < 6; ++i) {
-            m.layerN.push_back(1.56); m.layerK.push_back(0.0); m.layerThick.push_back(72.0);   // chitin
-            m.layerN.push_back(1.00); m.layerK.push_back(0.0); m.layerThick.push_back(112.0);  // air
-        }
-        out = m; return true;
-    }
-    if (name == "beetle" || name == "jewel-beetle") {
-        m.type = MatType::Multilayer;             // high/low chitin stack tuned to green
-        m.ior = iorConstant(1.6);
-        m.substrateK = constantSpectrum(0.4);
-        for (int i = 0; i < 6; ++i) {
-            m.layerN.push_back(1.70); m.layerK.push_back(0.0); m.layerThick.push_back(75.0);
-            m.layerN.push_back(1.40); m.layerK.push_back(0.0); m.layerThick.push_back(95.0);
-        }
-        out = m; return true;
-    }
-    if (name == "nacre" || name == "mother-of-pearl") {
-        m.type = MatType::Multilayer;             // aragonite/conchiolin platelets -> pastel iridescence
-        m.ior = iorConstant(1.68);
-        m.substrateK = constantSpectrum(0.0);     // translucent
-        for (int i = 0; i < 5; ++i) {
-            m.layerN.push_back(1.68); m.layerK.push_back(0.0); m.layerThick.push_back(300.0);  // aragonite
-            m.layerN.push_back(1.53); m.layerK.push_back(0.0); m.layerThick.push_back(120.0);  // conchiolin
-        }
         out = m; return true;
     }
     return false;
