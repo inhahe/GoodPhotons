@@ -677,8 +677,11 @@ per-frame auto-exposure; exposure-locked animation paths and the budget flags
 
 **Shared vs. independent randomness across cameras (matters for video and for
 side-by-side cameras).** This is the key per-mode difference in how randomness is
-distributed *between* cameras — whether they're distinct `camera` blocks or the frames a
-`camera_path`/`orbit`/`curve` expands into:
+distributed *between* cameras. Note that **a "frame" here is simply a camera in the same
+scene**: a `camera_path`/`orbit`/`curve` expands into one `camera` per frame, and they all
+render together in a single scene exactly like several hand-authored `camera` blocks — so
+everything below applies identically whether you wrote the cameras out by hand or generated
+them as animation frames:
 
 - **`B`** — every camera is splatted from the *same* photon set, so they share identical
   random paths: a camera's noise is **correlated** with every other camera's (and a camera
