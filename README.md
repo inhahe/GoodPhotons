@@ -290,6 +290,7 @@ Declared with `material "name" { type <type> … }`.
 | `dielectric` | Refractive glass with dispersion, optional **frosting** and **colored-glass tint** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
+| `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`) |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
 | `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k` |
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
@@ -368,12 +369,15 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 - **`reflectance:<name>`** — measured natural-material diffuse reflectances:
   `leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`, `soil`/`dirt`,
   `brick`/`red-brick`, `concrete`.
+- **`filter:<name>`** — gel/Wratten filter transmittances T(λ) (for a `filter`
+  material's `transmit`): `red-25`, `deep-red-29`, `orange-21`, `yellow-12`,
+  `green-58`, `blue-47`, `deep-blue-47b`.
 - **`spectrum "name" { … }`** blocks to define and reuse a named SPD.
 
-The `glass:`, `metal:`, `reflectance:` and `preset:` (illuminant) presets — plus the
-whole-material `preset <name>` recipes and the named light presets — are a **drop-in
-spectral asset library**: their data lives in external files under
-`data/{glass,metal,reflectance,illuminant,material,light}/`, loaded at runtime — add a
+The `glass:`, `metal:`, `reflectance:`, `filter:` and `preset:` (illuminant) presets —
+plus the whole-material `preset <name>` recipes and the named light presets — are a
+**drop-in spectral asset library**: their data lives in external files under
+`data/{glass,metal,reflectance,illuminant,filter,material,light}/`, loaded at runtime — add a
 file to a category directory and it resolves by name with **no rebuild** (the
 lowercased filename is the preset name; a `# aliases:` header line adds more). The
 `material/` and `light/` files are *bundles* that group several envelopes plus scalars

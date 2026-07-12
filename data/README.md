@@ -18,7 +18,7 @@ it contains no algorithm.
 
 ## File formats
 
-- **Curve files** (`.csv`, categories `metal/`, `reflectance/`, `illuminant/`):
+- **Curve files** (`.csv`, categories `metal/`, `reflectance/`, `illuminant/`, `filter/`):
   comment lines start with `#`, one header row `wavelength_nm,<value column>`, then
   `wavelength_nm,value` rows. Comma **or** whitespace delimited. Values are relative
   unless the column name says otherwise (an emission SPD's absolute scale is
@@ -53,6 +53,7 @@ it contains no algorithm.
 | `glass/`         | `glass:<name>`         | `resolveGlassIor`                 |
 | `metal/`         | `metal:<name>`         | `resolveMetalReflectance`         |
 | `reflectance/`   | `reflectance:<name>`   | `resolveNaturalReflectance`       |
+| `filter/`        | `filter:<name>`        | `resolveFilterTransmittance`      |
 | `illuminant/`    | `preset:<name>` (light)| `resolveTabulatedIlluminant`      |
 | `material/`      | `material { preset <name> }` | `resolveMaterialBundle`     |
 | `light/`         | `preset:<name>` (light)| `resolveLightBundle`              |
@@ -98,6 +99,16 @@ f2 (`cool-white`), f7 (`daylight-fl`), f11 (`triphosphor`): CIE standard illumin
 F-series relative SPDs, 380-780 nm at 5 nm. Transcribed from CIE 15:2004 fluorescent
 illuminant tables via colour-science (github.com/colour-science/colour, BSD-3; the
 CIE tables themselves are public reference data).
+
+### `filter/*.csv` — gel / Wratten filter transmittance T(λ)
+red-25 (`red`), deep-red-29, orange-21, yellow-12, green-58, blue-47, deep-blue-47b:
+the classic Kodak Wratten set, consumed by a `filter` material's `transmit`. These are
+**digitized from the numeric transmittance tables** in *Kodak Wratten Filters for
+Scientific and Technical Use*, 22nd ed. (Eastman Kodak, pub. B-3) — 400–700 nm at 10 nm,
+with book dashes ("negligible") read as 0. The FTSL loader interpolates linearly and
+clamps outside the tabulated range. A `filter` material is a thin non-scattering absorber
+(`src/render.h` MatType::Filter): the transmittance is data, the straight-through
+absorption is the algorithm.
 
 ### `material/*.material` — whole-material recipe bundles
 The iridescent structural-colour materials: soap-bubble (`bubble`), oil-slick
@@ -147,6 +158,13 @@ shoulder. To swap in a measurement, drop a die SPD into `illuminant/` (e.g.
   measurements alongside the lamps.
 - **OSRAM / Lumileds / Cree datasheets** publish per-die relative SPD plots (digitize
   to `wavelength_nm,value`).
+
+### Gel / Wratten filter transmittances (`red-25`, `green-58`, `blue-47`, …) — DONE
+`filter/*.csv` are now digitized from the numeric tables in *Kodak Wratten Filters for
+Scientific and Technical Use*, 22nd ed. (pub. B-3), 400–700 nm at 10 nm. To add more gels
+or finer spacing, drop a `wavelength_nm,transmittance` CSV into `filter/` (overwrite by
+name) — no rebuild. Further sources: **Rosco/LEE** swatch books (Rosco `.sed` spectral
+files; LEE T(λ) plots) and the CRC Handbook "Transmission of Wratten filters" tables.
 
 ### Human skin reflectance (`skin`, `skin-dark`)
 Currently `reflectance/skin-light.csv` / `skin-dark.csv` are representative

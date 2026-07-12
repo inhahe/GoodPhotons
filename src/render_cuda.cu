@@ -157,7 +157,7 @@ HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 // (MatType::Layered) has no device branch (Layered scenes fall back to the CPU tracer via
 // cudaForwardSupported), but the placeholder keeps D_DIFFUSETRANSMIT aligned at index 11.
 enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM,
-       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT };
+       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT, D_FILTER };
 
 // Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
 // exceed this fall back to the CPU forward tracer (cudaForwardSupported).
@@ -2556,6 +2556,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
         else { ro = h.p + rd * RAY_EPS; }
         return WF_CONTINUE;
+    } else if (m.type == D_FILTER) {
+        // Colored gel / Wratten filter (device twin of render.h MatType::Filter): a thin
+        // non-scattering absorber. Pass straight through; survive with prob T(lambda),
+        // else absorb. RR on the transmittance keeps beta unchanged and unbiased.
+        Real t = clamp01(specLookup(m.transmit, lambda));
+        if (rng.uniform() >= t) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
+        return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
         Real r = clamp01(specLookup(m.reflect, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -3214,6 +3222,13 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 else                   { ro = h.p + rd * RAY_EPS; }
                 specularArrival = true; break;
             }
+            case D_FILTER: {
+                // Colored gel filter: pass straight through, survive with prob T(lambda).
+                Real t = clamp01(specLookup(mp->transmit, lambda));
+                if (rng.uniform() >= t) return L;   // absorbed
+                ro = h.p + rd * RAY_EPS;            // direction unchanged
+                specularArrival = true; break;
+            }
             case D_GLOSSY: {
                 Real r = clamp01(specLookup(mp->reflect, lambda));
                 if (rng.uniform() >= r) return L;
@@ -3415,6 +3430,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 double r = clamp01(specLookup(mp->reflect, lambda));
                 if (rng.uniform() < r) wi = reflectv(rd, path[cur].ns); else wi = rd;
                 betaFactor = 1.0; delta = 1;
+                break;
+            }
+            case D_FILTER: {
+                // Colored gel filter: straight-through delta, throughput ×= T(lambda).
+                double t = clamp01(specLookup(mp->transmit, lambda));
+                wi = rd; betaFactor = t; delta = 1;
+                if (t <= 0) terminate = true;
                 break;
             }
             case D_THINFILM: {

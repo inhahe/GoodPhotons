@@ -1,5 +1,6 @@
 # Build output
 /build/
+/build_cuda/
 /build_het/
 /out/
 *.ppm
@@ -8,6 +9,9 @@
 
 # Generated meshes (regenerate with tools/make_mesh.py)
 *.obj
+
+# Reference PDFs (e.g. Kodak Wratten handbook used to digitize filter data)
+*.pdf
 
 # Checkpoints / render state
 *.ckpt

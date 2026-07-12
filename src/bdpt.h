@@ -525,6 +525,13 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 betaFactor = 1.0; delta = true;
                 break;
             }
+            case MatType::Filter: {
+                // Colored gel filter: straight-through delta, throughput ×= T(lambda).
+                double t = clamp01(mp->transmit(lambda));
+                wi = ray.d; betaFactor = t; delta = true;   // direction unchanged
+                if (t <= 0) terminate = true;
+                break;
+            }
             case MatType::ThinFilm: {
                 Ray nr;
                 if (!mats.thinFilmInterface(scene, *mp, h, ray.d, lambda, rng, nr)) { terminate = true; break; }

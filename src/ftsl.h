@@ -637,6 +637,12 @@ private:
             if (resolveNaturalReflectance(rname, r)) return r;
             fail("unknown reflectance '" + rname + "'"); return constantSpectrum(0.5);
         }
+        if (h.rfind("filter:", 0) == 0) {
+            std::string fname = h.substr(7);
+            Spectrum t;
+            if (resolveFilterTransmittance(fname, t)) return t;
+            fail("unknown filter '" + fname + "'"); return constantSpectrum(0.5);
+        }
         if (h.rfind("preset:", 0) == 0)  return resolvePreset(h.substr(7));
         if (h.rfind("file:", 0) == 0)    return loadSpdFile(h.substr(5));
         if (h.rfind("spectrum:", 0) == 0) {
@@ -906,6 +912,15 @@ private:
         } else if (type == "halfmirror") {
             m.type = MatType::HalfMirror;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.5));
+        } else if (type == "filter") {
+            // Colored gel / Wratten filter: a thin non-scattering absorber. A photon
+            // passes straight through, surviving with probability `transmit`(lambda) —
+            // the per-wavelength transmittance T(lambda) in [0,1] — and is absorbed
+            // otherwise. No reflection, no refraction. Feed T from a measured curve
+            // (`transmit file:data/filter/rosco-red.csv` / `transmit filter:red-25`)
+            // or a primitive (`transmit gaussian center=630 sigma=25`).
+            m.type = MatType::Filter;
+            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.5));
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));

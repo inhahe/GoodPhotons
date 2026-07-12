@@ -1203,6 +1203,19 @@ struct Renderer {
                     }
                     continue;                       // lossless split
                 }
+                case MatType::Filter: {
+                    // Colored gel / Wratten filter: a thin non-scattering absorber.
+                    // The photon passes straight through (direction unchanged) and
+                    // survives with probability T(lambda), else is absorbed. Russian
+                    // roulette on the transmittance keeps beta unchanged and unbiased —
+                    // the wavelength-dependent survival IS the colored transmission.
+                    // Specular straight-through, so no camera connect (like clear glass):
+                    // you see the filter's effect on whatever lies behind it.
+                    double t = clamp01(m.transmit(lambda));
+                    if (rng.uniform() >= t) { e.absorbed += beta; return; }
+                    ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
+                    continue;
+                }
                 case MatType::Glossy: {
                     double r = clamp01(m.reflect(lambda));
                     // Russian roulette on reflectance (see Mirror).

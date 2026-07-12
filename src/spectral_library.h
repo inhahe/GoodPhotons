@@ -193,6 +193,7 @@ inline bool resolveSpectrumTokens(const std::vector<std::string>& w, Spectrum& o
     if (h.rfind("metal:", 0) == 0)       return loadCurve("metal", h.substr(6), out);
     if (h.rfind("reflectance:", 0) == 0) return loadCurve("reflectance", h.substr(12), out);
     if (h.rfind("illuminant:", 0) == 0)  return loadCurve("illuminant", h.substr(11), out);
+    if (h.rfind("filter:", 0) == 0)      return loadCurve("filter", h.substr(7), out);
     if (h.rfind("file:", 0) == 0) {
         std::vector<std::pair<double, double>> p; std::string e;
         if (!loadSpdCsv(h.substr(5), p, e)) return false;
@@ -245,3 +246,4 @@ inline bool resolveGlassIor(const std::string& name, Spectrum& out)          { r
 inline bool resolveMetalReflectance(const std::string& name, Spectrum& out)  { return speclib::loadCurve("metal", name, out); }
 inline bool resolveNaturalReflectance(const std::string& name, Spectrum& out){ return speclib::loadCurve("reflectance", name, out); }
 inline bool resolveTabulatedIlluminant(const std::string& name, Spectrum& out){ return speclib::loadCurve("illuminant", name, out); }
+inline bool resolveFilterTransmittance(const std::string& name, Spectrum& out){ return speclib::loadCurve("filter", name, out); }

@@ -1,0 +1,37 @@
+# Kodak Wratten 47B (deep blue): narrower/deeper than 47, peak ~430 nm.
+# aliases: deep-blue wratten47b
+# Digitized from Kodak Wratten Filters for Scientific and Technical Use,
+# 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance tables.
+# 400-700 nm at 10 nm; book dashes = negligible -> 0. Loader clamps outside range.
+wavelength_nm,transmittance
+400,0.1600
+410,0.2950
+420,0.4360
+430,0.5000
+440,0.4720
+450,0.3600
+460,0.2500
+470,0.1320
+480,0.0450
+490,0.0130
+500,0.0017
+510,0.0000
+520,0.0000
+530,0.0000
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0000
+610,0.0000
+620,0.0000
+630,0.0000
+640,0.0000
+650,0.0000
+660,0.0000
+670,0.0000
+680,0.0000
+690,0.0000
+700,0.0000

@@ -32,6 +32,7 @@ inline bool parseMatType(const std::string& t, MatType& out) {
     else if (s == "multilayer")       out = MatType::Multilayer;
     else if (s == "layered")          out = MatType::Layered;
     else if (s == "diffusetransmit")  out = MatType::DiffuseTransmit;
+    else if (s == "filter")           out = MatType::Filter;
     else return false;
     return true;
 }

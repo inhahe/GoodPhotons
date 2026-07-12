@@ -1,0 +1,37 @@
+# Kodak Wratten 47 (tricolor blue): bandpass ~400-500 nm, peak ~440 nm.
+# aliases: blue wratten47 tricolor-blue
+# Digitized from Kodak Wratten Filters for Scientific and Technical Use,
+# 22nd ed. (Eastman Kodak, pub. B-3), numeric transmittance tables.
+# 400-700 nm at 10 nm; book dashes = negligible -> 0. Loader clamps outside range.
+wavelength_nm,transmittance
+400,0.0780
+410,0.1740
+420,0.3400
+430,0.4700
+440,0.5030
+450,0.4830
+460,0.4340
+470,0.3620
+480,0.2850
+490,0.1960
+500,0.1130
+510,0.0564
+520,0.0191
+530,0.0036
+540,0.0000
+550,0.0000
+560,0.0000
+570,0.0000
+580,0.0000
+590,0.0000
+600,0.0000
+610,0.0000
+620,0.0000
+630,0.0000
+640,0.0000
+650,0.0000
+660,0.0000
+670,0.0000
+680,0.0000
+690,0.0000
+700,0.0000

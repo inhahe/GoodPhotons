@@ -1220,6 +1220,30 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   load from `data/` files rather than baked source; skin/soil and iridescent recipes
   remain representative. All presets load on CPU==GPU and render the right colours.
 
+### Colored-LED light bundles + `filter` gel material — DONE 2026-07-12
+- **Colored LEDs (data only).** A direct-emission LED die is a single narrow band, and
+  the light-bundle vocabulary already had `gaussian center=… sigma=…`, so seven colored
+  LEDs (`data/light/led-royal-blue`…`led-deep-red`) are pure-data `.light` bundles — no
+  native code. Representative InGaN/AlInGaP peaks + FWHMs (sigma = FWHM/2.355). Measured
+  die SPDs (slightly asymmetric) can drop into `illuminant/` later (pending in
+  data/README). Verified `preset:led-red` renders pure red.
+- **`filter` material (option A).** New `MatType::Filter`: a thin non-scattering absorber
+  (colored gel / Wratten). The photon passes straight through (direction unchanged) and
+  survives with probability T(λ) = `transmit`(λ), else absorbs — Russian roulette on the
+  transmittance, β unchanged, unbiased. Specular straight-through so it makes no camera
+  connection (like clear glass — it colors what's behind it). Threaded through EVERY
+  tracer: forward CPU (`render.h`), forward GPU (`render_cuda.cu` `D_FILTER`), backward
+  CPU (`backward.h`) + GPU, and BDPT CPU (`bdpt.h`) + GPU (delta vertex, throughput
+  ×= T). `type filter` in FTSL (ftsl.h) reads `transmit`; `parseMatType` adds it for
+  bundles. New `filter/` data category + `filter:<name>` token + `resolveFilterTransmittance`.
+- **Data (RESOLVED 2026-07-12):** `data/filter/*.csv` (red-25, deep-red-29, orange-21,
+  yellow-12, green-58, blue-47, deep-blue-47b) are now **digitized from the numeric
+  transmittance tables** in *Kodak Wratten Filters for Scientific and Technical Use*,
+  22nd ed. (pub. B-3), 400–700 nm at 10 nm (book dashes = negligible → 0). Transcribed
+  via `scraps/extract_wratten.py` (which renders the table pages with `scraps/pdf_to_img.py`).
+  No longer a representative curve. Finer spacing/more gels can drop into `filter/` later
+  (Rosco `.sed` / LEE / CRC), no rebuild.
+
 ### Full physical `layered` material [IMPLEMENTED 2026-07-11]
 - **What:** both the FTSL `type mix` material (stochastic per-photon pick among named
   child materials, weights ≤ 1, remainder absorbs — Phase 2d, `scenes/mixmat.ftsl`,

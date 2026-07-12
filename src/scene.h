@@ -12,7 +12,7 @@
 #include "texture.h"
 #include "envmap.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -23,7 +23,7 @@ inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||
            t == MatType::Glossy     || t == MatType::Grating ||
-           t == MatType::Multilayer;
+           t == MatType::Multilayer || t == MatType::Filter;
 }
 
 struct Material {
@@ -45,6 +45,9 @@ struct Material {
     // (-n). reflect+transmit must be <= 1 per wavelength (the rest is absorbed). Because
     // both lobes are non-specular, a directly-viewed translucent solid CONNECTS to the
     // pinhole and is visible in mode B (unlike clear dielectric, which stays black).
+    // Also the per-wavelength TRANSMITTANCE T(lambda) in [0,1] of a MatType::Filter
+    // (colored gel / Wratten): the photon passes straight through, surviving with
+    // probability T(lambda) and absorbed otherwise — no scattering, no refraction.
     Spectrum transmit = constantSpectrum(0.0);
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
