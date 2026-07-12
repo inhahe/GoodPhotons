@@ -1,85 +1,116 @@
-# Mirror selfie — "a mirror that can see the camera". A studio room whose entire back
-# wall is a silver mirror; a DSLR-style camera on a stand stands in the room with its
-# lens pointed at the mirror. Rendered through a real PHYSICAL LENS — an achromatic
-# 50 mm doublet at f/2.8 (the `lens {}` prescription forces the backward realistic-
-# camera path, mode R) — focused on the mirror image so the reflected camera staring
-# back out of the glass is sharp while the near foreground melts into bokeh. The camera
-# prop is assembled from analytic isosurface SDF leaves (rounded box body, silver
-# cylinder lens barrel, torus lens ring, glass front element, stand) grouped by
-# material. Exercises: physical multi-element lens DoF, perfect-mirror reflection,
-# spectral metals.
+# Mirror selfie — a REAL one. The render camera IS the camera in the scene: the eye/
+# entrance pupil sits exactly at the prop's front lens element, and the whole camera
+# body, ring-flash, and tripod are assembled BEHIND that point (deeper into the room,
+# away from the mirror). So the lens never sees itself directly — everything you see of
+# the camera is its own reflection in the mirror on the back wall. That's what makes it
+# a genuine selfie: this is the view down the barrel of the very camera in the glass.
+#
+# Rendered through a real PHYSICAL LENS (achromatic 50 mm doublet). Focus is pinned on
+# the VIRTUAL image of the camera (~2.2 m behind the mirror) and stopped down to f/5.6
+# so the reflected camera is crisp while only the deep background and the glowing ring-
+# flash highlights fall into soft bokeh — much sharper than the old f/2.8 miss-focus.
+#
+# Cool stuff: a ring-flash (a halo of little emitters around the lens) that blooms in
+# the mirror, a red REC light on the body, a cyan/amber colour-split studio (coloured
+# walls + matching glowing accent orbs) reflected in the glass, a polished floor that
+# mirrors the whole rig, and chrome + glass hero spheres flanking the reflected camera.
 #   ftrace -in scenes/mirror_selfie.ftsl -mode R -device gpu -spp 8192 -o png/mirror_selfie.png
 
 scene { units meters  spectral 360 830 1 }
 
-material "mirror"   { type mirror reflect metal:silver }
-material "floor"    { type diffuse reflect 0.35 }
-material "white"    { type diffuse reflect whitewall 0.7 }
-material "bluewall" { type diffuse reflect rgb 0.18 0.32 0.68 }
-material "warmwall" { type diffuse reflect rgb 0.80 0.42 0.22 }
-material "body"     { type diffuse reflect 0.03 }
-material "barrel"   { type glossy  reflect metal:silver roughness 0.06 }
-material "glass"    { type dielectric ior 1.5 }
+material "mirror"  { type mirror   reflect metal:silver }
+material "floor"   { type glossy   reflect rgb 0.07 0.07 0.08   roughness 0.06 }   # polished charcoal
+material "cyanwall"  { type diffuse reflect rgb 0.10 0.34 0.52 }                   # cool left wall
+material "amberwall" { type diffuse reflect rgb 0.60 0.34 0.13 }                   # warm right wall
+material "back"    { type diffuse  reflect rgb 0.10 0.11 0.14 }                    # dark backdrop
+material "ceil"    { type diffuse  reflect whitewall 0.65 }
+material "body"    { type diffuse  reflect 0.03 }                                  # matte black shell
+material "grip"    { type diffuse  reflect rgb 0.05 0.05 0.055 }
+material "barrel"  { type glossy   reflect metal:aluminium  roughness 0.05 }
+material "chrome"  { type glossy   reflect metal:chrome     roughness 0.02 }
+material "glass"   { type dielectric ior 1.5 }
 
-# --- Studio room: x[0,2] wide, y[0,1.6] tall, z[0,3] deep. Mirror on the back wall. ---
-quad { origin 0 0 0    u 2 0 0    v 0 0 3    material floor }    # floor
-quad { origin 0 1.6 0  u 0 0 3    v 2 0 0    material white }    # ceiling
-quad { origin 0 0 0    u 0 1.6 0  v 2 0 0    material mirror }   # back wall = mirror
-quad { origin 0 0 3    u 2 0 0    v 0 1.6 0  material white }    # front backdrop (behind camera)
-quad { origin 0 0 0    u 0 0 3    v 0 1.6 0  material bluewall } # left
-quad { origin 2 0 0    u 0 1.6 0  v 0 0 3    material warmwall } # right
+# --- Studio: x[0,2] wide, y[0,1.8] tall, z[0,3] deep. Back wall (z=0) is the mirror.
+#     Left wall cyan, right wall amber -> a colour-split studio the mirror shows off. ---
+quad { origin 0 0 0    u 2 0 0    v 0 0 3    material floor }     # floor (polished)
+quad { origin 0 1.8 0  u 0 0 3    v 2 0 0    material ceil }      # ceiling
+quad { origin 0 0 0    u 0 1.8 0  v 2 0 0    material mirror }    # back wall = MIRROR
+quad { origin 0 0 3    u 2 0 0    v 0 1.8 0  material back }      # backdrop (behind camera)
+quad { origin 0 0 0    u 0 0 3    v 0 1.8 0  material cyanwall }  # left (cyan)
+quad { origin 2 0 0    u 0 1.8 0  v 0 0 3    material amberwall } # right (amber)
 
-# --- The camera prop. Lens points toward the mirror (-z). Body centred at
-#     (1.0, 0.78, 0.78); each part is a separate isosurface so it can have its own
-#     material. Parts use `translate` for position and `rotate` for orientation. ---
+# =====================================================================================
+#  THE CAMERA — co-located with the render eye at (1.0, 0.95, 1.00), lens toward -z
+#  (the mirror). Every solid part has z > 1.00, i.e. BEHIND the pupil, so nothing
+#  occludes the view; the camera exists in the frame only as its mirror reflection.
+# =====================================================================================
 
-# Body + viewfinder hump (matte black). Body sits close to the mirror so its reflected
-# twin stands right beside it, lens meeting lens.
-isosurface { material body  box { translate 1.0 0.72 0.50  size 0.26 0.18 0.16  round 0.022 } }
-isosurface { material body  box { translate 1.0 0.83 0.52  size 0.10 0.055 0.08  round 0.011 } }
+# Glass front element (bulging toward the mirror) + aluminium filter ring
+isosurface { material glass   sphere   { center 1.0 0.95 1.06  radius 0.052 } }
+isosurface { material barrel  torus     { translate 1.0 0.95 1.06  rotate 90 0 0  major 0.058  minor 0.013 } }
+# Lens barrel (cylinder along z)
+isosurface { material barrel  cylinder  { translate 1.0 0.95 1.17  rotate 90 0 0  radius 0.058  height 0.20 } }
+# Camera body (rounded box) + viewfinder hump + a side grip
+isosurface { material body    box       { translate 1.0 0.95 1.31  size 0.30 0.21 0.15  round 0.026 } }
+isosurface { material body    box       { translate 1.0 1.08 1.33  size 0.11 0.06 0.09  round 0.014 } }
+isosurface { material grip    box       { translate 1.19 0.95 1.30  size 0.05 0.20 0.15  round 0.022 } }
+# Shutter button (small silver nub on top)
+isosurface { material barrel  cylinder  { translate 1.19 1.07 1.30  radius 0.018  height 0.03 } }
 
-# Silver lens barrel (cylinder, axis rotated from local-y to +z) + front ring
-isosurface { material barrel  cylinder { translate 1.0 0.72 0.31  rotate 90 0 0  radius 0.068  height 0.20 } }
-isosurface { material barrel  torus    { translate 1.0 0.72 0.21  rotate 90 0 0  major 0.068  minor 0.015 } }
+# Tripod: centre column down to a base plate on the polished floor
+isosurface { material barrel  cylinder  { translate 1.0 0.52 1.31  radius 0.028  height 0.78 } }
+isosurface { material barrel  cylinder  { translate 1.0 0.03 1.31  radius 0.17   height 0.05 } }
 
-# Glass front lens element (bulging forward out of the ring, toward the mirror)
-isosurface { material glass  sphere { center 1.0 0.72 0.23  radius 0.065 } }
+# --- Ring-flash: a halo of little emitters encircling the lens, just in front of the
+#     body (z=1.04). They rim-light the barrel and bloom as a glowing ring in the
+#     mirror around the reflected lens. 8 beads at radius 0.10 about (1.0, 0.95). ---
+light sphere { center 1.100 0.950 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 1.071 1.021 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 1.000 1.050 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 0.929 1.021 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 0.900 0.950 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 0.929 0.879 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 1.000 0.850 1.04  radius 0.011  spd preset:bb6500 }
+light sphere { center 1.071 0.879 1.04  radius 0.011  spd preset:bb6500 }
 
-# Stand: centre post down to a base plate on the floor
-isosurface { material barrel  cylinder { translate 1.0 0.31 0.50  radius 0.026  height 0.62 } }
-isosurface { material barrel  cylinder { translate 1.0 0.02 0.50  radius 0.15   height 0.04 } }
+# Red REC light on the body corner (tiny red emitter) — glows in the reflection.
+light sphere { center 1.14 1.04 1.24  radius 0.010  spd rgb 1.0 0.03 0.03 }
 
-# --- Accent: a glass sphere on the floor for the mirror to pick up ---
-isosurface { material glass  sphere { center 1.62 0.20 1.15  radius 0.20 } }
+# --- Hero props BEHIND the camera (reflection-only), flanking the tripod low so they
+#     sit either side of the reflected rig and catch the neon. ---
+isosurface { material chrome  sphere { center 0.58 0.20 1.75  radius 0.20 } }
+isosurface { material glass   sphere { center 1.46 0.15 1.90  radius 0.15 } }
 
-# Big soft key light overhead; warm accent from the right rim-lights the silver.
+# --- Lighting: big soft overhead key + a low frontal fill to open the studio ---
+# Broad softbox across the ceiling.
 light area {
-    origin 0.5 1.599 0.3   u 1.0 0 0   v 0 0 1.0   normal 0 -1 0
-    spd preset:bb6500
-}
-light area {
-    origin 1.999 0.9 0.5   u 0 0.5 0   v 0 0 0.6   normal -1 0 0
-    spd preset:bb3200
-}
-# Fill aimed at the prop's front/lens (emits down-and-toward-camera) so the face that
-# points at the mirror is lit and reads clearly in the reflection.
-light area {
-    origin 0.6 1.55 0.7   u 0.8 0 0   v 0 0 0.4   normal 0 -0.6 0.8
+    origin 0.2 1.799 0.25   u 1.6 0 0   v 0 0 2.0   normal 0 -1 0
     spd preset:bb5500
 }
+# Frontal fill from behind the camera, aimed at the mirror wall so the reflected
+# studio (and the rig's mirror-facing side) is lifted out of shadow.
+light area {
+    origin 0.25 1.4 2.6   u 1.5 0 0   v 0 0.8 0   normal 0 -0.4 -1
+    spd preset:bb5200
+}
+# Colour accent orbs flanking the camera (behind the pupil, seen only in the mirror):
+# a cool orb on the cyan side, a warm orb on the amber side. Sphere lights DO
+# illuminate (unlike `light cylinder`, see known-issues.md), so these both glow as
+# visible orbs beside the reflected rig AND wash cyan/amber colour across it.
+light sphere { center 0.42 1.16 1.30  radius 0.05  spd preset:led6500k }
+light sphere { center 1.58 1.16 1.30  radius 0.05  spd preset:bb2600 }
 
-# Physical camera: achromatic 50 mm doublet at f/2.8, focused on the mirror image of
-# the prop. The prop lens front sits ~0.42 m from the mirror at z=0, and the eye is at
-# z=2.05, so the reflected (virtual) camera is ~2.6 m away: focus there so the lens
-# staring back is sharp and the near foreground camera body blurs into bokeh.
+# --- The taking camera: 50 mm achromat at f/5.6, focused on the virtual image of the
+#     rig (~2.2 m behind the mirror). Eye = the prop's front element; look straight into
+#     the mirror so the reflected camera lands dead-centre, staring back down its lens. ---
 camera "cam" {
-    eye 0.62 0.92 1.95   look_at 1.02 0.74 0.0   up 0 1 0
-    focus 2.3
+    eye 1.0 0.95 0.90   look_at 1.0 0.95 0.0   up 0 1 0
+    focus 2.0
     film { res 1200 800   format full-frame }
     lens {
         preset achromat
-        focal 50
-        fstop 2.8
+        focal 35
+        fstop 5.6
         glass BK7
     }
 }

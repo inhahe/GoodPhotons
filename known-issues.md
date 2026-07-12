@@ -3,6 +3,35 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Open bugs
+
+### `light cylinder` emits no illumination (tube is visible but lights nothing) — 2026-07-11
+
+A `light cylinder` renders as visible glowing emissive geometry (the tessellated
+lateral wall shows up when a camera ray hits it directly), but it does **not
+illuminate any other surface** — neither via next-event estimation nor via BSDF
+bounce. Reproduced with an isolation scene (`scraps/cyl_test.ftsl`): a white
+diffuse wall lit *only* by a `light cylinder` renders pure black behind the visibly-
+glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposure
+1.54e-14, i.e. zero contribution from the light). Contrast: `light sphere` and
+`light area` both illuminate correctly.
+
+- **Where:** `ftsl.h` `addLight` cylinder branch (~line 1496) calls
+  `L.scene.addCylinderLight(...)`, so the light is registered for sampling. The bug
+  is downstream in the light-sampling / direct-lighting path (`scene.h` /
+  `render.h` / `render_cuda.cu`) — the cylinder light is likely missing from (or
+  mis-weighted in) the NEE light-sampling switch, and its emissive tris are probably
+  excluded from BSDF-hit emission accounting (to avoid double counting) so both
+  contributions vanish.
+- **Repro:** `ftrace -in scraps/cyl_test.ftsl -mode R -device cpu -spp 128 -r 200 -o png/cyl_test.png` → wall is black.
+- **Proper fix:** ensure `sampleLight`/`lightPdf` (CPU and GPU) handle the cylinder
+  light type and return correct radiance+pdf, and/or let BSDF rays that hit the
+  cylinder's emissive tris contribute their emission with proper MIS. Then re-test
+  with `scraps/cyl_test.ftsl` (wall should light up).
+- **Workaround in scenes:** use `light sphere` (rings/stacks) or `light area` for
+  tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
+  accents + colored walls for this reason.
+
 ## Resolved
 
 ### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
