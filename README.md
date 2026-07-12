@@ -675,14 +675,24 @@ stream during the trace; mode `B` doesn't). Sharing applies to plain `-n` render
 per-frame auto-exposure; exposure-locked animation paths and the budget flags
 (`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera.
 
-**Noise correlation across frames (matters for video).** Because the shared pass splats
-**one** photon set to every frame at once, mode `B`'s residual grain is *correlated*
-between neighbouring frames — the same photon paths light every camera, so the noise
-drifts coherently rather than reshuffling each frame. This is usually invisible (and
-cheaper), but if you want independent, film-grain-like noise per frame, render the frames
-separately (e.g. via a budget flag, which falls back to per-camera passes) so each draws
-its own photons. The camera-anchored modes (`R`/`D`/`P`/`V`) always trace independently
-per frame, so their noise is uncorrelated by construction.
+**Shared vs. independent randomness across cameras (matters for video and for
+side-by-side cameras).** This is the key per-mode difference in how randomness is
+distributed *between* cameras — whether they're distinct `camera` blocks or the frames a
+`camera_path`/`orbit`/`curve` expands into:
+
+- **`B`** — every camera is splatted from the *same* photon set, so they share identical
+  random paths: a camera's noise is **correlated** with every other camera's (and a camera
+  rendered in the group is bit-identical to rendering it alone). Across an animation the
+  grain drifts coherently frame-to-frame rather than reshuffling.
+- **`A`** — cameras share the photon *flight* but each draws its own aperture-pupil
+  samples, so each carries **independent** randomness on top of the shared paths (unbiased
+  per camera; correlated only through the shared flight).
+- **`C`/`R`/`D`/`P`/`V`** — each camera is traced **fully independently** with its own
+  sample budget, so their randomness (and noise) is **uncorrelated** by construction.
+
+Mode `B`'s correlation is usually invisible (and cheaper), but if you want independent,
+film-grain-like noise per camera/frame, render them separately (e.g. via a budget flag,
+which falls back to per-camera passes) so each draws its own photons.
 
 > **Other modes do NOT save time with multiple cameras.** `C` (finite-aperture catch)
 > consumes each photon at the first aperture it hits, so it can't share a photon set; and
