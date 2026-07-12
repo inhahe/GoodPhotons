@@ -438,7 +438,8 @@ struct DScene {
     // BDPT samples one shared lambda per sample from this and sets invPdfLambda=1/pdf.
     const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
     double           emitG;
-    DMedium medium;
+    const DMedium*   media;    // participating media array (superposed); null if none
+    int              mediaN;   // number of media (0 => vacuum)
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -818,6 +819,36 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
         Tr *= 1.0 - sigT / sigMax;
     }
     return (Real)Tr;
+}
+
+// --- Multi-medium (superposition) device twins of Renderer::sampleMediaCollision /
+// mediaTransmittance. The scene may hold several independent, possibly overlapping
+// media (sc.media[0..mediaN)). Extinction adds, so total transmittance = product of
+// per-medium transmittances, and the first collision across all media is the EARLIEST
+// of their independent free-flight samples (Poisson superposition). With one medium
+// these reduce to the exact single-medium paths above.
+__device__ static bool dMediaSampleCollision(const DMedium* media, int n, const DVec3& o,
+                                             const DVec3& dir, Real dMax, Real lambda,
+                                             DRng& rng, Real& tHit, int& whichMed) {
+    Real best = dMax; int which = -1;
+    for (int i = 0; i < n; ++i) {
+        Real t;
+        if (dMedSampleCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+            best = t; which = i;
+        }
+    }
+    if (which < 0) return false;
+    tHit = best; whichMed = which; return true;
+}
+
+__device__ static Real dMediaTransmittance(const DMedium* media, int n, const DVec3& o,
+                                           const DVec3& dir, Real dist, Real lambda, DRng& rng) {
+    Real Tr = (Real)1;
+    for (int i = 0; i < n; ++i) {
+        Tr *= dMedTransmittance(media[i], o, dir, dist, lambda, rng);
+        if (Tr <= (Real)0) break;
+    }
+    return Tr;
 }
 
 // Minimal device complex (host uses std::complex; not available in device code).
@@ -1468,10 +1499,13 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     // classic 1/(A_pix cos^4) form; fisheye/panoramic uses the remapped solid angle.
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f * cosSurf / (Real)((double)dist2 * solidAngle);
-    if (sc.medium.enabled) contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
-__device__ static void connectVolume(const DScene& sc, const DCamera& cam, double* film, double* hits,
+// `med` is the medium that scattered the photon (its phase/albedo); transmittance is
+// over ALL media (product).
+__device__ static void connectVolume(const DScene& sc, const DMedium& med, const DCamera& cam,
+                                      double* film, double* hits,
                                       const DVec3& p, const DVec3& wIn, Real lambda, Real beta,
                                       DRng& rng) {
     DVec3 toCam = cam.eye - p;
@@ -1480,13 +1514,13 @@ __device__ static void connectVolume(const DScene& sc, const DCamera& cam, doubl
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
-    Real ph = hgPhase(dot(wIn, wdir), (Real)sc.medium.g);
-    Real Lambda = medAlbedo(sc.medium, lambda);
+    Real ph = hgPhase(dot(wIn, wdir), (Real)med.g);
+    Real Lambda = medAlbedo(med, lambda);
     // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
     // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * Lambda * ph / (Real)((double)dist2 * solidAngle);
-    contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (physical camera): next-event splat through the finite lens pupil. Sample a
@@ -1514,13 +1548,15 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
-    if (sc.medium.enabled) contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
 // surface BRDF*cosSurf is replaced by albedo*phase; the phase carries no 1/pi, so the
-// pupil pdf's pi R^2 stays. Port of Renderer::connectLensVolume.
-__device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, double* film, double* hits,
+// pupil pdf's pi R^2 stays. Port of Renderer::connectLensVolume. `med` is the scattering
+// medium; transmittance is over all media.
+__device__ static void connectLensVolume(const DScene& sc, const DMedium& med, const DCamera& cam,
+                                         double* film, double* hits,
                                          const DVec3& p, const DVec3& wIn, Real lambda,
                                          Real beta, DRng& rng) {
     Real R  = (Real)cam.apertureR;
@@ -1536,10 +1572,10 @@ __device__ static void connectLensVolume(const DScene& sc, const DCamera& cam, d
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
-    Real ph = hgPhase(dot(wIn, wdir), (Real)sc.medium.g);
-    Real Lambda = medAlbedo(sc.medium, lambda);
+    Real ph = hgPhase(dot(wIn, wdir), (Real)med.g);
+    Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
-    contrib *= dMedTransmittance(sc.medium, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
@@ -1576,12 +1612,12 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
     }
 }
 // Volume (fog) analogue of splatSurfaceAll.
-__device__ static void splatVolumeAll(const DScene& sc, const DCamSet& cs, int camMode,
-                                       const DVec3& p, const DVec3& wIn, Real lambda,
+__device__ static void splatVolumeAll(const DScene& sc, const DMedium& med, const DCamSet& cs,
+                                       int camMode, const DVec3& p, const DVec3& wIn, Real lambda,
                                        Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connectVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
-        else if (camMode == CAM_A) connectLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+        if (camMode == CAM_B) connectVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+        else if (camMode == CAM_A) connectLensVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
     }
 }
 
@@ -1999,13 +2035,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     Real dSurf = h.valid ? h.t : BIG;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
-    bool mediumEvent = false; DVec3 mp; Real dEvent = dSurf;
-    if (sc.medium.enabled) {
-        // Delta (Woodcock) tracking for a heterogeneous/bounded medium, exact analytic
-        // free-flight for a plain homogeneous one (dMedSampleCollision handles both).
-        Real tMed;
-        if (dMedSampleCollision(sc.medium, ro, rd, dSurf, lambda, rng, tMed)) {
-            mediumEvent = true; mp = ro + rd * tMed; dEvent = tMed;
+    bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
+    if (sc.mediaN > 0) {
+        // Superposition of all media: each does its own delta (Woodcock) tracking (or
+        // exact analytic free-flight if homogeneous); the earliest collision wins and
+        // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
+        Real tMed; int which;
+        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
+            mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
         }
     }
 
@@ -2029,9 +2066,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     }
 
     if (mediumEvent) {
-        splatVolumeAll(sc, cs, camMode, mp, rd, lambda, beta, rng);
-        if (rng.uniform() >= medAlbedo(sc.medium, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 nd = sampleHG(rd, (Real)sc.medium.g, rng);
+        const DMedium& sm = sc.media[scatterMed];
+        splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+        if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
         ro = mp; rd = nd;
         return WF_CONTINUE;
     }
@@ -2633,7 +2671,10 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         Real G = cosSurf * cosLight / dist2;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(f * G) * emitW * (double)em.area;
-        if (sc.medium.enabled) contrib *= exp(-(double)medSigmaT(sc.medium, lambda) * (double)dist);
+        // Backward (mode R) treats media as a single global HOMOGENEOUS haze (first
+        // medium); GPU backward is only reached when no medium is present (cudaBackwardSupported
+        // rejects any), so this is defensive parity with the host backwardMedium().
+        if (sc.mediaN > 0) contrib *= exp(-(double)medSigmaT(sc.media[0], lambda) * (double)dist);
         total += contrib;
     }
     return total;
@@ -3580,22 +3621,31 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
     sc.emitSamplerStep = scene.emitSampler.step;
     sc.emitG = scene.emitG;
-    sc.medium.enabled = scene.medium.enabled ? 1 : 0;
-    sc.medium.g = scene.medium.g;
-    bakeSpec(scene.medium.sigma_a, sc.medium.sigma_a);
-    bakeSpec(scene.medium.sigma_s, sc.medium.sigma_s);
-    // Heterogeneous density field + spatial bound (delta/ratio tracking on device).
-    sc.medium.heterogeneous = scene.medium.heterogeneous() ? 1 : 0;
-    sc.medium.density  = scene.medium.density.empty()
-                         ? nullptr : (const PatNode*)keep(uploadVec(scene.medium.density));
-    sc.medium.densityN = (int)scene.medium.density.size();
-    sc.medium.densityMax = scene.medium.densityMax;
-    sc.medium.bounded  = scene.medium.bounded ? 1 : 0;
-    sc.medium.boundShape = (scene.medium.boundShape == MediumBound::Sphere) ? 1 : 0;
-    sc.medium.bmin = {scene.medium.bmin.x, scene.medium.bmin.y, scene.medium.bmin.z};
-    sc.medium.bmax = {scene.medium.bmax.x, scene.medium.bmax.y, scene.medium.bmax.z};
-    sc.medium.bcenter = {scene.medium.bcenter.x, scene.medium.bcenter.y, scene.medium.bcenter.z};
-    sc.medium.bradius = scene.medium.bradius;
+    // Participating media array (superposed). Each medium's density program is uploaded
+    // separately; then the flat DMedium array is uploaded once. Empty => media=null, mediaN=0.
+    {
+        std::vector<DMedium> dmeds(scene.media.size());
+        for (size_t i = 0; i < scene.media.size(); ++i) {
+            const Medium& m = scene.media[i];
+            DMedium& dm = dmeds[i];
+            dm.enabled = m.enabled ? 1 : 0;
+            dm.g = m.g;
+            bakeSpec(m.sigma_a, dm.sigma_a);
+            bakeSpec(m.sigma_s, dm.sigma_s);
+            dm.heterogeneous = m.heterogeneous() ? 1 : 0;
+            dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
+            dm.densityN = (int)m.density.size();
+            dm.densityMax = m.densityMax;
+            dm.bounded  = m.bounded ? 1 : 0;
+            dm.boundShape = (m.boundShape == MediumBound::Sphere) ? 1 : 0;
+            dm.bmin = {m.bmin.x, m.bmin.y, m.bmin.z};
+            dm.bmax = {m.bmax.x, m.bmax.y, m.bmax.z};
+            dm.bcenter = {m.bcenter.x, m.bcenter.y, m.bcenter.z};
+            dm.bradius = m.bradius;
+        }
+        sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
+        sc.mediaN = (int)dmeds.size();
+    }
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
@@ -3866,7 +3916,7 @@ bool cudaBdptSupported(const Scene& scene) {
     // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): no participating
     // media, and only area/sphere/cylinder Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
-    if (scene.medium.enabled) return false;
+    if (scene.anyMedium()) return false;
     // Dielectric translucency (frosting + Beer-Lambert interior absorption) runs on the
     // device forward/backward tracers, but the BDPT kernel (kBdpt) treats every dielectric
     // as smooth & non-absorbing and its pdf/eval use constant params — a frosted or colored
@@ -4002,7 +4052,7 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // and no fluorescence. Textured albedo IS supported (dDiffuseRho ports it). This
     // keeps dInvPdfLambda exact (geomWeight = area*PI for every emitter).
     if (!cudaForwardSupported(scene)) return false;
-    if (scene.medium.enabled) return false;
+    if (scene.anyMedium()) return false;
     if (scene.envIndex >= 0)   return false;
     auto usesFluoro = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;

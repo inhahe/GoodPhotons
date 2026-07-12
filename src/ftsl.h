@@ -1613,9 +1613,14 @@ private:
     }
 
     // ---- medium ----
+    // Each `medium { }` block appends one independent region to Scene::media. Several
+    // may be authored (overlapping or disjoint boxes/spheres/heterogeneous blobs) and
+    // the forward tracer superposes them (extinction adds). Backward/BDPT modes use
+    // only the first as a global homogeneous haze (see Scene::backwardMedium()).
     bool addMedium(const Block& b, Loaded& L) {
-        L.scene.medium.enabled = true;
-        L.scene.medium.g = dblOf(b, "g", 0.0);
+        Medium med;
+        med.enabled = true;
+        med.g = dblOf(b, "g", 0.0);
         bool rayleigh = strOf(b, "rayleigh") == "true" || strOf(b, "rayleigh") == "1";
         // Extinction coefficients are per-length (1/authored-unit); divide by L_ to
         // convert to the internal 1/metre so fog reads the same regardless of unit.
@@ -1625,18 +1630,18 @@ private:
         if (sa || ss) {
             Spectrum a = sa ? evalSpectrum(sa->val) : constantSpectrum(0.0);
             Spectrum s = ss ? evalSpectrum(ss->val) : constantSpectrum(0.0);
-            L.scene.medium.sigma_a = [a, invL](double w) { return a(w) * invL; };
-            L.scene.medium.sigma_s = [s, invL](double w) { return s(w) * invL; };
+            med.sigma_a = [a, invL](double w) { return a(w) * invL; };
+            med.sigma_s = [s, invL](double w) { return s(w) * invL; };
         } else {
             double sigmaT = dblOf(b, "sigma_t", 0.0) * invL;
             double albedo = dblOf(b, "albedo", 0.9);
             double s_s = albedo * sigmaT, s_a = (1.0 - albedo) * sigmaT;
             if (rayleigh) {
-                L.scene.medium.sigma_s = [s_s](double w) { double r = 550.0 / w; double r2 = r * r; return s_s * r2 * r2; };
-                L.scene.medium.sigma_a = constantSpectrum(s_a);
+                med.sigma_s = [s_s](double w) { double r = 550.0 / w; double r2 = r * r; return s_s * r2 * r2; };
+                med.sigma_a = constantSpectrum(s_a);
             } else {
-                L.scene.medium.sigma_s = constantSpectrum(s_s);
-                L.scene.medium.sigma_a = constantSpectrum(s_a);
+                med.sigma_s = constantSpectrum(s_s);
+                med.sigma_a = constantSpectrum(s_a);
             }
         }
 
@@ -1657,22 +1662,22 @@ private:
                 double rad = Len(dblOf(bb, "radius", 0.0));
                 ctr = P(ctr);
                 if (rad <= 0.0) { fail("medium `bounds { center .. radius .. }` needs a positive radius"); return false; }
-                L.scene.medium.bounded = true;
-                L.scene.medium.boundShape = MediumBound::Sphere;
-                L.scene.medium.bcenter = ctr;
-                L.scene.medium.bradius = rad;
-                L.scene.medium.bmin = ctr - Vec3{rad, rad, rad};  // AABB for the majorant grid
-                L.scene.medium.bmax = ctr + Vec3{rad, rad, rad};
+                med.bounded = true;
+                med.boundShape = MediumBound::Sphere;
+                med.bcenter = ctr;
+                med.bradius = rad;
+                med.bmin = ctr - Vec3{rad, rad, rad};  // AABB for the majorant grid
+                med.bmax = ctr + Vec3{rad, rad, rad};
             } else {                                              // axis-aligned box region
                 Vec3 mn{0, 0, 0}, mx{0, 0, 0};
                 vec3Of(bb, "min", mn);
                 vec3Of(bb, "max", mx);
                 mn = P(mn); mx = P(mx);
                 for (int a = 0; a < 3; ++a) if ((&mn.x)[a] > (&mx.x)[a]) std::swap((&mn.x)[a], (&mx.x)[a]);
-                L.scene.medium.bounded = true;
-                L.scene.medium.boundShape = MediumBound::Box;
-                L.scene.medium.bmin = mn;
-                L.scene.medium.bmax = mx;
+                med.bounded = true;
+                med.boundShape = MediumBound::Box;
+                med.bmin = mn;
+                med.bmax = mx;
             }
         }
 
@@ -1699,7 +1704,7 @@ private:
                         fail("medium density: " + perr); return false;
                     }
                 }
-                L.scene.medium.density = std::move(prog);
+                med.density = std::move(prog);
 
                 // Majorant for delta/ratio tracking: explicit `density_max`, else a
                 // grid estimate over the bound (×1.3 safety), mirroring isosurface's
@@ -1707,13 +1712,13 @@ private:
                 // estimate over, so require either `bounds` or an explicit `density_max`.
                 double dmax = dblOf(b, "density_max", 0.0);
                 if (dmax <= 0.0) {
-                    if (!L.scene.medium.bounded) {
+                    if (!med.bounded) {
                         fail("a `medium` with a `density` field needs `bounds { min .. max .. }` "
                              "or an explicit `density_max <v>` (the delta-tracking majorant)");
                         return false;
                     }
-                    const Vec3& lo = L.scene.medium.bmin;
-                    const Vec3& hi = L.scene.medium.bmax;
+                    const Vec3& lo = med.bmin;
+                    const Vec3& hi = med.bmax;
                     const int NS = 24;
                     double peak = 0.0;
                     for (int iz = 0; iz <= NS; ++iz)
@@ -1722,13 +1727,14 @@ private:
                         Vec3 p{ lo.x + (hi.x - lo.x) * ix / NS,
                                 lo.y + (hi.y - lo.y) * iy / NS,
                                 lo.z + (hi.z - lo.z) * iz / NS };
-                        peak = std::max(peak, L.scene.medium.densityAt(p));
+                        peak = std::max(peak, med.densityAt(p));
                     }
                     dmax = 1.3 * peak;
                 }
-                L.scene.medium.densityMax = (dmax > 0.0) ? dmax : 1.0;
+                med.densityMax = (dmax > 0.0) ? dmax : 1.0;
             }
         }
+        L.scene.media.push_back(std::move(med));
         return true;
     }
 

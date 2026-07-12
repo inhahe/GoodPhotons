@@ -490,7 +490,24 @@ struct Scene {
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
     Sensor sensor;
-    Medium medium;   // optional global fog / participating medium (disabled by default)
+    // Participating media. Zero or more independent regions (global haze, bounded
+    // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
+    // them as superposed: extinction adds (sigma_t = sum over media containing the
+    // point), so transmittance is the product of per-medium transmittances and a
+    // collision is the earliest of the media's independent free-flight samples (with
+    // the scattering medium chosen by the Poisson superposition theorem). Empty =>
+    // vacuum. (The backward/BDPT modes are homogeneous-only and use backwardMedium().)
+    std::vector<Medium> media;
+
+    // Backward/BDPT (modes R/V/D and the P composite) support only a single GLOBAL
+    // HOMOGENEOUS haze; they ignore density/bounds. This returns the medium they use
+    // as that haze — the first authored medium — or a disabled default if there is
+    // none. main.cpp warns when an authored medium carries density/bounds for these modes.
+    const Medium& backwardMedium() const {
+        static const Medium none;   // disabled (enabled=false) sentinel
+        return media.empty() ? none : media.front();
+    }
+    bool anyMedium() const { return !media.empty(); }
 
     // Emitters. Forward tracing selects one per photon with probability
     // proportional to power (so every photon carries beta = totalPower, keeping

@@ -1499,7 +1499,7 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
 // referenced by geometry are flagged (built-in palettes carry spare unused entries);
 // Mix children are expanded since a used Mix can pick e.g. a fluorescent child.
 static const char* bdptUnsupportedFeature(const Scene& scene) {
-    if (scene.medium.enabled) return "participating media (fog)";
+    if (scene.anyMedium()) return "participating media (fog)";
     std::vector<char> matUsed(scene.mats.size(), 0);
     // Mark a material and (one level, since Mix children can't themselves be Mix) its
     // Mix children, which a used Mix can pick at runtime.
@@ -1695,12 +1695,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // HOMOGENEOUS haze — they ignore the density field and the bounds box. Warn loudly
     // rather than silently render a different fog than authored. (Tracked in
     // known-issues.md: heterogeneous media in backward/BDPT modes.)
-    if ((scene.medium.enabled) && (scene.medium.heterogeneous() || scene.medium.bounded) &&
+    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium is forward-only
+    for (const Medium& m : scene.media)
+        if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
+    if (scene.anyMedium() && mediaNeedForward &&
         (mode == 'R' || mode == 'V' || mode == 'D' || mode == 'P')) {
         std::fprintf(stderr,
             "[medium] mode %c uses the backward/BDPT tracer, which treats participating "
-            "media as a single global HOMOGENEOUS haze; the `density` field and `bounds` "
-            "region (box or sphere) are IGNORED here. Render heterogeneous/bounded fog with a forward mode "
+            "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
+            "additional media, `density` fields and `bounds` regions (box/sphere) are "
+            "IGNORED here. Render multi/heterogeneous/bounded fog with a forward mode "
             "(A/B/C) for correct results.\n", mode);
     }
 
@@ -2231,16 +2235,18 @@ int main(int argc, char** argv) {
     // the scattering coefficient varies as (550/lambda)^4, so short wavelengths
     // scatter far more — a bluish haze that transmits red (a spectral sky/sunset).
     if (fogSigmaT > 0.0) {
-        scene.medium.enabled = true;
-        scene.medium.g = fogG;
+        Medium fog;
+        fog.enabled = true;
+        fog.g = fogG;
         double ss = fogAlbedo * fogSigmaT, sa = (1.0 - fogAlbedo) * fogSigmaT;
         if (fogRayleigh) {
-            scene.medium.sigma_s = [ss](double w) { double r = 550.0 / w; double r2 = r * r; return ss * r2 * r2; };
-            scene.medium.sigma_a = constantSpectrum(sa);
+            fog.sigma_s = [ss](double w) { double r = 550.0 / w; double r2 = r * r; return ss * r2 * r2; };
+            fog.sigma_a = constantSpectrum(sa);
         } else {
-            scene.medium.sigma_s = constantSpectrum(ss);
-            scene.medium.sigma_a = constantSpectrum(sa);
+            fog.sigma_s = constantSpectrum(ss);
+            fog.sigma_a = constantSpectrum(sa);
         }
+        scene.media.push_back(std::move(fog));
     }
 
     if (checkBvhOnly) {

@@ -356,6 +356,48 @@ struct Renderer {
         return Tr;
     }
 
+    // --- Multi-medium (superposition) forward helpers ------------------------
+    // The scene may hold several independent media (Scene::media) that overlap. Two
+    // facts make combining them exact and per-medium bit-identity-preserving:
+    //   * Extinction adds:  T_total = exp(-INT (sig1+sig2+..)) = PROD exp(-INT sig_i),
+    //     so the total transmittance is the PRODUCT of the per-medium transmittances,
+    //     each estimated independently (product of independent unbiased estimators is
+    //     unbiased for the product).
+    //   * Collisions superpose:  the union of independent Poisson collision processes
+    //     with rates sig_i(x) is a Poisson process with rate SUM sig_i(x), whose first
+    //     event is the EARLIEST of the components' first events, and the component that
+    //     produced it (the scattering medium) is picked with the correct probability.
+    // So we sample each medium's first collision independently and take the minimum.
+    // With a single medium these reduce to the exact single-medium paths above (same
+    // RNG draws), so existing scenes are unchanged.
+
+    // Earliest real collision across all media within [0,dMax]. On a hit, `tHit` is the
+    // distance and `whichMed` the index of the scattering medium. false if none.
+    bool sampleMediaCollision(const std::vector<Medium>& media, const Vec3& o,
+                              const Vec3& dir, double dMax, double lambda, Pcg32& rng,
+                              double& tHit, int& whichMed) const {
+        double best = dMax; int which = -1;
+        for (int i = 0; i < (int)media.size(); ++i) {
+            double t;
+            if (sampleMediumCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+                best = t; which = i;
+            }
+        }
+        if (which < 0) return false;
+        tHit = best; whichMed = which; return true;
+    }
+
+    // Combined transmittance through all media = product of per-medium transmittances.
+    double mediaTransmittance(const std::vector<Medium>& media, const Vec3& o,
+                              const Vec3& dir, double dist, double lambda, Pcg32& rng) const {
+        double Tr = 1.0;
+        for (const Medium& m : media) {
+            Tr *= mediumTransmittance(m, o, dir, dist, lambda, rng);
+            if (Tr <= 0.0) break;
+        }
+        return Tr;
+    }
+
     // Model B: connect a surface vertex to the pinhole and splat onto the film.
     // f = rho/pi (Lambertian). The measurement contribution of a surface patch into
     // one pixel is  beta * f * cosSurf / (dist^2 * Omega_pix), where Omega_pix is the
@@ -378,9 +420,9 @@ struct Renderer {
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * f * cosSurf / (dist2 * omega);
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
-        // for a heterogeneous medium, exact exp for a homogeneous one).
-        if (scene.medium.enabled)
-            contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);
+        // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
+        if (!scene.media.empty())
+            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -389,7 +431,7 @@ struct Renderer {
     // single-scattering albedo; there is no surface normal. wIn is the photon's
     // propagation direction into the collision.
     //   contrib = beta * albedo * p_HG(cos) / (dist^2 * Omega_pix) * T_fog
-    void connectVolume(const Scene& scene, const Camera& cam, Film& film,
+    void connectVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
                        const Vec3& p, const Vec3& wIn, double lambda, double beta,
                        Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
@@ -399,11 +441,11 @@ struct Renderer {
         if (!cam.project(p, px, py, cosCam, dist2)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
-        double Lambda = scene.medium.albedo(lambda);
+        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);   // fog transmittance
+        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -444,15 +486,15 @@ struct Renderer {
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
-        if (scene.medium.enabled)
-            contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);
+        if (!scene.media.empty())
+            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
     // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
     // surface BRDF*cosSurf is replaced by albedo*phase; the phase function carries no
     // 1/pi, so the pupil pdf's pi R^2 stays. wIn is the photon's incoming direction.
-    void connectLensVolume(const Scene& scene, const Camera& cam, Film& film,
+    void connectLensVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
                            const Vec3& p, const Vec3& wIn, double lambda, double beta,
                            Pcg32& rng) const {
         double R = cam.apertureR;
@@ -469,10 +511,10 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), scene.medium.g);
-        double Lambda = scene.medium.albedo(lambda);
+        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double Lambda = med.albedo(lambda);
         double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
-        contrib *= mediumTransmittance(scene.medium, p, wdir, dist, lambda, rng);
+        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // all media
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -493,13 +535,16 @@ struct Renderer {
                 camSplat(scene, *cams[c].cam, *cams[c].film, p, n, lambda, beta, rho, rng);
     }
 
-    // Volume (fog) analogue of camSplatAll.
-    void camSplatVolumeAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
-                           const Vec3& wIn, double lambda, double beta, Pcg32& rng) const {
+    // Volume (fog) analogue of camSplatAll. `med` is the medium that scattered the
+    // photon here (its phase/albedo drive the in-scatter term); transmittance still
+    // accounts for all media (product) inside the volume connect functions.
+    void camSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
+                           int nCam, const Vec3& p, const Vec3& wIn, double lambda,
+                           double beta, Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
-                if (lensMode) connectLensVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
-                else          connectVolume(scene, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
+                if (lensMode) connectLensVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
+                else          connectVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
             }
     }
 
@@ -613,11 +658,12 @@ struct Renderer {
             // the exponential free-flight, so beta is unchanged (analog MC).
             double dEvent = dSurf;
             bool mediumEvent = false;
+            int scatterMed = -1;   // which medium scattered (index into scene.media)
             Vec3 mp;
-            if (scene.medium.enabled) {
-                double tMed;
-                if (sampleMediumCollision(scene.medium, ray.o, ray.d, dSurf, lambda, rng, tMed)) {
-                    dEvent = tMed; mediumEvent = true; mp = ray.o + ray.d * tMed;
+            if (!scene.media.empty()) {
+                double tMed; int which;
+                if (sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
+                    dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
                 }
             }
 
@@ -639,11 +685,12 @@ struct Renderer {
             }
 
             if (mediumEvent) {
+                const Medium& sm = scene.media[scatterMed];
                 if (nCam > 0 && !forwardCatch)
-                    camSplatVolumeAll(scene, cams, nCam, mp, ray.d, lambda, beta, rng);
+                    camSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
-                if (rng.uniform() >= scene.medium.albedo(lambda)) { e.absorbed += beta; return; }
-                ray = Ray{mp, sampleHG(ray.d, scene.medium.g, rng)};
+                if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
+                ray = Ray{mp, sampleHG(ray.d, sm.g, rng)};
                 continue;
             }
 
