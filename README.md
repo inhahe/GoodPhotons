@@ -799,7 +799,8 @@ add-on), this doubles as a Blender → FTSL path.
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-mode <A..D>` | Render mode (default `B`) |
-| `-camera <name>` | Select a named camera |
+| `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
+| `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
 | `-device auto\|cpu\|gpu` | Hardware backend |
 | `-wavefront` | Streaming GPU backend instead of megakernel |

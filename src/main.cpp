@@ -2292,7 +2292,10 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
-    const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
+    const char* cameraSel = nullptr; // -camera <name>|all|#N|near=X,Y,Z (FTSL multi-camera select)
+    bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
+    Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
+    double viewFov = 40.0;
     bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (modes A/B/C forward, R/D spp)
     double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (A/B/C, R/D)
@@ -2340,6 +2343,23 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
+        else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
+            // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
+            // are interchangeable separators). Renders and previews just this
+            // camera, ignoring any authored/curve cameras.
+            const char* s = argv[++i];
+            double v[7]; int nv = 0;
+            for (const char* p = s; *p && nv < 7; ) {
+                char* e = nullptr; double val = std::strtod(p, &e);
+                if (e == p) break;
+                v[nv++] = val; p = e;
+                while (*p == ',' || *p == '/' || *p == ' ') ++p;
+            }
+            if (nv < 6) { std::fprintf(stderr, "error: -view needs EX,EY,EZ/LX,LY,LZ[/FOV]\n"); return 1; }
+            viewEye = {v[0], v[1], v[2]}; viewLook = {v[3], v[4], v[5]};
+            if (nv >= 7) viewFov = v[6];
+            haveView = true;
+        }
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
@@ -2457,20 +2477,68 @@ static int run(int argc, char** argv) {
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup; };
     std::vector<RenderCam> toRender;
 
+    // -view against a loaded (-in) scene: inject an ad-hoc 'view' CamSpec and
+    // render only it (so the live -window/-preview shows exactly that angle).
+    // A built-in scene has no CamSpec list; its view override is applied in the
+    // else branch below.
+    if (haveView && fromFtsl) {
+        ftsl::CamSpec vc;
+        vc.name = "view"; vc.eye = viewEye; vc.look = viewLook; vc.up = viewUp; vc.fov = viewFov;
+        ftslScene.cameras.push_back(vc);
+        cameraSel = "view";
+    }
+
     if (fromFtsl && !ftslScene.cameras.empty()) {
-        // Select which cameras to render: `-camera <name>` picks one; `-camera all`
-        // (or, by default, more than one declared) renders every camera; a single
-        // declared camera renders it.
+        // Select which cameras to render. `-camera` accepts:
+        //   all           every camera (default when several are declared)
+        //   <name>        exact camera/frame name (e.g. hero, fly137)
+        //   #N            the Nth declared camera, 0-based (#-1 = last)
+        //   near=X,Y,Z    the camera whose eye is closest to (X,Y,Z)
+        // The index and nearest selectors make it easy to aim the live window at
+        // one frame of a long camera_curve without hunting for its frame name.
         std::vector<const ftsl::CamSpec*> sel;
         if (cameraSel && std::strcmp(cameraSel, "all") != 0) {
-            for (const auto& cs : ftslScene.cameras)
-                if (cs.name == cameraSel) sel.push_back(&cs);
-            if (sel.empty()) {
-                std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
+            const std::string q = cameraSel;
+            if (!q.empty() && q[0] == '#') {
+                int count = (int)ftslScene.cameras.size();
+                int n = std::atoi(q.c_str() + 1);
+                if (n < 0) n += count;
+                if (n < 0 || n >= count) {
+                    std::fprintf(stderr, "[camera] index '%s' out of range (have %d cameras: 0..%d)\n",
+                                 q.c_str(), count, count - 1);
+                    return 1;
+                }
+                sel.push_back(&ftslScene.cameras[n]);
+                std::printf("[camera] index %s -> '%s'\n", q.c_str(), ftslScene.cameras[n].name.c_str());
+            } else if (q.rfind("near=", 0) == 0 || q.rfind("near:", 0) == 0) {
+                double xyz[3] = {0,0,0}; int nv = 0;
+                for (const char* p = q.c_str() + 5; *p && nv < 3; ) {
+                    char* e = nullptr; double val = std::strtod(p, &e);
+                    if (e == p) break;
+                    xyz[nv++] = val; p = e;
+                    while (*p == ',' || *p == ' ') ++p;
+                }
+                if (nv < 3) { std::fprintf(stderr, "[camera] -camera near= needs X,Y,Z\n"); return 1; }
+                Vec3 target{xyz[0], xyz[1], xyz[2]};
+                const ftsl::CamSpec* best = nullptr; double bestD2 = 1e300;
+                for (const auto& cs : ftslScene.cameras) {
+                    Vec3 d = cs.eye - target; double d2 = dot(d, d);
+                    if (d2 < bestD2) { bestD2 = d2; best = &cs; }
+                }
+                sel.push_back(best);
+                std::printf("[camera] nearest to (%.3f,%.3f,%.3f) is '%s' (eye %.3f,%.3f,%.3f, dist %.3f)\n",
+                            target.x, target.y, target.z, best->name.c_str(),
+                            best->eye.x, best->eye.y, best->eye.z, std::sqrt(bestD2));
+            } else {
                 for (const auto& cs : ftslScene.cameras)
-                    std::fprintf(stderr, " %s", cs.name.c_str());
-                std::fprintf(stderr, ")\n");
-                return 1;
+                    if (cs.name == cameraSel) sel.push_back(&cs);
+                if (sel.empty()) {
+                    std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
+                    for (const auto& cs : ftslScene.cameras)
+                        std::fprintf(stderr, " %s", cs.name.c_str());
+                    std::fprintf(stderr, ")\n");
+                    return 1;
+                }
             }
         } else {
             for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
@@ -2546,8 +2614,9 @@ static int run(int argc, char** argv) {
         const int resY = (resYCli > 0) ? resYCli : res;
         Camera c;
         if (useCamera) {
-            if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, resY);
-            else       c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, resY);
+            if (haveView)   c.lookAt(viewEye, viewLook, viewUp, viewFov, res, resY);   // -view overrides the demo camera
+            else if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, resY);
+            else            c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, resY);
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
