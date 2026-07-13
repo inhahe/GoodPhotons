@@ -48,6 +48,18 @@ cmake --build build --config Release --target ftrace
 
 The binary lands at `build/bin/ftrace` (`.exe` on Windows).
 
+> **Windows + CUDA gotcha.** With the Visual Studio generator, CUDA auto-detection
+> needs the CUDA **VS integration** (MSBuild props), not just `nvcc` on `PATH`. If
+> configure prints `CUDA not found; building CPU-only`, point the toolset at the CUDA
+> install directly and select the VS instance that has the integration, e.g.:
+> ```sh
+> cmake -B build -S . -G "Visual Studio 17 2022" -A x64 \
+>   -T "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
+>   -DCMAKE_GENERATOR_INSTANCE="C:/Program Files/Microsoft Visual Studio/2022/Community"
+> ```
+> A CUDA-linked `ftrace.exe` is ~3 MB vs ~0.8 MB for a CPU-only build — a quick size
+> check tells you which you got.
+
 Useful CMake options:
 
 | Option | Meaning |
