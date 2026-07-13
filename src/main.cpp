@@ -17,6 +17,13 @@
 //             GPU-accelerated (its own BDPT megakernel; see renderBdptCuda). Does not
 //             support fluorescence / spot & env lights (use B/P or R for those). See
 //             renderBdpt / bdpt.h.
+//   -mode M : photon map — trace a forward photon pass once, store diffuse deposits in
+//             a view-independent uniform-hash-grid photon map, then final-gather the
+//             camera image from it (backward camera ray through specular, radius density
+//             estimate at the first diffuse hit). View-independent, so the map can be
+//             built once and reused across every camera / flythrough frame. Gather
+//             radius set by -pmradius (absolute) or -pmradiusfrac (fraction of scene
+//             radius, default 0.02). CPU only. See photonmap.h / photonmap_render.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
@@ -102,6 +109,7 @@
 #include "render.h"
 #include "backward.h"
 #include "bdpt.h"
+#include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
@@ -975,6 +983,13 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
 // the effective vertical resolution. Tone-mapping mirrors writeFilm (same p99 auto-
 // exposure + sRGB gamma) so the thumbnail tracks what the written image looks like.
 static int g_previewRows = 0;   // terminal lines the last preview occupied (for redraw)
+
+// Photon-map (mode M) gather-radius controls. The density-estimation radius is
+// g_pmRadiusAbs when >0 (absolute world units, CLI -pmradius), else a fraction
+// g_pmRadiusFactor of the scene bounding-sphere radius (CLI -pmradiusfrac). Larger
+// radius = smoother but blurrier estimate.
+static double g_pmRadiusAbs = 0.0;
+static double g_pmRadiusFactor = 0.02;
 
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
@@ -2062,6 +2077,42 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  renderChunked);
     }
 
+    // --- Photon-mapped final gather (mode M) — ROADMAP item 1 ---------------------
+    // Build a view-independent photon map ONCE (forward light-trace with the camera
+    // splat off, depositing a record at every diffuse vertex), then run a backward
+    // camera pass that estimates diffuse radiance by a radius density query into the
+    // map. Specular/direct reach the diffuse surface normally; the map supplies the
+    // (direct + indirect) diffuse illumination. The map is reusable across cameras of
+    // a static scene — the flythrough win (see the multi-camera path below).
+    if (mode == 'M') {
+        double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                              : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("mode M: photon map — tracing %lld photons on %d CPU threads "
+                    "(light=%s), gather radius %.4g ...\n",
+                    N, nThreads, lightLabel, radius);
+        PhotonMap pm;
+        auto tp0 = std::chrono::steady_clock::now();
+        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        pm.build(radius);
+        double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+        std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
+                    "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
+                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, res, resY);
+        if (pm.photons.empty())
+            std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
+                                 "surfaces reached? The image will be black.\n");
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
+                                              diffraction, /*maxBounce*/32, off);
+                });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
     // --- Forward + camera-side composite (mode P) ---
     if (mode == 'P') {
         std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
@@ -2342,6 +2393,8 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'

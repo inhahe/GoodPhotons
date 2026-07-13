@@ -105,6 +105,7 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
+| `M` | Photon map | Builds a **view-independent** photon map once, then final-gathers the camera image from it (reusable across cameras) | CPU |
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -167,6 +168,18 @@ paths they can capture at all**.
   transmittance), so fog *inside a glass shell* images correctly here (a case the
   next-event modes leave dark). *Cost:* highest cost per sample, and it **does not support
   fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
+- **`M` — photon map (view-independent, reusable).** Traces a forward photon pass
+  **once** and stores every diffuse deposit in a **view-independent photon map** (a
+  uniform hash grid), then forms the camera image by a backward final gather: each
+  camera ray walks through specular surfaces until it lands on a diffuse one, where a
+  radius density estimate over nearby photons gives the radiance. Because the map is
+  independent of the camera, it can be **built once and reused across every frame of a
+  flythrough** (or every camera of a multi-camera render) — the cost of the photon
+  pass amortizes over all views. *Cost:* the density estimate **blurs sharp contact
+  shadows** at large gather radii (bias controlled by `-pmradius` / `-pmradiusfrac`),
+  and directly-viewed emitters carry a little chromatic speckle at low spp. Best when
+  many cameras share one lighting solution. CPU only. (Matches the forward splat
+  modes `A`/`B`/`C` — same forward physics, just measured from a stored map.)
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
@@ -799,7 +812,8 @@ add-on), this doubles as a Blender → FTSL path.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
-| `-mode <A..D>` | Render mode (default `B`) |
+| `-mode <A..D,M,P,R,V>` | Render mode (default `B`) |
+| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M` photon-map gather radius: absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
@@ -816,7 +830,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
-| `-spp <n>` | Samples per pixel for modes `R`, `D`, and `V` |
+| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V` |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`),

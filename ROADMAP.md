@@ -29,9 +29,16 @@ Being precise, because the names overlap and it's easy to assume we have more th
   multi-medium superposition. Full on forward (A/B/C) + BDPT (D); **global-homogeneous only**
   on backward (R). Plus Beer–Lambert absorption inside dielectrics.
 
+**Triangle meshes already exist** (correction): `src/mesh.h` + `src/bvh.h` + `Tri` (geometry.h)
+give a working OBJ loader, a binned-SAH BVH, Möller–Trumbore intersection on **both CPU and GPU**,
+per-vertex UVs, per-face `usemtl` materials, and transforms — meshes render in **all** modes
+(A/B/C/R/D/P). What the mesh path *lacks* is **smooth per-vertex normals** (OBJ `vn` is dropped, so
+everything is flat-shaded — the biggest quality gap), plus glTF, instancing, emissive triangles,
+and normal maps. Item (5) is therefore scoped to those gaps, not a from-scratch primitive.
+
 **So we do NOT yet have:** a stored photon map, progressive photon mapping (PPM/SPPM), VCM/UPS
-merging, external volume-asset (VDB) import, or a **triangle-mesh primitive** (the renderer is
-analytic/isosurface-only — no polygon geometry). Those are the items below.
+merging, external volume-asset (VDB) import, or **smooth-shaded / glTF meshes**. Those are the
+items below.
 
 ### Dependency graph
 
@@ -200,51 +207,48 @@ follow-up); level-set vs fog-volume grid types.
 
 ---
 
-## (5) Triangle-mesh primitive
+## (5) Triangle-mesh gaps: smooth normals, glTF, instancing
 
-**Goal.** Load and render polygon meshes (`.obj`, `.gltf`/`.glb`) as first-class scene primitives, so
-authored/downloaded models (Fab, Megascans, Blender exports, scanned assets) can sit in a scene
-alongside the analytic quadrics and isosurfaces — the renderer is **analytic/isosurface-only** today
-and has no way to ingest polygon geometry.
+**Already done** (don't rebuild): OBJ loading (`src/mesh.h`), a binned-SAH BVH (`src/bvh.h`),
+Möller–Trumbore intersection on **CPU and GPU**, per-vertex UVs, per-face `usemtl` materials, mesh
+transforms (translate/rotate/scale, composed through `group{}`), and rendering in **every** mode
+(A/B/C/R/D/P). The `mesh { file "asset.obj" … }` grammar exists. So a Fab/Megascans/Blender OBJ
+already drops into a scene, scaled/rotated as a transform. This item is the **remaining gaps**.
 
-**Why.** Isosurfaces and quadrics are great for smooth, math-defined forms but can't represent
-authored hard-surface / organic models (characters, props, furniture, scanned objects). A triangle
-primitive opens the entire ecosystem of existing 3D assets and lets the gallery-style scenes hold
-real objects, not just procedural blobs.
+**Goal.** Close the quality/format gaps so authored models look right and more formats load:
+1. **Smooth per-vertex normals** (the big one) — the OBJ loader currently *drops* `vn` and `Tri`
+   stores only a geometric normal, so every mesh is flat-shaded (visible faceting; wrong refraction
+   on glass meshes). Read `vn`, store three normals per `Tri`, barycentric-interpolate a shading
+   normal at the hit, and (when absent) auto-generate smoothed normals with a crease-angle threshold.
+2. **glTF/GLB** — a second loader for the modern interchange format (PBR metallic-roughness materials,
+   node transforms, embedded/packed buffers), mapping metallic-roughness onto the existing BSDFs.
+3. **Instancing** — a two-level BVH (TLAS over instances → shared BLAS) so the same mesh can be
+   duplicated cheaply instead of baking every copy's triangles into `Scene::tris` (today's behaviour).
+4. Follow-ups: emissive triangles (mesh area lights), tangent-space **normal maps**, and a watertight
+   ray–triangle test to kill grazing-edge cracks.
 
-**Builds on.** The existing primitive dispatch (intersection + normal + material binding) and the
-material/texture system. This adds a new primitive *kind* rather than touching light transport, so it
-composes with **every** render mode (A/B/C/D/R/P) and with the participating-media and (future)
-photon-map paths for free — a triangle hit is just another surface vertex.
+**Why.** Smooth normals are the single biggest visual win — flat-shaded organic/curved meshes and
+faceted glass are the obvious "this looks CG" tell. glTF unlocks the bulk of freely-available assets
+(most Fab/Sketchfab/Blender exports). Instancing makes "shrink/enlarge/duplicate an asset" the cheap
+transform it should be.
 
-**Design sketch.**
-- **Mesh data:** indexed vertex buffer (position, normal, UV, optional tangent) + triangle index
-  buffer. Per-vertex normals → smooth (Phong) shading via barycentric interpolation; fall back to
-  geometric (flat) normals when a mesh has none. Optional per-triangle or per-mesh material slots.
-- **Acceleration structure:** a **BVH** (SAH-built, binary, flat/array-encoded) over the triangles —
-  the standard mesh accelerator and, like the photon hash grid, a flat array layout that ports cleanly
-  to CUDA (stackless/short-stack traversal on device). Watertight Möller–Trumbore (or the PBRT
-  watertight variant) ray–triangle test to avoid cracks.
-- **Transforms & instancing:** per-instance object→world transform so one loaded mesh can be scaled,
-  rotated, translated (and, later, **instanced** many times cheaply — the Fab "shrink/enlarge" use
-  case is just a transform). Two-level BVH (TLAS over instances → BLAS per mesh) is the natural
-  end state; a single-level BVH with baked transforms is the minimal first cut.
-- **Textures:** UV-sampled albedo/normal/roughness maps, reusing the medium/material texture plumbing;
-  a mesh-facing image loader (PNG/EXR) if one isn't already wired for surface textures.
-- **FTSL grammar:** `mesh { file "asset.obj"  translate … rotate … scale …  material … }`; derive the
-  primitive's world AABB from the transformed BVH root for the top-level scene bounds.
+**Builds on.** The whole existing mesh path — `Tri` (geometry.h:15), `loadObj` (mesh.h:112),
+`intersectTri` (geometry.h:42, CPU) and its GPU mirror (`DTri` / device `intersectTri` in
+render_cuda.cu), and `addMesh` in ftsl.h.
 
 **Steps.**
-1. `.obj` loader first (simplest, ubiquitous, text-parsable and thus validatable in-environment) →
-   vertex/index buffers + smooth normals; then `.gltf`/`.glb` (PBR materials + transforms come along).
-2. CPU BVH build (SAH) + ray–triangle intersection; add a `mesh { … }` primitive to the FTSL parser
-   and the intersection dispatch.
-3. Barycentric normal/UV interpolation; bind to the existing material system (incl. dielectrics —
-   interpolated normals need care so shading normals don't push rays through the surface).
-4. Validate: render a known mesh (e.g. a unit-cube / Stanford-bunny `.obj`) in mode R, check silhouette,
-   smooth-shading, and transform (scale/rotate) correctness against a reference.
-5. Mirror the BVH + triangle test to CUDA (`render_cuda.cu`): upload flat BVH + vertex arrays, device
-   traversal. Then instancing / two-level BVH for cheap duplication.
+1. Add `Vec3 n0,n1,n2` to `Tri`; parse OBJ `vn` in `loadObj` (index via the 3rd face field) and fill
+   them; when a mesh has no `vn`, area-weighted-average adjacent face normals under a crease angle.
+   Interpolate in `intersectTri` (`hit.n = normalize(w0*n0+u*n1+v*n2)`, keep `hit.ng` geometric).
+   Mirror the three normals into `DTri` and the device intersection; validate no shadow-terminator
+   artefacts (clamp the shading normal to the geometric hemisphere for transmission).
+2. glTF loader (`src/gltf.h`): parse nodes/meshes/accessors, bake node transforms, map
+   metallic-roughness → the renderer's spectral BSDFs; `mesh { file "asset.gltf" … }` dispatches by
+   extension.
+3. Two-level BVH for instancing: keep per-mesh BLAS, add a TLAS over `{blasId, Affine}` instances;
+   `mesh_instance { of "name" translate … }` grammar; transform the ray into BLAS space at traversal.
+4. Validate: render a smooth sphere-mesh vs the analytic sphere (should match), a glass Stanford
+   bunny (smooth refraction, no facets), and an instanced grid (memory stays flat).
 
 **Open questions.** Whether to reuse an existing scene BVH/accel or give meshes their own two-level
 structure; shading-normal vs geometric-normal handling for transmission and shadow terminators;

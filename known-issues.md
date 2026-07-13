@@ -34,6 +34,23 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
 
 ## Tech debt
 
+### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
+On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes
+and the new photon-map mode agree with each other but sit **~5% brighter** than the
+backward path tracer:
+- `R` (backward): mean 61.05  →  `B` (forward splat): 63.96  →  `M` (photon map): 63.84.
+
+Mode `M` matching mode `B` to within 0.2% is the *expected* result (both measure the
+same forward light transport, just from a stored map vs. a live splat) and **confirms
+the photon map is correct**. The open question is the **pre-existing forward-vs-backward
+discrepancy** — `B` and `R` should converge to the same image but don't quite. Likely
+suspects: a subtle difference in area-light emission normalization / solid-angle pdf
+between the forward emit sampler and the backward NEE light pdf, or a `cos`/pdf factor
+at the light or first diffuse bounce. Not introduced by this work; surfaced by the mode-M
+validation. **Proper fix:** derive both estimators' light-vertex measure on paper for the
+1-bounce diffuse case and reconcile the constant (check `emitSampler` power vs. `sampleLight`
+radiance × pdf). Until then `V`'s residual bakes this ~5% in.
+
 ### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU + GPU forward DONE 2026-07-12 (box/sphere/implicit bounds, density fields, multi-medium superposition, object-name bounds)
 **Resolved on the CPU forward tracer.** The `medium` block now takes an optional
 `bounds { min/max }` box (AABB the fog is clipped to) and an optional `density <expr>`
