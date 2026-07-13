@@ -603,6 +603,42 @@ Validated: on a clean surface the `sample` and `adaptive` marchers agree to RMSE
 adaptive default; `method sample` + `samples`/`refine` are shown in the scraps test
 scenes.
 
+##### Exporting an isosurface to a mesh (`-export-mesh`)
+
+Any scene's isosurfaces can be **polygonised into a watertight triangle mesh** and written
+as an OBJ (for import into Unreal, Blender, etc.) instead of being rendered:
+
+```
+ftrace -in scene.ftsl -export-mesh out.obj -mesh-res 192
+ftrace -in scene.ftsl -export-mesh out.obj -mesh-res 256 -mesh-adaptive -mesh-decimate 0.35
+```
+
+| Flag | Meaning |
+|---|---|
+| `-export-mesh <file.obj>` | polygonise every `isosurface` in the scene (marching **tetrahedra**), write an OBJ, then exit (no render). Each isosurface becomes one OBJ object (`o isosurface_k`). |
+| `-mesh-res <N>` | **fineness** — grid cells along the longest bounds axis (default 128). The other axes get proportional counts so cells stay ~cubic. Higher = more triangles / finer detail. |
+| `-mesh-adaptive` | after marching, run a curvature-adaptive **quadric-error decimation** pass. |
+| `-mesh-decimate <f>` | adaptive target: keep this fraction of triangles (default 0.5; implies `-mesh-adaptive`). |
+
+The exporter reuses the **exact field the renderer sees** — `f(x,y,z)` for edge crossings and
+`∇f` for normals — so the mesh matches the rendered surface. It uses **marching tetrahedra**
+(Kuhn/Freudenthal 6-tet split of each cell) rather than marching cubes: tetrahedra have no
+face-ambiguous cases, so the output is a guaranteed **watertight 2-manifold** (marching cubes
+can leave holes / non-manifold edges). The field is **intersected with its `contained_by`
+domain box** (a CSG `max(f, boxSDF)` over a lattice padded a couple cells beyond the box), so a
+surface that reaches the boundary is sealed with a flat cap into a **closed solid** instead of
+leaving an open rim. Vertices are welded by a canonical grid-edge id (adjacent cells reference
+one vertex ⇒ **no cracks**), crossings are refined by bisection on the real field, per-vertex
+normals come from the field gradient (box-face normals on caps), and each triangle is wound so
+its geometric normal points outward.
+
+The **adaptive** pass collapses cheap edges first: the quadric error is near-zero on flat
+regions (a vertex can slide freely) and large where the surface curves, so triangles thin out
+on flat areas and stay dense on detailed ones — the requested curvature-driven tessellation. A
+**link-condition** test plus foldover rejection keep the mesh a watertight 2-manifold through
+the collapses. (The mesher runs on the CPU; it reads `Implicit::eval`/`gradient` from
+`src/isomesh.h`.)
+
 ## Textures
 
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap
@@ -911,6 +947,9 @@ add-on), this doubles as a Blender → FTSL path.
 | `-light <preset>` | Override light SPD by preset |
 | `-aperture <r>` / `-focus <d>` | Thin-lens aperture radius / focus distance |
 | `-mesh <path>` / `-meshscale <s>` | Load & scale an OBJ into the built-in scene |
+| `-export-mesh <out.obj>` | Polygonise the scene's isosurfaces into a watertight OBJ mesh (marching tetrahedra, box-capped) and exit, instead of rendering — for Unreal / Blender import (see **Exporting an isosurface to a mesh**) |
+| `-mesh-res <N>` | Mesh export fineness: grid cells along the longest bounds axis (default 128) |
+| `-mesh-adaptive` / `-mesh-decimate <f>` | Curvature-adaptive QEM decimation of the exported mesh; `<f>` = triangle fraction to keep (default 0.5) |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |

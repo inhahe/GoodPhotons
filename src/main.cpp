@@ -120,6 +120,7 @@
 #include <map>
 #include <memory>
 #include "scene.h"
+#include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "camera.h"
 #include "render.h"
 #include "backward.h"
@@ -2438,6 +2439,10 @@ static int run(int argc, char** argv) {
     bool checkFluoroOnly = false;
     const char* meshPath = nullptr;
     double meshScale = 1.0;
+    const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
+    int    exportMeshRes = 128;            // -mesh-res <N>: cells along longest bounds axis
+    bool   exportMeshAdaptive = false;     // -mesh-adaptive: curvature-driven QEM decimation
+    double exportMeshDecimate = 0.5;       // -mesh-decimate <f>: keep this fraction of triangles
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
     double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
     double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
@@ -2538,6 +2543,10 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
+        else if (!std::strcmp(argv[i], "-mesh-res") && i + 1 < argc) exportMeshRes = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-mesh-adaptive")) exportMeshAdaptive = true;
+        else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fogalbedo") && i + 1 < argc) fogAlbedo = std::atof(argv[++i]);
@@ -2631,6 +2640,42 @@ static int run(int argc, char** argv) {
         return checkBvh(scene, rays) == 0 ? 0 : 1;
     }
     if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
+
+    // -export-mesh <file.obj>: polygonise every isosurface in the scene into a
+    // watertight triangle mesh (marching cubes) and write an OBJ for import into
+    // Unreal / Blender / etc., then exit. -mesh-res sets fineness (cells along the
+    // longest bounds axis). -mesh-adaptive runs a curvature-driven QEM decimation
+    // pass so triangles concentrate where the surface bends and thin out where it
+    // is flat, while staying watertight.
+    if (exportMeshPath) {
+        if (scene.implicits.empty()) {
+            std::fprintf(stderr, "[export-mesh] ERROR: scene has no isosurface to export\n");
+            return 1;
+        }
+        isomesh::Options mo;
+        mo.res = std::max(2, exportMeshRes);
+        mo.adaptive = exportMeshAdaptive;
+        mo.decimate = std::clamp(exportMeshDecimate, 0.01, 1.0);
+        auto logfn = [](const std::string& s) { std::printf("%s\n", s.c_str()); };
+        std::vector<std::pair<std::string, isomesh::Mesh>> groups;
+        for (size_t k = 0; k < scene.implicits.size(); ++k) {
+            std::printf("[export-mesh] marching isosurface %zu/%zu at res %d ...\n",
+                        k + 1, scene.implicits.size(), mo.res);
+            isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo);
+            std::printf("[export-mesh]   marched: %zu verts, %zu tris\n",
+                        m.pos.size(), m.tri.size() / 3);
+            if (mo.adaptive && !m.tri.empty()) {
+                size_t before = m.tri.size() / 3;
+                isomesh::decimateAdaptive(m, mo.decimate, scene.implicits[k]);
+                std::printf("[export-mesh]   decimated: %zu -> %zu tris (target %.0f%%)\n",
+                            before, m.tri.size() / 3, mo.decimate * 100.0);
+            }
+            groups.emplace_back("isosurface_" + std::to_string(k), std::move(m));
+        }
+        bool ok = isomesh::writeObj(exportMeshPath, groups, logfn);
+        return ok ? 0 : 1;
+    }
+
     // Build the list of cameras to render. FTSL scenes may declare several; a
     // built-in scene has exactly one. Each render camera carries its own effective
     // mode and film resolution (per-camera FTSL values, unless a CLI -mode/-r forces

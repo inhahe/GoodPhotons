@@ -492,6 +492,29 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   on `-mode R`/`-device gpu` renders frames sequentially — which is fine, the per-frame
   cost dominates.
 
+### Isosurface → watertight mesh export (`-export-mesh`) — DONE 2026-07-13
+- **What:** any scene's `isosurface`es can be polygonised to an OBJ (`-export-mesh out.obj`)
+  for Unreal / Blender import instead of being rendered. `-mesh-res <N>` sets fineness (cells
+  along the longest bounds axis); `-mesh-adaptive` / `-mesh-decimate <f>` run a
+  curvature-adaptive quadric-error decimation that thins triangles on flat regions and keeps
+  them dense where the surface curves. Reuses the renderer's `Implicit::eval`/`gradient`.
+- **Implementation:** `src/isomesh.h` (`marchImplicit`, `decimateAdaptive`, `writeObj`);
+  CLI + export hook in `src/main.cpp` (~line 2644). Runs on the CPU.
+- **Watertightness (proper fix, not a hack):** started on marching **cubes** → left holes /
+  non-manifold edges from its face-ambiguous cases. Replaced entirely with marching
+  **tetrahedra** (Kuhn/Freudenthal 6-tet split, no ambiguous cases). Surfaces that reach the
+  `contained_by` domain box were leaving an **open rim**; fixed by intersecting the field with
+  the box SDF (`max(f, boxSDF)`) over a lattice padded 2 cells beyond the box, sealing them
+  into flat-capped closed solids (cap normals from central differences of the augmented field).
+  Decimation was introducing **non-manifold edges**; fixed with a **link-condition** test
+  (collapse only when the endpoints' common neighbours are exactly the shared-face opposites)
+  plus foldover rejection.
+- **Verification:** heart (genus-0) exports at V−E+F=2, 0 boundary, 0 non-manifold — uniform
+  *and* adaptive (keep 30%). Gyroid TPMS shell → Euler −34 (genus-18), csg_mech → −4 (genus-3),
+  metaballs → 2, all with 0 boundary + 0 non-manifold edges (Euler correctly tracks genus).
+  Round-trip: re-rendering `heart_test.obj` via `-mesh` shows a clean solid heart with correct
+  outward normals.
+
 ### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
 - **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
   renders the zero set of a hand-typed equation (gyroid, Goursat, etc.), distinct from

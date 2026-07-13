@@ -463,6 +463,29 @@ isosurface {
 Analytic SDF leaves + CSG stay unit-Lipschitz; only `function` fields need
 `contained_by` + a gradient bound.
 
+### 10.4 Exporting an isosurface to a mesh (CLI, not FTSL)
+
+An isosurface scene can be **polygonised to a watertight OBJ** instead of rendered, for
+import into Unreal / Blender. This is a command-line action, not scene syntax:
+
+```
+ftrace -in scene.ftsl -export-mesh out.obj -mesh-res 192
+ftrace -in scene.ftsl -export-mesh out.obj -mesh-res 256 -mesh-adaptive -mesh-decimate 0.35
+```
+
+- `-export-mesh <out.obj>` — polygonise every `isosurface` in the scene (each becomes one OBJ
+  object) with **marching tetrahedra** (no ambiguous cases ⇒ guaranteed watertight 2-manifold),
+  then exit. Uses the exact `f(x,y,z)` for crossings and `∇f` for normals, intersects the field
+  with its `contained_by` box so boundary-reaching surfaces seal into closed solids (flat caps),
+  welds vertices by a canonical grid-edge id (no cracks), and winds triangles outward.
+- `-mesh-res <N>` — fineness: cells along the longest bounds axis (default 128); other axes
+  scale proportionally so cells stay ~cubic.
+- `-mesh-adaptive` / `-mesh-decimate <f>` — curvature-adaptive quadric-error decimation:
+  triangles thin out on flat regions and stay dense where the surface curves. `<f>` is the
+  triangle fraction to keep (default 0.5; passing `-mesh-decimate` implies `-mesh-adaptive`).
+
+See README → **Exporting an isosurface to a mesh** for details; the code is `src/isomesh.h`.
+
 ---
 
 ## 11. `light` — emitters
