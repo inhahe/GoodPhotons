@@ -2722,17 +2722,25 @@ static int run(int argc, char** argv) {
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
     const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume ||
                                wantCheckpointFlag || runForever || preview);
-    std::vector<int> groupB, groupA, restIdx;
+    std::vector<int> groupB, groupA, groupM, restIdx;
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
         bool base = (rc.expGroup < 0) && plainRender;
         if (base && rc.mode == 'B')                                           groupB.push_back(i);
         else if (base && rc.mode == 'A' && rc.cam.projection == CAM_RECTILINEAR) groupA.push_back(i);
+        // Mode M (photon map): the map is view-INDEPENDENT, so build it once and gather
+        // every camera from it — the flythrough win. Unlike A/B sharing (which reuses one
+        // photon *flight* and so imposes the same fixed noise on every frame), the mode-M
+        // gather is an independent backward pass per camera, so frames don't share noise —
+        // only the underlying radiance solution. That makes it safe to share even across
+        // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
+        else if (rc.mode == 'M' && plainRender)                               groupM.push_back(i);
         else                                                                  restIdx.push_back(i);
     }
     // A single-camera group has nothing to share — fold it back into the per-camera path.
     if (groupB.size() < 2) { for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
     if (groupA.size() < 2) { for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
+    if (groupM.size() < 2) { for (int i : groupM) restIdx.push_back(i); groupM.clear(); }
     std::sort(restIdx.begin(), restIdx.end());
 
     bool sharedWriteFail = false;
@@ -2775,6 +2783,42 @@ static int run(int argc, char** argv) {
     };
     runSharedGroup(groupB, 'B');
     runSharedGroup(groupA, 'A');
+
+    // Shared photon-map pass (mode M): build ONE view-independent map, gather every
+    // camera from it. This is where the photon map pays off over per-camera backward
+    // tracing — the (expensive) forward photon flight amortizes across all frames.
+    auto runSharedPhotonMap = [&](const std::vector<int>& idx) {
+        if (idx.empty()) return;
+        double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                              : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("[camera] shared photon map (mode M): %zu cameras, %lld photons, "
+                    "radius %.4g on %d CPU threads (light=%s) ...\n",
+                    idx.size(), N, radius, nThreads, lightLabel);
+        PhotonMap pm;
+        auto tp0 = std::chrono::steady_clock::now();
+        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        pm.build(radius);
+        double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+        std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
+                    "grid %dx%dx%d — gathering %zu cameras ...\n",
+                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, idx.size());
+        if (pm.photons.empty())
+            std::fprintf(stderr, "[mode M] warning: 0 photons deposited — images "
+                                 "will be black.\n");
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const RenderCam& rc = toRender[idx[k]];
+            Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
+                                        nThreads, diffraction, /*maxBounce*/32, 0);
+            std::string op = outFor(rc.name);
+            if (toRender.size() > 1)
+                std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",
+                            rc.name.c_str(), rc.res, rc.resY, op.c_str());
+            double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
+            if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
+                sharedWriteFail = true;
+        }
+    };
+    runSharedPhotonMap(groupM);
 
     for (int i : restIdx) {
         const RenderCam& rc = toRender[i];

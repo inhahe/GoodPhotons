@@ -726,7 +726,7 @@ extension), which ffmpeg concatenates into a video.
   virtual, so there `roll`/`fov`/`zoom` are the visible ones. Lens *projection*/fisheye is
   a discrete whole-flight mode, not a continuous track — set it once with `projection`.)
 
-### Multi-camera shared photon pass (modes `A` and `B`)
+### Multi-camera shared photon pass (modes `A`, `B`, and `M`)
 
 When several cameras render at once (multiple `camera` blocks, or the frames a
 `camera_path`/`orbit`/`curve` expands into) in a **forward next-event** mode, the
@@ -742,10 +742,22 @@ splat models:
   RNG), so the shared photon flight is **unbiased per camera** but matches a standalone
   render **in distribution**, not bit-for-bit. Rectilinear cameras only.
 
-The `A` and `B` cameras form **separate** shared passes (mode `A` perturbs the RNG
-stream during the trace; mode `B` doesn't). Sharing applies to plain `-n` renders with
-per-frame auto-exposure; exposure-locked animation paths and the budget flags
-(`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera.
+**Mode `M` (photon map) shares even more cheaply.** Because the photon map is
+**view-independent**, a multi-camera mode-`M` render builds the map **once** and runs
+each camera's backward final gather against that one shared map — the whole forward
+photon flight amortizes across every frame. Unlike `A`/`B` (which reuse a photon
+*flight*, so every camera inherits the *same* fixed noise), each mode-`M` camera gathers
+with its **own** independent backward samples, so frames share only the underlying
+radiance solution, **not** the noise. That makes `M` safe to share across
+**exposure-locked** `camera_path` frames too (it isn't restricted to per-frame
+auto-exposed cameras the way `A`/`B` sharing is) — the ideal mode for a flythrough of a
+static scene.
+
+The `A`, `B`, and `M` cameras form **separate** shared passes (`A` perturbs the RNG
+stream during the trace, `B` doesn't, and `M` gathers backward instead of splatting).
+`A`/`B` sharing applies to plain `-n` renders with per-frame auto-exposure; `M` sharing
+applies to any plain `-n` render (including exposure-locked paths). The budget flags
+(`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera in every mode.
 
 **Shared vs. independent randomness across cameras (matters for video and for
 side-by-side cameras).** This is the key per-mode difference in how randomness is
@@ -762,6 +774,9 @@ them as animation frames:
 - **`A`** — cameras share the photon *flight* but each draws its own aperture-pupil
   samples, so each carries **independent** randomness on top of the shared paths (unbiased
   per camera; correlated only through the shared flight).
+- **`M`** — cameras share the photon *map* (the radiance solution) but each runs its own
+  backward final gather, so each frame's noise is **independent** — the best of both:
+  the expensive forward pass is paid once, yet frames don't inherit a shared grain.
 - **`C`/`R`/`D`/`P`/`V`** — each camera is traced **fully independently** with its own
   sample budget, so their randomness (and noise) is **uncorrelated** by construction.
 
@@ -774,7 +789,7 @@ which falls back to per-camera passes) so each draws its own photons.
 > `R`, `D`, `P`, and `V` are camera-anchored estimators that trace **from** each camera —
 > a multi-camera render of those modes simply renders **each camera independently**
 > (re-tracing the full sample budget per camera), so it costs the same as running them
-> one at a time. Only `A` and `B` amortise the trace across cameras.
+> one at a time. Only `A`, `B`, and `M` amortise the forward trace across cameras.
 
 ### Importing Mitsuba scenes
 
