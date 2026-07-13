@@ -3985,9 +3985,35 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
 
     // --- bake geometry ---
-    std::vector<DTri> tris(scene.tris.size());
-    for (size_t i = 0; i < scene.tris.size(); ++i) {
-        const Tri& t = scene.tris[i]; DTri& d = tris[i];
+    // Instancing is CPU-only in the acceleration structure: the GPU has no two-level
+    // BVH, so each MeshInstance is EXPANDED here into world-space triangles appended
+    // after the base tris (and the top-level BVH is rebuilt over the full flat set
+    // below). This keeps device traversal identical to the non-instanced path (a flat
+    // tri/sphere/implicit list) at the cost of not sharing instance geometry in device
+    // memory — a documented limitation (see known-issues.md). `flatTris` is the base
+    // Scene::tris followed by every instance's transformed BLAS triangles.
+    std::vector<Tri> flatTris;
+    flatTris.reserve(scene.tris.size());
+    flatTris.insert(flatTris.end(), scene.tris.begin(), scene.tris.end());
+    const bool haveInstances = !scene.instances.empty();
+    for (const auto& inst : scene.instances) {
+        const Blas& bl = scene.blasList[inst.blasId];
+        for (const Tri& lt : bl.tris) {
+            Tri wt = lt;
+            wt.v0 = inst.toWorld.apply(lt.v0);
+            wt.v1 = inst.toWorld.apply(lt.v1);
+            wt.v2 = inst.toWorld.apply(lt.v2);
+            wt.n0 = normalize(inst.toWorld.applyNormal(lt.n0));
+            wt.n1 = normalize(inst.toWorld.applyNormal(lt.n1));
+            wt.n2 = normalize(inst.toWorld.applyNormal(lt.n2));
+            if (inst.matOverride >= 0) wt.matId = inst.matOverride;
+            wt.finalize();   // recompute gn from the world verts (n0/n1/n2 stay: nonzero)
+            flatTris.push_back(wt);
+        }
+    }
+    std::vector<DTri> tris(flatTris.size());
+    for (size_t i = 0; i < flatTris.size(); ++i) {
+        const Tri& t = flatTris[i]; DTri& d = tris[i];
         d.v0 = {t.v0.x, t.v0.y, t.v0.z}; d.v1 = {t.v1.x, t.v1.y, t.v1.z};
         d.v2 = {t.v2.x, t.v2.y, t.v2.z}; d.gn = {t.gn.x, t.gn.y, t.gn.z};
         d.uv0 = {t.uv0.x, t.uv0.y, t.uv0.z};
@@ -4003,14 +4029,38 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
     }
-    std::vector<DNode> nodes(scene.bvh.nodes.size());
-    for (size_t i = 0; i < scene.bvh.nodes.size(); ++i) {
-        const BvhNode& b = scene.bvh.nodes[i]; DNode& d = nodes[i];
+    // Top-level BVH: with no instances, upload Scene::bvh verbatim (the common,
+    // bit-identical path). With instances, Scene::bvh contains per-instance TLAS
+    // leaves the GPU can't traverse, so rebuild a FLAT BVH over the expanded prim set
+    // — flatTris (base + instance tris), then spheres, then implicits — matching the
+    // device leaf dispatch's [tris | spheres | implicits] index layout.
+    const Bvh* srcBvh = &scene.bvh;
+    Bvh flatBvh;
+    if (haveInstances) {
+        const double pad = 1e-6;
+        std::vector<Aabb> boxes;
+        boxes.reserve(flatTris.size() + scene.spheres.size() + scene.implicits.size());
+        for (const auto& t : flatTris) {
+            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+            b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
+            boxes.push_back(b);
+        }
+        for (const auto& s : scene.spheres) {
+            Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
+            boxes.push_back(b);
+        }
+        for (const auto& im : scene.implicits) boxes.push_back(im.bounds);
+        flatBvh.build(boxes);
+        srcBvh = &flatBvh;
+    }
+    std::vector<DNode> nodes(srcBvh->nodes.size());
+    for (size_t i = 0; i < srcBvh->nodes.size(); ++i) {
+        const BvhNode& b = srcBvh->nodes[i]; DNode& d = nodes[i];
         d.lo = {b.box.lo.x, b.box.lo.y, b.box.lo.z};
         d.hi = {b.box.hi.x, b.box.hi.y, b.box.hi.z};
         d.left = b.left; d.right = b.right; d.first = b.first; d.count = b.count;
     }
-    std::vector<int> primIdx = scene.bvh.primIdx;
+    std::vector<int> primIdx = srcBvh->primIdx;
 
     // --- bake implicit surfaces (isosurface / CSG / metaballs) ---
     // Flatten every Implicit's postfix FieldNode array into one pool; each DImplicit

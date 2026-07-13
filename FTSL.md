@@ -327,6 +327,41 @@ the fallback for primitives that carry no material. *Not supported* (see
 known-issues): textures, KHR extensions (transmission/clearcoat/…), skinning,
 morph targets, sparse accessors, animation, and non-triangle primitives (skipped).
 
+### 8.5 `mesh_asset` + `mesh_instance` — instancing (two-level BVH)
+
+A `mesh` bakes its triangles into the scene, so ten copies cost ten triangle
+sets. **Instancing** loads the geometry once and places it many times through
+per-placement affines — the copies share one set of triangles and one
+bottom-level BVH (a two-level / TLAS-over-BLAS acceleration structure).
+
+```
+mesh_asset "ball" {           # load ONCE into local space (no world transform)
+    file "meshes/sphere.obj"  # .obj / .gltf / .glb (same loaders as `mesh`)
+    material ivory            # fallback material for primitives without one
+    uv use_mesh               # optional: read OBJ vt
+    usemtl use_names          # optional: per-usemtl-group material by name
+    import_materials no       # optional (glTF): ignore glTF materials
+}
+
+mesh_instance {               # cheap placement of a named asset
+    of "ball"                 # references the mesh_asset by name
+    translate 0.5 0.3 0.5     # placement transform (like `mesh`); composes with
+    rotate 0 45 0             #   an enclosing group{} and the scene unit scale
+    scale 0.22                # uniform value or `sx sy sz`
+    material gold             # optional: override the asset's materials for THIS
+}                             #   placement (omit to keep the asset's own materials)
+```
+
+- The asset is stored in its **authored (local) space** — no transform is baked
+  in, so one asset serves differently scaled/rotated placements.
+- A `mesh_instance` may appear at top level or inside a `group{}` (its transform
+  composes with the group's, exactly like `mesh`).
+- **CPU:** true instancing — instances share the BLAS triangles, so N copies add
+  only N affines to memory. All render modes (A/B/C/R/D/P and the photon modes)
+  traverse the two-level BVH. **GPU:** instances are expanded to world-space
+  triangles at upload (flat device memory — the memory saving is CPU-only; images
+  are identical). See known-issues.
+
 ---
 
 ## 9. UV wraps on native primitives and meshes

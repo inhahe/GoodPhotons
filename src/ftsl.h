@@ -511,6 +511,13 @@ public:
             if (!resolveMixChildren(b, L.scene.mats[id], L)) return false;
         }
 
+        // Pass 2.5: mesh assets (shared instanced geometry). Loaded before the
+        // geometry pass so a `mesh_instance { of "name" }` (top-level or inside a
+        // group) can reference any asset regardless of authoring order.
+        for (const auto& b : blocks) {
+            if (b.type == "mesh_asset") { if (!addMeshAsset(b, L)) return false; }
+        }
+
         // Pass 3: geometry, lights, medium, camera, render.
         // `medium` blocks are DEFERRED to a second sweep so `bounds { object "name" }`
         // can reference any named sphere / isosurface / mesh regardless of authoring
@@ -522,6 +529,7 @@ public:
             else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
             else if (b.type == "triangle") { if (!addTriangle(b, L)) return false; }
             else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
+            else if (b.type == "mesh_instance") { if (!addMeshInstance(b, L)) return false; }
             else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
@@ -532,7 +540,7 @@ public:
             else if (b.type == "camera_curve") { if (!addCameraCurve(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
-                     b.type == "texture" || b.type == "pattern") { /* handled */ }
+                     b.type == "texture" || b.type == "pattern" || b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
@@ -564,6 +572,7 @@ private:
     std::unordered_map<std::string, NamedSphere> sphereByName_;   // named sphere -> world center/radius
     std::unordered_map<std::string, int>         implicitByName_; // named isosurface -> Scene::implicits index
     std::unordered_map<std::string, Aabb>        meshAabbByName_; // named mesh -> world AABB
+    std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
 
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
@@ -1217,6 +1226,100 @@ private:
         return true;
     }
 
+    // ---- mesh_asset (shared instanced geometry) ----
+    // `mesh_asset "name" { file "asset.obj|gltf|glb"  material <m>  [import_materials no]
+    //  [uv use_mesh]  [usemtl use_names] }` loads a mesh ONCE into its own local
+    //  (authored) space as a BLAS (Scene::blasList). It bakes NO world transform and
+    //  emits NO triangles into Scene::tris — placement is done by `mesh_instance`,
+    //  which references the asset by name. Multiple instances share this one BLAS,
+    //  so N copies cost N affines rather than N triangle sets.
+    bool addMeshAsset(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("mesh_asset needs a name: mesh_asset \"name\" { ... }"); return false; }
+        if (blasIndex_.count(b.name)) { fail("duplicate mesh_asset name '" + b.name + "'"); return false; }
+        std::string file = strOf(b, "file");
+        if (file.empty()) { fail("mesh_asset '" + b.name + "' needs a file"); return false; }
+        std::string mat = strOf(b, "material");
+        if (mat.empty()) { fail("mesh_asset '" + b.name + "' needs a material"); return false; }
+        int id = matId(mat); if (!err.empty()) return false;
+
+        bool loadUV = (strOf(b, "uv") == "use_mesh");
+        bool useNames = (strOf(b, "usemtl") == "use_names");
+        MtlResolver resolver = [this](const std::string& nm) -> int {
+            auto it = matIndex_.find(nm);
+            return (it == matIndex_.end()) ? -1 : it->second;
+        };
+        // Load into local space (identity transform) at the END of Scene::tris, then
+        // move those triangles out into a private BLAS. The unit scale is NOT folded in
+        // here — it is applied per-instance so one asset can serve differently-scaled
+        // placements.
+        Affine xf = Affine::identity();
+        size_t start = L.scene.tris.size();
+        std::string ext;
+        if (size_t dot = file.find_last_of('.'); dot != std::string::npos) {
+            ext = file.substr(dot);
+            for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+        }
+        if (ext == ".gltf" || ext == ".glb") {
+            bool importMats = (strOf(b, "import_materials") != "no");
+            std::string gerr;
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+                fail("mesh_asset: " + gerr); return false;
+            }
+        } else {
+            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr);
+        }
+        Blas blas;
+        blas.tris.assign(L.scene.tris.begin() + start, L.scene.tris.end());
+        L.scene.tris.resize(start);
+        if (blas.tris.empty()) { fail("mesh_asset '" + b.name + "' loaded no triangles"); return false; }
+        blas.build();
+        int blasId = (int)L.scene.blasList.size();
+        L.scene.blasList.push_back(std::move(blas));
+        blasIndex_[b.name] = blasId;
+        return true;
+    }
+
+    // ---- mesh_instance (place a shared mesh_asset) ----
+    // `mesh_instance { of "asset-name"  [translate ..] [rotate ..] [scale ..]
+    //  [material <m>] }` places a `mesh_asset` into the world via an affine (composed
+    //  with the enclosing group's transform, then the scene's unit scale). `material`
+    //  overrides the asset's own per-triangle materials for this placement; without it
+    //  the asset's materials (glTF-imported or the asset's fallback) are used.
+    bool addMeshInstance(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
+        std::string of = strOf(b, "of");
+        if (of.empty()) { fail("mesh_instance needs `of \"asset-name\"`"); return false; }
+        auto it = blasIndex_.find(of);
+        if (it == blasIndex_.end()) { fail("mesh_instance: unknown mesh_asset '" + of + "'"); return false; }
+        MeshXform mx;
+        vec3Of(b, "translate", mx.translate);
+        vec3Of(b, "rotate", mx.rotDeg);
+        const Stmt* sc = find(b, "scale");
+        if (sc) {
+            if (sc->val.words.size() >= 3)
+                mx.scale = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
+            else if (!sc->val.words.empty()) {
+                double k = num(sc->val.words[0]); mx.scale = {k, k, k};
+            }
+        }
+        // world = (parent group) ∘ (instance local); then fold in the unit scale so the
+        // placement lands in metres (mirrors addMesh's transform construction).
+        Affine xf = parentXf.compose(mx.toAffine());
+        for (double& e : xf.m) e *= L_;
+        xf.t = xf.t * L_;
+
+        int matOverride = -1;
+        std::string mat = strOf(b, "material");
+        if (!mat.empty()) { matOverride = matId(mat); if (!err.empty()) return false; }
+
+        MeshInstance inst;
+        inst.blasId = it->second;
+        inst.toWorld = xf;
+        inst.toLocal = xf.inverse();
+        inst.matOverride = matOverride;
+        L.scene.instances.push_back(inst);
+        return true;
+    }
+
     // ---- group (transform hierarchy) ----
     // A `group { translate .. rotate .. scale .. <child prims / nested groups> }`
     // node. The group's own transform composes with its parent's (parent applied
@@ -1247,9 +1350,10 @@ private:
             else if (s.key == "quad")     { if (!addQuad(*cb, L, world)) return false; }
             else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
+            else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
-            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, light, group)"); return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, light, group)"); return false; }
         }
         return true;
     }

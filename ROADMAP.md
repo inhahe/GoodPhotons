@@ -274,8 +274,14 @@ already drops into a scene, scaled/rotated as a transform. This item is the **re
    onto the spectral BSDFs (baseColor→upsampled reflectance, metallic→glossy tint, roughness→lobe).
    Dispatched by extension in `addMesh`; `import_materials no` forces the FTSL material. *Not yet:*
    textures, KHR extensions, skinning/morph, sparse accessors, animation.
-3. **Instancing** — a two-level BVH (TLAS over instances → shared BLAS) so the same mesh can be
-   duplicated cheaply instead of baking every copy's triangles into `Scene::tris` (today's behaviour).
+3. **Instancing** — ✅ **DONE** (2026-07-12). A two-level BVH (TLAS over instances → shared BLAS).
+   `mesh_asset "name" { file … }` loads a mesh once into local space as a `Blas` (its own tris + BVH,
+   `scene.h`); `mesh_instance { of "name"  translate/rotate/scale  [material …] }` adds a `MeshInstance`
+   (toWorld/toLocal affine + optional material override) as an extra leaf of `Scene::bvh`. `closestHit`/
+   `occluded` transform the ray into BLAS-local space and traverse the shared BLAS — the parametric `t`
+   is preserved because `Affine::applyDir` doesn't normalize, so local `t` == world `t` and the shared
+   `tMax` needs no rescaling. CPU shares geometry (N copies = N affines); the GPU expands instances to
+   world tris and rebuilds a flat BVH at upload (identical images, flat device memory — a follow-up).
 4. Follow-ups: emissive triangles (mesh area lights), tangent-space **normal maps**, and a watertight
    ray–triangle test to kill grazing-edge cracks.
 

@@ -492,7 +492,17 @@ projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UV
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
 `group { translate … rotate … scale … <children> }` composes transform
-hierarchies (baked to world space at load). Everything is accelerated by a BVH.
+hierarchies (baked to world space at load).
+
+**Instancing.** `mesh_asset "name" { file … material … }` loads a mesh once into
+its local space; `mesh_instance { of "name"  translate … rotate … scale …
+[material …] }` places that shared geometry through a per-copy affine. Instances
+share one triangle set and one bottom-level BVH — a **two-level BVH** (TLAS over
+instances → shared BLAS) — so N copies cost N affines instead of N triangle sets,
+and a per-instance `material` can override the asset's own materials. Works in
+every render mode; the memory sharing is CPU-side (the GPU expands instances to
+world triangles at upload, giving identical images). Everything is accelerated by
+a BVH.
 
 ### Implicit surfaces (`isosurface`)
 

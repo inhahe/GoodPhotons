@@ -74,10 +74,24 @@ follow-up, not a bug:
 - **No skinning, morph targets, animation, or sparse accessors.** Static bind pose only.
 - **Non-triangle primitives** (points/lines/strips/fans, `mode != 4`) are skipped with a
   note; only `mode 4` (TRIANGLES) is baked.
-- Materials are created **per glTF material, not deduplicated across meshes/files**, and
-  every instance's triangles are baked into `Scene::tris` (no instancing — that's §5c).
+- Materials are created **per glTF material, not deduplicated across meshes/files**. (A
+  `mesh` still bakes its triangles into `Scene::tris`; use `mesh_asset`/`mesh_instance`
+  for shared instanced geometry — see below.)
 The core path (buffers/GLB, node transforms, POSITION/NORMAL/TEXCOORD_0, indexed +
 non-indexed tris, metallic-roughness → BSDF) is validated on CPU and GPU.
+
+### Instancing memory saving is CPU-only (GPU expands instances) — 2026-07-12
+`mesh_asset`/`mesh_instance` (§5c) give a true two-level BVH on the CPU: instances share
+one BLAS (triangles + BVH), so N copies cost N affines. **The GPU has no two-level
+traversal** — `buildUploadScene` (`render_cuda.cu`) EXPANDS every instance into
+world-space triangles, appends them to the flat device tri list, and rebuilds a single
+flat BVH over the whole set at upload. Images are identical to the CPU, but device memory
+scales with total instanced triangles (no sharing), so a huge instanced scene that fits on
+the CPU can OOM on the GPU. Proper fix: a device two-level BVH — upload per-BLAS
+node/tri/primIdx pools + an instance table (toLocal affine + blasId + matOverride) and add
+an instance-leaf branch to the device `traverseClosest`/`traverseAny` that transforms the
+ray into BLAS space (parametric `t` is preserved, exactly as on the CPU). Deferred because
+it touches the hottest device kernel; the expand-at-upload path is correct and low-risk.
 
 ### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
 On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes
