@@ -158,6 +158,21 @@ Closing each of these is just: drop a `wavelength_nm,value` CSV into the right
 category directory (add `# aliases:` if you want extra names) and it resolves by
 name. No rebuild. Each entry lists an authoritative, openly-licensed source.
 
+**Sourcing tooling.** Two helpers automate the fetch-and-digitize loop:
+- `tools/plot_digitizer.py` — turn a datasheet's spectral *graph* (SPD, transmittance,
+  n/k, ...) into a numeric CSV. Handles rainbow-filled fill plots (`--mode fill-top`,
+  the top edge of the filled area) and plain colour lines (`--mode color`); calibrate
+  each axis with two pixel→data points; writes an `*_annotated.png` overlay to verify
+  the trace. Validated to <0.5 % of full scale on a synthetic curve — far better than
+  eyeballing.
+- `tools/browse.py` — headless Chromium (Playwright) for JS-heavy databases and
+  click-gated exports that plain `curl`/WebFetch can't reach: render the real DOM
+  (`--text`/`--links`/`--html`), drive a query builder (`--fill`/`--click`), screenshot
+  a JS chart for the digitizer (`--screenshot`), or capture a download (`--download-dir`).
+  `--stealth` softens light bot-detection but will not defeat a hard Cloudflare
+  Turnstile challenge (e.g. ResearchGate) — prefer sources with open data or PDFs.
+  Setup once: `pip install playwright playwright-stealth && python -m playwright install chromium`.
+
 ### Discharge lamps (HPS, LPS, metal-halide, mercury)
 Currently `src/lights.h` `sodiumHigh/sodiumLow/mercuryVapor/metalHalide()` are
 spectroscopic *line models*, not measurements. To swap in measurements, drop a
