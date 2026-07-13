@@ -141,12 +141,13 @@ White sources: sun, daylight (`d65`), incandescent (`a`), led, led-warm — each
 `spd` binding to a native light model (`blackbody <K>` for the thermal/daylight
 sources, `led-white <warm>` for the phosphor LEDs).
 
-Colored (single-die) LEDs: led-royal-blue (447 nm), led-blue (470), led-cyan (505),
-led-green (530), led-amber (590), led-red (627), led-deep-red (660). A direct-emission
-LED die is one narrow band, so each is just `spd gaussian center=<peak> sigma=<FWHM/2.355>`
-— a pure-data bundle reusing the existing `gaussian` primitive, no native model. Peaks
-are representative InGaN (blue/green) / AlInGaP (amber/red) dice; a Gaussian is a good
-first-order fit (a measured die SPD has a slight long-λ tail — see below to upgrade).
+Colored (single-die) LEDs: led-violet (400 nm), led-royal-blue (450), led-blue (472),
+led-cyan (506), led-green (522), led-amber (594), led-red (626), led-deep-red (658).
+Each binds `spd file:data/light/measured/<name>.csv` — a **measured** single-die SPD
+(Harald Brendel, "Spectral Power Distribution of LED" 2021, haraldbrendel.com/ledspd.html,
+CC BY-SA 4.0), peak-normalized to 350-700 nm at 2 nm in `light/measured/`. These capture
+the real die asymmetry (AlInGaP reds/ambers cut off steeply on the long-λ side; InGaN
+greens carry a broad shoulder) that the old single-Gaussian bands only approximated.
 
 The parametric `bb<K>`/`led<K>k` names and the gas-discharge line models
 (`hps`/`sodium`, `lps`, `mercury`, `metal-halide`) stay in `src/lights.h`; the measured
@@ -190,10 +191,10 @@ measured SPD into `illuminant/` (e.g. `hps.csv`) and reference it as `preset:hps
 - **LICA-UCM lamps spectral database v2.6** (guaix.fis.ucm.es): measured lamp SPDs.
 
 ### Colored-LED die SPDs (`led-red`, `led-green`, `led-blue`, …)
-Currently the colored LEDs (`light/led-*.light`) are single-Gaussian parametric bands
-(peak + FWHM). A real die is close to Gaussian but slightly asymmetric with a long-λ
-shoulder. To swap in a measurement, drop a die SPD into `illuminant/` (e.g.
-`led-red-627.csv`) and repoint the bundle's `spd` to `file:` / `illuminant:`.
+**DONE.** The eight colored LEDs (`light/led-*.light`) now bind measured single-die
+SPDs in `light/measured/*.csv` (Harald Brendel 2021, CC BY-SA 4.0), replacing the old
+single-Gaussian bands and adding `led-violet`. Rendered hues verified across the set
+(deep-red → violet, no fallback). Further alternatives if a specific die is wanted:
 - **LSPDD** (lspdd.org) and **LICA-UCM** (guaix.fis.ucm.es) both carry monochromatic-LED
   measurements alongside the lamps.
 - **OSRAM / Lumileds / Cree datasheets** publish per-die relative SPD plots (digitize

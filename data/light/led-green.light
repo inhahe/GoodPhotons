@@ -1,4 +1,6 @@
 # aliases: led_green green-led
-# Green InGaN LED. Peak ~530 nm, FWHM ~35 nm (sigma = FWHM/2.355). The broadest of
-# the direct-emission LEDs (efficiency-droop "green gap" die).
-spd gaussian center=530 sigma=14.9
+# Green InGaN LED. Peak ~522 nm, the broadest of the direct-emission LEDs
+# (efficiency-droop "green gap" die). Measured single-die SPD (Brendel 2021)
+# capturing the real asymmetric InGaN shoulder.
+# CIE 1931 xy=(0.190,0.730). See data/light/measured/led-green.csv for source.
+spd file:data/light/measured/led-green.csv

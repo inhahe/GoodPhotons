@@ -1,4 +1,5 @@
 # aliases: led_red red-led
-# Red AlInGaP LED. Peak ~627 nm, FWHM ~19 nm (sigma = FWHM/2.355). Narrow direct
-# emission (no phosphor).
-spd gaussian center=627 sigma=8.1
+# Red AlInGaP LED. Peak ~626 nm, narrow direct emission (no phosphor). Measured
+# single-die SPD (Brendel 2021) with the characteristic asymmetric AlInGaP band.
+# CIE 1931 xy=(0.685,0.313). See data/light/measured/led-red.csv for source.
+spd file:data/light/measured/led-red.csv

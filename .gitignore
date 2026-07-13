@@ -2,6 +2,7 @@
 /build/
 /build_cuda/
 /build_het/
+/build_verify/
 /out/
 *.ppm
 *.exr
@@ -19,6 +20,9 @@
 
 # Scratch / throwaway scripts and test outputs
 /scraps/
+
+# Raw upstream data dumps (kept locally; derived + attributed CSVs live in data/)
+/data_raw/
 
 # Editor / IDE
 .vs/

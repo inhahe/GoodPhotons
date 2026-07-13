@@ -1,4 +1,5 @@
 # aliases: led_blue blue-led
-# Blue InGaN LED. Peak ~470 nm, FWHM ~25 nm (sigma = FWHM/2.355). Direct-emission
-# narrow band (no phosphor); a Gaussian is a good first-order model of the die SPD.
-spd gaussian center=470 sigma=10.6
+# Blue InGaN LED. Peak ~472 nm, direct-emission narrow band (no phosphor).
+# Measured single-die SPD (Brendel 2021).
+# CIE 1931 xy=(0.118,0.103). See data/light/measured/led-blue.csv for source.
+spd file:data/light/measured/led-blue.csv

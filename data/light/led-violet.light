@@ -1,0 +1,5 @@
+# aliases: led_violet violet-led near-uv-led
+# Violet InGaN LED. Peak ~400 nm, near the UV-A boundary; the shortest-wavelength
+# single-die visible LED. Measured single-die SPD (Brendel 2021).
+# CIE 1931 xy=(0.185,0.044). See data/light/measured/led-violet.csv for source.
+spd file:data/light/measured/led-violet.csv

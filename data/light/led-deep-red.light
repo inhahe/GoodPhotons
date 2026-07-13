@@ -1,4 +1,6 @@
 # aliases: led_deep_red deep-red-led
-# Deep-red AlInGaP LED (horticulture / photography). Peak ~660 nm, FWHM ~24 nm
-# (sigma = FWHM/2.355). Matches the chlorophyll-a absorption peak.
-spd gaussian center=660 sigma=10.2
+# Deep-red AlInGaP LED (horticulture / photography). Peak ~658 nm, matches the
+# chlorophyll-a absorption peak. Measured single-die SPD (Brendel 2021); the real
+# die has a steeper long-wavelength cutoff than a symmetric Gaussian.
+# CIE 1931 xy=(0.716,0.278). See data/light/measured/led-deep-red.csv for source.
+spd file:data/light/measured/led-deep-red.csv

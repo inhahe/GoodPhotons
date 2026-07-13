@@ -1,4 +1,6 @@
 # aliases: led_royal_blue royalblue-led
 # Royal-blue InGaN LED. Single narrow emission band (no phosphor), the pump
-# colour used inside white LEDs. Peak ~447 nm, FWHM ~20 nm (sigma = FWHM/2.355).
-spd gaussian center=447 sigma=8.5
+# colour used inside white LEDs. Peak ~450 nm. Measured single-die SPD
+# (Brendel 2021).
+# CIE 1931 xy=(0.153,0.026). See data/light/measured/led-royal-blue.csv for source.
+spd file:data/light/measured/led-royal-blue.csv
