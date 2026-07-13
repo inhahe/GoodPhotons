@@ -509,6 +509,16 @@ medium {
   gradually rather than a hard surface. Albedo stays spatially constant (density scales
   absorption and scattering together), so only the *amount* of fog varies in space,
   not its color.
+- **`density vdb:<path>`** — instead of a formula, sample the density from an imported
+  **NanoVDB** volume. `<path>` is an **unquoted** bareword path to a `.nvdb` file
+  (uncompressed, float grid): `density vdb:scraps/cloud.nvdb`. Convert a `.vdb` to
+  `.nvdb` with OpenVDB's `nanovdb_convert` (or generate a test asset with
+  `scraps/make_nvdb.cpp`). On load the grid is baked into a dense lattice + world→index
+  transform and sampled trilinearly — the *same* sampler on CPU and GPU. The grid's world
+  AABB auto-seeds the medium **bound** and its peak value the **majorant**, so no `bounds`
+  or `density_max` is needed (either still overrides). Values scale `sigma_t` just like the
+  formula form, so dial optical thickness with `sigma_t`. Only float grids; the dense bake
+  is memory-capped (see `known-issues.md`).
 - **`density_max <v>`** — the delta/ratio-tracking majorant (an upper bound on the
   density over the region). If omitted it is auto-estimated on a 24³ grid over
   `bounds` (×1.3 safety), so a heterogeneous medium needs either a `bounds` box or an

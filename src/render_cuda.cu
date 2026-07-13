@@ -305,6 +305,14 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
+    // --- Optional imported .nvdb volume baked to a dense grid (mirrors VdbGrid) ---
+    // When `vdbData` is non-null the density multiplier is TRILINEARLY sampled from
+    // this uploaded dense lattice instead of the pattern VM; takes precedence.
+    const float*     vdbData;         // nx*ny*nz values, index [(k*ny+j)*nx+i] (or null)
+    int              vdbNx, vdbNy, vdbNz;
+    double           vdbAinv[9];      // world->index linear map (row-major 3x3)
+    DVec3            vdbW0;            // world position of index origin (0,0,0)
+    DVec3            vdbImin;          // integer min-corner of the baked lattice
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field
     DVec3            bmin, bmax;
@@ -742,6 +750,38 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
+    }
+    // Imported .nvdb volume: trilinearly sample the uploaded dense grid (device twin
+    // of VdbGrid::sample). Takes precedence over the pattern-VM density formula.
+    if (m.vdbData) {
+        double rx = (double)p.x - m.vdbW0.x, ry = (double)p.y - m.vdbW0.y, rz = (double)p.z - m.vdbW0.z;
+        double fi = m.vdbAinv[0]*rx + m.vdbAinv[1]*ry + m.vdbAinv[2]*rz - m.vdbImin.x;
+        double fj = m.vdbAinv[3]*rx + m.vdbAinv[4]*ry + m.vdbAinv[5]*rz - m.vdbImin.y;
+        double fk = m.vdbAinv[6]*rx + m.vdbAinv[7]*ry + m.vdbAinv[8]*rz - m.vdbImin.z;
+        int nx = m.vdbNx, ny = m.vdbNy, nz = m.vdbNz;
+        if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
+            fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
+        double ffi = floor(fi), ffj = floor(fj), ffk = floor(fk);
+        int i0 = (int)ffi, j0 = (int)ffj, k0 = (int)ffk;
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+        int i0c = cl(i0, nx-1), i1c = cl(i0+1, nx-1);
+        int j0c = cl(j0, ny-1), j1c = cl(j0+1, ny-1);
+        int k0c = cl(k0, nz-1), k1c = cl(k0+1, nz-1);
+        double tx = fi - ffi, ty = fj - ffj, tz = fk - ffk;
+        tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
+        ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
+        tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
+        const float* D = m.vdbData;
+        auto AT = [&](int i, int j, int k) -> double {
+            return (double)D[((size_t)k * ny + j) * nx + i];
+        };
+        double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
+        double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
+        double c01 = AT(i0c,j0c,k1c)*(1-tx) + AT(i1c,j0c,k1c)*tx;
+        double c11 = AT(i0c,j1c,k1c)*(1-tx) + AT(i1c,j1c,k1c)*tx;
+        double c0 = c00*(1-ty) + c10*ty, c1 = c01*(1-ty) + c11*ty;
+        double v = c0*(1-tz) + c1*tz;
+        return v > 0.0 ? v : 0.0;
     }
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
@@ -4219,6 +4259,20 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
+            // Imported .nvdb volume: upload the baked dense grid + world->index affine.
+            if (m.vdb && !m.vdb->empty()) {
+                const VdbGrid& g = *m.vdb;
+                dm.vdbData = (const float*)keep(uploadVec(g.data));
+                dm.vdbNx = g.nx; dm.vdbNy = g.ny; dm.vdbNz = g.nz;
+                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = g.ainv[k];
+                dm.vdbW0   = {g.w0.x, g.w0.y, g.w0.z};
+                dm.vdbImin = {g.imin.x, g.imin.y, g.imin.z};
+            } else {
+                dm.vdbData = nullptr;
+                dm.vdbNx = dm.vdbNy = dm.vdbNz = 0;
+                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = (k % 4 == 0) ? 1.0 : 0.0;
+                dm.vdbW0 = {0,0,0}; dm.vdbImin = {0,0,0};
+            }
             dm.bounded  = m.bounded ? 1 : 0;
             dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
                           : (m.boundShape == MediumBound::Implicit) ? 2 : 0;

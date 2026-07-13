@@ -528,6 +528,28 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   optical-depth accumulation along connection rays through dielectrics. Deferred until a
   dispersive-caustic VCM render demands it.
 
+### `.nvdb` volume import (`density vdb:<file>`): dense bake, float-only, uncompressed
+- **What:** `medium { density vdb:cloud.nvdb }` imports a NanoVDB FloatGrid (`src/vdbgrid.cpp`,
+  the only TU that includes the vendored `NanoVDB.h`). On load the sparse grid is **baked into a
+  dense float lattice** covering its active index-space bounding box (`VdbGrid`, `src/vdbgrid.h`).
+  A CPU+GPU-shared trilinear sampler reads that lattice.
+- **Limitations:**
+  1. **Dense memory** — RAM/VRAM scales with the index-space AABB (nx·ny·nz·4 bytes), not the
+     active voxel count, so a large but mostly-empty sparse volume can blow up. A safety cap
+     (512 M voxels) rejects pathological grids with a clear error rather than OOM-ing.
+  2. **Float grids only** — non-float builds (Fp4/Fp8/Fp16/level-set index grids) are rejected
+     with a message. Convert to a float fog volume first.
+  3. **Uncompressed `.nvdb` only** — Blosc/ZIP-compressed files are rejected (we deliberately
+     don't vendor zlib/blosc). Re-export uncompressed (`nanovdb_convert`, or NanoVDB's
+     `writeUncompressedGrids`).
+  4. **Quoted path not accepted** — the FTSL value grammar takes one bareword token, so the path
+     must be unquoted: `density vdb:scraps/cloud.nvdb` (no spaces). A quoted `vdb:"..."` form
+     would need a small `parseValue` change to consume a trailing String.
+  5. No emission/temperature grids (fire), no motion-blur/velocity grids.
+- **Proper fix (if needed):** a native NanoVDB **sparse** device accessor (sample the tree
+  directly on CPU+GPU instead of baking dense) to drop the memory cost and support huge volumes;
+  fp16 dense option; a second float grid for blackbody emission. Deferred until an asset needs it.
+
 ### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
 - **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward
   tracers: **implicit surfaces** (5a), **procedural patterns** (5b), and **dielectric

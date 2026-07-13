@@ -1788,6 +1788,34 @@ private:
         if (const Stmt* ds = find(b, "density")) {
             if (!ds->val.words.empty()) {
                 const std::string& w0 = ds->val.words[0];
+                // `density vdb:"cloud.nvdb"` (or `vdb:cloud.nvdb`) — import a real
+                // NanoVDB FloatGrid as the density field. Baked to a dense grid on
+                // load; the grid's world AABB seeds the medium bound and its peak
+                // value the delta-tracking majorant.
+                if (w0 == "vdb:" || w0.rfind("vdb:", 0) == 0) {
+                    std::string path = (w0 == "vdb:")
+                        ? (ds->val.words.size() > 1 ? ds->val.words[1] : std::string())
+                        : w0.substr(4);
+                    if (path.empty()) { fail("medium `density vdb:` needs a file path"); return false; }
+                    auto grid = std::make_shared<VdbGrid>();
+                    std::string verr;
+                    if (!loadVdbGrid(path, *grid, verr)) {
+                        fail("medium density: " + verr); return false;
+                    }
+                    med.vdb = grid;
+                    // Seed the bound from the grid's world AABB unless one is authored.
+                    if (!med.bounded) {
+                        med.bounded = true;
+                        med.boundShape = MediumBound::Box;
+                        med.bmin = grid->wmin;
+                        med.bmax = grid->wmax;
+                    }
+                    double dmax = dblOf(b, "density_max", 0.0);
+                    med.densityMax = (dmax > 0.0) ? dmax
+                                                  : std::max(1e-6, (double)grid->maxVal * 1.05);
+                    L.scene.media.push_back(std::move(med));
+                    return true;
+                }
                 std::vector<PatNode> prog;
                 if (w0.rfind("pattern:", 0) == 0) {
                     std::string nm = w0.substr(8);

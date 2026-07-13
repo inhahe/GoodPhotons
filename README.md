@@ -28,8 +28,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
-  **density fields** (formula-defined blobs with soft edges) via unbiased delta/ratio
-  tracking on the forward modes.
+  **density fields** — either formula-defined blobs with soft edges *or* imported
+  **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
+  tracking on the forward modes (CPU and GPU).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), megakernel or
   wavefront, with CPU fallback.
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
@@ -704,6 +705,21 @@ heterogeneous distance-pdf / transmittance — a variance-only simplification pe
 the balance heuristic is a partition of unity so the estimator stays unbiased regardless.)
 The backward reference (R/V) and the P composite treat the medium as a single global homogeneous haze
 and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
+
+**Imported volumes (`.nvdb`).** Instead of a formula, point the density field at a real
+sparse volume: `density vdb:<path.nvdb>` imports a NanoVDB **FloatGrid** (the compact,
+GPU-friendly form of an OpenVDB volume — convert a `.vdb` with OpenVDB's `nanovdb_convert`,
+uncompressed). On load the grid is **baked into a dense lattice** plus a world→index affine,
+so the *identical* trilinear sampler runs on the CPU and the GPU (`dMedDensityAt` reads the
+uploaded lattice) and any affine map (translation/scale/rotation) is honored. The grid's
+world AABB auto-seeds the medium bound and its peak value the delta-tracking majorant — so
+`medium { sigma_t 40  albedo 0.9  density vdb:cloud.nvdb }` is all it takes to light an
+imported cloud. Values are treated as a dimensionless density multiplier on `sigma_t`, so
+you still dial the optical thickness with `sigma_t`. Only **float** grids are supported and
+the bake is **dense** (memory ~ the grid's index-space bounding box), so very large sparse
+volumes are bounded by a safety cap; a native sparse device sampler is a future
+optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
+`density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
 ---
 

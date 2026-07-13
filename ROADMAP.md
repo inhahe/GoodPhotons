@@ -202,7 +202,20 @@ or GPU from the start; memory budget for storing light vertices each pass.
 
 ---
 
-## (4) `.vdb` / external volume-asset support
+## (4) `.vdb` / external volume-asset support — ✅ DONE (`density vdb:<file>`)
+
+**Status.** Implemented. `medium { density vdb:cloud.nvdb  sigma_t … }` imports a NanoVDB
+FloatGrid as the heterogeneous density field. The single self-contained `NanoVDB.h` is vendored
+into `src/third_party/nanovdb/` and confined to ONE loader TU (`src/vdbgrid.cpp`); everywhere
+else sees only the NanoVDB-free `VdbGrid` POD (`src/vdbgrid.h`). On load the sparse grid is baked
+into a **dense float lattice** + a world→index affine (recovered by probing `indexToWorld`), so
+the *identical* trilinear sampler runs on CPU (`VdbGrid::sample`) and GPU (`dMedDensityAt` over an
+uploaded lattice). The grid's world AABB auto-seeds the medium bound and its peak the
+delta-tracking majorant. Validated: CPU and GPU renders of the imported fog sphere give
+**bit-identical energy balance** (absorbed 0.9454 / escaped 0.0542 / residual 0.0004). Test asset
+generator: `scraps/make_nvdb.cpp` → `scraps/cloud.nvdb`; probe scene `scraps/vdb_cloud.ftsl`.
+Only float grids; dense bake (safety-capped) — a native sparse device sampler and fp16/emission
+grids remain as follow-ups (see `known-issues.md`).
 
 **Goal.** Load external VDB volumes into the existing heterogeneous `medium` path so authored
 clouds/smoke/explosions (Houdini/Blender/EmberGen) can be rendered, not just procedural

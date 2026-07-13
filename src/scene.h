@@ -11,6 +11,7 @@
 #include "scene_film.h"
 #include "texture.h"
 #include "envmap.h"
+#include "vdbgrid.h"
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
@@ -217,6 +218,13 @@ struct Medium {
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
 
+    // --- Optional imported .vdb/.nvdb sparse volume (baked to a dense grid) -----
+    // When set, the density multiplier is TRILINEARLY sampled from a real NanoVDB
+    // FloatGrid (`density vdb:"cloud.nvdb"`) instead of a formula. Shared so copies
+    // of the Medium stay cheap. The grid's world AABB seeds the medium bound and
+    // its peak value seeds densityMax. Takes precedence over the `density` formula.
+    std::shared_ptr<VdbGrid> vdb;
+
     // --- Optional spatial bound (localized / per-object fog) ----------------
     // When `bounded`, the medium exists only inside a region: an axis-aligned box
     // [bmin,bmax] (`boundShape == Box`) or a sphere centered `bcenter` radius
@@ -262,7 +270,7 @@ struct Medium {
     // an implicit membership makes the effective density spatially varying (1 inside,
     // 0 outside) even when the base coefficients are constant.
     bool heterogeneous() const {
-        return !density.empty() || boundShape == MediumBound::Implicit;
+        return !density.empty() || vdb || boundShape == MediumBound::Implicit;
     }
 
     // Dimensionless density multiplier at a world point (>= 0). 1 for a homogeneous
@@ -271,6 +279,7 @@ struct Medium {
     // does not exist there), so delta/ratio tracking carves out the exact iso-shape.
     double densityAt(const Vec3& p) const {
         if (boundShape == MediumBound::Implicit && !insideField(p)) return 0.0;
+        if (vdb) return vdb->sample(p);   // imported .nvdb volume (trilinear)
         if (density.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
         double d = patternEval(density.data(), (int)density.size(), c);
