@@ -9,7 +9,9 @@
 //      (direct + indirect) diffuse illumination.
 //
 // The map is built ONCE and can be reused for many cameras of a static scene — the
-// flythrough win (build once, gather per frame). See renderPhotonCameraMulti().
+// flythrough win (build once, gather per frame): the multi-camera driver in main.cpp
+// (runSharedPhotonMap) traces/builds one map, then calls renderPhotonCamera below for
+// each frame's camera.
 #pragma once
 #include <vector>
 #include <thread>

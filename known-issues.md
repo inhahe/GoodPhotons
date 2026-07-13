@@ -31,6 +31,23 @@ turned out to be a misdiagnosis.)_
 
 ## Tech debt
 
+### Mode `M` (photon map) is a direct density query, not a true final gather — 2026-07-13
+`photonGather` (`photonmap_render.h`) estimates diffuse radiance by a **direct radius
+density query** at the *first* diffuse hit of each camera ray — it reads the photon
+density right at the visible point. This is correct and matches mode `R` on a diffuse
+Cornell box (validated 2026-07-13: M/R=0.990, diffuse-mask relRMSE 4.7%, Pearson r=0.9980),
+but it is *not* a **secondary-hemisphere final gather** (where you'd shoot a cosine-weighted
+gather ray from the visible point and query the map at that *second* bounce). The direct
+query inherits the density estimate's low-frequency blur at the visible surface itself, so
+it **softens sharp contact shadows and small-scale detail** at large gather radii (mitigated
+by `-pmradius`/`-pmradiusfrac`, at the cost of noise). Proper enhancement: add an optional
+final-gather pass — at the first diffuse hit, sample K hemisphere directions, trace one
+bounce each, and query the map at those hit points — which decouples the visible-surface
+sharpness from the gather radius (standard Jensen photon mapping). Naming in README/roadmap
+was corrected to say "density query" rather than "final gather"; the real final gather is
+left as future work. Low priority — mode `M` already meets its done-criteria and `S`/`U`
+(SPPM/VCM) cover the unbiased/caustic cases.
+
 ### `-export-mesh` QEM decimation is pathologically slow on huge/self-intersecting meshes — 2026-07-13
 `isomesh::decimateAdaptive` (QEM edge-collapse) is fine at small/medium counts but effectively
 hangs on multi-million-triangle inputs. Meshing the Klein bottle `a=1.2 b=0.6 c=3.0 d=12.7`

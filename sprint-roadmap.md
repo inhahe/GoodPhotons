@@ -50,18 +50,29 @@ guard blocks cross-mode loads). `SppProgress::sampleBase` decorrelates resumed s
 diffuse residual falling 0.0281→0.0226. `-resume`/`-checkpoint`/`-time`/`-noise`/`-forever`
 gates extended to `P`; dead `renderComposite` wrapper removed; docs updated.
 
-## 3. Photon map / view-independent radiance cache (keystone) — ⬜
+## 3. Photon map / view-independent radiance cache (keystone) — ✅ DONE 2026-07-13
 **Source:** `ROADMAP.md` item (1).
 Stored, view-independent spatial structure of photon records queried by a backward
-camera final-gather pass — computes light transport once and reuses it across pixels and
-across many camera frames of a static scene. Uniform hash grid (CUDA-friendly). New mode
-(e.g. `-mode M` "photon-mapped final gather"). Unlocks PPM/VCM's merging term (already
-built as S/U, but those bake their own maps; this is the shared reusable cache) and the
-cross-camera flythrough win.
-**Note:** modes `S` (SPPM) and `U` (VCM) already exist and internally build hash grids;
-reuse/refactor that machinery rather than duplicating it.
+camera pass — computes light transport once and reuses it across pixels and across many
+camera frames of a static scene. Uniform hash grid (CUDA-friendly). New mode `-mode M`.
+Unlocks PPM/VCM's merging term (already built as S/U, but those bake their own maps; this
+is the shared reusable cache) and the cross-camera flythrough win.
+**Note:** modes `S` (SPPM) and `U` (VCM) already exist and internally build hash grids.
 **Done when:** `-mode M` matches mode `R` on a diffuse Cornell box (equal-quality RMSE),
 and the built map is reused across a multi-camera flythrough (build once, gather per frame).
+**Done:** Mode `M` and its cross-camera shared-map path already existed in the codebase
+(`tracePhotonPass`/`renderPhotonCamera`/`photonGather` in `photonmap_render.h`;
+`runSharedPhotonMap` in `main.cpp`); this item **validated both done-criteria**.
+(a) *Radiance match:* on the pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`,
+both auto-exposed identically to 2.43e-13), un-tone-mapping both images to raw radiance
+gives **M/R = 0.990 global**, diffuse-mask (both-unclipped) **relRMSE 4.7%**, **Pearson
+r = 0.9980**, thirds top 0.989 / mid 0.996 / bot 0.980 — mode M reproduces mode R's
+radiance solution. (b) *Cross-camera reuse:* `runSharedPhotonMap` built **one** map
+(11.4 M photons from 8 M emitted, ~2.3 s) and gathered all 3 frames of a dolly flythrough
+(`scraps/m3_fly.ftsl`), with dolly0 ≈ dolly2 by symmetry — build-once/gather-per-frame
+confirmed. **Caveat logged as tech debt:** mode M does a *direct density query* at the
+first diffuse hit, not a true secondary-hemisphere final gather (README/roadmap wording
+corrected; a real final-gather pass noted as a future enhancement in `known-issues.md`).
 
 ---
 
@@ -88,3 +99,13 @@ _(none yet — will append here if a fork needs a human call; work continues on 
   100/√spp exactly across resume, P residual falls 0.0281→0.0226; cross-mode guard rejects a
   mismatched checkpoint. Clean build, no warnings. Starting item 3 (photon map / radiance
   cache — mode M already exists; verifying against done-criteria).
+- 2026-07-13: item 3 DONE. Mode M and its cross-camera shared-map reuse already existed;
+  this item validated both done-criteria. Radiance match on the diffuse Cornell box:
+  M/R=0.990 global, diffuse-mask relRMSE 4.7%, Pearson r=0.9980 (thirds 0.989/0.996/0.980),
+  auto-exposures identical (2.43e-13). Cross-camera reuse: `runSharedPhotonMap` builds one
+  map (11.4 M photons, ~2.3 s) and gathers a 3-frame flythrough. Discovered mid-validation
+  that the scene must be passed with `-in <file>` (a positional arg is silently ignored and
+  the built-in cornell — with a dispersive glass sphere — is used instead), which had
+  contaminated an earlier M-vs-R compare; redone on the true diffuse box. Docs corrected to
+  describe mode M as a direct density query (not a secondary final gather); the true final
+  gather logged as a future enhancement in known-issues.md. **All four sprint items done.**

@@ -106,7 +106,7 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then final-gathers the camera image from it (reusable across cameras) | CPU |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it by a direct radius density estimate at the first diffuse hit (reusable across cameras) | CPU |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
@@ -173,9 +173,10 @@ paths they can capture at all**.
   fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
 - **`M` — photon map (view-independent, reusable).** Traces a forward photon pass
   **once** and stores every diffuse deposit in a **view-independent photon map** (a
-  uniform hash grid), then forms the camera image by a backward final gather: each
-  camera ray walks through specular surfaces until it lands on a diffuse one, where a
-  radius density estimate over nearby photons gives the radiance. Because the map is
+  uniform hash grid), then forms the camera image by a backward camera pass with a
+  **direct density query**: each camera ray walks through specular surfaces until it
+  lands on a diffuse one, where a radius density estimate over the nearby photons gives
+  the radiance directly (not a secondary hemisphere final gather). Because the map is
   independent of the camera, it can be **built once and reused across every frame of a
   flythrough** (or every camera of a multi-camera render) — the cost of the photon
   pass amortizes over all views. *Cost:* the density estimate **blurs sharp contact
@@ -921,7 +922,7 @@ splat models:
 
 **Mode `M` (photon map) shares even more cheaply.** Because the photon map is
 **view-independent**, a multi-camera mode-`M` render builds the map **once** and runs
-each camera's backward final gather against that one shared map — the whole forward
+each camera's backward density gather against that one shared map — the whole forward
 photon flight amortizes across every frame. Unlike `A`/`B` (which reuse a photon
 *flight*, so every camera inherits the *same* fixed noise), each mode-`M` camera gathers
 with its **own** independent backward samples, so frames share only the underlying
@@ -952,7 +953,7 @@ them as animation frames:
   samples, so each carries **independent** randomness on top of the shared paths (unbiased
   per camera; correlated only through the shared flight).
 - **`M`** — cameras share the photon *map* (the radiance solution) but each runs its own
-  backward final gather, so each frame's noise is **independent** — the best of both:
+  backward density gather, so each frame's noise is **independent** — the best of both:
   the expensive forward pass is paid once, yet frames don't inherit a shared grain.
 - **`C`/`R`/`D`/`P`/`V`** — each camera is traced **fully independently** with its own
   sample budget, so their randomness (and noise) is **uncorrelated** by construction.
