@@ -23,6 +23,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include "linalg.h"
 
 // One deposited photon: where light landed, where it came from, and how much power it
@@ -108,10 +109,17 @@ struct PhotonMap {
 
     // Invoke fn(const Photon&, double dist2) for every photon within `radius` of p.
     template <class F>
-    void query(const Vec3& p, F&& fn) const {
+    void query(const Vec3& p, F&& fn) const { queryR(p, radius, std::forward<F>(fn)); }
+
+    // Same, but with an explicit query radius `r`. The 3x3x3 cell neighbourhood only
+    // covers radii up to the grid cell size, so the CALLER MUST ensure r <= cellSize
+    // (true for PPM/SPPM, where the grid is built at the largest current per-pixel
+    // radius and every pixel's radius only shrinks from there).
+    template <class F>
+    void queryR(const Vec3& p, double r, F&& fn) const {
         if (photons.empty()) return;
         int ix, iy, iz; cellCoord(p, ix, iy, iz);
-        const double r2 = radius * radius;
+        const double r2 = r * r;
         for (int dz = -1; dz <= 1; ++dz) {
             int cz = iz + dz; if (cz < 0 || cz >= nz) continue;
             for (int dy = -1; dy <= 1; ++dy) {

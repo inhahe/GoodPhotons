@@ -24,6 +24,12 @@
 //             built once and reused across every camera / flythrough frame. Gather
 //             radius set by -pmradius (absolute) or -pmradiusfrac (fraction of scene
 //             radius, default 0.02). CPU only. See photonmap.h / photonmap_render.h.
+//   -mode S : stochastic progressive photon mapping (SPPM) — repeated bounded photon
+//             passes with a per-pixel shrinking gather radius (Hachisuka 2008/2009), so
+//             the estimate converges (unbiased in the limit) with flat memory and nails
+//             caustics / SDS paths. -n = photons per pass, -spp = number of passes (or a
+//             -time/-noise budget); radius-shrink rate -sppmalpha (default 0.7), initial
+//             radius from -pmradius/-pmradiusfrac. CPU only. See sppm_render.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
@@ -110,6 +116,7 @@
 #include "backward.h"
 #include "bdpt.h"
 #include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
+#include "sppm_render.h"        // mode S: stochastic progressive photon mapping (item 2)
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
@@ -991,6 +998,11 @@ static int g_previewRows = 0;   // terminal lines the last preview occupied (for
 static double g_pmRadiusAbs = 0.0;
 static double g_pmRadiusFactor = 0.02;
 
+// SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
+// faster radius shrink (less bias sooner, more variance); 0.7 is the paper default. The
+// initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls above.
+static double g_sppmAlpha = 0.7;
+
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
 static void enableAnsiTerminal() {
@@ -1851,9 +1863,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         resume = false; wantCheckpointFlag = false;
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
-        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D')) {
-        std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward) "
-                             "and R/D (reference/BDPT); ignoring for mode %c\n", mode);
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
+          mode == 'M' || mode == 'S')) {
+        std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward), "
+                             "R/D (reference/BDPT), and M/S (photon map / SPPM); ignoring for mode %c\n", mode);
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
@@ -2107,6 +2120,37 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
                                               diffraction, /*maxBounce*/32, off);
                 });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
+    // --- Stochastic progressive photon mapping (mode S) — ROADMAP item 2 ----------
+    // Repeated bounded photon passes with a per-pixel shrinking gather radius. Persistent
+    // per-pixel state (flux/radius/count) lives across passes in `st`; each pass re-samples
+    // the camera visible points (stochastic PPM), traces N photons, gathers, and updates the
+    // radius/flux. -n = photons PER PASS, -spp = number of passes (or a -time/-noise budget).
+    if (mode == 'S') {
+        double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                          : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("mode S: SPPM — %lld photons/pass, R0=%.4g, alpha=%.2f at %dx%d on "
+                    "%d CPU threads (light=%s) ...\n",
+                    N, R0, g_sppmAlpha, res, resY, nThreads, lightLabel);
+        SPPMState st; st.init(res, resY, R0);
+        // renderChunked runs the pass loop, reporting L*passes so the progress driver's
+        // divide-by-sppDone recovers the resolved radiance L. Persistent state means we
+        // ignore the chunk's sppTarget granularity and just step one pass per iteration.
+        auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+            Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+            for (long long pass = 0; pass < passTarget; ++pass) {
+                sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
+                         /*maxBounce*/32, (uint64_t)(pass + 1));
+                disp = sppmResolve(st);
+                for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
+                if (p->report(disp, st.passes, st.passes >= passTarget)) break;
+            }
+            return disp;
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
@@ -2395,6 +2439,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'

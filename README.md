@@ -106,6 +106,7 @@ paths they can capture at all**.
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 | `M` | Photon map | Builds a **view-independent** photon map once, then final-gathers the camera image from it (reusable across cameras) | CPU |
+| `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -180,6 +181,19 @@ paths they can capture at all**.
   and directly-viewed emitters carry a little chromatic speckle at low spp. Best when
   many cameras share one lighting solution. CPU only. (Matches the forward splat
   modes `A`/`B`/`C` — same forward physics, just measured from a stored map.)
+- **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
+  (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
+  photon passes** and **shrinks each pixel's gather radius** over iterations, so the
+  estimate is **unbiased in the limit** with **flat memory** (the map is rebuilt small
+  each pass, never grown). Each pass also re-samples the camera subpaths, which
+  anti-aliases and makes it robust for depth of field / glossy. Its stand-out strength is
+  **caustics and SDS paths** — light focused through glass or off metal, which the
+  backward tracer (`R`) and even BDPT (`D`) resolve slowly but a photon method captures
+  directly. `-n` is photons **per pass**, `-spp` is the **number of passes** (or use a
+  `-time`/`-noise`/`-forever` budget); the radius-shrink rate is `-sppmalpha` (default
+  `0.7`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`. A single pass reduces
+  exactly to mode `M`. CPU only. *Cost:* many passes to converge; the running preview
+  starts blurry (large radius) and sharpens as the radius shrinks.
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
@@ -827,8 +841,9 @@ add-on), this doubles as a Blender → FTSL path.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
-| `-mode <A..D,M,P,R,V>` | Render mode (default `B`) |
-| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M` photon-map gather radius: absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-mode <A..D,M,S,P,R,V>` | Render mode (default `B`) |
+| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S` photon-map gather radius (initial radius for `S`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
@@ -845,7 +860,8 @@ add-on), this doubles as a Blender → FTSL path.
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
-| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V` |
+| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) |
+| `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass) |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`),

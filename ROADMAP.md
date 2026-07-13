@@ -110,7 +110,20 @@ specular components sharp (final gather only the *indirect* diffuse, trace direc
 
 ---
 
-## (2) Progressive photon mapping (PPM / SPPM)
+## (2) Progressive photon mapping (PPM / SPPM) — **DONE 2026-07-12** (mode `S`)
+
+**Shipped** as `-mode S` (`src/sppm_render.h`): repeated bounded photon passes with a
+per-pixel shrinking gather radius (Hachisuka 2008/2009 shared-statistics form). Per-pixel
+`SPPMPixel` state (tau/radius/nAcc/directSum + a re-sampled visible point) lives across
+passes; each pass re-traces camera visible points (stochastic PPM), traces `-n` photons
+into a fresh bounded `PhotonMap`, gathers at the current radius, and applies the
+`R'² = R²(N+αM)/(N+M)` / flux-rescale update. `-n` = photons per pass, `-spp` = pass
+count (or a `-time`/`-noise`/`-forever` budget), `-sppmalpha` = shrink rate (default 0.7),
+initial radius from `-pmradius`/`-pmradiusfrac`. A single pass reduces algebraically to
+mode `M` (verified). Plugs into the existing progressive driver (`runSppProgressive`) by
+reporting `L·passes` so the divide-by-sppDone recovers the resolved radiance. CPU only.
+
+**Original plan below.**
 
 **Goal.** Converge the photon estimate without unbounded memory and without the bias of a fixed
 radius: run repeated photon passes and **shrink the density-estimation radius** over iterations
