@@ -323,6 +323,26 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   **render GPU jobs one at a time**; the difference is a contended render now fails
   loudly (non-zero exit, no PNG) instead of silently overwriting a good image with black.
 
+### Missing/unknown light spectrum silently fell back to 6500 K white — DONE 2026-07-12
+- **What:** an explicit spectrum resource that failed to load rendered the scene with
+  a silent default illuminant instead of erroring. `speclib::resolveSpectrumTokens`
+  returned `false` for a failed `file:`/`glass:`/`metal:`/`reflectance:`/`illuminant:`/
+  `filter:` reference — but `false` also means "not my token, try the next resolver",
+  so the failure cascaded to `main.cpp resolveLight`'s `return blackbody(6500.0)`. A
+  typo'd path or a `-light` name with no matching preset produced a plausible-looking
+  white render with exit 0 — the wrong image, no warning. (This is also why the
+  measured-LED presets appeared to "work as white" on a stale binary.)
+- **Root cause:** overloaded `false` return (fall-through vs. hard failure) on the
+  explicit-prefix branches, plus a catch-all 6500 K fallback for unknown `-light`.
+- **Fix:** explicit resource prefixes now **throw** `std::runtime_error` with a clear
+  message on load failure (`spectral_library.h`); `resolveLight` throws on an
+  unrecognized explicit `-light` name (the built-in `bb6500` default always resolves
+  via the parametric path, so only genuine typos trip it); `main()` wraps `run()` in a
+  `try/catch` that prints `error: <msg>` and exits 1. Bare, unprefixed names still
+  return `false` so the resolver layering (bb<K>, gas-discharge models, illuminant
+  lookup) is unchanged. Verified: valid `file:` → exit 0; missing `file:` and unknown
+  `-light` → `error:` + exit 1; no-`-light` default → exit 0.
+
 ### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
 - **What:** the procedural-pattern math VM now exposes the surface texture coordinates
   `u`,`v` (previously mesh-only) to expressions on **native** objects too, so a UV-space

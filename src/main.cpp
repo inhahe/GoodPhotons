@@ -153,13 +153,18 @@ static bool writeImage(const std::string& path, int W, int H, const std::vector<
 }
 
 // Resolve a -light name to an emission SPD. Delegates to the shared resolver in
-// lights.h (the same one the FTSL `preset:<name>` expression uses); unknown names
-// fall back to a 6500 K blackbody.
+// lights.h (the same one the FTSL `preset:<name>` expression uses). An explicitly
+// named light that resolves to nothing is a fatal error (the user asked for a
+// specific source), NOT a silent fall-through to white — the built-in default
+// ("bb6500") always resolves via the parametric bb<K> path, so this only fires on
+// a genuinely unrecognized name (typo / missing data file).
 static Spectrum resolveLight(const char* name) {
     if (!name) return blackbody(6500.0);
     Spectrum s;
     if (resolveLightPreset(name, s)) return s;
-    return blackbody(6500.0);
+    throw std::runtime_error("unknown -light preset '" + std::string(name) +
+        "' — not a bb<K>/led<K>k parametric, a data/light or data/illuminant file/alias, "
+        "or a built-in lamp model (sodium/mercury/metal-halide/fluorescent/led-white)");
 }
 
 static void addQuad(Scene& s, Vec3 a, Vec3 b, Vec3 c, Vec3 d, int mat, int sensorId = -1) {
@@ -2243,7 +2248,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     return writeOk ? 0 : 1;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
     // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
@@ -2662,4 +2667,17 @@ int main(int argc, char** argv) {
         if (rv != 0) return rv;
     }
     return sharedWriteFail ? 1 : 0;
+}
+
+// Thin wrapper: turn a fatal configuration error (e.g. an explicit `file:`/`glass:`/
+// `illuminant:` reference whose target is missing or malformed — thrown by the
+// spectral-library resolver) into a clean message + non-zero exit, instead of a
+// silent fall-through to a default illuminant that would render the wrong thing.
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }

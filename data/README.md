@@ -71,6 +71,13 @@ named-preset index. E.g. `spd file:data/illuminant/f2.csv`, demonstrated by
 `scenes/measured_spd.ftsl` (which renders identically to `spd preset:f2`, since the
 preset loads that very file — the end-to-end proof).
 
+**Missing / malformed target = hard error.** An explicit resource reference
+(`file:`, `glass:`, `metal:`, `reflectance:`, `illuminant:`, `filter:`) that can't
+be resolved aborts the render with a clear `error: ...` message and a non-zero exit
+— it does **not** silently fall through to a default illuminant. `file:` paths are
+resolved relative to the current working directory. (A bare, unprefixed `-light`
+name that matches no preset likewise errors; only the built-in default resolves.)
+
 ## Present data
 
 ### `glass/*.glass` — dispersion coefficients

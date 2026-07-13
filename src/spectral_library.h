@@ -34,6 +34,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include "spectrum.h"
 
 namespace speclib {
@@ -189,14 +190,43 @@ inline bool resolveSpectrumTokens(const std::vector<std::string>& w, Spectrum& o
         out = (h == "gaussian") ? gaussianBand(a, b, c) : shortPass(a, b, c);
         return true;
     }
-    if (h.rfind("glass:", 0) == 0)       return loadGlass(h.substr(6), out);
-    if (h.rfind("metal:", 0) == 0)       return loadCurve("metal", h.substr(6), out);
-    if (h.rfind("reflectance:", 0) == 0) return loadCurve("reflectance", h.substr(12), out);
-    if (h.rfind("illuminant:", 0) == 0)  return loadCurve("illuminant", h.substr(11), out);
-    if (h.rfind("filter:", 0) == 0)      return loadCurve("filter", h.substr(7), out);
+    // Explicit resource references (prefix:arg) are an UNAMBIGUOUS request for a
+    // named asset. If the asset can't be resolved that's a fatal configuration error
+    // — the user asked for this specific file/curve and it's missing or malformed —
+    // NOT a "not my token, try the next resolver" signal. So throw with a clear
+    // message rather than returning false (which would silently fall through to a
+    // default illuminant, e.g. a 6500 K blackbody, and render the wrong thing).
+    auto require = [](bool ok, const std::string& msg) {
+        if (!ok) throw std::runtime_error(msg);
+    };
+    if (h.rfind("glass:", 0) == 0) {
+        require(loadGlass(h.substr(6), out),
+                "unknown glass reference 'glass:" + h.substr(6) + "' — no matching file/alias in data/glass/");
+        return true;
+    }
+    if (h.rfind("metal:", 0) == 0) {
+        require(loadCurve("metal", h.substr(6), out),
+                "unknown metal reference 'metal:" + h.substr(6) + "' — no matching file/alias in data/metal/");
+        return true;
+    }
+    if (h.rfind("reflectance:", 0) == 0) {
+        require(loadCurve("reflectance", h.substr(12), out),
+                "unknown reflectance reference 'reflectance:" + h.substr(12) + "' — no matching file/alias in data/reflectance/");
+        return true;
+    }
+    if (h.rfind("illuminant:", 0) == 0) {
+        require(loadCurve("illuminant", h.substr(11), out),
+                "unknown illuminant reference 'illuminant:" + h.substr(11) + "' — no matching file/alias in data/illuminant/");
+        return true;
+    }
+    if (h.rfind("filter:", 0) == 0) {
+        require(loadCurve("filter", h.substr(7), out),
+                "unknown filter reference 'filter:" + h.substr(7) + "' — no matching file/alias in data/filter/");
+        return true;
+    }
     if (h.rfind("file:", 0) == 0) {
         std::vector<std::pair<double, double>> p; std::string e;
-        if (!loadSpdCsv(h.substr(5), p, e)) return false;
+        require(loadSpdCsv(h.substr(5), p, e), e);  // e = "cannot open ..." / "no numeric rows ..."
         out = tabulatedSpectrum(std::move(p)); return true;
     }
     return false;
