@@ -80,6 +80,53 @@ function-*wrappers* around POV's texturing engine, not standalone math. Out of s
 (if ever) that engine is ported. Parser rejects any unported name as an "unknown
 identifier", so scenes fail loudly rather than silently.
 
+### Isosurface `contained_by` is box-only — add a sphere/curved container — 2026-07-13
+**What:** an isosurface's `contained_by { min <x y z>  max <x y z> }` is the *only*
+container shape we support — an axis-aligned box (see `ftsl.h` `addIsosurface`
+~line 1545; the 8 corners are transformed to world and reduced to an AABB stored as
+`im.bounds`). POV-Ray also lets the container be a `sphere` (and in fact any shape).
+**Why it matters:** for a surface that reaches the container wall (any *unbounded*
+surface like `f_enneper`, or a solid lump that pokes out), a box clips it along **flat
+planes**, so the cut reads as hard angular facets. A **sphere** container clips along a
+smooth curved boundary, so the unavoidable cut looks like a natural rounded edge instead
+of a sawn plane — this is why hand-tuned POV enneper/klein renders frame cleanly and ours
+show flat patches. It's container ergonomics, not a math gap: both engines must clip an
+infinite surface *somewhere*; the sphere just hides the seam.
+**Where / proper fix:** `ftsl.h` `addIsosurface` — accept `contained_by { sphere {
+center <x y z> radius r } }` (keep `min`/`max` box as the default). Store the container
+shape on the `Implicit` (currently just `im.bounds`, an AABB used to clip the ray in
+`implicit.h intersectImplicit` ~line 246). The ray-clip step must then intersect the ray
+with the actual container (sphere slab → quadratic) rather than the AABB, and the CUDA
+mirror (`render_cuda.cu` `dIntersectImplicit`) needs the same. AABB stays as the BVH-leaf
+bound regardless.
+
+### Isosurface container has no cap/`open` control (and no proper cap at all) — 2026-07-13
+**What:** where an isosurface's solid interior (`f < 0`) is sliced by the container wall,
+we render **neither** a clean sealed cap **nor** a clean open edge. `intersectImplicit`
+(`implicit.h` ~line 245) clips the ray to the container and reports the first field
+*sign change* inside it; it never treats the container faces as geometry. So a solid cut
+by the box returns the next interior crossing (its back/inner wall) or passes straight
+through — reading as odd flat interior patches or see-through holes.
+**Background (what a "cap" is):** convention is `f < 0` = solid inside, `f > 0` = outside.
+When the container plane cuts through solid material you must choose: **capped/"closed"**
+(POV default) draws that slice as a flat face of the object's material, sealing the solid
+flush with the wall (looks cleanly sawn off); **`open`** (POV keyword) omits the wall so
+the surface just ends and you see into/through the interior. Only matters for surfaces
+that actually *reach* the container (`f_enneper`, the klein bottle's outer shell); a fully
+bounded surface never touches the wall so the choice is moot.
+**Why it matters:** without a real capped mode, box-cut solids can't be shown as clean
+solids; without an `open` option, thin-shell / hollow looks aren't authorable. Today's
+behavior is effectively a broken third option.
+**Where / proper fix:** in `intersectImplicit` (CPU) and `dIntersectImplicit`
+(`render_cuda.cu`), detect the case where the ray enters the container already inside the
+solid (`f < 0` at the near clip `t0`, or exits the far clip `t1` still `f < 0`) and, in the
+**default capped** mode, register a hit on the container face itself (position = clip
+point, normal = the container's inward face normal, material = the isosurface material).
+Add an `open` toggle to the `isosurface {}` block (`ftsl.h`) that suppresses these caps
+(current behavior). Pairs naturally with the sphere-container item above (a sphere cap is
+a spherical patch with the sphere's radial normal). Validate on `f_enneper` (should read
+as a cleanly-capped solid by default, an open shell with `open`).
+
 ### glTF/GLB loader is a static-geometry subset — 2026-07-12
 The new glTF 2.0 loader (`src/gltf.h` + `src/third_party/json.h`) covers the common
 static-mesh case but deliberately omits a number of glTF features. Each is a scoped
