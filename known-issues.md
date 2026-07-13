@@ -26,32 +26,8 @@ See `render_cuda.cu` ~line 555/577/624.
 
 ## Open bugs
 
-### `light cylinder` emits no illumination (tube is visible but lights nothing) — 2026-07-11
-
-A `light cylinder` renders as visible glowing emissive geometry (the tessellated
-lateral wall shows up when a camera ray hits it directly), but it does **not
-illuminate any other surface** — neither via next-event estimation nor via BSDF
-bounce. Reproduced with an isolation scene (`scraps/cyl_test.ftsl`): a white
-diffuse wall lit *only* by a `light cylinder` renders pure black behind the visibly-
-glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposure
-1.54e-14, i.e. zero contribution from the light). Contrast: `light sphere` and
-`light area` both illuminate correctly.
-
-- **Where:** `ftsl.h` `addLight` cylinder branch (~line 1496) calls
-  `L.scene.addCylinderLight(...)`, so the light is registered for sampling. The bug
-  is downstream in the light-sampling / direct-lighting path (`scene.h` /
-  `render.h` / `render_cuda.cu`) — the cylinder light is likely missing from (or
-  mis-weighted in) the NEE light-sampling switch, and its emissive tris are probably
-  excluded from BSDF-hit emission accounting (to avoid double counting) so both
-  contributions vanish.
-- **Repro:** `ftrace -in scraps/cyl_test.ftsl -mode R -device cpu -spp 128 -r 200 -o png/cyl_test.png` → wall is black.
-- **Proper fix:** ensure `sampleLight`/`lightPdf` (CPU and GPU) handle the cylinder
-  light type and return correct radiance+pdf, and/or let BSDF rays that hit the
-  cylinder's emissive tris contribute their emission with proper MIS. Then re-test
-  with `scraps/cyl_test.ftsl` (wall should light up).
-- **Workaround in scenes:** use `light sphere` (rings/stacks) or `light area` for
-  tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
-  accents + colored walls for this reason.
+_(none currently open — see Resolved for the former `light cylinder` entry, which
+turned out to be a misdiagnosis.)_
 
 ## Tech debt
 
@@ -442,6 +418,36 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   `writeCheckpoint`/`readCheckpoint` keyed on spp.
 
 ## Resolved
+
+### `light cylinder` "emits no illumination" — NOT A BUG (misdiagnosis) — RESOLVED 2026-07-13
+The original 2026-07-11 report claimed a `light cylinder` glows but lights nothing on
+both CPU and GPU, citing an "auto-exposure 1.54e-14, i.e. zero contribution." That
+inference was wrong on two counts, and re-testing shows the cylinder light works
+correctly on **both** backends.
+- **A ~1e-14 auto-exposure is normal here, not "zero light."** This renderer uses
+  physically-scaled blackbody SPDs whose absolute radiance is ~1e13 W/m²/sr, so the
+  content-based auto-exposure lands around 1e-14 for *any* such scene — the stock
+  Cornell box (`-scene cornell`) reports `auto-exposure=8.87e-14`.
+- **The isolation scene had no explicit `power`**, so `absPower` was a no-op and the
+  emitter surface kept the raw (astronomically bright) blackbody radiance. A directly-
+  visible emitter that bright dominates the auto-exposure anchor and crushes the
+  genuinely-lit wall to near-black in the tonemap. **A `light sphere` in the identical
+  no-`power` isolation scene behaves the same way** — so it was never cylinder-specific.
+- **Controlled proof.** In absolute mode (each light given an explicit `power`, so a
+  fixed sensor gain is used instead of content-based auto-exposure), a cylinder and a
+  sphere light of equal power illuminate the wall essentially identically: at `power 30`
+  wall-region mean ≈ 1.32 (cyl) vs 1.11 (sph); at `power 4000`, 21.33 (cyl) vs 19.65
+  (sph). GPU forward (mode B) matches the CPU backward (mode R): wall mean 21.60 vs
+  21.33. The `neeLight`/`neeVolume` switches in `backward.h` already dispatch the
+  Cylinder shape (`sampleCylinderVisible` for the un-capped front-facing arc; uniform
+  `samplePoint` for capped capsules), and forward photon emission selects it via the
+  power CDF — all correct.
+- **Repro (now shows a properly lit wall):** `scraps/cyl_test.ftsl` was updated to give
+  the tube `power 4000`; `ftrace -in scraps/cyl_test.ftsl -mode R -device cpu -spp 128
+  -o png/cyl_test.png` shows the wall lit with correct falloff around the tube.
+- **Lesson for the tracker:** don't read a tiny auto-exposure as "black"; verify with
+  absolute-`power` lighting or by measuring HDR/PNG pixels of a receiver away from the
+  directly-visible emitter.
 
 ### Unified live progress across all image modes (`R`/`D` join `A`/`B`/`C`) — DONE 2026-07-12
 - **What:** modes `R` (backward reference) and `D` (BDPT) previously ran as a single
