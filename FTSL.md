@@ -314,6 +314,19 @@ by the mesh transform's inverse-transpose. A mesh with **no `vn` stays exactly
 flat-shaded** (geometric normal), so it's a no-op for older assets. No FTSL key is
 needed — it's driven entirely by the OBJ contents.
 
+**glTF 2.0 / GLB.** `file` may point at a `.gltf` (JSON, embedded/external/base64
+buffers) or a `.glb` (binary container); the loader dispatches on the extension.
+It bakes the glTF node transform hierarchy (matrix or TRS) under the mesh block's
+own `translate/rotate/scale`, reads `POSITION` / `NORMAL` / `TEXCOORD_0` +
+indices, and imports `pbrMetallicRoughness` materials — `baseColorFactor` is
+upsampled to a reflectance spectrum, `metallicFactor ≥ 0.5` → a glossy (metal)
+BSDF tinted by the base color, else diffuse, with `roughnessFactor` as the lobe
+width. Add `import_materials no` to ignore glTF's materials and paint every
+primitive with the block's FTSL `material` instead. The block `material` is always
+the fallback for primitives that carry no material. *Not supported* (see
+known-issues): textures, KHR extensions (transmission/clearcoat/…), skinning,
+morph targets, sparse accessors, animation, and non-triangle primitives (skipped).
+
 ---
 
 ## 9. UV wraps on native primitives and meshes

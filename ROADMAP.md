@@ -267,8 +267,13 @@ already drops into a scene, scaled/rotated as a transform. This item is the **re
    `vn` falls each per-vertex normal back to the geometric normal in `Tri::finalize()`, so untouched
    meshes stay exactly flat-shaded (bit-identical). *Not yet done:* auto-generating smoothed normals
    from a crease-angle threshold when `vn` is absent (a mesh with no `vn` stays flat) — see follow-ups.
-2. **glTF/GLB** — a second loader for the modern interchange format (PBR metallic-roughness materials,
-   node transforms, embedded/packed buffers), mapping metallic-roughness onto the existing BSDFs.
+2. **glTF/GLB** — ✅ **DONE** (2026-07-12). A second loader (`src/gltf.h` + a self-contained JSON
+   parser `src/third_party/json.h`) handles `.gltf` (embedded/external/base64 buffers) and `.glb`
+   (binary container), bakes the node transform hierarchy (matrix or TRS quaternion), reads
+   POSITION/NORMAL/TEXCOORD_0 + indexed or non-indexed triangles, and maps `pbrMetallicRoughness`
+   onto the spectral BSDFs (baseColor→upsampled reflectance, metallic→glossy tint, roughness→lobe).
+   Dispatched by extension in `addMesh`; `import_materials no` forces the FTSL material. *Not yet:*
+   textures, KHR extensions, skinning/morph, sparse accessors, animation.
 3. **Instancing** — a two-level BVH (TLAS over instances → shared BLAS) so the same mesh can be
    duplicated cheaply instead of baking every copy's triangles into `Scene::tris` (today's behaviour).
 4. Follow-ups: emissive triangles (mesh area lights), tangent-space **normal maps**, and a watertight
@@ -292,9 +297,12 @@ render_cuda.cu), and `addMesh` in ftsl.h.
    so non-`vn` meshes stay flat-shaded. Validated: low-poly UV sphere renders smooth (mode R/B, CPU
    and GPU) vs the flat version's facets; energy balance bit-identical CPU↔GPU. *Follow-up:* crease-
    angle auto-smoothing when `vn` is absent; shading-normal hemisphere clamp for transmission.
-2. glTF loader (`src/gltf.h`): parse nodes/meshes/accessors, bake node transforms, map
-   metallic-roughness → the renderer's spectral BSDFs; `mesh { file "asset.gltf" … }` dispatches by
-   extension.
+2. ✅ **DONE** — glTF loader (`src/gltf.h`) + minimal JSON parser (`src/third_party/json.h`): parses
+   nodes/meshes/accessors/bufferViews/buffers (GLB BIN chunk, external `.bin`, base64 data URIs),
+   bakes node transforms (matrix or TRS), maps metallic-roughness → spectral BSDFs; `addMesh`
+   dispatches `.gltf`/`.glb` by extension. Validated: a metallic sphere + rotated diffuse cube scene
+   (both `.gltf` embedded-buffer and `.glb`) renders correctly on CPU (mode R) and GPU (mode B),
+   node transforms + materials + smooth normals all correct.
 3. Two-level BVH for instancing: keep per-mesh BLAS, add a TLAS over `{blasId, Affine}` instances;
    `mesh_instance { of "name" translate … }` grammar; transform the ray into BLAS space at traversal.
 4. Validate: render a smooth sphere-mesh vs the analytic sphere (should match), a glass Stanford

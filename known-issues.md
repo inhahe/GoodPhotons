@@ -55,6 +55,30 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
 
 ## Tech debt
 
+### glTF/GLB loader is a static-geometry subset — 2026-07-12
+The new glTF 2.0 loader (`src/gltf.h` + `src/third_party/json.h`) covers the common
+static-mesh case but deliberately omits a number of glTF features. Each is a scoped
+follow-up, not a bug:
+- **No textures.** Only `baseColorFactor`/`metallicFactor`/`roughnessFactor` *scalars*
+  are read; `baseColorTexture`/`metallicRoughnessTexture`/`normalTexture` are ignored.
+  Proper fix: decode referenced images (glTF images are PNG/JPEG — the renderer already
+  vendors stb_image), register them as `Scene::textures`, and set `reflectTex`/UV set.
+- **No KHR material extensions** (transmission, clearcoat, volume, ior, emissive
+  strength, sheen, specular). A glass glTF loads as an opaque glossy/diffuse, not a
+  dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
+  `MatType::Dielectric` with the given ior; other extensions as feasible.
+- **No `emissiveFactor` import.** Emissive glTF materials load unlit. (Intentionally
+  skipped for now: setting `emit` without registering the tris as a sampled light would
+  desync NEE; doing it right means adding mesh-emitter area lights — tied to ROADMAP §5
+  "emissive triangles".)
+- **No skinning, morph targets, animation, or sparse accessors.** Static bind pose only.
+- **Non-triangle primitives** (points/lines/strips/fans, `mode != 4`) are skipped with a
+  note; only `mode 4` (TRIANGLES) is baked.
+- Materials are created **per glTF material, not deduplicated across meshes/files**, and
+  every instance's triangles are baked into `Scene::tris` (no instancing — that's §5c).
+The core path (buffers/GLB, node transforms, POSITION/NORMAL/TEXCOORD_0, indexed +
+non-indexed tris, metallic-roughness → BSDF) is validated on CPU and GPU.
+
 ### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
 On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes
 and the new photon-map mode agree with each other but sit **~5% brighter** than the

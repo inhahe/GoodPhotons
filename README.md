@@ -478,8 +478,12 @@ sensor gain, and `iso`/`shutter`/`exposure` become true absolute stops (doubling
 
 ## Geometry
 
-`sphere`, `quad` (parallelogram), `triangle`, and `mesh` (OBJ import, with
-`usemtl use_names` for per-face materials and `uv use_mesh` for mesh UVs).
+`sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ and glTF 2.0 /
+GLB** import — the loader dispatches on file extension). glTF brings its node
+transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness` materials
+(base color upsampled to a reflectance spectrum, metallic → glossy tint, roughness
+→ lobe width; `import_materials no` forces the FTSL `material` instead). OBJ
+supports `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UVs.
 OBJ **vertex normals (`vn`) are read as smooth shading normals** — a hit
 barycentric-interpolates them (CPU and GPU) for smooth-shaded curved meshes, with
 no visible faceting; a mesh with no `vn` stays exactly flat-shaded (geometric

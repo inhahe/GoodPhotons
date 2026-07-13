@@ -61,6 +61,7 @@
 #include "lights.h"
 #include "materials.h"
 #include "mesh.h"
+#include "gltf.h"
 #include "upsample.h"
 
 namespace ftsl {
@@ -1182,8 +1183,25 @@ private:
             return (it == matIndex_.end()) ? -1 : it->second;
         };
         size_t triStart = L.scene.tris.size();
-        loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                uvProj, uvAxis);
+        // Dispatch by file extension: .gltf/.glb use the glTF loader (which imports
+        // its own pbrMetallicRoughness materials by default; `import_materials no`
+        // forces the FTSL-assigned `material` on every primitive). Everything else
+        // is an OBJ. Extension match is case-insensitive.
+        std::string ext;
+        if (size_t dot = file.find_last_of('.'); dot != std::string::npos) {
+            ext = file.substr(dot);
+            for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+        }
+        if (ext == ".gltf" || ext == ".glb") {
+            bool importMats = (strOf(b, "import_materials") != "no");
+            std::string gerr;
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+                fail("mesh: " + gerr); return false;
+            }
+        } else {
+            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                    uvProj, uvAxis);
+        }
         // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
         // is approximated by its box — true containment is deferred, see known-issues).
         if (!b.name.empty() && L.scene.tris.size() > triStart) {
