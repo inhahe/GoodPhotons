@@ -675,7 +675,8 @@ fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_cur
 (spline fly-through with variable speed), and `render` (render-setting overrides). See the `scenes/` directory for worked examples
 (`cornell.ftsl`, `fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`,
 `material_presets.ftsl`, `realcam.ftsl`, `implicit.ftsl`, `function.ftsl`,
-`procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`, …).
+`procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`,
+`gallery.ftsl` (a large room packed with varied materials around a gold gyroid), …).
 
 ### Camera animation (`camera_path`, `camera_orbit`)
 
