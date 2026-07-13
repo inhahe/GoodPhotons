@@ -30,6 +30,15 @@
 //             caustics / SDS paths. -n = photons per pass, -spp = number of passes (or a
 //             -time/-noise budget); radius-shrink rate -sppmalpha (default 0.7), initial
 //             radius from -pmradius/-pmradiusfrac. CPU only. See sppm_render.h.
+//   -mode U : vertex connection and merging (VCM/UPS, Georgiev 2012) — combines BDPT
+//             vertex connections with SPPM photon merging under one multiple-importance
+//             -sampling (balance-heuristic) weight, so it robustly handles both the
+//             diffuse/glossy paths BDPT is good at and the caustic/SDS paths photon
+//             mapping is good at. Each pass traces resX*resY light subpaths + one camera
+//             subpath per pixel; -n is ignored (light-path count follows the film). -spp
+//             = number of passes (or a -time/-noise budget); radius-shrink rate -vcmalpha
+//             (default 0.75), initial radius from -pmradius/-pmradiusfrac. CPU only.
+//             See vcm.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
@@ -117,6 +126,7 @@
 #include "bdpt.h"
 #include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
 #include "sppm_render.h"        // mode S: stochastic progressive photon mapping (item 2)
+#include "vcm.h"                // mode U: vertex connection and merging (VCM/UPS, item 3)
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
@@ -1003,6 +1013,11 @@ static double g_pmRadiusFactor = 0.02;
 // initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls above.
 static double g_sppmAlpha = 0.7;
 
+// VCM (mode U) radius-shrink rate alpha (Georgiev 2012; CLI -vcmalpha). The per-pass merge
+// radius follows r_i = R0 * i^((alpha-1)/2), i = pass index (1-based); 0.75 is the
+// SmallVCM default. Initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls.
+static double g_vcmAlpha = 0.75;
+
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
 static void enableAnsiTerminal() {
@@ -1705,6 +1720,17 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     return nullptr;
 }
 
+// VCM (mode U) scope guard. VCM reuses BDPT's transport scope but ADDITIONALLY excludes
+// participating media (surfaces-only merging in this build) and the fisheye/lensed cameras
+// (its camera importance assumes the rectilinear pinhole). Returns a reason string or null.
+static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) {
+    if (const char* r = bdptUnsupportedFeature(scene)) return r;
+    if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
+    if (cam.hasLens()) return "a realistic multi-element lens";
+    if (cam.projection != CAM_RECTILINEAR) return "a non-rectilinear (fisheye/panoramic) camera";
+    return nullptr;
+}
+
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
 // in adaptive chunks so a CPU mode-R/D render gets the same live progress as the GPU.
 // `renderOne(chunkSpp, seedOffset)` renders one chunk and returns its SUM film; the
@@ -1864,9 +1890,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
         !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
-          mode == 'M' || mode == 'S')) {
+          mode == 'M' || mode == 'S' || mode == 'U')) {
         std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward), "
-                             "R/D (reference/BDPT), and M/S (photon map / SPPM); ignoring for mode %c\n", mode);
+                             "R/D (reference/BDPT), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
@@ -2147,6 +2173,47 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
                          /*maxBounce*/32, (uint64_t)(pass + 1));
                 disp = sppmResolve(st);
+                for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
+                if (p->report(disp, st.passes, st.passes >= passTarget)) break;
+            }
+            return disp;
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
+    // --- Vertex Connection and Merging (mode U) — ROADMAP item 3 ------------------
+    // VCM/UPS: runs BDPT vertex connections AND photon-map vertex merging under one MIS
+    // balance heuristic, so it is robust across diffuse GI, glossy, and specular caustics
+    // in a single unbiased-in-the-limit estimator. Persistent per-pass accumulation lives
+    // in `st`; each pass traces one light + one camera subpath per pixel, shrinking the
+    // merge radius as r_i = R0 * i^((alpha-1)/2). -n is ignored (paths are per-pixel);
+    // -spp = number of passes (or a -time/-noise budget). -vcmalpha = radius-shrink rate.
+    if (mode == 'U') {
+        if (const char* unsupported = vcmUnsupportedFeature(scene, cam)) {
+            std::fprintf(stderr, "[mode U] this scene uses %s, which VCM (mode U) does not "
+                                 "support; render it with mode B/P (forward), R (backward), "
+                                 "or D (BDPT) instead.\n", unsupported);
+            return 1;
+        }
+        int maxDepth = 8;   // full path length in edges
+        double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                          : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
+                    "%d CPU threads (maxDepth=%d, light=%s) ...\n",
+                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel);
+        vcm::VcmState st; st.init(res, resY);
+        auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+            Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+            for (long long pass = 0; pass < passTarget; ++pass) {
+                // Progressive radius schedule (Georgiev/SmallVCM): shrink from R0.
+                double it = (double)(st.passes + 1);
+                double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
+                if (radius <= 0.0) radius = R0;
+                vcm::vcmPass(scene, cam, st, radius, nThreads, diffraction, maxDepth,
+                             (uint64_t)(st.passes + 1));
+                disp = vcm::vcmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
             }
@@ -2440,6 +2507,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
@@ -2705,10 +2773,11 @@ static int run(int argc, char** argv) {
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cs->exposureMul, eg});
         }
     } else {
-        // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/ref) uses
-        // the same camera frame; only the old contact-sensor diagnostic did not.
+        // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
+        // uses the same camera frame; only the old contact-sensor diagnostic did not.
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
-                                mode == 'P' || mode == 'D' || refMode);
+                                mode == 'P' || mode == 'D' || mode == 'M' ||
+                                mode == 'S' || mode == 'U' || refMode);
         const int resY = (resYCli > 0) ? resYCli : res;
         Camera c;
         if (useCamera) {

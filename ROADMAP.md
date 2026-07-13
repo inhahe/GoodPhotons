@@ -150,7 +150,25 @@ the checkpoint/resume system (forward modes only today).
 
 ---
 
-## (3) VCM / UPS (Vertex Connection and Merging / Unified Path Sampling)
+## (3) VCM / UPS (Vertex Connection and Merging / Unified Path Sampling) — ✅ DONE (mode `U`)
+
+**Status.** Implemented as render mode `U` in `src/vcm.h` (wired into `main.cpp`; CLI `-vcmalpha`,
+default `0.75`). Each pass traces a light subpath + a camera subpath per pixel and combines all
+BDPT connection strategies (emission, NEE, camera↔paired-light-vertex connection, connect-to-camera
+splat) with SPPM photon **merging** under one SmallVCM-style balance-heuristic weight (dVCM/dVC/dVM
+partial-MIS recursion). Progressive merge-radius shrink `r_i = R0·i^((alpha-1)/2)`; unbiased in the
+limit; CPU-threaded (per-thread light-vertex/splat buffers, a counting-sort hash grid rebuilt each
+pass). Single-wavelength handling: connections pair a camera path with its **own** light path
+(shared λ → exact); merges use the standard spectral-photon-mapping XYZ estimate (MIS pdfs are
+wavelength-independent so the balance weights stay a valid partition of unity).
+
+**Validated.** Absolute-exposure Cornell boxes (`scraps/cornell_diffuse_abs.ftsl`,
+`scraps/cornell_caustic_abs.ftsl`): mode `U` matches the mode `R` ground truth in absolute scale
+(diffuse mean ratio ≈1.009; caustic mean ratio ≈1.003 — unbiased) and, at equal wall-clock time,
+has **lower** RMSE-vs-`R` than SPPM both overall (3.93 vs 5.97) and in the caustic region
+(3.26 vs 5.31). Fixed a latent bug found during validation: built-in (`-scene`, non-`-in`) scenes
+never built a camera for modes `M`/`S`/`U` (they were absent from the `useCamera` list), leaving a
+zero camera — now included.
 
 **Goal.** Combine **BDPT vertex connections** (we have these — mode D) with **photon-map vertex
 merging** (density estimation reinterpreted as an extra *sampling technique*), all weighted

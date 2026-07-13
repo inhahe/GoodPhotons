@@ -107,6 +107,7 @@ paths they can capture at all**.
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 | `M` | Photon map | Builds a **view-independent** photon map once, then final-gathers the camera image from it (reusable across cameras) | CPU |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
+| `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -194,6 +195,25 @@ paths they can capture at all**.
   `0.7`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`. A single pass reduces
   exactly to mode `M`. CPU only. *Cost:* many passes to converge; the running preview
   starts blurry (large radius) and sharpens as the radius shrinks.
+- **`U` — VCM/UPS (the "have it all" estimator).** Vertex Connection and Merging
+  (Georgiev et al. 2012, a.k.a. Unified Path Sampling): each pass traces a **light
+  subpath and a camera subpath per pixel**, and combines **every** BDPT-style vertex
+  **connection** (what `D` does — great for diffuse/glossy interreflection connected
+  directly to the light) **and** every SPPM-style photon **merge** (what `S` does — great
+  for caustics / SDS focusing) under **one multiple-importance-sampling (balance-
+  heuristic) weight**. That single weighting makes it robust across the whole gamut: it
+  matches the backward tracer on diffuse GI *and* resolves caustics like a photon method,
+  with no per-scene mode picking. Like SPPM it is **progressive** and **unbiased in the
+  limit**, shrinking the merge radius as `r_i = R0·i^((alpha-1)/2)` across passes. `-n` is
+  **ignored** (light-path count follows the film resolution); `-spp` is the **number of
+  passes** (or a `-time`/`-noise`/`-forever` budget); the radius-shrink rate is
+  `-vcmalpha` (default `0.75`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`.
+  CPU only. *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
+  plus a grid build), but the most consistent quality per pass — at equal time it beats
+  SPPM on caustics *and* stays as clean as BDPT on diffuse GI. (Single-wavelength note:
+  connections pair a camera path with its **own** light path so they share one wavelength
+  and are exact; merges gather photons from other paths, so like modes `M`/`S` they use
+  the standard spectral-photon-mapping XYZ estimate.)
 
 The **image-forming modes are all progressive** — the forward camera models
 (`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
@@ -841,9 +861,10 @@ add-on), this doubles as a Blender → FTSL path.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
-| `-mode <A..D,M,S,P,R,V>` | Render mode (default `B`) |
-| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S` photon-map gather radius (initial radius for `S`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
+| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
+| `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
@@ -860,8 +881,8 @@ add-on), this doubles as a Blender → FTSL path.
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
-| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) |
-| `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass) |
+| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) and VCM (`U`) |
+| `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`),

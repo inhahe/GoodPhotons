@@ -508,6 +508,26 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   endpoint sits in) and multiply the connection throughput by the resulting
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
 
+### VCM (mode `U`): merges use a spectral XYZ estimate; connections through glass share BDPT's absorption gap; CPU-only
+- **What:** Mode `U` (VCM/UPS, `src/vcm.h`) is single-wavelength like the rest of the
+  renderer. Its **vertex connections** pair a camera subpath with its **own** light
+  subpath, so both share one wavelength and the connection is exact (like BDPT). Its
+  **merges**, however, gather light vertices from *other* paths (each carrying its own
+  sampled wavelength), so — exactly like the photon map (modes `M`/`S`) — the merge builds
+  the estimate directly in XYZ using `cie(λ_photon)` and the camera BSDF evaluated at the
+  photon's wavelength. This is the standard spectral-photon-mapping approximation, valid
+  because this renderer's MIS pdfs are wavelength-independent (diffuse cosine / glossy lobe
+  densities don't depend on λ), but it is not a spectrally-exact merge.
+- **Why it matters:** For strongly dispersive caustics (wavelength-dependent focusing) the
+  merged contribution is approximated in XYZ rather than resolved per-wavelength, just as in
+  modes `M`/`S`. Connections remain exact, so the diffuse/glossy portion is unaffected.
+- **Also:** VCM connection edges that cross colored glass inherit the same absorption gap
+  documented above for BDPT (the deterministic connect segment isn't Beer-Lambert weighted).
+  And mode `U` is **CPU-only** — no GPU path yet.
+- **Proper fix (if needed):** per-wavelength (hero-wavelength or spectral-bin) merging, and
+  optical-depth accumulation along connection rays through dielectrics. Deferred until a
+  dispersive-caustic VCM render demands it.
+
 ### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
 - **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward
   tracers: **implicit surfaces** (5a), **procedural patterns** (5b), and **dielectric
