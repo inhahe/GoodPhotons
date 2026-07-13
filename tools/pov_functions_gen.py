@@ -18,8 +18,90 @@ SRC_URL = ("https://raw.githubusercontent.com/POV-Ray/povray/master/"
 CACHE = os.path.join(os.path.dirname(__file__), ".pov_fnintern.cpp")
 OUT = os.path.join(os.path.dirname(__file__), "..", "src", "pov_functions.h")
 
-# internal ids that depend on POV noise / pattern / pigment / spline engines.
-EXCLUDE = {29, 58, 59, 76, 77, 78}
+# internal ids that depend on POV's pattern / pigment / spline engines (not ported).
+# The noise-based functions (29, 58, 59, 76, 78) ARE supported now via the exact
+# povNoise() port in src/pov_noise.h; they use MANUAL_BODIES below (their POV source
+# uses Vector3d / private_data caching that the plain text transform can't handle).
+# Only f_pattern (77) stays excluded - it needs POV's full pattern/warp engine.
+EXCLUDE = {77}
+
+# Hand-written, POV-faithful bodies for the noise functions: same algebra as
+# source/vm/fnintern.cpp, but with Vector3d ops spelled out on scalars and
+# Noise(V, ngen) -> povNoise(x,y,z, ngen) (from pov_noise.h).  f_noise3d uses the
+# scene default generator, which POV initializes to kNoiseGen_RangeCorrected (2).
+MANUAL_BODIES = {
+    76: """        // f_noise3d: POV Noise() with the scene-default generator (RangeCorrected=2)
+        return povNoise(PARAM_X, PARAM_Y, PARAM_Z, 2);""",
+    78: """        // f_noise_generator: generator selected by P0 (& 3)
+        int ngen = (int)PARAM(0) & 3;
+        return povNoise(PARAM_X, PARAM_Y, PARAM_Z, ngen);""",
+    58: """        // f_ridge
+        double px = PARAM_X, py = PARAM_Y, pz = PARAM_Z;
+        int ngen = (int)PARAM(5) & 3;
+        double Lambda = PARAM(0), l = Lambda;
+        int Octaves = (int)PARAM(1);
+        double Omega = PARAM(2), o = Omega;
+        double off = PARAM(3), ridge = PARAM(4);
+        double rscale = 1.0 / fmax(ridge, 1.0 - ridge);
+        double scale  = 1.0 / fmax(off, 1.0 - off);
+        double resid = PARAM(1) - (double)Octaves;
+        double v = fabs(povNoise(px, py, pz, ngen) - ridge) * rscale;
+        double value = (v - off);
+        double tot = 1.0;
+        for (int i = 2; i <= Octaves; i++) {
+            double tx = px * l, ty = py * l, tz = pz * l;
+            v = fabs(povNoise(tx, ty, tz, ngen) - ridge) * rscale;
+            value += o * (v - off);
+            tot += o; l *= Lambda; o *= Omega;
+        }
+        if (resid != 0.0) {
+            double tx = px * l, ty = py * l, tz = pz * l;
+            v = fabs(povNoise(tx, ty, tz, ngen) - ridge) * rscale;
+            value += o * (v - off) * resid;
+            tot += o * resid;
+        }
+        return value * scale / tot;""",
+    59: """        // f_ridged_mf (exponent array computed inline instead of cached)
+        double px = PARAM_X, py = PARAM_Y, pz = PARAM_Z;
+        int ngen = (int)PARAM(5) & 3;
+        double H = PARAM(0), Lambda = PARAM(1), offset = PARAM(3), gain = PARAM(4);
+        double eastep = pow(Lambda, -H), eacur = 1.0;
+        double signal = povNoise(px, py, pz, ngen) * 2.0 - 1.0;
+        if (signal < 0.0) signal = -signal;
+        signal = offset - signal; signal *= signal;
+        double result = signal, weight = 1.0;
+        for (int i = 1; i < PARAM(2); i++) {
+            px *= Lambda; py *= Lambda; pz *= Lambda;
+            weight = signal * gain;
+            if (weight > 1.0) weight = 1.0;
+            if (weight < 0.0) weight = 0.0;
+            signal = povNoise(px, py, pz, ngen) * 2.0 - 1.0;
+            if (signal < 0.0) signal = -signal;
+            signal = offset - signal; signal *= signal; signal *= weight;
+            eacur *= eastep;
+            result += signal * eacur;
+        }
+        return result;""",
+    29: """        // f_hetero_mf
+        double vx = PARAM_X, vy = PARAM_Y, vz = PARAM_Z;
+        int ngen = (int)PARAM(5) & 3;
+        double signal = (povNoise(vx, vy, vz, ngen) * 2.0 - 1.0) + PARAM(3);
+        vx *= PARAM(1); vy *= PARAM(1); vz *= PARAM(1);
+        double p1_2_mp0 = pow(PARAM(1), -PARAM(0)), ea = p1_2_mp0;
+        for (int i = 1; i < PARAM(2); i++) {
+            double inc = ((povNoise(vx, vy, vz, ngen) * 2.0 - 1.0) + PARAM(3)) * ea;
+            for (int q = (int)PARAM(4); q > 0; --q) inc *= signal;
+            signal += inc;
+            vx *= PARAM(1); vy *= PARAM(1); vz *= PARAM(1);
+            ea *= p1_2_mp0;
+        }
+        double rem = PARAM(2) - (int)PARAM(2);
+        if (rem != 0.0) {
+            double inc = ((povNoise(vx, vy, vz, ngen) * 2.0 - 1.0) + PARAM(3)) * ea;
+            signal += rem * inc * signal;
+        }
+        return signal;""",
+}
 
 if not os.path.exists(CACHE):
     print(f"fetching {SRC_URL}")
@@ -76,7 +158,10 @@ supported = sorted(i for i in bodies if i not in EXCLUDE and i in arity)
 cases = []
 for idn in supported:
     nm = name_by_id[idn]
-    body = transform(bodies[idn]).strip("\n")
+    if idn in MANUAL_BODIES:
+        body = MANUAL_BODIES[idn].strip("\n")
+    else:
+        body = transform(bodies[idn]).strip("\n")
     cases.append(f"    case {idn}: {{ // {nm}\n{body}\n    }}")
 switch = "\n".join(cases)
 
@@ -113,12 +198,20 @@ TEMPLATE = r'''// pov_functions.h - EXACT ports of POV-Ray's internal isosurface
 #pragma once
 
 #if defined(__CUDACC__)
+  #ifndef POV_HD
   #define POV_HD __host__ __device__
+  #endif
 #else
+  #ifndef POV_HD
   #define POV_HD
+  #endif
 #endif
 
 #include <math.h>
+// povNoise() - exact host+device port of POV's Perlin Noise(), used by the
+// noise-based internal functions (f_noise3d, f_noise_generator, f_ridge,
+// f_ridged_mf, f_hetero_mf).
+#include "pov_noise.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

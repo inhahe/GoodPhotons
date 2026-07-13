@@ -13,16 +13,24 @@
 // (render_cuda.cu / dPatternEval), so results agree bit-for-bit across backends.
 //
 // EXCLUDED (need POV's Perlin-noise / pattern / pigment / spline engine, not yet
-// ported): f_hetero_mf(29), f_ridge(58), f_ridged_mf(59), f_noise3d(76), f_pattern(77), f_noise_generator(78).
+// ported): f_pattern(77).
 #pragma once
 
 #if defined(__CUDACC__)
+  #ifndef POV_HD
   #define POV_HD __host__ __device__
+  #endif
 #else
+  #ifndef POV_HD
   #define POV_HD
+  #endif
 #endif
 
 #include <math.h>
+// povNoise() - exact host+device port of POV's Perlin Noise(), used by the
+// noise-based internal functions (f_noise3d, f_noise_generator, f_ridge,
+// f_ridged_mf, f_hetero_mf).
+#include "pov_noise.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -362,6 +370,27 @@ POV_HD inline double povFnEval(int id, const double* _pp) {
         return(fabs(y1));
     }
     }
+    case 29: { // f_hetero_mf
+        // f_hetero_mf
+        double vx = PARAM_X, vy = PARAM_Y, vz = PARAM_Z;
+        int ngen = (int)PARAM(5) & 3;
+        double signal = (povNoise(vx, vy, vz, ngen) * 2.0 - 1.0) + PARAM(3);
+        vx *= PARAM(1); vy *= PARAM(1); vz *= PARAM(1);
+        double p1_2_mp0 = pow(PARAM(1), -PARAM(0)), ea = p1_2_mp0;
+        for (int i = 1; i < PARAM(2); i++) {
+            double inc = ((povNoise(vx, vy, vz, ngen) * 2.0 - 1.0) + PARAM(3)) * ea;
+            for (int q = (int)PARAM(4); q > 0; --q) inc *= signal;
+            signal += inc;
+            vx *= PARAM(1); vy *= PARAM(1); vz *= PARAM(1);
+            ea *= p1_2_mp0;
+        }
+        double rem = PARAM(2) - (int)PARAM(2);
+        if (rem != 0.0) {
+            double inc = ((povNoise(vx, vy, vz, ngen) * 2.0 - 1.0) + PARAM(3)) * ea;
+            signal += rem * inc * signal;
+        }
+        return signal;
+    }
     case 30: { // f_hunt_surface
     double r, x2=PARAM_X*PARAM_X, y2=PARAM_Y*PARAM_Y, z2=PARAM_Z*PARAM_Z;
     r=-( 4*(x2+y2+z2-13)*(x2+y2+z2-13)*(x2+y2+z2-13) +
@@ -559,6 +588,57 @@ POV_HD inline double povFnEval(int id, const double* _pp) {
     case 57: { // f_r
     return( sqrt(PARAM_X*PARAM_X + PARAM_Y*PARAM_Y + PARAM_Z*PARAM_Z ) );
     }
+    case 58: { // f_ridge
+        // f_ridge
+        double px = PARAM_X, py = PARAM_Y, pz = PARAM_Z;
+        int ngen = (int)PARAM(5) & 3;
+        double Lambda = PARAM(0), l = Lambda;
+        int Octaves = (int)PARAM(1);
+        double Omega = PARAM(2), o = Omega;
+        double off = PARAM(3), ridge = PARAM(4);
+        double rscale = 1.0 / fmax(ridge, 1.0 - ridge);
+        double scale  = 1.0 / fmax(off, 1.0 - off);
+        double resid = PARAM(1) - (double)Octaves;
+        double v = fabs(povNoise(px, py, pz, ngen) - ridge) * rscale;
+        double value = (v - off);
+        double tot = 1.0;
+        for (int i = 2; i <= Octaves; i++) {
+            double tx = px * l, ty = py * l, tz = pz * l;
+            v = fabs(povNoise(tx, ty, tz, ngen) - ridge) * rscale;
+            value += o * (v - off);
+            tot += o; l *= Lambda; o *= Omega;
+        }
+        if (resid != 0.0) {
+            double tx = px * l, ty = py * l, tz = pz * l;
+            v = fabs(povNoise(tx, ty, tz, ngen) - ridge) * rscale;
+            value += o * (v - off) * resid;
+            tot += o * resid;
+        }
+        return value * scale / tot;
+    }
+    case 59: { // f_ridged_mf
+        // f_ridged_mf (exponent array computed inline instead of cached)
+        double px = PARAM_X, py = PARAM_Y, pz = PARAM_Z;
+        int ngen = (int)PARAM(5) & 3;
+        double H = PARAM(0), Lambda = PARAM(1), offset = PARAM(3), gain = PARAM(4);
+        double eastep = pow(Lambda, -H), eacur = 1.0;
+        double signal = povNoise(px, py, pz, ngen) * 2.0 - 1.0;
+        if (signal < 0.0) signal = -signal;
+        signal = offset - signal; signal *= signal;
+        double result = signal, weight = 1.0;
+        for (int i = 1; i < PARAM(2); i++) {
+            px *= Lambda; py *= Lambda; pz *= Lambda;
+            weight = signal * gain;
+            if (weight > 1.0) weight = 1.0;
+            if (weight < 0.0) weight = 0.0;
+            signal = povNoise(px, py, pz, ngen) * 2.0 - 1.0;
+            if (signal < 0.0) signal = -signal;
+            signal = offset - signal; signal *= signal; signal *= weight;
+            eacur *= eastep;
+            result += signal * eacur;
+        }
+        return result;
+    }
     case 60: { // f_rounded_box
     double x2, y2, z2, x3, y3, z3;
 
@@ -677,6 +757,15 @@ POV_HD inline double povFnEval(int id, const double* _pp) {
     r=-( PARAM(1)*PARAM(1) * PARAM_Y + x2 * PARAM_Y - PARAM(2)  );
     return( fmin(10.0, fmax(PARAM(0)*r,-10.0)) );
     }
+    case 76: { // f_noise3d
+        // f_noise3d: POV Noise() with the scene-default generator (RangeCorrected=2)
+        return povNoise(PARAM_X, PARAM_Y, PARAM_Z, 2);
+    }
+    case 78: { // f_noise_generator
+        // f_noise_generator: generator selected by P0 (& 3)
+        int ngen = (int)PARAM(0) & 3;
+        return povNoise(PARAM_X, PARAM_Y, PARAM_Z, ngen);
+    }
     default: break;
     }
 #undef PARAM_X
@@ -721,6 +810,7 @@ POV_HD inline int povFnArity(int id) {
     case 26: return 10; // f_helix2
     case 27: return 4; // f_hex_x
     case 28: return 4; // f_hex_y
+    case 29: return 9; // f_hetero_mf
     case 30: return 4; // f_hunt_surface
     case 31: return 6; // f_hyperbolic_torus
     case 32: return 7; // f_isect_ellipsoids
@@ -749,6 +839,8 @@ POV_HD inline int povFnArity(int id) {
     case 55: return 4; // f_quartic_saddle
     case 56: return 6; // f_quartic_cylinder
     case 57: return 3; // f_r
+    case 58: return 9; // f_ridge
+    case 59: return 9; // f_ridged_mf
     case 60: return 7; // f_rounded_box
     case 61: return 4; // f_sphere
     case 62: return 8; // f_spikes
@@ -765,6 +857,8 @@ POV_HD inline int povFnArity(int id) {
     case 73: return 4; // f_umbrella
     case 74: return 5; // f_witch_of_agnesi
     case 75: return 9; // f_witch_of_agnesi_2d
+    case 76: return 3; // f_noise3d
+    case 78: return 4; // f_noise_generator
     default: return 0;
     }
 }
@@ -806,6 +900,7 @@ inline const PovFnInfo* povFnTable(int& count) {
     { "f_helix2", 26, 10 },
     { "f_hex_x", 27, 4 },
     { "f_hex_y", 28, 4 },
+    { "f_hetero_mf", 29, 9 },
     { "f_hunt_surface", 30, 4 },
     { "f_hyperbolic_torus", 31, 6 },
     { "f_isect_ellipsoids", 32, 7 },
@@ -834,6 +929,8 @@ inline const PovFnInfo* povFnTable(int& count) {
     { "f_quartic_saddle", 55, 4 },
     { "f_quartic_cylinder", 56, 6 },
     { "f_r", 57, 3 },
+    { "f_ridge", 58, 9 },
+    { "f_ridged_mf", 59, 9 },
     { "f_rounded_box", 60, 7 },
     { "f_sphere", 61, 4 },
     { "f_spikes", 62, 8 },
@@ -850,6 +947,8 @@ inline const PovFnInfo* povFnTable(int& count) {
     { "f_umbrella", 73, 4 },
     { "f_witch_of_agnesi", 74, 5 },
     { "f_witch_of_agnesi_2d", 75, 9 },
+    { "f_noise3d", 76, 3 },
+    { "f_noise_generator", 78, 4 },
     };
     count = (int)(sizeof(T) / sizeof(T[0]));
     return T;
