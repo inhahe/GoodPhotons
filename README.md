@@ -217,18 +217,23 @@ paths they can capture at all**.
   the standard spectral-photon-mapping XYZ estimate.)
 
 The **image-forming modes are all progressive** — the forward camera models
-(`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
-refine an image whose brightness is fixed while only graininess falls, so they share the
-same live progress and budget flags (`-time` / `-noise` / `-forever` / `-preview` /
-`-interval`, and periodic crash-safe writes) on **both** the CPU and the GPU. They're all
-GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via the forward megakernel,
-**`D`** via its own GPU BDPT megakernel, and **`R` (including the physical-lens camera)**
-via its own GPU backward megakernel — which the **`P` composite reuses for its camera-side
-layer**, so both of `P`'s layers run on the GPU when the scene is within the backward-GPU
-scope. Outside that scope `P`'s camera-side layer, and `V`'s backward reference (kept on
-the CPU as a stable ground truth), remain CPU-only. `R`/`D` accumulate their sample chunks
-in memory only (no disk `-resume`/`-checkpoint`; those stay forward-mode `A`/`B`/`C`), and
-the `P` composite is not progressive.
+(`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), and the
+composite (`P`) each refine an image whose brightness is fixed while only graininess
+falls, so they share the same live progress and budget flags (`-time` / `-noise` /
+`-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
+and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
+the forward megakernel, **`D`** via its own GPU BDPT megakernel, and **`R` (including the
+physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
+reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
+is within the backward-GPU scope. Outside that scope `P`'s camera-side layer, and `V`'s
+backward reference (kept on the CPU as a stable ground truth), remain CPU-only. The
+composite `P` classifies its pixels once, then alternates forward and backward batches
+into two accumulating films, re-fitting the forward→backward scale and re-blending each
+interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count checkpoint),
+`R`/`D` (spp-count checkpoint), and `P` (dual forward+backward film)** — a resumed render
+draws a decorrelated sample stream so its added samples genuinely reduce variance. Only the
+persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
+stay non-resumable.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
@@ -1026,8 +1031,11 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
-`-interval` apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`),
-on both CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
+`-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
+the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /
+`-checkpoint` cover `A`/`B`/`C` (photon-count checkpoint), `R`/`D` (spp-count checkpoint),
+and `P` (dual forward+backward film) — `M`/`S`/`U` keep persistent per-pass state a film
+alone can't restore, so they are not disk-resumable.
 
 | Flag | Meaning |
 |---|---|
@@ -1037,7 +1045,7 @@ on both CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) on
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
-| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (forward `A`/`B`/`C` only) |
+| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,

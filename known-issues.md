@@ -419,24 +419,31 @@ fallback.
 with proper mean-free-path blurring) is still not implemented — this material is a thin
 diffuse-transmission approximation, not volumetric SSS.
 
-### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
-The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now
-covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` backward,
-`D` BDPT) on both CPU and GPU. Two gaps remain:
-- **Mode `P` (composite) is still single-shot.** `renderComposite` (`main.cpp` ~line 1246)
-  couples a forward pass (`N` photons) and a backward pass (`spp`) with a **best-fit scale
-  `s`** solved once over the diffuse-side pixels, then classifies pixels and blends. Making
-  it progressive means chunking *both* passes, re-fitting `s` and recomputing the residual
-  each chunk (pixel classification is fixed and can be cached), and reporting the blended
-  frame — doable but a real design task, deferred. `-time`/etc. are currently rejected for
-  mode `P` with a warning.
-- **`R`/`D` accumulate chunks in memory only.** They get live progress and can stop on a
-  budget, but there's no `.ftbuf` disk checkpoint, so `-resume`/`-checkpoint` stay
-  forward-mode-only. A resumable spp film would need an spp-count checkpoint format
-  (the forward one stores a photon count) — proper fix is a small variant of
-  `writeCheckpoint`/`readCheckpoint` keyed on spp.
-
 ## Resolved
+
+### Mode `P` composite is not progressive; `R`/`D` have no disk resume — DONE 2026-07-13
+Both gaps closed. `-time`/`-noise`/`-forever`/`-preview`/`-interval` and `-resume`/
+`-checkpoint` now cover **all** the accumulating image modes — the forward camera models
+`A`/`B`/`C`, the spp reference modes `R` (backward) / `D` (BDPT), and the composite `P`.
+- **Mode `P` is now progressive** (`runCompositeProgressive`, `main.cpp` ~line 1986). The
+  view-dependent first-hit pixel classification is computed **once** (`classifyComposite`)
+  and reused; the driver then alternates forward (model-B, `N` photons) and backward
+  (camera-side, `spp`) batches into two persistent SUM films, adapting the batch toward
+  ~0.5 s so early frames appear fast. After each batch it re-fits the forward→backward
+  scale `s` and re-blends (`compositeFromFilms`), writing the image + a status line every
+  `-interval`. The old single-shot `renderComposite` wrapper was deleted.
+- **`R`/`D` now disk-resume** through `runSppProgressive`, reusing the single-film
+  `Checkpoint`/`writeCheckpoint`/`readCheckpoint` format keyed on **spp** (the mode byte is
+  folded into the identity guard so an `R` checkpoint can't be loaded as `D`, verified).
+- **Mode `P` gets a dual-film checkpoint** (`CompositeCheckpoint`, magic `FTPCM02`) storing
+  the forward SUM + backward SUM + their counts + the forward energy tally.
+- **Seed decorrelation on resume:** fresh samples are biased past the loaded ones via
+  `SppProgress::sampleBase` (CPU: added to the per-chunk seed; GPU: XORed into the megakernel
+  seed base) so continued samples are an independent noise realization. Validated: `R`
+  58 196→116 545 spp with noise tracking 100/√spp exactly (0.41 %→0.29 %); `D`
+  1016→2052 spp (3.14 %→2.21 %); `P` 36.2 M photons/4636 spp→56.5 M/7228 spp with the
+  diffuse-side residual falling 0.0281→0.0226 — proving the resumed samples reduce variance
+  rather than re-tracing identical paths.
 
 ### `light cylinder` "emits no illumination" — NOT A BUG (misdiagnosis) — RESOLVED 2026-07-13
 The original 2026-07-11 report claimed a `light cylinder` glows but lights nothing on

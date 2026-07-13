@@ -4967,7 +4967,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
-    const unsigned long long seed = 0x9e3779b97f4a7c15ULL;
+    // Resume (mode D disk resume): mix the loaded sample count into the seed base so the
+    // continued samples are decorrelated from the ones already in the checkpoint film.
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
     std::vector<double> camH(npix * 3), splatH(npix * 3);
     auto download = [&](Film& o) {
@@ -5038,7 +5041,10 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
-    const unsigned long long seed = 0x9e3779b97f4a7c15ULL;
+    // Resume (mode R disk resume): mix the loaded sample count into the seed base so the
+    // continued samples are decorrelated from the ones already in the checkpoint film.
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {

@@ -34,12 +34,21 @@ preserved). Touches the hottest device kernel.
 **Done when:** an instanced scene renders bit-identical to today with device memory flat
 in instance count, validated CPU↔GPU.
 
-## 2. Mode P not progressive; R/D no disk resume — ⬜
+## 2. Mode P not progressive; R/D no disk resume — ✅ DONE 2026-07-13
 **Source:** `known-issues.md` → Tech debt.
 Mode `P` (composite) doesn't do progressive output; modes `R`/`D` have no `.ftbuf`-style
 disk resume (forward modes A/B/C already checkpoint/resume). 
 **Done when:** `P` produces periodic progressive writes like A/B/C, and `R`/`D` write a
 resumable checkpoint sidecar honored by `-resume`.
+**Done:** `runCompositeProgressive` (`main.cpp`) makes `P` progressive — classify pixels
+once, alternate forward/backward batches into two SUM films, re-fit the scale and re-blend
+every `-interval`, with a dual-film `FTPCM02` checkpoint. `R`/`D` disk-resume via
+`runSppProgressive` reusing the single-film `Checkpoint` keyed on spp (mode byte in the
+guard blocks cross-mode loads). `SppProgress::sampleBase` decorrelates resumed samples
+(CPU seed offset / GPU seed-base XOR). Validated: `R` 58 196→116 545 spp and `D`
+1016→2052 spp both track 100/√spp exactly; `P` 36.2 M/4636 spp→56.5 M/7228 spp with the
+diffuse residual falling 0.0281→0.0226. `-resume`/`-checkpoint`/`-time`/`-noise`/`-forever`
+gates extended to `P`; dead `renderComposite` wrapper removed; docs updated.
 
 ## 3. Photon map / view-independent radiance cache (keystone) — ⬜
 **Source:** `ROADMAP.md` item (1).
@@ -71,3 +80,11 @@ _(none yet — will append here if a fork needs a human call; work continues on 
   BLAS): GPU (B) ≈ CPU (R) at Pearson r=0.996; implicit scene unregressed. Device geometry
   memory now flat in instance count. known-issues.md entry marked DONE. Starting item 2
   (mode P progressive + R/D disk resume).
+- 2026-07-13: item 2 DONE. Mode `P` is now progressive (`runCompositeProgressive`): classify
+  once, alternate forward/backward batches into two persistent SUM films, re-fit scale + re-
+  blend every interval, dual-film `FTPCM02` checkpoint. `R`/`D` disk-resume via
+  `runSppProgressive` (single-film spp-keyed `Checkpoint`, mode byte in guard). Resume seed
+  decorrelation via `SppProgress::sampleBase`. Validated on GPU (cornell): R/D noise tracks
+  100/√spp exactly across resume, P residual falls 0.0281→0.0226; cross-mode guard rejects a
+  mismatched checkpoint. Clean build, no warnings. Starting item 3 (photon map / radiance
+  cache — mode M already exists; verifying against done-criteria).

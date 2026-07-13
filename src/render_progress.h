@@ -24,4 +24,12 @@ struct SppProgress {
     //   final   : true when sppDone has reached the requested spp target
     // Return true to stop after the current chunk (host requested an early stop).
     std::function<bool(const Film& sumFilm, long long sppDone, bool final)> report;
+
+    // Resume seed bias (mode R / D disk resume). When a render continues from a saved
+    // checkpoint that already holds `sampleBase` samples-per-pixel, the freshly-traced
+    // samples must draw an INDEPENDENT noise realization, or averaging them into the
+    // loaded film wouldn't reduce variance. The chunked renderers fold this into their
+    // RNG seed (CPU: added to the per-chunk seed offset; GPU: mixed into the seed base)
+    // so the continued samples are decorrelated from the loaded ones. 0 = fresh render.
+    long long sampleBase = 0;
 };
