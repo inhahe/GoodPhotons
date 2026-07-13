@@ -1,26 +1,28 @@
-# Gallery Hall — a busy material showcase in a large interior room. A gold GYROID
-# lattice ball (thickened triply-periodic minimal surface, clipped to a sphere) is the
-# centrepiece, surrounded by a spread of objects that each exercise a different BSDF:
-# clear glass and diamond dielectrics, copper / silver / chrome / brass conductors,
-# structural-colour iridescents (morpho, oil-slick, soap-bubble, mother-of-pearl),
-# smooth-union metaballs, hard CSG, and a wax translucent (diffuse-transmission) sphere.
-# The polished floor softly mirrors them all and warm/cool accent lights tint the walls,
-# so there's a lot going on from every angle. Rendered with the backward path tracer
-# (mode R), which resolves the interior global illumination and the specular metals/glass
-# far better than the forward splat.
+# Gallery Hall — a large museum room full of material studies, each object either
+# standing on the floor or displayed on its own stone plinth. A gold GYROID lattice ball
+# (a thickened triply-periodic minimal surface, clipped to a sphere) is the centrepiece
+# on a broad low plinth; around it, pedestals carry clear glass and diamond dielectrics,
+# copper / silver conductors, morpho / oil-slick / soap-bubble / mother-of-pearl
+# iridescents, and a wax translucent (diffuse-transmission) sphere, while a chrome column
+# and a brass CSG block stand on the floor. A polished floor mirrors it all; broad ceiling
+# lights plus warm/cool accents and small glowing orbs light the hall. Rendered with the
+# backward path tracer (mode R), which resolves the interior GI and the specular
+# metals/glass far better than the forward splat.
 #
-#   ftrace -in scenes/gallery.ftsl -mode R -device gpu -spp 4096 -window -o png/gallery.png
-#   # quick look:  ftrace -in scenes/gallery.ftsl -mode R -device gpu -spp 256 -r 640 360 -o png/gallery.png
+#   ftrace -in scenes/gallery.ftsl -mode R -device gpu -noise 2 -window -o png/gallery.png
+#   # quick look:  ftrace -in scenes/gallery.ftsl -mode R -device gpu -spp 200 -r 640 360 -o png/gallery.png
 
 scene { units meters  spectral 360 830 1 }
 
-# --- Materials -----------------------------------------------------------------
+# --- Surfaces ------------------------------------------------------------------
 material "floor"  { type glossy     reflect rgb 0.40 0.36 0.32   roughness 0.28 }  # polished stone
-material "ceil"   { type diffuse    reflect whitewall 0.80 }
+material "ceil"   { type diffuse    reflect whitewall 0.82 }
 material "teal"   { type diffuse    reflect rgb 0.16 0.28 0.32 }                   # back wall
 material "red"    { type diffuse    reflect rgb 0.46 0.26 0.24 }                   # left wall (muted terracotta)
 material "green"  { type diffuse    reflect rgb 0.28 0.38 0.30 }                   # right wall (muted sage)
+material "stone"  { type diffuse    reflect rgb 0.20 0.19 0.18 }                   # dark plinths
 
+# --- Objects -------------------------------------------------------------------
 material "gold"    { preset gold }
 material "copper"  { preset copper }
 material "silver"  { preset silver }
@@ -34,88 +36,103 @@ material "bubble"  { preset soap-bubble }
 material "nacre"   { preset nacre }
 material "wax"     { type translucent  reflect rgb 0.80 0.55 0.30   transmit rgb 0.70 0.45 0.25 }
 
-# --- The room: 5 wide (x) x 3 tall (y) x 7 deep (z). Camera sits inside near z=6.5. ---
-quad { origin 0 0 0   u 5 0 0   v 0 0 7   material floor }   # floor
-quad { origin 0 3 0   u 0 0 7   v 5 0 0   material ceil  }   # ceiling
-quad { origin 0 0 0   u 0 3 0   v 5 0 0   material teal  }   # back  (z=0)
-quad { origin 0 0 7   u 0 3 0   v 5 0 0   material ceil  }   # front (z=7, behind camera)
-quad { origin 0 0 0   u 0 0 7   v 0 3 0   material red   }   # left  (x=0)
-quad { origin 5 0 0   u 0 3 0   v 0 0 7   material green }   # right (x=5)
+# --- The hall: 9 wide (x) x 4.5 tall (y) x 13 deep (z). Camera sits inside near z=12.2. ---
+quad { origin 0 0 0    u 9 0 0    v 0 0 13   material floor }   # floor
+quad { origin 0 4.5 0  u 0 0 13   v 9 0 0    material ceil  }   # ceiling
+quad { origin 0 0 0    u 0 4.5 0  v 9 0 0    material teal  }   # back  (z=0)
+quad { origin 0 0 13   u 0 4.5 0  v 9 0 0    material ceil  }   # front (z=13, behind camera)
+quad { origin 0 0 0    u 0 0 13   v 0 4.5 0  material red   }   # left  (x=0)
+quad { origin 9 0 0    u 0 4.5 0  v 0 0 13   material green }   # right (x=9)
 
-# --- Hero: gold gyroid lattice ball (thickened TPMS sheet clipped to a sphere) -------
-# The field is translated to the ball centre so the sin/cos lattice is centred on it.
+# =========================  CENTREPIECE  =======================================
+# Broad low plinth (top at y=0.6) carrying the gold gyroid lattice ball.
+isosurface { material stone  box { center 4.5 0.30 6.0   size 2.2 0.60 2.2   round 0.05 } }
 isosurface {
     material gold
     intersect {
         function {
-            translate 2.5 0.9 2.7
+            translate 4.5 1.38 6.0
             expr "abs(sin(14*x)*cos(14*y) + sin(14*y)*cos(14*z) + sin(14*z)*cos(14*x)) - 0.5"
         }
-        sphere { center 2.5 0.9 2.7   radius 0.78 }
+        sphere { center 4.5 1.38 6.0   radius 0.78 }
     }
-    contained_by { min 1.70 0.10 1.90   max 3.30 1.70 3.50 }
+    contained_by { min 3.70 0.58 5.20   max 5.30 2.18 6.80 }
     max_gradient 48
 }
 
-# --- Dielectrics: clear glass + a brilliant diamond, near the camera. Each has a
-# small glowing accent orb tucked behind it (below) so it refracts something bright. ---
-sphere { center 1.10 0.50 4.8   radius 0.48   material glass   }
-sphere { center 3.92 0.46 4.5   radius 0.44   material diamond }
+# =========================  FRONT ROW (z ~ 8.6)  ===============================
+# Four display plinths (tops at y=0.9) spread across the hall; the centre is left
+# open so the gyroid stays visible between them.
+isosurface { material stone  box { center 1.9 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
+sphere { center 1.9 1.40 8.6   radius 0.50   material glass }
 
-# --- Conductors --------------------------------------------------------------------
-# Copper torus tilted to face the camera (translate = rotate in place; see FTSL §10.1).
+isosurface { material stone  box { center 3.2 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
+sphere { center 3.2 1.30 8.6   radius 0.40   material bubble }
+
+isosurface { material stone  box { center 5.8 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
+sphere { center 5.8 1.30 8.6   radius 0.40   material wax }
+
+isosurface { material stone  box { center 7.1 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
+sphere { center 7.1 1.35 8.6   radius 0.45   material diamond }
+
+# =========================  MID ROW (z ~ 5.4), flanking the hero  ==============
+# Copper torus stood upright on its plinth (top 1.0), silver metaballs on the other.
+isosurface { material stone  box { center 2.0 0.50 5.4   size 0.65 1.0 0.65   round 0.03 } }
 isosurface {
     material copper
-    torus { translate 1.30 0.95 3.7   rotate 72 0 0   major 0.34   minor 0.10 }
+    torus { translate 2.0 1.44 5.4   rotate 90 0 0   major 0.34   minor 0.10 }
 }
-# Silver metaballs (smooth union).
+
+isosurface { material stone  box { center 7.0 0.50 5.4   size 0.70 1.0 0.70   round 0.03 } }
 isosurface {
     material silver
     blob {
-        k 0.12
-        sphere { center 3.60 0.42 3.4   radius 0.24 }
-        sphere { center 3.86 0.46 3.5   radius 0.22 }
-        sphere { center 3.72 0.66 3.5   radius 0.20 }
+        k 0.14
+        sphere { center 6.85 1.24 5.40   radius 0.24 }
+        sphere { center 7.12 1.28 5.50   radius 0.22 }
+        sphere { center 6.98 1.50 5.45   radius 0.20 }
     }
 }
-# Chrome mirror pillar in the back-left corner (reflects the whole room).
+
+# =========================  BACK ROW (z ~ 3.3)  ================================
+isosurface { material stone  box { center 2.2 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
+sphere { center 2.2 1.32 3.3   radius 0.42   material morpho }
+
+isosurface { material stone  box { center 4.5 0.45 3.0   size 0.70 0.9 0.70   round 0.03 } }
+sphere { center 4.5 1.30 3.0   radius 0.40   material nacre }
+
+isosurface { material stone  box { center 6.8 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
+sphere { center 6.8 1.32 3.3   radius 0.42   material oil }
+
+# =========================  FLOOR PIECES  ======================================
+# Tall chrome column standing on the floor in the back-left corner (mirrors the hall).
 isosurface {
     material chrome
-    cylinder { translate 0.62 0.90 0.95   radius 0.26   height 1.80 }
+    cylinder { translate 1.1 1.50 1.6   radius 0.42   height 3.0 }
 }
-# Brass hard-CSG block near the camera: a rounded box with a sphere bored out.
+# Brass hard-CSG sculpture on the floor, near the camera on the right: a rounded box
+# with a sphere bored out of the front face.
 isosurface {
     material brass
     difference {
-        box    { center 2.5 0.42 5.35   size 0.66 0.66 0.66   round 0.06 }
-        sphere { center 2.5 0.42 5.05   radius 0.34 }
+        box    { center 6.0 0.60 10.6   size 1.1 1.2 1.1   round 0.08 }
+        sphere { center 6.0 0.75 10.05   radius 0.52 }
     }
 }
 
-# --- Structural colour (iridescents) -----------------------------------------------
-sphere { center 0.78 0.45 2.3   radius 0.45   material morpho }   # back-left, blue
-sphere { center 4.28 0.45 2.2   radius 0.45   material oil    }   # back-right, rainbow
-sphere { center 3.10 0.40 1.4   radius 0.40   material nacre  }   # back, pearlescent
-# Floating soap bubble above the hero.
-sphere { center 2.45 1.78 3.95   radius 0.32   material bubble }
-
-# --- Translucent wax sphere (diffuse transmission / thin-SSS look) ------------------
-sphere { center 1.90 0.40 1.5   radius 0.40   material wax }
-
-# --- Lighting: three broad neutral key lights down the hall + warm & cool accents ---
-light area { origin 1.3 2.98 5.0   u 1.4 0 0   v 0 0 1.0   normal 0 -1 0   spd preset:d65 }
-light area { origin 1.3 2.98 3.1   u 1.4 0 0   v 0 0 1.0   normal 0 -1 0   spd preset:d65 }
-light area { origin 1.0 2.98 0.9   u 2.0 0 0   v 0 0 1.1   normal 0 -1 0   spd preset:d65 }       # broad back wash
-light area { origin 3.7 2.6  0.9   u 0.7 0 0   v 0 0 0.6   normal 0 -1 0   spd blackbody 3000 }  # warm accent
-light area { origin 0.4 2.6  1.6   u 0.5 0 0   v 0 0 0.7   normal 0 -1 0   spd blackbody 8500 }  # cool accent
-# Small glowing decor orbs: colour points that also light (and refract inside) the
-# glass and diamond in front of them.
-light sphere { center 1.00 0.42 3.85   radius 0.11   spd blackbody 2500 }   # warm, behind glass
-light sphere { center 4.02 0.40 3.7    radius 0.11   spd blackbody 9000 }   # cool, behind diamond
-light sphere { center 2.50 0.16 4.55   radius 0.09   spd blackbody 5500 }   # low centre spark
+# =========================  LIGHTING  ==========================================
+# Three broad neutral ceiling lights down the hall, warm & cool wall accents, and a
+# few small glowing orbs that also give the glass and diamond something bright to refract.
+light area { origin 2.5 4.48 8.0   u 4.0 0 0   v 0 0 1.6   normal 0 -1 0   spd preset:d65 }
+light area { origin 2.5 4.48 5.3   u 4.0 0 0   v 0 0 1.6   normal 0 -1 0   spd preset:d65 }
+light area { origin 2.5 4.48 2.4   u 4.0 0 0   v 0 0 1.4   normal 0 -1 0   spd preset:d65 }
+light area { origin 7.6 4.0  2.0   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd blackbody 3000 }  # warm accent
+light area { origin 0.7 4.0  2.6   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd blackbody 8500 }  # cool accent
+light sphere { center 1.9 1.35 7.7   radius 0.10   spd blackbody 2500 }   # warm, behind glass
+light sphere { center 7.1 1.35 7.7   radius 0.10   spd blackbody 9000 }   # cool, behind diamond
 
 camera "cam" {
-    eye 2.5 1.45 6.5   look_at 2.5 0.92 2.6   up 0 1 0   fov_y 54
+    eye 4.5 1.85 12.2   look_at 4.5 1.15 5.5   up 0 1 0   fov_y 52
     mode R
-    film { res 1280 720   exposure 1.45 }
+    film { res 1280 720   exposure 1.5 }
 }
