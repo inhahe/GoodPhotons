@@ -186,6 +186,13 @@ measured SPD into `illuminant/` (e.g. `hps.csv`) and reference it as `preset:hps
   Ushio UXL datasheets, which state ~6000 K daylight continuum, CRI Ra 98. No CSV
   needed; the datasheet SPD plots add only small visible ripples plus 800-1000 nm
   NIR spikes outside the render's visible range.
+- **SKIPPED (neon):** a Ne I "neon sign" preset was attempted by summing the full
+  NIST ASD observed line list (380-720 nm) as narrow Gaussians, but the result is
+  near-white (xy≈0.29,0.31), not the expected orange-red (xy≈0.65,0.32). NIST
+  "relative intensity" values are photographic/visual estimates compiled per
+  multiplet, **not radiant powers**, so the many catalogued blue-green lines swamp
+  the red 2p→1s lines that dominate a real low-pressure neon discharge. Ship a
+  *measured* neon SPD instead (LSPDD / LICA-UCM below), not a NIST-synthesized one.
 - **LSPDD** — Lamp Spectral Power Distribution Database (lspdd.org): measured SPDs
   of real market lamps; per-lamp CSV export.
 - **LICA-UCM lamps spectral database v2.6** (guaix.fis.ucm.es): measured lamp SPDs.
