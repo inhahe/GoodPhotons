@@ -21,7 +21,7 @@ same. Controlled absolute-`power` test: cylinder vs sphere wall-region means mat
 entry moved to Resolved with the explanation; `scraps/cyl_test.ftsl` updated to use
 `power 4000` so it demonstrates the (correct) lit wall.
 
-## 1. GPU instancing expands instances to world tris — ⬜
+## 1. GPU instancing expands instances to world tris — ✅ DONE 2026-07-13
 **Source:** `known-issues.md` → Tech debt.
 CPU has a true two-level BVH (`mesh_asset`/`mesh_instance` share one BLAS). The GPU
 `buildUploadScene` (`render_cuda.cu`) expands every instance into world-space triangles
@@ -64,3 +64,10 @@ _(none yet — will append here if a fork needs a human call; work continues on 
 - 2026-07-13: item 0 closed as NOT-A-BUG (see above). Cylinder light verified correct on
   CPU (R) and GPU (B) via controlled absolute-power tests. Docs + repro scene updated.
   Starting item 1 (GPU two-level BVH for instancing).
+- 2026-07-13: item 1 DONE. Implemented a device two-level BVH in `render_cuda.cu`
+  (`DBlas`/`DInstance` + shared `blasTris`/`blasNodes`/`blasPrim` pools, `blasClosest`/
+  `blasOccluded`, instance-leaf branch in `closestHit`/`occluded`, `Scene::bvh` uploaded
+  verbatim). Validated with `scraps/instance_test.ftsl` (4 tori, one shared 16 384-tri
+  BLAS): GPU (B) ≈ CPU (R) at Pearson r=0.996; implicit scene unregressed. Device geometry
+  memory now flat in instance count. known-issues.md entry marked DONE. Starting item 2
+  (mode P progressive + R/D disk resume).

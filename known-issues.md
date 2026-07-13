@@ -160,7 +160,7 @@ follow-up, not a bug:
 The core path (buffers/GLB, node transforms, POSITION/NORMAL/TEXCOORD_0, indexed +
 non-indexed tris, metallic-roughness → BSDF) is validated on CPU and GPU.
 
-### Instancing memory saving is CPU-only (GPU expands instances) — 2026-07-12
+### Instancing memory saving is CPU-only (GPU expands instances) — 2026-07-12 — DONE 2026-07-13
 `mesh_asset`/`mesh_instance` (§5c) give a true two-level BVH on the CPU: instances share
 one BLAS (triangles + BVH), so N copies cost N affines. **The GPU has no two-level
 traversal** — `buildUploadScene` (`render_cuda.cu`) EXPANDS every instance into
@@ -172,6 +172,25 @@ node/tri/primIdx pools + an instance table (toLocal affine + blasId + matOverrid
 an instance-leaf branch to the device `traverseClosest`/`traverseAny` that transforms the
 ray into BLAS space (parametric `t` is preserved, exactly as on the CPU). Deferred because
 it touches the hottest device kernel; the expand-at-upload path is correct and low-risk.
+
+**RESOLVED 2026-07-13 — device two-level BVH.** `render_cuda.cu` now mirrors the CPU.
+`Scene::bvh` (TLAS) is uploaded **verbatim** in all cases; its prim-index layout
+`[tris | spheres | implicits | instances]` is understood by the device leaf dispatch in
+both `closestHit` and `occluded` (a prim index `>= nTris+nSph+nImplicits` is an instance
+leaf). New device structs `DBlas { nodeOff, triOff, primOff }` and `DInstance { Lm[9],
+Lt[3] (world→local affine), Nm[9] ((toWorld)⁻ᵀ normal matrix, host-precomputed), blasId,
+matOverride }`. Each `Blas` contributes its local-space tris/BVH-nodes/primIdx to three
+**concatenated shared pools** (`blasTris`/`blasNodes`/`blasPrim`) uploaded ONCE, and a
+`DInstance` places it via an affine — so N copies cost one `DInstance` each, not N× tris.
+Device `blasClosest`/`blasOccluded` walk the shared sub-BVH in BLAS-local space (48-deep
+local stack); `affPoint`/`affDir` transform the ray (dir NOT renormalized, so local `t` ==
+world `t`, matching the host `Blas`); `instanceHitToWorld` maps the hit back (normal by
+`Nm`, shading normal re-oriented, matOverride applied). Validated with
+`scraps/instance_test.ftsl` (4 tori sharing one 16 384-tri BLAS, incl. a material override
+and a mirror): GPU mode B matches CPU backward reference mode R at Pearson r=0.996 (MAE
+~1/255; residual is the forward-vs-backward mirror-highlight difference). Implicit scenes
+still render correctly (the leaf-dispatch bounds change is a no-op with no instances).
+Device geometry memory is now flat in instance count.
 
 ### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
 On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes

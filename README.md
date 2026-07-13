@@ -500,9 +500,10 @@ its local space; `mesh_instance { of "name"  translate … rotate … scale …
 share one triangle set and one bottom-level BVH — a **two-level BVH** (TLAS over
 instances → shared BLAS) — so N copies cost N affines instead of N triangle sets,
 and a per-instance `material` can override the asset's own materials. Works in
-every render mode; the memory sharing is CPU-side (the GPU expands instances to
-world triangles at upload, giving identical images). Everything is accelerated by
-a BVH.
+every render mode, and the memory sharing holds on **both** the CPU and the GPU: the
+device also uses a true two-level BVH (shared per-BLAS pools + an instance table that
+transforms the ray into BLAS space), so device memory scales with unique geometry, not
+with the instance count. Everything is accelerated by a BVH.
 
 ### Implicit surfaces (`isosurface`)
 
