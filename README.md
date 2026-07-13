@@ -573,6 +573,32 @@ The worked gyroid example is in `scenes/function.ftsl`; expression isosurfaces r
 expression sphere matches the analytic `sphere` leaf to RMSE ≈ 0.15 % on the same
 backend).
 
+**Container shape and caps.** The container can be a box **or a sphere**, and you can
+choose whether the container *seals* the solid it cuts:
+
+```
+isosurface {
+    material gold
+    function { expr "f_enneper(x, y, z, 1)"  scale 1.7  translate 0 1.2 0 }
+    contained_by { sphere { center 0 1.2 0  radius 1.7 } }   # curved boundary
+    max_gradient 20
+    open                                                     # (optional) don't cap
+}
+```
+
+`contained_by { sphere { center <x y z>  radius r } }` clips the ray along a **smooth
+curved boundary** instead of the axis-aligned `min`/`max` box, so an *unbounded* surface
+(e.g. `f_enneper`, or a solid that pokes out of the container) reads as a natural rounded
+edge rather than hard box facets. The sphere `center`/`radius` are taken in the field's
+frame and transformed to world (exact under uniform scale; a conservative bounding sphere
+under rotation/shear). Where the container wall slices through **solid** material
+(`f < 0`), it is **capped** by default — sealed with a flat/curved face of the isosurface
+material (a cleanly sawn-off solid). The **`open`** keyword suppresses those caps, leaving
+the surface's cut edge and a see-through opening into the interior (`open off` forces the
+default). Caps only affect surfaces that actually reach the container wall; a fully
+bounded surface never touches it, so the choice is moot. Both the container shape and the
+cap policy run identically on CPU and GPU.
+
 ##### POV-Ray internal functions (`f_torus`, `f_heart`, …)
 
 The formula VM also ships the **complete set of POV-Ray's built-in isosurface

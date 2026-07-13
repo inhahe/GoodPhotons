@@ -279,6 +279,10 @@ struct DImplicit {
     int    uvProj;           // 0 none, 1 planar, 2 spherical, 3 cylindrical (UvProjection)
     int    uvAxis;           // 0=x, 1=y, 2=z (projection/up axis)
     double uvLo[3], uvHi[3]; // reference box for the [0,1] UV wrap
+    int    container;        // 0 = box (lo/hi), 1 = sphere (sphereCenter/sphereRadius)
+    double sphereCenter[3];  // world center for Container::Sphere
+    double sphereRadius;     // world radius for Container::Sphere
+    int    capped;           // 1 = draw container caps (closed); 0 = `open`
 };
 
 // Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
@@ -1191,16 +1195,59 @@ __device__ static void dProjectUV(double px, double py, double pz,
 __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                                           const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
     double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
-    double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
-    double t0 = tmin, t1 = hit.t;
-    // clip to world AABB
-    { double ta = (im.lo[0]-ox)*idx, tb = (im.hi[0]-ox)*idx; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
-    { double ta = (im.lo[1]-oy)*idy, tb = (im.hi[1]-oy)*idy; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
-    { double ta = (im.lo[2]-oz)*idz, tb = (im.hi[2]-oz)*idz; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
 
     const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
     const PatNode* exprPool = sc.fieldExprNodes;
     const int N = im.nodeN;
+
+    // ---- Container clip: entry/exit params [tEnter, tExit] and the container's OUTWARD
+    // normals at those crossings (needed to shade caps). Box (lo/hi) or world sphere.
+    double tEnter, tExit;
+    double neX = 0, neY = 0, neZ = 0, nxX = 0, nxY = 0, nxZ = 0;
+    if (im.container == 1) {
+        double ocx = ox - im.sphereCenter[0], ocy = oy - im.sphereCenter[1], ocz = oz - im.sphereCenter[2];
+        double A = dx*dx + dy*dy + dz*dz;
+        double B = ocx*dx + ocy*dy + ocz*dz;
+        double C = ocx*ocx + ocy*ocy + ocz*ocz - im.sphereRadius*im.sphereRadius;
+        double disc = B*B - A*C;
+        if (disc < 0.0) return false;
+        double sq = sqrt(disc);
+        tEnter = (-B - sq) / A;
+        tExit  = (-B + sq) / A;
+        double pex = ox + dx*tEnter, pey = oy + dy*tEnter, pez = oz + dz*tEnter;
+        double pxx = ox + dx*tExit,  pxy = oy + dy*tExit,  pxz = oz + dz*tExit;
+        double gex = pex - im.sphereCenter[0], gey = pey - im.sphereCenter[1], gez = pez - im.sphereCenter[2];
+        double gxx = pxx - im.sphereCenter[0], gxy = pxy - im.sphereCenter[1], gxz = pxz - im.sphereCenter[2];
+        double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
+        if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
+        if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+    } else {
+        double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
+        tEnter = -1e300; tExit = 1e300;
+        int eAx = 0; double eSgn = -1.0;
+        int xAx = 0; double xSgn = 1.0;
+        double o3[3] = {ox, oy, oz}, id3[3] = {idx, idy, idz};
+        double lo3[3] = {im.lo[0], im.lo[1], im.lo[2]}, hi3[3] = {im.hi[0], im.hi[1], im.hi[2]};
+        for (int a = 0; a < 3; ++a) {
+            double tLo = (lo3[a] - o3[a]) * id3[a];
+            double tHi = (hi3[a] - o3[a]) * id3[a];
+            double tnear, tfar, nearSgn, farSgn;
+            if (id3[a] >= 0.0) { tnear = tLo; tfar = tHi; nearSgn = -1.0; farSgn = +1.0; }
+            else               { tnear = tHi; tfar = tLo; nearSgn = +1.0; farSgn = -1.0; }
+            if (tnear > tEnter) { tEnter = tnear; eAx = a; eSgn = nearSgn; }
+            if (tfar  < tExit)  { tExit  = tfar;  xAx = a; xSgn = farSgn; }
+            if (tExit < tEnter) return false;
+        }
+        if (eAx == 0) neX = eSgn; else if (eAx == 1) neY = eSgn; else neZ = eSgn;
+        if (xAx == 0) nxX = xSgn; else if (xAx == 1) nxY = xSgn; else nxZ = xSgn;
+    }
+    double t0 = tmin, t1 = hit.t;
+    if (tEnter > t0) t0 = tEnter;
+    if (tExit  < t1) t1 = tExit;
+    if (t1 < t0) return false;
+    const bool capped          = (im.capped != 0);
+    const bool exitIsContainer = (tExit <= (double)hit.t);
+
     const double dlen = sqrt(dx*dx + dy*dy + dz*dz);
     const int MAX_STEP = 2048;
     const double invLip = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
@@ -1210,8 +1257,28 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const double fixedStep   = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
     const bool   regulaFalsi = (im.refine == 1);
 
+    // Commit a hit at parametric `th`, world point (px,py,pz), geometric normal (gx,gy,gz).
+    auto writeHit = [&](double th, double px, double py, double pz,
+                        double gx, double gy, double gz) -> bool {
+        hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
+        hit.ng = DVec3(gx, gy, gz);
+        double side = dx*gx + dy*gy + dz*gz;
+        hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
+        hit.matId = im.matId; hit.sensorId = -1;
+        if (im.uvProj != 0) {
+            double uu, vv;
+            dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
+            hit.u = (Real)uu; hit.v = (Real)vv;
+        } else { hit.u = 0; hit.v = 0; }
+        return true;
+    };
+
     double t = t0;
     double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
+    // NEAR CAP: ray enters the container already inside the solid (f<0); the container
+    // face is the nearest surface. `open` skips this to reveal the cut edge.
+    if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0)
+        return writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
     for (int i = 0; i < MAX_STEP; ++i) {
         double step = sampleMode ? fixedStep : fmax(fabs(f) * invLip, minStep) / dlen;
         double tn = t + step;
@@ -1247,19 +1314,15 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
             double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool);
-            hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
-            hit.ng = DVec3(gx, gy, gz);
-            double side = dx*gx + dy*gy + dz*gz;
-            hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
-            hit.matId = im.matId; hit.sensorId = -1;
-            if (im.uvProj != 0) {
-                double uu, vv;
-                dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
-                hit.u = (Real)uu; hit.v = (Real)vv;
-            } else { hit.u = 0; hit.v = 0; }
-            return true;
+            return writeHit(th, px, py, pz, gx, gy, gz);
         }
-        if (last) return false;
+        if (last) {
+            // FAR CAP: reached the container exit still inside the solid (fn<0), and the
+            // far clip is the container itself — seal the sawn-off solid.
+            if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < (double)hit.t)
+                return writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
+            return false;
+        }
         t = tn; f = fn;
     }
     return false;
@@ -4112,6 +4175,12 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.uvLo[0] = ub.lo.x; d.uvLo[1] = ub.lo.y; d.uvLo[2] = ub.lo.z;
             d.uvHi[0] = ub.hi.x; d.uvHi[1] = ub.hi.y; d.uvHi[2] = ub.hi.z;
         }
+        d.container = (int)im.container;
+        d.sphereCenter[0] = im.sphereCenter.x;
+        d.sphereCenter[1] = im.sphereCenter.y;
+        d.sphereCenter[2] = im.sphereCenter.z;
+        d.sphereRadius = im.sphereRadius;
+        d.capped = im.capped ? 1 : 0;
         // Rebase this implicit's field program (and its private expr pool) into the
         // shared device pools; sets d.nodeOff/d.nodeN.
         appendFieldProgram(im.nodes, im.exprNodes, d.nodeOff, d.nodeN);

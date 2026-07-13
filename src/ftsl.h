@@ -1548,17 +1548,51 @@ private:
                 return false;
             }
             const Block& cbb = *cb->val.block;
-            Vec3 mn{-1,-1,-1}, mx{1,1,1};
-            vec3Of(cbb, "min", mn);
-            vec3Of(cbb, "max", mx);
-            // Transform all 8 authored corners into world (metre-rebased) and take the AABB.
-            Aabb box; bool first = true;
-            for (int c = 0; c < 8; ++c) {
-                Vec3 corner{(c&1)?mx.x:mn.x, (c&2)?mx.y:mn.y, (c&4)?mx.z:mn.z};
-                Vec3 w = rootXf.apply(corner) * L_;
-                if (first) { box.lo = w; box.hi = w; first = false; } else box.expand(w);
+            // Container shape. `contained_by { sphere { center x y z  radius r } }`
+            // clips the ray along a smooth curved boundary (an unbounded surface's
+            // unavoidable cut then reads as a rounded edge, not hard box facets);
+            // otherwise a `min`/`max` axis-aligned box.
+            Aabb box;
+            const Stmt* sph = find(cbb, "sphere");
+            if (sph && sph->val.block) {
+                const Block& sb = *sph->val.block;
+                Vec3 ctr{0, 0, 0}; vec3Of(sb, "center", ctr);
+                double rad = dblOf(sb, "radius", 1.0);
+                // World center; radius scaled by the leaf transform (exact for uniform
+                // scale, a conservative bounding sphere under rotation/shear).
+                Vec3 cw = rootXf.apply(ctr) * L_;
+                double rx = length(rootXf.apply(ctr + Vec3{rad, 0, 0}) * L_ - cw);
+                double ry = length(rootXf.apply(ctr + Vec3{0, rad, 0}) * L_ - cw);
+                double rz = length(rootXf.apply(ctr + Vec3{0, 0, rad}) * L_ - cw);
+                double rw = std::fmax(rx, std::fmax(ry, rz));
+                im.container    = Container::Sphere;
+                im.sphereCenter = cw;
+                im.sphereRadius = rw;
+                box.lo = cw - Vec3{rw, rw, rw};
+                box.hi = cw + Vec3{rw, rw, rw};
+            } else {
+                Vec3 mn{-1,-1,-1}, mx{1,1,1};
+                vec3Of(cbb, "min", mn);
+                vec3Of(cbb, "max", mx);
+                // Transform all 8 authored corners into world (metre-rebased), take the AABB.
+                bool first = true;
+                for (int c = 0; c < 8; ++c) {
+                    Vec3 corner{(c&1)?mx.x:mn.x, (c&2)?mx.y:mn.y, (c&4)?mx.z:mn.z};
+                    Vec3 w = rootXf.apply(corner) * L_;
+                    if (first) { box.lo = w; box.hi = w; first = false; } else box.expand(w);
+                }
+                im.container = Container::Box;
             }
             im.bounds = box;
+            // Cap policy: a container-clipped solid is sealed with a face of the
+            // isosurface material by default; `open` (or `open on`) omits those caps,
+            // leaving the surface's cut edge / a see-through opening. `open off`
+            // forces the default. Only affects surfaces that reach the container.
+            const Stmt* openS = find(b, "open");
+            std::string openV = strOf(b, "open", "");
+            bool isOpen = (openS != nullptr) &&
+                          !(openV == "off" || openV == "false" || openV == "no" || openV == "0");
+            im.capped = !isOpen;
             double mg = dblOf(b, "max_gradient", 0.0);
             im.lipschitz = (mg > 0.0) ? mg
                                       : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box);

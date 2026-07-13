@@ -200,6 +200,13 @@ enum class MarchMethod : int { Adaptive = 0, Sample = 1 };
 //     safeguard so the bracket always shrinks; faster on smooth brackets.
 enum class RootRefine : int { Bisect = 0, RegulaFalsi = 1 };
 
+// Container shape an expression isosurface is clipped to (POV `contained_by`).
+//   Box    — the world AABB `bounds` (default; flat clip planes).
+//   Sphere — a world sphere (center/radius); clips along a smooth curved boundary,
+//            so an unbounded surface's unavoidable cut reads as a rounded edge
+//            instead of hard facets. `bounds` is still the sphere's AABB for BVH.
+enum class Container : int { Box = 0, Sphere = 1 };
+
 // ---------------------------------------------------------------------------
 // The primitive.
 // ---------------------------------------------------------------------------
@@ -208,6 +215,16 @@ struct Implicit {
     std::vector<PatNode> exprNodes; // shared pool backing FieldOp::Expr leaves (f(x,y,z))
     int    matId = 0;
     Aabb   bounds;                  // conservative world AABB (BVH leaf box + ray clip)
+    // Container shape + cap policy (expression isosurfaces only; SDF/CSG leaves are
+    // closed and never touch their computed bounds, so they leave these at defaults).
+    Container container = Container::Box;
+    Vec3      sphereCenter{0, 0, 0};   // world center  (Container::Sphere)
+    double    sphereRadius = 0.0;      // world radius  (Container::Sphere)
+    // Where the solid interior (f<0) is sliced by the container wall, `capped` draws
+    // that slice as a face of the isosurface material (a cleanly "sawn off" solid);
+    // `open` (capped=false) omits it, leaving the surface's cut edge / a see-through
+    // opening. Only affects surfaces that actually reach the container.
+    bool      capped = false;
     // Lipschitz bound of the field: for a true SDF this is 1, and a sphere-trace
     // step of |f| never overshoots. Fields that aren't unit-Lipschitz (e.g. summed
     // metaball densities) set this > 1 so the step is scaled down to |f|/lipschitz,
@@ -243,18 +260,54 @@ struct Implicit {
 // is in world distance, so the parametric step is (|f|/lipschitz)/|d|. Writes into
 // `hit` (respecting hit.t as the current closest) and returns true on a nearer hit.
 inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit& hit) {
-    // Clip the ray to the primitive's world AABB: [t0, t1].
-    Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
-    double t0 = tmin, t1 = hit.t;
-    for (int a = 0; a < 3; ++a) {
-        double o = vget(r.o, a), id = vget(invD, a);
-        double ta = (vget(im.bounds.lo, a) - o) * id;
-        double tb = (vget(im.bounds.hi, a) - o) * id;
-        if (ta > tb) std::swap(ta, tb);
-        if (ta > t0) t0 = ta;
-        if (tb < t1) t1 = tb;
-        if (t1 < t0) return false;
+    // ---- Container clip: entry/exit params [tEnter, tExit] and the container's
+    // OUTWARD normals at those crossings (needed to shade caps). The container is the
+    // world AABB `bounds` (box) or a world sphere. `bounds` is always the BVH/broad box.
+    double tEnter, tExit;
+    Vec3   nEnter{0, 0, 0}, nExit{0, 0, 0};
+    if (im.container == Container::Sphere) {
+        Vec3   oc = r.o - im.sphereCenter;
+        double A  = dot(r.d, r.d);
+        double B  = dot(oc, r.d);
+        double C  = dot(oc, oc) - im.sphereRadius * im.sphereRadius;
+        double disc = B * B - A * C;
+        if (disc < 0.0) return false;
+        double sq = std::sqrt(disc);
+        tEnter = (-B - sq) / A;
+        tExit  = (-B + sq) / A;
+        Vec3 pe = r.o + r.d * tEnter, px = r.o + r.d * tExit;
+        Vec3 ge = pe - im.sphereCenter, gx = px - im.sphereCenter;
+        double le = length(ge), lx = length(gx);
+        nEnter = (le > 0.0) ? ge / le : Vec3{0, 0, 1};
+        nExit  = (lx > 0.0) ? gx / lx : Vec3{0, 0, 1};
+    } else {
+        Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
+        tEnter = -1e300; tExit = 1e300;
+        int eAx = 0; double eSgn = -1.0;   // entry face axis + outward-normal sign
+        int xAx = 0; double xSgn = 1.0;    // exit  face axis + outward-normal sign
+        for (int a = 0; a < 3; ++a) {
+            double o = vget(r.o, a), id = vget(invD, a);
+            double tLo = (vget(im.bounds.lo, a) - o) * id;
+            double tHi = (vget(im.bounds.hi, a) - o) * id;
+            double tnear, tfar, nearSgn, farSgn;
+            if (id >= 0.0) { tnear = tLo; tfar = tHi; nearSgn = -1.0; farSgn = +1.0; }
+            else           { tnear = tHi; tfar = tLo; nearSgn = +1.0; farSgn = -1.0; }
+            if (tnear > tEnter) { tEnter = tnear; eAx = a; eSgn = nearSgn; }
+            if (tfar  < tExit)  { tExit  = tfar;  xAx = a; xSgn = farSgn; }
+            if (tExit < tEnter) return false;
+        }
+        (eAx == 0 ? nEnter.x : eAx == 1 ? nEnter.y : nEnter.z) = eSgn;
+        (xAx == 0 ? nExit.x  : xAx == 1 ? nExit.y  : nExit.z)  = xSgn;
     }
+    double t0 = tmin, t1 = hit.t;
+    if (tEnter > t0) t0 = tEnter;
+    if (tExit  < t1) t1 = tExit;
+    if (t1 < t0) return false;
+    // `capped` draws the container face where the ray is inside the solid at a
+    // container crossing. `exitIsContainer` = the far clip ended at the container wall
+    // (not at a nearer surface via hit.t), so a far cap there is genuinely visible.
+    const bool capped          = im.capped;
+    const bool exitIsContainer = (tExit <= hit.t);
 
     const double dlen    = length(r.d);
     const int    N       = (int)im.nodes.size();
@@ -281,8 +334,30 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     const double fixedStep  = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
     const bool  regulaFalsi = (im.refine == RootRefine::RegulaFalsi);
 
+    // Commit a hit at parametric `th`, world point `p`, geometric normal `ng`
+    // (field gradient for the surface; container outward normal for a cap).
+    auto writeHit = [&](double th, const Vec3& p, const Vec3& ng) -> bool {
+        hit.t = th; hit.p = p; hit.valid = true;
+        hit.ng = ng;
+        hit.n  = (dot(r.d, ng) < 0.0) ? ng : -ng;
+        hit.matId = im.matId; hit.sensorId = -1;
+        if (im.uvProj != UvProjection::None) {
+            const Aabb& b = im.uvBoundsSet ? im.uvBounds : im.bounds;
+            Vec3 ctr = (b.lo + b.hi) * 0.5;
+            Vec3 uv = projectUV(p, b.lo, b.hi, ctr, im.uvProj, im.uvAxis);
+            hit.u = uv.x; hit.v = uv.y;
+        } else { hit.u = 0.0; hit.v = 0.0; }
+        return true;
+    };
+
     double t = t0;
     double f = fieldEval(nd, N, r.o + r.d * t, pool);
+    // NEAR CAP: the ray enters the container from outside (tEnter >= tmin) already
+    // inside the solid (f<0). The container face is then the first surface along the
+    // ray — the nearest possible hit — so cap it and return. `open` surfaces skip this
+    // and let the march reveal the field (a see-through opening / cut edge).
+    if (capped && tEnter >= tmin && tEnter < hit.t && f < 0.0)
+        return writeHit(tEnter, r.o + r.d * tEnter, nEnter);
     for (int i = 0; i < MAX_STEP; ++i) {
         double step = sampleMode ? fixedStep
                                  : std::fmax(std::fabs(f) * invLip, minStep) / dlen;
@@ -327,23 +402,17 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             Vec3 p = r.o + r.d * th;
             double eps = std::fmax(1e-6, 1e-4 * th);
             Vec3 g = fieldGradient(nd, N, p, eps, pool);
-            hit.t = th; hit.p = p; hit.valid = true;
-            hit.ng = g;
-            hit.n = (dot(r.d, g) < 0.0) ? g : -g;
-            hit.matId = im.matId; hit.sensorId = -1;
-            if (im.uvProj != UvProjection::None) {
-                // Wrap UV from the world hit point across the reference box (same
-                // planar/spherical/cylindrical projection meshes use).
-                const Aabb& b = im.uvBoundsSet ? im.uvBounds : im.bounds;
-                Vec3 ctr = (b.lo + b.hi) * 0.5;
-                Vec3 uv = projectUV(p, b.lo, b.hi, ctr, im.uvProj, im.uvAxis);
-                hit.u = uv.x; hit.v = uv.y;
-            } else {
-                hit.u = 0.0; hit.v = 0.0;   // procedural materials use hit.p directly
-            }
-            return true;
+            return writeHit(th, p, g);   // field surface: geometric normal = gradient
         }
-        if (last) return false;
+        if (last) {
+            // FAR CAP: reached the container exit still inside the solid (fn<0) — the
+            // exit face seals the sawn-off solid. Only when the far clip is the
+            // container itself (not a nearer surface via hit.t). Handles rays that
+            // originate inside the solid (bounce/transmission/shadow) and exit a cap.
+            if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < hit.t)
+                return writeHit(tExit, r.o + r.d * tExit, nExit);
+            return false;
+        }
         t = tn; f = fn;
     }
     return false;

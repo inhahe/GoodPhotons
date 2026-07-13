@@ -80,7 +80,16 @@ function-*wrappers* around POV's texturing engine, not standalone math. Out of s
 (if ever) that engine is ported. Parser rejects any unported name as an "unknown
 identifier", so scenes fail loudly rather than silently.
 
-### Isosurface `contained_by` is box-only — add a sphere/curved container — 2026-07-13
+### Isosurface `contained_by` is box-only — add a sphere/curved container — 2026-07-13 — DONE 2026-07-13
+**DONE:** `contained_by { sphere { center <x y z>  radius r } }` is now accepted (`ftsl.h`
+`addIsosurface`), storing `Container::Sphere` + world `sphereCenter`/`sphereRadius` on the
+`Implicit` (box stays the default). `intersectImplicit` (`implicit.h`) and the device twin
+(`render_cuda.cu`) clip the ray against the actual container (sphere → quadratic; box →
+face-tracking slab) and carry the container's outward normals for cap shading. The AABB
+`im.bounds` is still the BVH-leaf/broad bound (set to the sphere's AABB for sphere
+containers). Validated on `f_enneper`/`f_klein_bottle` (rounded clip vs box facets) — see
+`scraps/gen_container_test.py` → `png/iso_container_grid.png`.
+
 **What:** an isosurface's `contained_by { min <x y z>  max <x y z> }` is the *only*
 container shape we support — an axis-aligned box (see `ftsl.h` `addIsosurface`
 ~line 1545; the 8 corners are transformed to world and reduced to an AABB stored as
@@ -100,7 +109,19 @@ with the actual container (sphere slab → quadratic) rather than the AABB, and 
 mirror (`render_cuda.cu` `dIntersectImplicit`) needs the same. AABB stays as the BVH-leaf
 bound regardless.
 
-### Isosurface container has no cap/`open` control (and no proper cap at all) — 2026-07-13
+### Isosurface container has no cap/`open` control (and no proper cap at all) — 2026-07-13 — DONE 2026-07-13
+**DONE:** `intersectImplicit` (CPU `implicit.h` + device `render_cuda.cu`) now caps the
+container. In the **default capped** mode a ray that enters the container already inside
+the solid (`f < 0` at the near clip) registers a hit on the container's near face (a NEAR
+cap); a ray that reaches the container exit still inside the solid registers a hit on the
+far face (a FAR cap, only when the far clip is the container itself, so bounce/transmission/
+shadow rays originating inside the solid seal correctly). Both use the container's outward
+normal and the isosurface material. The **`open`** keyword on the `isosurface {}` block
+(`ftsl.h`, default `capped = true` for expr fields) suppresses both caps, revealing the
+cut edge. Fully-bounded surfaces (`f > 0` at entry) never trigger a cap, so SDF/CSG leaves
+are byte-identical. Validated: `f_enneper`/`f_klein_bottle` render as cleanly sealed solids
+by default and open shells with `open`.
+
 **What:** where an isosurface's solid interior (`f < 0`) is sliced by the container wall,
 we render **neither** a clean sealed cap **nor** a clean open edge. `intersectImplicit`
 (`implicit.h` ~line 245) clips the ray to the container and reports the first field
