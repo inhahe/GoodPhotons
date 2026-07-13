@@ -1,0 +1,44 @@
+# GE ConstantColor CMH G12 ceramic metal-halide, cool white (CCT 4200 K).
+# aliases: cmh-4200k metal-halide-4200k ceramic-metal-halide-4200k cool-white-mh
+# Visually traced from the spectral-power-distribution plot on p.4 of the
+# GE ConstantColor CMH G12 datasheet (Sep 2013), 390-750 nm; coarse trace
+# of the plot envelope plus the characteristic In/Tl/Na + rare-earth
+# emission features, tuned so CIE 1931 xy = (0.379, 0.375).
+wavelength_nm,relative_power
+390,0.2143
+400,0.2976
+410,0.4048
+420,0.3095
+430,0.3690
+440,0.4286
+450,0.5119
+460,0.4524
+470,0.4643
+480,0.5000
+490,0.5000
+500,0.5238
+510,0.5357
+520,0.5476
+530,0.5833
+540,0.9762
+550,0.6190
+560,0.5357
+570,0.5833
+580,0.7500
+590,1.0000
+600,0.8690
+610,0.6786
+620,0.6667
+630,0.7976
+640,0.7024
+650,0.7024
+660,0.7024
+670,0.8214
+680,0.6905
+690,0.7143
+700,0.6190
+710,0.5000
+720,0.3810
+730,0.2738
+740,0.1786
+750,0.1310

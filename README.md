@@ -352,7 +352,10 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
     measured CIE F-series `f2`/`cool-white`, `f7`/`daylight-fl`, `f11`/`triphosphor`.
   - **Gas-discharge lamps:** `hps`/`sodium` (high-pressure sodium),
     `lps`/`sodium-low` (low-pressure sodium), `mercury`/`hg` (mercury vapor),
-    `metal-halide`/`mh`.
+    `metal-halide`/`mh` (analytic line model), plus measured ceramic-metal-halide
+    SPDs `cmh`/`cmh-3000k` (warm white) and `cmh-4200k` (cool white), digitized from
+    the GE ConstantColor CMH G12 datasheet and colour-matched to its published
+    chromaticity.
 - **`rgb r g b`** — Jakob–Hanika sigmoid upsampling to a reflectance spectrum
   (round-trips under D65).
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
