@@ -36,13 +36,17 @@ material "bubble"  { preset soap-bubble }
 material "nacre"   { preset nacre }
 material "wax"     { type translucent  reflect rgb 0.80 0.55 0.30   transmit rgb 0.70 0.45 0.25 }
 
-# --- The hall: 9 wide (x) x 4.5 tall (y) x 13 deep (z). Camera sits inside near z=12.2. ---
-quad { origin 0 0 0    u 9 0 0    v 0 0 13   material floor }   # floor
-quad { origin 0 4.5 0  u 0 0 13   v 9 0 0    material ceil  }   # ceiling
-quad { origin 0 0 0    u 0 4.5 0  v 9 0 0    material teal  }   # back  (z=0)
-quad { origin 0 0 13   u 0 4.5 0  v 9 0 0    material ceil  }   # front (z=13, behind camera)
-quad { origin 0 0 0    u 0 0 13   v 0 4.5 0  material red   }   # left  (x=0)
-quad { origin 9 0 0    u 0 4.5 0  v 0 0 13   material green }   # right (x=9)
+# --- The hall: 9 wide (x) x 4.5 tall (y) x 15.5 deep (z). The extra depth lets the
+# camera sit well back (z=14.6) with a NARROW 44deg lens: a wide lens (the old 52deg
+# at z=12.2) is rectilinear, so it stretches spheres near the frame edges into ovals
+# (off-axis solid-angle distortion). Pulling back + narrowing keeps the outer pieces
+# comfortably inside ~24deg of the axis where that stretch is negligible. ---
+quad { origin 0 0 0    u 9 0 0    v 0 0 15.5   material floor }   # floor
+quad { origin 0 4.5 0  u 0 0 15.5 v 9 0 0      material ceil  }   # ceiling
+quad { origin 0 0 0    u 0 4.5 0  v 9 0 0      material teal  }   # back  (z=0)
+quad { origin 0 0 15.5 u 0 4.5 0  v 9 0 0      material ceil  }   # front (z=15.5, behind camera)
+quad { origin 0 0 0    u 0 0 15.5 v 0 4.5 0    material red   }   # left  (x=0)
+quad { origin 9 0 0    u 0 4.5 0  v 0 0 15.5   material green }   # right (x=9)
 
 # =========================  CENTREPIECE  =======================================
 # Broad low plinth (top at y=0.6) carrying the gold gyroid lattice ball.
@@ -70,10 +74,34 @@ isosurface { material stone  box { center 1.9 0.45 8.6   size 0.75 0.9 0.75   ro
 sphere { center 1.9 1.40 8.6   radius 0.50   material glass }
 
 isosurface { material stone  box { center 3.2 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
-sphere { center 3.2 1.30 8.6   radius 0.40   material bubble }
+# Two interlocked rings smooth-fused into a chain-link knot (soap-film iridescence
+# reads beautifully off the doubly-curved tube).
+isosurface {
+    material bubble
+    smooth_union {
+        k 0.06
+        torus { translate 3.2 1.32 8.6   rotate 0  0 0   major 0.26   minor 0.085 }
+        torus { translate 3.2 1.32 8.6   rotate 90 0 0   major 0.26   minor 0.085 }
+    }
+    contained_by { min 2.75 0.87 8.15   max 3.65 1.77 9.05 }
+    max_gradient 8
+}
 
 isosurface { material stone  box { center 5.8 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
-sphere { center 5.8 1.30 8.6   radius 0.40   material wax }
+# Lumpy asymmetric blob — a melted wax glob (four offset metaballs of different radii,
+# so the silhouette is irregular, not a sphere). Diffuse-transmission wax glows softly.
+isosurface {
+    material wax
+    blob {
+        k 0.11
+        sphere { center 5.70 1.20 8.58   radius 0.25 }
+        sphere { center 5.90 1.33 8.66   radius 0.21 }
+        sphere { center 5.80 1.52 8.52   radius 0.16 }
+        sphere { center 5.96 1.16 8.50   radius 0.14 }
+    }
+    contained_by { min 5.30 0.85 8.10   max 6.30 1.80 9.10 }
+    max_gradient 8
+}
 
 isosurface { material stone  box { center 7.1 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
 sphere { center 7.1 1.35 8.6   radius 0.45   material diamond }
@@ -106,13 +134,49 @@ isosurface {
 
 # =========================  BACK ROW (z ~ 3.3)  ================================
 isosurface { material stone  box { center 2.2 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
-sphere { center 2.2 1.32 3.3   radius 0.42   material morpho }
+# Twisted vertical ribbon: a thin sheet |rotated-x| < 4.5 cm whose rotation angle winds
+# with height (helical twist ~5 rad/m), clipped to an ellipsoid. Morpho-blue iridescence
+# on a butterfly-wing form. The `function` value is not a distance, so max_gradient bounds
+# the field's Lipschitz constant for the safe sphere-march.
+isosurface {
+    material morpho
+    intersect {
+        function {
+            translate 2.2 1.35 3.3
+            expr "abs(x*cos(5*y) - z*sin(5*y)) - 0.045"
+        }
+        ellipsoid { center 2.2 1.35 3.3   radius 0.34 0.44 0.20 }
+    }
+    contained_by { min 1.80 0.88 2.98   max 2.60 1.82 3.62 }
+    max_gradient 9
+}
 
 isosurface { material stone  box { center 4.5 0.45 3.0   size 0.70 0.9 0.70   round 0.03 } }
-sphere { center 4.5 1.30 3.0   radius 0.40   material nacre }
+# Superellipsoid "cushion": |x/a|^4 + |y/b|^4 + |z/c|^4 = 1. A plump rounded-cube pillow
+# (not a sphere, not a lattice) — the smooth broad faces show off nacre's angle-dependent
+# mother-of-pearl sheen.
+isosurface {
+    material nacre
+    function {
+        translate 4.5 1.32 3.0
+        expr "pow(abs(x/0.36),4) + pow(abs(y/0.30),4) + pow(abs(z/0.36),4) - 1"
+    }
+    contained_by { min 4.05 0.92 2.55   max 4.95 1.72 3.45 }
+    max_gradient 26
+}
 
 isosurface { material stone  box { center 6.8 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
-sphere { center 6.8 1.32 3.3   radius 0.42   material oil }
+# Dimpled sphere: radius 0.36 modulated by a ±5 cm sinusoidal bump field (a brain-coral /
+# golf-ball relief). Oil-slick thin-film shifts hue across every bump.
+isosurface {
+    material oil
+    function {
+        translate 6.8 1.34 3.3
+        expr "sqrt(x*x + y*y + z*z) - 0.36 - 0.05*sin(9*x)*sin(9*y)*sin(9*z)"
+    }
+    contained_by { min 6.28 0.85 2.78   max 7.32 1.83 3.82 }
+    max_gradient 6
+}
 
 # =========================  FLOOR PIECES  ======================================
 # Tall chrome column standing on the floor in the back-left corner (mirrors the hall).
@@ -141,8 +205,16 @@ light area { origin 0.7 4.0  2.6   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd b
 light sphere { center 1.9 1.35 7.7   radius 0.10   spd blackbody 2500 }   # warm, behind glass
 light sphere { center 7.1 1.35 7.7   radius 0.10   spd blackbody 9000 }   # cool, behind diamond
 
+# --- Atmosphere: a faint hall haze. Participating media is BUILT IN (Henyey-Greenstein
+# phase + delta/ratio tracking), so this thin homogeneous fog gives the whole hall aerial
+# depth and lets the ceiling lights cast soft volumetric shafts. Mode R renders a
+# HOMOGENEOUS GLOBAL medium like this; for a BOUNDED or HETEROGENEOUS glowing fog
+# (sigma via `bounds { ... }` / a `density "expr"` field) render mode D (BDPT), which
+# resolves fog-through-glass and varying density that the mode-R/forward paths cannot.
+medium { sigma_t 0.016   albedo 0.85   g 0.6 }
+
 camera "cam" {
-    eye 4.5 1.85 12.2   look_at 4.5 1.15 5.5   up 0 1 0   fov_y 52
+    eye 4.5 1.90 14.6   look_at 4.5 1.15 5.8   up 0 1 0   fov_y 44
     mode R
     film { res 1280 720   exposure 1.5 }
 }
