@@ -87,6 +87,18 @@ struct Affine {
         return r;
     }
 
+    // Transform a surface normal: normals map by the INVERSE-TRANSPOSE of the
+    // linear part (not the affine itself), so they stay perpendicular to the
+    // surface under non-uniform scale. Result is NOT normalized (the caller
+    // renormalizes). Falls back to applyDir when the linear part is singular.
+    Vec3 applyNormal(const Vec3& n) const {
+        Affine inv = inverse();
+        // (M^-1)^T * n  — transpose means read inv.m in column order.
+        return Vec3{inv.m[0] * n.x + inv.m[3] * n.y + inv.m[6] * n.z,
+                    inv.m[1] * n.x + inv.m[4] * n.y + inv.m[7] * n.z,
+                    inv.m[2] * n.x + inv.m[5] * n.y + inv.m[8] * n.z};
+    }
+
     // Uniform-scale factor of the linear part (column norms; rotation preserves
     // length so a column's norm is its axis scale). Sets `nonUniform` when the
     // three axis scales differ beyond a small tolerance — the caller uses this to

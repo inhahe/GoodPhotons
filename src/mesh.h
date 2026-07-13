@@ -1,8 +1,9 @@
-// Minimal Wavefront OBJ loader. Reads v / f (triangulating polygons via a fan);
-// ignores vt/vn/mtl for now (surface appearance comes from the assigned material,
-// and geometric normals are recomputed in Scene::build). Dependency-free — enough
-// to drop real meshes into a scene and stress the BVH. A richer loader (normals,
-// per-face materials, .mtl) can replace this later.
+// Minimal Wavefront OBJ loader. Reads v / vt / vn / f (triangulating polygons via
+// a fan). Per-vertex `vn` normals are loaded as smooth SHADING normals (transformed
+// by the mesh transform's inverse-transpose); a mesh without `vn` stays exactly
+// flat-shaded (Tri::finalize falls the per-vertex normals back to the geometric
+// normal). Dependency-free — enough to drop real meshes into a scene and stress the
+// BVH. A richer loader (per-face materials, full .mtl) can replace this later.
 #pragma once
 #include <cstdio>
 #include <fstream>
@@ -37,6 +38,21 @@ inline int objTexIndex(const std::string& tok, int texCount) {
     int idx = std::atoi(field.c_str());
     if (idx > 0)  return idx - 1;
     if (idx < 0)  return texCount + idx;       // relative
+    return -1;
+}
+
+// Parse the normal index (the 3rd field) of an OBJ face token ("12/3/4",
+// "12//4"). Returns -1 when the token carries no vn ("12" or "12/3").
+inline int objNormalIndex(const std::string& tok, int normCount) {
+    auto p = tok.find('/');
+    if (p == std::string::npos) return -1;
+    auto q = tok.find('/', p + 1);
+    if (q == std::string::npos) return -1;     // "12/3" has no vn
+    std::string field = tok.substr(q + 1);
+    if (field.empty()) return -1;
+    int idx = std::atoi(field.c_str());
+    if (idx > 0)  return idx - 1;
+    if (idx < 0)  return normCount + idx;      // relative
     return -1;
 }
 
@@ -117,6 +133,7 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
 
     std::vector<Vec3> verts;
     std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
+    std::vector<Vec3> normals;     // per `vn`, already in WORLD space (inv-transpose)
     int curMat = matId;            // active material (switched by `usemtl` when resolving)
     int added = 0;
     std::string line;
@@ -135,6 +152,15 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
             std::istringstream ss(line.substr(2));
             double u = 0, v = 0; ss >> u >> v;
             texcoords.push_back(Vec3{u, v, 0});
+        } else if (line[0] == 'v' && line[1] == 'n') {
+            // Smooth shading normal: transform object->world by the inverse-transpose
+            // of the mesh transform's linear part, then normalize (renormalized again
+            // in finalize()). Stored world-space so it feeds Tri.n{0,1,2} directly.
+            std::istringstream ss(line.substr(2));
+            Vec3 vn; ss >> vn.x >> vn.y >> vn.z;
+            Vec3 wn = xf.applyNormal(vn);
+            double l = std::sqrt(dot(wn, wn));
+            normals.push_back(l > 1e-18 ? wn * (1.0 / l) : Vec3{0, 0, 0});
         } else if (matResolver && line.rfind("usemtl", 0) == 0) {
             std::istringstream ss(line.substr(6));
             std::string name; ss >> name;
@@ -142,23 +168,30 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
             curMat = (resolved >= 0) ? resolved : matId;
         } else if (line[0] == 'f' && line[1] == ' ') {
             std::istringstream ss(line.substr(2));
-            std::vector<int> idx, tidx;
+            std::vector<int> idx, tidx, nidx;
             std::string tok;
             while (ss >> tok) {
                 int vi = objVertexIndex(tok, (int)verts.size());
                 if (vi < 0 || vi >= (int)verts.size()) continue;
                 idx.push_back(vi);
                 tidx.push_back(loadUV ? objTexIndex(tok, (int)texcoords.size()) : -1);
+                nidx.push_back(objNormalIndex(tok, (int)normals.size()));
             }
             // Fan-triangulate the polygon (0, k, k+1).
             auto uvAt = [&](int ti) -> Vec3 {
                 return (ti >= 0 && ti < (int)texcoords.size()) ? texcoords[ti] : Vec3{0, 0, 0};
+            };
+            auto nAt = [&](int ni) -> Vec3 {
+                return (ni >= 0 && ni < (int)normals.size()) ? normals[ni] : Vec3{0, 0, 0};
             };
             for (size_t k = 1; k + 1 < idx.size(); ++k) {
                 Tri t{verts[idx[0]], verts[idx[k]], verts[idx[k + 1]], curMat, -1, {}};
                 if (loadUV) {
                     t.uv0 = uvAt(tidx[0]); t.uv1 = uvAt(tidx[k]); t.uv2 = uvAt(tidx[k + 1]);
                 }
+                // Per-vertex shading normals (zero => finalize() falls back to gn,
+                // preserving exact flat-shading for meshes without `vn`).
+                t.n0 = nAt(nidx[0]); t.n1 = nAt(nidx[k]); t.n2 = nAt(nidx[k + 1]);
                 s.tris.push_back(t);
                 if (proceduralUV) triVI.push_back({idx[0], idx[k], idx[k + 1]});
                 ++added;

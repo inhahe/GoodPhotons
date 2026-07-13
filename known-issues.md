@@ -3,6 +3,27 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Recently fixed
+
+### GPU forward camera-splat out-of-bounds write (illegal memory access) — FIXED 2026-07-12
+
+The GPU forward/light-tracing kernel (modes A/B/C, and the splat in M/S/U) could
+crash with `[cuda] forward kernel failed: an illegal memory access was encountered`.
+**Root cause:** `DCamera::project()` / `lensImage()` compute the splat pixel as
+`px = (int)((ix*0.5+0.5)*resX)` in **FP32** (`Real`). The on-film rejection test only
+guarantees `ix,iy < 1`, but the gap between the largest float below 1 and 1.0 is
+~6e-8, so for a photon landing within that gap of the film edge, `(ix*0.5f+0.5f)`
+rounds to exactly `1.0f` and `px` becomes `resX` (likewise `py==resY`). `filmAdd()`
+indexes `py*resX+px` with no bounds check → out-of-bounds write. Data-dependent, so
+it manifested only for some scenes/resolutions and always eventually with enough
+photons (longer renders reliably tripped it). The CPU `Camera::project()` uses
+`double` and never rounds up this way, which is why CPU renders were unaffected.
+**Fix:** clamp `px∈[0,resX-1]`, `py∈[0,resY-1]` right after the cast in all three GPU
+projection sites (`project()` rectilinear + fisheye/panoramic branches, `lensImage()`;
+`catchPhoton()` routes through `lensImage()`). The rejection test already guarantees
+the point is on-film, so clamping the boundary roundup to the last pixel is exact.
+See `render_cuda.cu` ~line 555/577/624.
+
 ## Open bugs
 
 ### `light cylinder` emits no illumination (tube is visible but lights nothing) — 2026-07-11
@@ -33,6 +54,61 @@ glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposu
   accents + colored walls for this reason.
 
 ## Tech debt
+
+### glTF/GLB loader is a static-geometry subset — 2026-07-12
+The new glTF 2.0 loader (`src/gltf.h` + `src/third_party/json.h`) covers the common
+static-mesh case but deliberately omits a number of glTF features. Each is a scoped
+follow-up, not a bug:
+- **No textures.** Only `baseColorFactor`/`metallicFactor`/`roughnessFactor` *scalars*
+  are read; `baseColorTexture`/`metallicRoughnessTexture`/`normalTexture` are ignored.
+  Proper fix: decode referenced images (glTF images are PNG/JPEG — the renderer already
+  vendors stb_image), register them as `Scene::textures`, and set `reflectTex`/UV set.
+- **No KHR material extensions** (transmission, clearcoat, volume, ior, emissive
+  strength, sheen, specular). A glass glTF loads as an opaque glossy/diffuse, not a
+  dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
+  `MatType::Dielectric` with the given ior; other extensions as feasible.
+- **No `emissiveFactor` import.** Emissive glTF materials load unlit. (Intentionally
+  skipped for now: setting `emit` without registering the tris as a sampled light would
+  desync NEE; doing it right means adding mesh-emitter area lights — tied to ROADMAP §5
+  "emissive triangles".)
+- **No skinning, morph targets, animation, or sparse accessors.** Static bind pose only.
+- **Non-triangle primitives** (points/lines/strips/fans, `mode != 4`) are skipped with a
+  note; only `mode 4` (TRIANGLES) is baked.
+- Materials are created **per glTF material, not deduplicated across meshes/files**. (A
+  `mesh` still bakes its triangles into `Scene::tris`; use `mesh_asset`/`mesh_instance`
+  for shared instanced geometry — see below.)
+The core path (buffers/GLB, node transforms, POSITION/NORMAL/TEXCOORD_0, indexed +
+non-indexed tris, metallic-roughness → BSDF) is validated on CPU and GPU.
+
+### Instancing memory saving is CPU-only (GPU expands instances) — 2026-07-12
+`mesh_asset`/`mesh_instance` (§5c) give a true two-level BVH on the CPU: instances share
+one BLAS (triangles + BVH), so N copies cost N affines. **The GPU has no two-level
+traversal** — `buildUploadScene` (`render_cuda.cu`) EXPANDS every instance into
+world-space triangles, appends them to the flat device tri list, and rebuilds a single
+flat BVH over the whole set at upload. Images are identical to the CPU, but device memory
+scales with total instanced triangles (no sharing), so a huge instanced scene that fits on
+the CPU can OOM on the GPU. Proper fix: a device two-level BVH — upload per-BLAS
+node/tri/primIdx pools + an instance table (toLocal affine + blasId + matOverride) and add
+an instance-leaf branch to the device `traverseClosest`/`traverseAny` that transforms the
+ray into BLAS space (parametric `t` is preserved, exactly as on the CPU). Deferred because
+it touches the hottest device kernel; the expand-at-upload path is correct and low-risk.
+
+### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
+On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes
+and the new photon-map mode agree with each other but sit **~5% brighter** than the
+backward path tracer:
+- `R` (backward): mean 61.05  →  `B` (forward splat): 63.96  →  `M` (photon map): 63.84.
+
+Mode `M` matching mode `B` to within 0.2% is the *expected* result (both measure the
+same forward light transport, just from a stored map vs. a live splat) and **confirms
+the photon map is correct**. The open question is the **pre-existing forward-vs-backward
+discrepancy** — `B` and `R` should converge to the same image but don't quite. Likely
+suspects: a subtle difference in area-light emission normalization / solid-angle pdf
+between the forward emit sampler and the backward NEE light pdf, or a `cos`/pdf factor
+at the light or first diffuse bounce. Not introduced by this work; surfaced by the mode-M
+validation. **Proper fix:** derive both estimators' light-vertex measure on paper for the
+1-bounce diffuse case and reconcile the constant (check `emitSampler` power vs. `sampleLight`
+radiance × pdf). Until then `V`'s residual bakes this ~5% in.
 
 ### No bounded / per-object participating medium (fog is global-only) — 2026-07-12 — CPU + GPU forward DONE 2026-07-12 (box/sphere/implicit bounds, density fields, multi-medium superposition, object-name bounds)
 **Resolved on the CPU forward tracer.** The `medium` block now takes an optional
@@ -93,10 +169,30 @@ images as a bright disc — `scraps/fogsphere.ftsl` mode D fog-sphere center box
 (saturating) vs mode B's 0.00, at the same absolute exposure.
 The fog still correctly **lights the surrounding room** (indirect, via NEE off the walls),
 and an **open** fog sphere (no glass shell) is directly viewable in every forward mode
-(`scraps/fogorb.ftsl` mode B center box mean 135.8). A proper fix is refractive/manifold
-next-event estimation (specular connections through the glass) — genuine research-grade work,
-out of scope; a naive "let connect rays pass through glass" hack is wrong (it draws the fog
-along a straight line, with no lensing, in the wrong place) and is deliberately avoided.
+(`scraps/fogorb.ftsl` mode B center box mean 135.8). A naive "let connect rays pass through
+glass" hack is wrong (it draws the fog along a straight line, with no lensing, in the wrong
+place) and is deliberately avoided — the correct fix is the analytic specular connection below.
+
+**Mode-B analytic specular connection through glass SPHERES — DONE 2026-07-12.** The proper
+refractive/manifold next-event estimation is now implemented for the tractable case: a
+**glass sphere** in the **pinhole splat (`B`)**. For each fog in-scatter vertex (and each
+diffuse surface vertex), the renderer solves — in closed form — the refracted eye ray that
+leaves the vertex, bends through the sphere, and reaches the pinhole: a planar reduction of
+the two-refraction manifold to a **1-D root solve**, with a ray-differential Jacobian
+(`G = eps²/|ax·by − ay·bx|`) supplying the splat weight, and Fresnel-transmittance ×
+Beer-Lambert interior absorption × medium transmittance along the two glass segments. The
+sphere's ior is evaluated at the photon's **own wavelength**, so the refraction is dispersive
+for free. Unified surface/volume vertices via a `SpecVtx`/`DSpecVtx` `term(wP)` (Lambertian
+`rho/π·cosSurf` vs HG-phase·albedo). Implemented on **CPU** (`render.h`:
+`connectSpecularSphere`/`connectSpecularSphereInside`, `camSpecularSplatAll`/`…VolumeAll`)
+and **GPU** (`render_cuda.cu`: `dConnectSpecularSphere`/`…Inside`, `camSpecularSplatAll`/
+`camSpecularSplatVolumeAll`), validated GPU-vs-CPU and vs BDPT/mode-P ground truth. So a
+lantern glowing inside — and a fly-through *through* — a clear glass orb now images correctly
+in mode B (see `scenes/lanterns.ftsl`). *Still out of scope for now:* the finite-lens splat
+(`A`), photon-catch (`C`), and **non-spherical** dielectric shells — those still render the
+direct fog-through-glass view black in the forward splat modes (use BDPT `D`, which handles
+any shape). Mode A and flat-plane (window/pane) analytic connections are the next tracked
+items.
 
 **Multiple coexisting media (superposition) — DONE 2026-07-12.** `Scene::medium` is now a
 vector `Scene::media` of independent, possibly overlapping media; several `medium {}` blocks
@@ -303,6 +399,26 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   **render GPU jobs one at a time**; the difference is a contended render now fails
   loudly (non-zero exit, no PNG) instead of silently overwriting a good image with black.
 
+### Missing/unknown light spectrum silently fell back to 6500 K white — DONE 2026-07-12
+- **What:** an explicit spectrum resource that failed to load rendered the scene with
+  a silent default illuminant instead of erroring. `speclib::resolveSpectrumTokens`
+  returned `false` for a failed `file:`/`glass:`/`metal:`/`reflectance:`/`illuminant:`/
+  `filter:` reference — but `false` also means "not my token, try the next resolver",
+  so the failure cascaded to `main.cpp resolveLight`'s `return blackbody(6500.0)`. A
+  typo'd path or a `-light` name with no matching preset produced a plausible-looking
+  white render with exit 0 — the wrong image, no warning. (This is also why the
+  measured-LED presets appeared to "work as white" on a stale binary.)
+- **Root cause:** overloaded `false` return (fall-through vs. hard failure) on the
+  explicit-prefix branches, plus a catch-all 6500 K fallback for unknown `-light`.
+- **Fix:** explicit resource prefixes now **throw** `std::runtime_error` with a clear
+  message on load failure (`spectral_library.h`); `resolveLight` throws on an
+  unrecognized explicit `-light` name (the built-in `bb6500` default always resolves
+  via the parametric path, so only genuine typos trip it); `main()` wraps `run()` in a
+  `try/catch` that prints `error: <msg>` and exits 1. Bare, unprefixed names still
+  return `false` so the resolver layering (bb<K>, gas-discharge models, illuminant
+  lookup) is unchanged. Verified: valid `file:` → exit 0; missing `file:` and unknown
+  `-light` → `error:` + exit 1; no-`-light` default → exit 0.
+
 ### UV coordinates (`u`,`v`) on native primitives for pattern materials — DONE 2026-07-11
 - **What:** the procedural-pattern math VM now exposes the surface texture coordinates
   `u`,`v` (previously mesh-only) to expressions on **native** objects too, so a UV-space
@@ -340,6 +456,26 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   (`scraps/curve_test.ftsl`, 3 frames — eye rides the spline, holds the look_at). Same
   GPU caveat as `camera_orbit`: one camera per launch, frames render sequentially (fine).
 
+### `camera_curve` animatable orientation + lens tracks — DONE 2026-07-12
+- **What:** `camera_curve` gained the two remaining animatable degrees of freedom it was
+  missing — **orientation roll** and **lens properties**. `roll[_at]` banks the camera
+  about its view axis (the third orientation DOF beyond eye position and look target);
+  `fov_at` / `zoom_at` / `fstop_at` / `focus_at` animate vertical field of view, focal
+  multiplier, f-number and focus distance. Each is a keyframe track over the normalized
+  timeline `t ∈ [0,1]` (piecewise-linear, flat-clamped at the ends — same idiom as
+  `density_at`), or a constant via the bare keyword. Lens *projection*/fisheye stays a
+  discrete whole-flight mode (not a continuous track), documented as such.
+- **Implementation:** `ftsl.h` — new `ScalarTrack` helper (sorted `{t,v}` keys +
+  flat-clamped `sample()`), `rotateAboutAxis()` (Rodrigues) for the roll bank, and a
+  static `deriveCameraOptics()` factored out of `readFilmExposure()` so the per-frame loop
+  can re-derive focal/fov/aperture/film-distance from the sampled tracks starting from the
+  authored base values (no double-apply of zoom). `addCameraCurve()` parses the tracks,
+  samples them at each frame's timeline `fr`, re-derives optics when any lens track is
+  active, and applies roll to `up` about the final view direction. Demoed in
+  `scenes/crystalloop.ftsl` (roll banks into the oval's turns; fov widens for the crystal
+  plunge). Note: `fstop`/`focus`/DoF only bite in the physical catch modes (A/C); in the
+  pinhole splat mode B the aperture is virtual, so roll/fov/zoom are the visible tracks.
+
 ### `camera_orbit` block (turntable / fly-around for MP4s) — DONE 2026-07-11
 - **What:** a new top-level `camera_orbit "name" { center radius [height] [axis] frames
   [start_deg] [sweep_deg] [look_at] [exposure_lock] … }` expands into N CamSpec frames
@@ -355,6 +491,29 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   entry below), but `-mode R` is camera-anchored (it traces *from* each camera) so an orbit
   on `-mode R`/`-device gpu` renders frames sequentially — which is fine, the per-frame
   cost dominates.
+
+### Isosurface → watertight mesh export (`-export-mesh`) — DONE 2026-07-13
+- **What:** any scene's `isosurface`es can be polygonised to an OBJ (`-export-mesh out.obj`)
+  for Unreal / Blender import instead of being rendered. `-mesh-res <N>` sets fineness (cells
+  along the longest bounds axis); `-mesh-adaptive` / `-mesh-decimate <f>` run a
+  curvature-adaptive quadric-error decimation that thins triangles on flat regions and keeps
+  them dense where the surface curves. Reuses the renderer's `Implicit::eval`/`gradient`.
+- **Implementation:** `src/isomesh.h` (`marchImplicit`, `decimateAdaptive`, `writeObj`);
+  CLI + export hook in `src/main.cpp` (~line 2644). Runs on the CPU.
+- **Watertightness (proper fix, not a hack):** started on marching **cubes** → left holes /
+  non-manifold edges from its face-ambiguous cases. Replaced entirely with marching
+  **tetrahedra** (Kuhn/Freudenthal 6-tet split, no ambiguous cases). Surfaces that reach the
+  `contained_by` domain box were leaving an **open rim**; fixed by intersecting the field with
+  the box SDF (`max(f, boxSDF)`) over a lattice padded 2 cells beyond the box, sealing them
+  into flat-capped closed solids (cap normals from central differences of the augmented field).
+  Decimation was introducing **non-manifold edges**; fixed with a **link-condition** test
+  (collapse only when the endpoints' common neighbours are exactly the shared-face opposites)
+  plus foldover rejection.
+- **Verification:** heart (genus-0) exports at V−E+F=2, 0 boundary, 0 non-manifold — uniform
+  *and* adaptive (keep 30%). Gyroid TPMS shell → Euler −34 (genus-18), csg_mech → −4 (genus-3),
+  metaballs → 2, all with 0 boundary + 0 non-manifold edges (Euler correctly tracks genus).
+  Round-trip: re-rendering `heart_test.obj` via `-mesh` shows a clean solid heart with correct
+  outward normals.
 
 ### Arbitrary-formula isosurfaces (`function` leaf, `f(x,y,z)=0`) — DONE 2026-07-11
 - **What:** an `isosurface` can now contain a `function { expr "f(x,y,z)" }` leaf that
@@ -430,6 +589,48 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   intersecting it against dielectric boundaries (or track the medium a connection
   endpoint sits in) and multiply the connection throughput by the resulting
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
+
+### VCM (mode `U`): merges use a spectral XYZ estimate; connections through glass share BDPT's absorption gap; CPU-only
+- **What:** Mode `U` (VCM/UPS, `src/vcm.h`) is single-wavelength like the rest of the
+  renderer. Its **vertex connections** pair a camera subpath with its **own** light
+  subpath, so both share one wavelength and the connection is exact (like BDPT). Its
+  **merges**, however, gather light vertices from *other* paths (each carrying its own
+  sampled wavelength), so — exactly like the photon map (modes `M`/`S`) — the merge builds
+  the estimate directly in XYZ using `cie(λ_photon)` and the camera BSDF evaluated at the
+  photon's wavelength. This is the standard spectral-photon-mapping approximation, valid
+  because this renderer's MIS pdfs are wavelength-independent (diffuse cosine / glossy lobe
+  densities don't depend on λ), but it is not a spectrally-exact merge.
+- **Why it matters:** For strongly dispersive caustics (wavelength-dependent focusing) the
+  merged contribution is approximated in XYZ rather than resolved per-wavelength, just as in
+  modes `M`/`S`. Connections remain exact, so the diffuse/glossy portion is unaffected.
+- **Also:** VCM connection edges that cross colored glass inherit the same absorption gap
+  documented above for BDPT (the deterministic connect segment isn't Beer-Lambert weighted).
+  And mode `U` is **CPU-only** — no GPU path yet.
+- **Proper fix (if needed):** per-wavelength (hero-wavelength or spectral-bin) merging, and
+  optical-depth accumulation along connection rays through dielectrics. Deferred until a
+  dispersive-caustic VCM render demands it.
+
+### `.nvdb` volume import (`density vdb:<file>`): dense bake, float-only, uncompressed
+- **What:** `medium { density vdb:cloud.nvdb }` imports a NanoVDB FloatGrid (`src/vdbgrid.cpp`,
+  the only TU that includes the vendored `NanoVDB.h`). On load the sparse grid is **baked into a
+  dense float lattice** covering its active index-space bounding box (`VdbGrid`, `src/vdbgrid.h`).
+  A CPU+GPU-shared trilinear sampler reads that lattice.
+- **Limitations:**
+  1. **Dense memory** — RAM/VRAM scales with the index-space AABB (nx·ny·nz·4 bytes), not the
+     active voxel count, so a large but mostly-empty sparse volume can blow up. A safety cap
+     (512 M voxels) rejects pathological grids with a clear error rather than OOM-ing.
+  2. **Float grids only** — non-float builds (Fp4/Fp8/Fp16/level-set index grids) are rejected
+     with a message. Convert to a float fog volume first.
+  3. **Uncompressed `.nvdb` only** — Blosc/ZIP-compressed files are rejected (we deliberately
+     don't vendor zlib/blosc). Re-export uncompressed (`nanovdb_convert`, or NanoVDB's
+     `writeUncompressedGrids`).
+  4. **Quoted path not accepted** — the FTSL value grammar takes one bareword token, so the path
+     must be unquoted: `density vdb:scraps/cloud.nvdb` (no spaces). A quoted `vdb:"..."` form
+     would need a small `parseValue` change to consume a trailing String.
+  5. No emission/temperature grids (fire), no motion-blur/velocity grids.
+- **Proper fix (if needed):** a native NanoVDB **sparse** device accessor (sample the tree
+  directly on CPU+GPU instead of baking dense) to drop the memory cost and support huge volumes;
+  fp16 dense option; a second float grid for blackbody emission. Deferred until an asset needs it.
 
 ### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
 - **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward
@@ -1061,32 +1262,35 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
     `led4000k`).
 - **The honesty caveats (tech debt, not a bug):**
   1. ~~**The F2/F7/F11 tables were transcribed from the canonical CIE 15 illuminant
-     data by hand/from memory.**~~ **VERIFIED & CORRECTED 2026-07-11.** The baked
-     tables were diffed against the authoritative CIE 15:2004 F-series (via
-     colour-science), which caught a real bug: `fluorescentF7()`'s tail (685–780 nm)
-     was wrong (it wiggled back up to 4.34 at 765 nm instead of decaying smoothly).
-     F7 is now corrected; F2/F11 already matched exactly. The authoritative tables
-     are committed to `data/spd/cie_f2.csv` / `cie_f7.csv` / `cie_f11.csv`. The
-     runtime measured-SPD loader now exists (`file:<path>`, DONE 2026-07-11 — see
-     below), so a scene can drive a light straight from those CSVs
-     (`spd file:data/spd/cie_f2.csv`, verified pixel-identical to `preset:f2` by
-     `scenes/measured_spd.ftsl`). Remaining sub-item: the *built-in* `preset:f2/f7/f11`
-     names are still baked in-source rather than reading the CSVs at startup (a minor
-     wiring change now that the loader exists).
+     data by hand/from memory.**~~ **VERIFIED & CORRECTED 2026-07-11; FULLY
+     EXTERNALIZED 2026-07-12.** The baked tables were diffed against the authoritative
+     CIE 15:2004 F-series (via colour-science), which caught a real bug:
+     `fluorescentF7()`'s tail (685–780 nm) was wrong (it wiggled back up to 4.34 at
+     765 nm instead of decaying smoothly). F7 was corrected; F2/F11 already matched
+     exactly. **As of 2026-07-12 the baked `fluorescentF2/F7/F11()` tables are DELETED
+     from `src/lights.h`** — the measured SPDs live only in
+     `data/illuminant/{f2,f7,f11}.csv` and `resolveLightPreset()` resolves the
+     `f2`/`f7`/`f11`/`cool-white`/`daylight-fl`/`triphosphor` names through
+     `resolveTabulatedIlluminant()` (spectral_library.h) at load time. `preset:f2`
+     and `spd file:data/illuminant/f2.csv` now load the *same file* — verified
+     identical by `scenes/measured_spd.ftsl`, and the loader round-trips the old baked
+     values exactly (e.g. F2 P(545 nm)=24.88). This sub-item is DONE.
   2. **The sodium / mercury / metal-halide entries are deliberately *illustrative*
      spectroscopic models, not per-lamp measurements** — correct line positions and
      plausible relative strengths (from spectroscopy references) over analytic
      continua, tuned to give the right visual cast. They are not a specific
      manufacturer's lamp and are not radiometrically calibrated. Same intended
      upgrade path: swap for measured SPDs when the data-file loader lands.
-- **Proper fix:** the measured-SPD data loader now exists (`file:<path>` — DONE
-  2026-07-11), so the path to fully closing this is (a) mirror measured lamp SPDs
-  (LSPDD / LICA-UCM, see `data/README.md`) into `data/spd/`, and (b) point the
-  built-in `preset:` names at those CSVs at load time instead of the baked/analytic
-  tables — turning the built-ins into verifiable data. The discharge lamps still need
-  their measured CSVs fetched; the F-series CSVs are already present.
-- **Status:** OPEN (acceptable, reduced) — loader + F-series data done; discharge-lamp
-  measurements and the preset-reads-CSV wiring are the tracked remainder.
+- **Proper fix:** the spectral asset library now exists (`data/<category>/<name>` +
+  `src/spectral_library.h`, DONE 2026-07-12), and `resolveLightPreset()` already reads
+  the F-series from `data/illuminant/`. To upgrade the discharge lamps to measurements:
+  drop a measured lamp SPD (LSPDD / LICA-UCM, see `data/README.md`) into
+  `data/illuminant/` (e.g. `hps.csv`, alias `sodium`) — it then resolves by name with
+  no rebuild, and can shadow the analytic model. Only the discharge-lamp measured CSVs
+  remain to be fetched; the preset-reads-CSV wiring is now generic and done.
+- **Status:** OPEN (acceptable, reduced) — library + F-series data done and the
+  built-in F-series presets now read the CSVs at load time; only discharge-lamp
+  measurements remain (the analytic line models stay as the default until then).
 
 ### Built-in material presets: skin/soil & iridescent recipes are representative (metals + most natural curves now measured)
 - **What (added 2026-07-11):** `src/materials.h` adds built-in common-material data
@@ -1137,14 +1341,74 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   (generic CSV→`table`), `tools/ri_nk_to_reflectance.py` (refractiveindex.info
   n,k→reflectance), and `tools/splib_to_reflectance.py` (USGS splib07→reflectance) —
   plus, as of 2026-07-11, a *runtime* `file:<path>` loader so a reflectance CSV can be
-  bound directly (`reflect file:data/reflectance/skin.csv`) without re-baking source.
-  Metals and leaf/snow/brick/concrete are done. Remaining debt is finding measured
-  samples for `skin`/`skin-dark` (a skin-optics dataset, e.g. NIST JRES 122.026) and
-  `soil` (a loam/dirt reflectance, e.g. ECOSTRESS/ISRIC) and dropping them into
-  `data/`, plus optionally validating the iridescent recipes against specimens.
+  bound directly (`reflect file:data/reflectance/skin-light.csv`) without re-baking
+  source. Metals and leaf/snow/brick/concrete are done. Remaining debt is finding
+  measured samples for `skin`/`skin-dark` (a skin-optics dataset, e.g. NIST JRES
+  122.026) and `soil` (a loam/dirt reflectance, e.g. ECOSTRESS/ISRIC) and overwriting
+  the placeholder files in `data/reflectance/`, plus optionally validating the
+  iridescent recipes against specimens.
+- **DATA EXTERNALIZED 2026-07-12:** the baked `metalGold()..metalBrass()`,
+  `reflectanceLeaf()..reflectanceConcrete()` tables (`src/materials.h`) and the
+  `iorBK7()..iorPolycarbonate()` dispersion functions (`src/spectrum.h`) are **deleted
+  from source**. They now live as data files — `data/metal/*.csv`,
+  `data/reflectance/*.csv`, `data/glass/*.glass` (Sellmeier/Cauchy coefficients) — and
+  are loaded by the same-named resolvers (`resolveMetalReflectance` /
+  `resolveNaturalReflectance` / `resolveGlassIor`) now living in
+  `src/spectral_library.h`. Every call site is unchanged (only the data source and
+  includes moved); a category is a directory of files keyed by lowercased filename
+  stem + `# aliases:` header, so new metals/glasses/reflectances drop in with no
+  rebuild. The `sellmeier()`/`cauchy()`/`tabulatedSpectrum()` evaluators and the
+  iridescent recipes stayed native (algorithms, not data). Verified: standalone loader
+  test round-trips n_d (BK7 1.5168, SF10 1.7283, water 1.333) and R(λ) (Au R(700)=0.970)
+  from the files, matching the old baked values.
+- **RECIPES EXTERNALIZED (bundles) 2026-07-12:** the whole-material `preset` recipes
+  and named light presets are now **composite asset bundle files**, not baked C++.
+  `data/material/*.material` (soap-bubble, oil-slick, anodized-ti, morpho, beetle,
+  nacre) and `data/light/*.light` (sun, daylight/d65, incandescent/a, led, led-warm)
+  group a `type` + several spectral envelopes (`ior`/`substrate_k`/`spd`…) + intrinsic
+  scalars (`film_ior`/`film_thickness`, `layer <n> <k> <nm>` rows) under one name.
+  `resolveMaterialBundle` (materials.h) / `resolveLightBundle` (lights.h) interpret the
+  manifest; spectrum-valued fields reuse the scene language's primitive vocabulary via
+  a new shared `speclib::resolveSpectrumTokens`. So the tuned iridescent layer stacks
+  are now DATA (retune/extend with no rebuild) while the interference/Abeles/Fresnel
+  evaluators (render.h) and the LED/gas-discharge line models (lights.h) stay native.
+  `resolveMaterialPreset` reads a bundle first, then a generic metal→glossy /
+  glass→dielectric convention so bare primitive names still resolve with no file. The
+  bit-for-bit faithfulness holds: `const N` == the old `iorConstant(N)`
+  (`[N](double){return N;}`), so the bundles reproduce the baked recipes exactly.
 - **Status:** OPEN (acceptable, much reduced) — metals + 4 natural curves are now
-  measured data; skin/soil and iridescent recipes remain representative. All presets
-  load on CPU==GPU and render the right colours.
+  measured data, and ALL spectral data AND the whole-material / named-light recipes now
+  load from `data/` files rather than baked source; skin/soil and iridescent recipes
+  remain representative. All presets load on CPU==GPU and render the right colours.
+
+### Colored-LED light bundles + `filter` gel material — DONE 2026-07-12
+- **Colored LEDs (data only).** A direct-emission LED die is a single narrow band, and
+  the light-bundle vocabulary already had `gaussian center=… sigma=…`, so seven colored
+  LEDs (`data/light/led-royal-blue`…`led-deep-red`) are pure-data `.light` bundles — no
+  native code. Representative InGaN/AlInGaP peaks + FWHMs (sigma = FWHM/2.355). Measured
+  die SPDs (slightly asymmetric) can drop into `illuminant/` later (pending in
+  data/README). Verified `preset:led-red` renders pure red.
+- **`filter` material (option A).** New `MatType::Filter`: a thin non-scattering absorber
+  (colored gel / Wratten). The photon passes straight through (direction unchanged) and
+  survives with probability T(λ) = `transmit`(λ), else absorbs — Russian roulette on the
+  transmittance, β unchanged, unbiased. Specular straight-through so it makes no camera
+  connection (like clear glass — it colors what's behind it). Threaded through EVERY
+  tracer: forward CPU (`render.h`), forward GPU (`render_cuda.cu` `D_FILTER`), backward
+  CPU (`backward.h`) + GPU, and BDPT CPU (`bdpt.h`) + GPU (delta vertex, throughput
+  ×= T). `type filter` in FTSL (ftsl.h) reads `transmit`; `parseMatType` adds it for
+  bundles. New `filter/` data category + `filter:<name>` token + `resolveFilterTransmittance`.
+- **Data (RESOLVED 2026-07-12; full set digitized 2026-07-12):** `data/filter/wratten-*.csv`
+  is now the **complete 84-filter Kodak Wratten set**, each **digitized from the numeric
+  percent-transmittance tables** in *Kodak Wratten Filters for Scientific and Technical Use*,
+  22nd ed. (pub. B-3), 400–700 nm at 10 nm, 31 samples (book dashes = negligible → 0).
+  Files are named `wratten-<n>` (letter suffix lowercased) with `# aliases:` headers keeping
+  the old descriptive names (red-25, deep-red-29, orange-21, yellow-12, green-58, blue-47,
+  deep-blue-47b, …) resolvable; the 7 old descriptive-named CSVs were deleted. Text-layer
+  pages were coordinate-extracted (word x → column, y → row); the eight image-only pages
+  (28,29,31,33,35,38,41,47) were visually transcribed from high-DPI crops. Extraction/
+  transcription scripts live in `scraps/` (`wratten_extract.py`, `wratten_manual.py`,
+  `wratten_all.py`; gitignored). Renders confirm correct per-filter tints. Finer spacing/
+  more gels can drop into `filter/` later (Rosco `.sed` / LEE / CRC), no rebuild.
 
 ### Full physical `layered` material [IMPLEMENTED 2026-07-11]
 - **What:** both the FTSL `type mix` material (stochastic per-photon pick among named

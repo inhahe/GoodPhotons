@@ -10,6 +10,7 @@
 #include <cmath>
 #include <string>
 #include "spectrum.h"
+#include "spectral_library.h"
 #include "color.h"
 
 inline double gaussLobe(double x, double mu, double sigma) {
@@ -45,7 +46,9 @@ inline Spectrum ledWhite(double warm = 0.3) {
 
 // Trichromatic fluorescent: a low phosphor continuum with mercury emission lines.
 // Illustrative model of the spiky spectrum, not a measured F-series. For real
-// tabulated fluorescent SPDs use the CIE F-series builders below (f2/f7/f11).
+// tabulated fluorescent SPDs load the CIE F-series (f2/f7/f11) — those measured
+// tables now live in data/illuminant/*.csv and are resolved by
+// resolveTabulatedIlluminant() (spectral_library.h), not baked in this file.
 inline Spectrum fluorescent() {
     return [](double w) {
         double cont = 0.08 + 0.05 * gaussLobe(w, 560.0, 120.0);
@@ -82,51 +85,13 @@ inline Spectrum emissionLines(std::vector<std::pair<double, double>> lines, doub
     };
 }
 
-// CIE Standard Illuminant F-series: real tabulated relative SPDs, 380-780 nm at
-// 5 nm. F2 = cool white halophosphate (CCT ~4230 K, CRI ~64); F7 = broadband
-// "daylight" fluorescent, a D65 simulator (CCT ~6500 K, CRI ~90); F11 = narrow-band
-// triphosphor (CCT ~4000 K, CRI ~83). Source: CIE 15 tabulated illuminant data,
-// verified against colour-science's transcription and mirrored (for the future
-// data-file loader) in data/spd/cie_f2.csv / cie_f7.csv / cie_f11.csv.
-inline Spectrum fluorescentF2() {
-    static const std::vector<double> d = {
-        1.18, 1.48, 1.84, 2.15, 3.44, 15.69, 3.85, 3.74, 4.19, 4.62,   // 380-425
-        5.06, 34.98, 11.81, 6.27, 6.63, 6.93, 7.19, 7.40, 7.54, 7.62,  // 430-475
-        7.65, 7.62, 7.62, 7.45, 7.28, 7.15, 7.05, 7.04, 7.16, 7.47,    // 480-525
-        8.04, 8.88, 10.01, 24.88, 16.64, 14.59, 16.16, 17.56, 18.62, 21.47, // 530-575
-        22.79, 19.29, 18.66, 17.73, 16.54, 15.21, 13.80, 12.36, 10.95, 9.65, // 580-625
-        8.40, 7.32, 6.31, 5.43, 4.68, 4.02, 3.45, 2.96, 2.55, 2.19,    // 630-675
-        1.89, 1.64, 1.53, 1.27, 1.10, 0.99, 0.88, 0.76, 0.68, 0.61,    // 680-725
-        0.56, 0.54, 0.51, 0.47, 0.47, 0.43, 0.46, 0.47, 0.40, 0.33, 0.27 // 730-780
-    };
-    return sampledSPD(380.0, 5.0, d);
-}
-inline Spectrum fluorescentF7() {
-    static const std::vector<double> d = {
-        2.56, 3.18, 3.84, 4.53, 6.15, 19.37, 7.37, 7.05, 7.71, 8.41,   // 380-425
-        9.15, 44.14, 17.52, 11.35, 12.00, 12.58, 13.08, 13.45, 13.71, 13.88, // 430-475
-        13.95, 13.93, 13.82, 13.64, 13.43, 13.25, 13.08, 12.93, 12.78, 12.60, // 480-525
-        12.44, 12.33, 12.26, 29.52, 17.05, 12.44, 12.58, 12.72, 12.83, 15.46, // 530-575
-        16.75, 12.83, 12.67, 12.45, 12.19, 11.89, 11.60, 11.35, 11.12, 10.95, // 580-625
-        10.76, 10.42, 10.11, 10.04, 10.02, 10.11, 9.87, 8.65, 7.27, 6.44, // 630-675
-        5.83, 5.41, 5.04, 4.57, 4.12, 3.77, 3.46, 3.08, 2.73, 2.47,    // 680-725
-        2.25, 2.06, 1.90, 1.75, 1.62, 1.54, 1.45, 1.32, 1.17, 0.99, 0.81 // 730-780
-    };
-    return sampledSPD(380.0, 5.0, d);
-}
-inline Spectrum fluorescentF11() {
-    static const std::vector<double> d = {
-        0.91, 0.63, 0.46, 0.37, 1.29, 12.68, 1.59, 1.79, 2.46, 3.33,   // 380-425
-        4.49, 33.94, 12.13, 6.95, 7.19, 7.12, 6.72, 6.13, 5.46, 4.79,  // 430-475
-        5.66, 14.29, 14.96, 8.97, 4.72, 2.33, 1.47, 1.10, 0.89, 0.83,  // 480-525
-        1.18, 4.90, 39.59, 72.84, 32.61, 7.52, 2.83, 1.96, 1.67, 4.43, // 530-575
-        11.28, 14.76, 12.73, 9.74, 7.33, 9.72, 55.27, 42.58, 13.18, 13.16, // 580-625
-        12.26, 5.11, 2.07, 2.34, 3.58, 3.01, 2.48, 2.14, 1.54, 1.33,   // 630-675
-        1.46, 1.94, 2.00, 1.20, 1.35, 4.10, 5.58, 2.51, 0.57, 0.27,    // 680-725
-        0.23, 0.21, 0.24, 0.24, 0.20, 0.24, 0.32, 0.26, 0.16, 0.12, 0.09 // 730-780
-    };
-    return sampledSPD(380.0, 5.0, d);
-}
+// NOTE: the CIE Standard Illuminant F-series (F2 cool-white, F7 daylight/D65-sim,
+// F11 triphosphor) used to be baked here as `fluorescentF2/F7/F11()` sampledSPD
+// tables. Those measured tabulated SPDs now live in data/illuminant/{f2,f7,f11}.csv
+// and are loaded at runtime by `resolveTabulatedIlluminant()` (spectral_library.h);
+// resolveLightPreset() below delegates the f2/f7/f11 names there. Only the DATA
+// moved out — the sampledSPD/emissionLines builders and the analytic line models
+// (sodium/mercury/metal-halide/LED) are algorithms and stay native.
 
 // Low-pressure sodium (LPS/SOX): the near-monochromatic sodium D doublet at 589.0 /
 // 589.6 nm — the classic deep-orange streetlight, essentially zero colour rendering.
@@ -200,11 +165,51 @@ inline Spectrum ledCCT(double kelvin) {
     };
 }
 
+// Resolve a light `spd <expr>` token list to an emission SPD. First tries the shared
+// data-oriented vocabulary (`blackbody K`, `const N`, `file:...`, `gaussian …` — see
+// spectral_library.h), then the native light MODELS defined above (which live here,
+// above the library, so they can't go in the shared resolver): the phosphor-LED and
+// gas-discharge line models. Returns false on an unrecognized head.
+inline bool resolveLightSpd(const std::vector<std::string>& w, Spectrum& out) {
+    if (speclib::resolveSpectrumTokens(w, out)) return true;
+    if (w.empty()) return false;
+    const std::string& h = w[0];
+    auto num = [](const std::string& s) -> double {
+        try { return std::stod(s); } catch (...) { return 0.0; }
+    };
+    if (h == "led-white")                        { out = ledWhite(w.size() > 1 ? num(w[1]) : 0.3); return true; }
+    if (h == "led-cct" && w.size() > 1)          { out = ledCCT(num(w[1]));  return true; }
+    if (h == "fluorescent")                      { out = fluorescent();      return true; }
+    if (h == "sodium-high" || h == "sodium")     { out = sodiumHigh();       return true; }
+    if (h == "sodium-low")                       { out = sodiumLow();        return true; }
+    if (h == "mercury")                          { out = mercuryVapor();     return true; }
+    if (h == "metal-halide")                     { out = metalHalide();      return true; }
+    return false;
+}
+
+// Interpret a data/light/<name>.light bundle into an emission SPD. A light asset
+// currently groups a single `spd <expr>` field (plus room for future intrinsic
+// fields — angular/goniometric envelope, size — grouped under one name). Aliases are
+// handled by the library's `# aliases:` header scan. Returns true when a file exists
+// and yields an SPD.
+inline bool resolveLightBundle(const std::string& name, Spectrum& out) {
+    speclib::Bundle b;
+    if (!speclib::loadBundle("light", name, b)) return false;
+    for (const auto& f : b.fields)
+        if (f.key == "spd") return resolveLightSpd(f.args, out);
+    return false;
+}
+
 // Resolve a light/illuminant preset name to an emission SPD. Returns true and sets
 // `out` if the name is recognized; returns false for unknown names so each caller
 // picks its own fallback (main.cpp -> 6500 K blackbody; FTSL loader -> parse error).
 // This is the single source of truth shared by the `-light` CLI flag and the FTSL
 // `preset:<name>` expression — keep new sources here, not duplicated per caller.
+//
+// Resolution order: parametric names (computed from the name) -> data/light/*.light
+// bundles (sun / daylight / incandescent / led / led-warm — simple parameter bindings
+// to the native models, now externalized) -> data/illuminant/*.csv measured SPDs ->
+// the native gas-discharge line models (analytic shaping = algorithm, kept in source).
 inline bool resolveLightPreset(const std::string& name, Spectrum& out) {
     auto num = [](const std::string& s) -> double {
         try { return std::stod(s); } catch (...) { return 0.0; }
@@ -221,17 +226,14 @@ inline bool resolveLightPreset(const std::string& name, Spectrum& out) {
         double k = num(p);                       // stod stops at trailing 'k'
         if (k > 100.0) { out = ledCCT(k); return true; }
     }
-    if (name == "sun")                          { out = sunlight();       return true; }
-    if (name == "daylight" || name == "d65")    { out = daylight(6504.0); return true; }
-    if (name == "a" || name == "incandescent")  { out = illuminantA();    return true; }
-    if (name == "led")                          { out = ledWhite(0.3);    return true; }
-    if (name == "led-warm")                     { out = ledWhite(1.0);    return true; }
+    // Externalized named presets (data/light/*.light) — sun / daylight / incandescent
+    // / led / led-warm and any drop-in additions.
+    if (resolveLightBundle(name, out)) return true;
     if (name == "fluorescent" || name == "cfl") { out = fluorescent();    return true; }
-    // CIE F-series fluorescents (measured tabulated SPDs).
-    if (name == "f2"  || name == "cool-white")  { out = fluorescentF2();  return true; }
-    if (name == "f7"  || name == "daylight-fl") { out = fluorescentF7();  return true; }
-    if (name == "f11" || name == "triphosphor") { out = fluorescentF11(); return true; }
-    // Gas-discharge lamps (spectroscopic line models).
+    // CIE F-series fluorescents (measured tabulated SPDs, loaded from
+    // data/illuminant/*.csv via the spectral library — aliases handled there).
+    if (resolveTabulatedIlluminant(name, out)) return true;
+    // Gas-discharge lamps (spectroscopic line models — analytic shaping stays native).
     if (name == "hps" || name == "sodium")      { out = sodiumHigh();     return true; }
     if (name == "lps" || name == "sodium-low")  { out = sodiumLow();      return true; }
     if (name == "mercury" || name == "hg")      { out = mercuryVapor();   return true; }

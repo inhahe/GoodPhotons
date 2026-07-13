@@ -33,7 +33,8 @@
 #include <cmath>
 #include "linalg.h"
 #include "geometry.h"   // Ray, PI
-#include "spectrum.h"   // Spectrum, iorConstant, iorBK7/iorSF10, resolveGlassIor
+#include "spectrum.h"           // Spectrum, iorConstant, sellmeier/cauchy evaluators
+#include "spectral_library.h"   // resolveGlassIor (loads BK7/SF10 dispersion from data/glass)
 
 // One refracting interface of the lens (a spherical cap, or a plane when radius==0).
 struct LensSurface {
@@ -290,19 +291,25 @@ inline bool resolveLensPreset(const std::string& name, double focalMM, double fs
     for (char c : name) { if (c == ' ' || c == '_' || c == '-') continue; k += (char)std::tolower((unsigned char)c); }
     if (focalMM <= 0.0) focalMM = 50.0;
     if (fstop   <= 0.0) fstop   = 2.8;
+    // Crown/flint glasses for the singlet/doublet elements, loaded from the spectral
+    // library (data/glass/BK7.glass, SF10.glass). Constant-index fallbacks keep the
+    // preset usable if the data files are missing.
+    Spectrum bk7, sf10;
+    if (!resolveGlassIor("BK7",  bk7))  bk7  = iorConstant(1.5168);
+    if (!resolveGlassIor("SF10", sf10)) sf10 = iorConstant(1.7283);
     if (k == "singlet" || k == "biconvex" || k == "simple") {
-        out = makeSinglet(focalMM, fstop, iorBK7()); out.name = "singlet"; return true;
+        out = makeSinglet(focalMM, fstop, bk7); out.name = "singlet"; return true;
     }
     if (k == "achromat" || k == "doublet") {
-        out = makeAchromat(focalMM, fstop, iorBK7(), iorSF10()); out.name = "achromat"; return true;
+        out = makeAchromat(focalMM, fstop, bk7, sf10); out.name = "achromat"; return true;
     }
     if (k == "telephoto" || k == "tele") {                 // long achromat
         double f = focalMM > 0.0 ? focalMM : 135.0;
-        out = makeAchromat(f, fstop, iorBK7(), iorSF10()); out.name = "telephoto"; return true;
+        out = makeAchromat(f, fstop, bk7, sf10); out.name = "telephoto"; return true;
     }
     if (k == "wide" || k == "wideangle") {                 // short achromat
         double f = focalMM > 0.0 ? focalMM : 28.0;
-        out = makeAchromat(f, fstop, iorBK7(), iorSF10()); out.name = "wide"; return true;
+        out = makeAchromat(f, fstop, bk7, sf10); out.name = "wide"; return true;
     }
     return false;
 }

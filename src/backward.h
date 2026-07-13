@@ -406,6 +406,16 @@ struct BackwardRenderer {
                     specularArrival = true;
                     break;
                 }
+                case MatType::Filter: {
+                    // Colored gel filter (backward adjoint of render.h MatType::Filter):
+                    // pass straight through, survive with prob T(lambda), else absorb.
+                    // Specular straight-through — no NEE, throughput unchanged on survival.
+                    double t = clamp01(m.transmit(lambda));
+                    if (rng.uniform() >= t) return L;      // absorbed
+                    ray = Ray{h.p + ray.d * 1e-6, ray.d};  // direction unchanged
+                    specularArrival = true;
+                    break;
+                }
                 case MatType::Glossy: {
                     double r = clamp01(m.reflect(lambda));
                     if (rng.uniform() >= r) return L;

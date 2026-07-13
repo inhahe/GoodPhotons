@@ -11,8 +11,9 @@
 #include "scene_film.h"
 #include "texture.h"
 #include "envmap.h"
+#include "vdbgrid.h"
 
-enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit };
+enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
 // Materials whose last-vertex-before-camera cannot connect to the pinhole in
 // model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
@@ -23,7 +24,7 @@ inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||
            t == MatType::Glossy     || t == MatType::Grating ||
-           t == MatType::Multilayer;
+           t == MatType::Multilayer || t == MatType::Filter;
 }
 
 struct Material {
@@ -45,6 +46,9 @@ struct Material {
     // (-n). reflect+transmit must be <= 1 per wavelength (the rest is absorbed). Because
     // both lobes are non-specular, a directly-viewed translucent solid CONNECTS to the
     // pinhole and is visible in mode B (unlike clear dielectric, which stays black).
+    // Also the per-wavelength TRANSMITTANCE T(lambda) in [0,1] of a MatType::Filter
+    // (colored gel / Wratten): the photon passes straight through, surviving with
+    // probability T(lambda) and absorbed otherwise — no scattering, no refraction.
     Spectrum transmit = constantSpectrum(0.0);
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
@@ -214,6 +218,13 @@ struct Medium {
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
 
+    // --- Optional imported .vdb/.nvdb sparse volume (baked to a dense grid) -----
+    // When set, the density multiplier is TRILINEARLY sampled from a real NanoVDB
+    // FloatGrid (`density vdb:"cloud.nvdb"`) instead of a formula. Shared so copies
+    // of the Medium stay cheap. The grid's world AABB seeds the medium bound and
+    // its peak value seeds densityMax. Takes precedence over the `density` formula.
+    std::shared_ptr<VdbGrid> vdb;
+
     // --- Optional spatial bound (localized / per-object fog) ----------------
     // When `bounded`, the medium exists only inside a region: an axis-aligned box
     // [bmin,bmax] (`boundShape == Box`) or a sphere centered `bcenter` radius
@@ -259,7 +270,7 @@ struct Medium {
     // an implicit membership makes the effective density spatially varying (1 inside,
     // 0 outside) even when the base coefficients are constant.
     bool heterogeneous() const {
-        return !density.empty() || boundShape == MediumBound::Implicit;
+        return !density.empty() || vdb || boundShape == MediumBound::Implicit;
     }
 
     // Dimensionless density multiplier at a world point (>= 0). 1 for a homogeneous
@@ -268,6 +279,7 @@ struct Medium {
     // does not exist there), so delta/ratio tracking carves out the exact iso-shape.
     double densityAt(const Vec3& p) const {
         if (boundShape == MediumBound::Implicit && !insideField(p)) return 0.0;
+        if (vdb) return vdb->sample(p);   // imported .nvdb volume (trilinear)
         if (density.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
         double d = patternEval(density.data(), (int)density.size(), c);
@@ -508,10 +520,68 @@ struct Emitter {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Instancing: a bottom-level acceleration structure (BLAS) is a mesh asset held
+// ONCE in its own local (authored) space with its own BVH. A MeshInstance places
+// that shared geometry into the world via an affine, WITHOUT baking a private
+// copy of the triangles into Scene::tris — this is the memory win over group{}
+// (which bakes every copy). The top-level BVH (Scene::bvh) carries one leaf box
+// per instance; traversal transforms the ray into the BLAS's local space, walks
+// the shared BLAS BVH, and transforms the hit back. The parametric ray distance
+// `t` is PRESERVED by the affine ray transform because Affine::applyDir does NOT
+// normalize the direction — so the local hit's t equals the world t directly and
+// can be compared against the shared world tMax with no rescaling.
+// ---------------------------------------------------------------------------
+struct Blas {
+    std::vector<Tri> tris;   // in local (authored) space
+    Bvh bvh;                 // over the local tris
+    Aabb localBounds;        // union of the local triangle boxes
+
+    void build() {
+        const double pad = 1e-6;
+        std::vector<Aabb> boxes;
+        boxes.reserve(tris.size());
+        localBounds = Aabb{};
+        for (auto& t : tris) {
+            t.finalize();     // BLAS tris live outside Scene::tris, so finalize here
+            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+            b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
+            localBounds.expand(b);
+            boxes.push_back(b);
+        }
+        bvh.build(boxes);
+    }
+    // Closest hit in local space. `h.t` carries the running (world==local) tMax on
+    // entry; intersectTri only accepts a closer hit. Returns true if `h` was updated.
+    bool intersectLocal(const Ray& lr, double tmin, Hit& h) const {
+        bool found = false;
+        double tMax = h.t;
+        bvh.traverseClosest(lr, tmin, tMax, [&](int prim, double& tm) {
+            if (intersectTri(lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
+        });
+        return found;
+    }
+    bool occludedLocal(const Ray& lr, double tmin, double maxDist) const {
+        return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
+            Hit h; h.t = maxDist;
+            return intersectTri(lr, tris[prim], tmin, h);
+        });
+    }
+};
+
+struct MeshInstance {
+    int blasId = -1;
+    Affine toWorld = Affine::identity();   // local -> world
+    Affine toLocal = Affine::identity();   // world -> local (= toWorld.inverse())
+    int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
+};
+
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
+    std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
+    std::vector<MeshInstance> instances; // placements of blasList into the world
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
@@ -756,6 +826,7 @@ struct Scene {
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
     void build() {
         for (auto& t : tris) t.finalize();
+        for (auto& bl : blasList) bl.build();   // shared instanced assets (local space)
         buildBvh();
         // Scene bounding sphere from the BVH root AABB: center = box center, radius
         // = half the box diagonal (the box circumradius, guaranteed to enclose all
@@ -791,9 +862,36 @@ struct Scene {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
             boxes.push_back(b);
         }
-        boxes.reserve(boxes.size() + implicits.size());
+        boxes.reserve(boxes.size() + implicits.size() + instances.size());
         for (const auto& im : implicits) boxes.push_back(im.bounds);
+        // One TLAS leaf per instance: the BLAS's local bounding box transformed into
+        // world space (union of its 8 transformed corners — the tightest world AABB
+        // of a rotated box short of re-bounding the actual triangles).
+        for (const auto& inst : instances) {
+            const Aabb& lb = blasList[inst.blasId].localBounds;
+            Aabb wb;
+            for (int c = 0; c < 8; ++c) {
+                Vec3 corner{ (c & 1) ? lb.hi.x : lb.lo.x,
+                             (c & 2) ? lb.hi.y : lb.lo.y,
+                             (c & 4) ? lb.hi.z : lb.lo.z };
+                wb.expand(inst.toWorld.apply(corner));
+            }
+            boxes.push_back(wb);
+        }
         bvh.build(boxes);
+    }
+
+    // Transform a BLAS-local hit (from Blas::intersectLocal) back into world space for
+    // instance `inst` under the world ray `r`. Positions map by toWorld; shading and
+    // geometric normals map by the inverse-transpose (toWorld.applyNormal) and the
+    // shading normal is re-oriented against the world ray (matching the primitive path).
+    static void instanceHitToWorld(const MeshInstance& inst, const Ray& r, Hit& lh) {
+        lh.p  = r.o + r.d * lh.t;                       // world t == local t (see Blas)
+        Vec3 wn  = normalize(inst.toWorld.applyNormal(lh.n));
+        Vec3 wng = normalize(inst.toWorld.applyNormal(lh.ng));
+        lh.ng = wng;
+        lh.n  = (dot(r.d, wn) < 0.0) ? wn : -wn;
+        if (inst.matOverride >= 0) lh.matId = inst.matOverride;
     }
 
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr) const {
@@ -801,10 +899,20 @@ struct Scene {
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
+        const size_t nI = implicits.size();
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
             if (prim < (int)nT)            { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
-            else                           { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
+            else {
+                const MeshInstance& inst = instances[prim - nT - nS - nI];
+                Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+                Hit lh; lh.t = h.t;                    // running world tMax == local tMax
+                if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
+                    instanceHitToWorld(inst, r, lh);
+                    h = lh; tm = h.t;
+                }
+            }
         }, stats);
         return h;
     }
@@ -818,11 +926,16 @@ struct Scene {
         Ray r{o, dir};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
-        return bvh.traverseAny(r, tmin, maxDist - tmin, [&](int prim) {
-            Hit h; h.t = maxDist - tmin;
+        const size_t nI = implicits.size();
+        const double seg = maxDist - tmin;
+        return bvh.traverseAny(r, tmin, seg, [&](int prim) {
+            Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTri(r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
-            return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
+            const MeshInstance& inst = instances[prim - nT - nS - nI];
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
         });
     }
 
@@ -832,6 +945,14 @@ struct Scene {
         for (const auto& t : tris)     intersectTri(r, t, tmin, h);
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h);
+        for (const auto& inst : instances) {
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            Hit lh; lh.t = h.t;
+            if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
+                instanceHitToWorld(inst, r, lh);
+                h = lh;
+            }
+        }
         return h;
     }
 };

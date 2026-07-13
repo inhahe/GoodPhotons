@@ -1,13 +1,28 @@
+Create a bunch of interesting isosurphase functions - not necessarily spherical, not necessarily symmetrical - and render them using the fastest renderer, all in one large image in a grid view, then let me select which ones to put in our hero fly-by, and also tell make an isosurface-to-mesh converter so i can import them into Unreal - it can be a feature of Good Photons if you wants but I don't know if that would serve anything. have a variable for how fine to make the mesh. and ideally, the tesselation would be adaptive to how much detail/change/curvaturue is in each particular area of the isosurface.
+
+eventually, have Fable 5 (can use it with my subscription, just reaches limits faster) look over the code for the tightest loops and try to optimize them.
+
+/graphify when the project is finished. (use Fable 5 for the refactor planning, but not the actual refactors?)
+
+let's have more interesting shapes than a bunch of spheres - let's have more isosurfaces - and not necesarily spherical or symmetrical ones
+^ doing
+
+and let's have the camera make an arc right through the gyroid, but not through a solid part, just going in between its empty spaces - in addition to going right through a glass sphere
+
+at some point, let's re-render that pic with the golden gyroid since it's had the extra wall added
+
+Add "progressive" or whatever it was called photon mapping and analytic specular connections to readme eventually.. and the (VCM/UPS = BDPT ∪ photon mapping under MIS. and the five new curve variables for cameras.
+
+from what i can see of the lantern image, it doesn't look hero at all. it's just chromatic sphere, a small dot next to it, and an ugly oblong yellow circle to the right of both of them...
+"The file: path resolves relative to CWD, and a wrong path would silently fall back to 6500K blackbody (white) rather than erroring" i don't like this, i think if the user specifies a file and it can't find it, it shouldn't render it, it should error
+^ done
+	
+there are many colors of LEDs, should we download some more LED data? oh, and i have some filter ideas you might want to use in the ..\spectral-bounce project.. for example, 'Red 25'. but i think they only have 16 frequency bins each. but maybe they could give you ideas for filters to look up further data for.
+^ doing	n
+
+
 "Mature renderers reflect this by combining them (VCM/UPS = BDPT ∪ photon mapping under MIS), which is the real endgame."
 ^ doing, plus more analytic specular connections for more modes
-
-/graphify when done.
-
-when you get a chance, let's solve both the tech debt problems. but regarding the  fog, i'd take it a step further: allow a way to define blobs of fog with unclear boundaries. what would be a good way to do that? an isosurface with a definabl fall-off with distance from the surface? even define the fall-off based on U-V map of the isosurface? a formala determining fog density via x-y-z location?
-^ done
-
-in addition to the fog isosurface-like function possibilities i described, let's also have fog determinable simply per object/medium like you said earlier. (for example, the whole inside of a glass sphere)
-^ doing
 
 forward renderer
 - one photon at a time, selected from one of the light sources, at one of its component frequencies (configurable frequency bin size?), at random using the proper distribution
@@ -60,5 +75,7 @@ make a new showcase.png with the new wall that gets rid of the dark spots in the
 
 please make the proper fix now (detect NaN framebuffer post-kernel and fail loudly instead of writing a black PNG)
 "Good idea to do this properly. Let me study the code first — the auto-exposure fallback and the GPU render output path. (I'll do all the code work now, but hold any GPU testing until the showcase render finishes, to avoid the very contention that causes this bug.)"
+
+look for a camera prop in unreal fab - then convert it into a real physically simulated camera and look at it in a mirror
 
 

@@ -134,28 +134,36 @@ declared once as a named `spectrum` block and referenced as `spectrum:name`.
 | `blackbody 6500`                       | Planck's law at 6500 K (normalized)                            | `blackbody` — **[maps 1:1]**   |
 | `gaussian center=550 sigma=40 amp=0.8` | Gaussian band (emission lines, fluorescence)                   | `gaussianBand` — **[maps 1:1]** |
 | `shortpass edge=500 slope=0.2 amp=1`   | Logistic high-pass (excitation filters)                        | `shortPass` — **[maps 1:1]**   |
-| `glass:BK7`, `glass:diamond`, ...      | Named dispersion curve (refractive index) — see list below    | `resolveGlassIor`, `src/spectrum.h` — **[maps 1:1]** |
-| `metal:Au`, `metal:copper`, ...        | Named metal reflectance R(λ) from measured n,k                | `resolveMetalReflectance`, `src/materials.h` — **[maps 1:1]** |
-| `reflectance:leaf`, `reflectance:skin`, ... | Named natural diffuse reflectance (representative)        | `resolveNaturalReflectance`, `src/materials.h` — **[maps 1:1]** |
+| `glass:BK7`, `glass:diamond`, ...      | Named dispersion curve (refractive index) — loaded from `data/glass/` | `resolveGlassIor`, `src/spectral_library.h` — **[maps 1:1]** |
+| `metal:Au`, `metal:copper`, ...        | Named metal reflectance R(λ) from measured n,k — loaded from `data/metal/` | `resolveMetalReflectance`, `src/spectral_library.h` — **[maps 1:1]** |
+| `reflectance:leaf`, `reflectance:skin`, ... | Named natural diffuse reflectance — loaded from `data/reflectance/`  | `resolveNaturalReflectance`, `src/spectral_library.h` — **[maps 1:1]** |
 | `ior 1.5`                              | Constant refractive index                                     | `iorConstant` — **[maps 1:1]** |
 | `table { 400:0.05 450:0.12 ... }`      | Piecewise-linear measured curve (λnm:value pairs)             | `tabulatedSpectrum` — **[maps 1:1]** |
-| `file:data/spd/cie_f2.csv`             | Piecewise-linear curve loaded from an external data file (see below) | `loadSpdCsv` → `tabulatedSpectrum` — **[maps 1:1]** |
+| `file:data/illuminant/f2.csv`          | Piecewise-linear curve loaded from an external data file (see below) | `speclib::loadSpdCsv` → `tabulatedSpectrum` — **[maps 1:1]** |
 | `rgb 0.63 0.06 0.05`                   | Convenience: upsample an sRGB triple to a smooth reflectance   | `rgbToReflectanceJH` (Jakob-Hanika sigmoid fit, `src/upsample.h`) — **[maps 1:1]**; validated by `-checkupsample` |
 | `spectrum:name`                        | Reference a named `spectrum` block                            | name resolution                |
 | `preset:D65`, `preset:led`, ...        | Named illuminant SPD (see §5)                                 | `src/lights.h` — **[maps 1:1]** |
 
-**`glass:<name>` dispersion curves** (refractive index vs λ, `src/spectrum.h`):
-`BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`, `sapphire`,
-`diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`. Sellmeier for
-the glasses/crystals, Cauchy fits for water/ice/plastics.
+These three families are the **spectral asset library**: their data lives in external
+files under `data/{glass,metal,reflectance}/` and is loaded at runtime by
+`src/spectral_library.h` (the Sellmeier/Cauchy evaluators and the piecewise-linear
+curve builder stay native in `src/spectrum.h`). Each name resolves to a file whose
+lowercased stem matches, plus any `# aliases:` the file declares — so dropping a new
+file into a category directory adds a preset with **no rebuild**. See `data/README.md`.
+
+**`glass:<name>` dispersion curves** (refractive index vs λ, `data/glass/*.glass`
+dispersion coefficients): `BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`,
+`sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`. Sellmeier
+for the glasses/crystals, Cauchy fits for water/ice/plastics.
 
 **`metal:<name>` reflectances** (normal-incidence R(λ) from measured complex index,
-`src/materials.h`): `Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`,
+`data/metal/*.csv`): `Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`,
 `Cr`/`chrome`, `brass`. Feed a `mirror`/`glossy` `reflect`.
 
-**`reflectance:<name>` natural diffuse curves** (representative spectral shapes, *not*
-a specific measured sample — see known-issues): `leaf`/`vegetation`, `skin`/`skin-light`,
-`skin-dark`, `snow`, `soil`/`dirt`, `brick`/`red-brick`, `concrete`.
+**`reflectance:<name>` natural diffuse curves** (`data/reflectance/*.csv`;
+representative spectral shapes for skin/soil, measured USGS splib07 for the rest — see
+known-issues): `leaf`/`vegetation`, `skin`/`skin-light`, `skin-dark`, `snow`,
+`soil`/`dirt`, `brick`/`red-brick`, `concrete`.
 
 **`file:<path>` — measured spectra from disk.** Any `<spectrum>` slot accepts
 `file:<path>` to load a piecewise-linear curve (an SPD, a reflectance, or an n(λ)
@@ -169,8 +177,8 @@ taken verbatim (an emission SPD's absolute scale is irrelevant — the power law
 renormalises it — and a reflectance file should already be in 0..1). Paths resolve
 relative to the current working directory (the same convention as `texture`/`mesh`
 file refs), and repeated references to one path share a cached curve. Because the
-built-in `preset:f2` blackbody-table was transcribed from `data/spd/cie_f2.csv`,
-`spd file:data/spd/cie_f2.csv` renders pixel-identically to `spd preset:f2` — the
+built-in `preset:f2` now *loads* `data/illuminant/f2.csv` (rather than a baked table),
+`spd file:data/illuminant/f2.csv` renders pixel-identically to `spd preset:f2` — the
 end-to-end loader proof (`scenes/measured_spd.ftsl`).
 
 ### 2.2 Named spectrum blocks
@@ -201,6 +209,17 @@ Wherever the grammar shows a `<spectrum>` you may write any inline form from
 >
 > Still representative (not per-sample measurements, see known-issues.md): `brass`,
 > `reflectance:skin|skin-dark|soil`, and the iridescent recipes.
+>
+> **All of this spectral data now lives in external files** under
+> `data/{glass,metal,reflectance,illuminant,material,light}/`, loaded at runtime by
+> `src/spectral_library.h` — not baked into the binary. Add a file to a category
+> directory (lowercased stem = the preset name, `# aliases:` header for extra names)
+> and it resolves with no rebuild. The `material/` and `light/` categories are
+> *bundles* — composite manifests that group several spectral envelopes plus intrinsic
+> scalars into one named asset (the iridescent `preset`s and named light presets moved
+> here as `.material` / `.light` files). Only *data* moved out; the dispersion
+> evaluators, blackbody/LED/discharge line models, and the interference/Abeles/Fresnel
+> BSDF math stay native as *algorithms* — a bundle just names data for them to consume.
 >
 > Three stdlib-only converters in `tools/` ingest published data into scenes — each
 > can emit an FTSL `table` block or a C++ `tabulatedSpectrum` initializer:
@@ -273,6 +292,7 @@ material "glow"    { type fluorescent  absorb spectrum:excite  emit spectrum:emi
 | `dielectric`  | **transparency / refraction / dispersion** | `ior <spectrum>` → `ior` (Sellmeier curve gives wavelength-dependent bending = dispersion).                      |
 | `mirror`      | **specular reflection**           | `reflect <spectrum>` → `reflect` (metallic tint; probability of reflect-vs-absorb per photon).                   |
 | `halfmirror`  | **semi-mirror / beamsplitter**    | `reflect <spectrum>` → `reflect` used as reflection **probability**; the rest passes straight through (semi-transparency). |
+| `filter`      | **colored gel / Wratten filter**  | `transmit <spectrum>` → `transmit` used as the per-wavelength transmittance T(λ) ∈ [0,1]. A photon passes **straight through** (no reflection/refraction) and survives with probability T(λ), else is absorbed — Russian roulette on the transmittance. Specular straight-through, so (like clear glass) the gel isn't lit directly; it colors whatever is behind it. Feed T from `filter:<name>`, `file:<path>`, or a primitive (`gaussian center=… sigma=…`). |
 | `glossy`      | **glossiness / brushed metal**    | `reflect <spectrum>` → `reflect`; `roughness <0..1>` → `roughness` (power-cosine lobe width).                    |
 | `thinfilm`    | **iridescence** (Airy interference) | `ior <spectrum>` (substrate) → `ior`; `film_ior <n>` → `filmIor`; `film_thickness <nm>` → `filmThickness`; `substrate_k <spectrum>` → `substrateK` (substrate extinction κ; **0 = transparent** substrate → lossless reflect-or-refract; **>0 = absorbing/metallic** substrate → **opaque** structural colour, transmitted light absorbed). |
 | `multilayer`  | **structural colour** (N-layer Abelès transfer matrix) | `ior <spectrum>` (substrate) → `ior`; `substrate_k <spectrum>` → `substrateK` (substrate κ, same rule as `thinfilm`); one or more ordered `layer <n> <k> <thickness_nm>` statements → `layerN`/`layerK`/`layerThick` (**layer 0 = outermost**, nearest incident air). A stack of alternating high/low-index quarter-wave layers is a Bragg/dichroic mirror (Morpho, jewel beetle, nacre, dielectric mirror). Any absorbing layer (`k > 0`) or absorbing substrate makes it **opaque** (reflect-or-absorb); a fully lossless stack over a transparent substrate is dichroic (reflect-or-refract). A single lossless layer reduces exactly to `thinfilm` Airy. GPU caps the stack at 16 layers; deeper stacks fall back to CPU. |

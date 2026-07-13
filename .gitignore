@@ -1,6 +1,8 @@
 # Build output
 /build/
+/build_cuda/
 /build_het/
+/build_verify/
 /out/
 *.ppm
 *.exr
@@ -9,12 +11,18 @@
 # Generated meshes (regenerate with tools/make_mesh.py)
 *.obj
 
+# Reference PDFs (e.g. Kodak Wratten handbook used to digitize filter data)
+*.pdf
+
 # Checkpoints / render state
 *.ckpt
 /renders/
 
 # Scratch / throwaway scripts and test outputs
 /scraps/
+
+# Raw upstream data dumps (kept locally; derived + attributed CSVs live in data/)
+/data_raw/
 
 # Editor / IDE
 .vs/

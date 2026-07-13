@@ -20,6 +20,7 @@
 #include <complex>
 #include "scene.h"
 #include "camera.h"
+#include "photonmap.h"
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -288,6 +289,20 @@ struct Renderer {
                                  // pupil (physical camera with depth of field).
     bool diffraction = true;     // when false, MatType::Grating collapses to its m=0
                                  // (specular) order — a plain mirror (CLI -diffraction).
+
+    // Photon-map deposit (ROADMAP item 1 / mode M). When non-null, every diffuse-family
+    // surface vertex ALSO appends a Photon record here (view-independent radiance cache).
+    // A photon pass runs with nCam==0 (no camera splat) + photonDeposit set: paths bounce
+    // and deposit, but energy goes into the map instead of onto a sensor. Null in modes
+    // A/B/C, so their splat behaviour is byte-for-byte unchanged.
+    std::vector<Photon>* photonDeposit = nullptr;
+
+    // Append a photon record at a diffuse/translucent vertex (no-op when the map is off).
+    void depositPhoton(const Vec3& p, const Vec3& wtravel, const Vec3& n,
+                       double lambda, double beta) const {
+        if (!photonDeposit) return;
+        photonDeposit->push_back(Photon{p, -wtravel, n, (float)beta, (float)lambda});
+    }
 
     // Model A: map a contact-sensor hit to a pixel and deposit.
     void deposit(const Sensor& s, Film& film, const Vec3& p, double lambda, double beta) const {
@@ -1203,6 +1218,19 @@ struct Renderer {
                     }
                     continue;                       // lossless split
                 }
+                case MatType::Filter: {
+                    // Colored gel / Wratten filter: a thin non-scattering absorber.
+                    // The photon passes straight through (direction unchanged) and
+                    // survives with probability T(lambda), else is absorbed. Russian
+                    // roulette on the transmittance keeps beta unchanged and unbiased —
+                    // the wavelength-dependent survival IS the colored transmission.
+                    // Specular straight-through, so no camera connect (like clear glass):
+                    // you see the filter's effect on whatever lies behind it.
+                    double t = clamp01(m.transmit(lambda));
+                    if (rng.uniform() >= t) { e.absorbed += beta; return; }
+                    ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
+                    continue;
+                }
                 case MatType::Glossy: {
                     double r = clamp01(m.reflect(lambda));
                     // Russian roulette on reflectance (see Mirror).
@@ -1243,6 +1271,8 @@ struct Renderer {
                     double rhoT = clamp01(m.transmit(lambda));
                     double sum = rhoR + rhoT;
                     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
+                    // Photon-map deposit: incident flux at this translucent vertex.
+                    depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
@@ -1259,6 +1289,10 @@ struct Renderer {
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    // Photon-map deposit: incident flux at this diffuse vertex. Stored
+                    // BEFORE the Russian-roulette reflect/absorb so the record captures
+                    // the arriving power (direct on the first hit, indirect thereafter).
+                    depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);

@@ -8,11 +8,13 @@
 # known-issues.md — so the "translucent object" is a lit region of the global haze,
 # which is exactly the shape mode B images for free.)
 #
-# The flight deliberately never traverses OR directly views any transparent surface: a
-# directly-viewed dielectric renders black in mode B (a delta BSDF has no forward camera
-# connection — the SDS limitation), so the scene contains NO dielectric at all. Every
-# surface is diffuse and the volumetric glow is the sole star — exactly the regime mode
-# B nails and a backward tracer struggles with (it would fight to find the haze glow).
+# The star is the volumetric glow — exactly the regime mode B nails and a backward tracer
+# struggles with (it would fight to find the haze glow). On top of that the flight passes
+# straight THROUGH a clear glass orb suspended in the haze: historically a directly-viewed
+# dielectric renders black in mode B (a delta BSDF has no forward camera connection — the
+# SDS limitation), but the ANALYTIC SPECULAR CONNECTION solves the refracted eye ray for
+# both surface and volume in-scatter vertices, so the fog glow refracts correctly through
+# the glass as the camera approaches, enters, and exits it. The glass is the second star.
 #
 # The three lanterns use `lumens` (photometric power), so each reads at the SAME
 # perceived brightness despite very different color temperatures — otherwise the
@@ -37,6 +39,7 @@ scene { units meters  spectral 360 830 1 }
 # image, while the floor picks up the lantern pools of light.
 material "wall"  { type diffuse    reflect rgb 0.50 0.50 0.56 }
 material "floor" { type diffuse    reflect rgb 0.68 0.62 0.52 }
+material "glass" { type dielectric ior    glass:BK7 }
 
 # --- Hall enclosure: floor x[0,3.2], height y[0,2.6], length z[0,7] -------------
 quad { origin 0 0 0     u 3.2 0 0   v 0 0 7    material floor }   # floor
@@ -49,9 +52,14 @@ quad { origin 3.2 0 0   u 0 2.6 0   v 0 0 7    material wall  }   # right (x=3.2
 # --- Glowing lantern orbs: bright sphere lights suspended in the haze -----------
 # Warm amber, cool blue, neutral white — small emitters, but the fog turns each into a
 # broad glowing halo. `lumens` equalizes perceived brightness across color temps.
-light sphere { center 1.0 1.50 1.8   radius 0.16   spd preset:bb2700   lumens 600 }
-light sphere { center 2.3 1.15 3.6   radius 0.16   spd preset:bb8500   lumens 600 }
-light sphere { center 1.3 1.80 5.4   radius 0.16   spd preset:bb5200   lumens 600 }
+light sphere { center 1.0 1.50 1.8   radius 0.20   spd preset:bb2700   lumens 1200 }
+light sphere { center 2.3 1.15 3.6   radius 0.20   spd preset:bb8500   lumens 1200 }
+light sphere { center 1.3 1.80 5.4   radius 0.20   spd preset:bb5200   lumens 1200 }
+
+# --- Clear glass orb the flight passes straight THROUGH (mode-B analytic specular
+# connection). Sits on the curve between the warm and neutral lanterns, so the camera
+# sees the neutral orb's glow refract as it approaches, enters the glass, and exits. --
+sphere { center 2.1 1.25 3.0   radius 0.55   material glass }
 
 # --- Global scattering haze the whole flight is immersed in. Mildly forward-peaked
 # (g 0.35) so the glow biases toward the camera; albedo 0.93 keeps it luminous. -----

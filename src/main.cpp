@@ -17,6 +17,28 @@
 //             GPU-accelerated (its own BDPT megakernel; see renderBdptCuda). Does not
 //             support fluorescence / spot & env lights (use B/P or R for those). See
 //             renderBdpt / bdpt.h.
+//   -mode M : photon map — trace a forward photon pass once, store diffuse deposits in
+//             a view-independent uniform-hash-grid photon map, then final-gather the
+//             camera image from it (backward camera ray through specular, radius density
+//             estimate at the first diffuse hit). View-independent, so the map can be
+//             built once and reused across every camera / flythrough frame. Gather
+//             radius set by -pmradius (absolute) or -pmradiusfrac (fraction of scene
+//             radius, default 0.02). CPU only. See photonmap.h / photonmap_render.h.
+//   -mode S : stochastic progressive photon mapping (SPPM) — repeated bounded photon
+//             passes with a per-pixel shrinking gather radius (Hachisuka 2008/2009), so
+//             the estimate converges (unbiased in the limit) with flat memory and nails
+//             caustics / SDS paths. -n = photons per pass, -spp = number of passes (or a
+//             -time/-noise budget); radius-shrink rate -sppmalpha (default 0.7), initial
+//             radius from -pmradius/-pmradiusfrac. CPU only. See sppm_render.h.
+//   -mode U : vertex connection and merging (VCM/UPS, Georgiev 2012) — combines BDPT
+//             vertex connections with SPPM photon merging under one multiple-importance
+//             -sampling (balance-heuristic) weight, so it robustly handles both the
+//             diffuse/glossy paths BDPT is good at and the caustic/SDS paths photon
+//             mapping is good at. Each pass traces resX*resY light subpaths + one camera
+//             subpath per pixel; -n is ignored (light-path count follows the film). -spp
+//             = number of passes (or a -time/-noise budget); radius-shrink rate -vcmalpha
+//             (default 0.75), initial radius from -pmradius/-pmradiusfrac. CPU only.
+//             See vcm.h.
 // Modes A/B/C/P trace identical forward physics; B/C/P differ only in how the
 // camera measures (splat / aperture catch / composite with the camera-side path).
 //
@@ -71,6 +93,12 @@
 //                  are not disk-resumable yet — their chunks accumulate only in memory.)
 //   -preview       during a progress render, redraw a live ANSI colour thumbnail of the
 //                  current image in the terminal at each periodic update (in place).
+//   -window        open a real OS window (Win32 GDI on Windows; no-op elsewhere) that shows
+//                  the actual tone-mapped pixels, refreshed at each -interval tick. Unlike
+//                  -preview's coarse terminal thumbnail this is the full-resolution image.
+//                  A plain fixed -n forward render with -window is auto-chunked so the view
+//                  updates as it converges; closing the window stops the render (final image
+//                  is still written). Runs on its own UI thread, so it stays responsive.
 //   -interval <s>  seconds between periodic image writes / preview refreshes (default 15).
 //                  The output image file is rewritten at this cadence, so an auto-reloading
 //                  image viewer is also a live display. Applies to every mode above (a plain
@@ -90,11 +118,16 @@
 #include <algorithm>
 #include <thread>
 #include <map>
+#include <memory>
 #include "scene.h"
+#include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "camera.h"
 #include "render.h"
 #include "backward.h"
 #include "bdpt.h"
+#include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
+#include "sppm_render.h"        // mode S: stochastic progressive photon mapping (item 2)
+#include "vcm.h"                // mode U: vertex connection and merging (VCM/UPS, item 3)
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
@@ -146,13 +179,18 @@ static bool writeImage(const std::string& path, int W, int H, const std::vector<
 }
 
 // Resolve a -light name to an emission SPD. Delegates to the shared resolver in
-// lights.h (the same one the FTSL `preset:<name>` expression uses); unknown names
-// fall back to a 6500 K blackbody.
+// lights.h (the same one the FTSL `preset:<name>` expression uses). An explicitly
+// named light that resolves to nothing is a fatal error (the user asked for a
+// specific source), NOT a silent fall-through to white — the built-in default
+// ("bb6500") always resolves via the parametric bb<K> path, so this only fires on
+// a genuinely unrecognized name (typo / missing data file).
 static Spectrum resolveLight(const char* name) {
     if (!name) return blackbody(6500.0);
     Spectrum s;
     if (resolveLightPreset(name, s)) return s;
-    return blackbody(6500.0);
+    throw std::runtime_error("unknown -light preset '" + std::string(name) +
+        "' — not a bb<K>/led<K>k parametric, a data/light or data/illuminant file/alias, "
+        "or a built-in lamp model (sodium/mercury/metal-halide/fluorescent/led-white)");
 }
 
 static void addQuad(Scene& s, Vec3 a, Vec3 b, Vec3 c, Vec3 d, int mat, int sensorId = -1) {
@@ -170,7 +208,8 @@ static Scene buildPrism(int res) {
     Material white; white.reflect = whiteWall(0.75);            s.mats.push_back(white); // 0
     Material glass; glass.type = MatType::Dielectric;
     glass.roughness = 0.0;
-    glass.ior = iorSF10();                                       s.mats.push_back(glass); // 1
+    Spectrum sf10; if (!resolveGlassIor("SF10", sf10)) sf10 = iorConstant(1.7283);
+    glass.ior = sf10;                                            s.mats.push_back(glass); // 1
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);   // floor
     addQuad(s, {0,1,0},{0,1,1},{1,1,1},{1,1,0}, 0);   // ceiling
@@ -249,7 +288,8 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
     Material glass; glass.type = MatType::Dielectric;
     glass.roughness = 0.0;
-    glass.ior = iorSF10();                                       s.mats.push_back(glass); // 4
+    Spectrum sf10; if (!resolveGlassIor("SF10", sf10)) sf10 = iorConstant(1.7283);
+    glass.ior = sf10;                                            s.mats.push_back(glass); // 4
     Material mesh;  mesh.reflect  = whiteWall(0.8);              s.mats.push_back(mesh);  // 5 (diffuse)
     s.mats.push_back(makeFluoroMaterial());                                              // 6 (fluorescent)
     Material film;  film.type = MatType::ThinFilm;
@@ -873,15 +913,15 @@ static int checkUpsample() {
 // and iso/shutter/exposure give exact photographic stops on top.
 constexpr double ABS_EXPOSURE_GAIN = 6.0;
 
-// Returns true on success, false if the image encoder failed. Callers that own the
-// process exit code should propagate a non-zero status on false. (GPU renders that
-// fail — driver TDR, device-memory/scheduling contention — are now caught at the
-// source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
-// which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
-// all-zero/black film never reaches this function.)
-static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
-                      bool quiet = false, double* lockAnchor = nullptr,
-                      bool absolute = false) {
+// Tone-map a film into an 8-bit RGB buffer (W*H*3, row 0 = image top; +y flipped to
+// image-top to match writeImage). Shared by writeFilm (PNG/PPM output) and the live
+// preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
+// absolute EV uses a fixed sensor gain; otherwise a p99 anchor (locked via lockAnchor
+// if non-null, else recomputed per frame). Optionally reports the chosen gain/exposure.
+static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
+                                       bool absolute, double* lockAnchor,
+                                       double* outEAuto = nullptr,
+                                       double* outExposure = nullptr) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
@@ -919,6 +959,24 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
             img[dst + c] = (uint8_t)std::clamp(srgbGamma(v) * 255.0 + 0.5, 0.0, 255.0);
         }
     }
+    if (outEAuto)    *outEAuto = eAuto;
+    if (outExposure) *outExposure = exposure;
+    return img;
+}
+
+// Returns true on success, false if the image encoder failed. Callers that own the
+// process exit code should propagate a non-zero status on false. (GPU renders that
+// fail — driver TDR, device-memory/scheduling contention — are now caught at the
+// source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
+// which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
+// all-zero/black film never reaches this function.)
+static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
+                      bool quiet = false, double* lockAnchor = nullptr,
+                      bool absolute = false) {
+    const int W = f.resX, H = f.resY;
+    double eAuto = 0.0, exposure = 0.0;
+    std::vector<uint8_t> img = filmToRgb8(f, N, expComp, absolute, lockAnchor,
+                                          &eAuto, &exposure);
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
@@ -943,6 +1001,23 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
 // the effective vertical resolution. Tone-mapping mirrors writeFilm (same p99 auto-
 // exposure + sRGB gamma) so the thumbnail tracks what the written image looks like.
 static int g_previewRows = 0;   // terminal lines the last preview occupied (for redraw)
+
+// Photon-map (mode M) gather-radius controls. The density-estimation radius is
+// g_pmRadiusAbs when >0 (absolute world units, CLI -pmradius), else a fraction
+// g_pmRadiusFactor of the scene bounding-sphere radius (CLI -pmradiusfrac). Larger
+// radius = smoother but blurrier estimate.
+static double g_pmRadiusAbs = 0.0;
+static double g_pmRadiusFactor = 0.02;
+
+// SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
+// faster radius shrink (less bias sooner, more variance); 0.7 is the paper default. The
+// initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls above.
+static double g_sppmAlpha = 0.7;
+
+// VCM (mode U) radius-shrink rate alpha (Georgiev 2012; CLI -vcmalpha). The per-pass merge
+// radius follows r_i = R0 * i^((alpha-1)/2), i = pass index (1-based); 0.75 is the
+// SmallVCM default. Initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls.
+static double g_vcmAlpha = 0.75;
 
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
@@ -1406,6 +1481,25 @@ static void onInterrupt(int sig) {
     g_stopRequested = 1;
 }
 
+// --- Live preview window (-window) --------------------------------------------
+// When enabled, the render drivers periodically push the current tone-mapped frame
+// to a real OS window (Win32 GDI; no-op stub off Windows) so the image is watched as
+// it converges, instead of only landing in a PNG. The window is created lazily on the
+// first update at the film's resolution and torn down at process exit. Closing the
+// window sets g_stopRequested so the render stops cleanly (writing its final image).
+static bool                        g_showWindow = false;
+static std::unique_ptr<LiveWindow> g_liveWin;
+static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute) {
+    if (!g_showWindow || N <= 0.0) return;
+    if (!g_liveWin)
+        g_liveWin = std::make_unique<LiveWindow>(f.resX, f.resY, "ftrace — live preview");
+    // Per-frame auto-expose (nullptr anchor) so the live view tracks the converging
+    // image the same way the ANSI preview does.
+    std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
+    g_liveWin->update(f.resX, f.resY, rgb);
+    if (g_liveWin->closed()) g_stopRequested = 1;
+}
+
 // --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
 // A forward render accumulates radiance photon-by-photon into a Film, so it can be
 // stopped and continued: brightness scales with photon count and only graininess
@@ -1627,6 +1721,17 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     return nullptr;
 }
 
+// VCM (mode U) scope guard. VCM reuses BDPT's transport scope but ADDITIONALLY excludes
+// participating media (surfaces-only merging in this build) and the fisheye/lensed cameras
+// (its camera importance assumes the rectilinear pinhole). Returns a reason string or null.
+static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) {
+    if (const char* r = bdptUnsupportedFeature(scene)) return r;
+    if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
+    if (cam.hasLens()) return "a realistic multi-element lens";
+    if (cam.projection != CAM_RECTILINEAR) return "a non-rectilinear (fisheye/panoramic) camera";
+    return nullptr;
+}
+
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
 // in adaptive chunks so a CPU mode-R/D render gets the same live progress as the GPU.
 // `renderOne(chunkSpp, seedOffset)` renders one chunk and returns its SUM film; the
@@ -1734,6 +1839,7 @@ static int runSppProgressive(
                               sppDone, sppReq, elapsed, noisePct);
             if (preview) ansiPreview(film, (double)sppDone, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
+            liveWindowUpdate(film, (double)sppDone, manualExposure, absolute);
         }
         return stop;
     };
@@ -1784,9 +1890,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         resume = false; wantCheckpointFlag = false;
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
-        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D')) {
-        std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward) "
-                             "and R/D (reference/BDPT); ignoring for mode %c\n", mode);
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
+          mode == 'M' || mode == 'S' || mode == 'U')) {
+        std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward), "
+                             "R/D (reference/BDPT), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
@@ -2010,6 +2117,114 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  renderChunked);
     }
 
+    // --- Photon-mapped final gather (mode M) — ROADMAP item 1 ---------------------
+    // Build a view-independent photon map ONCE (forward light-trace with the camera
+    // splat off, depositing a record at every diffuse vertex), then run a backward
+    // camera pass that estimates diffuse radiance by a radius density query into the
+    // map. Specular/direct reach the diffuse surface normally; the map supplies the
+    // (direct + indirect) diffuse illumination. The map is reusable across cameras of
+    // a static scene — the flythrough win (see the multi-camera path below).
+    if (mode == 'M') {
+        double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                              : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("mode M: photon map — tracing %lld photons on %d CPU threads "
+                    "(light=%s), gather radius %.4g ...\n",
+                    N, nThreads, lightLabel, radius);
+        PhotonMap pm;
+        auto tp0 = std::chrono::steady_clock::now();
+        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        pm.build(radius);
+        double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+        std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
+                    "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
+                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, res, resY);
+        if (pm.photons.empty())
+            std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
+                                 "surfaces reached? The image will be black.\n");
+        auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
+            return cpuSppChunks(sppTarget, p, res, resY,
+                [&](long long c, unsigned long long off) {
+                    return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
+                                              diffraction, /*maxBounce*/32, off);
+                });
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
+    // --- Stochastic progressive photon mapping (mode S) — ROADMAP item 2 ----------
+    // Repeated bounded photon passes with a per-pixel shrinking gather radius. Persistent
+    // per-pixel state (flux/radius/count) lives across passes in `st`; each pass re-samples
+    // the camera visible points (stochastic PPM), traces N photons, gathers, and updates the
+    // radius/flux. -n = photons PER PASS, -spp = number of passes (or a -time/-noise budget).
+    if (mode == 'S') {
+        double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                          : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("mode S: SPPM — %lld photons/pass, R0=%.4g, alpha=%.2f at %dx%d on "
+                    "%d CPU threads (light=%s) ...\n",
+                    N, R0, g_sppmAlpha, res, resY, nThreads, lightLabel);
+        SPPMState st; st.init(res, resY, R0);
+        // renderChunked runs the pass loop, reporting L*passes so the progress driver's
+        // divide-by-sppDone recovers the resolved radiance L. Persistent state means we
+        // ignore the chunk's sppTarget granularity and just step one pass per iteration.
+        auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+            Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+            for (long long pass = 0; pass < passTarget; ++pass) {
+                sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
+                         /*maxBounce*/32, (uint64_t)(pass + 1));
+                disp = sppmResolve(st);
+                for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
+                if (p->report(disp, st.passes, st.passes >= passTarget)) break;
+            }
+            return disp;
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
+    // --- Vertex Connection and Merging (mode U) — ROADMAP item 3 ------------------
+    // VCM/UPS: runs BDPT vertex connections AND photon-map vertex merging under one MIS
+    // balance heuristic, so it is robust across diffuse GI, glossy, and specular caustics
+    // in a single unbiased-in-the-limit estimator. Persistent per-pass accumulation lives
+    // in `st`; each pass traces one light + one camera subpath per pixel, shrinking the
+    // merge radius as r_i = R0 * i^((alpha-1)/2). -n is ignored (paths are per-pixel);
+    // -spp = number of passes (or a -time/-noise budget). -vcmalpha = radius-shrink rate.
+    if (mode == 'U') {
+        if (const char* unsupported = vcmUnsupportedFeature(scene, cam)) {
+            std::fprintf(stderr, "[mode U] this scene uses %s, which VCM (mode U) does not "
+                                 "support; render it with mode B/P (forward), R (backward), "
+                                 "or D (BDPT) instead.\n", unsupported);
+            return 1;
+        }
+        int maxDepth = 8;   // full path length in edges
+        double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                          : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
+                    "%d CPU threads (maxDepth=%d, light=%s) ...\n",
+                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel);
+        vcm::VcmState st; st.init(res, resY);
+        auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+            Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+            for (long long pass = 0; pass < passTarget; ++pass) {
+                // Progressive radius schedule (Georgiev/SmallVCM): shrink from R0.
+                double it = (double)(st.passes + 1);
+                double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
+                if (radius <= 0.0) radius = R0;
+                vcm::vcmPass(scene, cam, st, radius, nThreads, diffraction, maxDepth,
+                             (uint64_t)(st.passes + 1));
+                disp = vcm::vcmResolve(st);
+                for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
+                if (p->report(disp, st.passes, st.passes >= passTarget)) break;
+            }
+            return disp;
+        };
+        return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
+                                 timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                 renderChunked);
+    }
+
     // --- Forward + camera-side composite (mode P) ---
     if (mode == 'P') {
         std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
@@ -2072,13 +2287,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     };
 
     using clk = std::chrono::steady_clock;
-    if (progressive) {
-        long long batchN = (N > 0) ? N : 2'000'000;  // -n is the per-batch granularity
+    // A plain fixed-N render with -window (no time/noise/forever budget) still wants a
+    // live view, so chunk N into pieces and stop at the total. `chunkFixed` marks that
+    // mode: the batch loop runs but the stop is the fixed photon total, not a budget.
+    const bool chunkFixed = !progressive && g_showWindow;
+    if (progressive || chunkFixed) {
+        long long batchN = chunkFixed ? std::max(1LL, ((N > 0) ? N : 2'000'000) / 16)
+                                      : ((N > 0) ? N : 2'000'000);  // -n is the granularity
         const char* resumeTag = (resume && acc.N > 0) ? " [resuming]" : "";
         char noiseSuffix[64] = "";                    // appended when -noise adds a floor
         if (noiseTarget > 0.0)
             std::snprintf(noiseSuffix, sizeof noiseSuffix, " or until ~%.2g%% noise", noiseTarget);
-        if (runForever)
+        if (chunkFixed)
+            std::printf("mode %c: tracing %lld photons in %lld-photon batches at %dx%d on %s "
+                        "(light=%s)%s — live window; Ctrl-C to stop early ...\n",
+                        mode, N, batchN, res, resY, backend.c_str(), lightLabel, resumeTag);
+        else if (runForever)
             std::printf("mode %c: tracing indefinitely in %lld-photon batches at %dx%d on %s "
                         "(light=%s)%s%s — press Ctrl-C to stop ...\n",
                         mode, batchN, res, resY, backend.c_str(), lightLabel, resumeTag, noiseSuffix);
@@ -2127,14 +2351,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // black frame from "converging" at 0% on the very first batch).
             bool noiseMet = (noiseTarget > 0.0 && meanHits > 0.0 && noisePct <= noiseTarget);
             if (noiseMet) metNoise = true;
-            bool done = stopped || timeUp || noiseMet;
+            bool totalDone = chunkFixed && N > 0 && acc.N >= N;   // fixed-N window render
+            bool done = stopped || timeUp || noiseMet || totalDone;
             if (done || wantStatus) {   // periodic crash-safe checkpoint + preview
                 writeOut(/*announceCheckpoint*/false, /*quiet*/preview, /*useAnchor*/done);
                 lastSave = clk::now();
                 const char* why = stopped ? " (stopping)"
-                                : noiseMet ? " (noise target met)" : "";
+                                : noiseMet ? " (noise target met)"
+                                : totalDone ? " (done)" : "";
                 char st[220];
-                if (runForever)
+                if (chunkFixed)
+                    std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, ~%.1f%% noise%s",
+                                  elapsed, acc.N, N, noisePct, why);
+                else if (runForever)
                     std::snprintf(st, sizeof st, "[forever] %.1fs elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   elapsed, batches, acc.N, noisePct, why);
                 else if (timeBudgetSec > 0.0)
@@ -2143,10 +2372,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else
                     std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   noiseTarget, elapsed, batches, acc.N, noisePct, why);
-                if (preview) {
+                if (preview || g_showWindow) {
                     Film disp = acc.film;
                     if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-                    ansiPreview(disp, (double)acc.N, manualExposure, st);
+                    if (preview) ansiPreview(disp, (double)acc.N, manualExposure, st);
+                    else { std::printf("%s\n", st); std::fflush(stdout); }
+                    liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute);
                 } else { std::printf("%s\n", st); std::fflush(stdout); }
             }
             if (done) break;
@@ -2180,7 +2411,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     return writeOk ? 0 : 1;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
     // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
@@ -2208,6 +2439,10 @@ int main(int argc, char** argv) {
     bool checkFluoroOnly = false;
     const char* meshPath = nullptr;
     double meshScale = 1.0;
+    const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
+    int    exportMeshRes = 128;            // -mesh-res <N>: cells along longest bounds axis
+    bool   exportMeshAdaptive = false;     // -mesh-adaptive: curvature-driven QEM decimation
+    double exportMeshDecimate = 0.5;       // -mesh-decimate <f>: keep this fraction of triangles
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
     double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
     double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
@@ -2224,7 +2459,10 @@ int main(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
-    const char* cameraSel = nullptr; // -camera <name>|all (FTSL multi-camera select)
+    const char* cameraSel = nullptr; // -camera <name>|all|#N|near=X,Y,Z (FTSL multi-camera select)
+    bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
+    Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
+    double viewFov = 40.0;
     bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (modes A/B/C forward, R/D spp)
     double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (A/B/C, R/D)
@@ -2271,7 +2509,28 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
+        else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
+            // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
+            // are interchangeable separators). Renders and previews just this
+            // camera, ignoring any authored/curve cameras.
+            const char* s = argv[++i];
+            double v[7]; int nv = 0;
+            for (const char* p = s; *p && nv < 7; ) {
+                char* e = nullptr; double val = std::strtod(p, &e);
+                if (e == p) break;
+                v[nv++] = val; p = e;
+                while (*p == ',' || *p == '/' || *p == ' ') ++p;
+            }
+            if (nv < 6) { std::fprintf(stderr, "error: -view needs EX,EY,EZ/LX,LY,LZ[/FOV]\n"); return 1; }
+            viewEye = {v[0], v[1], v[2]}; viewLook = {v[3], v[4], v[5]};
+            if (nv >= 7) viewFov = v[6];
+            haveView = true;
+        }
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) nThreads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-scene") && i + 1 < argc) sceneName = argv[++i];
         else if (!std::strcmp(argv[i], "-light") && i + 1 < argc) lightName = argv[++i];
@@ -2284,6 +2543,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
         else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
+        else if (!std::strcmp(argv[i], "-mesh-res") && i + 1 < argc) exportMeshRes = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-mesh-adaptive")) exportMeshAdaptive = true;
+        else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fogalbedo") && i + 1 < argc) fogAlbedo = std::atof(argv[++i]);
@@ -2308,6 +2571,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
+        else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
@@ -2376,6 +2640,42 @@ int main(int argc, char** argv) {
         return checkBvh(scene, rays) == 0 ? 0 : 1;
     }
     if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
+
+    // -export-mesh <file.obj>: polygonise every isosurface in the scene into a
+    // watertight triangle mesh (marching cubes) and write an OBJ for import into
+    // Unreal / Blender / etc., then exit. -mesh-res sets fineness (cells along the
+    // longest bounds axis). -mesh-adaptive runs a curvature-driven QEM decimation
+    // pass so triangles concentrate where the surface bends and thin out where it
+    // is flat, while staying watertight.
+    if (exportMeshPath) {
+        if (scene.implicits.empty()) {
+            std::fprintf(stderr, "[export-mesh] ERROR: scene has no isosurface to export\n");
+            return 1;
+        }
+        isomesh::Options mo;
+        mo.res = std::max(2, exportMeshRes);
+        mo.adaptive = exportMeshAdaptive;
+        mo.decimate = std::clamp(exportMeshDecimate, 0.01, 1.0);
+        auto logfn = [](const std::string& s) { std::printf("%s\n", s.c_str()); };
+        std::vector<std::pair<std::string, isomesh::Mesh>> groups;
+        for (size_t k = 0; k < scene.implicits.size(); ++k) {
+            std::printf("[export-mesh] marching isosurface %zu/%zu at res %d ...\n",
+                        k + 1, scene.implicits.size(), mo.res);
+            isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo);
+            std::printf("[export-mesh]   marched: %zu verts, %zu tris\n",
+                        m.pos.size(), m.tri.size() / 3);
+            if (mo.adaptive && !m.tri.empty()) {
+                size_t before = m.tri.size() / 3;
+                isomesh::decimateAdaptive(m, mo.decimate, scene.implicits[k]);
+                std::printf("[export-mesh]   decimated: %zu -> %zu tris (target %.0f%%)\n",
+                            before, m.tri.size() / 3, mo.decimate * 100.0);
+            }
+            groups.emplace_back("isosurface_" + std::to_string(k), std::move(m));
+        }
+        bool ok = isomesh::writeObj(exportMeshPath, groups, logfn);
+        return ok ? 0 : 1;
+    }
+
     // Build the list of cameras to render. FTSL scenes may declare several; a
     // built-in scene has exactly one. Each render camera carries its own effective
     // mode and film resolution (per-camera FTSL values, unless a CLI -mode/-r forces
@@ -2388,20 +2688,68 @@ int main(int argc, char** argv) {
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup; };
     std::vector<RenderCam> toRender;
 
+    // -view against a loaded (-in) scene: inject an ad-hoc 'view' CamSpec and
+    // render only it (so the live -window/-preview shows exactly that angle).
+    // A built-in scene has no CamSpec list; its view override is applied in the
+    // else branch below.
+    if (haveView && fromFtsl) {
+        ftsl::CamSpec vc;
+        vc.name = "view"; vc.eye = viewEye; vc.look = viewLook; vc.up = viewUp; vc.fov = viewFov;
+        ftslScene.cameras.push_back(vc);
+        cameraSel = "view";
+    }
+
     if (fromFtsl && !ftslScene.cameras.empty()) {
-        // Select which cameras to render: `-camera <name>` picks one; `-camera all`
-        // (or, by default, more than one declared) renders every camera; a single
-        // declared camera renders it.
+        // Select which cameras to render. `-camera` accepts:
+        //   all           every camera (default when several are declared)
+        //   <name>        exact camera/frame name (e.g. hero, fly137)
+        //   #N            the Nth declared camera, 0-based (#-1 = last)
+        //   near=X,Y,Z    the camera whose eye is closest to (X,Y,Z)
+        // The index and nearest selectors make it easy to aim the live window at
+        // one frame of a long camera_curve without hunting for its frame name.
         std::vector<const ftsl::CamSpec*> sel;
         if (cameraSel && std::strcmp(cameraSel, "all") != 0) {
-            for (const auto& cs : ftslScene.cameras)
-                if (cs.name == cameraSel) sel.push_back(&cs);
-            if (sel.empty()) {
-                std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
+            const std::string q = cameraSel;
+            if (!q.empty() && q[0] == '#') {
+                int count = (int)ftslScene.cameras.size();
+                int n = std::atoi(q.c_str() + 1);
+                if (n < 0) n += count;
+                if (n < 0 || n >= count) {
+                    std::fprintf(stderr, "[camera] index '%s' out of range (have %d cameras: 0..%d)\n",
+                                 q.c_str(), count, count - 1);
+                    return 1;
+                }
+                sel.push_back(&ftslScene.cameras[n]);
+                std::printf("[camera] index %s -> '%s'\n", q.c_str(), ftslScene.cameras[n].name.c_str());
+            } else if (q.rfind("near=", 0) == 0 || q.rfind("near:", 0) == 0) {
+                double xyz[3] = {0,0,0}; int nv = 0;
+                for (const char* p = q.c_str() + 5; *p && nv < 3; ) {
+                    char* e = nullptr; double val = std::strtod(p, &e);
+                    if (e == p) break;
+                    xyz[nv++] = val; p = e;
+                    while (*p == ',' || *p == ' ') ++p;
+                }
+                if (nv < 3) { std::fprintf(stderr, "[camera] -camera near= needs X,Y,Z\n"); return 1; }
+                Vec3 target{xyz[0], xyz[1], xyz[2]};
+                const ftsl::CamSpec* best = nullptr; double bestD2 = 1e300;
+                for (const auto& cs : ftslScene.cameras) {
+                    Vec3 d = cs.eye - target; double d2 = dot(d, d);
+                    if (d2 < bestD2) { bestD2 = d2; best = &cs; }
+                }
+                sel.push_back(best);
+                std::printf("[camera] nearest to (%.3f,%.3f,%.3f) is '%s' (eye %.3f,%.3f,%.3f, dist %.3f)\n",
+                            target.x, target.y, target.z, best->name.c_str(),
+                            best->eye.x, best->eye.y, best->eye.z, std::sqrt(bestD2));
+            } else {
                 for (const auto& cs : ftslScene.cameras)
-                    std::fprintf(stderr, " %s", cs.name.c_str());
-                std::fprintf(stderr, ")\n");
-                return 1;
+                    if (cs.name == cameraSel) sel.push_back(&cs);
+                if (sel.empty()) {
+                    std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
+                    for (const auto& cs : ftslScene.cameras)
+                        std::fprintf(stderr, " %s", cs.name.c_str());
+                    std::fprintf(stderr, ")\n");
+                    return 1;
+                }
             }
         } else {
             for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
@@ -2470,15 +2818,17 @@ int main(int argc, char** argv) {
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cs->exposureMul, eg});
         }
     } else {
-        // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/ref) uses
-        // the same camera frame; only the old contact-sensor diagnostic did not.
+        // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
+        // uses the same camera frame; only the old contact-sensor diagnostic did not.
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
-                                mode == 'P' || mode == 'D' || refMode);
+                                mode == 'P' || mode == 'D' || mode == 'M' ||
+                                mode == 'S' || mode == 'U' || refMode);
         const int resY = (resYCli > 0) ? resYCli : res;
         Camera c;
         if (useCamera) {
-            if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, resY);
-            else       c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, resY);
+            if (haveView)   c.lookAt(viewEye, viewLook, viewUp, viewFov, res, resY);   // -view overrides the demo camera
+            else if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, resY);
+            else            c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, resY);
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
@@ -2531,17 +2881,25 @@ int main(int argc, char** argv) {
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
     const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || resume ||
                                wantCheckpointFlag || runForever || preview);
-    std::vector<int> groupB, groupA, restIdx;
+    std::vector<int> groupB, groupA, groupM, restIdx;
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
         bool base = (rc.expGroup < 0) && plainRender;
         if (base && rc.mode == 'B')                                           groupB.push_back(i);
         else if (base && rc.mode == 'A' && rc.cam.projection == CAM_RECTILINEAR) groupA.push_back(i);
+        // Mode M (photon map): the map is view-INDEPENDENT, so build it once and gather
+        // every camera from it — the flythrough win. Unlike A/B sharing (which reuses one
+        // photon *flight* and so imposes the same fixed noise on every frame), the mode-M
+        // gather is an independent backward pass per camera, so frames don't share noise —
+        // only the underlying radiance solution. That makes it safe to share even across
+        // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
+        else if (rc.mode == 'M' && plainRender)                               groupM.push_back(i);
         else                                                                  restIdx.push_back(i);
     }
     // A single-camera group has nothing to share — fold it back into the per-camera path.
     if (groupB.size() < 2) { for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
     if (groupA.size() < 2) { for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
+    if (groupM.size() < 2) { for (int i : groupM) restIdx.push_back(i); groupM.clear(); }
     std::sort(restIdx.begin(), restIdx.end());
 
     bool sharedWriteFail = false;
@@ -2585,6 +2943,42 @@ int main(int argc, char** argv) {
     runSharedGroup(groupB, 'B');
     runSharedGroup(groupA, 'A');
 
+    // Shared photon-map pass (mode M): build ONE view-independent map, gather every
+    // camera from it. This is where the photon map pays off over per-camera backward
+    // tracing — the (expensive) forward photon flight amortizes across all frames.
+    auto runSharedPhotonMap = [&](const std::vector<int>& idx) {
+        if (idx.empty()) return;
+        double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                              : scene.sceneRadius * g_pmRadiusFactor;
+        std::printf("[camera] shared photon map (mode M): %zu cameras, %lld photons, "
+                    "radius %.4g on %d CPU threads (light=%s) ...\n",
+                    idx.size(), N, radius, nThreads, lightLabel);
+        PhotonMap pm;
+        auto tp0 = std::chrono::steady_clock::now();
+        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        pm.build(radius);
+        double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+        std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
+                    "grid %dx%dx%d — gathering %zu cameras ...\n",
+                    pm.photons.size(), pm.nEmitted, buildSec, pm.nx, pm.ny, pm.nz, idx.size());
+        if (pm.photons.empty())
+            std::fprintf(stderr, "[mode M] warning: 0 photons deposited — images "
+                                 "will be black.\n");
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const RenderCam& rc = toRender[idx[k]];
+            Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
+                                        nThreads, diffraction, /*maxBounce*/32, 0);
+            std::string op = outFor(rc.name);
+            if (toRender.size() > 1)
+                std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",
+                            rc.name.c_str(), rc.res, rc.resY, op.c_str());
+            double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
+            if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
+                sharedWriteFail = true;
+        }
+    };
+    runSharedPhotonMap(groupM);
+
     for (int i : restIdx) {
         const RenderCam& rc = toRender[i];
         if (toRender.size() > 1)
@@ -2598,4 +2992,17 @@ int main(int argc, char** argv) {
         if (rv != 0) return rv;
     }
     return sharedWriteFail ? 1 : 0;
+}
+
+// Thin wrapper: turn a fatal configuration error (e.g. an explicit `file:`/`glass:`/
+// `illuminant:` reference whose target is missing or malformed — thrown by the
+// spectral-library resolver) into a clean message + non-zero exit, instead of a
+// silent fall-through to a default illuminant that would render the wrong thing.
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }

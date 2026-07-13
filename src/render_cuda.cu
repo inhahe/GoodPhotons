@@ -157,7 +157,7 @@ HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 // (MatType::Layered) has no device branch (Layered scenes fall back to the CPU tracer via
 // cudaForwardSupported), but the placeholder keeps D_DIFFUSETRANSMIT aligned at index 11.
 enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM,
-       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT };
+       D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT, D_FILTER };
 
 // Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
 // exceed this fall back to the CPU forward tracer (cudaForwardSupported).
@@ -243,7 +243,7 @@ struct DMaterial {
     int    mixWeightPat;
 };
 
-struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId; };
+struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId; };
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
@@ -305,6 +305,14 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
+    // --- Optional imported .nvdb volume baked to a dense grid (mirrors VdbGrid) ---
+    // When `vdbData` is non-null the density multiplier is TRILINEARLY sampled from
+    // this uploaded dense lattice instead of the pattern VM; takes precedence.
+    const float*     vdbData;         // nx*ny*nz values, index [(k*ny+j)*nx+i] (or null)
+    int              vdbNx, vdbNy, vdbNz;
+    double           vdbAinv[9];      // world->index linear map (row-major 3x3)
+    DVec3            vdbW0;            // world position of index origin (0,0,0)
+    DVec3            vdbImin;          // integer min-corner of the baked lattice
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field
     DVec3            bmin, bmax;
@@ -546,6 +554,13 @@ struct DCamera {
             if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
             px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
             py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+            // FP32 rounding at the film edge can push (ix*0.5+0.5)*res up to exactly
+            // res, yielding px==resX/py==resY and an out-of-bounds film write. The
+            // ix/iy<1 rejection above guarantees the point is on-film, so clamp the
+            // boundary case back to the last valid pixel. (CPU project uses double and
+            // never rounds up this way, so it needs no clamp — behaviour still matches.)
+            px = px < 0 ? 0 : (px >= resX ? resX - 1 : px);
+            py = py < 0 ? 0 : (py >= resY ? resY - 1 : py);
             dist2 = dot(d, d);
             cosCam = cz / sqrt(dist2);
             return true;
@@ -567,6 +582,8 @@ struct DCamera {
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
         py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+        px = px < 0 ? 0 : (px >= resX ? resX - 1 : px);   // clamp FP32 edge roundup
+        py = py < 0 ? 0 : (py >= resY ? resY - 1 : py);
         dist2 = len * len;
         cosCam = costh;
         return true;
@@ -613,6 +630,8 @@ struct DCamera {
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
         py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+        px = px < 0 ? 0 : (px >= resX ? resX - 1 : px);   // clamp FP32 edge roundup
+        py = py < 0 ? 0 : (py >= resY ? resY - 1 : py);
         return true;
     }
     // Model C perspective catch: does this photon fly through the finite aperture
@@ -742,6 +761,38 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
+    }
+    // Imported .nvdb volume: trilinearly sample the uploaded dense grid (device twin
+    // of VdbGrid::sample). Takes precedence over the pattern-VM density formula.
+    if (m.vdbData) {
+        double rx = (double)p.x - m.vdbW0.x, ry = (double)p.y - m.vdbW0.y, rz = (double)p.z - m.vdbW0.z;
+        double fi = m.vdbAinv[0]*rx + m.vdbAinv[1]*ry + m.vdbAinv[2]*rz - m.vdbImin.x;
+        double fj = m.vdbAinv[3]*rx + m.vdbAinv[4]*ry + m.vdbAinv[5]*rz - m.vdbImin.y;
+        double fk = m.vdbAinv[6]*rx + m.vdbAinv[7]*ry + m.vdbAinv[8]*rz - m.vdbImin.z;
+        int nx = m.vdbNx, ny = m.vdbNy, nz = m.vdbNz;
+        if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
+            fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
+        double ffi = floor(fi), ffj = floor(fj), ffk = floor(fk);
+        int i0 = (int)ffi, j0 = (int)ffj, k0 = (int)ffk;
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+        int i0c = cl(i0, nx-1), i1c = cl(i0+1, nx-1);
+        int j0c = cl(j0, ny-1), j1c = cl(j0+1, ny-1);
+        int k0c = cl(k0, nz-1), k1c = cl(k0+1, nz-1);
+        double tx = fi - ffi, ty = fj - ffj, tz = fk - ffk;
+        tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
+        ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
+        tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
+        const float* D = m.vdbData;
+        auto AT = [&](int i, int j, int k) -> double {
+            return (double)D[((size_t)k * ny + j) * nx + i];
+        };
+        double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
+        double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
+        double c01 = AT(i0c,j0c,k1c)*(1-tx) + AT(i1c,j0c,k1c)*tx;
+        double c11 = AT(i0c,j1c,k1c)*(1-tx) + AT(i1c,j1c,k1c)*tx;
+        double c0 = c00*(1-ty) + c10*ty, c1 = c01*(1-ty) + c11*ty;
+        double v = c0*(1-tz) + c1*tz;
+        return v > 0.0 ? v : 0.0;
     }
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
@@ -1231,13 +1282,19 @@ __device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri
     if (t < tmin || t >= hit.t) return false;
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
     hit.ng = tri.gn;
-    hit.n = (dot(rd, tri.gn) < 0) ? tri.gn : -tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolate the per-vertex UVs (u,vv are the Moller-Trumbore
     // weights of v1,v2; the v0 weight is 1-u-vv). Mirrors host intersectTri.
     Real w0 = (Real)1 - u - vv;
     hit.u = w0 * tri.uv0.x + u * tri.uv1.x + vv * tri.uv2.x;
     hit.v = w0 * tri.uv0.y + u * tri.uv1.y + vv * tri.uv2.y;
+    // Smooth shading normal: interpolate per-vertex normals (equal to gn for a flat
+    // tri, so this reduces to the geometric normal). Orient against the ray. Mirrors
+    // host intersectTri.
+    DVec3 ns = tri.n0 * w0 + tri.n1 * u + tri.n2 * vv;
+    Real nl = dot(ns, ns);
+    ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
+    hit.n = (dot(rd, ns) < 0) ? ns : -ns;
     return true;
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
@@ -2556,6 +2613,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
         else { ro = h.p + rd * RAY_EPS; }
         return WF_CONTINUE;
+    } else if (m.type == D_FILTER) {
+        // Colored gel / Wratten filter (device twin of render.h MatType::Filter): a thin
+        // non-scattering absorber. Pass straight through; survive with prob T(lambda),
+        // else absorb. RR on the transmittance keeps beta unchanged and unbiased.
+        Real t = clamp01(specLookup(m.transmit, lambda));
+        if (rng.uniform() >= t) { eAbsorbed += beta; return WF_TERMINATE; }
+        ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
+        return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
         Real r = clamp01(specLookup(m.reflect, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -3214,6 +3279,13 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 else                   { ro = h.p + rd * RAY_EPS; }
                 specularArrival = true; break;
             }
+            case D_FILTER: {
+                // Colored gel filter: pass straight through, survive with prob T(lambda).
+                Real t = clamp01(specLookup(mp->transmit, lambda));
+                if (rng.uniform() >= t) return L;   // absorbed
+                ro = h.p + rd * RAY_EPS;            // direction unchanged
+                specularArrival = true; break;
+            }
             case D_GLOSSY: {
                 Real r = clamp01(specLookup(mp->reflect, lambda));
                 if (rng.uniform() >= r) return L;
@@ -3415,6 +3487,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 double r = clamp01(specLookup(mp->reflect, lambda));
                 if (rng.uniform() < r) wi = reflectv(rd, path[cur].ns); else wi = rd;
                 betaFactor = 1.0; delta = 1;
+                break;
+            }
+            case D_FILTER: {
+                // Colored gel filter: straight-through delta, throughput ×= T(lambda).
+                double t = clamp01(specLookup(mp->transmit, lambda));
+                wi = rd; betaFactor = t; delta = 1;
+                if (t <= 0) terminate = true;
                 break;
             }
             case D_THINFILM: {
@@ -3906,14 +3985,43 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
 
     // --- bake geometry ---
-    std::vector<DTri> tris(scene.tris.size());
-    for (size_t i = 0; i < scene.tris.size(); ++i) {
-        const Tri& t = scene.tris[i]; DTri& d = tris[i];
+    // Instancing is CPU-only in the acceleration structure: the GPU has no two-level
+    // BVH, so each MeshInstance is EXPANDED here into world-space triangles appended
+    // after the base tris (and the top-level BVH is rebuilt over the full flat set
+    // below). This keeps device traversal identical to the non-instanced path (a flat
+    // tri/sphere/implicit list) at the cost of not sharing instance geometry in device
+    // memory — a documented limitation (see known-issues.md). `flatTris` is the base
+    // Scene::tris followed by every instance's transformed BLAS triangles.
+    std::vector<Tri> flatTris;
+    flatTris.reserve(scene.tris.size());
+    flatTris.insert(flatTris.end(), scene.tris.begin(), scene.tris.end());
+    const bool haveInstances = !scene.instances.empty();
+    for (const auto& inst : scene.instances) {
+        const Blas& bl = scene.blasList[inst.blasId];
+        for (const Tri& lt : bl.tris) {
+            Tri wt = lt;
+            wt.v0 = inst.toWorld.apply(lt.v0);
+            wt.v1 = inst.toWorld.apply(lt.v1);
+            wt.v2 = inst.toWorld.apply(lt.v2);
+            wt.n0 = normalize(inst.toWorld.applyNormal(lt.n0));
+            wt.n1 = normalize(inst.toWorld.applyNormal(lt.n1));
+            wt.n2 = normalize(inst.toWorld.applyNormal(lt.n2));
+            if (inst.matOverride >= 0) wt.matId = inst.matOverride;
+            wt.finalize();   // recompute gn from the world verts (n0/n1/n2 stay: nonzero)
+            flatTris.push_back(wt);
+        }
+    }
+    std::vector<DTri> tris(flatTris.size());
+    for (size_t i = 0; i < flatTris.size(); ++i) {
+        const Tri& t = flatTris[i]; DTri& d = tris[i];
         d.v0 = {t.v0.x, t.v0.y, t.v0.z}; d.v1 = {t.v1.x, t.v1.y, t.v1.z};
         d.v2 = {t.v2.x, t.v2.y, t.v2.z}; d.gn = {t.gn.x, t.gn.y, t.gn.z};
         d.uv0 = {t.uv0.x, t.uv0.y, t.uv0.z};
         d.uv1 = {t.uv1.x, t.uv1.y, t.uv1.z};
         d.uv2 = {t.uv2.x, t.uv2.y, t.uv2.z};
+        d.n0 = {t.n0.x, t.n0.y, t.n0.z};
+        d.n1 = {t.n1.x, t.n1.y, t.n1.z};
+        d.n2 = {t.n2.x, t.n2.y, t.n2.z};
         d.matId = t.matId; d.sensorId = t.sensorId;
     }
     std::vector<DSphere> sph(scene.spheres.size());
@@ -3921,14 +4029,38 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
     }
-    std::vector<DNode> nodes(scene.bvh.nodes.size());
-    for (size_t i = 0; i < scene.bvh.nodes.size(); ++i) {
-        const BvhNode& b = scene.bvh.nodes[i]; DNode& d = nodes[i];
+    // Top-level BVH: with no instances, upload Scene::bvh verbatim (the common,
+    // bit-identical path). With instances, Scene::bvh contains per-instance TLAS
+    // leaves the GPU can't traverse, so rebuild a FLAT BVH over the expanded prim set
+    // — flatTris (base + instance tris), then spheres, then implicits — matching the
+    // device leaf dispatch's [tris | spheres | implicits] index layout.
+    const Bvh* srcBvh = &scene.bvh;
+    Bvh flatBvh;
+    if (haveInstances) {
+        const double pad = 1e-6;
+        std::vector<Aabb> boxes;
+        boxes.reserve(flatTris.size() + scene.spheres.size() + scene.implicits.size());
+        for (const auto& t : flatTris) {
+            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+            b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
+            boxes.push_back(b);
+        }
+        for (const auto& s : scene.spheres) {
+            Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
+            boxes.push_back(b);
+        }
+        for (const auto& im : scene.implicits) boxes.push_back(im.bounds);
+        flatBvh.build(boxes);
+        srcBvh = &flatBvh;
+    }
+    std::vector<DNode> nodes(srcBvh->nodes.size());
+    for (size_t i = 0; i < srcBvh->nodes.size(); ++i) {
+        const BvhNode& b = srcBvh->nodes[i]; DNode& d = nodes[i];
         d.lo = {b.box.lo.x, b.box.lo.y, b.box.lo.z};
         d.hi = {b.box.hi.x, b.box.hi.y, b.box.hi.z};
         d.left = b.left; d.right = b.right; d.first = b.first; d.count = b.count;
     }
-    std::vector<int> primIdx = scene.bvh.primIdx;
+    std::vector<int> primIdx = srcBvh->primIdx;
 
     // --- bake implicit surfaces (isosurface / CSG / metaballs) ---
     // Flatten every Implicit's postfix FieldNode array into one pool; each DImplicit
@@ -4197,6 +4329,20 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
+            // Imported .nvdb volume: upload the baked dense grid + world->index affine.
+            if (m.vdb && !m.vdb->empty()) {
+                const VdbGrid& g = *m.vdb;
+                dm.vdbData = (const float*)keep(uploadVec(g.data));
+                dm.vdbNx = g.nx; dm.vdbNy = g.ny; dm.vdbNz = g.nz;
+                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = g.ainv[k];
+                dm.vdbW0   = {g.w0.x, g.w0.y, g.w0.z};
+                dm.vdbImin = {g.imin.x, g.imin.y, g.imin.z};
+            } else {
+                dm.vdbData = nullptr;
+                dm.vdbNx = dm.vdbNy = dm.vdbNz = 0;
+                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = (k % 4 == 0) ? 1.0 : 0.0;
+                dm.vdbW0 = {0,0,0}; dm.vdbImin = {0,0,0};
+            }
             dm.bounded  = m.bounded ? 1 : 0;
             dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
                           : (m.boundShape == MediumBound::Implicit) ? 2 : 0;

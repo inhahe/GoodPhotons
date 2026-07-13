@@ -1,0 +1,85 @@
+# Crystal loop — a seamless, endlessly-loopable mode-B fly-through built to be turned
+# straight into an animated GIF. The camera rides a CLOSED oval and, once per lap, plunges
+# straight THROUGH a big clear glass sphere: the colored orbs and glowing haze behind the
+# glass smear into a refracted fisheye as the camera enters, invert as it passes the centre,
+# and snap back as it exits — the whole point of the analytic specular connection (mode B
+# images a directly-viewed / flown-through dielectric that a plain forward splat renders
+# black). Because the curve is `closed` and the exposure is absolute (`lumens`), the last
+# frame flows seamlessly into the first with zero brightness flicker — a perfect GIF loop.
+#
+#   # 120 frames @ 30 fps = a 4 s loop
+#   ftrace -in scenes/crystalloop.ftsl -mode B -device gpu -n 2000000000 -o png/crystalloop.png
+#   # seamless looping GIF (palette per-frame for clean colour):
+#   ffmpeg -framerate 30 -i png/crystalloop_loop%03d.png \
+#          -vf "split[a][b];[a]palettegen[p];[b][p]paletteuse" -loop 0 png/crystalloop.gif
+
+scene { units meters  spectral 360 830 1 }
+
+# Dark, slightly cool room so the colored orbs and the glass carry the frame.
+material "wall"  { type diffuse    reflect rgb 0.34 0.34 0.40 }
+material "floor" { type diffuse    reflect rgb 0.30 0.28 0.26 }
+material "glass" { type dielectric ior    glass:BK7 }
+
+# --- Room enclosure: floor x[0,3.2], height y[0,2.6], length z[0,6] -------------
+quad { origin 0 0 0     u 3.2 0 0   v 0 0 6    material floor }   # floor
+quad { origin 0 2.6 0   u 0 0 6     v 3.2 0 0  material wall  }   # ceiling
+quad { origin 0 0 0     u 0 2.6 0   v 3.2 0 0  material wall  }   # back  (z=0)
+quad { origin 0 0 6     u 0 2.6 0   v 3.2 0 0  material wall  }   # front (z=6)
+quad { origin 0 0 0     u 0 0 6     v 0 2.6 0  material wall  }   # left  (x=0)
+quad { origin 3.2 0 0   u 0 2.6 0   v 0 0 6    material wall  }   # right (x=3.2)
+
+# --- The crystal: a big clear glass sphere the loop flies straight through. Sits on the
+# right arc of the camera oval, its centre nudged 5 cm off the camera line so the flight
+# cuts a near-central chord (a full refracted transit) rather than the exact degenerate
+# centre. -------------------------------------------------------------------------------
+sphere { center 2.55 1.35 3.0   radius 0.72   material glass }
+
+# --- Glowing colored orbs suspended in the haze. `lumens` equalizes perceived brightness
+# across color temperatures AND forces absolute exposure (one fixed sensor gain every frame
+# -> zero GIF flicker). Warm / neutral / cool / warm placed around the room so at least one
+# is refracting through the glass at any point in the lap. --------------------------------
+light sphere { center 1.0 1.65 4.4   radius 0.18   spd preset:bb2700   lumens 1300 }
+light sphere { center 1.7 1.95 1.4   radius 0.18   spd preset:bb5200   lumens 1300 }
+light sphere { center 0.7 1.05 2.2   radius 0.18   spd preset:bb8500   lumens 1300 }
+light sphere { center 1.3 0.85 5.2   radius 0.16   spd preset:bb3500   lumens 1000 }
+
+# --- Global scattering haze the whole flight is immersed in. Forward-peaked (g 0.4) so the
+# glow biases toward the camera; albedo 0.94 keeps it luminous. --------------------------
+medium { sigma_t 0.30   albedo 0.94   g 0.40 }
+
+# --- Seamless closed oval loop. Eight control points trace an oval centred on the room
+# (O = 1.6, 1.3, 3.0; x-radius ~1.1, z-radius ~1.9) with a gentle vertical bob. The 0-degree
+# (right) point sits at the glass sphere, so the camera plunges through the crystal once per
+# lap. `look tangent` aims it straight down the path — into and through the glass. `closed`
+# ties the last point back to the first for an endless GIF. --------------------------------
+camera_curve "loop" {
+    point 2.70 1.30 3.0      #   0 deg — entering the glass sphere (crossing its near-centre)
+    point 2.38 1.42 4.34     #  45 deg
+    point 1.60 1.30 4.90     #  90 deg — front, low
+    point 0.82 1.42 4.34     # 135 deg
+    point 0.50 1.30 3.0      # 180 deg — far left
+    point 0.82 1.48 1.66     # 225 deg
+    point 1.60 1.30 1.10     # 270 deg — back, low
+    point 2.38 1.44 1.66     # 315 deg — sweeping back toward the glass
+
+    up 0 1 0   fov_y 66   mode B   frames 120   closed
+    look tangent             # fly into the glow — and straight through the crystal
+
+    # Animated orientation + lens (per-frame keyframe tracks over the loop timeline
+    # t in [0,1]; the crystal transit is at t=0 == t=1 because the curve is `closed`).
+    # roll banks the camera into the oval's turns and levels out at the crystal, so the
+    # world tips one way rounding the near arc and the other rounding the far arc — the
+    # third orientation DOF. fov widens for a fisheye "plunge" as it dives through the
+    # glass, then eases back to a normal field for the cruise around the loop.
+    roll_at 0.00   0        # level, diving into the crystal
+    roll_at 0.25  14        # bank right rounding the front
+    roll_at 0.50   0        # level at the far side
+    roll_at 0.75 -14        # bank left rounding the back
+    roll_at 1.00   0        # level again, seamless with t=0
+    fov_at  0.00  84        # wide plunge through the crystal
+    fov_at  0.15  66        # settle to normal for the cruise
+    fov_at  0.85  66
+    fov_at  1.00  84        # widen back for the next transit (seamless)
+
+    film { res 480 270   exposure 26 }   # absolute exposure (lumens) -> no flicker; GIF-friendly res
+}

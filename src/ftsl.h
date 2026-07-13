@@ -61,6 +61,7 @@
 #include "lights.h"
 #include "materials.h"
 #include "mesh.h"
+#include "gltf.h"
 #include "upsample.h"
 
 namespace ftsl {
@@ -74,38 +75,19 @@ inline bool isNumber(const std::string& s) {
 }
 inline double num(const std::string& s) { return std::strtod(s.c_str(), nullptr); }
 
-// Load a measured spectrum from a CSV/whitespace file into (wavelength_nm, value)
-// pairs. This is the runtime "measured-SPD loader": the ingestion point for the
-// authoritative data mirrored under data/ (see data/README.md). Format is liberal —
-// lines beginning with '#' are comments, fields are separated by comma OR whitespace,
-// and any line whose first two fields do not both parse as numbers (e.g. a
-// `wavelength_nm,relative_power` header row) is skipped. The first numeric field is
-// the wavelength in nanometres, the second is the (relative or absolute) value; extra
-// columns are ignored. Values are taken verbatim — an emission SPD's absolute scale is
-// irrelevant (the power law renormalises it), and a reflectance file should already be
-// in 0..1. Returns false with `err` set on an unreadable/empty file.
-inline bool loadSpdCsv(const std::string& path,
-                       std::vector<std::pair<double, double>>& out,
-                       std::string& err) {
-    std::ifstream f(path);
-    if (!f) { err = "cannot open spectrum file: " + path; return false; }
-    out.clear();
-    std::string line;
-    while (std::getline(f, line)) {
-        // Strip a trailing CR (CRLF files) and an inline '#' comment.
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        auto hash = line.find('#');
-        if (hash != std::string::npos) line.erase(hash);
-        // Turn commas into spaces so a single stream reader handles both delimiters.
-        for (char& c : line) if (c == ',' || c == '\t') c = ' ';
-        std::istringstream ss(line);
-        std::string a, b;
-        if (!(ss >> a >> b)) continue;                 // blank / single-field line
-        if (!isNumber(a) || !isNumber(b)) continue;    // header row or junk -> skip
-        out.push_back({num(a), num(b)});
-    }
-    if (out.empty()) { err = "spectrum file has no numeric rows: " + path; return false; }
-    return true;
+// NOTE: the measured-SPD CSV loader (`loadSpdCsv`) that used to live here now lives
+// in spectral_library.h as `speclib::loadSpdCsv` — a single implementation shared by
+// the FTSL `file:` expression (via loadSpdFile below) and the named-preset library
+// resolvers (metal/reflectance/illuminant). See data/README.md for the file format.
+
+// Resolve a named glass dispersion from the spectral library (data/glass/<name>.glass),
+// falling back to a constant index if that file is missing. Used for the built-in
+// BK7/SF10 defaults that back `dielectric`'s default IOR and the lens presets — the
+// dispersion DATA lives in files, but a sane default must survive a stripped data dir.
+inline Spectrum glassOrDefault(const char* name, double fallbackN) {
+    Spectrum s;
+    if (resolveGlassIor(name, s)) return s;
+    return iorConstant(fallbackN);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +330,41 @@ inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
           + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
 }
 
+// Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
+// `axis` is normalized internally; a zero-length axis returns `v` unchanged. Used
+// by `camera_curve` to apply a per-frame `roll` (bank about the view direction).
+inline Vec3 rotateAboutAxis(const Vec3& v, const Vec3& axis, double ang) {
+    double al = length(axis);
+    if (al < 1e-12) return v;
+    Vec3 k = axis * (1.0 / al);
+    double c = std::cos(ang), s = std::sin(ang);
+    return v * c + cross(k, v) * s + k * (dot(k, v) * (1.0 - c));
+}
+
+// A piecewise-linear animation track over a normalized timeline t in [0,1]: a sorted
+// list of `{t, value}` keyframes with flat clamping outside the first/last key. Used
+// by `camera_curve` to animate scalar camera properties (roll, fov, zoom, f-stop,
+// focus) frame-by-frame, mirroring how `density_at` keyframes camera speed.
+struct ScalarTrack {
+    struct Key { double t, v; };
+    std::vector<Key> keys;
+    bool active() const { return !keys.empty(); }
+    void sort() { std::sort(keys.begin(), keys.end(),
+                            [](const Key& a, const Key& b){ return a.t < b.t; }); }
+    double sample(double t, double fallback) const {
+        if (keys.empty()) return fallback;
+        if (t <= keys.front().t) return keys.front().v;
+        if (t >= keys.back().t)  return keys.back().v;
+        for (size_t j = 0; j + 1 < keys.size(); ++j)
+            if (t >= keys[j].t && t <= keys[j + 1].t) {
+                double sp = keys[j + 1].t - keys[j].t;
+                double f = (sp > 1e-12) ? (t - keys[j].t) / sp : 0.0;
+                return keys[j].v + (keys[j + 1].v - keys[j].v) * f;
+            }
+        return keys.back().v;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -494,6 +511,13 @@ public:
             if (!resolveMixChildren(b, L.scene.mats[id], L)) return false;
         }
 
+        // Pass 2.5: mesh assets (shared instanced geometry). Loaded before the
+        // geometry pass so a `mesh_instance { of "name" }` (top-level or inside a
+        // group) can reference any asset regardless of authoring order.
+        for (const auto& b : blocks) {
+            if (b.type == "mesh_asset") { if (!addMeshAsset(b, L)) return false; }
+        }
+
         // Pass 3: geometry, lights, medium, camera, render.
         // `medium` blocks are DEFERRED to a second sweep so `bounds { object "name" }`
         // can reference any named sphere / isosurface / mesh regardless of authoring
@@ -505,6 +529,7 @@ public:
             else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
             else if (b.type == "triangle") { if (!addTriangle(b, L)) return false; }
             else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
+            else if (b.type == "mesh_instance") { if (!addMeshInstance(b, L)) return false; }
             else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
@@ -515,7 +540,7 @@ public:
             else if (b.type == "camera_curve") { if (!addCameraCurve(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
-                     b.type == "texture" || b.type == "pattern") { /* handled */ }
+                     b.type == "texture" || b.type == "pattern" || b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
@@ -547,6 +572,7 @@ private:
     std::unordered_map<std::string, NamedSphere> sphereByName_;   // named sphere -> world center/radius
     std::unordered_map<std::string, int>         implicitByName_; // named isosurface -> Scene::implicits index
     std::unordered_map<std::string, Aabb>        meshAabbByName_; // named mesh -> world AABB
+    std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
 
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
@@ -607,7 +633,7 @@ private:
             std::string g = h.substr(6);
             Spectrum ior;
             if (resolveGlassIor(g, ior)) return ior;
-            fail("unknown glass '" + g + "'"); return iorBK7();
+            fail("unknown glass '" + g + "'"); return glassOrDefault("BK7", 1.5168);
         }
         if (h.rfind("metal:", 0) == 0) {
             std::string mname = h.substr(6);
@@ -620,6 +646,12 @@ private:
             Spectrum r;
             if (resolveNaturalReflectance(rname, r)) return r;
             fail("unknown reflectance '" + rname + "'"); return constantSpectrum(0.5);
+        }
+        if (h.rfind("filter:", 0) == 0) {
+            std::string fname = h.substr(7);
+            Spectrum t;
+            if (resolveFilterTransmittance(fname, t)) return t;
+            fail("unknown filter '" + fname + "'"); return constantSpectrum(0.5);
         }
         if (h.rfind("preset:", 0) == 0)  return resolvePreset(h.substr(7));
         if (h.rfind("file:", 0) == 0)    return loadSpdFile(h.substr(5));
@@ -645,7 +677,7 @@ private:
         if (it != spdFileCache_.end()) return it->second;
         std::vector<std::pair<double, double>> pairs;
         std::string ferr;
-        if (!loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
+        if (!speclib::loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
         Spectrum s = tabulatedSpectrum(std::move(pairs));
         spdFileCache_[path] = s;
         return s;
@@ -873,7 +905,7 @@ private:
             m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.4));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
-            m.ior = spectrumParam(b, "ior", iorBK7());
+            m.ior = spectrumParam(b, "ior", glassOrDefault("BK7", 1.5168));
             // Frosted/rough transmission: 0 (default) = perfectly clear glass, bit-
             // identical to before; >0 roughens both the reflected and refracted lobes.
             // `roughness pattern:<name>` (§4) or `texture:<name>` binds a per-hit map.
@@ -890,6 +922,15 @@ private:
         } else if (type == "halfmirror") {
             m.type = MatType::HalfMirror;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.5));
+        } else if (type == "filter") {
+            // Colored gel / Wratten filter: a thin non-scattering absorber. A photon
+            // passes straight through, surviving with probability `transmit`(lambda) —
+            // the per-wavelength transmittance T(lambda) in [0,1] — and is absorbed
+            // otherwise. No reflection, no refraction. Feed T from a measured curve
+            // (`transmit file:data/filter/rosco-red.csv` / `transmit filter:red-25`)
+            // or a primitive (`transmit gaussian center=630 sigma=25`).
+            m.type = MatType::Filter;
+            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.5));
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
@@ -1151,8 +1192,25 @@ private:
             return (it == matIndex_.end()) ? -1 : it->second;
         };
         size_t triStart = L.scene.tris.size();
-        loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                uvProj, uvAxis);
+        // Dispatch by file extension: .gltf/.glb use the glTF loader (which imports
+        // its own pbrMetallicRoughness materials by default; `import_materials no`
+        // forces the FTSL-assigned `material` on every primitive). Everything else
+        // is an OBJ. Extension match is case-insensitive.
+        std::string ext;
+        if (size_t dot = file.find_last_of('.'); dot != std::string::npos) {
+            ext = file.substr(dot);
+            for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+        }
+        if (ext == ".gltf" || ext == ".glb") {
+            bool importMats = (strOf(b, "import_materials") != "no");
+            std::string gerr;
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+                fail("mesh: " + gerr); return false;
+            }
+        } else {
+            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                    uvProj, uvAxis);
+        }
         // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
         // is approximated by its box — true containment is deferred, see known-issues).
         if (!b.name.empty() && L.scene.tris.size() > triStart) {
@@ -1165,6 +1223,100 @@ private:
             }
             meshAabbByName_[b.name] = box;
         }
+        return true;
+    }
+
+    // ---- mesh_asset (shared instanced geometry) ----
+    // `mesh_asset "name" { file "asset.obj|gltf|glb"  material <m>  [import_materials no]
+    //  [uv use_mesh]  [usemtl use_names] }` loads a mesh ONCE into its own local
+    //  (authored) space as a BLAS (Scene::blasList). It bakes NO world transform and
+    //  emits NO triangles into Scene::tris — placement is done by `mesh_instance`,
+    //  which references the asset by name. Multiple instances share this one BLAS,
+    //  so N copies cost N affines rather than N triangle sets.
+    bool addMeshAsset(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("mesh_asset needs a name: mesh_asset \"name\" { ... }"); return false; }
+        if (blasIndex_.count(b.name)) { fail("duplicate mesh_asset name '" + b.name + "'"); return false; }
+        std::string file = strOf(b, "file");
+        if (file.empty()) { fail("mesh_asset '" + b.name + "' needs a file"); return false; }
+        std::string mat = strOf(b, "material");
+        if (mat.empty()) { fail("mesh_asset '" + b.name + "' needs a material"); return false; }
+        int id = matId(mat); if (!err.empty()) return false;
+
+        bool loadUV = (strOf(b, "uv") == "use_mesh");
+        bool useNames = (strOf(b, "usemtl") == "use_names");
+        MtlResolver resolver = [this](const std::string& nm) -> int {
+            auto it = matIndex_.find(nm);
+            return (it == matIndex_.end()) ? -1 : it->second;
+        };
+        // Load into local space (identity transform) at the END of Scene::tris, then
+        // move those triangles out into a private BLAS. The unit scale is NOT folded in
+        // here — it is applied per-instance so one asset can serve differently-scaled
+        // placements.
+        Affine xf = Affine::identity();
+        size_t start = L.scene.tris.size();
+        std::string ext;
+        if (size_t dot = file.find_last_of('.'); dot != std::string::npos) {
+            ext = file.substr(dot);
+            for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+        }
+        if (ext == ".gltf" || ext == ".glb") {
+            bool importMats = (strOf(b, "import_materials") != "no");
+            std::string gerr;
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+                fail("mesh_asset: " + gerr); return false;
+            }
+        } else {
+            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr);
+        }
+        Blas blas;
+        blas.tris.assign(L.scene.tris.begin() + start, L.scene.tris.end());
+        L.scene.tris.resize(start);
+        if (blas.tris.empty()) { fail("mesh_asset '" + b.name + "' loaded no triangles"); return false; }
+        blas.build();
+        int blasId = (int)L.scene.blasList.size();
+        L.scene.blasList.push_back(std::move(blas));
+        blasIndex_[b.name] = blasId;
+        return true;
+    }
+
+    // ---- mesh_instance (place a shared mesh_asset) ----
+    // `mesh_instance { of "asset-name"  [translate ..] [rotate ..] [scale ..]
+    //  [material <m>] }` places a `mesh_asset` into the world via an affine (composed
+    //  with the enclosing group's transform, then the scene's unit scale). `material`
+    //  overrides the asset's own per-triangle materials for this placement; without it
+    //  the asset's materials (glTF-imported or the asset's fallback) are used.
+    bool addMeshInstance(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
+        std::string of = strOf(b, "of");
+        if (of.empty()) { fail("mesh_instance needs `of \"asset-name\"`"); return false; }
+        auto it = blasIndex_.find(of);
+        if (it == blasIndex_.end()) { fail("mesh_instance: unknown mesh_asset '" + of + "'"); return false; }
+        MeshXform mx;
+        vec3Of(b, "translate", mx.translate);
+        vec3Of(b, "rotate", mx.rotDeg);
+        const Stmt* sc = find(b, "scale");
+        if (sc) {
+            if (sc->val.words.size() >= 3)
+                mx.scale = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
+            else if (!sc->val.words.empty()) {
+                double k = num(sc->val.words[0]); mx.scale = {k, k, k};
+            }
+        }
+        // world = (parent group) ∘ (instance local); then fold in the unit scale so the
+        // placement lands in metres (mirrors addMesh's transform construction).
+        Affine xf = parentXf.compose(mx.toAffine());
+        for (double& e : xf.m) e *= L_;
+        xf.t = xf.t * L_;
+
+        int matOverride = -1;
+        std::string mat = strOf(b, "material");
+        if (!mat.empty()) { matOverride = matId(mat); if (!err.empty()) return false; }
+
+        MeshInstance inst;
+        inst.blasId = it->second;
+        inst.toWorld = xf;
+        inst.toLocal = xf.inverse();
+        inst.matOverride = matOverride;
+        L.scene.instances.push_back(inst);
         return true;
     }
 
@@ -1198,9 +1350,10 @@ private:
             else if (s.key == "quad")     { if (!addQuad(*cb, L, world)) return false; }
             else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
+            else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
-            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, light, group)"); return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, light, group)"); return false; }
         }
         return true;
     }
@@ -1757,6 +1910,34 @@ private:
         if (const Stmt* ds = find(b, "density")) {
             if (!ds->val.words.empty()) {
                 const std::string& w0 = ds->val.words[0];
+                // `density vdb:"cloud.nvdb"` (or `vdb:cloud.nvdb`) — import a real
+                // NanoVDB FloatGrid as the density field. Baked to a dense grid on
+                // load; the grid's world AABB seeds the medium bound and its peak
+                // value the delta-tracking majorant.
+                if (w0 == "vdb:" || w0.rfind("vdb:", 0) == 0) {
+                    std::string path = (w0 == "vdb:")
+                        ? (ds->val.words.size() > 1 ? ds->val.words[1] : std::string())
+                        : w0.substr(4);
+                    if (path.empty()) { fail("medium `density vdb:` needs a file path"); return false; }
+                    auto grid = std::make_shared<VdbGrid>();
+                    std::string verr;
+                    if (!loadVdbGrid(path, *grid, verr)) {
+                        fail("medium density: " + verr); return false;
+                    }
+                    med.vdb = grid;
+                    // Seed the bound from the grid's world AABB unless one is authored.
+                    if (!med.bounded) {
+                        med.bounded = true;
+                        med.boundShape = MediumBound::Box;
+                        med.bmin = grid->wmin;
+                        med.bmax = grid->wmax;
+                    }
+                    double dmax = dblOf(b, "density_max", 0.0);
+                    med.densityMax = (dmax > 0.0) ? dmax
+                                                  : std::max(1e-6, (double)grid->maxVal * 1.05);
+                    L.scene.media.push_back(std::move(med));
+                    return true;
+                }
                 std::vector<PatNode> prog;
                 if (w0.rfind("pattern:", 0) == 0) {
                     std::string nm = w0.substr(8);
@@ -1807,6 +1988,43 @@ private:
         return true;
     }
 
+    // Derive the optical quantities (focal length, resolved fov, aperture radius and
+    // physical-optics film distance) from the photographic controls, and write them into
+    // `cs`. `fovDeg` is the BASE vertical fov before zoom; `lensMM` a prime focal length
+    // in mm (>0 overrides fov); `zoom` a focal-length multiplier; `fstopN` the f-number;
+    // `hmm` the film height in mm; `focus_m` the focus distance in metres. Factored out of
+    // readFilmExposure so `camera_curve` can re-derive it per frame when fov/zoom/fstop/
+    // focus are animated by keyframe tracks (see ScalarTrack). Pure function of its args.
+    static void deriveCameraOptics(CamSpec& cs, double fovDeg, double lensMM,
+                                   double zoom, double fstopN, double hmm, double focus_m) {
+        const double DEG = 3.141592653589793 / 180.0;
+        if (zoom <= 0.0) zoom = 1.0;
+        cs.zoom = zoom;
+        double focalMM;
+        if (lensMM > 0.0) focalMM = lensMM;
+        else { double th = std::tan(0.5 * fovDeg * DEG); focalMM = (th > 1e-9) ? hmm / (2.0 * th) : 0.0; }
+        focalMM *= zoom;
+        cs.focal = focalMM / 1000.0;
+        // fov follows the (zoomed) focal length when a lens/zoom is in play; otherwise it
+        // stays the authored base fov.
+        if (lensMM > 0.0 || zoom != 1.0)
+            cs.fov = (focalMM > 1e-9) ? 2.0 * std::atan(hmm / (2.0 * focalMM)) / DEG : fovDeg;
+        else
+            cs.fov = fovDeg;
+        // f-stop: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides any `aperture`
+        // radius. Aperture radius is an internal (metre) length.
+        if (fstopN > 0.0 && cs.focal > 0.0) cs.aperture = cs.focal / (2.0 * fstopN);
+        // Physical-optics camera: when a lens/f-stop is authored, put the film at the real
+        // image distance and give the thin lens the true focal length, so the f-number
+        // yields correct depth of field in the catch modes (A/C). Thin-lens law
+        // 1/so + 1/si = 1/f; focus 0 (or beyond hyperfocal) means infinity -> si = f.
+        if ((lensMM > 0.0 || fstopN > 0.0) && cs.focal > 0.0) {
+            double f = cs.focal, so = focus_m;
+            cs.filmDist_m = (so > f) ? 1.0 / (1.0 / f - 1.0 / so) : f;
+            cs.lensF_m    = f;
+        }
+    }
+
     // Read the film sub-block + photographic exposure/f-stop/lens controls shared by
     // `camera` and `camera_path`, and resolve the film size (named format or explicit
     // mm), the focal length (from `lens <mm>` or `fov_y`), the f-stop -> aperture
@@ -1852,34 +2070,13 @@ private:
         // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a 35mm
         // full-frame 24mm height when no physical size is authored.
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
-        const double DEG = 3.141592653589793 / 180.0;
         double lensMM = dblOf(b, "lens", 0.0);     // focal length in mm (physical, unit-independent)
         // `zoom <x>` multiplies the focal length (x>1 = tele/narrower fov; x<1 = wider).
         // It is the animatable "zoom ring" and composes on top of `lens`/`fov_y`.
-        double zoom = dblOf(b, "zoom", 1.0); if (zoom <= 0.0) zoom = 1.0;
-        cs.zoom = zoom;
-        double focalMM;
-        if (lensMM > 0.0) focalMM = lensMM;
-        else { double th = std::tan(0.5 * cs.fov * DEG); focalMM = (th > 1e-9) ? hmm / (2.0 * th) : 0.0; }
-        focalMM *= zoom;
-        cs.focal = focalMM / 1000.0;
-        if (lensMM > 0.0 || zoom != 1.0)           // fov follows the (zoomed) focal length
-            cs.fov = (focalMM > 1e-9) ? 2.0 * std::atan(hmm / (2.0 * focalMM)) / DEG : cs.fov;
-        // f-stop authoring: N = f / (2*apertureR) -> apertureR = f / (2N). Overrides
-        // any `aperture` radius. Aperture radius is an internal (metre) length.
+        double zoom  = dblOf(b, "zoom", 1.0);
         double fstop = dblOf(b, "fstop", 0.0);
-        if (fstop > 0.0 && cs.focal > 0.0) cs.aperture = cs.focal / (2.0 * fstop);
-        // Physical-optics camera: when a lens/f-stop is authored, put the film at the
-        // real image distance and give the thin lens the true focal length, so the
-        // f-number yields correct depth of field in the catch modes (A/C). Thin-lens
-        // law 1/so + 1/si = 1/f: a focus plane at so (metres) images at si; focus 0
-        // (or beyond hyperfocal) means infinity -> si = f. Legacy cameras (no lens /
-        // f-stop) leave these 0 and keep the unit-film-distance behaviour.
-        if ((lensMM > 0.0 || fstop > 0.0) && cs.focal > 0.0) {
-            double f = cs.focal, so = cs.focus;    // cs.focus already in metres (Len-scaled)
-            cs.filmDist_m = (so > f) ? 1.0 / (1.0 / f - 1.0 / so) : f;
-            cs.lensF_m    = f;
-        }
+        // Resolve focal/fov/aperture/film-distance. cs.focus is already in metres (Len-scaled).
+        deriveCameraOptics(cs, cs.fov, lensMM, zoom, fstop, hmm, cs.focus);
         // Manual exposure multiplier (see CamSpec). Active iff any control authored.
         if (cs.exposure > 0.0 || cs.iso > 0.0 || cs.shutter > 0.0) {
             double base = (cs.exposure > 0.0) ? cs.exposure : 1.0;
@@ -1965,7 +2162,7 @@ private:
             if ((pk == "singlet" || pk == "biconvex" || pk == "simple")) {
                 Spectrum g;
                 if (!resolveGlassIor((glassName.rfind("glass:",0)==0?glassName.substr(6):glassName), g))
-                    g = iorBK7();
+                    g = glassOrDefault("BK7", 1.5168);
                 *sys = makeSinglet(focalMM, fstop, g);
             } else if (!preset.empty()) {
                 if (!resolveLensPreset(preset, focalMM, fstop, *sys)) {
@@ -1973,7 +2170,7 @@ private:
                          "' (singlet, achromat/doublet, telephoto, wide)"); return false;
                 }
             } else {
-                *sys = makeAchromat(focalMM, fstop, iorBK7(), iorSF10());
+                *sys = makeAchromat(focalMM, fstop, glassOrDefault("BK7", 1.5168), glassOrDefault("SF10", 1.7283));
             }
         }
         // Sensor size from the camera film (default full-frame 36x24 mm).
@@ -2219,13 +2416,27 @@ private:
     //   look tangent    (default) — aim along the direction of travel
     //   look_at x y z             — a fixed target for every frame
     //   look curve + look_point.. — aim at a SECOND Catmull-Rom spline, sampled in step
-    // `closed` loops the curve (seamless). All frames share up/fov/mode/film/lens.
+    // Roll and the lens scalars can be ANIMATED per frame over the normalized timeline
+    // t in [0,1] (t=0 first frame, t=1 last), each keyframed by `<name>_at <t> <value>`
+    // (piecewise-linear, flat-clamped outside the ends, exactly like `density_at`) or set
+    // constant with the bare keyword:
+    //   roll <deg> | roll_at t deg      — bank about the view axis (the third orientation DOF)
+    //   fov_at t deg                    — animate vertical field of view (a fov "zoom")
+    //   zoom_at t x                     — animate the focal-length multiplier
+    //   fstop_at t N                    — animate the f-number (aperture / depth of field)
+    //   focus_at t dist                 — animate the focus distance (authored units)
+    // (Lens PROJECTION / fisheye is a discrete mode, not a continuous track — set it once
+    // for the whole flight with `projection`/`fisheye`.) `closed` loops the curve
+    // (seamless). Frames share up/mode/film/lens and any un-animated lens scalars.
     // Grammar:
     //   camera_curve "fly" {
     //       point 0 1 3   point 1 1 1   point 2 1 3   point 1 1 5   # >= 2 control points
     //       up 0 1 0   fov_y 50   mode R   frames 90
     //       density 20                       # OR density_at 0 5  density_at 0.5 40  density_at 1 5
     //       look tangent                     # OR look_at 1 1 3   OR look curve + look_point ...
+    //       roll_at 0 0   roll_at 0.5 20   roll_at 1 0        # bank into the turn and back
+    //       fstop_at 0 8   fstop_at 1 1.4                     # rack the aperture open
+    //       focus_at 0 5   focus_at 1 1.5                     # pull focus toward the camera
     //       closed   exposure_lock
     //       film { res 900 600 }
     //   }
@@ -2341,6 +2552,47 @@ private:
         if (lookFixed) { vec3Of(b, "look_at", fixedLook); fixedLook = P(fixedLook); }
         int lookSeg = lookCurve ? (closed ? (int)lookPts.size() : (int)lookPts.size() - 1) : 0;
 
+        // ---- Animatable orientation + lens tracks ----------------------------------
+        // Roll (bank about the view axis) and the lens scalars (fov_y, zoom, f-stop,
+        // focus) can each be keyframed by `<name>_at <t> <value>` over the normalized
+        // timeline t in [0,1] (mirroring `density_at`), or set constant with the bare
+        // keyword. A bare keyword doubles as the flat fallback for its track.
+        bool trkOk = true;
+        auto readTrack = [&](const char* atKey) -> ScalarTrack {
+            ScalarTrack tk;
+            for (const auto& s : b.stmts) {
+                if (s.key != atKey) continue;
+                if (s.val.words.size() < 2) {
+                    fail("camera_curve '" + base + "' " + atKey + " needs: <t> <value>");
+                    trkOk = false; continue;
+                }
+                tk.keys.push_back({num(s.val.words[0]), num(s.val.words[1])});
+            }
+            tk.sort();
+            return tk;
+        };
+        ScalarTrack rollTrk  = readTrack("roll_at");
+        ScalarTrack fovTrk   = readTrack("fov_at");
+        ScalarTrack zoomTrk  = readTrack("zoom_at");
+        ScalarTrack fstopTrk = readTrack("fstop_at");
+        ScalarTrack focusTrk = readTrack("focus_at");
+        if (!trkOk) return false;
+
+        // Base (constant) values a track falls back to and that the whole-flight optics
+        // were derived from. Captured from the same keywords readFilmExposure consumed so
+        // per-frame re-derivation starts from the authored baseline (never double-applies).
+        double rollConst  = dblOf(b, "roll",  0.0);
+        double baseFovDeg = dblOf(b, "fov_y", 40.0);
+        double baseLensMM = dblOf(b, "lens",  0.0);
+        double baseZoom   = dblOf(b, "zoom",  1.0);
+        double baseFstop  = dblOf(b, "fstop", 0.0);
+        double hmm        = (shared.filmH_mm > 0.0) ? shared.filmH_mm : 24.0;
+        double baseFocus  = shared.focus;   // metres (Len-scaled)
+        bool haveRoll   = rollTrk.active() || find(b, "roll");
+        bool haveOptics = fovTrk.active() || zoomTrk.active() ||
+                          fstopTrk.active() || focusTrk.active();
+        const double DEG = 3.141592653589793 / 180.0;
+
         bool pathLock = false;
         if (const Stmt* el = find(b, "exposure_lock")) {
             if (el->val.words.empty()) pathLock = true;
@@ -2367,6 +2619,26 @@ private:
                 Vec3 c = catmullRomAt(pts, closed, g + dg);
                 Vec3 tan = c - a;
                 cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});
+            }
+            // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.
+            // cs starts as `shared`, so restore its aperture before re-deriving in case a
+            // static f-stop had already set it (a live fstop track will overwrite it).
+            if (haveOptics) {
+                double fov = fovTrk.sample(fr, baseFovDeg);
+                double zm  = zoomTrk.sample(fr, baseZoom);
+                double fs  = fstopTrk.sample(fr, baseFstop);
+                double fo  = focusTrk.active() ? Len(focusTrk.sample(fr, 0.0)) : baseFocus;
+                cs.aperture = shared.aperture;
+                cs.focus    = fo;
+                deriveCameraOptics(cs, fov, baseLensMM, zm, fs, hmm, fo);
+            }
+            // Per-frame roll: bank `up` about the view direction (Rodrigues). Applied after
+            // look so the axis is the final view ray; starts from the authored `up`.
+            if (haveRoll) {
+                double rollDeg = rollTrk.sample(fr, rollConst);
+                Vec3 w = cs.look - cs.eye;
+                if (length(w) > 1e-12)
+                    cs.up = rotateAboutAxis(shared.up, normalize(w), rollDeg * DEG);
             }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
