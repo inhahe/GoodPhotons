@@ -188,6 +188,16 @@ meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
 
+**POV-Ray internal functions:** the whole classic `functions.inc` isosurface library is
+built in — `f_torus`, `f_heart`, `f_klein_bottle`, `f_superellipsoid`, `f_dupin_cyclid`,
+`f_helix1`, `f_spiral`, `f_boy_surface`, `f_kummer_surface_v1/v2`, … (~73 functions, exact
+ports of POV-Ray's `source/vm/fnintern.cpp`). As in POV-Ray, the **first three arguments
+are the coordinates** and the rest are parameters: `f_torus(x,y,z, majorR, minorR)`,
+`f_heart(x,y,z, strength)`, `f_superellipsoid(x,y,z, e, n)`. They shine as `isosurface`
+`function { expr "…" }` leaves (§ isosurface / README) but work in any pattern `expr`.
+The ~5 noise-/pattern-based entries (`f_noise3d`, `f_ridged_mf`, `f_hetero_mf`, `f_ridge`,
+`f_pattern`) are not yet available. Regenerate via `tools/pov_functions_gen.py`.
+
 **Operators:** `+ - * / % ^` and unary `-`. `%` is floating-point modulo.
 
 > **There is no `mod()` function** — use the `%` operator: `(floor(u*8)+floor(v*4)) % 2`.

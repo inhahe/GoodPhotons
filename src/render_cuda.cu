@@ -2303,6 +2303,14 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::PovFn: {
+                int id = (int)nd.a;
+                int na = povFnArity(id);
+                double args[POV_FN_MAX_ARGS];
+                for (int k = na - 1; k >= 0; --k) args[k] = st[--sp];
+                st[sp++] = povFnEval(id, args);
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0;

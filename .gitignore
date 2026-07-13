@@ -24,6 +24,9 @@
 # Raw upstream data dumps (kept locally; derived + attributed CSVs live in data/)
 /data_raw/
 
+# Cached POV-Ray source fetched by tools/pov_functions_gen.py (AGPL; re-fetched on demand)
+/tools/.pov_fnintern.cpp
+
 # Editor / IDE
 .vs/
 .vscode/
