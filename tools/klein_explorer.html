@@ -97,6 +97,22 @@
       <button id="reset">Reset view</button>
     </div>
     <pre id="snippet"></pre>
+
+    <hr>
+    <h1 style="font-size:14px">Export mesh for Unreal</h1>
+    <div class="row">
+      <label>export resolution (grid) <b id="vN">128</b></label>
+      <input id="N" type="range" min="48" max="224" step="8" value="128">
+      <div class="desc">grid cells per axis; higher = finer but slower &amp; bigger file (224 ≈ 2M tris)</div>
+    </div>
+    <div class="row">
+      <label>size in Unreal (cm, longest axis) <b id="vSZ">100</b></label>
+      <input id="SZ" type="range" min="10" max="500" step="5" value="100">
+    </div>
+    <div class="btns">
+      <button id="export">Export .obj (download)</button>
+    </div>
+    <div class="desc" id="exportStatus">Watertight, +Y up, sphere-capped, welded normals — 1 unit = 1&nbsp;cm. Import as a Static Mesh (enable Nanite for the high-res grids).</div>
   </div>
 </div>
 
@@ -281,6 +297,159 @@ el('copy').addEventListener('click', ()=>{
   navigator.clipboard.writeText(el('snippet').textContent);
   el('copy').textContent = 'Copied!';
   setTimeout(()=>el('copy').textContent='Copy ftrace scene', 900);
+});
+
+// ---- mesh export (marching tetrahedra, client-side) --------------------------
+// Mirrors src/isomesh.h: Kuhn/Freudenthal 6-tet split (no ambiguous cases) so the
+// output is a watertight 2-manifold. The exported solid is the SAME region the
+// shader shows — field > level, intersected with the clip sphere — always sealed
+// into a closed solid (sphere cap) regardless of the on-screen "cap the cut"
+// toggle, since Unreal wants a closed mesh. Vertices weld by their canonical pair
+// of lattice endpoints; normals come from the gradient of the augmented field so
+// winding is outward.
+const kCorner = [[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,1,0],[1,1,0],[1,1,1],[0,1,1]];
+const kTet    = [[0,1,5,6],[0,1,2,6],[0,4,5,6],[0,4,7,6],[0,3,2,6],[0,3,7,6]];
+
+function buildMesh(n, N){
+  const {a,b,c,d,L,R} = n;
+  const pad = R*1.06;                      // sample a hair past the sphere so the cap closes
+  const lo = -pad, h = (2*pad)/N, S1 = N+1;
+  const gp = i => lo + h*i;
+  const S3 = S1*S1*S1;
+  const fieldP = (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-a*y-b, bd=S+a*y-b;
+                            return bd*(A*A - c*z*z) + d*x*z*A; };
+  // aug < 0  ⟺  inside solid (fieldP > L) AND inside clip sphere.  aug == 0 is the surface.
+  const aug = (x,y,z)=>{ const f = L - fieldP(x,y,z), s = Math.sqrt(x*x+y*y+z*z) - R;
+                         return f > s ? f : s; };
+
+  // sample the augmented field on the lattice
+  const val = new Float64Array(S3);
+  const vidx = (i,j,k)=> (i*S1 + j)*S1 + k;
+  for (let i=0;i<S1;i++){ const x=gp(i);
+    for (let j=0;j<S1;j++){ const y=gp(j);
+      for (let k=0;k<S1;k++) val[vidx(i,j,k)] = aug(x, y, gp(k)); } }
+
+  const pos = [], nrm = [], tris = [];
+  const edgeMap = new Map();
+  const eps = h*0.5;
+  const gradAug = (x,y,z)=>{
+    let gx=aug(x+eps,y,z)-aug(x-eps,y,z),
+        gy=aug(x,y+eps,z)-aug(x,y-eps,z),
+        gz=aug(x,y,z+eps)-aug(x,y,z-eps);
+    let Ln=Math.hypot(gx,gy,gz); if (Ln<1e-30){ gx=0;gy=1;gz=0;Ln=1; }
+    return [gx/Ln, gy/Ln, gz/Ln];
+  };
+  const edgeVertex = (i0,j0,k0,f0, i1,j1,k1,f1)=>{
+    const A0=(i0*S1+j0)*S1+k0, B0=(i1*S1+j1)*S1+k1;
+    const key = A0<B0 ? A0*S3+B0 : B0*S3+A0;
+    const got = edgeMap.get(key); if (got!==undefined) return got;
+    const x0=gp(i0),y0=gp(j0),z0=gp(k0), x1=gp(i1),y1=gp(j1),z1=gp(k1);
+    let ta=0, tb=1, fa=f0, fb=f1;              // bisection-refine the crossing on the real field
+    for (let r=0;r<4;r++){ const tm=0.5*(ta+tb),
+      fm=aug(x0+(x1-x0)*tm, y0+(y1-y0)*tm, z0+(z1-z0)*tm);
+      if ((fa<0)===(fm<0)){ ta=tm; fa=fm; } else { tb=tm; fb=fm; } }
+    const t=0.5*(ta+tb);
+    const px=x0+(x1-x0)*t, py=y0+(y1-y0)*t, pz=z0+(z1-z0)*t;
+    const id = pos.length/3;
+    pos.push(px,py,pz);
+    const g=gradAug(px,py,pz); nrm.push(g[0],g[1],g[2]);
+    edgeMap.set(key,id); return id;
+  };
+  const emitTri = (A,B,C)=>{
+    if (A===B||B===C||A===C) return;
+    const ux=pos[B*3]-pos[A*3],   uy=pos[B*3+1]-pos[A*3+1], uz=pos[B*3+2]-pos[A*3+2];
+    const vx=pos[C*3]-pos[A*3],   vy=pos[C*3+1]-pos[A*3+1], vz=pos[C*3+2]-pos[A*3+2];
+    const fnx=uy*vz-uz*vy, fny=uz*vx-ux*vz, fnz=ux*vy-uy*vx;   // geometric normal
+    const gnx=nrm[A*3]+nrm[B*3]+nrm[C*3], gny=nrm[A*3+1]+nrm[B*3+1]+nrm[C*3+1],
+          gnz=nrm[A*3+2]+nrm[B*3+2]+nrm[C*3+2];                 // field normal
+    if (fnx*gnx+fny*gny+fnz*gnz < 0) tris.push(A,C,B); else tris.push(A,B,C);
+  };
+
+  const cc = [], cvv = [];                    // cell corner lattice coords + values
+  for (let ci=0;ci<N;ci++)
+  for (let cj=0;cj<N;cj++)
+  for (let ck=0;ck<N;ck++){
+    for (let m=0;m<8;m++){
+      const i=ci+kCorner[m][0], j=cj+kCorner[m][1], k=ck+kCorner[m][2];
+      cc[m]=[i,j,k]; cvv[m]=val[vidx(i,j,k)];
+    }
+    for (let t=0;t<6;t++){
+      const T=kTet[t];
+      let ins=null, outs=null;                // classify the 4 tet corners (inside = aug<0)
+      const insA=[], outA=[];
+      for (let m=0;m<4;m++){ (cvv[T[m]]<0 ? insA : outA).push(T[m]); }
+      const ni=insA.length;
+      if (ni===0 || ni===4) continue;
+      const E = (p,q)=>{ const P=cc[p], Q=cc[q];
+        return edgeVertex(P[0],P[1],P[2],cvv[p], Q[0],Q[1],Q[2],cvv[q]); };
+      if (ni===1){ const iv=insA[0];
+        emitTri(E(iv,outA[0]), E(iv,outA[1]), E(iv,outA[2]));
+      } else if (ni===3){ const ov=outA[0];
+        emitTri(E(insA[0],ov), E(insA[1],ov), E(insA[2],ov));
+      } else { // ni===2 : the crossing edges form a quad -> two triangles
+        const a2=insA[0], b2=insA[1], c2=outA[0], d2=outA[1];
+        const eac=E(a2,c2), ead=E(a2,d2), ebd=E(b2,d2), ebc=E(b2,c2);
+        emitTri(eac,ead,ebd); emitTri(eac,ebd,ebc);
+      }
+    }
+  }
+  return { pos, nrm, tris };
+}
+
+function toOBJ(pos, nrm, tris, scale, n){
+  const P=[];
+  P.push('# Klein bottle isosurface — exported from klein_explorer.html');
+  P.push(`# a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L} clip_radius=${n.R}`);
+  P.push('# watertight marching-tetrahedra mesh, +Y up, 1 unit = 1 cm (Unreal)');
+  P.push('o klein_bottle');
+  for (let i=0;i<pos.length;i+=3)
+    P.push('v '+(pos[i]*scale).toFixed(5)+' '+(pos[i+1]*scale).toFixed(5)+' '+(pos[i+2]*scale).toFixed(5));
+  for (let i=0;i<nrm.length;i+=3)
+    P.push('vn '+nrm[i].toFixed(4)+' '+nrm[i+1].toFixed(4)+' '+nrm[i+2].toFixed(4));
+  for (let i=0;i<tris.length;i+=3){ const A=tris[i]+1, B=tris[i+1]+1, C=tris[i+2]+1;
+    P.push('f '+A+'//'+A+' '+B+'//'+B+' '+C+'//'+C); }
+  return P.join('\n')+'\n';
+}
+
+function downloadText(name, text){
+  const blob = new Blob([text], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+
+const ctlN = el('N'), ctlSZ = el('SZ');
+ctlN.addEventListener('input',  ()=> el('vN').textContent  = ctlN.value);
+ctlSZ.addEventListener('input', ()=> el('vSZ').textContent = ctlSZ.value);
+
+el('export').addEventListener('click', ()=>{
+  const btn = el('export'), st = el('exportStatus');
+  const n = nums(), N = +ctlN.value, targetCm = +ctlSZ.value;
+  btn.disabled = true;
+  st.textContent = `meshing at grid ${N}³ …`;
+  // yield one frame so the status paints before the (synchronous) meshing runs
+  setTimeout(()=>{
+    try {
+      const t0 = performance.now();
+      const m = buildMesh(n, N);
+      if (m.tris.length === 0){ st.textContent = 'no surface in the clip sphere — adjust parameters'; return; }
+      let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
+      for (let i=0;i<m.pos.length;i+=3){ const x=m.pos[i],y=m.pos[i+1],z=m.pos[i+2];
+        if(x<mnx)mnx=x; if(y<mny)mny=y; if(z<mnz)mnz=z;
+        if(x>mxx)mxx=x; if(y>mxy)mxy=y; if(z>mxz)mxz=z; }
+      const dim = Math.max(mxx-mnx, mxy-mny, mxz-mnz) || 1;
+      const scale = targetCm / dim;
+      const obj = toOBJ(m.pos, m.nrm, m.tris, scale, n);
+      const nv = m.pos.length/3, nt = m.tris.length/3;
+      const fn = `klein_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
+      downloadText(fn, obj);
+      const dt = ((performance.now()-t0)/1000).toFixed(1);
+      st.textContent = `exported ${nv.toLocaleString()} verts / ${nt.toLocaleString()} tris in ${dt}s → ${fn}`;
+    } catch(err){
+      st.textContent = 'export failed: ' + err.message;
+    } finally { btn.disabled = false; }
+  }, 30);
 });
 
 // ---- orbit camera ----
