@@ -30,7 +30,8 @@ Being precise, because the names overlap and it's easy to assume we have more th
   on backward (R). Plus Beer–Lambert absorption inside dielectrics.
 
 **So we do NOT yet have:** a stored photon map, progressive photon mapping (PPM/SPPM), VCM/UPS
-merging, or external volume-asset (VDB) import. Those are the items below.
+merging, external volume-asset (VDB) import, or a **triangle-mesh primitive** (the renderer is
+analytic/isosurface-only — no polygon geometry). Those are the items below.
 
 ### Dependency graph
 
@@ -43,7 +44,8 @@ merging, or external volume-asset (VDB) import. Those are the items below.
    (2) Progressive PM (PPM/SPPM)   (3) VCM / UPS
                                    (needs BDPT ✔ + merging from (1))
 
-   (4) .vdb / NanoVDB volumes  ── independent, can land anytime
+   (4) .vdb / NanoVDB volumes    ── independent, can land anytime
+   (5) Triangle-mesh primitive   ── independent, can land anytime
 ```
 
 Item **(1) is the keystone**: it's the data structure that unlocks both progressive photon
@@ -198,6 +200,59 @@ follow-up); level-set vs fog-volume grid types.
 
 ---
 
+## (5) Triangle-mesh primitive
+
+**Goal.** Load and render polygon meshes (`.obj`, `.gltf`/`.glb`) as first-class scene primitives, so
+authored/downloaded models (Fab, Megascans, Blender exports, scanned assets) can sit in a scene
+alongside the analytic quadrics and isosurfaces — the renderer is **analytic/isosurface-only** today
+and has no way to ingest polygon geometry.
+
+**Why.** Isosurfaces and quadrics are great for smooth, math-defined forms but can't represent
+authored hard-surface / organic models (characters, props, furniture, scanned objects). A triangle
+primitive opens the entire ecosystem of existing 3D assets and lets the gallery-style scenes hold
+real objects, not just procedural blobs.
+
+**Builds on.** The existing primitive dispatch (intersection + normal + material binding) and the
+material/texture system. This adds a new primitive *kind* rather than touching light transport, so it
+composes with **every** render mode (A/B/C/D/R/P) and with the participating-media and (future)
+photon-map paths for free — a triangle hit is just another surface vertex.
+
+**Design sketch.**
+- **Mesh data:** indexed vertex buffer (position, normal, UV, optional tangent) + triangle index
+  buffer. Per-vertex normals → smooth (Phong) shading via barycentric interpolation; fall back to
+  geometric (flat) normals when a mesh has none. Optional per-triangle or per-mesh material slots.
+- **Acceleration structure:** a **BVH** (SAH-built, binary, flat/array-encoded) over the triangles —
+  the standard mesh accelerator and, like the photon hash grid, a flat array layout that ports cleanly
+  to CUDA (stackless/short-stack traversal on device). Watertight Möller–Trumbore (or the PBRT
+  watertight variant) ray–triangle test to avoid cracks.
+- **Transforms & instancing:** per-instance object→world transform so one loaded mesh can be scaled,
+  rotated, translated (and, later, **instanced** many times cheaply — the Fab "shrink/enlarge" use
+  case is just a transform). Two-level BVH (TLAS over instances → BLAS per mesh) is the natural
+  end state; a single-level BVH with baked transforms is the minimal first cut.
+- **Textures:** UV-sampled albedo/normal/roughness maps, reusing the medium/material texture plumbing;
+  a mesh-facing image loader (PNG/EXR) if one isn't already wired for surface textures.
+- **FTSL grammar:** `mesh { file "asset.obj"  translate … rotate … scale …  material … }`; derive the
+  primitive's world AABB from the transformed BVH root for the top-level scene bounds.
+
+**Steps.**
+1. `.obj` loader first (simplest, ubiquitous, text-parsable and thus validatable in-environment) →
+   vertex/index buffers + smooth normals; then `.gltf`/`.glb` (PBR materials + transforms come along).
+2. CPU BVH build (SAH) + ray–triangle intersection; add a `mesh { … }` primitive to the FTSL parser
+   and the intersection dispatch.
+3. Barycentric normal/UV interpolation; bind to the existing material system (incl. dielectrics —
+   interpolated normals need care so shading normals don't push rays through the surface).
+4. Validate: render a known mesh (e.g. a unit-cube / Stanford-bunny `.obj`) in mode R, check silhouette,
+   smooth-shading, and transform (scale/rotate) correctness against a reference.
+5. Mirror the BVH + triangle test to CUDA (`render_cuda.cu`): upload flat BVH + vertex arrays, device
+   traversal. Then instancing / two-level BVH for cheap duplication.
+
+**Open questions.** Whether to reuse an existing scene BVH/accel or give meshes their own two-level
+structure; shading-normal vs geometric-normal handling for transmission and shadow terminators;
+texture-format scope (PNG/EXR/JPG) and sRGB handling; how much glTF material model to map onto this
+renderer's spectral materials (metallic-roughness → the existing BSDFs); mesh memory budget on GPU.
+
+---
+
 ## Suggested build order
 
 1. **(4) `.vdb`/NanoVDB** — independent, self-contained, immediately useful, and a good warm-up
@@ -206,6 +261,10 @@ follow-up); level-set vs fog-volume grid types.
    win on its own.
 3. **(2) PPM/SPPM** — progressive convergence + caustics on top of (1).
 4. **(3) VCM/UPS** — glue (1)'s merging to the existing BDPT connections under MIS; the capstone.
+
+**(5) Triangle mesh** is independent of the photon chain and can slot in wherever it's wanted — it's
+the enabler for using external/authored assets (Fab, Megascans, Blender), so prioritize it whenever
+polygon geometry is needed rather than treating it as part of the (1)→(3) sequence.
 
 GPU note for (1)–(3): prefer a **uniform hash grid** over a kd-tree throughout — it's the
 CUDA-friendly structure the shared photon/light-vertex passes all reuse.
