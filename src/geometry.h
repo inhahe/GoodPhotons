@@ -20,7 +20,16 @@ struct Tri {
     // Per-vertex texture coordinates (u in .x, v in .y; .z unused). Defaults give
     // a sensible mapping for an untextured tri; quads and OBJ `vt` fill real values.
     Vec3 uv0{0, 0, 0}, uv1{1, 0, 0}, uv2{1, 1, 0};
-    void finalize() { gn = normalize(cross(v1 - v0, v2 - v0)); }
+    // Per-vertex SHADING normals (barycentric-interpolated at a hit for smooth
+    // shading). Zero-length => "not supplied": finalize() falls them back to the
+    // geometric normal, so any tri without OBJ `vn` data stays exactly flat-shaded.
+    Vec3 n0{0, 0, 0}, n1{0, 0, 0}, n2{0, 0, 0};
+    void finalize() {
+        gn = normalize(cross(v1 - v0, v2 - v0));
+        if (dot(n0, n0) < 1e-12) n0 = gn;
+        if (dot(n1, n1) < 1e-12) n1 = gn;
+        if (dot(n2, n2) < 1e-12) n2 = gn;
+    }
 };
 
 struct Sphere {
@@ -56,13 +65,19 @@ inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
     if (t < tmin || t >= hit.t) return false;
     hit.t = t; hit.p = r.o + r.d * t; hit.valid = true;
     hit.ng = tri.gn;
-    hit.n = (dot(r.d, tri.gn) < 0.0) ? tri.gn : -tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
-    // Barycentric-interpolate the per-vertex UVs (u,v here are the Moller-Trumbore
-    // weights of v1,v2; the v0 weight is 1-u-v).
+    // Barycentric weights: u,v here are the Moller-Trumbore weights of v1,v2; the
+    // v0 weight is 1-u-v. Reused for both UVs and the shading normal.
     double w0 = 1.0 - u - v;
     hit.u = w0 * tri.uv0.x + u * tri.uv1.x + v * tri.uv2.x;
     hit.v = w0 * tri.uv0.y + u * tri.uv1.y + v * tri.uv2.y;
+    // Smooth shading normal: interpolate the per-vertex normals (equal to gn for a
+    // flat tri, so this reduces to the geometric normal there). Orient against the
+    // ray to match the geometric-normal convention.
+    Vec3 ns = w0 * tri.n0 + u * tri.n1 + v * tri.n2;
+    double nl = dot(ns, ns);
+    ns = (nl > 1e-18) ? ns * (1.0 / std::sqrt(nl)) : tri.gn;
+    hit.n = (dot(r.d, ns) < 0.0) ? ns : -ns;
     return true;
 }
 

@@ -260,10 +260,13 @@ transforms (translate/rotate/scale, composed through `group{}`), and rendering i
 already drops into a scene, scaled/rotated as a transform. This item is the **remaining gaps**.
 
 **Goal.** Close the quality/format gaps so authored models look right and more formats load:
-1. **Smooth per-vertex normals** (the big one) — the OBJ loader currently *drops* `vn` and `Tri`
-   stores only a geometric normal, so every mesh is flat-shaded (visible faceting; wrong refraction
-   on glass meshes). Read `vn`, store three normals per `Tri`, barycentric-interpolate a shading
-   normal at the hit, and (when absent) auto-generate smoothed normals with a crease-angle threshold.
+1. **Smooth per-vertex normals** — ✅ **DONE** (2026-07-12). The OBJ loader now reads `vn`, `Tri`
+   stores three per-vertex shading normals (`n0/n1/n2`), and both the CPU and GPU `intersectTri`
+   barycentric-interpolate a shading normal at the hit (geometric normal kept as `hit.ng`). Normals
+   transform by the inverse-transpose of the mesh transform (`Affine::applyNormal`). A mesh without
+   `vn` falls each per-vertex normal back to the geometric normal in `Tri::finalize()`, so untouched
+   meshes stay exactly flat-shaded (bit-identical). *Not yet done:* auto-generating smoothed normals
+   from a crease-angle threshold when `vn` is absent (a mesh with no `vn` stays flat) — see follow-ups.
 2. **glTF/GLB** — a second loader for the modern interchange format (PBR metallic-roughness materials,
    node transforms, embedded/packed buffers), mapping metallic-roughness onto the existing BSDFs.
 3. **Instancing** — a two-level BVH (TLAS over instances → shared BLAS) so the same mesh can be
@@ -281,11 +284,14 @@ transform it should be.
 render_cuda.cu), and `addMesh` in ftsl.h.
 
 **Steps.**
-1. Add `Vec3 n0,n1,n2` to `Tri`; parse OBJ `vn` in `loadObj` (index via the 3rd face field) and fill
-   them; when a mesh has no `vn`, area-weighted-average adjacent face normals under a crease angle.
-   Interpolate in `intersectTri` (`hit.n = normalize(w0*n0+u*n1+v*n2)`, keep `hit.ng` geometric).
-   Mirror the three normals into `DTri` and the device intersection; validate no shadow-terminator
-   artefacts (clamp the shading normal to the geometric hemisphere for transmission).
+1. ✅ **DONE** — Added `Vec3 n0,n1,n2` to `Tri` (geometry.h) and `DVec3 n0,n1,n2` to `DTri`
+   (render_cuda.cu); parse OBJ `vn` in `loadObj` (index via the 3rd face field, `objNormalIndex`),
+   transform each by `Affine::applyNormal` (inverse-transpose), and fill the three `Tri` normals.
+   Both `intersectTri` (CPU + GPU) interpolate `hit.n = normalize(w0*n0+u*n1+v*n2)` and orient it
+   against the ray, keeping `hit.ng` geometric. `Tri::finalize()` falls absent normals back to `gn`
+   so non-`vn` meshes stay flat-shaded. Validated: low-poly UV sphere renders smooth (mode R/B, CPU
+   and GPU) vs the flat version's facets; energy balance bit-identical CPU↔GPU. *Follow-up:* crease-
+   angle auto-smoothing when `vn` is absent; shading-normal hemisphere clamp for transmission.
 2. glTF loader (`src/gltf.h`): parse nodes/meshes/accessors, bake node transforms, map
    metallic-roughness → the renderer's spectral BSDFs; `mesh { file "asset.gltf" … }` dispatches by
    extension.

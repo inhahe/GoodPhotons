@@ -307,6 +307,13 @@ mesh "bunny" {
 }
 ```
 
+OBJ **vertex normals (`vn`) are read automatically** as smooth shading normals:
+if the OBJ supplies `vn` (face tokens like `f v//vn` or `v/vt/vn`), the hit
+barycentric-interpolates them for smooth shading (no per-facet look), transformed
+by the mesh transform's inverse-transpose. A mesh with **no `vn` stays exactly
+flat-shaded** (geometric normal), so it's a no-op for older assets. No FTSL key is
+needed — it's driven entirely by the OBJ contents.
+
 ---
 
 ## 9. UV wraps on native primitives and meshes

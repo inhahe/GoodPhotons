@@ -3,6 +3,27 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Recently fixed
+
+### GPU forward camera-splat out-of-bounds write (illegal memory access) — FIXED 2026-07-12
+
+The GPU forward/light-tracing kernel (modes A/B/C, and the splat in M/S/U) could
+crash with `[cuda] forward kernel failed: an illegal memory access was encountered`.
+**Root cause:** `DCamera::project()` / `lensImage()` compute the splat pixel as
+`px = (int)((ix*0.5+0.5)*resX)` in **FP32** (`Real`). The on-film rejection test only
+guarantees `ix,iy < 1`, but the gap between the largest float below 1 and 1.0 is
+~6e-8, so for a photon landing within that gap of the film edge, `(ix*0.5f+0.5f)`
+rounds to exactly `1.0f` and `px` becomes `resX` (likewise `py==resY`). `filmAdd()`
+indexes `py*resX+px` with no bounds check → out-of-bounds write. Data-dependent, so
+it manifested only for some scenes/resolutions and always eventually with enough
+photons (longer renders reliably tripped it). The CPU `Camera::project()` uses
+`double` and never rounds up this way, which is why CPU renders were unaffected.
+**Fix:** clamp `px∈[0,resX-1]`, `py∈[0,resY-1]` right after the cast in all three GPU
+projection sites (`project()` rectilinear + fisheye/panoramic branches, `lensImage()`;
+`catchPhoton()` routes through `lensImage()`). The rejection test already guarantees
+the point is on-film, so clamping the boundary roundup to the last pixel is exact.
+See `render_cuda.cu` ~line 555/577/624.
+
 ## Open bugs
 
 ### `light cylinder` emits no illumination (tube is visible but lights nothing) — 2026-07-11

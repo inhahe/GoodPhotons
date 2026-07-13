@@ -480,7 +480,10 @@ sensor gain, and `iso`/`shutter`/`exposure` become true absolute stops (doubling
 
 `sphere`, `quad` (parallelogram), `triangle`, and `mesh` (OBJ import, with
 `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UVs).
-Meshes without their own `vt` coordinates can be textured via a procedural
+OBJ **vertex normals (`vn`) are read as smooth shading normals** — a hit
+barycentric-interpolates them (CPU and GPU) for smooth-shaded curved meshes, with
+no visible faceting; a mesh with no `vn` stays exactly flat-shaded (geometric
+normal). Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).

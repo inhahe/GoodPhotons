@@ -243,7 +243,7 @@ struct DMaterial {
     int    mixWeightPat;
 };
 
-struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; int matId, sensorId; };
+struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId; };
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
@@ -554,6 +554,13 @@ struct DCamera {
             if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
             px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
             py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+            // FP32 rounding at the film edge can push (ix*0.5+0.5)*res up to exactly
+            // res, yielding px==resX/py==resY and an out-of-bounds film write. The
+            // ix/iy<1 rejection above guarantees the point is on-film, so clamp the
+            // boundary case back to the last valid pixel. (CPU project uses double and
+            // never rounds up this way, so it needs no clamp — behaviour still matches.)
+            px = px < 0 ? 0 : (px >= resX ? resX - 1 : px);
+            py = py < 0 ? 0 : (py >= resY ? resY - 1 : py);
             dist2 = dot(d, d);
             cosCam = cz / sqrt(dist2);
             return true;
@@ -575,6 +582,8 @@ struct DCamera {
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
         py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+        px = px < 0 ? 0 : (px >= resX ? resX - 1 : px);   // clamp FP32 edge roundup
+        py = py < 0 ? 0 : (py >= resY ? resY - 1 : py);
         dist2 = len * len;
         cosCam = costh;
         return true;
@@ -621,6 +630,8 @@ struct DCamera {
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
         py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
+        px = px < 0 ? 0 : (px >= resX ? resX - 1 : px);   // clamp FP32 edge roundup
+        py = py < 0 ? 0 : (py >= resY ? resY - 1 : py);
         return true;
     }
     // Model C perspective catch: does this photon fly through the finite aperture
@@ -1271,13 +1282,19 @@ __device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri
     if (t < tmin || t >= hit.t) return false;
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
     hit.ng = tri.gn;
-    hit.n = (dot(rd, tri.gn) < 0) ? tri.gn : -tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolate the per-vertex UVs (u,vv are the Moller-Trumbore
     // weights of v1,v2; the v0 weight is 1-u-vv). Mirrors host intersectTri.
     Real w0 = (Real)1 - u - vv;
     hit.u = w0 * tri.uv0.x + u * tri.uv1.x + vv * tri.uv2.x;
     hit.v = w0 * tri.uv0.y + u * tri.uv1.y + vv * tri.uv2.y;
+    // Smooth shading normal: interpolate per-vertex normals (equal to gn for a flat
+    // tri, so this reduces to the geometric normal). Orient against the ray. Mirrors
+    // host intersectTri.
+    DVec3 ns = tri.n0 * w0 + tri.n1 * u + tri.n2 * vv;
+    Real nl = dot(ns, ns);
+    ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
+    hit.n = (dot(rd, ns) < 0) ? ns : -ns;
     return true;
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
@@ -3976,6 +3993,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.uv0 = {t.uv0.x, t.uv0.y, t.uv0.z};
         d.uv1 = {t.uv1.x, t.uv1.y, t.uv1.z};
         d.uv2 = {t.uv2.x, t.uv2.y, t.uv2.z};
+        d.n0 = {t.n0.x, t.n0.y, t.n0.z};
+        d.n1 = {t.n1.x, t.n1.y, t.n1.z};
+        d.n2 = {t.n2.x, t.n2.y, t.n2.z};
         d.matId = t.matId; d.sensorId = t.sensorId;
     }
     std::vector<DSphere> sph(scene.spheres.size());
