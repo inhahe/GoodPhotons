@@ -5,6 +5,41 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### Headless-spawned `-window` render on gallery.ftsl hangs with no output — NEEDS INVESTIGATION 2026-07-14
+
+A `ftrace -in scenes/gallery.ftsl -mode R -n 1500000 -spp 8 -window` invocation *spawned
+as a background process without an interactive window station* ran for 15+ min burning
+~7 CPU cores (3400+ CPU-seconds) at **1% GPU**, producing **zero stdout and no image /
+checkpoint**, and never exited. Meanwhile the same scene stripped to room+lights (no
+isosurfaces/fog), rendered with `-mode R -device gpu -spp 64 -preview` (NO `-window`, no
+`-n`), built and rendered in seconds on the GPU concurrently. Two suspects, not yet
+isolated: (a) `-window` can't create its Win32 GDI window when the process has no window
+station (background/detached spawn) and the code spins instead of erroring; (b) passing
+`-n <photons>` to **mode R** (which is spp-based, not photon-count) mis-budgets into a
+huge CPU loop. Likely (a). **Repro to confirm:** run the heavy scene once with `-window`
++ no `-n`, and once with `-n` + no `-window`, from a detached shell. If (a): make the
+`-window` init detect a missing/invalid window station and fall back to `-preview`
+(or error cleanly) instead of hanging. NB: do NOT `taskkill /F` a live ftrace — the
+nvlddmkm teardown BSOD (below) has fired after an abrupt kill.
+
+### `look tangent` pitches hard at path folds (gallery fly cusps) — FIXED 2026-07-14
+
+`camera_curve` `look tangent` aims at a point a FIXED arc-length ahead (`sTgt =
+sHere + 0.045*Smax`, ftsl.h ~2726). Where the path makes a horizontal U-turn (a
+"fold") while also changing height, that look-ahead reaches across the fold to a
+point at a very different y, so the view pitches sharply — a visible frame-to-frame
+flick. The gallery `fly` curve had two folds: the dive turnaround (frames ~117-120,
+old peak pitch **+24.5°** staring UP into the y=4.48 ceiling lights — the jerk the
+user reported) and the loop closure (frames ~171-175, old peak **-70°** staring DOWN
+at the floor, pre-existing/unreported). **Fix (scene-level):** keep y as flat as
+possible ACROSS each fold and push the height change onto the straight opening
+corridor — return apex lowered from y~2.6 to ~2.2. New peaks +10.6° / -15°, worst
+frame-to-frame pitch swing ~30° → 6.5° (measured with `scraps/_cam_curve.py`, a
+faithful re-impl of the ftsl.h sampler). Commit d46cacb. **Latent general issue:**
+any tangent-look path with a fold+climb will pitch; a robust engine-side fix would
+be to low-pass the look direction or clamp per-frame pitch rate in the `look tangent`
+branch (ftsl.h ~2718-2734), or expose the 0.045 look-ahead fraction as a curve knob.
+
 ### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14
 
 With a very dense saved map (the 60M-photon gallery map deposits ~58.3M photons), each
