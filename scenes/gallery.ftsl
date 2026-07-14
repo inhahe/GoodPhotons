@@ -1,13 +1,13 @@
-# Gallery Hall — a large museum room full of material studies, each object either
-# standing on the floor or displayed on its own stone plinth. A gold GYROID lattice ball
-# (a thickened triply-periodic minimal surface, clipped to a sphere) is the centrepiece
-# on a broad low plinth; around it, pedestals carry clear glass and diamond dielectrics,
-# copper / silver conductors, morpho / oil-slick / soap-bubble / mother-of-pearl
-# iridescents, and a wax translucent (diffuse-transmission) sphere, while a chrome column
-# and a brass CSG block stand on the floor. A polished floor mirrors it all; broad ceiling
-# lights plus warm/cool accents and small glowing orbs light the hall. Rendered with the
-# backward path tracer (mode R), which resolves the interior GI and the specular
-# metals/glass far better than the forward splat.
+# Gallery Hall — a large museum room, pared back to a handful of hero pieces on stone
+# plinths, lit by a SINGLE overhead bulb. A gold GYROID lattice ball (a thickened
+# triply-periodic minimal surface, clipped to a sphere) is the centrepiece; on the open
+# centre line sits the dense-flint hero orb the fly-path dives through. Around them:
+# an algebraic KLEIN BOTTLE in glass (the intricate transparent piece), a tilted algebraic
+# HEART in morpho-blue iridescence, a chrome MIRROR ring, and two brass CSG studies
+# (a fused cluster and a dumbbell-ring). One warm ~4200 K bulb pools light on the centre
+# and fades into the corners; the thin hall haze turns it into a soft volumetric glow.
+# A polished floor mirrors it all. Rendered with the backward path tracer (mode R), which
+# resolves the interior GI and the specular metals/glass far better than the forward splat.
 #
 #   ftrace -in scenes/gallery.ftsl -mode R -device gpu -noise 2 -window -o png/gallery.png
 #   # quick look:  ftrace -in scenes/gallery.ftsl -mode R -device gpu -spp 200 -r 640 360 -o png/gallery.png
@@ -52,7 +52,7 @@ quad { origin 0 0 15.5 u 0 4.5 0  v 9 0 0      material ceil  }   # front (z=15.
 quad { origin 0 0 0    u 0 0 15.5 v 0 4.5 0    material red   }   # left  (x=0)
 quad { origin 9 0 0    u 0 4.5 0  v 0 0 15.5   material green }   # right (x=9)
 
-# =========================  CENTREPIECE  =======================================
+# =========================  CENTREPIECE (KEPT)  ================================
 # Broad low plinth (top at y=0.6) carrying the gold gyroid lattice ball.
 isosurface { material stone  box { center 4.5 0.30 6.0   size 2.2 0.60 2.2   round 0.05 } }
 isosurface {
@@ -71,151 +71,120 @@ isosurface {
     max_gradient 40
 }
 
-# =========================  FRONT ROW (z ~ 8.6)  ===============================
-# Four display plinths (tops at y=0.9) spread across the hall; the centre is left
-# open so the gyroid stays visible between them.
-isosurface { material stone  box { center 1.9 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
-sphere { center 1.9 1.40 8.6   radius 0.50   material glass }
-
-isosurface { material stone  box { center 3.2 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
-# Two interlocked rings smooth-fused into a chain-link knot (soap-film iridescence
-# reads beautifully off the doubly-curved tube).
-isosurface {
-    material bubble
-    smooth_union {
-        k 0.06
-        torus { translate 3.2 1.32 8.6   rotate 0  0 0   major 0.26   minor 0.085 }
-        torus { translate 3.2 1.32 8.6   rotate 90 0 0   major 0.26   minor 0.085 }
-    }
-    contained_by { min 2.75 0.87 8.15   max 3.65 1.77 9.05 }
-    max_gradient 8
-}
-
-isosurface { material stone  box { center 5.8 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
-# Lumpy asymmetric blob — a melted wax glob (four offset metaballs of different radii,
-# so the silhouette is irregular, not a sphere). Diffuse-transmission wax glows softly.
-isosurface {
-    material wax
-    blob {
-        k 0.11
-        sphere { center 5.70 1.20 8.58   radius 0.25 }
-        sphere { center 5.90 1.33 8.66   radius 0.21 }
-        sphere { center 5.80 1.52 8.52   radius 0.16 }
-        sphere { center 5.96 1.16 8.50   radius 0.14 }
-    }
-    contained_by { min 5.30 0.85 8.10   max 6.30 1.80 9.10 }
-    max_gradient 8
-}
-
-isosurface { material stone  box { center 7.1 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
-sphere { center 7.1 1.35 8.6   radius 0.45   material diamond }
-
-# Fly-through glass orb: a big clear sphere on the OPEN centre line (x=4.35), between
-# the front row (z=8.6) and the camera. The `camera_curve "fly"` below dives straight
-# through its centre on the way to the gyroid channel, so we get an inside-the-glass
-# refraction beat before the lattice tunnel. On its own tall plinth (top y=0.80).
+# The MIDDLE SPHERE (KEPT): the fly-through hero orb on the OPEN centre line (x=4.35),
+# dense flint (SF10) so the dive through its centre gives a strong dispersive refraction
+# beat. The `camera_curve "fly"` plunges straight through it. On its own tall plinth.
 isosurface { material stone  box { center 4.35 0.40 9.5   size 0.9 0.8 0.9   round 0.03 } }
 sphere { center 4.35 1.35 9.5   radius 0.55   material heroglass }
 
-# =========================  MID ROW (z ~ 5.4), flanking the hero  ==============
-# Copper torus stood upright on its plinth (top 1.0), silver metaballs on the other.
-isosurface { material stone  box { center 2.0 0.50 5.4   size 0.65 1.0 0.65   round 0.03 } }
-isosurface {
-    material copper
-    torus { translate 2.0 1.44 5.4   rotate 90 0 0   major 0.34   minor 0.10 }
-}
+# =========================  NEW PIECES  ========================================
+# The hall was stripped back to just the gyroid + the hero orb above; everything below
+# is the new set. Placement trick: the unit-cube gallery CSG definitions (05/07/09) are
+# dropped in VERBATIM and relocated with a TOP-LEVEL translate+scale on the isosurface,
+# which composes down into every CSG leaf AND the contained_by box (ftsl.h buildFieldStmt
+# threads rootXf through all children), so `local 0.5 -> translate + 0.5*scale` centres
+# the unit cube on its plinth.
 
-isosurface { material stone  box { center 7.0 0.50 5.4   size 0.70 1.0 0.70   round 0.03 } }
+# --- INTRICATE TRANSPARENT OBJECT: an algebraic Klein bottle in glass (front-left). ---
+# Own function (the Ian-Stewart quartic, NOT a POV blob), params from tools/klein_explorer.html
+# a=1.2 b=0.6 c=3 d=18.5, iso-level 0.15 -> a solid-walled bottle that refracts cleanly.
+# r*r == x^2+y^2+z^2 in the expr evaluator. Object-space clip radius 5 * scale 0.12 = 0.60 m.
+isosurface { material stone  box { center 1.9 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
 isosurface {
-    material silver
-    blob {
-        k 0.14
-        sphere { center 6.85 1.24 5.40   radius 0.24 }
-        sphere { center 7.12 1.28 5.50   radius 0.22 }
-        sphere { center 6.98 1.50 5.45   radius 0.20 }
+    material glass
+    function {
+        scale 0.12   translate 1.9 1.50 8.6   rotate 12 28 0
+        expr "clamp(-((r*r + 1.2*y - 0.6)*((r*r - 1.2*y - 0.6)*(r*r - 1.2*y - 0.6) - 3*z*z) + 18.5*x*z*(r*r - 1.2*y - 0.6) - 0.15), -10, 10)"
     }
+    contained_by { sphere { center 1.9 1.50 8.6   radius 0.62 } }
+    max_gradient 40
+    open
 }
 
-# =========================  BACK ROW (z ~ 3.3)  ================================
-isosurface { material stone  box { center 2.2 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
-# Twisted vertical ribbon: a thin sheet |rotated-x| < 4.5 cm whose rotation angle winds
-# with height (helical twist ~5 rad/m), clipped to an ellipsoid. Morpho-blue iridescence
-# on a butterfly-wing form. The `function` value is not a distance, so max_gradient bounds
-# the field's Lipschitz constant for the safe sphere-march.
+# --- IRIDESCENT: tilted algebraic heart (gallery pick 07) in morpho-blue (front-right). ---
+isosurface { material stone  box { center 7.1 0.45 8.6   size 0.75 0.9 0.75   round 0.03 } }
 isosurface {
     material morpho
-    intersect {
-        function {
-            translate 2.2 1.35 3.3
-            expr "abs(x*cos(5*y) - z*sin(5*y)) - 0.045"
-        }
-        ellipsoid { center 2.2 1.35 3.3   radius 0.34 0.44 0.20 }
-    }
-    contained_by { min 1.80 0.88 2.98   max 2.60 1.82 3.62 }
-    max_gradient 9
-}
-
-isosurface { material stone  box { center 4.5 0.45 3.0   size 0.70 0.9 0.70   round 0.03 } }
-# Superellipsoid "cushion": |x/a|^4 + |y/b|^4 + |z/c|^4 = 1. A plump rounded-cube pillow
-# (not a sphere, not a lattice) — the smooth broad faces show off nacre's angle-dependent
-# mother-of-pearl sheen.
-isosurface {
-    material nacre
+    translate 6.675 0.975 8.175   scale 0.85
     function {
-        translate 4.5 1.32 3.0
-        expr "pow(abs(x/0.36),4) + pow(abs(y/0.30),4) + pow(abs(z/0.36),4) - 1"
+        translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
+        expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
     }
-    contained_by { min 4.05 0.92 2.55   max 4.95 1.72 3.45 }
-    max_gradient 26
+    contained_by { min 0.14 0.14 0.2   max 0.86 0.86 0.8 }
+    max_gradient 60
 }
 
-isosurface { material stone  box { center 6.8 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
-# Dimpled sphere: radius 0.36 modulated by a ±5 cm sinusoidal bump field (a brain-coral /
-# golf-ball relief). Oil-slick thin-film shifts hue across every bump.
-isosurface {
-    material oil
-    function {
-        translate 6.8 1.34 3.3
-        expr "sqrt(x*x + y*y + z*z) - 0.36 - 0.05*sin(9*x)*sin(9*y)*sin(9*z)"
-    }
-    contained_by { min 6.28 0.85 2.78   max 7.32 1.83 3.82 }
-    max_gradient 6
-}
-
-# =========================  FLOOR PIECES  ======================================
-# Tall chrome column standing on the floor in the back-left corner (mirrors the hall).
-isosurface {
-    material chrome
-    cylinder { translate 1.1 1.50 1.6   radius 0.42   height 3.0 }
-}
-# Brass hard-CSG sculpture on the floor, near the camera on the right: a rounded box
-# with a sphere bored out of the front face.
+# --- BRASS CSG cluster (gallery pick 05): nested smooth_union of spheres+tori with two
+# spheres bored out (mid-left plinth). SDF leaves stay unit-Lipschitz, so no max_gradient. ---
+isosurface { material stone  box { center 2.0 0.50 5.4   size 0.70 1.0 0.70   round 0.03 } }
 isosurface {
     material brass
+    translate 1.6 1.0 5.0   scale 0.8
     difference {
-        box    { center 6.0 0.60 10.6   size 1.1 1.2 1.1   round 0.08 }
-        sphere { center 6.0 0.75 10.05   radius 0.52 }
+    difference {
+    smooth_union { k 0.038
+        smooth_union { k 0.050
+        smooth_union { k 0.039
+        smooth_union { k 0.035
+        smooth_union { k 0.032
+        smooth_union { k 0.042
+        sphere { center 0.642 0.391 0.564  radius 0.137 }
+        sphere { center 0.602 0.392 0.536  radius 0.133 }
     }
+        torus { translate 0.369 0.629 0.403  rotate 155 167 28  major 0.201  minor 0.041 }
+    }
+        sphere { center 0.671 0.427 0.395  radius 0.092 }
+    }
+        sphere { center 0.566 0.601 0.542  radius 0.097 }
+    }
+        sphere { center 0.365 0.665 0.501  radius 0.128 }
+    }
+        torus { translate 0.390 0.561 0.494  rotate 152 95 79  major 0.150  minor 0.060 }
+    }
+    sphere { center 0.435 0.587 0.480  radius 0.070 }
+    }
+    sphere { center 0.520 0.500 0.495  radius 0.071 }
+    }
+    contained_by { min 0.12 0.12 0.22   max 0.88 0.88 0.78 }
+}
+
+# --- MIRRORED: an upright chrome torus ring (mid-right plinth). A clean mirror reflects
+# the whole hall + the single bulb around its curve. ---
+isosurface { material stone  box { center 7.0 0.50 5.4   size 0.70 1.0 0.70   round 0.03 } }
+isosurface {
+    material chrome
+    torus { translate 7.0 1.44 5.4   rotate 90 0 0   major 0.34   minor 0.10 }
+}
+
+# --- BRASS dumbbell-ring (gallery pick 09): two spheres joined by a fused bar + ring,
+# with a small bite bored out (back plinth). ---
+isosurface { material stone  box { center 6.8 0.45 3.3   size 0.70 0.9 0.70   round 0.03 } }
+isosurface {
+    material brass
+    translate 6.41 0.96 2.91   scale 0.78
+    difference {
+    smooth_union { k 0.046
+        smooth_union { k 0.033
+        smooth_union { k 0.032
+        sphere { center 0.340 0.500 0.500  radius 0.150 }
+        sphere { center 0.660 0.500 0.500  radius 0.150 }
+    }
+        cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
+    }
+        torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.150  minor 0.045 }
+    }
+    sphere { center 0.369 0.528 0.501  radius 0.067 }
+    }
+    contained_by { min 0.08 0.08 0.12   max 0.92 0.92 0.88 }
 }
 
 # =========================  LIGHTING  ==========================================
-# Three broad neutral ceiling lights down the hall, warm & cool wall accents, and a
-# few small glowing orbs that also give the glass and diamond something bright to refract.
-light area { origin 2.5 4.48 8.0   u 4.0 0 0   v 0 0 1.6   normal 0 -1 0   spd preset:d65 }
-light area { origin 2.5 4.48 5.3   u 4.0 0 0   v 0 0 1.6   normal 0 -1 0   spd preset:d65 }
-light area { origin 2.5 4.48 2.4   u 4.0 0 0   v 0 0 1.4   normal 0 -1 0   spd preset:d65 }
-light area { origin 7.6 4.0  2.0   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd blackbody 3000 }  # warm accent
-light area { origin 0.7 4.0  2.6   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd blackbody 8500 }  # cool accent
-light sphere { center 1.9 1.35 7.7   radius 0.10   spd blackbody 2500 }   # warm, behind glass
-light sphere { center 7.1 1.35 7.7   radius 0.10   spd blackbody 9000 }   # cool, behind diamond
-# CAUSTIC BULB: a compact near-point source directly above the hero orb. A SMALL
-# source is essential for a SHARP caustic -- the broad ceiling area lights each throw
-# a shifted caustic that averages into a smooth glow, washing them out; one tight bulb
-# throws a single crisp, coloured focus. Refracted down through the SF10 orb (paraxial
-# focus ~0.6 below centre, n~1.73) it pools a bright caustic on the plinth top / floor
-# right where the fly path approaches and dives through the orb. Neutral white so the
-# flint's dispersion shows as rainbow fringing.
-light sphere { center 4.35 3.45 9.70   radius 0.06   spd blackbody 6000 }   # caustic focuser
+# A SINGLE light bulb hung over the hall centre. One warm ~4200 K sphere source is the
+# whole illumination: strong falloff gives a dramatic, gallery-at-night pool of light on
+# the centrepieces that fades into the corners, and the thin hall haze (medium below)
+# turns it into a soft volumetric glow. Small enough to throw a crisp dispersive caustic
+# down through the SF10 orb, big enough (r=0.32) to carry real power and soft shadows.
+light sphere { center 4.5 3.7 7.6   radius 0.55   spd blackbody 4200 }
 
 # --- Atmosphere: a faint hall haze. Participating media is BUILT IN (Henyey-Greenstein
 # phase + delta/ratio tracking), so this thin homogeneous fog gives the whole hall aerial
@@ -228,7 +197,7 @@ medium { sigma_t 0.016   albedo 0.85   g 0.6 }
 camera "cam" {
     eye 4.5 1.90 14.6   look_at 4.5 1.15 5.8   up 0 1 0   fov_y 44
     mode R
-    film { res 1280 720   exposure 1.5 }
+    film { res 1280 720   exposure 11.0 }
 }
 
 # --- Flythrough: a SEAMLESS LOOP that dives through the glass orb, threads the gyroid's
@@ -268,7 +237,7 @@ camera_curve "fly" {
     point 4.261 1.432 5.576
     point 4.335 1.305 5.385    # channel exit  (-z face)
     point 4.30  1.38  4.60     # emerge behind the ball
-    point 3.90  1.52  3.70     # bank up-and-LEFT, clearing the nacre sphere at x=4.5,z=3.0
+    point 3.90  1.52  3.70     # bank up-and-LEFT across the open back of the hall
     point 3.30  1.70  2.70
     point 2.60  1.84  1.90     # finish the dive, back-left of the hall
     # --- return glide (reshaped v2): a smooth, MOSTLY-LEVEL cruise back to the start. `look
@@ -282,7 +251,7 @@ camera_curve "fly" {
     # each fold so the look-ahead stays level -- the apex now peaks at only ~y2.2, the turnaround
     # is +10.6deg and the closure -15deg (max frame-to-frame swing 6.5deg, was ~30deg). The
     # height change is pushed onto the STRAIGHT opening corridor (p0->orb) where a steeper look
-    # reads fine. Still glides above every plinth and beside the chrome column (top y=3.0). ---
+    # reads fine. Still glides above every plinth in the pared-back hall. ---
     point 2.35  1.90  2.90     # ease up out of the dive, staying LEVEL across the turnaround fold
     point 2.80  2.00  5.10     # reach cruise height, gliding forward down the hall
     point 3.40  2.13  7.60     # near-level establishing sweep over the hall centre-left
@@ -304,5 +273,5 @@ camera_curve "fly" {
     # from `material white`), so `closed exposure_lock` on one line would silently drop the lock.
     closed
     exposure_lock
-    film { res 1280 720   exposure 1.5 }
+    film { res 1280 720   exposure 11.0 }
 }
