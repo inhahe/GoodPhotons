@@ -38,12 +38,21 @@
   input[type=number] { background:#0e1014; color:var(--ink); border:1px solid #2a2f39;
     border-radius:5px; padding:3px 6px; width:64px; font-size:12px; }
   a { color:var(--acc); }
+  #loadbar { position:absolute; left:0; top:0; height:3px; width:100%; background:transparent;
+    pointer-events:none; }
+  #loadfill { height:100%; width:0; background:var(--acc); transition:width .08s linear; }
+  #status { background:#0e1014; border:1px solid #2a2f39; border-radius:20px; padding:3px 10px;
+    color:var(--dim); font-variant-numeric:tabular-nums; }
+  #status.load { color:var(--acc); border-color:#4a3d1f; }
+  #status.rdy  { color:#7fd081; border-color:#2f5233; }
+  button:disabled { opacity:.42; cursor:not-allowed; }
 </style>
 </head>
 <body>
 <div id="wrap">
   <div id="top">
     <img id="img" alt="">
+    <div id="loadbar"><div id="loadfill"></div></div>
     <div id="badge"></div>
     <div id="drop">
       <div style="font-size:15px;color:var(--ink)">Frame Scrubber</div>
@@ -55,12 +64,13 @@
   </div>
   <div id="ctrl">
     <div class="rowline">
-      <button id="play" class="acc">▶ Play</button>
+      <button id="play" class="acc" disabled>▶ Play</button>
       <button id="prev">◀ ,</button>
       <button id="next">. ▶</button>
       <input id="scrub" type="range" min="0" max="0" value="0" step="1">
       <span class="pill" id="fnum">— / —</span>
       <span class="pill" id="tc">0.00s</span>
+      <span class="pill" id="status">no frames</span>
     </div>
     <div class="rowline" style="margin-top:8px">
       <label>fps <input id="fps" type="number" value="30" min="1" max="120" step="1"></label>
@@ -81,7 +91,7 @@
 const $=id=>document.getElementById(id);
 let frames=[];      // {url, name, num}
 let motion=[];      // mean abs diff to previous frame (motion[0]=0)
-let idx=0, playing=false, A=-1, B=-1, rafPlay=0, acc=0, lastNow=0;
+let idx=0, playing=false, A=-1, B=-1, rafPlay=0, acc=0, lastNow=0, ready=false;
 
 // ---------- folder loading ----------
 $('pick').onclick=e=>{ e.preventDefault(); $('folder').click(); };
@@ -115,7 +125,7 @@ async function loadFiles(files){
   $('drop').classList.add('hide');
   $('scrub').max=frames.length-1; A=-1; B=-1; updateAB();
   idx=0; await show(0);
-  computeMotion();   // async, fills the graph as it goes
+  prepare();   // decode+cache every frame AND compute motion in one pass, then mark ready
 }
 
 // ---------- PPM (P6) decoder for the few .ppm frames ----------
@@ -168,7 +178,7 @@ function advance(){
   if(n>hi){ n = $('loop').checked ? lo : hi, playing=(n!==hi||$('loop').checked)?playing:false; if(!$('loop').checked&&idx>=hi){ stop(); return; } }
   show(n);
 }
-function play(){ if(!frames.length) return; playing=true; lastNow=0; acc=0; $('play').textContent='❚❚ Pause';
+function play(){ if(!frames.length||!ready) return; playing=true; lastNow=0; acc=0; $('play').textContent='❚❚ Pause';
   rafPlay=requestAnimationFrame(tick); }
 function stop(){ playing=false; cancelAnimationFrame(rafPlay); $('play').textContent='▶ Play'; }
 $('play').onclick=()=>playing?stop():play();
@@ -181,8 +191,16 @@ $('clrAB').onclick=()=>{ A=-1; B=-1; updateAB(); drawGraph(); };
 function updateAB(){ const fps=Math.max(1,+$('fps').value);
   $('ab').textContent='A '+(A<0?'—':A+' ('+(A/fps).toFixed(2)+'s)')+' · B '+(B<0?'—':B+' ('+(B/fps).toFixed(2)+'s)'); }
 
-// ---------- inter-frame motion (find the jerk) ----------
-async function computeMotion(){
+// ---------- prepare: decode+cache every frame and compute motion in one pass ----------
+// Playback used to stutter on the first run because each frame was only decoded the
+// first time it was displayed. Here we decode every frame up front, retain the decoded
+// Image (so paints are instant), fold the motion-graph math into the same pass (one
+// decode per frame), and only enable Play once the whole sequence is genuinely ready.
+function setStatus(cls,txt){ const s=$('status'); s.className='pill'+(cls?' '+cls:''); s.textContent=txt; }
+async function prepare(){
+  ready=false; $('play').disabled=true;
+  setStatus('load','decoding 0 / '+frames.length);
+  $('loadfill').style.width='0%';
   motion=new Array(frames.length).fill(0);
   const W=96,H=54; const cv=document.createElement('canvas'); cv.width=W; cv.height=H;
   const cx=cv.getContext('2d',{willReadFrequently:true});
@@ -191,14 +209,20 @@ async function computeMotion(){
     const f=frames[i]; if(!f.url && f.ppm) f.url=await ppmToUrl(f.ppm);
     const im=new Image(); im.src=f.url;
     await im.decode().catch(()=>{});
+    f.img=im;   // keep a reference so the decoded bitmap stays warm for playback
     cx.drawImage(im,0,0,W,H);
     const d=cx.getImageData(0,0,W,H).data;
     if(prev){ let s=0; for(let k=0;k<d.length;k+=4){ s+=Math.abs(d[k]-prev[k])+Math.abs(d[k+1]-prev[k+1])+Math.abs(d[k+2]-prev[k+2]); }
       motion[i]=s/(W*H*3); }
     prev=d.slice(0);
+    $('loadfill').style.width=((i+1)/frames.length*100)+'%';
+    setStatus('load','decoding '+(i+1)+' / '+frames.length);
     if((i&7)===0) drawGraph();
   }
   drawGraph(); flagJerk();
+  ready=true; $('play').disabled=false;
+  setStatus('rdy','\u2713 ready \u00b7 '+frames.length+' frames');
+  setTimeout(()=>{ $('loadfill').style.width='0%'; }, 500);
 }
 function flagJerk(){ if(motion.length<3){ $('jerk').textContent=''; return; }
   let mi=1,mv=0; for(let i=1;i<motion.length;i++) if(motion[i]>mv){ mv=motion[i]; mi=i; }
