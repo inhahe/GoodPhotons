@@ -3233,6 +3233,43 @@ static int run(int argc, char** argv) {
         if (idx.empty()) return;
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
+#ifdef HAVE_CUDA
+        // GPU photon map: build the map once on the device and gather every frame there —
+        // the same amortization as the CPU shared path, but the (expensive) gather runs on
+        // the GPU. Only the DIRECT density estimate is ported, so a final-gather render, a
+        // lens camera, an env scene, or an unsupported material falls back to the CPU below.
+        {
+            const bool wantGpu  = !std::strcmp(device, "gpu");
+            const bool wantAuto = !std::strcmp(device, "auto");
+            bool allPinhole = true;
+            for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
+            if ((wantGpu || wantAuto) && g_pmFinalGather == 0 && allPinhole &&
+                cudaAvailable() && cudaPhotonMapSupported(scene)) {
+                std::vector<Camera> cams; std::vector<int> rxs, rys;
+                for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
+                std::printf("[camera] shared photon map (mode M) on %s: %zu cameras, %lld "
+                            "photons, radius %.4g (light=%s) ...\n",
+                            cudaDeviceName(), cams.size(), N, radius, lightLabel);
+                EnergyReport e;
+                auto films = renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e, diffraction, spp);
+                if (e.emitted > 0.0)
+                    std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                                e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
+                                (e.absorbed + e.sensor + e.escaped + e.residual) / e.emitted);
+                for (size_t k = 0; k < idx.size(); ++k) {
+                    const RenderCam& rc = toRender[idx[k]];
+                    std::string op = outFor(rc.name);
+                    if (toRender.size() > 1)
+                        std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
+                                    rc.name.c_str(), rc.res, rc.resY, op.c_str());
+                    double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
+                    if (!writeFilm(op.c_str(), films[k], (double)spp, rc.exposure, false, anchor, scene.absolute))
+                        sharedWriteFail = true;
+                }
+                return;
+            }
+        }
+#endif
         std::printf("[camera] shared photon map (mode M): %zu cameras, %lld photons, "
                     "radius %.4g on %d CPU threads (light=%s)%s ...\n",
                     idx.size(), N, radius, nThreads, lightLabel,

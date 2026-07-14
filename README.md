@@ -31,8 +31,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **density fields** — either formula-defined blobs with soft edges *or* imported
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU).
-- **CUDA GPU backend** for the forward pinhole splat (mode `B`), megakernel or
-  wavefront, with CPU fallback.
+- **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
+  BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
+  across a whole camera flythrough), megakernel or wavefront, with CPU fallback.
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
   and checkpoint/resume.
 
@@ -106,7 +107,7 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
@@ -189,8 +190,12 @@ paths they can capture at all**.
   contact shadows and fine detail **sharp** while still smoothing indirect light, at
   roughly `K`× the per-sample cost (so pair it with fewer `-spp`). Directly-viewed
   emitters carry a little chromatic speckle at low spp. Best when many cameras share one
-  lighting solution. CPU only. (Matches the forward splat modes `A`/`B`/`C` — same
-  forward physics, just measured from a stored map.)
+  lighting solution. **GPU-accelerated** for the direct density query: the device
+  deposits the photon pass, hands the hits to the same grid builder, then gathers every
+  camera on the GPU from the one shared map — so a whole flythrough builds the map once
+  and renders each frame in device time (a `-pmfg` final gather still falls back to the
+  CPU, as do env-lit or unsupported-material scenes). (Matches the forward splat modes
+  `A`/`B`/`C` — same forward physics, just measured from a stored map.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -230,10 +235,11 @@ composite (`P`) each refine an image whose brightness is fixed while only graini
 falls, so they share the same live progress and budget flags (`-time` / `-noise` /
 `-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
 and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
-the forward megakernel, **`D`** via its own GPU BDPT megakernel, and **`R` (including the
+the forward megakernel, **`D`** via its own GPU BDPT megakernel, **`R` (including the
 physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
 reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
-is within the backward-GPU scope. Outside that scope `P`'s camera-side layer, and `V`'s
+is within the backward-GPU scope — and the **`M` photon map** (direct density query),
+which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s
 backward reference (kept on the CPU as a stable ground truth), remain CPU-only. The
 composite `P` classifies its pixels once, then alternates forward and backward batches
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
@@ -248,11 +254,13 @@ stay non-resumable.
 - **`-device auto` (default, recommended).** Uses the GPU when a supported CUDA
   device is present *and* the render is one it can handle (forward modes
   `A`/`B`/`C` on a non-fluorescent scene, mode `D`'s BDPT megakernel, mode `R`'s
-  backward megakernel — including the physical-lens camera — or both layers of the
-  mode-`P` composite); otherwise the CPU. Prints its choice.
+  backward megakernel — including the physical-lens camera — both layers of the
+  mode-`P` composite, or mode `M`'s shared photon map with the direct density query
+  on a non-env, pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (env/spot/collimated lights, fluorescence; any fog for `R`), and for
+  (env/spot/collimated lights, fluorescence; any fog for `R`), for a mode-`M` render
+  that uses a `-pmfg` final gather or an env light, and for
   fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous
   `density`-field fog — directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and

@@ -55,6 +55,7 @@
 
 #include "render_cuda.h"
 #include "render_progress.h"
+#include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -1868,11 +1869,43 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
 // standalone render in distribution only. (A HETEROGENEOUS medium adds a ratio-tracking
 // transmittance draw per connect, so multi-cam model-B also matches only in distribution
 // then — inherent to the estimator, and consistent with the CPU tracer.)
+// One deposited photon (device twin of Photon in photonmap.h): where light landed, the
+// incident direction (= -travel), the shading normal (for cross-surface leak rejection),
+// and the monochromatic power / wavelength it carried. Laid out to round-trip through the
+// host PhotonMap (float here <-> double on the host build).
+struct DPhoton {
+    DVec3 pos, wi, n;
+    float power, lambda;
+};
+
 struct DCamSet {
     const DCamera* cams;      // nCam cameras
     double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
     double* const* hits;      // nCam per-pixel hit-count buffers
     int nCam;
+    // Photon-map deposit (mode M forward pass). When depCount != nullptr the forward
+    // tracer appends a photon record at every diffuse / diffuse-transmit vertex (device
+    // twin of Renderer::depositPhoton) instead of / in addition to splatting: the pass
+    // runs with nCam == 0 (all camera splats become no-ops) so the trace is pure deposit.
+    // depCount is an atomic write cursor; depPhotons may be null (count-only sizing pass),
+    // else records with index < depCap are stored (excess is counted but dropped).
+    DPhoton*            depPhotons = nullptr;
+    unsigned long long* depCount   = nullptr;
+    unsigned long long  depCap     = 0;
+};
+
+// A view-independent photon-map query structure on the device (device twin of PhotonMap
+// in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
+// photon records, so a radius-r query touches only the 3x3x3 neighbourhood. Built on the
+// host (PhotonMap::build) from the deposited photons, then uploaded for the gather kernel.
+struct DPhotonMap {
+    const DPhoton* photons;   // reordered into cell-contiguous runs
+    const int*     cellStart; // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
+    DVec3  lo;                // grid origin (world)
+    Real   cellSize;          // == gather radius
+    Real   radius;            // gather radius (world units)
+    int    nx, ny, nz;
+    long long nEmitted;       // total photons emitted in the pass (normalization)
 };
 
 // Splat a surface vertex to every camera (model B pinhole connect, or model A finite-
@@ -1886,6 +1919,22 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
     for (int c = 0; c < cs.nCam; ++c) {
         if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
         else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
+    }
+}
+// Append a photon record at a diffuse / translucent vertex (device twin of
+// Renderer::depositPhoton). No-op unless the camera set carries a deposit buffer
+// (normal renders leave cs.depCount == nullptr, so this compiles away to nothing).
+// Always increments the atomic count (so a null-buffer sizing pass measures the exact
+// deposit total); stores only when a buffer is bound and the slot is within capacity.
+__device__ static void depositPhoton(const DCamSet& cs, const DVec3& p, const DVec3& wtravel,
+                                     const DVec3& n, Real beta, Real lambda) {
+    if (!cs.depCount) return;
+    unsigned long long i = atomicAdd(cs.depCount, 1ULL);
+    if (cs.depPhotons && i < cs.depCap) {
+        DPhoton ph;
+        ph.pos = p; ph.wi = -wtravel; ph.n = n;
+        ph.power = (float)beta; ph.lambda = (float)lambda;
+        cs.depPhotons[i] = ph;
     }
 }
 // Volume (fog) analogue of splatSurfaceAll.
@@ -2883,6 +2932,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real sum = rhoR + rhoT;
         if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
         DVec3 nb = h.n * (Real)(-1);
+        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
         splatSurfaceAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
@@ -2896,6 +2946,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
+        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -4067,6 +4118,155 @@ __global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm
     }
 }
 
+// ----------------------- photon-map camera gather (mode M) -------------------
+// Device twin of photonGather (photonmap_render.h, fgRays == 0 path). Follows a camera
+// ray through specular surfaces (monochromatic at the sampled `lambda`); at the first
+// diffuse / translucent hit it estimates reflected radiance by a radius density query
+// into the uploaded photon map, each photon reflected at ITS OWN wavelength so the
+// estimate is built directly in XYZ (returned via oX/oY/oZ). Directly-viewed emitters
+// are added as a monochromatic estimate at the sampled lambda. No final gather, no env
+// (both gated out by cudaPhotonMapSupported); Beer-Lambert interior absorption is tracked
+// exactly like bkRadiance. Keep in sync with photonGather.
+__device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
+                                     DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
+                                     double& oX, double& oY, double& oZ) {
+    oX = oY = oZ = 0.0;
+    double thr = 1.0;
+    int interior = -1;
+    const double area = DPI * (double)pm.radius * (double)pm.radius;
+    const double norm = (pm.nEmitted > 0 && area > 0.0) ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
+    const double r2 = (double)pm.radius * (double)pm.radius;
+    const int maxBounce = 32;
+
+    for (int b = 0; b < maxBounce; ++b) {
+        DHit h = closestHit(sc, ro, rd);
+        if (interior >= 0 && h.valid) {                 // Beer-Lambert inside glass
+            Real a = specLookup(sc.mats[interior].absorb, lambda);
+            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        }
+        if (!h.valid) return;                            // escaped (env gated out of mode-M GPU)
+
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return;                       // absorbed by the mix
+            mp = &sc.mats[child]; matId = child;
+        }
+        const DMaterial& m = *mp;
+
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0) {                                   // directly-viewed / specular-seen emitter
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            oX += (double)cieX(lambda) * e;
+            oY += (double)cieY(lambda) * e;
+            oZ += (double)cieZ(lambda) * e;
+            return;
+        }
+
+        if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            // Radius density estimate at the visible point, accumulated in XYZ (each photon
+            // folded at its own wavelength): L_r = (1/N) sum_p rho(l_p)/pi * Phi_p / (pi r^2).
+            double gx = 0, gy = 0, gz = 0;
+            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
+            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
+            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
+            ix = min(max(ix, 0), pm.nx - 1);
+            iy = min(max(iy, 0), pm.ny - 1);
+            iz = min(max(iz, 0), pm.nz - 1);
+            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
+              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
+                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
+                  int c = (cz * pm.ny + cy) * pm.nx + cx;
+                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
+                      const DPhoton& ph = pm.photons[k];
+                      DVec3 d = h.p - ph.pos;
+                      if ((double)dot(d, d) > r2) continue;
+                      if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
+                      Real rho = dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                      double w = (double)rho * (1.0 / DPI) * (double)ph.power;
+                      gx += (double)cieX((Real)ph.lambda) * w;
+                      gy += (double)cieY((Real)ph.lambda) * w;
+                      gz += (double)cieZ((Real)ph.lambda) * w;
+                  }
+                }}}
+            double s = norm * thr;
+            oX += gx * s; oY += gy * s; oZ += gz * s;
+            return;
+        }
+
+        switch (m.type) {                                // specular walk (monochromatic)
+            case D_MIRROR: {
+                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+            case D_GLOSSY: {
+                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                if (dot(o, h.n) <= 0) return;
+                ro = h.p + h.n * RAY_EPS; rd = o; break;
+            }
+            case D_DIELECTRIC: {
+                bool entering = dot(rd, h.ng) < 0;
+                bool transmitted = false;
+                DVec3 nro, nrd; refractOrReflect(sc, m, h, rd, lambda, rng, nro, nrd, &transmitted);
+                if (transmitted) interior = entering ? matId : -1;
+                ro = nro; rd = nrd; break;
+            }
+            case D_HALFMIRROR: {
+                Real r = clamp01(specLookup(m.reflect, lambda));
+                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else                   { ro = h.p + rd * RAY_EPS; }
+                break;
+            }
+            case D_FILTER: {
+                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                ro = h.p + rd * RAY_EPS; break;
+            }
+            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+        }
+        if (thr <= 0.0) return;
+    }
+}
+
+// One thread per (pixel, sample); grid-strides over totalSamples. Mirrors kBackward's
+// seeding (global sample index) so a chunked gather is decorrelated across chunks. The
+// gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
+__global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, double* hits,
+                        long long totalSamples, long long chunkSpp, long long sppTotal,
+                        long long sampleBase, int resX, int diffraction,
+                        unsigned long long seedBase) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    for (long long idx = g; idx < totalSamples; idx += G) {
+        long long pix  = idx / chunkSpp;
+        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        int px = (int)(pix % resX);
+        int py = (int)(pix / resX);
+
+        double pdf = 0.0;
+        Real lambda = dSampleSceneLambda(sc, rng, pdf);
+        if (pdf <= 0.0) continue;
+        double invPdfL = dInvPdfLambda(sc, lambda);
+
+        DVec3 ro, rd;
+        Real jx = rng.uniform(), jy = rng.uniform();
+        dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
+
+        double oX, oY, oZ;
+        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, oX, oY, oZ);
+        size_t o = ((size_t)py * resX + px) * 3;
+        atomicAdd(&film[o + 0], oX);
+        atomicAdd(&film[o + 1], oY);
+        atomicAdd(&film[o + 2], oZ);
+        if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+    }
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
@@ -5065,5 +5265,145 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
 
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits);
+    return out;
+}
+
+// --------------------- photon map (mode M) host ------------------------------
+
+bool cudaPhotonMapSupported(const Scene& scene) {
+    // The GPU mode-M path reuses the forward photon tracer (deposit) and a device gather
+    // that mirrors photonGather's DIRECT (fgRays == 0) density estimate. Scope for v1:
+    //   * same POD-bakeable materials as the forward path (cudaForwardSupported), and
+    //   * NO environment light — the device gather has no env term (CPU photonGather adds
+    //     env on escape / at diffuse hits); an env scene must stay on the CPU.
+    // Final gather (g_pmFinalGather > 0) and physical-lens cameras are gated by the caller
+    // (main.cpp) since those are render-config, not scene, properties. Fluorescence is fine:
+    // neither CPU nor GPU deposits at a fluorescent vertex, and both gather it as a query
+    // point, so the two agree. Participating media (fog) are supported — the forward deposit
+    // pass runs the same Woodcock free-flight as the CPU tracePhoton.
+    if (!cudaForwardSupported(scene)) return false;
+    if (scene.envIndex >= 0) return false;
+    return true;
+}
+
+// Build the view-independent photon map on the GPU (forward deposit pass) and gather every
+// camera from it — the flythrough win, on the device. The deposit runs the megakernel
+// forward tracer TWICE: a count-only pass to size the buffer exactly, then a fill pass
+// (deterministic same-seed launch). The grid is built on the host (PhotonMap::build, the
+// tested counting sort) and re-uploaded, then each camera is gathered by kGather. Films are
+// SUMs over spp (writeFilm divides by spp), matching renderPhotonCamera / the backward path.
+std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
+                                            const std::vector<int>& resX, const std::vector<int>& resY,
+                                            long long N, double radius, EnergyReport& eOut,
+                                            bool diffraction, long long spp) {
+    using namespace gpu;
+    int nc = (int)cams.size();
+    std::vector<Film> out(nc);
+    for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
+    if (nc == 0 || !cudaAvailable() || !cudaPhotonMapSupported(scene)) return out;
+
+    DUpload up;
+    buildUploadScene(scene, up);
+
+    // ---- forward deposit pass (count, then fill) ----
+    unsigned long long* d_depCount = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_depCount, sizeof(unsigned long long)));
+    double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
+
+    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap) {
+        CUDA_CHECK(cudaMemset(d_depCount, 0, sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
+        DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
+        cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
+        cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
+        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B);
+    };
+
+    depositLaunch(nullptr, 0);              // count-only sizing pass
+    unsigned long long nDep = 0;
+    CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+    PhotonMap pm; pm.nEmitted = N;
+    if (nDep > 0) {
+        DPhoton* d_photons = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+        depositLaunch(d_photons, nDep);     // fill pass (same seed => same nDep deposits)
+        unsigned long long nFill = 0;
+        CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        unsigned long long stored = (nFill < nDep) ? nFill : nDep;
+
+        std::vector<DPhoton> hp((size_t)stored);
+        CUDA_CHECK(cudaMemcpy(hp.data(), d_photons, (size_t)stored * sizeof(DPhoton), cudaMemcpyDeviceToHost));
+        cudaFree(d_photons);
+
+        pm.photons.resize((size_t)stored);
+        for (size_t i = 0; i < (size_t)stored; ++i) {
+            const DPhoton& d = hp[i];
+            Photon& p = pm.photons[i];
+            p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
+            p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
+            p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
+            p.power = d.power; p.lambda = d.lambda;
+        }
+    }
+    pm.build(radius);                       // host counting sort -> cell-contiguous runs
+
+    double energy[5] = {0,0,0,0,0};
+    CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
+    eOut.emitted  += energy[0]; eOut.absorbed += energy[1]; eOut.sensor += energy[2];
+    eOut.escaped  += energy[3]; eOut.residual += energy[4];
+    cudaFree(d_depCount); cudaFree(d_energy);
+
+    // ---- upload the built grid ----
+    DPhotonMap dpm{};
+    dpm.nEmitted = pm.nEmitted;
+    dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
+    dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
+    dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
+    dpm.photons = nullptr;
+    if (!pm.photons.empty()) {
+        std::vector<DPhoton> sorted(pm.photons.size());
+        for (size_t i = 0; i < pm.photons.size(); ++i) {
+            const Photon& p = pm.photons[i];
+            DPhoton& d = sorted[i];
+            d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
+            d.wi  = DVec3(p.wi.x,  p.wi.y,  p.wi.z);
+            d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
+            d.power = p.power; d.lambda = p.lambda;
+        }
+        dpm.photons = (const DPhoton*)up.keep(uploadVec(sorted));
+    }
+    // cellStart always has >= 2 entries after build() (even for an empty map, where every
+    // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
+    dpm.cellStart = (const int*)up.keep(uploadVec(pm.cellStart));
+
+    // ---- gather each camera ----
+    for (int c = 0; c < nc; ++c) {
+        DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
+        const size_t npix = (size_t)resX[c] * resY[c];
+        double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
+        double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+        const unsigned long long seed = 0xA24BAED4963EE407ULL ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1));
+        // Chunk spp so a single launch stays well under the Windows TDR watchdog even when a
+        // caustic cell holds a dense photon cluster (heavy density query).
+        long long chunk = 200000 / (long long)(npix ? npix : 1); if (chunk < 1) chunk = 1;
+        for (long long base = 0; base < spp; base += chunk) {
+            long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
+            long long total = (long long)npix * cs2;
+            kGather<<<2048, 128>>>(up.sc, dpm, hc, d_film, d_hits, total, cs2, spp, base,
+                                   resX[c], diffraction ? 1 : 0, seed);
+            cudaCheckKernel("photon-gather");
+        }
+        std::vector<double> film(npix * 3);
+        CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)
+            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+        cudaFree(d_film); cudaFree(d_hits);
+    }
+
+    freeUpload(up);
     return out;
 }

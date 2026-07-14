@@ -2471,9 +2471,14 @@ private:
     //       roll_at 0 0   roll_at 0.5 20   roll_at 1 0        # bank into the turn and back
     //       fstop_at 0 8   fstop_at 1 1.4                     # rack the aperture open
     //       focus_at 0 5   focus_at 1 1.5                     # pull focus toward the camera
-    //       closed   exposure_lock
+    //       closed                           # seamless loop (its OWN line — see note below)
+    //       exposure_lock                    # freeze frame 0's exposure across all frames
     //       film { res 900 600 }
     //   }
+    // NOTE: each value-less flag keyword (`closed`, `exposure_lock`) must be on its OWN
+    // line. A statement's value is always the next token, so `closed exposure_lock` parses
+    // as `closed` with the *value* "exposure_lock" (the grammar can't tell that apart from
+    // `material white`), silently dropping the second flag.
     bool addCameraCurve(const Block& b, Loaded& L) {
         std::string base = b.name.empty() ? ("curve" + std::to_string(L.cameras.size())) : b.name;
         CamSpec shared;

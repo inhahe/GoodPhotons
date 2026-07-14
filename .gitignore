@@ -1,6 +1,7 @@
 # Build output
 /build/
 /build_cuda/
+/build_cuda2/
 /build_het/
 /build_verify/
 /out/

@@ -69,6 +69,24 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           char camMode, unsigned long long seedBase = 0,
                                           bool wavefront = false);
 
+// True if this scene can be rendered by the GPU photon-map path (mode M). Requires the
+// same POD-bakeable materials as the forward path (cudaForwardSupported) and no
+// environment light (the device gather has no env term). Final gather and physical-lens
+// cameras are render-config properties gated by the caller, not here.
+bool cudaPhotonMapSupported(const Scene& scene);
+
+// GPU shared photon-map render (mode M): build ONE view-independent photon map on the
+// device (forward deposit pass over N photons) and gather every camera from it — the
+// device twin of the CPU shared runSharedPhotonMap. `radius` is the gather radius (== grid
+// cell size). Returns one film per camera (each at resX[c] x resY[c]), accumulated as a
+// SUM over `spp` (display divides by spp: writeFilm(film, spp)). Only the DIRECT density
+// estimate is implemented (final gather stays on the CPU). Requires cudaAvailable() &&
+// cudaPhotonMapSupported(scene) and pinhole cameras; otherwise returns empty films.
+std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
+                                            const std::vector<int>& resX, const std::vector<int>& resY,
+                                            long long N, double radius, EnergyReport& eOut,
+                                            bool diffraction, long long spp);
+
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
 // cylinder Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the

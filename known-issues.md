@@ -5,6 +5,51 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Recently fixed
 
+### Scene grammar: two value-less flag keywords can't share a line — FIXED (docs+scene) 2026-07-14
+
+`camera_curve "fly" { … closed   exposure_lock … }` silently dropped the exposure lock, so
+the gallery flythrough flickered (every frame auto-exposed independently). Cause: in the
+FTSL grammar (`ftsl.h parseValue`) a statement's value is *always* the next token — required
+for value-bearing barewords like `material white`, `look tangent`, `caps on`. So
+`closed exposure_lock` parses as key `closed` with value `"exposure_lock"`; there is no
+separate `exposure_lock` statement, `find(b,"exposure_lock")` returns null, and the lock
+never applies (`closed` still works by accident since any non-`off` value is truthy). The
+grammar genuinely can't tell `closed exposure_lock` from `material white`, so this is a
+by-design limitation, **not** a parser bug to "fix." **Resolution:** put each value-less
+flag on its own line — done in `scenes/gallery.ftsl`, and the misleading one-line example in
+the `camera_curve` doc comment (`ftsl.h`) is corrected with an explicit NOTE. The CLI
+`-exposure-lock` (global override) was always a reliable alternative. Workaround for authors:
+one flag keyword per line.
+
+### Mode `M` photon map ported to the GPU (direct density query) — ADDED 2026-07-14
+
+Mode `M` was **CPU-only** — a serious backend gap, since the shared photon map (build
+once, gather every camera) is exactly the workload a GPU wins at (e.g. a 90-frame
+flythrough). Ported the **direct density query** to CUDA (`render_cuda.cu`
+`renderPhotonMapSharedCuda`), reusing the existing pieces: the forward deposit runs on
+the **same** `kTrace`/`shadeStep` megakernel (added a `depositPhoton` branch at every
+`Diffuse`/`DiffuseTransmit` vertex, gated by a device deposit buffer — a two-pass
+count-then-fill for exact sizing), the grid build reuses the tested host
+`PhotonMap::build` (download hits → build → re-upload sorted photons + `cellStart`), and
+the gather is a new `kGather`/`dPhotonGather` kernel mirroring the CPU `photonGather`
+(specular walk, 3×3×3 grid query, per-photon-wavelength XYZ density estimate,
+cross-surface reject, emitter term, Beer–Lambert interior; no env term). Gather is
+spp-chunked to stay under the Windows TDR watchdog. Gated by `cudaPhotonMapSupported`
+(POD-bakeable materials, no env light) + pinhole cameras + no `-pmfg`; otherwise the CPU
+path runs. Host dispatch in `main.cpp runSharedPhotonMap` honors the shared
+`-exposure-lock` anchor so a flythrough doesn't flicker.
+
+**Validation** (`scenes/_gpumtest.ftsl`, dispersive-glass Cornell box, 2 mode-M cameras):
+energy conserves exactly (sum/emitted = 1.000000). CPU-vs-GPU converges *together* as
+photons rise (the signature of a correct port whose only difference is the RNG noise
+realisation): 4M/8spp → linear relRMSE 51%, Pearson 0.836; 40M/32spp → 28%, 0.954. After
+a heavy Gaussian blur to remove Monte-Carlo noise, the two radiance fields agree to
+**1.7% / 3.8% linear RMSE at Pearson 0.999** with a best-fit scale of **1.00** (no
+systematic brightness bias). The residual per-pixel error is pure caustic/light-source
+noise (bright in linear space, slow to converge). **`-pmfg` final gather and env-lit
+scenes still fall back to the CPU** — porting the final-gather sub-ray pass is future
+work. `README.md` mode-`M`/CUDA/`-device` sections updated.
+
 ### Mode `M` optional Jensen final gather (`-pmfg`) — ADDED 2026-07-14
 
 Mode `M` was a **direct** radius density query at the visible point, which inherits the
