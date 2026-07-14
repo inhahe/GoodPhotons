@@ -35,10 +35,24 @@ at the floor, pre-existing/unreported). **Fix (scene-level):** keep y as flat as
 possible ACROSS each fold and push the height change onto the straight opening
 corridor — return apex lowered from y~2.6 to ~2.2. New peaks +10.6° / -15°, worst
 frame-to-frame pitch swing ~30° → 6.5° (measured with `scraps/_cam_curve.py`, a
-faithful re-impl of the ftsl.h sampler). Commit d46cacb. **Latent general issue:**
-any tangent-look path with a fold+climb will pitch; a robust engine-side fix would
-be to low-pass the look direction or clamp per-frame pitch rate in the `look tangent`
-branch (ftsl.h ~2718-2734), or expose the 0.045 look-ahead fraction as a curve knob.
+faithful re-impl of the ftsl.h sampler). Commit d46cacb. **Engine-side fix (also
+done):** the latent general issue is now fixed in the `look tangent` branch. Root
+cause pinned down numerically: at a fold the look-ahead chord's HORIZONTAL reach
+collapses (e.g. closure frame 171: dy only -0.46 but h=0.17), so `asin(dy/L)` blows
+the pitch up to -70°. Two defences, both only touching near-fold frames (well-
+conditioned frames incl. legit steep dives keep their reach → byte-identical):
+(1) `min_reach <frac>` (default 0.5) floors the horizontal reach used for the pitch
+at `frac * lookAheadChord`; (2) `look_smooth <sigma_frames>` (default 0/off) does a
+wrap-aware Gaussian smooth of the decomposed yaw+pitch so a fold's unavoidable fast
+pan (the flight genuinely reverses direction) is spread over frames instead of
+snapping. Implemented as a pre-pass before the frame loop (ftsl.h ~2720). Validated
+A/B on the ORIGINAL unfixed control points (`scraps/_engine_fix_test.ftsl` vs
+`_engine_fix_legacy.ftsl`): legacy frame 11 rakes into a ceiling light, fixed frame
+11 is level. Numerically (`scraps/_cam_smooth_test.py`) the original -69.7° rake
+becomes a bounded ±30° near-level pan with `min_reach 0.5 look_smooth 2`. NOTE: the
+scene-level control-point fix is still the best-LOOKING result for the gallery (it
+removes the sharp reversal geometrically → jerk 6.5°); the engine fix is the general
+safety net so aggressive future paths degrade to a bounded pan instead of a rake.
 
 ### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14
 

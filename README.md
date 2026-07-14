@@ -907,8 +907,8 @@ extension), which ffmpeg concatenates into a video.
   partial sweep spans its endpoints. See `scenes/showcase_orbit.ftsl` (an orbit tuned
   to fly straight *through* a glass sphere).
 - **`camera_curve "name" { point <x y z> … [frames N] [density <ρ> | density_at <t> <ρ> …]
-  [spline uniform|centripetal|chordal|<alpha>] [look tangent | look_at <x y z> |
-  look curve + look_point <x y z> …] [closed] }`** — a
+  [spline uniform|centripetal|chordal|<alpha>] [look tangent [min_reach <f>] [look_smooth <n>] |
+  look_at <x y z> | look curve + look_point <x y z> …] [closed] }`** — a
   fly-through along a **Catmull-Rom spline** that passes through the `point` control
   points. `spline` selects the parameterization: `uniform` (α=0, the default — simple but
   can **overshoot** and swing wide between unevenly-spaced control points), `centripetal`
@@ -919,7 +919,12 @@ extension), which ffmpeg concatenates into a video.
   **density** (cameras per unit length) that can vary along the curve via `density_at`
   keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
   slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
-  `look_at`, or at a second `look curve`. **Orientation and lens can also be animated**
+  `look_at`, or at a second `look curve`. The **travel tangent is fold-robust**: where the
+  path makes a sharp horizontal U-turn its look-ahead chord loses horizontal reach and would
+  otherwise rake the view steeply up into the ceiling / down at the floor, so `min_reach <f>`
+  (default `0.5`, `0` = legacy) floors that reach for the pitch calculation and `look_smooth
+  <n>` (default `0`; a Gaussian sigma in frames) temporally smooths the look direction so a
+  fold reads as a bounded near-level pan instead of a flick. **Orientation and lens can also be animated**
   per frame over the normalized timeline `t ∈ [0,1]` (`t=0` first frame, `t=1` last),
   each keyframed by `<name>_at <t> <value>` (piecewise-linear, flat-clamped at the ends,
   just like `density_at`) or held constant by the bare keyword: **`roll[_at]`** banks the

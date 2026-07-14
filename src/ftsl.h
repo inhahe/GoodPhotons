@@ -2475,6 +2475,11 @@ private:
     // integrating rho over arc length; `frames N` (if also given) instead fixes the
     // count and only uses the density to DISTRIBUTE those N cameras. Orientation:
     //   look tangent    (default) — aim along the direction of travel
+    //       min_reach <frac>       (default 0.5) fold defence: floor the horizontal reach used
+    //                              for pitch so a hairpin/U-turn can't rake the view into the
+    //                              ceiling or floor. `0` disables (legacy behaviour).
+    //       look_smooth <n>        (default 0/off) Gaussian sigma in frames; temporally smooths
+    //                              the look direction so a fold's fast pan is spread out.
     //   look_at x y z             — a fixed target for every frame
     //   look curve + look_point.. — aim at a SECOND Catmull-Rom spline, sampled in step
     // Roll and the lens scalars can be ANIMATED per frame over the normalized timeline
@@ -2654,6 +2659,21 @@ private:
         if (lookFixed) { vec3Of(b, "look_at", fixedLook); fixedLook = P(fixedLook); }
         int lookSeg = lookCurve ? (closed ? (int)lookPts.size() : (int)lookPts.size() - 1) : 0;
 
+        // Tangent-mode robustness knobs (fold defence). The tangent look aims at a point a
+        // fixed arc-length ahead; where the path FOLDS (a U-turn / hairpin) the horizontal
+        // reach of that chord collapses toward zero, so even a small height difference gets
+        // amplified by asin(dy/L) into a steep pitch and the camera rakes up into the
+        // ceiling (or down into the floor). Two defences, both only touching frames that are
+        // actually near a fold — well-conditioned frames (incl. legitimately steep dives that
+        // keep their horizontal reach) are left byte-identical:
+        //   min_reach <frac>   floor the horizontal reach used for the PITCH at
+        //                      frac * (look-ahead chord length); default 0.5, `0` disables.
+        //   look_smooth <n>    Gaussian sigma (in frames) for temporal smoothing of the look
+        //                      direction (yaw+pitch, wrap-aware for closed loops), spreading a
+        //                      fold's unavoidable fast pan over more frames; default 0 (off).
+        double minReachFrac = dblOf(b, "min_reach",   0.5);
+        double lookSmooth   = dblOf(b, "look_smooth", 0.0);
+
         // ---- Animatable orientation + lens tracks ----------------------------------
         // Roll (bank about the view axis) and the lens scalars (fov_y, zoom, f-stop,
         // focus) can each be keyframed by `<name>_at <t> <value>` over the normalized
@@ -2702,6 +2722,67 @@ private:
         }
         const int pathGroup = (int)L.cameras.size();
 
+        // ---- Tangent look-direction pre-pass (fold-robust) -------------------------
+        // Computed ahead of the main frame loop because temporal smoothing needs the whole
+        // sequence. For look_curve / look_at modes this stays empty and the loop uses those
+        // targets directly. The min_reach floor prevents a folded chord's collapsing
+        // horizontal reach from raking the pitch into the ceiling/floor; look_smooth then
+        // spreads a fold's unavoidable fast pan over neighbouring frames.
+        std::vector<Vec3> tangentDirs;
+        if (!lookCurve && !lookFixed) {
+            const double lookAheadFrac = 0.045;                 // shared with the note above
+            const double hMin = std::max(0.0, minReachFrac) * lookAheadFrac * Smax;
+            std::vector<double> yawA((size_t)N), pitA((size_t)N);
+            for (int i = 0; i < N; ++i) {
+                double fr = closed ? ((double)i / N) : (N == 1 ? 0.5 : (double)i / (N - 1));
+                double g = invertC(fr * Cmax);
+                Vec3 eye = catmullRomAt(pts, closed, g, splineAlpha);
+                double sHere = arcAtG(g);
+                double sTgt  = sHere + lookAheadFrac * Smax;
+                double gTgt  = closed ? gAtArc(std::fmod(sTgt, Smax)) : gAtArc(std::min(sTgt, Smax));
+                Vec3 tan = catmullRomAt(pts, closed, gTgt, splineAlpha) - eye;
+                if (length(tan) <= 1e-9) {   // degenerate (end of an open curve): look forward from behind
+                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, g - (double)nSeg / (M * 4.0)), splineAlpha);
+                    tan = eye - a;
+                }
+                double h = std::sqrt(tan.x * tan.x + tan.z * tan.z);
+                yawA[(size_t)i] = std::atan2(tan.x, tan.z);          // bearing in xz
+                pitA[(size_t)i] = std::atan2(tan.y, std::max(h, hMin));   // floored-reach pitch
+            }
+            auto rebuild = [&](const std::vector<double>& yawS, const std::vector<double>& pitS) {
+                tangentDirs.resize((size_t)N);
+                for (int i = 0; i < N; ++i) {
+                    double cp = std::cos(pitS[(size_t)i]);
+                    Vec3 d{ cp * std::sin(yawS[(size_t)i]), std::sin(pitS[(size_t)i]), cp * std::cos(yawS[(size_t)i]) };
+                    tangentDirs[(size_t)i] = (length(d) > 1e-12) ? normalize(d) : Vec3{0, 0, -1};
+                }
+            };
+            if (lookSmooth > 1e-6 && N >= 3) {
+                const double PI = 3.141592653589793, TWO_PI = 6.283185307179586;
+                int r = std::max(1, (int)std::lround(3.0 * lookSmooth));
+                std::vector<double> w((size_t)(2 * r + 1));
+                for (int k = -r; k <= r; ++k)
+                    w[(size_t)(k + r)] = std::exp(-(double)(k * k) / (2.0 * lookSmooth * lookSmooth));
+                std::vector<double> yawS((size_t)N), pitS((size_t)N);
+                for (int i = 0; i < N; ++i) {
+                    double ay = 0, ap = 0, ws = 0;
+                    for (int k = -r; k <= r; ++k) {
+                        int j = i + k, jj;
+                        if (closed) jj = ((j % N) + N) % N; else jj = std::min(std::max(j, 0), N - 1);
+                        double vy = yawA[(size_t)jj];
+                        while (vy - yawA[(size_t)i] >  PI) vy -= TWO_PI;   // wrap-aware: nearest branch
+                        while (vy - yawA[(size_t)i] < -PI) vy += TWO_PI;
+                        double wk = w[(size_t)(k + r)];
+                        ay += vy * wk; ap += pitA[(size_t)jj] * wk; ws += wk;
+                    }
+                    yawS[(size_t)i] = ay / ws; pitS[(size_t)i] = ap / ws;
+                }
+                rebuild(yawS, pitS);
+            } else {
+                rebuild(yawA, pitA);
+            }
+        }
+
         int pad = 1; for (int f = N - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
         for (int i = 0; i < N; ++i) {
             // A closed loop samples i/N (frame N == frame 0, not duplicated); an open
@@ -2715,23 +2796,13 @@ private:
                 cs.look = catmullRomAt(lookPts, closed, fr * lookSeg, splineAlpha);
             } else if (lookFixed) {
                 cs.look = fixedLook;
-            } else {   // tangent: aim at a point a FIXED ARC-LENGTH ahead along the curve.
-                // A differential finite-difference tangent is hypersensitive to local
-                // spline wiggle where control points cluster (e.g. the channel-threading
-                // zigzag), so the view swings jerkily frame-to-frame. Looking at an
-                // absolute point a fair arc-distance ahead averages that wiggle out and
-                // reads as a smooth "flying down the path" motion. The look-ahead is a
-                // fraction of total arc length, so it scales with the scene.
-                double sHere = arcAtG(g);
-                double sTgt  = sHere + 0.045 * Smax;
-                double gTgt  = closed ? gAtArc(std::fmod(sTgt, Smax))   // wrap the loop
-                                      : gAtArc(std::min(sTgt, Smax));   // clamp at the end
-                Vec3 tan = catmullRomAt(pts, closed, gTgt, splineAlpha) - cs.eye;
-                if (length(tan) <= 1e-9) {   // degenerate (end of an open curve): look forward from behind
-                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, g - (double)nSeg / (M * 4.0)), splineAlpha);
-                    tan = cs.eye - a;
-                }
-                cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});
+            } else {   // tangent: aim a fixed arc-length ahead. A differential finite-difference
+                // tangent is hypersensitive to local spline wiggle where control points cluster
+                // (e.g. the channel-threading zigzag), so aiming at an absolute point a fair
+                // arc-distance ahead averages that wiggle out into a smooth "flying down the
+                // path" motion. Direction (plus the fold-robust min_reach / look_smooth
+                // treatment) is precomputed in tangentDirs above.
+                cs.look = cs.eye + tangentDirs[(size_t)i];
             }
             // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.
             // cs starts as `shared`, so restore its aperture before re-deriving in case a
