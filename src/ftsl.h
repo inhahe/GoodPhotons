@@ -2547,15 +2547,16 @@ private:
         // yields uniform arc-length spacing.
         int nSeg = closed ? (int)pts.size() : (int)pts.size() - 1;
         int M = std::max(64, 64 * nSeg);
-        std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1);
+        std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1), sampS((size_t)M + 1);
         Vec3 prev = catmullRomAt(pts, closed, 0.0);
-        sampG[0] = 0.0; sampC[0] = 0.0;
+        sampG[0] = 0.0; sampC[0] = 0.0; sampS[0] = 0.0;
         for (int k = 1; k <= M; ++k) {
             double g = nSeg * (double)k / M;
             Vec3 pcur = catmullRomAt(pts, closed, g);
             double ds = length(pcur - prev);
             double rho = densityAt(g / nSeg);
             sampC[k] = sampC[k - 1] + rho * ds;
+            sampS[k] = sampS[k - 1] + ds;      // pure arc length (density-free), for look-ahead
             sampG[k] = g;
             prev = pcur;
         }
@@ -2571,6 +2572,26 @@ private:
             while (lo + 1 < hi) { int mid = (lo + hi) / 2; (sampC[(size_t)mid] <= target ? lo : hi) = mid; }
             double c0 = sampC[(size_t)lo], c1 = sampC[(size_t)lo + 1];
             double f = (c1 > c0) ? (target - c0) / (c1 - c0) : 0.0;
+            return sampG[(size_t)lo] + (sampG[(size_t)lo + 1] - sampG[(size_t)lo]) * f;
+        };
+
+        // Pure arc-length reparameterization (density-free) for the tangent look-ahead.
+        double Smax = sampS[M];
+        auto arcAtG = [&](double g) -> double {          // g -> arc length s
+            if (g <= 0.0) return 0.0;
+            if (g >= (double)nSeg) return Smax;
+            double kf = g / (double)nSeg * (double)M;     // sampG is linear in k
+            int lo = (int)kf; if (lo < 0) lo = 0; if (lo > M - 1) lo = M - 1;
+            double f = kf - lo;
+            return sampS[(size_t)lo] + (sampS[(size_t)lo + 1] - sampS[(size_t)lo]) * f;
+        };
+        auto gAtArc = [&](double s) -> double {          // arc length s -> g
+            if (s <= 0.0) return 0.0;
+            if (s >= Smax) return (double)nSeg;
+            int lo = 0, hi = M;
+            while (lo + 1 < hi) { int mid = (lo + hi) / 2; (sampS[(size_t)mid] <= s ? lo : hi) = mid; }
+            double s0 = sampS[(size_t)lo], s1 = sampS[(size_t)lo + 1];
+            double f = (s1 > s0) ? (s - s0) / (s1 - s0) : 0.0;
             return sampG[(size_t)lo] + (sampG[(size_t)lo + 1] - sampG[(size_t)lo]) * f;
         };
 
@@ -2652,11 +2673,22 @@ private:
                 cs.look = catmullRomAt(lookPts, closed, fr * lookSeg);
             } else if (lookFixed) {
                 cs.look = fixedLook;
-            } else {   // tangent: aim one finite-difference step ahead along the curve
-                double dg = (double)nSeg / (M * 4.0);
-                Vec3 a = catmullRomAt(pts, closed, g - dg);
-                Vec3 c = catmullRomAt(pts, closed, g + dg);
-                Vec3 tan = c - a;
+            } else {   // tangent: aim at a point a FIXED ARC-LENGTH ahead along the curve.
+                // A differential finite-difference tangent is hypersensitive to local
+                // spline wiggle where control points cluster (e.g. the channel-threading
+                // zigzag), so the view swings jerkily frame-to-frame. Looking at an
+                // absolute point a fair arc-distance ahead averages that wiggle out and
+                // reads as a smooth "flying down the path" motion. The look-ahead is a
+                // fraction of total arc length, so it scales with the scene.
+                double sHere = arcAtG(g);
+                double sTgt  = sHere + 0.045 * Smax;
+                double gTgt  = closed ? gAtArc(std::fmod(sTgt, Smax))   // wrap the loop
+                                      : gAtArc(std::min(sTgt, Smax));   // clamp at the end
+                Vec3 tan = catmullRomAt(pts, closed, gTgt) - cs.eye;
+                if (length(tan) <= 1e-9) {   // degenerate (end of an open curve): look forward from behind
+                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, g - (double)nSeg / (M * 4.0)));
+                    tan = cs.eye - a;
+                }
                 cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});
             }
             // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.

@@ -29,6 +29,10 @@ material "silver"  { preset silver }
 material "chrome"  { preset chrome }
 material "brass"   { preset brass }
 material "glass"   { type dielectric ior glass:BK7 }
+# Hero fly-through orb: dense flint (SF10, n~1.73 @ 589 nm, Abbe ~28 -> strong
+# dispersion). Higher IOR than BK7 tightens the refractive focus and the extra
+# dispersion splays the caustic into a coloured fan -- the "obvious caustic" lever.
+material "heroglass" { type dielectric ior glass:SF10 }
 material "diamond" { preset diamond }
 material "morpho"  { preset morpho }
 material "oil"     { preset oil-slick }
@@ -111,7 +115,7 @@ sphere { center 7.1 1.35 8.6   radius 0.45   material diamond }
 # through its centre on the way to the gyroid channel, so we get an inside-the-glass
 # refraction beat before the lattice tunnel. On its own tall plinth (top y=0.80).
 isosurface { material stone  box { center 4.35 0.40 9.5   size 0.9 0.8 0.9   round 0.03 } }
-sphere { center 4.35 1.35 9.5   radius 0.55   material glass }
+sphere { center 4.35 1.35 9.5   radius 0.55   material heroglass }
 
 # =========================  MID ROW (z ~ 5.4), flanking the hero  ==============
 # Copper torus stood upright on its plinth (top 1.0), silver metaballs on the other.
@@ -204,6 +208,14 @@ light area { origin 7.6 4.0  2.0   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd b
 light area { origin 0.7 4.0  2.6   u 0.6 0 0   v 0 0 0.7   normal 0 -1 0   spd blackbody 8500 }  # cool accent
 light sphere { center 1.9 1.35 7.7   radius 0.10   spd blackbody 2500 }   # warm, behind glass
 light sphere { center 7.1 1.35 7.7   radius 0.10   spd blackbody 9000 }   # cool, behind diamond
+# CAUSTIC BULB: a compact near-point source directly above the hero orb. A SMALL
+# source is essential for a SHARP caustic -- the broad ceiling area lights each throw
+# a shifted caustic that averages into a smooth glow, washing them out; one tight bulb
+# throws a single crisp, coloured focus. Refracted down through the SF10 orb (paraxial
+# focus ~0.6 below centre, n~1.73) it pools a bright caustic on the plinth top / floor
+# right where the fly path approaches and dives through the orb. Neutral white so the
+# flint's dispersion shows as rainbow fringing.
+light sphere { center 4.35 3.45 9.70   radius 0.06   spd blackbody 6000 }   # caustic focuser
 
 # --- Atmosphere: a faint hall haze. Participating media is BUILT IN (Henyey-Greenstein
 # phase + delta/ratio tracking), so this thin homogeneous fog gives the whole hall aerial
