@@ -5325,6 +5325,13 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
 
     PhotonMap pm; pm.nEmitted = N;
+    // Staging-chunk size for the host<->device photon copies below. Streaming the
+    // deposits in blocks (instead of one giant transfer) means the host never holds a
+    // second full DPhoton mirror of the map alongside pm.photons -- at high photon
+    // counts (tens of millions emitted, each depositing at several bounces) those two
+    // full copies together would exhaust host RAM (std::bad_alloc). A 4M-photon block
+    // is ~176 MB, negligible next to the map itself.
+    const size_t PM_CHUNK = 4u << 20;
     if (nDep > 0) {
         DPhoton* d_photons = nullptr;
         CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
@@ -5333,19 +5340,24 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         unsigned long long stored = (nFill < nDep) ? nFill : nDep;
 
-        std::vector<DPhoton> hp((size_t)stored);
-        CUDA_CHECK(cudaMemcpy(hp.data(), d_photons, (size_t)stored * sizeof(DPhoton), cudaMemcpyDeviceToHost));
-        cudaFree(d_photons);
-
+        // Download + convert to Photon in chunks (never a full host-side DPhoton copy).
         pm.photons.resize((size_t)stored);
-        for (size_t i = 0; i < (size_t)stored; ++i) {
-            const DPhoton& d = hp[i];
-            Photon& p = pm.photons[i];
-            p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
-            p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
-            p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
-            p.power = d.power; p.lambda = d.lambda;
+        std::vector<DPhoton> stage;
+        for (size_t off = 0; off < (size_t)stored; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, (size_t)stored - off);
+            stage.resize(cnt);
+            CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton),
+                                  cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < cnt; ++i) {
+                const DPhoton& d = stage[i];
+                Photon& p = pm.photons[off + i];
+                p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
+                p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
+                p.power = d.power; p.lambda = d.lambda;
+            }
         }
+        cudaFree(d_photons);
     }
     pm.build(radius);                       // host counting sort -> cell-contiguous runs
 
@@ -5363,16 +5375,26 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
     dpm.photons = nullptr;
     if (!pm.photons.empty()) {
-        std::vector<DPhoton> sorted(pm.photons.size());
-        for (size_t i = 0; i < pm.photons.size(); ++i) {
-            const Photon& p = pm.photons[i];
-            DPhoton& d = sorted[i];
-            d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
-            d.wi  = DVec3(p.wi.x,  p.wi.y,  p.wi.z);
-            d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
-            d.power = p.power; d.lambda = p.lambda;
+        // Upload the sorted map host->device in chunks (no full DPhoton mirror).
+        size_t n = pm.photons.size();
+        DPhoton* d_sorted = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DPhoton)));
+        std::vector<DPhoton> stage;
+        for (size_t off = 0; off < n; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, n - off);
+            stage.resize(cnt);
+            for (size_t i = 0; i < cnt; ++i) {
+                const Photon& p = pm.photons[off + i];
+                DPhoton& d = stage[i];
+                d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
+                d.wi  = DVec3(p.wi.x,  p.wi.y,  p.wi.z);
+                d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
+                d.power = p.power; d.lambda = p.lambda;
+            }
+            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DPhoton),
+                                  cudaMemcpyHostToDevice));
         }
-        dpm.photons = (const DPhoton*)up.keep(uploadVec(sorted));
+        dpm.photons = (const DPhoton*)up.keep(d_sorted);
     }
     // cellStart always has >= 2 entries after build() (even for an empty map, where every
     // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
