@@ -83,14 +83,16 @@
 //                  Ctrl-C finishes the current batch/chunk, writes a final image, and
 //                  exits cleanly (a second Ctrl-C force-quits). For A/B/C it implies the
 //                  checkpoint, so a later -resume picks up where you stopped.
-//   -resume        (forward A/B/C only) reload the accumulated film from the "<out>.ftbuf"
-//                  checkpoint and keep adding photons (with -n/-time/-forever).
-//   -checkpoint    (forward A/B/C only) on a plain -n render, also write the checkpoint so
-//                  a later -resume can continue it (-time/-forever/-resume imply it). Each
+//   -resume        (modes A/B/C, R/D, P) reload the accumulated film from the "<out>.ftbuf"
+//                  checkpoint and keep adding samples (with -n/-spp/-time/-forever).
+//   -checkpoint    (modes A/B/C, R/D, P) on a plain -n/-spp render, also write the checkpoint
+//                  so a later -resume can continue it (-time/-forever/-resume imply it). Each
 //                  batch/resume draws an independent RNG stream (seed offset = cumulative
-//                  photons), so the result matches a single render of the combined count; a
-//                  fresh -n render (offset 0) is bit-identical to the historical path. (R/D
-//                  are not disk-resumable yet — their chunks accumulate only in memory.)
+//                  photons for A/B/C, cumulative spp for R/D/P), so the result matches a single
+//                  render of the combined count; a fresh render (offset 0) is bit-identical to
+//                  the historical path. R/D store a SUM-over-spp film + spp count; P stores a
+//                  dual forward+backward film (magic FTPCM02). M/S/U keep persistent per-pass
+//                  state that a film alone can't restore, so they are not disk-resumable.
 //   -preview       during a progress render, redraw a live ANSI colour thumbnail of the
 //                  current image in the terminal at each periodic update (in place).
 //   -window        open a real OS window (Win32 GDI on Windows; no-op elsewhere) that shows
@@ -1009,6 +1011,14 @@ static int g_previewRows = 0;   // terminal lines the last preview occupied (for
 static double g_pmRadiusAbs = 0.0;
 static double g_pmRadiusFactor = 0.02;
 
+// Mode-M final gather (CLI -pmfg <K>). 0 = off: read the density estimate directly at the
+// visible point (fast, but the estimate's blur softens contact shadows / fine detail right
+// at that surface). K > 0 = Jensen final gather: shoot K cosine-weighted hemisphere
+// sub-rays from the visible point and query the map ONE bounce away, decoupling visible-
+// surface sharpness from the gather radius (sharper contact shadows, at ~K x the cost, so
+// pair with fewer spp). See photonmap_render.h (photonGatherSub).
+static int g_pmFinalGather = 0;
+
 // SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
 // faster radius shrink (less bias sooner, more variance); 0.7 is the paper default. The
 // initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls above.
@@ -1327,97 +1337,83 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
 // NOTE: fluorescence is unsupported here (the backward tracer can't reradiate) —
 // same caveat as modes R/V. Classification uses the pixel-centre camera ray, so
 // silhouette pixels are assigned wholesale to one side (a sub-pixel edge approx).
-static Film renderComposite(const Scene& scene, const Camera& cam, int resX, int resY,
-                            long long N, long long spp, int nThreads, bool diffraction = true,
-                            bool useGpu = false, bool wavefront = false) {
-    EnergyReport e;
-    // Both layers can run on the GPU: the forward (model-B) layer via renderForward's
-    // useGpu path, and the camera-side backward layer via the mode-R backward megakernel
-    // (renderBackwardCuda) when the scene is within its v1 scope (no fog/env/spot/
-    // collimated/fluorescence). Outside that scope the backward layer falls back to CPU,
-    // so useGpu still accelerates at least the forward half.
-    Film fwd = renderForward(scene, &cam, resX, resY, N, nThreads,
-                             /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e,
-                             diffraction, useGpu, /*seedBase*/0, wavefront);
-    Film ref;
-#ifdef HAVE_CUDA
-    if (useGpu && cudaBackwardSupported(scene, cam))
-        ref = renderBackwardCuda(scene, cam, resX, resY, spp, diffraction);
-    else
-        ref = renderBackward(scene, cam, resX, resY, spp, nThreads, diffraction);
-#else
-    ref = renderBackward(scene, cam, resX, resY, spp, nThreads, diffraction);
-#endif
-    const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
-
-    // Classify each pixel by its first camera-ray hit into three exclusive classes:
-    //   SPEC (specular-first surface) -> camera-side (backward) layer,
-    //   SKY  (camera ray escapes an env scene) -> directly-viewed environment,
-    //   DIFF (everything else) -> forward (model-B) layer.
-    // Only DIFF pixels feed the forward->backward scale fit: SPEC pixels are black in
-    // the forward film (the SDS gap the camera-side layer fills), and SKY pixels are
-    // measured by the env radiance directly, not by forward photon transport — the
-    // forward film is ~0 there while the backward film has the full bright sky, so
-    // including them would drag the best-fit s toward 0 (this is exactly why mode V
-    // adds the sky to `fwd` before its compareFilms fit).
+// Per-pixel first-hit classification for the mode-P composite (view-dependent, so it is
+// computed ONCE and reused across every progressive pass). Each pixel is DIFF (forward
+// model-B layer), SPEC (camera-side backward layer fills the SDS specular gap), or SKY
+// (directly-viewed environment). `skyXYZ` holds the env radiance per SKY pixel.
+struct CompositeClass {
     enum { DIFF = 0, SPEC = 1, SKY = 2 };
-    std::vector<char> cls((size_t)resX * resY, DIFF);
-    std::vector<Vec3> skyXYZ;                 // env radiance per SKY pixel (display units)
-    if (scene.envIndex >= 0) skyXYZ.assign(cls.size(), {});
+    std::vector<char> cls;
+    std::vector<Vec3> skyXYZ;   // populated only for env scenes
     long long nSpec = 0, nSky = 0;
+};
+
+static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
+                                        int resX, int resY) {
+    CompositeClass cc;
+    cc.cls.assign((size_t)resX * resY, CompositeClass::DIFF);
+    if (scene.envIndex >= 0) cc.skyXYZ.assign(cc.cls.size(), {});
     for (int py = 0; py < resY; ++py)
         for (int px = 0; px < resX; ++px) {
             size_t i = (size_t)py * resX + px;
             Ray r = cam.genRay(px, py, 0.5, 0.5);
             Hit h = scene.closestHit(r);
             if (!h.valid) {
-                if (scene.envIndex >= 0) { cls[i] = SKY; skyXYZ[i] = scene.envXYZForDir(r.d); ++nSky; }
+                if (scene.envIndex >= 0) {
+                    cc.cls[i] = CompositeClass::SKY;
+                    cc.skyXYZ[i] = scene.envXYZForDir(r.d); ++cc.nSky;
+                }
                 // (no env => leave as DIFF; the forward film is legitimately black there)
             } else if (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type)) {
-                cls[i] = SPEC; ++nSpec;
+                cc.cls[i] = CompositeClass::SPEC; ++cc.nSpec;
             }
         }
+    return cc;
+}
+
+// Composite the accumulated forward (SUM over N photons) and backward (SUM over spp)
+// films into one true-radiance image using the fixed classification `cc`. Fits the
+// forward->backward scale s over the DIFF pixels, then blends: forward F/(N*s) on DIFF,
+// backward R/spp on SPEC, env radiance on SKY. Result is in writeFilm(...,1.0) units.
+// When `verbose` prints the scale/residual diagnostics (once, at the final write).
+static Film compositeFromFilms(const Film& fwd, long long N, const Film& ref, long long spp,
+                               const CompositeClass& cc, bool envScene, bool verbose) {
+    using CC = CompositeClass;
+    const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
+    const auto& cls = cc.cls;
 
     // Best-fit forward->backward scale over the DIFF pixels only: Fval ~ s*Rval,
     // so s = sum(Fval.Rval)/sum(Rval.Rval) (same convention as compareFilms).
     double sfr = 0, srr = 0;
     for (size_t i = 0; i < cls.size(); ++i) {
-        if (cls[i] != DIFF) continue;
+        if (cls[i] != CC::DIFF) continue;
         Vec3 f = fwd.xyz[i] * invF, rv = ref.xyz[i] * invR;
         sfr += dot(f, rv); srr += dot(rv, rv);
     }
     double s = (srr > 0) ? sfr / srr : 1.0;
     if (s <= 0) s = 1.0;
 
-    // Diffuse-side residual after calibration: forward/s should match the backward
-    // radiance on exactly the pixels that feed the fit. A small relative RMSE
-    // confirms the two halves live on one consistent radiance scale (no transport
-    // bug); a large/structured one would flag that the composite seam is real.
     double num = 0, den = 0;
     for (size_t i = 0; i < cls.size(); ++i) {
-        if (cls[i] != DIFF) continue;
+        if (cls[i] != CC::DIFF) continue;
         Vec3 fr = fwd.xyz[i] * (invF / s), rv = ref.xyz[i] * invR;
         Vec3 dd = fr - rv;
         num += dot(dd, dd); den += dot(fr, fr);
     }
     double rmse = (den > 0) ? std::sqrt(num / den) : 0.0;
 
-    // Composite in radiance-display units: writeFilm(comp, 1.0) divides only by
-    // cieYIntegral, so store forward as F/(N*s), backward as R/spp, and the directly-
-    // viewed sky as its env XYZ (envXYZForDir already lands in these units — identical
-    // to mode B's post-norm background and the backward ray-miss term). The
-    // true-radiance We fix makes s~1, so all three layers share one radiance scale.
-    Film comp; comp.resX = resX; comp.resY = resY; comp.alloc();
+    Film comp; comp.resX = fwd.resX; comp.resY = fwd.resY; comp.alloc();
     for (size_t i = 0; i < cls.size(); ++i)
-        comp.xyz[i] = (cls[i] == SPEC) ? ref.xyz[i] * invR
-                    : (cls[i] == SKY)  ? skyXYZ[i]
-                                       : fwd.xyz[i] * (invF / s);
-
-    std::printf("[composite] forward->radiance scale s=%.6g  specular-first pixels=%lld/%lld\n",
-                s, nSpec, (long long)cls.size());
-    if (scene.envIndex >= 0)
-        std::printf("[composite] env background on %lld escaped (sky) pixels\n", nSky);
-    std::printf("[composite] diffuse-side residual (forward/s vs backward) rel RMSE=%.4f\n", rmse);
+        comp.xyz[i] = (cls[i] == CC::SPEC) ? ref.xyz[i] * invR
+                    : (cls[i] == CC::SKY)  ? cc.skyXYZ[i]
+                                           : fwd.xyz[i] * (invF / s);
+    if (verbose) {
+        std::printf("[composite] forward->radiance scale s=%.6g  specular-first pixels=%lld/%lld\n",
+                    s, cc.nSpec, (long long)cls.size());
+        if (envScene)
+            std::printf("[composite] env background on %lld escaped (sky) pixels\n", cc.nSky);
+        std::printf("[composite] diffuse-side residual (forward/s vs backward) rel RMSE=%.4f\n", rmse);
+    }
     return comp;
 }
 
@@ -1587,6 +1583,76 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     return true;
 }
 
+// --- Mode-P composite checkpoint (dual-film .ftbuf sidecar) --------------------
+// Mode P blends TWO accumulators — a forward SUM film (over N photons) and a backward
+// SUM film (over spp) — so its resumable sidecar stores both, plus their two counts.
+// The per-pixel classification is view-dependent and cheap, so it is recomputed on
+// resume rather than serialized. Magic "FTPCM02\n" distinguishes it from the single-film
+// "FTBUF01\n" format so a stale/mismatched sidecar can never be misread.
+struct CompositeCheckpoint {
+    Film fwd;                 // SUM over N photons (forward model-B layer)
+    Film ref;                 // SUM over spp (backward camera-side layer)
+    long long N = 0;          // cumulative forward photons in `fwd`
+    long long spp = 0;        // cumulative backward samples in `ref`
+    EnergyReport energy;      // cumulative forward energy tally
+};
+
+static bool writeCompositeCheckpoint(const std::string& outPath, const CompositeCheckpoint& c,
+                                     uint64_t guard) {
+    std::ofstream o(checkpointPath(outPath), std::ios::binary);
+    if (!o) return false;
+    const char magic[8] = {'F','T','P','C','M','0','2','\n'};
+    int32_t rx = c.fwd.resX, ry = c.fwd.resY;
+    o.write(magic, 8);
+    o.write((const char*)&rx, 4); o.write((const char*)&ry, 4);
+    o.write((const char*)&c.N, 8); o.write((const char*)&c.spp, 8);
+    double en[5] = {c.energy.emitted, c.energy.absorbed, c.energy.sensor,
+                    c.energy.escaped, c.energy.residual};
+    o.write((const char*)en, sizeof en);
+    o.write((const char*)&guard, 8);
+    o.write((const char*)c.fwd.xyz.data(), c.fwd.xyz.size() * sizeof(Vec3));
+    o.write((const char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
+    o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
+    o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+    return (bool)o;
+}
+
+static bool readCompositeCheckpoint(const std::string& outPath, int res, int resY,
+                                    uint64_t guard, CompositeCheckpoint& c) {
+    std::ifstream in(checkpointPath(outPath), std::ios::binary);
+    if (!in) return false;
+    char magic[8];
+    in.read(magic, 8);
+    if (!in || std::memcmp(magic, "FTPCM02\n", 8) != 0) {
+        std::fprintf(stderr, "[resume] %s is not a recognised composite checkpoint; ignoring\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    int32_t rx = 0, ry = 0; long long N = 0, spp = 0;
+    in.read((char*)&rx, 4); in.read((char*)&ry, 4);
+    in.read((char*)&N, 8); in.read((char*)&spp, 8);
+    double en[5] = {0,0,0,0,0}; in.read((char*)en, sizeof en);
+    uint64_t g = 0; in.read((char*)&g, 8);
+    if (!in) return false;
+    if (rx != res || ry != resY || g != guard) {
+        std::fprintf(stderr, "[resume] composite checkpoint %s does not match this render "
+                             "(scene/resolution differ); starting fresh\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    c.fwd.resX = rx; c.fwd.resY = ry; c.fwd.alloc();
+    c.ref.resX = rx; c.ref.resY = ry; c.ref.alloc();
+    c.N = N; c.spp = spp;
+    c.energy = {en[0], en[1], en[2], en[3], en[4]};
+    in.read((char*)c.fwd.xyz.data(), c.fwd.xyz.size() * sizeof(Vec3));
+    in.read((char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
+    in.read((char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
+    in.read((char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+    if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
+                            checkpointPath(outPath).c_str()); return false; }
+    return true;
+}
+
 // --- Standalone artifact -> PNG conversion (`-topng`) --------------------------
 // Turn an existing render artifact into a 24-bit PNG without re-rendering, so the
 // ppm/ outputs and *.ftbuf resume checkpoints can be shared as PNGs with the same
@@ -1743,12 +1809,15 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
                          const std::function<Film(long long, unsigned long long)>& renderOne) {
     if (!prog || !prog->report) return renderOne(sppTarget, 0);
     using clk = std::chrono::steady_clock;
+    // On resume the loaded film already holds `sampleBase` spp; bias the fresh seeds past
+    // it so the continued samples are an independent realization (see SppProgress).
+    const unsigned long long seedBias = (unsigned long long)prog->sampleBase;
     Film acc; acc.resX = resX; acc.resY = resY; acc.alloc();
     long long done = 0, chunk = 1;
     while (done < sppTarget) {
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
-        Film f = renderOne(c, (unsigned long long)(done + 1));
+        Film f = renderOne(c, seedBias + (unsigned long long)(done + 1));
         acc.merge(f);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
@@ -1779,7 +1848,10 @@ static int runSppProgressive(
         double manualExposure, double* exposureAnchor, bool absolute,
         double timeBudgetSec, double noiseTarget, bool runForever,
         double intervalSec, bool preview,
-        const std::function<Film(long long, const SppProgress*)>& renderChunked) {
+        const std::function<Film(long long, const SppProgress*)>& renderChunked,
+        int res = 0, int resY = 0,
+        bool resume = false, bool wantCheckpoint = false,
+        uint64_t guard = 0, char mode = '?') {
     using clk = std::chrono::steady_clock;
     // A time/noise/forever budget renders "until the budget", so open the spp target to a
     // large-but-safe cap (keeps pixel*sppTotal seed indices well inside int64). A plain
@@ -1788,6 +1860,20 @@ static int runSppProgressive(
     const bool budgeted = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever);
     const long long sppTarget = budgeted ? UNBOUNDED_SPP : sppReq;
     if (intervalSec <= 0.0) intervalSec = 15.0;
+
+    // --- disk resume (mode R / D): reload a saved SUM film + spp count from the .ftbuf
+    // sidecar and keep adding samples on top. The freshly-traced samples are biased past
+    // the loaded ones (prog.sampleBase) so they form an independent realization; the
+    // display/checkpoint always uses the COMBINED film (base + fresh) and the COMBINED
+    // spp, so brightness is constant and only graininess falls (exactly like A/B/C).
+    Checkpoint base;
+    long long baseSpp = 0;
+    if (resume && readCheckpoint(outPath, res, resY, guard, mode, base)) {
+        baseSpp = base.N;
+        std::printf("[resume] loaded %s: %lld spp accumulated so far\n",
+                    checkpointPath(outPath).c_str(), baseSpp);
+    }
+    const bool haveBase = baseSpp > 0 && base.film.resX == res && base.film.resY == resY;
 
     if (preview) { enableAnsiTerminal(); g_previewRows = 0; }
     // Trap Ctrl-C (and Windows Ctrl-Break) so a long render stops cleanly with the
@@ -1804,42 +1890,54 @@ static int runSppProgressive(
     long long finalSpp = 0;
 
     SppProgress prog;
+    prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
     prog.report = [&](const Film& film, long long sppDone, bool final) -> bool {
-        finalSpp = sppDone;
+        long long totalSpp = baseSpp + sppDone;
+        finalSpp = totalSpp;
         double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
         double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
-        // Every pixel receives exactly sppDone samples, so the Monte-Carlo relative error
+        // Every pixel receives exactly totalSpp samples, so the Monte-Carlo relative error
         // ~ 1/sqrt(samples) gives an honest graininess ballpark straight from the count.
-        double noisePct = sppDone > 0 ? 100.0 / std::sqrt((double)sppDone) : 0.0;
+        double noisePct = totalSpp > 0 ? 100.0 / std::sqrt((double)totalSpp) : 0.0;
         bool stopped  = g_stopRequested != 0;
         bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
-        bool noiseMet = (noiseTarget > 0.0 && sppDone > 0 && noisePct <= noiseTarget);
+        bool noiseMet = (noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
         bool stop = stopped || timeUp || noiseMet;
         bool done = stop || final;
         if (done || sinceSave >= intervalSec) {
+            // Combine the loaded base film (if resuming) with the fresh SUM before display.
+            const Film* shown = &film;
+            Film combined;
+            if (haveBase) { combined = film; combined.merge(base.film); shown = &combined; }
             // The converged/stopping frame owns the exposure anchor; intermediate frames
             // auto-expose independently (they only refine, never lock the anchor).
-            writeOk = writeFilm(outPath.c_str(), film, (double)sppDone, manualExposure,
+            writeOk = writeFilm(outPath.c_str(), *shown, (double)totalSpp, manualExposure,
                                 /*quiet*/preview, done ? exposureAnchor : nullptr, absolute);
+            if (wantCheckpoint) {
+                Checkpoint save; save.film = *shown; save.N = totalSpp;
+                if (!writeCheckpoint(outPath, save, guard, mode))
+                    std::fprintf(stderr, "[checkpoint] could not write %s\n",
+                                 checkpointPath(outPath).c_str());
+            }
             lastSave = clk::now();
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
                 std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, ~%.2f%% noise%s",
-                              elapsed, sppDone, noisePct, why);
+                              elapsed, totalSpp, noisePct, why);
             else if (timeBudgetSec > 0.0)
                 std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, ~%.2f%% noise%s",
-                              elapsed, timeBudgetSec, sppDone, noisePct, why);
+                              elapsed, timeBudgetSec, totalSpp, noisePct, why);
             else if (noiseTarget > 0.0)
                 std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, ~%.2f%% noise%s",
-                              noiseTarget, elapsed, sppDone, noisePct, why);
+                              noiseTarget, elapsed, totalSpp, noisePct, why);
             else
                 std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, ~%.2f%% noise",
-                              sppDone, sppReq, elapsed, noisePct);
-            if (preview) ansiPreview(film, (double)sppDone, manualExposure, st);
+                              totalSpp, baseSpp + sppReq, elapsed, noisePct);
+            if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
-            liveWindowUpdate(film, (double)sppDone, manualExposure, absolute);
+            liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute);
         }
         return stop;
     };
@@ -1855,6 +1953,168 @@ static int runSppProgressive(
     else if (metNoise)
         std::printf("[noise] reached the ~%.2g%% target at %lld spp — image saved.\n",
                     noiseTarget, finalSpp);
+    if (wantCheckpoint)
+        std::printf("[checkpoint] %s holds %lld spp — rerun with -resume to add more\n",
+                    checkpointPath(outPath).c_str(), finalSpp);
+    return writeOk ? 0 : 1;
+}
+
+// Progressive driver for mode P (forward + camera-side composite). Grows BOTH the forward
+// SUM film (over photons, seedBase = cumulative photons) and the backward SUM film (over
+// spp, decorrelated per batch) in lockstep at the requested N:spp ratio, re-compositing
+// and rewriting the image every `intervalSec` so the render is watchable and crash-safe —
+// the same live-progress + .ftbuf resume the forward camera models A/B/C already have,
+// but over the composite's two accumulators (dual-film sidecar). Handles -time / -noise /
+// -forever budgets, a fixed N/spp target, Ctrl-C, -window / -preview, and -resume.
+static int runCompositeProgressive(
+        const Scene& scene, const Camera& cam, int res, int resY,
+        long long N, long long spp, int nThreads, bool diffraction, bool useGpu, bool wavefront,
+        const std::string& outPath, double manualExposure, double* exposureAnchor,
+        double timeBudgetSec, double noiseTarget, bool runForever, double intervalSec,
+        bool preview, bool resume, bool wantCheckpoint, uint64_t guard) {
+    using clk = std::chrono::steady_clock;
+    if (intervalSec <= 0.0) intervalSec = 15.0;
+    const bool absolute = scene.absolute;
+    const bool envScene = scene.envIndex >= 0;
+    const bool budgeted = timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+    // Photons traced per backward sample-per-pixel, so the two halves grow at the ratio the
+    // user requested (N photons alongside spp samples). Defaults keep both halves nonzero.
+    const long long Nreq   = (N   > 0) ? N   : 2'000'000;
+    const long long sppReq = (spp > 0) ? spp : 64;
+    const double perSpp = (double)Nreq / (double)sppReq;
+#ifdef HAVE_CUDA
+    const bool gpuBackward = useGpu && cudaBackwardSupported(scene, cam);
+#else
+    const bool gpuBackward = false;
+#endif
+
+    // View-dependent first-hit classification: computed once, reused every pass.
+    CompositeClass cc = classifyComposite(scene, cam, res, resY);
+
+    CompositeCheckpoint acc;
+    acc.fwd.resX = res; acc.fwd.resY = resY; acc.fwd.alloc();
+    acc.ref.resX = res; acc.ref.resY = resY; acc.ref.alloc();
+    if (resume && readCompositeCheckpoint(outPath, res, resY, guard, acc))
+        std::printf("[resume] loaded %s: %lld photons + %lld spp accumulated so far\n",
+                    checkpointPath(outPath).c_str(), acc.N, acc.spp);
+
+    std::printf("mode P: forward+camera-side composite, target %lld photons / %lld spp "
+                "at %dx%d on %s (light=%s)%s ...\n",
+                Nreq, sppReq, res, resY,
+                useGpu ? "GPU" : (std::to_string(nThreads) + " threads").c_str(),
+                scene.envIndex >= 0 ? "env" : "lit",
+                (resume && (acc.N > 0 || acc.spp > 0)) ? " [resuming]" : "");
+
+    if (preview) { enableAnsiTerminal(); g_previewRows = 0; }
+    auto prev = std::signal(SIGINT, onInterrupt);
+#ifdef SIGBREAK
+    auto prevBrk = std::signal(SIGBREAK, onInterrupt);
+#endif
+
+    const auto t0 = clk::now();
+    auto lastSave = t0;
+    bool writeOk = true;
+    bool metNoise = false;
+    long long batchSpp = 1;   // adapts toward ~0.5 s of combined work per iteration
+
+    auto writeOut = [&](bool done) {
+        Film comp = compositeFromFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref,
+                                       std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done);
+        writeOk = writeFilm(outPath.c_str(), comp, 1.0, manualExposure, /*quiet*/preview,
+                            done ? exposureAnchor : nullptr, absolute);
+        if (wantCheckpoint && !writeCompositeCheckpoint(outPath, acc, guard))
+            std::fprintf(stderr, "[checkpoint] could not write %s\n",
+                         checkpointPath(outPath).c_str());
+        return comp;
+    };
+
+    for (;;) {
+        long long dSpp = batchSpp;
+        long long dN   = std::max(1LL, (long long)std::llround((double)batchSpp * perSpp));
+        if (!budgeted) {                              // cap each half to its remaining budget
+            long long remSpp = sppReq - acc.spp; if (remSpp < 0) remSpp = 0;
+            long long remN   = Nreq   - acc.N;   if (remN   < 0) remN   = 0;
+            dSpp = std::min(dSpp, remSpp);
+            dN   = std::min(dN,   remN);
+            if (dSpp == 0 && dN == 0) { writeOut(/*done*/true); break; }  // both budgets met
+        }
+        auto tb = clk::now();
+        if (dN > 0) {   // forward model-B layer (seedBase = cumulative photons, like A/B/C)
+            EnergyReport e;
+            Film f = renderForward(scene, &cam, res, resY, dN, nThreads,
+                                   /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true,
+                                   e, diffraction, useGpu, (uint64_t)acc.N, wavefront);
+            acc.fwd.merge(f); acc.N += dN;
+            acc.energy.emitted += e.emitted; acc.energy.absorbed += e.absorbed;
+            acc.energy.sensor  += e.sensor;  acc.energy.escaped  += e.escaped;
+            acc.energy.residual += e.residual;
+        }
+        if (dSpp > 0) {  // backward camera-side layer, decorrelated per batch by acc.spp
+            Film r;
+#ifdef HAVE_CUDA
+            if (gpuBackward) {
+                SppProgress bp; bp.sampleBase = acc.spp;   // mixes into the device seed
+                bp.report = [](const Film&, long long, bool) { return false; };
+                r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp);
+            } else
+#endif
+                r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
+                                   (uint64_t)acc.spp + 1);
+            acc.ref.merge(r); acc.spp += dSpp;
+        }
+        // Adapt the batch toward ~0.5 s so early frames appear fast and overhead stays low.
+        double dt = std::chrono::duration<double>(clk::now() - tb).count();
+        if (dt > 1e-4) {
+            long long next = (long long)((double)batchSpp * (0.5 / dt));
+            if (next < 1) next = 1;
+            if (next > batchSpp * 8 + 1) next = batchSpp * 8 + 1;
+            batchSpp = next;
+        }
+
+        double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+        double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
+        double noisePct  = acc.spp > 0 ? 100.0 / std::sqrt((double)acc.spp) : 0.0;
+        bool stopped  = g_stopRequested != 0;
+        bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
+        bool noiseMet = (noiseTarget > 0.0 && acc.spp > 0 && noisePct <= noiseTarget);
+        if (noiseMet) metNoise = true;
+        bool done = stopped || timeUp || noiseMet;
+        bool wantStatus = sinceSave >= intervalSec;
+        if (done || wantStatus) {
+            Film comp = writeOut(done);
+            lastSave = clk::now();
+            const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
+            char st[220];
+            if (runForever)
+                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              elapsed, acc.N, acc.spp, noisePct, why);
+            else if (timeBudgetSec > 0.0)
+                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              elapsed, timeBudgetSec, acc.N, acc.spp, noisePct, why);
+            else if (noiseTarget > 0.0)
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld photons / %lld spp, ~%.2f%% noise%s",
+                              noiseTarget, elapsed, acc.N, acc.spp, noisePct, why);
+            else
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld spp (%lld / %lld photons), %.1fs, ~%.2f%% noise",
+                              acc.spp, sppReq, acc.N, Nreq, elapsed, noisePct);
+            if (preview) ansiPreview(comp, 1.0, manualExposure, st);
+            else { std::printf("%s\n", st); std::fflush(stdout); }
+            liveWindowUpdate(comp, 1.0, manualExposure, absolute);
+        }
+        if (done) break;
+    }
+
+    std::signal(SIGINT, prev);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, prevBrk);
+#endif
+    if (g_stopRequested)
+        std::printf("\n[stop] interrupted at %lld photons / %lld spp — image saved.\n", acc.N, acc.spp);
+    else if (metNoise)
+        std::printf("[noise] reached the ~%.2g%% target at %lld spp — image saved.\n", noiseTarget, acc.spp);
+    if (wantCheckpoint)
+        std::printf("[checkpoint] %s holds %lld photons / %lld spp — rerun with -resume to add more\n",
+                    checkpointPath(outPath).c_str(), acc.N, acc.spp);
     return writeOk ? 0 : 1;
 }
 
@@ -1881,19 +2141,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // -time / -noise / -forever now drive progress for the spp image modes too (R
     // backward reference, D bidirectional): those accumulate a SUM-over-samples film in
     // chunks, so a wall-clock/noise/indefinite budget just keeps adding samples exactly
-    // like the forward camera models. -resume / -checkpoint, however, still apply only to
-    // the forward models A/B/C (their photon-count checkpoint format); the spp modes are
-    // not resumable from disk yet, so keep those gated with a warning.
-    if ((resume || wantCheckpointFlag) && !(mode == 'A' || mode == 'B' || mode == 'C')) {
-        std::fprintf(stderr, "[render] -resume/-checkpoint apply only to forward camera modes "
-                             "A/B/C; ignoring for mode %c\n", mode);
+    // like the forward camera models. -resume / -checkpoint apply to the forward models
+    // A/B/C (photon-count checkpoint), the SUM-over-spp reference modes R and D
+    // (spp-count checkpoint — the .ftbuf stores the SUM film + spp; resume adds decorrelated
+    // samples on top), and the composite mode P (dual-film checkpoint — forward SUM + backward
+    // SUM). The persistent-state modes M/S/U (photon-map / SPPM / VCM) can't be
+    // resumed from a film alone, so keep those gated with a warning.
+    if ((resume || wantCheckpointFlag) &&
+        !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' || mode == 'P')) {
+        std::fprintf(stderr, "[render] -resume/-checkpoint apply only to modes A/B/C "
+                             "(forward), R/D (reference), and P (composite); ignoring for mode %c\n", mode);
         resume = false; wantCheckpointFlag = false;
     }
     if ((timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) &&
         !(mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D' ||
-          mode == 'M' || mode == 'S' || mode == 'U')) {
+          mode == 'P' || mode == 'M' || mode == 'S' || mode == 'U')) {
         std::fprintf(stderr, "[render] -time/-noise/-forever apply only to modes A/B/C (forward), "
-                             "R/D (reference/BDPT), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
+                             "R/D (reference/BDPT), P (composite), and M/S/U (photon map / SPPM / VCM); ignoring for mode %c\n", mode);
         timeBudgetSec = 0.0; noiseTarget = 0.0; runForever = false;
     }
     if (intervalSec <= 0.0) intervalSec = 15.0;
@@ -2057,9 +2321,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     return renderBackward(scene, cam, res, resY, c, nThreads, diffraction, off);
                 });
         };
+        // Disk resume/checkpoint (like A/B/C): a budgeted or -checkpoint render writes a
+        // resumable .ftbuf sidecar; -resume continues it. The film is a SUM over spp.
+        const bool ckpt = resume || wantCheckpointFlag ||
+                          timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked);
+                                 renderChunked, res, resY, resume, ckpt,
+                                 checkpointGuard(scene, mode, res, resY), mode);
     }
 
     // --- Validation (mode V) ---
@@ -2112,9 +2381,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth, diffraction, off);
                 });
         };
+        // Disk resume/checkpoint (like A/B/C): a budgeted or -checkpoint render writes a
+        // resumable .ftbuf sidecar; -resume continues it. The film is a SUM over spp.
+        const bool ckpt = resume || wantCheckpointFlag ||
+                          timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked);
+                                 renderChunked, res, resY, resume, ckpt,
+                                 checkpointGuard(scene, mode, res, resY), mode);
     }
 
     // --- Photon-mapped final gather (mode M) — ROADMAP item 1 ---------------------
@@ -2130,6 +2404,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode M: photon map — tracing %lld photons on %d CPU threads "
                     "(light=%s), gather radius %.4g ...\n",
                     N, nThreads, lightLabel, radius);
+        if (g_pmFinalGather > 0)
+            std::printf("mode M: final gather ON — %d hemisphere sub-rays/sample "
+                        "(density query one bounce away)\n", g_pmFinalGather);
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm);
@@ -2145,12 +2422,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off);
+                                              diffraction, /*maxBounce*/32, off, g_pmFinalGather);
                 });
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked);
+                                 renderChunked, res, resY);
     }
 
     // --- Stochastic progressive photon mapping (mode S) — ROADMAP item 2 ----------
@@ -2181,7 +2458,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked);
+                                 renderChunked, res, resY);
     }
 
     // --- Vertex Connection and Merging (mode U) — ROADMAP item 3 ------------------
@@ -2222,16 +2499,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                 renderChunked);
+                                 renderChunked, res, resY);
     }
 
     // --- Forward + camera-side composite (mode P) ---
+    // Progressive: alternates forward (model-B) and backward (camera-side) batches into
+    // two persistent SUM films, recompositing + writing periodically. A budgeted or
+    // -checkpoint render writes a resumable dual-film .ftbuf sidecar (magic FTPCM02);
+    // -resume continues both halves, decorrelating fresh samples from the loaded ones.
     if (mode == 'P') {
-        std::printf("mode P: forward+camera-side composite, %lld photons / %lld spp "
-                    "at %dx%d on %d threads (light=%s) ...\n",
-                    N, spp, res, resY, nThreads, lightLabel);
-        Film comp = renderComposite(scene, cam, res, resY, N, spp, nThreads, diffraction, useGpu, wavefront);
-        return writeFilm(outPath.c_str(), comp, 1.0, manualExposure, false, exposureAnchor, scene.absolute) ? 0 : 1;
+        const bool ckpt = resume || wantCheckpointFlag ||
+                          timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+        return runCompositeProgressive(scene, cam, res, resY, N, spp, nThreads, diffraction,
+                                       useGpu, wavefront, outPath, manualExposure, exposureAnchor,
+                                       timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
+                                       resume, ckpt, checkpointGuard(scene, mode, res, resY));
     }
 
     // --- Forward camera models A/B/C ---------------------------------------
@@ -2511,6 +2793,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
@@ -2951,8 +3234,9 @@ static int run(int argc, char** argv) {
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
         std::printf("[camera] shared photon map (mode M): %zu cameras, %lld photons, "
-                    "radius %.4g on %d CPU threads (light=%s) ...\n",
-                    idx.size(), N, radius, nThreads, lightLabel);
+                    "radius %.4g on %d CPU threads (light=%s)%s ...\n",
+                    idx.size(), N, radius, nThreads, lightLabel,
+                    g_pmFinalGather > 0 ? " [final gather]" : "");
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm);
@@ -2967,7 +3251,7 @@ static int run(int argc, char** argv) {
         for (size_t k = 0; k < idx.size(); ++k) {
             const RenderCam& rc = toRender[idx[k]];
             Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
-                                        nThreads, diffraction, /*maxBounce*/32, 0);
+                                        nThreads, diffraction, /*maxBounce*/32, 0, g_pmFinalGather);
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)
                 std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",

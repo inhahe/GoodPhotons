@@ -1,4 +1,10 @@
-Create a bunch of interesting isosurphase functions - not necessarily spherical, not necessarily symmetrical - and render them using the fastest renderer, all in one large image in a grid view, then let me select which ones to put in our hero fly-by, and also tell make an isosurface-to-mesh converter so i can import them into Unreal - it can be a feature of Good Photons if you wants but I don't know if that would serve anything. have a variable for how fine to make the mesh. and ideally, the tesselation would be adaptive to how much detail/change/curvaturue is in each particular area of the isosurface.
+okay, now, let's generate our hero image, the one with the gold gyroid in it (i don't know what the scene file is called), and also generate our hero video (this scene has a larger room with more things in it, including the gold gyroid), using the camera array curve, make enough cameras  for 30fps for a few  seconds, make the curve join back onto itself so the video can be a seamlessly looping gif, and make the array run right through a glass sphere and through the gyroid but not going right through any solid part, just through the empty spaces. for the video one, in order to get many cameras efficiently in one render including transparency, we need to use photon mapping or  whatever other means of storing photons we have
+^ doing
+
+Generate all the isosurfaces you just downloaded. If you want, you can generated them with Pov-Ray to make them clearer faster.
+^ doing
+
+You said that there was one remaining POV-Ray isosurface function not ported because it required a full POV-Ray feature, what is that feature, and how could it affect isosurfaces?
 
 eventually, have Fable 5 (can use it with my subscription, just reaches limits faster) look over the code for the tightest loops and try to optimize them.
 

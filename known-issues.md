@@ -5,6 +5,32 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Recently fixed
 
+### Mode `M` optional Jensen final gather (`-pmfg`) — ADDED 2026-07-14
+
+Mode `M` was a **direct** radius density query at the visible point, which inherits the
+density estimate's low-frequency blur *at that surface* (softening contact shadows / fine
+detail at large gather radii). Added an optional true **final gather** (`-pmfg <K>`,
+`g_pmFinalGather`): at the first diffuse hit it shoots `K` cosine-weighted hemisphere
+sub-rays (`photonGatherSub` in `photonmap_render.h`), traces one bounce each, and queries
+the map at *those* points — so the blur now lives one bounce away, decoupling the visible-
+surface sharpness from the gather radius. **Direct** lighting at the visible point is done
+with low-variance next-event estimation (`BackwardRenderer::neeLight`) instead of relying
+on gather rays randomly striking the light; the gather rays therefore collect indirect
+(+ env + specular-direct via a `specularSeen` gate) only, so there is no double-count. The
+cosine/pdf and Lambertian `1/pi` cancel to `rho(x)`, folded per-photon at the gather hit
+(spectrally, at each photon's wavelength) so two-bounce colour bleed stays correct.
+`K = 0` (default) keeps the original direct query — a pure superset. Validated on the
+diffuse Cornell box: direct query reproduces the prior numbers (M/R=0.989, relRMSE 4.7%,
+r=0.998) and final gather matches mode `R` in energy (diffuse-mask M/R=1.010). The point
+of the feature shows up at a large gather radius (`-pmradius 0.06`), in the darkest 10% of
+the reference (contact shadows / corner creases): the direct query suffers the classic
+photon-map **boundary/corner-darkening bias** (the `1/(pi r^2)` normalisation overshoots
+where the gather disc runs off the surface or into shadow) reading **M/R=0.929**, while
+final gather is essentially unbiased at **M/R=0.994** (see `scraps/_shadow_bias.py`). Cost
+~`K`× per sample, so pair with fewer `-spp`. `DiffuseTransmit`/`Fluorescent` visible points
+fall back to the direct query. `README.md` mode-`M` description + CLI table updated. (A
+secondary-hemisphere final gather is what this file previously listed as future work.)
+
 ### GPU forward camera-splat out-of-bounds write (illegal memory access) — FIXED 2026-07-12
 
 The GPU forward/light-tracing kernel (modes A/B/C, and the splat in M/S/U) could
@@ -26,34 +52,114 @@ See `render_cuda.cu` ~line 555/577/624.
 
 ## Open bugs
 
-### `light cylinder` emits no illumination (tube is visible but lights nothing) — 2026-07-11
-
-A `light cylinder` renders as visible glowing emissive geometry (the tessellated
-lateral wall shows up when a camera ray hits it directly), but it does **not
-illuminate any other surface** — neither via next-event estimation nor via BSDF
-bounce. Reproduced with an isolation scene (`scraps/cyl_test.ftsl`): a white
-diffuse wall lit *only* by a `light cylinder` renders pure black behind the visibly-
-glowing tube, on **both** `-device cpu` and `-device gpu` (identical auto-exposure
-1.54e-14, i.e. zero contribution from the light). Contrast: `light sphere` and
-`light area` both illuminate correctly.
-
-- **Where:** `ftsl.h` `addLight` cylinder branch (~line 1496) calls
-  `L.scene.addCylinderLight(...)`, so the light is registered for sampling. The bug
-  is downstream in the light-sampling / direct-lighting path (`scene.h` /
-  `render.h` / `render_cuda.cu`) — the cylinder light is likely missing from (or
-  mis-weighted in) the NEE light-sampling switch, and its emissive tris are probably
-  excluded from BSDF-hit emission accounting (to avoid double counting) so both
-  contributions vanish.
-- **Repro:** `ftrace -in scraps/cyl_test.ftsl -mode R -device cpu -spp 128 -r 200 -o png/cyl_test.png` → wall is black.
-- **Proper fix:** ensure `sampleLight`/`lightPdf` (CPU and GPU) handle the cylinder
-  light type and return correct radiance+pdf, and/or let BSDF rays that hit the
-  cylinder's emissive tris contribute their emission with proper MIS. Then re-test
-  with `scraps/cyl_test.ftsl` (wall should light up).
-- **Workaround in scenes:** use `light sphere` (rings/stacks) or `light area` for
-  tube-like emitters until fixed. `scenes/mirror_selfie.ftsl` uses sphere-light
-  accents + colored walls for this reason.
+_(none currently open — see Resolved for the former `light cylinder` entry, which
+turned out to be a misdiagnosis.)_
 
 ## Tech debt
+
+### `-export-mesh` QEM decimation is pathologically slow on huge/self-intersecting meshes — 2026-07-13
+`isomesh::decimateAdaptive` (QEM edge-collapse) is fine at small/medium counts but effectively
+hangs on multi-million-triangle inputs. Meshing the Klein bottle `a=1.2 b=0.6 c=3.0 d=12.7`
+at `-mesh-res 224` produces ~2.19 M tris (the neck self-intersects, so there's a lot of
+interior surface); `-mesh-adaptive -mesh-decimate 0.18` on it ran for minutes with flat memory
+(~469 MB) and made no visible progress before it was killed. Workaround for now: march at a
+lower `-mesh-res` (e.g. 128 → ~716 k tris) to get a lighter mesh directly instead of decimating
+a huge one. Proper fix: profile the collapse loop — likely the priority-queue / cost-update or
+the link-condition neighbour scan is super-linear on high-valence, self-touching vertices; add
+a progress log and a spatial cap, or switch to a vertex-clustering pre-pass before QEM.
+
+### POV-Ray pattern/pigment/spline internal functions not ported — 2026-07-13
+`src/pov_functions.h` (generated by `tools/pov_functions_gen.py` from POV-Ray's
+`source/vm/fnintern.cpp`) now ports **78 of POV-Ray's ~79 internal isosurface functions**
+as exact formulas, shared by the CPU (`pattern.h`/`patternEval`) and GPU
+(`render_cuda.cu`/`dPatternEval`).
+
+**DONE — Perlin noise ported (2026-07-13):** `f_noise3d` (76), `f_noise_generator` (78),
+`f_hetero_mf` (29), `f_ridge` (58), `f_ridged_mf` (59) are now supported. `src/pov_noise.h`
+(generated by `tools/pov_noise_gen.py`) is an exact host+device port of POV's `Noise()`:
+its three init tables (`hashTable[8192]`, gradient `RTable`, and the Perlin
+`NoisePermutation`/`NoiseGradients` lattice) are re-derived by replicating POV's
+deterministic 32-bit-LCG init procedures and baked in as constant data, so the CPU and GPU
+evaluate byte-identical noise with no runtime init. All three generators are supported
+(1=Original, 2=RangeCorrected [default], 3=Perlin). Device storage uses `__device__`
+globals (via `#ifdef __CUDA_ARCH__`) so the ~130 KB of tables sidestep the 64 KB
+constant-memory limit. Validated visually: `sqrt(x²+z²)-1 + 0.5*f_noise3d(3x,3y,3z)`
+renders a coherent Perlin-lumped cylinder identical in character to POV's f_noise3d.
+
+**Still not ported** (the `EXCLUDE` set in the generator): `f_pattern` (77) — plus the
+S-table `f_pigment`/`f_transform`/`f_spline`. These reference a whole
+`TPATTERN`/`PIGMENT`/`TRANSFORM`/`Spline` object via `private_data`; they are
+function-*wrappers* around POV's texturing engine, not standalone math. Out of scope until
+(if ever) that engine is ported. Parser rejects any unported name as an "unknown
+identifier", so scenes fail loudly rather than silently.
+
+### Isosurface `contained_by` is box-only — add a sphere/curved container — 2026-07-13 — DONE 2026-07-13
+**DONE:** `contained_by { sphere { center <x y z>  radius r } }` is now accepted (`ftsl.h`
+`addIsosurface`), storing `Container::Sphere` + world `sphereCenter`/`sphereRadius` on the
+`Implicit` (box stays the default). `intersectImplicit` (`implicit.h`) and the device twin
+(`render_cuda.cu`) clip the ray against the actual container (sphere → quadratic; box →
+face-tracking slab) and carry the container's outward normals for cap shading. The AABB
+`im.bounds` is still the BVH-leaf/broad bound (set to the sphere's AABB for sphere
+containers). Validated on `f_enneper`/`f_klein_bottle` (rounded clip vs box facets) — see
+`scraps/gen_container_test.py` → `png/iso_container_grid.png`.
+
+**What:** an isosurface's `contained_by { min <x y z>  max <x y z> }` is the *only*
+container shape we support — an axis-aligned box (see `ftsl.h` `addIsosurface`
+~line 1545; the 8 corners are transformed to world and reduced to an AABB stored as
+`im.bounds`). POV-Ray also lets the container be a `sphere` (and in fact any shape).
+**Why it matters:** for a surface that reaches the container wall (any *unbounded*
+surface like `f_enneper`, or a solid lump that pokes out), a box clips it along **flat
+planes**, so the cut reads as hard angular facets. A **sphere** container clips along a
+smooth curved boundary, so the unavoidable cut looks like a natural rounded edge instead
+of a sawn plane — this is why hand-tuned POV enneper/klein renders frame cleanly and ours
+show flat patches. It's container ergonomics, not a math gap: both engines must clip an
+infinite surface *somewhere*; the sphere just hides the seam.
+**Where / proper fix:** `ftsl.h` `addIsosurface` — accept `contained_by { sphere {
+center <x y z> radius r } }` (keep `min`/`max` box as the default). Store the container
+shape on the `Implicit` (currently just `im.bounds`, an AABB used to clip the ray in
+`implicit.h intersectImplicit` ~line 246). The ray-clip step must then intersect the ray
+with the actual container (sphere slab → quadratic) rather than the AABB, and the CUDA
+mirror (`render_cuda.cu` `dIntersectImplicit`) needs the same. AABB stays as the BVH-leaf
+bound regardless.
+
+### Isosurface container has no cap/`open` control (and no proper cap at all) — 2026-07-13 — DONE 2026-07-13
+**DONE:** `intersectImplicit` (CPU `implicit.h` + device `render_cuda.cu`) now caps the
+container. In the **default capped** mode a ray that enters the container already inside
+the solid (`f < 0` at the near clip) registers a hit on the container's near face (a NEAR
+cap); a ray that reaches the container exit still inside the solid registers a hit on the
+far face (a FAR cap, only when the far clip is the container itself, so bounce/transmission/
+shadow rays originating inside the solid seal correctly). Both use the container's outward
+normal and the isosurface material. The **`open`** keyword on the `isosurface {}` block
+(`ftsl.h`, default `capped = true` for expr fields) suppresses both caps, revealing the
+cut edge. Fully-bounded surfaces (`f > 0` at entry) never trigger a cap, so SDF/CSG leaves
+are byte-identical. Validated: `f_enneper`/`f_klein_bottle` render as cleanly sealed solids
+by default and open shells with `open`.
+
+**What:** where an isosurface's solid interior (`f < 0`) is sliced by the container wall,
+we render **neither** a clean sealed cap **nor** a clean open edge. `intersectImplicit`
+(`implicit.h` ~line 245) clips the ray to the container and reports the first field
+*sign change* inside it; it never treats the container faces as geometry. So a solid cut
+by the box returns the next interior crossing (its back/inner wall) or passes straight
+through — reading as odd flat interior patches or see-through holes.
+**Background (what a "cap" is):** convention is `f < 0` = solid inside, `f > 0` = outside.
+When the container plane cuts through solid material you must choose: **capped/"closed"**
+(POV default) draws that slice as a flat face of the object's material, sealing the solid
+flush with the wall (looks cleanly sawn off); **`open`** (POV keyword) omits the wall so
+the surface just ends and you see into/through the interior. Only matters for surfaces
+that actually *reach* the container (`f_enneper`, the klein bottle's outer shell); a fully
+bounded surface never touches the wall so the choice is moot.
+**Why it matters:** without a real capped mode, box-cut solids can't be shown as clean
+solids; without an `open` option, thin-shell / hollow looks aren't authorable. Today's
+behavior is effectively a broken third option.
+**Where / proper fix:** in `intersectImplicit` (CPU) and `dIntersectImplicit`
+(`render_cuda.cu`), detect the case where the ray enters the container already inside the
+solid (`f < 0` at the near clip `t0`, or exits the far clip `t1` still `f < 0`) and, in the
+**default capped** mode, register a hit on the container face itself (position = clip
+point, normal = the container's inward face normal, material = the isosurface material).
+Add an `open` toggle to the `isosurface {}` block (`ftsl.h`) that suppresses these caps
+(current behavior). Pairs naturally with the sphere-container item above (a sphere cap is
+a spherical patch with the sphere's radial normal). Validate on `f_enneper` (should read
+as a cleanly-capped solid by default, an open shell with `open`).
 
 ### glTF/GLB loader is a static-geometry subset — 2026-07-12
 The new glTF 2.0 loader (`src/gltf.h` + `src/third_party/json.h`) covers the common
@@ -80,7 +186,7 @@ follow-up, not a bug:
 The core path (buffers/GLB, node transforms, POSITION/NORMAL/TEXCOORD_0, indexed +
 non-indexed tris, metallic-roughness → BSDF) is validated on CPU and GPU.
 
-### Instancing memory saving is CPU-only (GPU expands instances) — 2026-07-12
+### Instancing memory saving is CPU-only (GPU expands instances) — 2026-07-12 — DONE 2026-07-13
 `mesh_asset`/`mesh_instance` (§5c) give a true two-level BVH on the CPU: instances share
 one BLAS (triangles + BVH), so N copies cost N affines. **The GPU has no two-level
 traversal** — `buildUploadScene` (`render_cuda.cu`) EXPANDS every instance into
@@ -92,6 +198,25 @@ node/tri/primIdx pools + an instance table (toLocal affine + blasId + matOverrid
 an instance-leaf branch to the device `traverseClosest`/`traverseAny` that transforms the
 ray into BLAS space (parametric `t` is preserved, exactly as on the CPU). Deferred because
 it touches the hottest device kernel; the expand-at-upload path is correct and low-risk.
+
+**RESOLVED 2026-07-13 — device two-level BVH.** `render_cuda.cu` now mirrors the CPU.
+`Scene::bvh` (TLAS) is uploaded **verbatim** in all cases; its prim-index layout
+`[tris | spheres | implicits | instances]` is understood by the device leaf dispatch in
+both `closestHit` and `occluded` (a prim index `>= nTris+nSph+nImplicits` is an instance
+leaf). New device structs `DBlas { nodeOff, triOff, primOff }` and `DInstance { Lm[9],
+Lt[3] (world→local affine), Nm[9] ((toWorld)⁻ᵀ normal matrix, host-precomputed), blasId,
+matOverride }`. Each `Blas` contributes its local-space tris/BVH-nodes/primIdx to three
+**concatenated shared pools** (`blasTris`/`blasNodes`/`blasPrim`) uploaded ONCE, and a
+`DInstance` places it via an affine — so N copies cost one `DInstance` each, not N× tris.
+Device `blasClosest`/`blasOccluded` walk the shared sub-BVH in BLAS-local space (48-deep
+local stack); `affPoint`/`affDir` transform the ray (dir NOT renormalized, so local `t` ==
+world `t`, matching the host `Blas`); `instanceHitToWorld` maps the hit back (normal by
+`Nm`, shading normal re-oriented, matOverride applied). Validated with
+`scraps/instance_test.ftsl` (4 tori sharing one 16 384-tri BLAS, incl. a material override
+and a mirror): GPU mode B matches CPU backward reference mode R at Pearson r=0.996 (MAE
+~1/255; residual is the forward-vs-backward mirror-highlight difference). Implicit scenes
+still render correctly (the leaf-dispatch bounds change is a no-op with no instances).
+Device geometry memory is now flat in instance count.
 
 ### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
 On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes
@@ -320,24 +445,61 @@ fallback.
 with proper mean-free-path blurring) is still not implemented — this material is a thin
 diffuse-transmission approximation, not volumetric SSS.
 
-### Mode `P` composite is not progressive; `R`/`D` have no disk resume — 2026-07-12
-The progress/budget unification (`-time`/`-noise`/`-forever`/`-preview`/`-interval`) now
-covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` backward,
-`D` BDPT) on both CPU and GPU. Two gaps remain:
-- **Mode `P` (composite) is still single-shot.** `renderComposite` (`main.cpp` ~line 1246)
-  couples a forward pass (`N` photons) and a backward pass (`spp`) with a **best-fit scale
-  `s`** solved once over the diffuse-side pixels, then classifies pixels and blends. Making
-  it progressive means chunking *both* passes, re-fitting `s` and recomputing the residual
-  each chunk (pixel classification is fixed and can be cached), and reporting the blended
-  frame — doable but a real design task, deferred. `-time`/etc. are currently rejected for
-  mode `P` with a warning.
-- **`R`/`D` accumulate chunks in memory only.** They get live progress and can stop on a
-  budget, but there's no `.ftbuf` disk checkpoint, so `-resume`/`-checkpoint` stay
-  forward-mode-only. A resumable spp film would need an spp-count checkpoint format
-  (the forward one stores a photon count) — proper fix is a small variant of
-  `writeCheckpoint`/`readCheckpoint` keyed on spp.
-
 ## Resolved
+
+### Mode `P` composite is not progressive; `R`/`D` have no disk resume — DONE 2026-07-13
+Both gaps closed. `-time`/`-noise`/`-forever`/`-preview`/`-interval` and `-resume`/
+`-checkpoint` now cover **all** the accumulating image modes — the forward camera models
+`A`/`B`/`C`, the spp reference modes `R` (backward) / `D` (BDPT), and the composite `P`.
+- **Mode `P` is now progressive** (`runCompositeProgressive`, `main.cpp` ~line 1986). The
+  view-dependent first-hit pixel classification is computed **once** (`classifyComposite`)
+  and reused; the driver then alternates forward (model-B, `N` photons) and backward
+  (camera-side, `spp`) batches into two persistent SUM films, adapting the batch toward
+  ~0.5 s so early frames appear fast. After each batch it re-fits the forward→backward
+  scale `s` and re-blends (`compositeFromFilms`), writing the image + a status line every
+  `-interval`. The old single-shot `renderComposite` wrapper was deleted.
+- **`R`/`D` now disk-resume** through `runSppProgressive`, reusing the single-film
+  `Checkpoint`/`writeCheckpoint`/`readCheckpoint` format keyed on **spp** (the mode byte is
+  folded into the identity guard so an `R` checkpoint can't be loaded as `D`, verified).
+- **Mode `P` gets a dual-film checkpoint** (`CompositeCheckpoint`, magic `FTPCM02`) storing
+  the forward SUM + backward SUM + their counts + the forward energy tally.
+- **Seed decorrelation on resume:** fresh samples are biased past the loaded ones via
+  `SppProgress::sampleBase` (CPU: added to the per-chunk seed; GPU: XORed into the megakernel
+  seed base) so continued samples are an independent noise realization. Validated: `R`
+  58 196→116 545 spp with noise tracking 100/√spp exactly (0.41 %→0.29 %); `D`
+  1016→2052 spp (3.14 %→2.21 %); `P` 36.2 M photons/4636 spp→56.5 M/7228 spp with the
+  diffuse-side residual falling 0.0281→0.0226 — proving the resumed samples reduce variance
+  rather than re-tracing identical paths.
+
+### `light cylinder` "emits no illumination" — NOT A BUG (misdiagnosis) — RESOLVED 2026-07-13
+The original 2026-07-11 report claimed a `light cylinder` glows but lights nothing on
+both CPU and GPU, citing an "auto-exposure 1.54e-14, i.e. zero contribution." That
+inference was wrong on two counts, and re-testing shows the cylinder light works
+correctly on **both** backends.
+- **A ~1e-14 auto-exposure is normal here, not "zero light."** This renderer uses
+  physically-scaled blackbody SPDs whose absolute radiance is ~1e13 W/m²/sr, so the
+  content-based auto-exposure lands around 1e-14 for *any* such scene — the stock
+  Cornell box (`-scene cornell`) reports `auto-exposure=8.87e-14`.
+- **The isolation scene had no explicit `power`**, so `absPower` was a no-op and the
+  emitter surface kept the raw (astronomically bright) blackbody radiance. A directly-
+  visible emitter that bright dominates the auto-exposure anchor and crushes the
+  genuinely-lit wall to near-black in the tonemap. **A `light sphere` in the identical
+  no-`power` isolation scene behaves the same way** — so it was never cylinder-specific.
+- **Controlled proof.** In absolute mode (each light given an explicit `power`, so a
+  fixed sensor gain is used instead of content-based auto-exposure), a cylinder and a
+  sphere light of equal power illuminate the wall essentially identically: at `power 30`
+  wall-region mean ≈ 1.32 (cyl) vs 1.11 (sph); at `power 4000`, 21.33 (cyl) vs 19.65
+  (sph). GPU forward (mode B) matches the CPU backward (mode R): wall mean 21.60 vs
+  21.33. The `neeLight`/`neeVolume` switches in `backward.h` already dispatch the
+  Cylinder shape (`sampleCylinderVisible` for the un-capped front-facing arc; uniform
+  `samplePoint` for capped capsules), and forward photon emission selects it via the
+  power CDF — all correct.
+- **Repro (now shows a properly lit wall):** `scraps/cyl_test.ftsl` was updated to give
+  the tube `power 4000`; `ftrace -in scraps/cyl_test.ftsl -mode R -device cpu -spp 128
+  -o png/cyl_test.png` shows the wall lit with correct falloff around the tube.
+- **Lesson for the tracker:** don't read a tiny auto-exposure as "black"; verify with
+  absolute-`power` lighting or by measuring HDR/PNG pixels of a receiver away from the
+  directly-visible emitter.
 
 ### Unified live progress across all image modes (`R`/`D` join `A`/`B`/`C`) — DONE 2026-07-12
 - **What:** modes `R` (backward reference) and `D` (BDPT) previously ran as a single
@@ -509,6 +671,14 @@ covers the forward camera models (`A`/`B`/`C`) *and* the spp image modes (`R` ba
   Decimation was introducing **non-manifold edges**; fixed with a **link-condition** test
   (collapse only when the endpoints' common neighbours are exactly the shared-face opposites)
   plus foldover rejection.
+- **Container-aware caps (2026-07-13):** the mesher originally *always* box-capped at
+  `im.bounds` (the AABB), ignoring the isosurface's `contained_by` shape and `open` flag — a
+  sphere-container isosurface would mesh with flat AABB caps that bulge toward the box corners
+  instead of a clean spherical cut. `marchImplicit` now switches the cap SDF on `im.container`
+  (`Container::Sphere` → `sphereSDF(center,radius)`, else box), so the mesh boundary matches
+  what the ray tracer / `klein_explorer.html` show. When the isosurface is `open`
+  (`im.capped == false`) the field is left un-sealed (`augEval = im.eval`), so the surface's own
+  cut edge stays an open rim rather than being force-capped. `src/isomesh.h` ~line 84.
 - **Verification:** heart (genus-0) exports at V−E+F=2, 0 boundary, 0 non-manifold — uniform
   *and* adaptive (keep 30%). Gyroid TPMS shell → Euler −34 (genus-18), csg_mech → −4 (genus-3),
   metaballs → 2, all with 0 boundary + 0 non-manifold edges (Euler correctly tracks genus).

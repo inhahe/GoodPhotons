@@ -106,7 +106,7 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then final-gathers the camera image from it (reusable across cameras) | CPU |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
@@ -173,16 +173,24 @@ paths they can capture at all**.
   fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
 - **`M` — photon map (view-independent, reusable).** Traces a forward photon pass
   **once** and stores every diffuse deposit in a **view-independent photon map** (a
-  uniform hash grid), then forms the camera image by a backward final gather: each
-  camera ray walks through specular surfaces until it lands on a diffuse one, where a
-  radius density estimate over nearby photons gives the radiance. Because the map is
-  independent of the camera, it can be **built once and reused across every frame of a
-  flythrough** (or every camera of a multi-camera render) — the cost of the photon
-  pass amortizes over all views. *Cost:* the density estimate **blurs sharp contact
-  shadows** at large gather radii (bias controlled by `-pmradius` / `-pmradiusfrac`),
-  and directly-viewed emitters carry a little chromatic speckle at low spp. Best when
-  many cameras share one lighting solution. CPU only. (Matches the forward splat
-  modes `A`/`B`/`C` — same forward physics, just measured from a stored map.)
+  uniform hash grid), then forms the camera image by a backward camera pass. By default
+  it uses a **direct density query**: each camera ray walks through specular surfaces
+  until it lands on a diffuse one, where a radius density estimate over the nearby
+  photons gives the radiance directly at that surface. Optionally, `-pmfg <K>` switches
+  to a **Jensen final gather**: at the first diffuse hit it shoots `K` cosine-weighted
+  hemisphere sub-rays, traces one bounce each, and queries the map at *those* points —
+  so the density estimate's blur lives one bounce away instead of on the visible surface
+  (direct light at the visible point is recovered by gather rays that strike an emitter
+  directly). Because the map is independent of the camera, it can be **built once and
+  reused across every frame of a flythrough** (or every camera of a multi-camera render)
+  — the cost of the photon pass amortizes over all views. *Cost:* with the direct query
+  the density estimate **blurs sharp contact shadows** at large gather radii (bias
+  controlled by `-pmradius` / `-pmradiusfrac`); final gather (`-pmfg`) keeps those
+  contact shadows and fine detail **sharp** while still smoothing indirect light, at
+  roughly `K`× the per-sample cost (so pair it with fewer `-spp`). Directly-viewed
+  emitters carry a little chromatic speckle at low spp. Best when many cameras share one
+  lighting solution. CPU only. (Matches the forward splat modes `A`/`B`/`C` — same
+  forward physics, just measured from a stored map.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -217,18 +225,23 @@ paths they can capture at all**.
   the standard spectral-photon-mapping XYZ estimate.)
 
 The **image-forming modes are all progressive** — the forward camera models
-(`A`/`B`/`C`), the backward reference (`R`), and the bidirectional tracer (`D`) each
-refine an image whose brightness is fixed while only graininess falls, so they share the
-same live progress and budget flags (`-time` / `-noise` / `-forever` / `-preview` /
-`-interval`, and periodic crash-safe writes) on **both** the CPU and the GPU. They're all
-GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via the forward megakernel,
-**`D`** via its own GPU BDPT megakernel, and **`R` (including the physical-lens camera)**
-via its own GPU backward megakernel — which the **`P` composite reuses for its camera-side
-layer**, so both of `P`'s layers run on the GPU when the scene is within the backward-GPU
-scope. Outside that scope `P`'s camera-side layer, and `V`'s backward reference (kept on
-the CPU as a stable ground truth), remain CPU-only. `R`/`D` accumulate their sample chunks
-in memory only (no disk `-resume`/`-checkpoint`; those stay forward-mode `A`/`B`/`C`), and
-the `P` composite is not progressive.
+(`A`/`B`/`C`), the backward reference (`R`), the bidirectional tracer (`D`), and the
+composite (`P`) each refine an image whose brightness is fixed while only graininess
+falls, so they share the same live progress and budget flags (`-time` / `-noise` /
+`-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
+and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
+the forward megakernel, **`D`** via its own GPU BDPT megakernel, and **`R` (including the
+physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
+reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
+is within the backward-GPU scope. Outside that scope `P`'s camera-side layer, and `V`'s
+backward reference (kept on the CPU as a stable ground truth), remain CPU-only. The
+composite `P` classifies its pixels once, then alternates forward and backward batches
+into two accumulating films, re-fitting the forward→backward scale and re-blending each
+interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count checkpoint),
+`R`/`D` (spp-count checkpoint), and `P` (dual forward+backward film)** — a resumed render
+draws a decorrelated sample stream so its added samples genuinely reduce variance. Only the
+persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
+stay non-resumable.
 
 ### Backends & performance (`-device`, `-wavefront`)
 
@@ -500,9 +513,10 @@ its local space; `mesh_instance { of "name"  translate … rotate … scale …
 share one triangle set and one bottom-level BVH — a **two-level BVH** (TLAS over
 instances → shared BLAS) — so N copies cost N affines instead of N triangle sets,
 and a per-instance `material` can override the asset's own materials. Works in
-every render mode; the memory sharing is CPU-side (the GPU expands instances to
-world triangles at upload, giving identical images). Everything is accelerated by
-a BVH.
+every render mode, and the memory sharing holds on **both** the CPU and the GPU: the
+device also uses a true two-level BVH (shared per-BLAS pools + an instance table that
+transforms the ray into BLAS space), so device memory scales with unique geometry, not
+with the instance count. Everything is accelerated by a BVH.
 
 ### Implicit surfaces (`isosurface`)
 
@@ -572,6 +586,74 @@ The worked gyroid example is in `scenes/function.ftsl`; expression isosurfaces r
 **both the CPU and the GPU** (the device evaluates the identical formula VM — an
 expression sphere matches the analytic `sphere` leaf to RMSE ≈ 0.15 % on the same
 backend).
+
+**Container shape and caps.** The container can be a box **or a sphere**, and you can
+choose whether the container *seals* the solid it cuts:
+
+```
+isosurface {
+    material gold
+    function { expr "f_enneper(x, y, z, 1)"  scale 1.7  translate 0 1.2 0 }
+    contained_by { sphere { center 0 1.2 0  radius 1.7 } }   # curved boundary
+    max_gradient 20
+    open                                                     # (optional) don't cap
+}
+```
+
+`contained_by { sphere { center <x y z>  radius r } }` clips the ray along a **smooth
+curved boundary** instead of the axis-aligned `min`/`max` box, so an *unbounded* surface
+(e.g. `f_enneper`, or a solid that pokes out of the container) reads as a natural rounded
+edge rather than hard box facets. The sphere `center`/`radius` are taken in the field's
+frame and transformed to world (exact under uniform scale; a conservative bounding sphere
+under rotation/shear). Where the container wall slices through **solid** material
+(`f < 0`), it is **capped** by default — sealed with a flat/curved face of the isosurface
+material (a cleanly sawn-off solid). The **`open`** keyword suppresses those caps, leaving
+the surface's cut edge and a see-through opening into the interior (`open off` forces the
+default). Caps only affect surfaces that actually reach the container wall; a fully
+bounded surface never touches it, so the choice is moot. Both the container shape and the
+cap policy run identically on CPU and GPU.
+
+##### POV-Ray internal functions (`f_torus`, `f_heart`, …)
+
+The formula VM also ships the **complete set of POV-Ray's built-in isosurface
+functions** — the classic `functions.inc` library (`f_torus`, `f_heart`,
+`f_klein_bottle`, `f_superellipsoid`, `f_dupin_cyclid`, `f_helix1`, `f_spiral`,
+`f_kummer_surface_v1/v2`, `f_boy_surface`, `f_steiners_roman`, and ~60 more). They are
+**exact ports of POV-Ray's own C++ source** (`source/vm/fnintern.cpp`), so a scene using
+them evaluates to the same field POV-Ray computes — call them straight from any `expr`
+string, no `#include` needed:
+
+```
+isosurface {
+    material copper
+    function {
+        expr "f_torus(x, y, z, 0.28, 0.10)"    # major R = 0.28, minor r = 0.10
+        translate 0.5 0.5 0.5   rotate 62 0 0
+    }
+    contained_by { min 0.05 0.05 0.05   max 0.95 0.95 0.95 }
+    max_gradient 1.5
+}
+```
+
+Exactly as in POV-Ray, the **first three arguments are the coordinates** (`x, y, z`,
+which you may pre-transform) and the rest are the function's parameters — e.g.
+`f_torus(x,y,z, majorR, minorR)`, `f_heart(x,y,z, strength)`,
+`f_superellipsoid(x,y,z, e, n)`. Distance-like functions (`f_torus`, `f_sphere`,
+`f_rounded_box`, `f_helix1`) are ~unit-Lipschitz and march robustly; the many
+**polynomial** surfaces (`f_heart`, `f_klein_bottle`, `f_dupin_cyclid`, …) are not signed
+distances, so give them a `max_gradient` (POV clamps most of them to ±10, so a bound in
+the 5–50 range usually works).
+
+The **noise-based** entries — `f_noise3d`, `f_noise_generator`, `f_ridge`, `f_ridged_mf`,
+`f_hetero_mf` — are supported too, driven by an **exact host+device port of POV-Ray's
+Perlin `Noise()`** (`src/pov_noise.h`, generated by `tools/pov_noise_gen.py`): POV's init
+tables are re-derived and baked in, so a scene like
+`sqrt(x*x+z*z) - 1 + 0.5*f_noise3d(3*x,3*y,3*z)` yields the same bumpy field POV produces,
+identically on CPU and GPU (all three noise generators: 1=Original, 2=RangeCorrected
+[default], 3=Perlin). Only `f_pattern` (which needs POV's full pattern/pigment engine)
+remains unported — tracked in `known-issues.md`. The functions are generated by
+`tools/pov_functions_gen.py` into `src/pov_functions.h` and evaluated by the same
+host+device VM, so they render identically on CPU and GPU.
 
 ##### Ray-march strategy (`method`, `refine`)
 
@@ -847,7 +929,7 @@ splat models:
 
 **Mode `M` (photon map) shares even more cheaply.** Because the photon map is
 **view-independent**, a multi-camera mode-`M` render builds the map **once** and runs
-each camera's backward final gather against that one shared map — the whole forward
+each camera's backward density gather against that one shared map — the whole forward
 photon flight amortizes across every frame. Unlike `A`/`B` (which reuse a photon
 *flight*, so every camera inherits the *same* fixed noise), each mode-`M` camera gathers
 with its **own** independent backward samples, so frames share only the underlying
@@ -878,7 +960,7 @@ them as animation frames:
   samples, so each carries **independent** randomness on top of the shared paths (unbiased
   per camera; correlated only through the shared flight).
 - **`M`** — cameras share the photon *map* (the radiance solution) but each runs its own
-  backward final gather, so each frame's noise is **independent** — the best of both:
+  backward density gather, so each frame's noise is **independent** — the best of both:
   the expensive forward pass is paid once, yet frames don't inherit a shared grain.
 - **`C`/`R`/`D`/`P`/`V`** — each camera is traced **fully independently** with its own
   sample budget, so their randomness (and noise) is **uncorrelated** by construction.
@@ -932,6 +1014,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
@@ -957,8 +1040,11 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
-`-interval` apply to every image-forming mode (forward `A`/`B`/`C` and the spp modes `R`/`D`),
-on both CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) only.
+`-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
+the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /
+`-checkpoint` cover `A`/`B`/`C` (photon-count checkpoint), `R`/`D` (spp-count checkpoint),
+and `P` (dual forward+backward film) — `M`/`S`/`U` keep persistent per-pass state a film
+alone can't restore, so they are not disk-resumable.
 
 | Flag | Meaning |
 |---|---|
@@ -968,7 +1054,7 @@ on both CPU and GPU. `-resume` / `-checkpoint` are forward-mode (`A`/`B`/`C`) on
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
-| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (forward `A`/`B`/`C` only) |
+| `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,

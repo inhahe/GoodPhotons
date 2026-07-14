@@ -247,6 +247,24 @@ struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; in
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
+// Two-level BVH for instancing (device twin of scene.h Blas / MeshInstance). A DBlas
+// is a shared mesh asset held ONCE in local (authored) space as a slice of the flat
+// per-BLAS pools (blasNodes/blasTris/blasPrim); a DInstance places it into the world
+// via an affine WITHOUT baking a private triangle copy. The TLAS (DScene::nodes) gets
+// one leaf per instance; the leaf transforms the ray into BLAS-local space and walks
+// the shared sub-BVH. This is the device memory win over expanding instances to world
+// tris at upload (N copies cost N affines, not N triangle sets). See known-issues.md.
+struct DBlas     { int nodeOff, triOff, primOff; };   // offsets into the flat BLAS pools
+struct DInstance {
+    // world -> local affine (toLocal): p_local = Lm*p + Lt, dir_local = Lm*dir.
+    double Lm[9], Lt[3];
+    // shading/geometric normal local -> world = (toWorld linear)^-T = transpose of
+    // toWorld.inverse().m — precomputed on the host so the device does no inverse.
+    double Nm[9];
+    int    blasId;
+    int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
+};
+
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
 // The field is a flat postfix array evaluated with a scalar stack, sphere-traced for
 // intersection. All math is done in DOUBLE (independent of the FP32 transport `Real`):
@@ -279,6 +297,10 @@ struct DImplicit {
     int    uvProj;           // 0 none, 1 planar, 2 spherical, 3 cylindrical (UvProjection)
     int    uvAxis;           // 0=x, 1=y, 2=z (projection/up axis)
     double uvLo[3], uvHi[3]; // reference box for the [0,1] UV wrap
+    int    container;        // 0 = box (lo/hi), 1 = sphere (sphereCenter/sphereRadius)
+    double sphereCenter[3];  // world center for Container::Sphere
+    double sphereRadius;     // world radius for Container::Sphere
+    int    capped;           // 1 = draw container caps (closed); 0 = `open`
 };
 
 // Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
@@ -438,6 +460,15 @@ struct DScene {
     // patNodes so material patterns and field formulas don't share offsets.
     const PatNode*    fieldExprNodes;
     const DImplicit*  implicits; int nImplicits;
+    // Instancing (two-level BVH). BVH prims with index >= nTris+nSph+nImplicits map to
+    // instances[prim - nTris - nSph - nImplicits]; each instance references a DBlas
+    // (offsets into the shared blasNodes/blasTris/blasPrim pools). Null/0 when the scene
+    // has no instances (the common path uploads Scene::bvh verbatim, bit-identical).
+    const DInstance*  instances; int nInstances;
+    const DBlas*      blas;                 // per-BLAS pool offsets, indexed by blasId
+    const DNode*      blasNodes;            // concatenated per-BLAS BVH nodes (0-based)
+    const int*        blasPrim;             // concatenated per-BLAS primIdx (0-based)
+    const DTri*       blasTris;             // concatenated per-BLAS local-space tris
     // Procedural patterns (§4): flat postfix PatNode pool + per-pattern slices.
     // A material's roughnessPat/filmThicknessPat/mixWeightPat index `patterns`.
     const PatNode*   patNodes;
@@ -1191,16 +1222,59 @@ __device__ static void dProjectUV(double px, double py, double pz,
 __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                                           const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
     double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
-    double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
-    double t0 = tmin, t1 = hit.t;
-    // clip to world AABB
-    { double ta = (im.lo[0]-ox)*idx, tb = (im.hi[0]-ox)*idx; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
-    { double ta = (im.lo[1]-oy)*idy, tb = (im.hi[1]-oy)*idy; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
-    { double ta = (im.lo[2]-oz)*idz, tb = (im.hi[2]-oz)*idz; if (ta>tb){double s=ta;ta=tb;tb=s;} if(ta>t0)t0=ta; if(tb<t1)t1=tb; if(t1<t0)return false; }
 
     const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
     const PatNode* exprPool = sc.fieldExprNodes;
     const int N = im.nodeN;
+
+    // ---- Container clip: entry/exit params [tEnter, tExit] and the container's OUTWARD
+    // normals at those crossings (needed to shade caps). Box (lo/hi) or world sphere.
+    double tEnter, tExit;
+    double neX = 0, neY = 0, neZ = 0, nxX = 0, nxY = 0, nxZ = 0;
+    if (im.container == 1) {
+        double ocx = ox - im.sphereCenter[0], ocy = oy - im.sphereCenter[1], ocz = oz - im.sphereCenter[2];
+        double A = dx*dx + dy*dy + dz*dz;
+        double B = ocx*dx + ocy*dy + ocz*dz;
+        double C = ocx*ocx + ocy*ocy + ocz*ocz - im.sphereRadius*im.sphereRadius;
+        double disc = B*B - A*C;
+        if (disc < 0.0) return false;
+        double sq = sqrt(disc);
+        tEnter = (-B - sq) / A;
+        tExit  = (-B + sq) / A;
+        double pex = ox + dx*tEnter, pey = oy + dy*tEnter, pez = oz + dz*tEnter;
+        double pxx = ox + dx*tExit,  pxy = oy + dy*tExit,  pxz = oz + dz*tExit;
+        double gex = pex - im.sphereCenter[0], gey = pey - im.sphereCenter[1], gez = pez - im.sphereCenter[2];
+        double gxx = pxx - im.sphereCenter[0], gxy = pxy - im.sphereCenter[1], gxz = pxz - im.sphereCenter[2];
+        double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
+        if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
+        if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+    } else {
+        double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
+        tEnter = -1e300; tExit = 1e300;
+        int eAx = 0; double eSgn = -1.0;
+        int xAx = 0; double xSgn = 1.0;
+        double o3[3] = {ox, oy, oz}, id3[3] = {idx, idy, idz};
+        double lo3[3] = {im.lo[0], im.lo[1], im.lo[2]}, hi3[3] = {im.hi[0], im.hi[1], im.hi[2]};
+        for (int a = 0; a < 3; ++a) {
+            double tLo = (lo3[a] - o3[a]) * id3[a];
+            double tHi = (hi3[a] - o3[a]) * id3[a];
+            double tnear, tfar, nearSgn, farSgn;
+            if (id3[a] >= 0.0) { tnear = tLo; tfar = tHi; nearSgn = -1.0; farSgn = +1.0; }
+            else               { tnear = tHi; tfar = tLo; nearSgn = +1.0; farSgn = -1.0; }
+            if (tnear > tEnter) { tEnter = tnear; eAx = a; eSgn = nearSgn; }
+            if (tfar  < tExit)  { tExit  = tfar;  xAx = a; xSgn = farSgn; }
+            if (tExit < tEnter) return false;
+        }
+        if (eAx == 0) neX = eSgn; else if (eAx == 1) neY = eSgn; else neZ = eSgn;
+        if (xAx == 0) nxX = xSgn; else if (xAx == 1) nxY = xSgn; else nxZ = xSgn;
+    }
+    double t0 = tmin, t1 = hit.t;
+    if (tEnter > t0) t0 = tEnter;
+    if (tExit  < t1) t1 = tExit;
+    if (t1 < t0) return false;
+    const bool capped          = (im.capped != 0);
+    const bool exitIsContainer = (tExit <= (double)hit.t);
+
     const double dlen = sqrt(dx*dx + dy*dy + dz*dz);
     const int MAX_STEP = 2048;
     const double invLip = 1.0 / (im.lipschitz > 0.0 ? im.lipschitz : 1.0);
@@ -1210,8 +1284,28 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const double fixedStep   = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
     const bool   regulaFalsi = (im.refine == 1);
 
+    // Commit a hit at parametric `th`, world point (px,py,pz), geometric normal (gx,gy,gz).
+    auto writeHit = [&](double th, double px, double py, double pz,
+                        double gx, double gy, double gz) -> bool {
+        hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
+        hit.ng = DVec3(gx, gy, gz);
+        double side = dx*gx + dy*gy + dz*gz;
+        hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
+        hit.matId = im.matId; hit.sensorId = -1;
+        if (im.uvProj != 0) {
+            double uu, vv;
+            dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
+            hit.u = (Real)uu; hit.v = (Real)vv;
+        } else { hit.u = 0; hit.v = 0; }
+        return true;
+    };
+
     double t = t0;
     double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
+    // NEAR CAP: ray enters the container already inside the solid (f<0); the container
+    // face is the nearest surface. `open` skips this to reveal the cut edge.
+    if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0)
+        return writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
     for (int i = 0; i < MAX_STEP; ++i) {
         double step = sampleMode ? fixedStep : fmax(fabs(f) * invLip, minStep) / dlen;
         double tn = t + step;
@@ -1247,19 +1341,15 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
             double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool);
-            hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
-            hit.ng = DVec3(gx, gy, gz);
-            double side = dx*gx + dy*gy + dz*gz;
-            hit.n = (side < 0.0) ? DVec3(gx, gy, gz) : DVec3(-gx, -gy, -gz);
-            hit.matId = im.matId; hit.sensorId = -1;
-            if (im.uvProj != 0) {
-                double uu, vv;
-                dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
-                hit.u = (Real)uu; hit.v = (Real)vv;
-            } else { hit.u = 0; hit.v = 0; }
-            return true;
+            return writeHit(th, px, py, pz, gx, gy, gz);
         }
-        if (last) return false;
+        if (last) {
+            // FAR CAP: reached the container exit still inside the solid (fn<0), and the
+            // far clip is the container itself — seal the sawn-off solid.
+            if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < (double)hit.t)
+                return writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
+            return false;
+        }
         t = tn; f = fn;
     }
     return false;
@@ -1334,6 +1424,99 @@ __device__ static bool boxHit(const DNode& nd, const DVec3& ro, const DVec3& inv
     return true;
 }
 
+// Apply an affine's linear part + translation to a point (device twin of Affine::apply).
+HD static inline DVec3 affPoint(const double* M, const double* T, const DVec3& p) {
+    return DVec3(M[0]*p.x + M[1]*p.y + M[2]*p.z + T[0],
+                 M[3]*p.x + M[4]*p.y + M[5]*p.z + T[1],
+                 M[6]*p.x + M[7]*p.y + M[8]*p.z + T[2]);
+}
+// Apply an affine's linear part only, to a direction (device twin of Affine::applyDir).
+// NOTE (mirrors host Blas): the direction is NOT renormalized, so the local parametric
+// t equals the world t and the shared tMax needs no rescaling.
+HD static inline DVec3 affDir(const double* M, const DVec3& v) {
+    return DVec3(M[0]*v.x + M[1]*v.y + M[2]*v.z,
+                 M[3]*v.x + M[4]*v.y + M[5]*v.z,
+                 M[6]*v.x + M[7]*v.y + M[8]*v.z);
+}
+
+// Closest hit inside one BLAS, in its LOCAL space. `h.t` carries the running
+// world(==local) tMax on entry; a closer local hit updates `h` (local normals/UVs).
+// Mirrors Blas::intersectLocal. Returns true if `h` was updated.
+__device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
+                                    const DVec3& lro, const DVec3& lrd, Real tmin, DHit& h) {
+    const DBlas& bl = sc.blas[inst.blasId];
+    const DNode* N = sc.blasNodes + bl.nodeOff;
+    const int*   P = sc.blasPrim  + bl.primOff;
+    const DTri*  T = sc.blasTris   + bl.triOff;
+    DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    Real tMax = h.t;
+    bool found = false;
+    int stack[48]; int sp = 0; stack[sp++] = 0;
+    while (sp) {
+        const DNode& n = N[stack[--sp]];
+        Real tE;
+        if (!boxHit(n, lro, invD, tmin, tMax, tE)) continue;
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) {
+                int prim = P[n.first + i];
+                if (intersectTri(lro, lrd, T[prim], tmin, h)) { tMax = h.t; found = true; }
+            }
+        } else {
+            Real tL, tR;
+            bool hL = boxHit(N[n.left],  lro, invD, tmin, tMax, tL);
+            bool hR = boxHit(N[n.right], lro, invD, tmin, tMax, tR);
+            if (hL && hR) {
+                if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
+                else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
+            } else if (hL) stack[sp++] = n.left;
+            else if (hR)   stack[sp++] = n.right;
+        }
+    }
+    return found;
+}
+
+// Any hit inside one BLAS (local space), before `maxDist`. Mirrors Blas::occludedLocal.
+__device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
+                                     const DVec3& lro, const DVec3& lrd, Real tmin, Real maxDist) {
+    const DBlas& bl = sc.blas[inst.blasId];
+    const DNode* N = sc.blasNodes + bl.nodeOff;
+    const int*   P = sc.blasPrim  + bl.primOff;
+    const DTri*  T = sc.blasTris   + bl.triOff;
+    DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    int stack[48]; int sp = 0; stack[sp++] = 0;
+    while (sp) {
+        const DNode& n = N[stack[--sp]];
+        Real tE;
+        if (!boxHit(n, lro, invD, tmin, maxDist, tE)) continue;
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) {
+                int prim = P[n.first + i];
+                DHit h; h.t = maxDist; h.valid = false;
+                if (intersectTri(lro, lrd, T[prim], tmin, h)) return true;
+            }
+        } else {
+            Real tc;
+            if (boxHit(N[n.left],  lro, invD, tmin, maxDist, tc)) stack[sp++] = n.left;
+            if (boxHit(N[n.right], lro, invD, tmin, maxDist, tc)) stack[sp++] = n.right;
+        }
+    }
+    return false;
+}
+
+// Transform a BLAS-local hit `lh` back into world space for instance `inst` under the
+// world ray (ro,rd). Positions map by the world t (== local t); normals by (toWorld)^-T
+// (Nm); the shading normal is re-oriented against the world ray. Mirrors the host
+// Scene::instanceHitToWorld exactly.
+__device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro,
+                                          const DVec3& rd, DHit& lh) {
+    lh.p = ro + rd * lh.t;
+    DVec3 wn  = normalize(affDir(inst.Nm, lh.n));
+    DVec3 wng = normalize(affDir(inst.Nm, lh.ng));
+    lh.ng = wng;
+    lh.n  = (dot(rd, wn) < 0) ? wn : -wn;
+    if (inst.matOverride >= 0) lh.matId = inst.matOverride;
+}
+
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_EPS) {
     DHit h; h.t = BIG; h.valid = false; h.matId = 0; h.sensorId = -1;
@@ -1350,7 +1533,19 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                 int prim = sc.primIdx[n.first + i];
                 if (prim < sc.nTris)              { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
-                else                              { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
+                else {
+                    // Instance leaf: transform the ray into BLAS-local space, walk the
+                    // shared sub-BVH, and map any closer hit back to world space.
+                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                    DVec3 lro = affPoint(inst.Lm, inst.Lt, ro);
+                    DVec3 lrd = affDir(inst.Lm, rd);
+                    DHit lh; lh.t = h.t; lh.valid = false;
+                    if (blasClosest(sc, inst, lro, lrd, tmin, lh)) {
+                        instanceHitToWorld(inst, ro, rd, lh);
+                        h = lh; tMax = h.t;
+                    }
+                }
             }
         } else {
             Real tL, tR;
@@ -1379,9 +1574,17 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
-                bool blocked = (prim < sc.nTris) ? intersectTri(o, dir, sc.tris[prim], tmin, h)
-                             : (prim < sc.nTris + sc.nSph) ? intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h)
-                             : intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
+                bool blocked;
+                if (prim < sc.nTris)                              blocked = intersectTri(o, dir, sc.tris[prim], tmin, h);
+                else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
+                else {
+                    // Instance leaf: any-hit inside the shared BLAS in local space.
+                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                    DVec3 lo = affPoint(inst.Lm, inst.Lt, o);
+                    DVec3 ld = affDir(inst.Lm, dir);
+                    blocked = blasOccluded(sc, inst, lo, ld, tmin, tMax);
+                }
                 if (blocked) return true;
             }
         } else {
@@ -2303,6 +2506,14 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::PovFn: {
+                int id = (int)nd.a;
+                int na = povFnArity(id);
+                double args[POV_FN_MAX_ARGS];
+                for (int k = na - 1; k >= 0; --k) args[k] = st[--sp];
+                st[sp++] = povFnEval(id, args);
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -3985,35 +4196,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
 
     // --- bake geometry ---
-    // Instancing is CPU-only in the acceleration structure: the GPU has no two-level
-    // BVH, so each MeshInstance is EXPANDED here into world-space triangles appended
-    // after the base tris (and the top-level BVH is rebuilt over the full flat set
-    // below). This keeps device traversal identical to the non-instanced path (a flat
-    // tri/sphere/implicit list) at the cost of not sharing instance geometry in device
-    // memory — a documented limitation (see known-issues.md). `flatTris` is the base
-    // Scene::tris followed by every instance's transformed BLAS triangles.
-    std::vector<Tri> flatTris;
-    flatTris.reserve(scene.tris.size());
-    flatTris.insert(flatTris.end(), scene.tris.begin(), scene.tris.end());
-    const bool haveInstances = !scene.instances.empty();
-    for (const auto& inst : scene.instances) {
-        const Blas& bl = scene.blasList[inst.blasId];
-        for (const Tri& lt : bl.tris) {
-            Tri wt = lt;
-            wt.v0 = inst.toWorld.apply(lt.v0);
-            wt.v1 = inst.toWorld.apply(lt.v1);
-            wt.v2 = inst.toWorld.apply(lt.v2);
-            wt.n0 = normalize(inst.toWorld.applyNormal(lt.n0));
-            wt.n1 = normalize(inst.toWorld.applyNormal(lt.n1));
-            wt.n2 = normalize(inst.toWorld.applyNormal(lt.n2));
-            if (inst.matOverride >= 0) wt.matId = inst.matOverride;
-            wt.finalize();   // recompute gn from the world verts (n0/n1/n2 stay: nonzero)
-            flatTris.push_back(wt);
-        }
-    }
-    std::vector<DTri> tris(flatTris.size());
-    for (size_t i = 0; i < flatTris.size(); ++i) {
-        const Tri& t = flatTris[i]; DTri& d = tris[i];
+    // Convert one host Tri (already in its own space) into a device DTri. Shared by the
+    // base Scene::tris and the per-BLAS local-space tris so the conversion lives once.
+    auto bakeTri = [](const Tri& t) {
+        DTri d;
         d.v0 = {t.v0.x, t.v0.y, t.v0.z}; d.v1 = {t.v1.x, t.v1.y, t.v1.z};
         d.v2 = {t.v2.x, t.v2.y, t.v2.z}; d.gn = {t.gn.x, t.gn.y, t.gn.z};
         d.uv0 = {t.uv0.x, t.uv0.y, t.uv0.z};
@@ -4023,36 +4209,28 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.n1 = {t.n1.x, t.n1.y, t.n1.z};
         d.n2 = {t.n2.x, t.n2.y, t.n2.z};
         d.matId = t.matId; d.sensorId = t.sensorId;
-    }
+        return d;
+    };
+    // Instancing now uses a true TWO-LEVEL BVH on the device (matching the CPU): base
+    // Scene::tris stay as the flat tri list, and each MeshInstance becomes one TLAS leaf
+    // (in Scene::bvh, uploaded verbatim below) that references a shared DBlas — no
+    // world-triangle expansion, so device memory scales with UNIQUE geometry, not with
+    // the instance count. See the DBlas/DInstance traversal in closestHit/occluded.
+    const bool haveInstances = !scene.instances.empty();
+    std::vector<DTri> tris(scene.tris.size());
+    for (size_t i = 0; i < scene.tris.size(); ++i) tris[i] = bakeTri(scene.tris[i]);
     std::vector<DSphere> sph(scene.spheres.size());
     for (size_t i = 0; i < scene.spheres.size(); ++i) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
     }
-    // Top-level BVH: with no instances, upload Scene::bvh verbatim (the common,
-    // bit-identical path). With instances, Scene::bvh contains per-instance TLAS
-    // leaves the GPU can't traverse, so rebuild a FLAT BVH over the expanded prim set
-    // — flatTris (base + instance tris), then spheres, then implicits — matching the
-    // device leaf dispatch's [tris | spheres | implicits] index layout.
+    // Top-level BVH: upload Scene::bvh VERBATIM in every case. Its prim-index layout is
+    // [tris | spheres | implicits | instances] — the device leaf dispatch in
+    // closestHit/occluded now understands all four ranges (an instance leaf transforms
+    // the ray into BLAS-local space and walks the shared sub-BVH), so no flat rebuild /
+    // instance expansion is needed. This is bit-identical to the old path for scenes
+    // with no instances, and the memory win (shared BLAS) for scenes with them.
     const Bvh* srcBvh = &scene.bvh;
-    Bvh flatBvh;
-    if (haveInstances) {
-        const double pad = 1e-6;
-        std::vector<Aabb> boxes;
-        boxes.reserve(flatTris.size() + scene.spheres.size() + scene.implicits.size());
-        for (const auto& t : flatTris) {
-            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
-            b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
-            boxes.push_back(b);
-        }
-        for (const auto& s : scene.spheres) {
-            Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
-            boxes.push_back(b);
-        }
-        for (const auto& im : scene.implicits) boxes.push_back(im.bounds);
-        flatBvh.build(boxes);
-        srcBvh = &flatBvh;
-    }
     std::vector<DNode> nodes(srcBvh->nodes.size());
     for (size_t i = 0; i < srcBvh->nodes.size(); ++i) {
         const BvhNode& b = srcBvh->nodes[i]; DNode& d = nodes[i];
@@ -4061,6 +4239,47 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.left = b.left; d.right = b.right; d.first = b.first; d.count = b.count;
     }
     std::vector<int> primIdx = srcBvh->primIdx;
+
+    // --- bake the two-level BVH (shared BLAS pools + instance table) ---
+    // Each Blas contributes its local-space tris, its own BVH nodes, and its primIdx to
+    // three concatenated pools; a DBlas records the per-BLAS start offsets. Each
+    // MeshInstance becomes a DInstance carrying the world->local affine (for the ray),
+    // the (toWorld)^-T normal matrix (host-precomputed so the device does no inverse),
+    // its blasId, and any material override.
+    std::vector<DBlas>     dblas(scene.blasList.size());
+    std::vector<DTri>      blasTris;
+    std::vector<DNode>     blasNodes;
+    std::vector<int>       blasPrim;
+    for (size_t bi = 0; bi < scene.blasList.size(); ++bi) {
+        const Blas& bl = scene.blasList[bi];
+        dblas[bi].triOff  = (int)blasTris.size();
+        dblas[bi].nodeOff = (int)blasNodes.size();
+        dblas[bi].primOff = (int)blasPrim.size();
+        for (const Tri& t : bl.tris) blasTris.push_back(bakeTri(t));
+        for (const BvhNode& b : bl.bvh.nodes) {
+            DNode d;
+            d.lo = {b.box.lo.x, b.box.lo.y, b.box.lo.z};
+            d.hi = {b.box.hi.x, b.box.hi.y, b.box.hi.z};
+            d.left = b.left; d.right = b.right; d.first = b.first; d.count = b.count;
+            blasNodes.push_back(d);
+        }
+        blasPrim.insert(blasPrim.end(), bl.bvh.primIdx.begin(), bl.bvh.primIdx.end());
+    }
+    std::vector<DInstance> dinst(scene.instances.size());
+    for (size_t ii = 0; ii < scene.instances.size(); ++ii) {
+        const MeshInstance& in = scene.instances[ii]; DInstance& d = dinst[ii];
+        for (int k = 0; k < 9; ++k) d.Lm[k] = in.toLocal.m[k];
+        d.Lt[0] = in.toLocal.t.x; d.Lt[1] = in.toLocal.t.y; d.Lt[2] = in.toLocal.t.z;
+        // Normal local->world = (toWorld linear)^-T. toWorld.applyNormal(n) uses
+        // (toWorld.inverse().m) read in COLUMN order, i.e. the transpose of inv.m. Bake
+        // that transposed matrix so the device applies it as a plain row-major matvec.
+        Affine inv = in.toWorld.inverse();
+        d.Nm[0] = inv.m[0]; d.Nm[1] = inv.m[3]; d.Nm[2] = inv.m[6];
+        d.Nm[3] = inv.m[1]; d.Nm[4] = inv.m[4]; d.Nm[5] = inv.m[7];
+        d.Nm[6] = inv.m[2]; d.Nm[7] = inv.m[5]; d.Nm[8] = inv.m[8];
+        d.blasId = in.blasId; d.matOverride = in.matOverride;
+    }
+    (void)haveInstances;
 
     // --- bake implicit surfaces (isosurface / CSG / metaballs) ---
     // Flatten every Implicit's postfix FieldNode array into one pool; each DImplicit
@@ -4104,6 +4323,12 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.uvLo[0] = ub.lo.x; d.uvLo[1] = ub.lo.y; d.uvLo[2] = ub.lo.z;
             d.uvHi[0] = ub.hi.x; d.uvHi[1] = ub.hi.y; d.uvHi[2] = ub.hi.z;
         }
+        d.container = (int)im.container;
+        d.sphereCenter[0] = im.sphereCenter.x;
+        d.sphereCenter[1] = im.sphereCenter.y;
+        d.sphereCenter[2] = im.sphereCenter.z;
+        d.sphereRadius = im.sphereRadius;
+        d.capped = im.capped ? 1 : 0;
         // Rebase this implicit's field program (and its private expr pool) into the
         // shared device pools; sets d.nodeOff/d.nodeN.
         appendFieldProgram(im.nodes, im.exprNodes, d.nodeOff, d.nodeN);
@@ -4190,6 +4415,12 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
     PatNode*    d_fexpr  = fieldExprNodes.empty() ? nullptr : (PatNode*)keep(uploadVec(fieldExprNodes));
     DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
+    // Two-level BVH pools (shared BLAS + instance table). Empty for scenes with no instances.
+    DInstance*  d_inst   = dinst.empty()     ? nullptr : (DInstance*)keep(uploadVec(dinst));
+    DBlas*      d_blas   = dblas.empty()     ? nullptr : (DBlas*)keep(uploadVec(dblas));
+    DNode*      d_blasN  = blasNodes.empty() ? nullptr : (DNode*)keep(uploadVec(blasNodes));
+    int*        d_blasP  = blasPrim.empty()  ? nullptr : (int*)keep(uploadVec(blasPrim));
+    DTri*       d_blasT  = blasTris.empty()  ? nullptr : (DTri*)keep(uploadVec(blasTris));
     PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
     DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
 
@@ -4304,6 +4535,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
     sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
+    sc.instances = d_inst; sc.nInstances = (int)dinst.size();
+    sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
@@ -4734,7 +4967,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
-    const unsigned long long seed = 0x9e3779b97f4a7c15ULL;
+    // Resume (mode D disk resume): mix the loaded sample count into the seed base so the
+    // continued samples are decorrelated from the ones already in the checkpoint film.
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
     std::vector<double> camH(npix * 3), splatH(npix * 3);
     auto download = [&](Film& o) {
@@ -4805,7 +5041,10 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
-    const unsigned long long seed = 0x9e3779b97f4a7c15ULL;
+    // Resume (mode R disk resume): mix the loaded sample count into the seed base so the
+    // continued samples are decorrelated from the ones already in the checkpoint film.
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {

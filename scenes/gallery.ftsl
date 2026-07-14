@@ -219,16 +219,25 @@ camera "cam" {
     film { res 1280 720   exposure 1.5 }
 }
 
-# --- Flythrough: dive through the glass orb, then thread the gyroid's empty channel ---
-# A smooth Catmull-Rom flight that (1) starts up near the hero viewpoint, (2) plunges
+# --- Flythrough: a SEAMLESS LOOP that dives through the glass orb, threads the gyroid's
+# empty channel, then sweeps back over the hall to where it began ---
+# A smooth CLOSED Catmull-Rom flight that (1) starts up near the hero viewpoint, (2) plunges
 # straight through the centre of the fly-through glass orb (z=9.5) for a refraction beat,
 # (3) enters the gyroid clip-sphere at its +z face and follows the widest empty tunnel
 # through the lattice (11 cm bottleneck clearance, control points from scraps/gyroid_path.py
 # for k=10 / T=0.45) WITHOUT touching a gold strut, then (4) emerges out the -z face and
-# banks up-and-left to finish over the back-left of the hall — swerving clear of the nacre
-# sphere that sits dead ahead at (4.5,1.30,3.0). `look tangent` keeps the lens aimed along
-# travel so the tunnel rushes toward the viewer. Render one frame with, e.g.,
+# banks up-and-left (swerving clear of the nacre sphere dead ahead at (4.5,1.30,3.0)), then
+# (5) climbs to a high establishing arc that glides forward over the whole hall — well above
+# every plinth and the y=3.0 chrome column — and (6) curls back down at the front to REJOIN
+# the start point, so `closed` makes frame N == frame 0 for a gap-free looping gif. The dive
+# control points (through the orb and the lattice) are UNCHANGED, so the delicate threading
+# is preserved; only the high return arc is new. `look tangent` keeps the lens aimed along
+# travel, `density_at` dwells on the money shots (orb + tunnel) and speeds the return, and
+# `exposure_lock` freezes frame 0's auto-exposure across all frames so the loop never flickers.
+# Render one frame with, e.g.,
 #   ftrace -in scenes/gallery.ftsl -mode R -device gpu -noise 2 -window -camera "#50" -o png/fly.png
+# Render the whole looping video via ONE shared photon map (mode M):
+#   ftrace -in scenes/gallery.ftsl -mode M -device gpu -n 300000000 -pmfg 24 -o png/gallery.png
 camera_curve "fly" {
     point 4.50  1.78 11.60     # start: up in the hall, near the hero eye
     point 4.42  1.52 10.50     # descend toward the orb
@@ -244,8 +253,19 @@ camera_curve "fly" {
     point 4.30  1.38  4.60     # emerge behind the ball
     point 3.90  1.55  3.70     # bank up-and-LEFT, clearing the nacre sphere at x=4.5,z=3.0
     point 3.30  1.75  2.70
-    point 2.60  1.90  1.90     # finish high over the back-left of the hall
-    up 0 1 0   fov_y 72   mode R   frames 120
+    point 2.60  1.90  1.90     # finish the dive, back-left of the hall
+    # --- high return arc (new): climb clear of everything and glide forward back to start ---
+    point 2.15  2.75  2.35     # lift off the dive, rising clear of the chrome column (top y=3.0)
+    point 2.30  3.55  4.20     # up near the ceiling lights, moving forward down the hall
+    point 3.00  3.78  7.00     # high establishing sweep over the hall's centre-left
+    point 3.80  3.60  9.60     # glide forward, high above the glass orb
+    point 4.30  3.10 13.40     # top-of-loop turnaround at the front, above & ahead of the start
+    point 4.55  2.35 12.60     # curl back down toward the start from the front
+    up 0 1 0   fov_y 72   mode R   frames 150
     look tangent
+    # dwell on the orb + tunnel, race through the high return (t is normalised curve position)
+    density_at 0.00 8   density_at 0.10 16   density_at 0.24 22   density_at 0.48 22
+    density_at 0.58 10  density_at 0.667 6   density_at 1.00 6
+    closed   exposure_lock
     film { res 1280 720   exposure 1.5 }
 }

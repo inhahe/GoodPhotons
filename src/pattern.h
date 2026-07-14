@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include "linalg.h"
+#include "pov_functions.h"   // exact POV-Ray internal isosurface functions (f_torus, ...)
 
 // ---------------------------------------------------------------------------
 // Postfix opcodes.
@@ -42,6 +43,10 @@ enum class PatOp : int {
     Mix,          // lerp(a, b, t)
     Smoothstep,   // smoothstep(edge0, edge1, x)
     Noise,        // value noise of (x, y, z) in [0,1]
+    // variadic built-in: an exact POV-Ray internal function. The node's `a` holds
+    // the POV internal id (0..75); the evaluator pops povFnArity(id) args (the
+    // first three are the coordinates) and pushes the returned scalar.
+    PovFn,
 };
 
 // One postfix node. POD (no std:: members) so it uploads to the GPU verbatim.
@@ -153,6 +158,14 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = patValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::PovFn: {
+                int id = (int)nd.a;
+                int na = povFnArity(id);
+                double args[POV_FN_MAX_ARGS];
+                for (int k = na - 1; k >= 0; --k) args[k] = st[--sp];
+                st[sp++] = povFnEval(id, args);
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -200,8 +213,11 @@ inline bool varOp(const std::string& s, PatOp& out) {
     return false;
 }
 
-// Function name -> (opcode, arity). Returns false if not a known function.
-inline bool funcOp(const std::string& s, PatOp& out, int& arity) {
+// Function name -> (opcode, arity[, povId]). Returns false if not a known function.
+// For exact POV-Ray internal functions (f_torus, f_heart, ...) out=PatOp::PovFn and
+// povId is the POV internal id; for built-ins povId is left as -1.
+inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
+    povId = -1;
     struct F { const char* n; PatOp op; int ar; };
     static const F fs[] = {
         {"abs",PatOp::Abs,1},{"sqrt",PatOp::Sqrt,1},{"sin",PatOp::Sin,1},
@@ -214,7 +230,12 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity) {
         {"smoothstep",PatOp::Smoothstep,3},{"noise",PatOp::Noise,3},
     };
     for (const F& g : fs) if (s == g.n) { out = g.op; arity = g.ar; return true; }
+    int id, ar;
+    if (povFnLookup(s.c_str(), id, ar)) { out = PatOp::PovFn; arity = ar; povId = id; return true; }
     return false;
+}
+inline bool funcOp(const std::string& s, PatOp& out, int& arity) {
+    int dummy; return funcOp(s, out, arity, dummy);
 }
 
 inline int opPrec(char c) {
@@ -306,8 +327,8 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             if (t.op == 'u') { PatNode nd; nd.op = PatOp::Neg; queue.push_back(nd); }
             else             { PatNode nd; nd.op = binOp(t.op); queue.push_back(nd); }
         } else if (t.kind == Tok::Func) {
-            PatOp op; int ar; funcOp(t.name, op, ar);
-            PatNode nd; nd.op = op; queue.push_back(nd);
+            PatOp op; int ar; int povId; funcOp(t.name, op, ar, povId);
+            PatNode nd; nd.op = op; if (op == PatOp::PovFn) nd.a = (double)povId; queue.push_back(nd);
         }
     };
 

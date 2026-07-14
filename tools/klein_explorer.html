@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Klein Bottle Explorer — ftrace isosurface</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2027; --ink:#e7e9ee; --dim:#9aa0ad; --acc:#e0b25a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  #wrap { display:flex; height:100vh; }
+  #view { flex:1; position:relative; min-width:0; }
+  canvas { display:block; width:100%; height:100%; }
+  #hint { position:absolute; left:12px; bottom:10px; color:var(--dim);
+    background:rgba(0,0,0,.35); padding:4px 8px; border-radius:6px; font-size:12px; }
+  #panel { width:340px; background:var(--panel); padding:14px 16px; overflow-y:auto;
+    border-left:1px solid #000; }
+  h1 { font-size:15px; margin:0 0 2px; color:var(--acc); font-weight:600; }
+  .sub { color:var(--dim); font-size:12px; margin:0 0 12px; }
+  .row { margin:10px 0; }
+  .row label { display:flex; justify-content:space-between; font-size:12px;
+    color:var(--dim); margin-bottom:3px; }
+  .row label b { color:var(--ink); font-variant-numeric:tabular-nums; font-weight:600; }
+  .row .desc { color:#6d7482; font-size:11px; margin-top:2px; }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  .chk { display:flex; gap:8px; align-items:center; margin:8px 0; color:var(--dim); }
+  .btns { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
+  button { background:#2a2f39; color:var(--ink); border:1px solid #000; border-radius:6px;
+    padding:6px 10px; cursor:pointer; font-size:12px; }
+  button:hover { background:#333a46; }
+  button.preset { background:#242832; }
+  pre { background:#0f1115; color:#cdd3df; padding:10px; border-radius:6px; font-size:11px;
+    white-space:pre-wrap; word-break:break-word; max-height:230px; overflow:auto;
+    border:1px solid #000; }
+  hr { border:none; border-top:1px solid #2a2f39; margin:14px 0; }
+  .fps { color:#6d7482; font-size:11px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="view">
+    <canvas id="gl"></canvas>
+    <div id="hint">drag = orbit · wheel = zoom · <span class="fps" id="fps"></span></div>
+  </div>
+  <div id="panel">
+    <h1>Klein Bottle Explorer</h1>
+    <p class="sub">Live raymarch of the generalized POV klein quartic. Drag the knobs;
+      copy the ftrace scene when you like a shape.</p>
+
+    <div class="row">
+      <label>a — body/neck separation, re-entry height <b id="va">2.00</b></label>
+      <input id="a" type="range" min="1.2" max="3.4" step="0.01" value="2.00">
+    </div>
+    <div class="row">
+      <label>b — body size <b id="vb">1.00</b></label>
+      <input id="b" type="range" min="0.6" max="1.6" step="0.01" value="1.00">
+    </div>
+    <div class="row">
+      <label>c — mouth opening (z²) <b id="vc">8.0</b></label>
+      <input id="c" type="range" min="3" max="16" step="0.1" value="8.0">
+      <div class="desc">too low seals the mouth into a plain egg</div>
+    </div>
+    <div class="row">
+      <label>d — neck-tube curl (x·z) <b id="vd">16.0</b></label>
+      <input id="d" type="range" min="4" max="30" step="0.1" value="16.0">
+      <div class="desc">also helps hold the mouth open</div>
+    </div>
+    <div class="row">
+      <label>level — iso-level (wall thickness) <b id="vL">0.00</b></label>
+      <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.00">
+    </div>
+    <div class="row">
+      <label>clip radius (object space) <b id="vR">3.20</b></label>
+      <input id="R" type="range" min="1.5" max="5.0" step="0.05" value="3.20">
+    </div>
+    <div class="row">
+      <label>march quality (steps) <b id="vS">256</b></label>
+      <input id="S" type="range" min="64" max="512" step="16" value="256">
+    </div>
+
+    <label class="chk"><input id="cap" type="checkbox"> cap the cut (default = open)</label>
+    <label class="chk"><input id="spin" type="checkbox" checked> auto-spin</label>
+
+    <div class="btns">
+      <button class="preset" data-p="2.0,1.0,8,16">base</button>
+      <button class="preset" data-p="2.0,1.0,12,16">wide mouth</button>
+      <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
+      <button class="preset" data-p="2.0,1.0,10,12">loose curl</button>
+      <button class="preset" data-p="2.7,1.0,9,16">low re-entry</button>
+      <button class="preset" data-p="2.0,1.2,9,16">big body</button>
+    </div>
+
+    <hr>
+    <div class="btns">
+      <button id="copy">Copy ftrace scene</button>
+      <button id="reset">Reset view</button>
+    </div>
+    <pre id="snippet"></pre>
+
+    <hr>
+    <h1 style="font-size:14px">Export mesh for Unreal</h1>
+    <div class="row">
+      <label>export resolution (grid) <b id="vN">128</b></label>
+      <input id="N" type="range" min="48" max="224" step="8" value="128">
+      <div class="desc">grid cells per axis; higher = finer but slower &amp; bigger file (224 ≈ 2M tris)</div>
+    </div>
+    <div class="row">
+      <label>size in Unreal (cm, longest axis) <b id="vSZ">100</b></label>
+      <input id="SZ" type="range" min="10" max="500" step="5" value="100">
+    </div>
+    <div class="btns">
+      <button id="export">Export .obj (download)</button>
+    </div>
+    <div class="desc" id="exportStatus">Watertight, +Y up, sphere-capped, welded normals — 1 unit = 1&nbsp;cm. Import as a Static Mesh (enable Nanite for the high-res grids).</div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('gl');
+const gl = cv.getContext('webgl2', {antialias:false, preserveDrawingBuffer:true});
+if (!gl) { document.body.innerHTML = '<p style="padding:20px">WebGL2 not available in this browser.</p>'; }
+
+const VS = `#version 300 es
+in vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform vec2  uRes;
+uniform vec3  uCam;      // camera position (object space)
+uniform mat3  uBasis;    // right, up, forward
+uniform float uA,uB,uC,uD,uL,uR;
+uniform int   uSteps;
+uniform int   uCap;
+const int MAXSTEPS = 512;
+
+float fieldP(vec3 p){
+  float S = dot(p,p);
+  float A = S - uA*p.y - uB;
+  float bd = S + uA*p.y - uB;
+  return bd*(A*A - uC*p.z*p.z) + uD*p.x*p.z*A;
+}
+// solid interior where field > 0 (matches ftrace: f = clamp(-(P-L)) < 0)
+float field(vec3 p){ return fieldP(p) - uL; }
+
+vec3 gradient(vec3 p){
+  float e = 0.0015;
+  vec2 h = vec2(e,0.0);
+  return vec3(
+    field(p+h.xyy)-field(p-h.xyy),
+    field(p+h.yxy)-field(p-h.yxy),
+    field(p+h.yyx)-field(p-h.yyx));
+}
+
+vec3 shade(vec3 p, vec3 n, vec3 rd){
+  if (dot(n,rd) > 0.0) n = -n;               // face the camera
+  vec3 base = vec3(0.92,0.72,0.34);          // gold-ish, for readable geometry
+  vec3 L1 = normalize(vec3(-0.5, 0.95, 0.55));
+  vec3 L2 = normalize(vec3( 0.65,0.35, 0.60));
+  float d1 = max(dot(n,L1),0.0);
+  float d2 = max(dot(n,L2),0.0)*0.45;
+  vec3 col = base*(0.18 + d1 + d2);
+  vec3 h1 = normalize(L1 - rd);
+  col += vec3(1.0)*pow(max(dot(n,h1),0.0),46.0)*0.45;
+  float rim = pow(1.0 - max(dot(n,-rd),0.0), 3.0);
+  col += base*rim*0.28;
+  return col;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
+  vec3 ro = uCam;
+  vec3 rd = normalize(uBasis * vec3(uv, 1.0));
+
+  // clip to the container sphere (object space, center 0, radius uR)
+  float b = dot(ro, rd);
+  float c = dot(ro,ro) - uR*uR;
+  float disc = b*b - c;
+  vec3 bg = mix(vec3(0.10,0.11,0.13), vec3(0.16,0.17,0.20), uv.y*0.5+0.5);
+  if (disc < 0.0){ outColor = vec4(bg,1.0); return; }
+  float sq = sqrt(disc);
+  float t0 = max(-b - sq, 0.0);
+  float t1 = -b + sq;
+  if (t1 < t0){ outColor = vec4(bg,1.0); return; }
+
+  vec3 pen = ro + rd*t0;
+  vec3 nEn = normalize(pen);
+  float f = field(pen);
+  // NEAR cap: enter already inside solid
+  if (uCap==1 && f > 0.0){
+    outColor = vec4(shade(pen, nEn, rd), 1.0); return;
+  }
+  float dt = (t1 - t0) / float(uSteps);
+  float t = t0;
+  for (int i=0;i<MAXSTEPS;i++){
+    if (i>=uSteps) break;
+    float tn = t + dt;
+    vec3 pp = ro + rd*tn;
+    float fn = field(pp);
+    if (f*fn < 0.0){
+      float ta=t, tb=tn, fa=f, fb=fn;
+      for (int k=0;k<14;k++){
+        float tm=0.5*(ta+tb);
+        float fm=field(ro+rd*tm);
+        if (fa*fm<=0.0){ tb=tm; fb=fm; } else { ta=tm; fa=fm; }
+      }
+      vec3 hp = ro+rd*(0.5*(ta+tb));
+      vec3 n  = -normalize(gradient(hp));    // outward = decreasing field
+      outColor = vec4(shade(hp, n, rd), 1.0); return;
+    }
+    t = tn; f = fn;
+  }
+  // FAR cap: exit still inside solid
+  if (uCap==1 && f > 0.0){
+    vec3 pex = ro + rd*t1;
+    outColor = vec4(shade(pex, normalize(pex), rd), 1.0); return;
+  }
+  outColor = vec4(bg,1.0);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const ploc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(ploc);
+gl.vertexAttribPointer(ploc, 2, gl.FLOAT, false, 0, 0);
+
+const U = {};
+['uRes','uCam','uBasis','uA','uB','uC','uD','uL','uR','uSteps','uCap']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+// ---- controls ----
+const el = id => document.getElementById(id);
+const ctl = { a:el('a'), b:el('b'), c:el('c'), d:el('d'), L:el('L'), R:el('R'), S:el('S') };
+const val = { a:el('va'), b:el('vb'), c:el('vc'), d:el('vd'), L:el('vL'), R:el('vR'), S:el('vS') };
+const cap = el('cap'), spin = el('spin');
+
+function nums(){
+  return { a:+ctl.a.value, b:+ctl.b.value, c:+ctl.c.value, d:+ctl.d.value,
+           L:+ctl.L.value, R:+ctl.R.value, S:+ctl.S.value };
+}
+function refreshLabels(){
+  const n = nums();
+  val.a.textContent = n.a.toFixed(2); val.b.textContent = n.b.toFixed(2);
+  val.c.textContent = n.c.toFixed(1); val.d.textContent = n.d.toFixed(1);
+  val.L.textContent = n.L.toFixed(2); val.R.textContent = n.R.toFixed(2);
+  val.S.textContent = n.S.toFixed(0);
+  updateSnippet(n);
+}
+Object.values(ctl).forEach(x => x.addEventListener('input', refreshLabels));
+
+document.querySelectorAll('.preset').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    const [a,b,c,d] = btn.dataset.p.split(',').map(Number);
+    ctl.a.value=a; ctl.b.value=b; ctl.c.value=c; ctl.d.value=d; ctl.L.value=0;
+    refreshLabels();
+  });
+});
+
+function updateSnippet(n){
+  const A=n.a, B=n.b, C=n.c, D=n.d, L=n.L;
+  const inner = `(r*r - ${A}*y - ${B})`;
+  const body  = `(r*r + ${A}*y - ${B})`;
+  let poly = `${body}*(${inner}*${inner} - ${C}*z*z) + ${D}*x*z*${inner}`;
+  if (Math.abs(L) > 1e-9) poly = `(${poly}) - ${L}`;
+  const expr = `clamp(-(${poly}), -10, 10)`;
+  const scale = 0.55;
+  const rWorld = (scale * n.R).toFixed(3);
+  const mg = Math.max(18, Math.round(C + D));
+  el('snippet').textContent =
+`isosurface {
+    material gold
+    function {
+        expr "${expr}"
+        scale ${scale}   translate 0 1.2 0   rotate 12 28 0
+    }
+    contained_by { sphere { center 0 1.2 0  radius ${rWorld} } }
+    max_gradient ${mg}
+    open
+}`;
+}
+el('copy').addEventListener('click', ()=>{
+  navigator.clipboard.writeText(el('snippet').textContent);
+  el('copy').textContent = 'Copied!';
+  setTimeout(()=>el('copy').textContent='Copy ftrace scene', 900);
+});
+
+// ---- mesh export (marching tetrahedra, client-side) --------------------------
+// Mirrors src/isomesh.h: Kuhn/Freudenthal 6-tet split (no ambiguous cases) so the
+// output is a watertight 2-manifold. The exported solid is the SAME region the
+// shader shows — field > level, intersected with the clip sphere — always sealed
+// into a closed solid (sphere cap) regardless of the on-screen "cap the cut"
+// toggle, since Unreal wants a closed mesh. Vertices weld by their canonical pair
+// of lattice endpoints; normals come from the gradient of the augmented field so
+// winding is outward.
+const kCorner = [[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,1,0],[1,1,0],[1,1,1],[0,1,1]];
+const kTet    = [[0,1,5,6],[0,1,2,6],[0,4,5,6],[0,4,7,6],[0,3,2,6],[0,3,7,6]];
+
+function buildMesh(n, N){
+  const {a,b,c,d,L,R} = n;
+  const pad = R*1.06;                      // sample a hair past the sphere so the cap closes
+  const lo = -pad, h = (2*pad)/N, S1 = N+1;
+  const gp = i => lo + h*i;
+  const S3 = S1*S1*S1;
+  const fieldP = (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-a*y-b, bd=S+a*y-b;
+                            return bd*(A*A - c*z*z) + d*x*z*A; };
+  // aug < 0  ⟺  inside solid (fieldP > L) AND inside clip sphere.  aug == 0 is the surface.
+  const aug = (x,y,z)=>{ const f = L - fieldP(x,y,z), s = Math.sqrt(x*x+y*y+z*z) - R;
+                         return f > s ? f : s; };
+
+  // sample the augmented field on the lattice
+  const val = new Float64Array(S3);
+  const vidx = (i,j,k)=> (i*S1 + j)*S1 + k;
+  for (let i=0;i<S1;i++){ const x=gp(i);
+    for (let j=0;j<S1;j++){ const y=gp(j);
+      for (let k=0;k<S1;k++) val[vidx(i,j,k)] = aug(x, y, gp(k)); } }
+
+  const pos = [], nrm = [], tris = [];
+  const edgeMap = new Map();
+  const eps = h*0.5;
+  const gradAug = (x,y,z)=>{
+    let gx=aug(x+eps,y,z)-aug(x-eps,y,z),
+        gy=aug(x,y+eps,z)-aug(x,y-eps,z),
+        gz=aug(x,y,z+eps)-aug(x,y,z-eps);
+    let Ln=Math.hypot(gx,gy,gz); if (Ln<1e-30){ gx=0;gy=1;gz=0;Ln=1; }
+    return [gx/Ln, gy/Ln, gz/Ln];
+  };
+  const edgeVertex = (i0,j0,k0,f0, i1,j1,k1,f1)=>{
+    const A0=(i0*S1+j0)*S1+k0, B0=(i1*S1+j1)*S1+k1;
+    const key = A0<B0 ? A0*S3+B0 : B0*S3+A0;
+    const got = edgeMap.get(key); if (got!==undefined) return got;
+    const x0=gp(i0),y0=gp(j0),z0=gp(k0), x1=gp(i1),y1=gp(j1),z1=gp(k1);
+    let ta=0, tb=1, fa=f0, fb=f1;              // bisection-refine the crossing on the real field
+    for (let r=0;r<4;r++){ const tm=0.5*(ta+tb),
+      fm=aug(x0+(x1-x0)*tm, y0+(y1-y0)*tm, z0+(z1-z0)*tm);
+      if ((fa<0)===(fm<0)){ ta=tm; fa=fm; } else { tb=tm; fb=fm; } }
+    const t=0.5*(ta+tb);
+    const px=x0+(x1-x0)*t, py=y0+(y1-y0)*t, pz=z0+(z1-z0)*t;
+    const id = pos.length/3;
+    pos.push(px,py,pz);
+    const g=gradAug(px,py,pz); nrm.push(g[0],g[1],g[2]);
+    edgeMap.set(key,id); return id;
+  };
+  const emitTri = (A,B,C)=>{
+    if (A===B||B===C||A===C) return;
+    const ux=pos[B*3]-pos[A*3],   uy=pos[B*3+1]-pos[A*3+1], uz=pos[B*3+2]-pos[A*3+2];
+    const vx=pos[C*3]-pos[A*3],   vy=pos[C*3+1]-pos[A*3+1], vz=pos[C*3+2]-pos[A*3+2];
+    const fnx=uy*vz-uz*vy, fny=uz*vx-ux*vz, fnz=ux*vy-uy*vx;   // geometric normal
+    const gnx=nrm[A*3]+nrm[B*3]+nrm[C*3], gny=nrm[A*3+1]+nrm[B*3+1]+nrm[C*3+1],
+          gnz=nrm[A*3+2]+nrm[B*3+2]+nrm[C*3+2];                 // field normal
+    if (fnx*gnx+fny*gny+fnz*gnz < 0) tris.push(A,C,B); else tris.push(A,B,C);
+  };
+
+  const cc = [], cvv = [];                    // cell corner lattice coords + values
+  for (let ci=0;ci<N;ci++)
+  for (let cj=0;cj<N;cj++)
+  for (let ck=0;ck<N;ck++){
+    for (let m=0;m<8;m++){
+      const i=ci+kCorner[m][0], j=cj+kCorner[m][1], k=ck+kCorner[m][2];
+      cc[m]=[i,j,k]; cvv[m]=val[vidx(i,j,k)];
+    }
+    for (let t=0;t<6;t++){
+      const T=kTet[t];
+      let ins=null, outs=null;                // classify the 4 tet corners (inside = aug<0)
+      const insA=[], outA=[];
+      for (let m=0;m<4;m++){ (cvv[T[m]]<0 ? insA : outA).push(T[m]); }
+      const ni=insA.length;
+      if (ni===0 || ni===4) continue;
+      const E = (p,q)=>{ const P=cc[p], Q=cc[q];
+        return edgeVertex(P[0],P[1],P[2],cvv[p], Q[0],Q[1],Q[2],cvv[q]); };
+      if (ni===1){ const iv=insA[0];
+        emitTri(E(iv,outA[0]), E(iv,outA[1]), E(iv,outA[2]));
+      } else if (ni===3){ const ov=outA[0];
+        emitTri(E(insA[0],ov), E(insA[1],ov), E(insA[2],ov));
+      } else { // ni===2 : the crossing edges form a quad -> two triangles
+        const a2=insA[0], b2=insA[1], c2=outA[0], d2=outA[1];
+        const eac=E(a2,c2), ead=E(a2,d2), ebd=E(b2,d2), ebc=E(b2,c2);
+        emitTri(eac,ead,ebd); emitTri(eac,ebd,ebc);
+      }
+    }
+  }
+  return { pos, nrm, tris };
+}
+
+function toOBJ(pos, nrm, tris, scale, n){
+  const P=[];
+  P.push('# Klein bottle isosurface — exported from klein_explorer.html');
+  P.push(`# a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L} clip_radius=${n.R}`);
+  P.push('# watertight marching-tetrahedra mesh, +Y up, 1 unit = 1 cm (Unreal)');
+  P.push('o klein_bottle');
+  for (let i=0;i<pos.length;i+=3)
+    P.push('v '+(pos[i]*scale).toFixed(5)+' '+(pos[i+1]*scale).toFixed(5)+' '+(pos[i+2]*scale).toFixed(5));
+  for (let i=0;i<nrm.length;i+=3)
+    P.push('vn '+nrm[i].toFixed(4)+' '+nrm[i+1].toFixed(4)+' '+nrm[i+2].toFixed(4));
+  for (let i=0;i<tris.length;i+=3){ const A=tris[i]+1, B=tris[i+1]+1, C=tris[i+2]+1;
+    P.push('f '+A+'//'+A+' '+B+'//'+B+' '+C+'//'+C); }
+  return P.join('\n')+'\n';
+}
+
+function downloadText(name, text){
+  const blob = new Blob([text], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+
+const ctlN = el('N'), ctlSZ = el('SZ');
+ctlN.addEventListener('input',  ()=> el('vN').textContent  = ctlN.value);
+ctlSZ.addEventListener('input', ()=> el('vSZ').textContent = ctlSZ.value);
+
+el('export').addEventListener('click', ()=>{
+  const btn = el('export'), st = el('exportStatus');
+  const n = nums(), N = +ctlN.value, targetCm = +ctlSZ.value;
+  btn.disabled = true;
+  st.textContent = `meshing at grid ${N}³ …`;
+  // yield one frame so the status paints before the (synchronous) meshing runs
+  setTimeout(()=>{
+    try {
+      const t0 = performance.now();
+      const m = buildMesh(n, N);
+      if (m.tris.length === 0){ st.textContent = 'no surface in the clip sphere — adjust parameters'; return; }
+      let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
+      for (let i=0;i<m.pos.length;i+=3){ const x=m.pos[i],y=m.pos[i+1],z=m.pos[i+2];
+        if(x<mnx)mnx=x; if(y<mny)mny=y; if(z<mnz)mnz=z;
+        if(x>mxx)mxx=x; if(y>mxy)mxy=y; if(z>mxz)mxz=z; }
+      const dim = Math.max(mxx-mnx, mxy-mny, mxz-mnz) || 1;
+      const scale = targetCm / dim;
+      const obj = toOBJ(m.pos, m.nrm, m.tris, scale, n);
+      const nv = m.pos.length/3, nt = m.tris.length/3;
+      const fn = `klein_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
+      downloadText(fn, obj);
+      const dt = ((performance.now()-t0)/1000).toFixed(1);
+      st.textContent = `exported ${nv.toLocaleString()} verts / ${nt.toLocaleString()} tris in ${dt}s → ${fn}`;
+    } catch(err){
+      st.textContent = 'export failed: ' + err.message;
+    } finally { btn.disabled = false; }
+  }, 30);
+});
+
+// ---- orbit camera ----
+let yaw = 0.6, pitch = 0.25, zoom = 2.35, dragging=false, px=0, py=0;
+cv.addEventListener('mousedown', e=>{ dragging=true; px=e.clientX; py=e.clientY; spin.checked=false; });
+window.addEventListener('mouseup', ()=> dragging=false);
+window.addEventListener('mousemove', e=>{
+  if(!dragging) return;
+  yaw   += (e.clientX - px) * 0.008;
+  pitch += (e.clientY - py) * 0.008;
+  pitch = Math.max(-1.5, Math.min(1.5, pitch));
+  px=e.clientX; py=e.clientY;
+});
+cv.addEventListener('wheel', e=>{ e.preventDefault(); zoom *= Math.exp(e.deltaY*0.0011);
+  zoom = Math.max(1.4, Math.min(6.0, zoom)); }, {passive:false});
+el('reset').addEventListener('click', ()=>{ yaw=0.6; pitch=0.25; zoom=2.35; });
+
+function basisFrom(yaw,pitch){
+  const cp=Math.cos(pitch), sp=Math.sin(pitch), cy=Math.cos(yaw), sy=Math.sin(yaw);
+  const fwd = [-cp*sy, -sp, -cp*cy];              // camera looks toward origin
+  const wup = [0,1,0];
+  let r = [ fwd[1]*wup[2]-fwd[2]*wup[1], fwd[2]*wup[0]-fwd[0]*wup[2], fwd[0]*wup[1]-fwd[1]*wup[0] ];
+  const rl = Math.hypot(...r); r = r.map(v=>v/rl);
+  const up = [ r[1]*fwd[2]-r[2]*fwd[1], r[2]*fwd[0]-r[0]*fwd[2], r[0]*fwd[1]-r[1]*fwd[0] ];
+  return {fwd, r, up};
+}
+
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio||1, 2);
+  const w = Math.floor(cv.clientWidth*dpr), h = Math.floor(cv.clientHeight*dpr);
+  if (cv.width!==w || cv.height!==h){ cv.width=w; cv.height=h; }
+}
+
+let lastT=performance.now(), frames=0, facc=0;
+function frame(now){
+  resize();
+  if (spin.checked) yaw += 0.006;
+  const n = nums();
+  const dist = zoom * n.R;
+  const {fwd,r,up} = basisFrom(yaw,pitch);
+  const cam = fwd.map(v=>-v*dist);               // position = -fwd*dist (looking at origin)
+
+  gl.viewport(0,0,cv.width,cv.height);
+  gl.uniform2f(U.uRes, cv.width, cv.height);
+  gl.uniform3f(U.uCam, cam[0], cam[1], cam[2]);
+  // column-major mat3 = [right, up, forward]
+  gl.uniformMatrix3fv(U.uBasis, false, new Float32Array([
+    r[0],r[1],r[2], up[0],up[1],up[2], fwd[0],fwd[1],fwd[2] ]));
+  gl.uniform1f(U.uA,n.a); gl.uniform1f(U.uB,n.b); gl.uniform1f(U.uC,n.c);
+  gl.uniform1f(U.uD,n.d); gl.uniform1f(U.uL,n.L); gl.uniform1f(U.uR,n.R);
+  gl.uniform1i(U.uSteps, n.S|0); gl.uniform1i(U.uCap, cap.checked?1:0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++; facc += now-lastT; lastT=now;
+  if (facc>500){ el('fps').textContent = (1000*frames/facc).toFixed(0)+' fps'; frames=0; facc=0; }
+  requestAnimationFrame(frame);
+}
+refreshLabels();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

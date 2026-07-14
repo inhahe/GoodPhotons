@@ -56,10 +56,10 @@ struct Mesh {
     std::vector<int>  tri;   // 3 indices per triangle
 };
 
-// ---- Uniform marching tetrahedra over one implicit (box-capped) -------------
+// ---- Uniform marching tetrahedra over one implicit (container-capped) -------
 inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
     Mesh m;
-    Aabb capBox = im.bounds;              // solid is intersected with this box (caps)
+    Aabb capBox = im.bounds;              // sampling domain (= container AABB); caps here
     Vec3 ext0 = capBox.hi - capBox.lo;
     double maxe = std::max(ext0.x, std::max(ext0.y, ext0.z));
     if (maxe <= 0) return m;
@@ -91,11 +91,27 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
         double inside  = std::min(std::max(dx, std::max(dy,dz)), 0.0);
         return outside + inside;
     };
-    // Augmented field = CSG intersection of the solid with the cap box. This is the
+    // Signed distance to the sphere container (negative inside, positive outside).
+    const bool sphereCap = (im.container == Container::Sphere) && (im.sphereRadius > 0.0);
+    auto sphereSDF = [&](const Vec3& p)->double {
+        return length(p - im.sphereCenter) - im.sphereRadius;
+    };
+    // Container SDF: the actual `contained_by` shape the renderer clips to, so the
+    // mesh boundary matches what the ray tracer / explorer shows (a sphere container
+    // caps into a spherical cap, not a flat AABB face).
+    auto contSDF = [&](const Vec3& p)->double {
+        return sphereCap ? sphereSDF(p) : boxSDF(p);
+    };
+    // Augmented field = CSG intersection of the solid with the container. This is the
     // field the exported mesh actually represents; both sampling and vertex normals
-    // use it, so box-face caps get correct outward normals.
+    // use it, so caps get correct outward normals. When the isosurface is `open`
+    // (im.capped == false) the container slice is NOT sealed: the mesh keeps the raw
+    // field so the surface's own cut edge stays an open rim (matching the renderer's
+    // see-through look), bounded only where the field exits the sampling lattice.
+    const bool doCap = im.capped;
     auto augEval = [&](const Vec3& p)->double {
-        return std::max(im.eval(p), boxSDF(p));
+        double f = im.eval(p);
+        return doCap ? std::max(f, contSDF(p)) : f;
     };
     double eps = maxe / std::max(NX, std::max(NY, NZ)) * 0.5;
     auto augGrad = [&](const Vec3& p)->Vec3 {
