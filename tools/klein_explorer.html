@@ -45,34 +45,36 @@
   </div>
   <div id="panel">
     <h1>Klein Bottle Explorer</h1>
-    <p class="sub">Live raymarch of the generalized POV klein quartic. Drag the knobs;
+    <p class="sub">Live raymarch of the algebraic (Ian&nbsp;Stewart) Klein quartic —
+      <code>(S+ay−b)·((S−ay−b)²−c·z²) + d·x·z·(S−ay−b)</code>, S=x²+y²+z². This is a
+      real self-intersecting Klein surface, not a POV metaball blob. Drag the knobs;
       copy the ftrace scene when you like a shape.</p>
 
     <div class="row">
-      <label>a — body/neck separation, re-entry height <b id="va">2.00</b></label>
-      <input id="a" type="range" min="1.2" max="3.4" step="0.01" value="2.00">
+      <label>a — body/neck separation, re-entry height <b id="va">1.20</b></label>
+      <input id="a" type="range" min="0.6" max="3.4" step="0.01" value="1.20">
     </div>
     <div class="row">
-      <label>b — body size <b id="vb">1.00</b></label>
-      <input id="b" type="range" min="0.6" max="1.6" step="0.01" value="1.00">
+      <label>b — body size <b id="vb">0.60</b></label>
+      <input id="b" type="range" min="0.3" max="1.6" step="0.01" value="0.60">
     </div>
     <div class="row">
-      <label>c — mouth opening (z²) <b id="vc">8.0</b></label>
-      <input id="c" type="range" min="3" max="16" step="0.1" value="8.0">
+      <label>c — mouth opening (z²) <b id="vc">3.0</b></label>
+      <input id="c" type="range" min="1" max="16" step="0.1" value="3.0">
       <div class="desc">too low seals the mouth into a plain egg</div>
     </div>
     <div class="row">
-      <label>d — neck-tube curl (x·z) <b id="vd">16.0</b></label>
-      <input id="d" type="range" min="4" max="30" step="0.1" value="16.0">
+      <label>d — neck-tube curl (x·z) <b id="vd">18.5</b></label>
+      <input id="d" type="range" min="4" max="30" step="0.1" value="18.5">
       <div class="desc">also helps hold the mouth open</div>
     </div>
     <div class="row">
-      <label>level — iso-level (wall thickness) <b id="vL">0.00</b></label>
-      <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.00">
+      <label>level — iso-level (wall thickness) <b id="vL">0.15</b></label>
+      <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.15">
     </div>
     <div class="row">
-      <label>clip radius (object space) <b id="vR">3.20</b></label>
-      <input id="R" type="range" min="1.5" max="5.0" step="0.05" value="3.20">
+      <label>clip radius (object space) <b id="vR">5.00</b></label>
+      <input id="R" type="range" min="1.5" max="6.0" step="0.05" value="5.00">
     </div>
     <div class="row">
       <label>march quality (steps) <b id="vS">256</b></label>
@@ -83,6 +85,7 @@
     <label class="chk"><input id="spin" type="checkbox" checked> auto-spin</label>
 
     <div class="btns">
+      <button class="preset" data-p="1.2,0.6,3,18.5,0.15,5.0">glass pick</button>
       <button class="preset" data-p="2.0,1.0,8,16">base</button>
       <button class="preset" data-p="2.0,1.0,12,16">wide mouth</button>
       <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
@@ -265,8 +268,10 @@ Object.values(ctl).forEach(x => x.addEventListener('input', refreshLabels));
 
 document.querySelectorAll('.preset').forEach(btn=>{
   btn.addEventListener('click', ()=>{
-    const [a,b,c,d] = btn.dataset.p.split(',').map(Number);
-    ctl.a.value=a; ctl.b.value=b; ctl.c.value=c; ctl.d.value=d; ctl.L.value=0;
+    const [a,b,c,d,lvl,r] = btn.dataset.p.split(',').map(Number);
+    ctl.a.value=a; ctl.b.value=b; ctl.c.value=c; ctl.d.value=d;
+    ctl.L.value = (lvl===undefined ? 0 : lvl);
+    if (r!==undefined) ctl.R.value = r;
     refreshLabels();
   });
 });
@@ -283,7 +288,7 @@ function updateSnippet(n){
   const mg = Math.max(18, Math.round(C + D));
   el('snippet').textContent =
 `isosurface {
-    material gold
+    material glass
     function {
         expr "${expr}"
         scale ${scale}   translate 0 1.2 0   rotate 12 28 0
