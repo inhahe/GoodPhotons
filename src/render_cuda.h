@@ -26,6 +26,18 @@ bool cudaAvailable();
 // Human-readable name of the primary CUDA device (or "none").
 const char* cudaDeviceName();
 
+// Orderly CUDA teardown: synchronize any outstanding device work, then destroy the
+// primary context (cudaDeviceReset) while the process is still in a clean, quiescent
+// state. Call this once, at the very end of a successful (or failed) run, BEFORE the
+// process exits. Rationale: leaving the context to be reclaimed implicitly at process
+// exit means the NVIDIA kernel driver tears it down asynchronously, from a DPC, after
+// main() has already returned — and buggy nvlddmkm builds can fault there and bugcheck
+// the whole machine (observed as BSOD/reboot "a couple seconds after the window closed",
+// worst with an abrupt kill). Draining + resetting synchronously here removes that
+// window: by the time we return there is no live GPU work and no context left to reap.
+// No-op (and safe to call) when CUDA is unavailable or was never initialised.
+void cudaGracefulShutdown();
+
 // True if this scene can be rendered on the GPU (no unsupported material such as
 // Fluorescent). When false, the caller must use the CPU renderer.
 bool cudaForwardSupported(const Scene& scene);

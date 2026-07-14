@@ -63,6 +63,11 @@ if(CMAKE_CUDA_COMPILER)
 
     target_sources(ftrace PRIVATE src/render_cuda.cu)
     target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
+    # Emit source line-number info in device code (nvcc -lineinfo). This is
+    # essentially free at runtime (unlike -G, which disables optimisation) and
+    # lets compute-sanitizer / cuda-gdb map GPU faults back to file:line — the
+    # difference between "an OOB happened somewhere" and "OOB at render_cuda.cu:1234".
+    target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
     if(FTRACE_GPU_FP32)
         target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=1)
     else()

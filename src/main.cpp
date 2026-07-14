@@ -3338,10 +3338,20 @@ static int run(int argc, char** argv) {
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
 // silent fall-through to a default illuminant that would render the wrong thing.
 int main(int argc, char** argv) {
+    // Tear the CUDA context down synchronously, in-process, on EVERY exit path (normal
+    // return or exception). Leaving it for the driver to reclaim implicitly after main()
+    // returns triggers an asynchronous nvlddmkm DPC teardown that, on buggy driver
+    // builds, can fault and bugcheck the machine (the "reboot a few seconds after the
+    // window closed" BSOD). Draining + resetting here closes that window.
+    int rc;
     try {
-        return run(argc, argv);
+        rc = run(argc, argv);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
-        return 1;
+        rc = 1;
     }
+#ifdef HAVE_CUDA
+    cudaGracefulShutdown();
+#endif
+    return rc;
 }

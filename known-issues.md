@@ -3,6 +3,60 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Open issues
+
+### System BSOD/reboot on GPU context teardown (nvlddmkm.sys driver bug) — MITIGATED 2026-07-14
+
+Twice, the whole machine bugchecked and rebooted **a couple of seconds after an ftrace
+render window closed** (once after an abrupt `taskkill /F`). Forensics (minidumps copied
+from `C:\Windows\Minidump` via elevated PowerShell, analyzed with `cdb -z <dump> -c
+"!analyze -v"`):
+
+- Both dumps fault **inside `nvlddmkm.sys`** (NVIDIA kernel driver, build ~Jan 2026,
+  driver 591.86) at the **same function** (+0xcff9xx), at **IRQL 2 (DISPATCH_LEVEL / DPC
+  context)** — bugcheck `0xBE` (ATTEMPTED_WRITE_TO_READONLY_MEMORY) and `0xD1`
+  (DRIVER_IRQL_NOT_LESS_OR_EQUAL). A DPC-level fault has **no attributable user process**;
+  it is the driver's own asynchronous context-teardown DPC, running *after* our process
+  has exited. `nvlddmkm` Event 13 (Xid 13, "Graphics FECS Exception") also appears in the
+  System log during render sessions. This is a **driver bug**, widely reported for
+  RTX 4090 + nvlddmkm across driver versions — not something ftrace causes directly.
+- **ftrace's own CUDA kernels are clean.** `compute-sanitizer --tool memcheck` and
+  `--tool initcheck` on a mode-M render (`scenes/gallery.ftsl -mode M -camera fly090 -n
+  150000 -spp 1 -r 64 48`) both report **0 errors** — no out-of-bounds or uninitialized
+  device memory access. So the crash is not an app-side OOB feeding the driver a bad
+  pointer; it is purely the driver's teardown path.
+
+**Root enabler found: TDR was disabled.** `HKLM\System\CurrentControlSet\Control\
+GraphicsDrivers\TdrLevel = 0` (Timeout Detection & Recovery **off** — no `TdrDelay`
+override). With TDR off, a wedged GPU op / driver fault has **no recovery path** and
+escalates straight to a bugcheck instead of the driver being reset. (TDR was likely
+disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.)
+
+**Mitigations:**
+1. **App-side (done):** added `cudaGracefulShutdown()` (`render_cuda.cu`) — a
+   `cudaDeviceSynchronize()` + `cudaDeviceReset()` called from `main()` on every exit path
+   (normal or exception, guarded by `HAVE_CUDA`). This destroys the CUDA context
+   **synchronously, in-process, while quiescent**, instead of leaving it for the driver to
+   reap asynchronously from a DPC after `main()` returns — closing the exact window in
+   which the fault fires. Build now also compiles device code with `-lineinfo` (free at
+   runtime) so any future GPU fault maps to `file:line`.
+2. **Operational (done):** always shut renders down **gracefully** (close the live window /
+   Ctrl-C / let it finish) — **never `taskkill /F`** a live CUDA process, which yanks the
+   context mid-flight and is the most reliable way to hit the teardown fault.
+   - **Teardown tracer:** set `FTRACE_TEARDOWN_LOG=<path>` to have `cudaGracefulShutdown()`
+     append a flushed line to `<path>` around each driver call (`cudaDeviceSynchronize` /
+     `cudaDeviceReset` enter+return). Each line is written with reopen+`fflush` so a hard
+     reboot mid-teardown leaves the **failing step as the last line on disk**. Reading it
+     after a crash tells us whether the fault is *inside* our `cudaDeviceReset` call (last
+     line = "cudaDeviceReset enter", no "returned") or purely the driver's post-exit DPC
+     (last line = "cudaDeviceReset returned") — which we can't touch from user space.
+3. **OS-side (RECOMMENDED, needs admin + reboot — not auto-applied):** re-enable TDR with a
+   generous delay so the OS *recovers* a hung GPU instead of bugchecking, while still not
+   killing legitimate multi-second kernels. As elevated `reg add`:
+   `HKLM\...\GraphicsDrivers  TdrLevel=3 (REG_DWORD)`, `TdrDelay=60`, `TdrDdiDelay=60`.
+   Revert with `TdrLevel=0`. Also worth doing: update the NVIDIA driver (591.86 is months
+   old) or DDU clean-reinstall.
+
 ## Recently fixed
 
 ### Scene grammar: two value-less flag keywords can't share a line — FIXED (docs+scene) 2026-07-14

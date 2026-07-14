@@ -279,6 +279,11 @@ camera_curve "fly" {
     point 4.55  2.35 12.60     # curl back down toward the start from the front
     up 0 1 0   fov_y 72   mode R   frames 180
     look tangent
+    # Centripetal Catmull-Rom (alpha 0.5): the waypoints down the hall and around the
+    # high return arc are unevenly spaced, and plain uniform Catmull-Rom overshoots
+    # between them -- the eye path bulges and wobbles, so the room flight reads jerky.
+    # Centripetal knots (chord^0.5) stay tight to the points with no overshoot/looping.
+    spline centripetal
     # dwell on the orb + tunnel, race through the high return (t is normalised curve position)
     density_at 0.00 8   density_at 0.10 16   density_at 0.24 22   density_at 0.48 22
     density_at 0.58 10  density_at 0.667 6   density_at 1.00 6

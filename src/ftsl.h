@@ -304,7 +304,14 @@ inline int projectionFromName(const std::string& raw) {
 // fraction. Segment `seg` blends points [seg-1, seg, seg+1, seg+2]; an open curve
 // clamps the out-of-range neighbours (so the end tangents point straight down the
 // last edge), a closed curve wraps them modulo n. Used by `camera_curve`.
-inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
+//
+// `alpha` selects the knot parameterization: 0 = UNIFORM (the classic form, tangent
+// (P2-P0)/2 -- fast but OVERSHOOTS and can cusp/loop when control points are unevenly
+// spaced), 0.5 = CENTRIPETAL (knots spaced by chord^0.5; provably no cusps or
+// self-intersections, stays tight to the points -- the fix for a jerky flight through
+// unevenly-spaced waypoints), 1 = CHORDAL (chord^1). alpha=0 is bit-identical to the
+// original so existing scenes are unchanged.
+inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g, double alpha = 0.0) {
     int n = (int)p.size();
     if (n == 1) return p[0];
     int nSeg = closed ? n : n - 1;
@@ -323,11 +330,31 @@ inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
     const Vec3& P1 = idx(seg);
     const Vec3& P2 = idx(seg + 1);
     const Vec3& P3 = idx(seg + 2);
-    double t2 = t * t, t3 = t2 * t;
-    return (P1 * 2.0
-          + (P2 - P0) * t
-          + (P0 * 2.0 - P1 * 5.0 + P2 * 4.0 - P3) * t2
-          + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
+    if (alpha <= 0.0) {
+        double t2 = t * t, t3 = t2 * t;
+        return (P1 * 2.0
+              + (P2 - P0) * t
+              + (P0 * 2.0 - P1 * 5.0 + P2 * 4.0 - P3) * t2
+              + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
+    }
+    // Non-uniform Catmull-Rom via the Barry-Goldman recursion. Knots advance by
+    // chord^alpha; a small floor keeps duplicated endpoints (open-curve clamping) and
+    // coincident control points from dividing by zero.
+    auto knot = [&](double ti, const Vec3& a, const Vec3& b) {
+        return ti + std::pow(std::max(length(b - a), 1e-9), alpha);
+    };
+    double k0 = 0.0;
+    double k1 = knot(k0, P0, P1);
+    double k2 = knot(k1, P1, P2);
+    double k3 = knot(k2, P2, P3);
+    double tt = k1 + t * (k2 - k1);                 // evaluation param within [k1,k2]
+    auto lerp = [](const Vec3& a, const Vec3& b, double u) { return a * (1.0 - u) + b * u; };
+    Vec3 A1 = lerp(P0, P1, (tt - k0) / (k1 - k0));
+    Vec3 A2 = lerp(P1, P2, (tt - k1) / (k2 - k1));
+    Vec3 A3 = lerp(P2, P3, (tt - k2) / (k3 - k2));
+    Vec3 B1 = lerp(A1, A2, (tt - k0) / (k2 - k0));
+    Vec3 B2 = lerp(A2, A3, (tt - k1) / (k3 - k1));
+    return lerp(B1, B2, (tt - k1) / (k2 - k1));
 }
 
 // Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
@@ -2506,6 +2533,21 @@ private:
             else { const std::string& v = c->val.words[0]; closed = !(v == "off" || v == "false" || v == "0"); }
         }
 
+        // Spline knot parameterization: `spline uniform|centripetal|chordal` (or a raw
+        // alpha number). Default UNIFORM preserves every existing scene bit-for-bit;
+        // CENTRIPETAL (alpha 0.5) removes the overshoot/looping that uniform Catmull-Rom
+        // produces when waypoints are unevenly spaced -- the fix for a jerky room flight.
+        double splineAlpha = 0.0;
+        if (const Stmt* sp = find(b, "spline")) {
+            if (sp->val.words.empty()) { fail("camera_curve '" + base + "' spline needs: uniform|centripetal|chordal|<alpha>"); return false; }
+            const std::string& v = sp->val.words[0];
+            if      (v == "uniform")     splineAlpha = 0.0;
+            else if (v == "centripetal") splineAlpha = 0.5;
+            else if (v == "chordal")     splineAlpha = 1.0;
+            else                         splineAlpha = num(v);   // raw alpha
+            if (splineAlpha < 0.0) splineAlpha = 0.0;
+        }
+
         // Density = cameras per unit LENGTH (1/authored-unit -> 1/metre). `density_at`
         // keyframes it (piecewise-linear over normalized position t in [0,1]); a bare
         // `density` is constant. Either drives BOTH the camera count (integral of rho
@@ -2548,11 +2590,11 @@ private:
         int nSeg = closed ? (int)pts.size() : (int)pts.size() - 1;
         int M = std::max(64, 64 * nSeg);
         std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1), sampS((size_t)M + 1);
-        Vec3 prev = catmullRomAt(pts, closed, 0.0);
+        Vec3 prev = catmullRomAt(pts, closed, 0.0, splineAlpha);
         sampG[0] = 0.0; sampC[0] = 0.0; sampS[0] = 0.0;
         for (int k = 1; k <= M; ++k) {
             double g = nSeg * (double)k / M;
-            Vec3 pcur = catmullRomAt(pts, closed, g);
+            Vec3 pcur = catmullRomAt(pts, closed, g, splineAlpha);
             double ds = length(pcur - prev);
             double rho = densityAt(g / nSeg);
             sampC[k] = sampC[k - 1] + rho * ds;
@@ -2668,9 +2710,9 @@ private:
                                : (N == 1 ? 0.5 : (double)i / (N - 1));
             double g = invertC(fr * Cmax);
             CamSpec cs = shared;
-            cs.eye = catmullRomAt(pts, closed, g);
+            cs.eye = catmullRomAt(pts, closed, g, splineAlpha);
             if (lookCurve) {
-                cs.look = catmullRomAt(lookPts, closed, fr * lookSeg);
+                cs.look = catmullRomAt(lookPts, closed, fr * lookSeg, splineAlpha);
             } else if (lookFixed) {
                 cs.look = fixedLook;
             } else {   // tangent: aim at a point a FIXED ARC-LENGTH ahead along the curve.
@@ -2684,9 +2726,9 @@ private:
                 double sTgt  = sHere + 0.045 * Smax;
                 double gTgt  = closed ? gAtArc(std::fmod(sTgt, Smax))   // wrap the loop
                                       : gAtArc(std::min(sTgt, Smax));   // clamp at the end
-                Vec3 tan = catmullRomAt(pts, closed, gTgt) - cs.eye;
+                Vec3 tan = catmullRomAt(pts, closed, gTgt, splineAlpha) - cs.eye;
                 if (length(tan) <= 1e-9) {   // degenerate (end of an open curve): look forward from behind
-                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, g - (double)nSeg / (M * 4.0)));
+                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, g - (double)nSeg / (M * 4.0)), splineAlpha);
                     tan = cs.eye - a;
                 }
                 cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});

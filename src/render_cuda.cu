@@ -4290,6 +4290,43 @@ bool cudaAvailable() {
 }
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
 
+// Append one flushed line to the teardown-trace file named by $FTRACE_TEARDOWN_LOG
+// (no-op when the env var is unset). Each call opens/appends/flushes/closes so that if
+// the machine hard-reboots mid-teardown, the LAST line on disk names the exact step that
+// was in flight when it died — the "log every step so the last log is the culprit"
+// diagnostic. Deliberately heavyweight-per-line (reopen + fflush) precisely so nothing is
+// buffered away and lost in a crash.
+static void teardownLog(const char* step) {
+    const char* path = std::getenv("FTRACE_TEARDOWN_LOG");
+    if (!path || !*path) return;
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    std::fprintf(f, "[teardown] %s\n", step);
+    std::fflush(f);
+    std::fclose(f);
+}
+
+void cudaGracefulShutdown() {
+    // Only touch the driver if a device was actually brought up; probing when none is
+    // present (or CUDA never initialised) would needlessly spin up a context just to
+    // tear it down. cudaAvailable() is cached and cheap.
+    if (!g_queried) { teardownLog("cuda: never initialised, skip"); return; }  // CUDA path never taken
+    if (!g_available) { teardownLog("cuda: no device, skip"); return; }        // no usable device
+    // Drain outstanding work first so the reset doesn't race a still-running kernel /
+    // async copy, then destroy the primary context on this thread synchronously. Ignore
+    // errors: this runs at shutdown and there's nothing left to salvage — the point is
+    // simply to reclaim the context HERE, in-process, rather than leaving it for the
+    // driver's asynchronous DPC teardown after main() returns. Bracketing each driver call
+    // with a flushed log line means a BSOD during teardown leaves the offending call as the
+    // last line in $FTRACE_TEARDOWN_LOG.
+    teardownLog("cuda: cudaDeviceSynchronize enter");
+    cudaDeviceSynchronize();
+    teardownLog("cuda: cudaDeviceSynchronize returned");
+    teardownLog("cuda: cudaDeviceReset enter");
+    cudaDeviceReset();
+    teardownLog("cuda: cudaDeviceReset returned");
+}
+
 bool cudaForwardSupported(const Scene& scene) {
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the

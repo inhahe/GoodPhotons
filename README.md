@@ -902,9 +902,15 @@ extension), which ffmpeg concatenates into a video.
   partial sweep spans its endpoints. See `scenes/showcase_orbit.ftsl` (an orbit tuned
   to fly straight *through* a glass sphere).
 - **`camera_curve "name" { point <x y z> … [frames N] [density <ρ> | density_at <t> <ρ> …]
-  [look tangent | look_at <x y z> | look curve + look_point <x y z> …] [closed] }`** — a
+  [spline uniform|centripetal|chordal|<alpha>] [look tangent | look_at <x y z> |
+  look curve + look_point <x y z> …] [closed] }`** — a
   fly-through along a **Catmull-Rom spline** that passes through the `point` control
-  points. Camera placement is either a fixed `frames` count (uniform arc length) or a
+  points. `spline` selects the parameterization: `uniform` (α=0, the default — simple but
+  can **overshoot** and swing wide between unevenly-spaced control points), `centripetal`
+  (α=0.5 — the recommended choice; provably no cusps or self-intersections, stays tight to
+  the control polygon, so an irregularly-spaced fly path reads smooth instead of lurching),
+  or `chordal` (α=1.0); a bare number sets α directly. Camera placement is either a fixed
+  `frames` count (uniform arc length) or a
   **density** (cameras per unit length) that can vary along the curve via `density_at`
   keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
   slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
