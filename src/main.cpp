@@ -3267,23 +3267,31 @@ static int run(int argc, char** argv) {
                         return g_stopRequested != 0;   // window closed -> stop after this chunk
                     };
                 }
-                auto films = renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
-                                                       diffraction, spp,
-                                                       g_showWindow ? &liveProg : nullptr);
+                // Write each frame to disk the instant its gather completes (crash-safe
+                // incremental output, same as the CPU mode-M path below): a flythrough of
+                // hundreds of frames can run for many minutes, and batching every write to
+                // the very end means an interrupt / crash / power loss throws away ALL of it.
+                // Writing per frame also lets the device path free each film as it goes, so a
+                // long render stays near one-frame of host RAM instead of ~3 GB of films.
+                std::function<bool(int, const Film&)> writeFrame =
+                    [&](int k, const Film& f) -> bool {
+                        const RenderCam& rc = toRender[idx[k]];
+                        std::string op = outFor(rc.name);
+                        if (toRender.size() > 1)
+                            std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
+                                        rc.name.c_str(), rc.res, rc.resY, op.c_str());
+                        double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
+                        if (!writeFilm(op.c_str(), f, (double)spp, rc.exposure, false, anchor, scene.absolute))
+                            sharedWriteFail = true;
+                        return g_stopRequested != 0;   // window closed / Ctrl-C -> stop after this frame
+                    };
+                renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
+                                          diffraction, spp,
+                                          g_showWindow ? &liveProg : nullptr, &writeFrame);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
                                 (e.absorbed + e.sensor + e.escaped + e.residual) / e.emitted);
-                for (size_t k = 0; k < idx.size(); ++k) {
-                    const RenderCam& rc = toRender[idx[k]];
-                    std::string op = outFor(rc.name);
-                    if (toRender.size() > 1)
-                        std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
-                                    rc.name.c_str(), rc.res, rc.resY, op.c_str());
-                    double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-                    if (!writeFilm(op.c_str(), films[k], (double)spp, rc.exposure, false, anchor, scene.absolute))
-                        sharedWriteFail = true;
-                }
                 return;
             }
         }

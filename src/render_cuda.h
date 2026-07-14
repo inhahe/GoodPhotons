@@ -99,11 +99,23 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // drive the live window / preview as each frame builds up (final is true on the chunk that
 // completes a camera). Returning true from report() stops the render after the current
 // chunk (e.g. the live window was closed). A null `prog` renders silently as before.
+//
+// `onFrame` (when non-null) is called ONCE per camera, right after that camera's gather
+// fully completes, with its local index and finished film — so the host can write that
+// frame to disk IMMEDIATELY (crash-safe incremental output, matching the CPU mode-M path
+// which writes each frame as it finishes) instead of holding all films to the end. When
+// `onFrame` is supplied the returned vector's films are RELEASED as they are handed off
+// (each returned Film[c] is left empty after the callback), so the whole render runs in
+// roughly one-frame of host memory rather than accumulating every frame — the caller must
+// therefore consume frames via `onFrame`, not the return value. Returning true from
+// `onFrame` stops the render after the current frame. A null `onFrame` keeps every film in
+// the returned vector for the caller to write at the end (the historical behaviour).
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
-                                            const SppProgress* prog = nullptr);
+                                            const SppProgress* prog = nullptr,
+                                            const std::function<bool(int, const Film&)>* onFrame = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

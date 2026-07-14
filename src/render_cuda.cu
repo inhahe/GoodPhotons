@@ -5333,7 +5333,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
-                                            const SppProgress* prog) {
+                                            const SppProgress* prog,
+                                            const std::function<bool(int, const Film&)>* onFrame) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -5483,6 +5484,17 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
         downloadFilm(c, d_film, d_hits, npix);   // ensure out[c] holds the final accumulation
         cudaFree(d_film); cudaFree(d_hits);
+        // Hand the finished frame to the host for IMMEDIATE crash-safe write, then release
+        // its buffers so a long flythrough runs in ~one frame of host RAM instead of holding
+        // all nc films to the end (mirrors the CPU mode-M path, which writes per frame). If
+        // the host asks to stop (window closed / Ctrl-C), quit after this frame — everything
+        // written so far is already safely on disk.
+        if (onFrame) {
+            bool stopReq = (*onFrame)(c, out[c]);
+            Film empty; empty.resX = resX[c]; empty.resY = resY[c];   // shape kept, buffers freed
+            out[c] = std::move(empty);
+            if (stopReq) stopped = true;
+        }
         if (nc > 1) {   // watchable per-frame progress on a multi-camera (flythrough) render
             std::printf("\r[camera] mode-M GPU gather %d/%d ...", c + 1, nc);
             std::fflush(stdout);

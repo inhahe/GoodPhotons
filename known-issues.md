@@ -5,6 +5,20 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — TODO
+
+The shared photon-map path (mode M, both CPU and GPU) now writes each frame to disk the
+moment its gather completes (crash-safe incremental output; see 2026-07-14 fix). The
+shared **forward** models A/B (`renderForwardShared` / `renderForwardSharedCuda`, dispatched
+from `main.cpp runSharedGroup`) do NOT: they trace one photon set that splats to every
+camera simultaneously, so all films finish together and are written in a single loop at the
+end. A long forward-mode flythrough (large `-n`, many cameras) that is interrupted/crashes
+mid-pass therefore loses everything. **Proper fix:** chunk the N-photon pass, accumulate
+into the per-camera films, and every `-interval` seconds write all current films to disk
+(and support `-resume` from them), mirroring how the single-camera chunked modes (R/D,
+budgeted forward) already checkpoint. Lower priority than mode M was because the gallery
+flythrough renders in mode M; revisit if forward-mode flythroughs become common.
+
 ### System BSOD/reboot on GPU context teardown (nvlddmkm.sys driver bug) — MITIGATED 2026-07-14
 
 Twice, the whole machine bugchecked and rebooted **a couple of seconds after an ftrace
