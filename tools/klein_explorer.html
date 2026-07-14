@@ -24,6 +24,10 @@
   .row label b { color:var(--ink); font-variant-numeric:tabular-nums; font-weight:600; }
   .row .desc { color:#6d7482; font-size:11px; margin-top:2px; }
   input[type=range] { width:100%; accent-color:var(--acc); }
+  select { width:100%; background:#2a2f39; color:var(--ink); border:1px solid #000;
+    border-radius:6px; padding:6px 8px; font-size:12px; }
+  .mgroup[hidden] { display:none; }
+  #modelDesc { color:#6d7482; font-size:11px; margin-top:6px; }
   .chk { display:flex; gap:8px; align-items:center; margin:8px 0; color:var(--dim); }
   .btns { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
   button { background:#2a2f39; color:var(--ink); border:1px solid #000; border-radius:6px;
@@ -45,36 +49,84 @@
   </div>
   <div id="panel">
     <h1>Klein Bottle Explorer</h1>
-    <p class="sub">Live raymarch of the algebraic (Ian&nbsp;Stewart) Klein quartic —
-      <code>(S+ay−b)·((S−ay−b)²−c·z²) + d·x·z·(S−ay−b)</code>, S=x²+y²+z². This is a
-      real self-intersecting Klein surface, not a POV metaball blob. Drag the knobs;
+    <p class="sub">Three different Klein-bottle definitions. Pick one, drag the knobs,
       copy the ftrace scene when you like a shape.</p>
 
     <div class="row">
-      <label>a — body/neck separation, re-entry height <b id="va">1.20</b></label>
-      <input id="a" type="range" min="0.6" max="3.4" step="0.01" value="1.20">
+      <label>model</label>
+      <select id="model">
+        <option value="bottle">Classic bottle (sphere-chain SDF)</option>
+        <option value="quartic">Algebraic quartic (POV-Ray)</option>
+        <option value="fig8">Figure-8 immersion</option>
+      </select>
+      <div class="desc" id="modelDesc"></div>
     </div>
-    <div class="row">
-      <label>b — body size <b id="vb">0.60</b></label>
-      <input id="b" type="range" min="0.3" max="1.6" step="0.01" value="0.60">
+
+    <!-- ============ CLASSIC BOTTLE (default) ============ -->
+    <div class="mgroup" data-m="bottle">
+      <div class="row">
+        <label>wall / tube thickness <b id="vbt">1.00</b></label>
+        <input id="bt" type="range" min="0.55" max="1.6" step="0.01" value="1.00">
+        <div class="desc">scales every tube radius — thin = delicate glass, fat = chunky</div>
+      </div>
+      <div class="row">
+        <label>blend smoothness (k) <b id="vbk">0.040</b></label>
+        <input id="bk" type="range" min="0.01" max="0.12" step="0.005" value="0.040">
+        <div class="desc">how softly the chain fuses; higher = more molten</div>
+      </div>
     </div>
-    <div class="row">
-      <label>c — mouth opening (z²) <b id="vc">3.0</b></label>
-      <input id="c" type="range" min="1" max="16" step="0.1" value="3.0">
-      <div class="desc">too low seals the mouth into a plain egg</div>
+
+    <!-- ============ ALGEBRAIC QUARTIC (POV-Ray) ============ -->
+    <div class="mgroup" data-m="quartic" hidden>
+      <div class="row">
+        <label>a — body/neck separation, re-entry height <b id="va">2.00</b></label>
+        <input id="a" type="range" min="0.6" max="3.4" step="0.01" value="2.00">
+      </div>
+      <div class="row">
+        <label>b — body size <b id="vb">1.00</b></label>
+        <input id="b" type="range" min="0.3" max="1.6" step="0.01" value="1.00">
+      </div>
+      <div class="row">
+        <label>c — mouth opening (z²) <b id="vc">8.0</b></label>
+        <input id="c" type="range" min="1" max="16" step="0.1" value="8.0">
+        <div class="desc">too low seals the mouth into a plain egg</div>
+      </div>
+      <div class="row">
+        <label>d — neck-tube curl (x·z) <b id="vd">16.0</b></label>
+        <input id="d" type="range" min="4" max="30" step="0.1" value="16.0">
+        <div class="desc">also helps hold the mouth open</div>
+      </div>
+      <div class="row">
+        <label>level — iso-level (wall thickness) <b id="vL">0.00</b></label>
+        <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.00">
+      </div>
+      <div class="btns">
+        <button class="preset" data-p="2.0,1.0,8,16">POV classic</button>
+        <button class="preset" data-p="1.2,0.6,3,18.5,0.15,5.0">glass pick</button>
+        <button class="preset" data-p="2.0,1.0,12,16">wide mouth</button>
+        <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
+        <button class="preset" data-p="2.7,1.0,9,16">low re-entry</button>
+        <button class="preset" data-p="2.0,1.2,9,16">big body</button>
+      </div>
     </div>
-    <div class="row">
-      <label>d — neck-tube curl (x·z) <b id="vd">18.5</b></label>
-      <input id="d" type="range" min="4" max="30" step="0.1" value="18.5">
-      <div class="desc">also helps hold the mouth open</div>
+
+    <!-- ============ FIGURE-8 IMMERSION ============ -->
+    <div class="mgroup" data-m="fig8" hidden>
+      <div class="row">
+        <label>R₀ — main loop radius <b id="vf0">0.70</b></label>
+        <input id="f0" type="range" min="0.30" max="1.40" step="0.01" value="0.70">
+      </div>
+      <div class="row">
+        <label>A — figure-8 tube size <b id="vfa">0.50</b></label>
+        <input id="fa" type="range" min="0.25" max="0.90" step="0.01" value="0.50">
+        <div class="desc">a genuine immersion — reads as a bottle in profile, a twisted torus from the side</div>
+      </div>
     </div>
+
+    <!-- ============ SHARED ============ -->
     <div class="row">
-      <label>level — iso-level (wall thickness) <b id="vL">0.15</b></label>
-      <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.15">
-    </div>
-    <div class="row">
-      <label>clip radius (object space) <b id="vR">5.00</b></label>
-      <input id="R" type="range" min="1.5" max="6.0" step="0.05" value="5.00">
+      <label>clip radius (object space) <b id="vR">1.10</b></label>
+      <input id="R" type="range" min="0.8" max="6.0" step="0.05" value="1.10">
     </div>
     <div class="row">
       <label>march quality (steps) <b id="vS">256</b></label>
@@ -83,16 +135,6 @@
 
     <label class="chk"><input id="cap" type="checkbox"> cap the cut (default = open)</label>
     <label class="chk"><input id="spin" type="checkbox" checked> auto-spin</label>
-
-    <div class="btns">
-      <button class="preset" data-p="1.2,0.6,3,18.5,0.15,5.0">glass pick</button>
-      <button class="preset" data-p="2.0,1.0,8,16">base</button>
-      <button class="preset" data-p="2.0,1.0,12,16">wide mouth</button>
-      <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
-      <button class="preset" data-p="2.0,1.0,10,12">loose curl</button>
-      <button class="preset" data-p="2.7,1.0,9,16">low re-entry</button>
-      <button class="preset" data-p="2.0,1.2,9,16">big body</button>
-    </div>
 
     <hr>
     <div class="btns">
@@ -124,6 +166,35 @@ const cv = document.getElementById('gl');
 const gl = cv.getContext('webgl2', {antialias:false, preserveDrawingBuffer:true});
 if (!gl) { document.body.innerHTML = '<p style="padding:20px">WebGL2 not available in this browser.</p>'; }
 
+// The iconic "glassblower's" Klein bottle, traced as a chain of spheres (object-local,
+// +Y up). smooth_union of these = an SDF that reads as the classic bottle: vase body,
+// thin neck arcing over the top and diving back into the belly. [x,y,z,radius].
+const BOTTLE = [
+  [ 0.00,-0.75, 0.00, 0.300],
+  [ 0.00,-0.55, 0.00, 0.360],
+  [ 0.00,-0.35, 0.00, 0.380],
+  [ 0.00,-0.15, 0.00, 0.360],
+  [ 0.00, 0.05, 0.00, 0.300],
+  [ 0.00, 0.22, 0.00, 0.220],
+  [ 0.00, 0.36, 0.00, 0.160],
+  [ 0.02, 0.52, 0.00, 0.115],
+  [ 0.06, 0.68, 0.00, 0.105],
+  [ 0.16, 0.80, 0.00, 0.100],
+  [ 0.30, 0.84, 0.00, 0.098],
+  [ 0.43, 0.78, 0.00, 0.097],
+  [ 0.50, 0.64, 0.00, 0.097],
+  [ 0.50, 0.46, 0.00, 0.098],
+  [ 0.44, 0.28, 0.00, 0.100],
+  [ 0.33, 0.10, 0.00, 0.105],
+  [ 0.20,-0.06, 0.00, 0.110],
+  [ 0.08,-0.18, 0.00, 0.115],
+  [ 0.00,-0.28, 0.00, 0.120],
+];
+const bottleGLSL =
+  'const int NB = ' + BOTTLE.length + ';\n' +
+  'const vec4 BOTTLE[' + BOTTLE.length + '] = vec4[' + BOTTLE.length + '](\n' +
+  BOTTLE.map(s => '  vec4(' + s.map(v => v.toFixed(3)).join(',') + ')').join(',\n') + ');';
+
 const VS = `#version 300 es
 in vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
 
@@ -134,18 +205,56 @@ uniform vec2  uRes;
 uniform vec3  uCam;      // camera position (object space)
 uniform mat3  uBasis;    // right, up, forward
 uniform float uA,uB,uC,uD,uL,uR;
+uniform float uThick,uBk,uR0,uAt;
+uniform int   uModel;    // 0 = bottle (SDF), 1 = quartic, 2 = figure-8
 uniform int   uSteps;
 uniform int   uCap;
 const int MAXSTEPS = 512;
 
+${bottleGLSL}
+
+// ---- model 1: Ian Stewart quartic (POV-Ray's classic klein.pov) ----
 float fieldP(vec3 p){
   float S = dot(p,p);
   float A = S - uA*p.y - uB;
   float bd = S + uA*p.y - uB;
   return bd*(A*A - uC*p.z*p.z) + uD*p.x*p.z*A;
 }
-// solid interior where field > 0 (matches ftrace: f = clamp(-(P-L)) < 0)
-float field(vec3 p){ return fieldP(p) - uL; }
+
+// ---- model 0: classic bottle, smooth-union of spheres (a signed distance field) ----
+float smin(float a, float b, float k){
+  float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
+  return mix(b, a, h) - k*h*(1.0-h);
+}
+float field_bottle(vec3 p){
+  float d = 1e9;
+  for (int i=0;i<NB;i++){
+    vec4 s = BOTTLE[i];
+    float di = length(p - s.xyz) - s.w*uThick;
+    d = smin(d, di, uBk);
+  }
+  return -d;               // interior (d<0) -> field>0
+}
+
+// ---- model 2: figure-8 immersion (Gerono lemniscate swept with a half-twist) ----
+float field_fig8(vec3 p){
+  float th = 0.5*atan(p.z, p.x);
+  float ct = cos(th), st = sin(th);
+  float s = length(p.xz) - uR0;
+  float w = p.y;
+  float inv = 1.0/uAt;
+  float X = (s*ct + w*st)*inv;
+  float Y = (w*ct - s*st)*inv;
+  float F = Y*Y - 4.0*X*X*(1.0 - X*X);
+  return -F;               // solid F<0 -> field>0
+}
+
+// solid interior where field > 0 (ftrace's expr < 0 convention, negated)
+float field(vec3 p){
+  if (uModel==0) return field_bottle(p);
+  if (uModel==2) return field_fig8(p);
+  return fieldP(p) - uL;
+}
 
 vec3 gradient(vec3 p){
   float e = 0.0015;
@@ -243,28 +352,61 @@ gl.enableVertexAttribArray(ploc);
 gl.vertexAttribPointer(ploc, 2, gl.FLOAT, false, 0, 0);
 
 const U = {};
-['uRes','uCam','uBasis','uA','uB','uC','uD','uL','uR','uSteps','uCap']
+['uRes','uCam','uBasis','uA','uB','uC','uD','uL','uR','uSteps','uCap',
+ 'uThick','uBk','uR0','uAt','uModel']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 // ---- controls ----
 const el = id => document.getElementById(id);
-const ctl = { a:el('a'), b:el('b'), c:el('c'), d:el('d'), L:el('L'), R:el('R'), S:el('S') };
-const val = { a:el('va'), b:el('vb'), c:el('vc'), d:el('vd'), L:el('vL'), R:el('vR'), S:el('vS') };
+const ctl = { model:el('model'),
+              a:el('a'), b:el('b'), c:el('c'), d:el('d'), L:el('L'),
+              bt:el('bt'), bk:el('bk'), f0:el('f0'), fa:el('fa'),
+              R:el('R'), S:el('S') };
+const val = { a:el('va'), b:el('vb'), c:el('vc'), d:el('vd'), L:el('vL'),
+              bt:el('vbt'), bk:el('vbk'), f0:el('vf0'), fa:el('vfa'),
+              R:el('vR'), S:el('vS') };
 const cap = el('cap'), spin = el('spin');
 
+const MODEL_IDX  = { bottle:0, quartic:1, fig8:2 };
+const MODEL_R    = { bottle:1.35, quartic:1.10, fig8:1.45 };   // default clip radius per model
+const MODEL_DESC = {
+  bottle: "The iconic glassblower's Klein bottle: a vase whose thin neck arcs over the top, "
+        + "pierces the wall and opens back into the belly. Built as a smooth union of spheres "
+        + "(a signed-distance field), so it also exports to a clean watertight mesh.",
+  quartic: "Ian Stewart's quartic — exactly POV-Ray's classic klein.pov isosurface (a=2, b=1, "
+        + "c=8, d=16). Mathematically a Klein bottle, but it renders as a smooth blob, never the "
+        + "familiar bottle shape, no matter how you tune it.",
+  fig8: "The figure-8 immersion — a Gerono lemniscate (∞-shaped cross-section) swept around a "
+        + "circle with a half-twist. A genuine Klein bottle: bottle-like in profile, a twisted "
+        + "torus from other angles.",
+};
+
 function nums(){
-  return { a:+ctl.a.value, b:+ctl.b.value, c:+ctl.c.value, d:+ctl.d.value,
-           L:+ctl.L.value, R:+ctl.R.value, S:+ctl.S.value };
+  return { model: ctl.model.value,
+           a:+ctl.a.value, b:+ctl.b.value, c:+ctl.c.value, d:+ctl.d.value, L:+ctl.L.value,
+           bt:+ctl.bt.value, bk:+ctl.bk.value, f0:+ctl.f0.value, fa:+ctl.fa.value,
+           R:+ctl.R.value, S:+ctl.S.value };
 }
 function refreshLabels(){
   const n = nums();
   val.a.textContent = n.a.toFixed(2); val.b.textContent = n.b.toFixed(2);
   val.c.textContent = n.c.toFixed(1); val.d.textContent = n.d.toFixed(1);
-  val.L.textContent = n.L.toFixed(2); val.R.textContent = n.R.toFixed(2);
-  val.S.textContent = n.S.toFixed(0);
+  val.L.textContent = n.L.toFixed(2);
+  val.bt.textContent = n.bt.toFixed(2); val.bk.textContent = n.bk.toFixed(3);
+  val.f0.textContent = n.f0.toFixed(2); val.fa.textContent = n.fa.toFixed(2);
+  val.R.textContent = n.R.toFixed(2);  val.S.textContent = n.S.toFixed(0);
   updateSnippet(n);
 }
 Object.values(ctl).forEach(x => x.addEventListener('input', refreshLabels));
+
+function switchModel(){
+  const m = ctl.model.value;
+  document.querySelectorAll('.mgroup').forEach(g => g.hidden = (g.dataset.m !== m));
+  el('modelDesc').textContent = MODEL_DESC[m];
+  ctl.R.value = MODEL_R[m];
+  refreshLabels();
+}
+ctl.model.addEventListener('change', switchModel);
 
 document.querySelectorAll('.preset').forEach(btn=>{
   btn.addEventListener('click', ()=>{
@@ -277,6 +419,12 @@ document.querySelectorAll('.preset').forEach(btn=>{
 });
 
 function updateSnippet(n){
+  if (n.model === 'bottle')  { el('snippet').textContent = snippetBottle(n); return; }
+  if (n.model === 'fig8')    { el('snippet').textContent = snippetFig8(n);   return; }
+  el('snippet').textContent = snippetQuartic(n);
+}
+
+function snippetQuartic(n){
   const A=n.a, B=n.b, C=n.c, D=n.d, L=n.L;
   const inner = `(r*r - ${A}*y - ${B})`;
   const body  = `(r*r + ${A}*y - ${B})`;
@@ -286,8 +434,8 @@ function updateSnippet(n){
   const scale = 0.55;
   const rWorld = (scale * n.R).toFixed(3);
   const mg = Math.max(18, Math.round(C + D));
-  el('snippet').textContent =
-`isosurface {
+  return `# Klein bottle — Ian Stewart quartic (POV-Ray's classic klein.pov)
+isosurface {
     material glass
     function {
         expr "${expr}"
@@ -296,6 +444,44 @@ function updateSnippet(n){
     contained_by { sphere { center 0 1.2 0  radius ${rWorld} } }
     max_gradient ${mg}
     open
+}`;
+}
+
+function snippetFig8(n){
+  const R0 = n.f0.toFixed(3), inv = (1/n.fa).toFixed(4);
+  const th = `0.5*atan2(z,x)`;
+  const s  = `(sqrt(x*x+z*z)-${R0})`;
+  const Y  = `((y*cos(${th}) - ${s}*sin(${th}))*${inv})`;
+  const X  = `((${s}*cos(${th}) + y*sin(${th}))*${inv})`;
+  const F  = `${Y}*${Y} - 4.0*${X}*${X}*(1.0 - ${X}*${X})`;
+  const expr = `clamp( ${F}, -4.0, 4.0 )`;
+  const scale = 1.0;
+  const rWorld = (scale * n.R).toFixed(3);
+  return `# Klein bottle — figure-8 immersion (Gerono lemniscate swept with a half-twist)
+isosurface {
+    material glass
+    function {
+        expr "${expr}"
+        scale ${scale}   translate 0 1.25 0   rotate 8 22 0
+    }
+    contained_by { sphere { center 0 1.25 0  radius ${rWorld} } }
+    max_gradient 30
+    open
+}`;
+}
+
+function snippetBottle(n){
+  const t = n.bt;
+  const rows = BOTTLE.map(s =>
+    `        sphere { center ${s[0].toFixed(2)} ${s[1].toFixed(2)} ${s[2].toFixed(2)}` +
+    `  radius ${(s[3]*t).toFixed(3)} }`).join('\n');
+  return `# Klein bottle — classic "glassblower" form, smooth-union of spheres (SDF, exports cleanly)
+isosurface {
+    material glass
+    translate 0 1.15 0   scale 1.0   rotate 0 25 0
+    smooth_union { k ${n.bk.toFixed(3)}
+${rows}
+    }
 }`;
 }
 el('copy').addEventListener('click', ()=>{
@@ -315,16 +501,33 @@ el('copy').addEventListener('click', ()=>{
 const kCorner = [[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,1,0],[1,1,0],[1,1,1],[0,1,1]];
 const kTet    = [[0,1,5,6],[0,1,2,6],[0,4,5,6],[0,4,7,6],[0,3,2,6],[0,3,7,6]];
 
+// signed field for meshing, matching the shader (> 0 inside the solid) for each model
+function makeSolid(n){
+  if (n.model === 'bottle'){
+    const smin = (a,b,k)=>{ const h=Math.max(0,Math.min(1,0.5+0.5*(b-a)/k)); return (b + (a-b)*h) - k*h*(1-h); };
+    return (x,y,z)=>{ let d=1e9;
+      for (const s of BOTTLE){ const di = Math.hypot(x-s[0],y-s[1],z-s[2]) - s[3]*n.bt; d = smin(d,di,n.bk); }
+      return -d; };
+  }
+  if (n.model === 'fig8'){
+    return (x,y,z)=>{ const th=0.5*Math.atan2(z,x), ct=Math.cos(th), st=Math.sin(th);
+      const s=Math.hypot(x,z)-n.f0, w=y, inv=1/n.fa;
+      const X=(s*ct+w*st)*inv, Y=(w*ct-s*st)*inv;
+      return -(Y*Y - 4*X*X*(1 - X*X)); };
+  }
+  return (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-n.a*y-n.b, bd=S+n.a*y-n.b;
+    return (bd*(A*A - n.c*z*z) + n.d*x*z*A) - n.L; };
+}
+
 function buildMesh(n, N){
-  const {a,b,c,d,L,R} = n;
+  const R = n.R;
   const pad = R*1.06;                      // sample a hair past the sphere so the cap closes
   const lo = -pad, h = (2*pad)/N, S1 = N+1;
   const gp = i => lo + h*i;
   const S3 = S1*S1*S1;
-  const fieldP = (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-a*y-b, bd=S+a*y-b;
-                            return bd*(A*A - c*z*z) + d*x*z*A; };
-  // aug < 0  ⟺  inside solid (fieldP > L) AND inside clip sphere.  aug == 0 is the surface.
-  const aug = (x,y,z)=>{ const f = L - fieldP(x,y,z), s = Math.sqrt(x*x+y*y+z*z) - R;
+  const solid = makeSolid(n);
+  // aug < 0  ⟺  inside solid (field > 0) AND inside clip sphere.  aug == 0 is the surface.
+  const aug = (x,y,z)=>{ const f = -solid(x,y,z), s = Math.sqrt(x*x+y*y+z*z) - R;
                          return f > s ? f : s; };
 
   // sample the augmented field on the lattice
@@ -404,7 +607,10 @@ function buildMesh(n, N){
 function toOBJ(pos, nrm, tris, scale, n){
   const P=[];
   P.push('# Klein bottle isosurface — exported from klein_explorer.html');
-  P.push(`# a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L} clip_radius=${n.R}`);
+  const desc = n.model==='bottle' ? `bottle thickness=${n.bt} k=${n.bk}`
+             : n.model==='fig8'   ? `figure-8 R0=${n.f0} A=${n.fa}`
+             : `quartic a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L}`;
+  P.push(`# model=${n.model}  ${desc}  clip_radius=${n.R}`);
   P.push('# watertight marching-tetrahedra mesh, +Y up, 1 unit = 1 cm (Unreal)');
   P.push('o klein_bottle');
   for (let i=0;i<pos.length;i+=3)
@@ -447,7 +653,9 @@ el('export').addEventListener('click', ()=>{
       const scale = targetCm / dim;
       const obj = toOBJ(m.pos, m.nrm, m.tris, scale, n);
       const nv = m.pos.length/3, nt = m.tris.length/3;
-      const fn = `klein_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
+      const fn = n.model==='bottle' ? `klein_bottle_t${n.bt.toFixed(2)}.obj`
+               : n.model==='fig8'   ? `klein_fig8_R${n.f0.toFixed(2)}_A${n.fa.toFixed(2)}.obj`
+               : `klein_quartic_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
       downloadText(fn, obj);
       const dt = ((performance.now()-t0)/1000).toFixed(1);
       st.textContent = `exported ${nv.toLocaleString()} verts / ${nt.toLocaleString()} tris in ${dt}s → ${fn}`;
@@ -505,6 +713,9 @@ function frame(now){
     r[0],r[1],r[2], up[0],up[1],up[2], fwd[0],fwd[1],fwd[2] ]));
   gl.uniform1f(U.uA,n.a); gl.uniform1f(U.uB,n.b); gl.uniform1f(U.uC,n.c);
   gl.uniform1f(U.uD,n.d); gl.uniform1f(U.uL,n.L); gl.uniform1f(U.uR,n.R);
+  gl.uniform1f(U.uThick,n.bt); gl.uniform1f(U.uBk,n.bk);
+  gl.uniform1f(U.uR0,n.f0); gl.uniform1f(U.uAt,n.fa);
+  gl.uniform1i(U.uModel, MODEL_IDX[n.model]|0);
   gl.uniform1i(U.uSteps, n.S|0); gl.uniform1i(U.uCap, cap.checked?1:0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -512,7 +723,7 @@ function frame(now){
   if (facc>500){ el('fps').textContent = (1000*frames/facc).toFixed(0)+' fps'; frames=0; facc=0; }
   requestAnimationFrame(frame);
 }
-refreshLabels();
+switchModel();          // sets the initial model group visibility + description + clip radius
 requestAnimationFrame(frame);
 </script>
 </body>
