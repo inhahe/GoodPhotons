@@ -6,13 +6,16 @@ a per-approach directory under png/iso_gen/.
 
 Usage:
     python tools/render_isos.py <approach> [--count N] [--seed S] [--size PX]
-                                           [--steps K] [--gpu]
+                                           [--steps K] [--cpu]
     <approach> = trig | sdf | super | all
+
+Renders on the real GPU (ANGLE/D3D11) by default; pass --cpu to force the CPU
+SwiftShader fallback (much slower, only needed if the GPU path fails).
 
 Examples:
     python tools/render_isos.py all                 # 12 of each, default size
     python tools/render_isos.py trig --count 16 --size 560
-    python tools/render_isos.py sdf --seed 100 --gpu
+    python tools/render_isos.py sdf --seed 100 --cpu
 
 It launches headless Chrome on iso_render.html?batch=1&..., waits for the page to
 finish (title -> DONE), reads the JSON blob it dumps into #out, and decodes the
@@ -106,11 +109,13 @@ def main():
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--size', type=int, default=480)
     ap.add_argument('--steps', type=int, default=300)
-    ap.add_argument('--gpu', action='store_true', help='try GPU (ANGLE/D3D11) instead of SwiftShader')
+    ap.add_argument('--cpu', action='store_true',
+                    help='force CPU SwiftShader (default is real GPU via ANGLE/D3D11, ~3-10x faster)')
     a = ap.parse_args()
     keys = list(APPROACHES) if a.approach == 'all' else [a.approach]
+    gpu = not a.cpu
     for k in keys:
-        render_approach(k, a.count, a.seed, a.size, a.steps, a.gpu)
+        render_approach(k, a.count, a.seed, a.size, a.steps, gpu)
 
 if __name__ == '__main__':
     main()
