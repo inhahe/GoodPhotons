@@ -5323,6 +5323,77 @@ bool cudaPhotonMapSupported(const Scene& scene) {
     return true;
 }
 
+// ---- mode-M photon-map cache file (-savemap / -loadmap) -----------------------
+// The deposited photon map is view-INDEPENDENT: it is the (expensive) result of the
+// forward photon trace, and any camera at any gather radius can be gathered from it. So
+// it is worth persisting. `-savemap <f>` writes the built map after the deposit pass;
+// `-loadmap <f>` reloads it and SKIPS the deposit entirely, re-gathering new camera
+// angles / a new radius for free without re-tracing a single photon. The file stores the
+// raw photon set + emitted count + energy tally; the grid is rebuilt on load via
+// PhotonMap::build(radius), so one file serves any gather radius. A scene-identity guard
+// (magic "FTPMP01\n") refuses to blend a stale map into a different scene.
+static uint64_t photonMapGuard(const Scene& scene, bool diffraction) {
+    uint64_t h = 14695981039346656037ULL;                 // FNV-1a offset basis
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+    mix((uint64_t)scene.tris.size());
+    mix((uint64_t)scene.spheres.size());
+    mix((uint64_t)scene.emitters.size());
+    uint64_t tp; std::memcpy(&tp, &scene.totalPower, sizeof tp); mix(tp);
+    mix(diffraction ? 0x9E37ULL : 0x1234ULL);
+    return h;
+}
+
+static bool savePhotonMap(const char* path, const PhotonMap& pm,
+                          const EnergyReport& e, uint64_t guard) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
+    const char magic[8] = {'F','T','P','M','P','0','1','\n'};
+    long long nPh = (long long)pm.photons.size();
+    double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
+    bool ok = true;
+    ok = ok && std::fwrite(magic, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&guard, sizeof guard, 1, f) == 1;
+    ok = ok && std::fwrite(&pm.nEmitted, sizeof pm.nEmitted, 1, f) == 1;
+    ok = ok && std::fwrite(en, sizeof en, 1, f) == 1;
+    ok = ok && std::fwrite(&nPh, sizeof nPh, 1, f) == 1;
+    if (ok && nPh > 0)
+        ok = std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    std::fclose(f);
+    if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
+    return ok;
+}
+
+static bool loadPhotonMap(const char* path, PhotonMap& pm,
+                          EnergyReport& e, uint64_t guard) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "[loadmap] cannot open %s\n", path); return false; }
+    char magic[8] = {0};
+    long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
+    bool ok = std::fread(magic, 1, 8, f) == 8;
+    if (!ok || std::memcmp(magic, "FTPMP01\n", 8) != 0) {
+        std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
+        std::fclose(f); return false;
+    }
+    ok = ok && std::fread(&g, sizeof g, 1, f) == 1;
+    ok = ok && std::fread(&nEmitted, sizeof nEmitted, 1, f) == 1;
+    ok = ok && std::fread(en, sizeof en, 1, f) == 1;
+    ok = ok && std::fread(&nPh, sizeof nPh, 1, f) == 1;
+    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated header; ignoring\n", path); std::fclose(f); return false; }
+    if (g != guard) {
+        std::fprintf(stderr, "[loadmap] %s was built for a different scene; ignoring\n", path);
+        std::fclose(f); return false;
+    }
+    if (nPh > 0) {
+        pm.photons.resize((size_t)nPh);
+        ok = std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    }
+    std::fclose(f);
+    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path); pm.photons.clear(); return false; }
+    pm.nEmitted = nEmitted;
+    e.emitted += en[0]; e.absorbed += en[1]; e.sensor += en[2]; e.escaped += en[3]; e.residual += en[4];
+    return true;
+}
+
 // Build the view-independent photon map on the GPU (forward deposit pass) and gather every
 // camera from it — the flythrough win, on the device. The deposit runs the megakernel
 // forward tracer TWICE: a count-only pass to size the buffer exactly, then a fill pass
@@ -5334,7 +5405,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
                                             const SppProgress* prog,
-                                            const std::function<bool(int, const Film&)>* onFrame) {
+                                            const std::function<bool(int, const Film&)>* onFrame,
+                                            const char* mapLoad, const char* mapSave) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -5344,6 +5416,30 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     DUpload up;
     buildUploadScene(scene, up);
 
+    // Staging-chunk size for the host<->device photon copies (deposit download AND grid
+    // upload below). Streaming the deposits in blocks (instead of one giant transfer) means
+    // the host never holds a second full DPhoton mirror of the map alongside pm.photons -- at
+    // high photon counts (tens of millions emitted, each depositing at several bounces) those
+    // two full copies together would exhaust host RAM (std::bad_alloc). A 4M-photon block is
+    // ~176 MB, negligible next to the map itself.
+    const size_t PM_CHUNK = 4u << 20;
+
+    // Load a cached map (-loadmap) and skip the deposit entirely, or run the forward deposit
+    // trace and optionally persist it (-savemap). The map is view-independent, so a loaded
+    // one is re-gathered for any camera/radius without re-tracing a photon.
+    PhotonMap pm;
+    bool mapLoaded = false;
+    if (mapLoad && *mapLoad) {
+        mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction));
+        if (mapLoaded) {
+            std::printf("[loadmap] %s: %zu photons from %lld emitted -- deposit skipped\n",
+                        mapLoad, pm.photons.size(), (long long)pm.nEmitted);
+            pm.build(radius);                   // (re)build the grid at the requested radius
+        } else {
+            std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
+        }
+    }
+    if (!mapLoaded) {
     // ---- forward deposit pass (count, then fill) ----
     unsigned long long* d_depCount = nullptr;
     CUDA_CHECK(cudaMalloc(&d_depCount, sizeof(unsigned long long)));
@@ -5362,14 +5458,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     unsigned long long nDep = 0;
     CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
 
-    PhotonMap pm; pm.nEmitted = N;
-    // Staging-chunk size for the host<->device photon copies below. Streaming the
-    // deposits in blocks (instead of one giant transfer) means the host never holds a
-    // second full DPhoton mirror of the map alongside pm.photons -- at high photon
-    // counts (tens of millions emitted, each depositing at several bounces) those two
-    // full copies together would exhaust host RAM (std::bad_alloc). A 4M-photon block
-    // is ~176 MB, negligible next to the map itself.
-    const size_t PM_CHUNK = 4u << 20;
+    pm.nEmitted = N;
     if (nDep > 0) {
         DPhoton* d_photons = nullptr;
         CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
@@ -5404,6 +5493,13 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     eOut.emitted  += energy[0]; eOut.absorbed += energy[1]; eOut.sensor += energy[2];
     eOut.escaped  += energy[3]; eOut.residual += energy[4];
     cudaFree(d_depCount); cudaFree(d_energy);
+    if (mapSave && *mapSave) {
+        EnergyReport passE{energy[0], energy[1], energy[2], energy[3], energy[4]};
+        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction)))
+            std::printf("[savemap] wrote %s: %zu photons (%lld emitted)\n",
+                        mapSave, pm.photons.size(), (long long)pm.nEmitted);
+    }
+    }   // end if (!mapLoaded): deposit + build + optional save
 
     // ---- upload the built grid ----
     DPhotonMap dpm{};

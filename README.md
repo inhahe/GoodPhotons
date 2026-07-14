@@ -194,8 +194,13 @@ paths they can capture at all**.
   deposits the photon pass, hands the hits to the same grid builder, then gathers every
   camera on the GPU from the one shared map — so a whole flythrough builds the map once
   and renders each frame in device time (a `-pmfg` final gather still falls back to the
-  CPU, as do env-lit or unsupported-material scenes). (Matches the forward splat modes
-  `A`/`B`/`C` — same forward physics, just measured from a stored map.)
+  CPU, as do env-lit or unsupported-material scenes). The built map can also be
+  **persisted to disk** with `-savemap <f>` and reloaded with `-loadmap <f>`: because it
+  is view-independent, a reloaded map re-gathers new camera angles or a new gather radius
+  **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
+  A scene-identity guard rejects a stale map built for a different scene, falling back to
+  a fresh deposit. (Matches the forward splat modes `A`/`B`/`C` — same forward physics,
+  just measured from a stored map.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -1029,6 +1034,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
+| `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |

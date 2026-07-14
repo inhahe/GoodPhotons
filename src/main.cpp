@@ -93,6 +93,13 @@
 //                  the historical path. R/D store a SUM-over-spp film + spp count; P stores a
 //                  dual forward+backward film (magic FTPCM02). M/S/U keep persistent per-pass
 //                  state that a film alone can't restore, so they are not disk-resumable.
+//   -savemap <f>   (mode M, GPU) after the forward deposit pass, write the view-independent
+//                  photon map to <f> (magic FTPMP01). The map is the expensive result of the
+//                  photon trace and is independent of camera and gather radius.
+//   -loadmap <f>   (mode M, GPU) load a photon map saved with -savemap and SKIP the deposit
+//                  entirely — re-gather new camera angles / a different -pmradius for free,
+//                  without re-tracing a single photon. A scene-identity guard rejects a map
+//                  built for a different scene (falls back to a fresh deposit).
 //   -preview       during a progress render, redraw a live ANSI colour thumbnail of the
 //                  current image in the terminal at each periodic update (in place).
 //   -window        open a real OS window (Win32 GDI on Windows; no-op elsewhere) that shows
@@ -1018,6 +1025,14 @@ static double g_pmRadiusFactor = 0.02;
 // surface sharpness from the gather radius (sharper contact shadows, at ~K x the cost, so
 // pair with fewer spp). See photonmap_render.h (photonGatherSub).
 static int g_pmFinalGather = 0;
+
+// Mode-M photon-map cache file (CLI -savemap / -loadmap). The deposited map is view-
+// independent — the expensive result of the forward photon trace, gatherable by any camera
+// at any radius — so it is worth persisting. -savemap writes it after the GPU deposit pass;
+// -loadmap reloads it and SKIPS the deposit, re-gathering new angles / a new radius without
+// re-tracing a photon. Empty = disabled. GPU shared mode-M only (see renderPhotonMapSharedCuda).
+static std::string g_pmapSave;
+static std::string g_pmapLoad;
 
 // SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
 // faster radius shrink (less bias sooner, more variance); 0.7 is the paper default. The
@@ -2794,6 +2809,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
+        else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
+        else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
@@ -3287,7 +3304,9 @@ static int run(int argc, char** argv) {
                     };
                 renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
                                           diffraction, spp,
-                                          g_showWindow ? &liveProg : nullptr, &writeFrame);
+                                          g_showWindow ? &liveProg : nullptr, &writeFrame,
+                                          g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
+                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str());
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,

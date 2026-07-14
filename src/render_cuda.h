@@ -110,12 +110,22 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // therefore consume frames via `onFrame`, not the return value. Returning true from
 // `onFrame` stops the render after the current frame. A null `onFrame` keeps every film in
 // the returned vector for the caller to write at the end (the historical behaviour).
+//
+// `mapLoad`/`mapSave` (when non-null) drive the view-independent photon-map cache file. The
+// deposited map is the expensive result of the forward photon trace and is independent of
+// camera and gather radius, so it is worth persisting: `mapSave` writes it after the deposit,
+// and `mapLoad` reloads it and SKIPS the deposit entirely — re-gathering new camera angles /
+// a new radius for free, without re-tracing a photon. The file (magic "FTPMP01\n") holds the
+// raw photon set + emitted count + energy; the grid is rebuilt on load at the requested
+// `radius`, so one file serves any radius. A scene-identity guard rejects a stale map built
+// for a different scene (it falls back to a fresh deposit). Both default null (no caching).
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
                                             bool diffraction, long long spp,
                                             const SppProgress* prog = nullptr,
-                                            const std::function<bool(int, const Film&)>* onFrame = nullptr);
+                                            const std::function<bool(int, const Film&)>* onFrame = nullptr,
+                                            const char* mapLoad = nullptr, const char* mapSave = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
