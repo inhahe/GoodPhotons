@@ -106,7 +106,7 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it by a direct radius density estimate at the first diffuse hit (reusable across cameras) | CPU |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
@@ -173,17 +173,24 @@ paths they can capture at all**.
   fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
 - **`M` — photon map (view-independent, reusable).** Traces a forward photon pass
   **once** and stores every diffuse deposit in a **view-independent photon map** (a
-  uniform hash grid), then forms the camera image by a backward camera pass with a
-  **direct density query**: each camera ray walks through specular surfaces until it
-  lands on a diffuse one, where a radius density estimate over the nearby photons gives
-  the radiance directly (not a secondary hemisphere final gather). Because the map is
-  independent of the camera, it can be **built once and reused across every frame of a
-  flythrough** (or every camera of a multi-camera render) — the cost of the photon
-  pass amortizes over all views. *Cost:* the density estimate **blurs sharp contact
-  shadows** at large gather radii (bias controlled by `-pmradius` / `-pmradiusfrac`),
-  and directly-viewed emitters carry a little chromatic speckle at low spp. Best when
-  many cameras share one lighting solution. CPU only. (Matches the forward splat
-  modes `A`/`B`/`C` — same forward physics, just measured from a stored map.)
+  uniform hash grid), then forms the camera image by a backward camera pass. By default
+  it uses a **direct density query**: each camera ray walks through specular surfaces
+  until it lands on a diffuse one, where a radius density estimate over the nearby
+  photons gives the radiance directly at that surface. Optionally, `-pmfg <K>` switches
+  to a **Jensen final gather**: at the first diffuse hit it shoots `K` cosine-weighted
+  hemisphere sub-rays, traces one bounce each, and queries the map at *those* points —
+  so the density estimate's blur lives one bounce away instead of on the visible surface
+  (direct light at the visible point is recovered by gather rays that strike an emitter
+  directly). Because the map is independent of the camera, it can be **built once and
+  reused across every frame of a flythrough** (or every camera of a multi-camera render)
+  — the cost of the photon pass amortizes over all views. *Cost:* with the direct query
+  the density estimate **blurs sharp contact shadows** at large gather radii (bias
+  controlled by `-pmradius` / `-pmradiusfrac`); final gather (`-pmfg`) keeps those
+  contact shadows and fine detail **sharp** while still smoothing indirect light, at
+  roughly `K`× the per-sample cost (so pair it with fewer `-spp`). Directly-viewed
+  emitters carry a little chromatic speckle at low spp. Best when many cameras share one
+  lighting solution. CPU only. (Matches the forward splat modes `A`/`B`/`C` — same
+  forward physics, just measured from a stored map.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -1007,6 +1014,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |

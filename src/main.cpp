@@ -1011,6 +1011,14 @@ static int g_previewRows = 0;   // terminal lines the last preview occupied (for
 static double g_pmRadiusAbs = 0.0;
 static double g_pmRadiusFactor = 0.02;
 
+// Mode-M final gather (CLI -pmfg <K>). 0 = off: read the density estimate directly at the
+// visible point (fast, but the estimate's blur softens contact shadows / fine detail right
+// at that surface). K > 0 = Jensen final gather: shoot K cosine-weighted hemisphere
+// sub-rays from the visible point and query the map ONE bounce away, decoupling visible-
+// surface sharpness from the gather radius (sharper contact shadows, at ~K x the cost, so
+// pair with fewer spp). See photonmap_render.h (photonGatherSub).
+static int g_pmFinalGather = 0;
+
 // SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
 // faster radius shrink (less bias sooner, more variance); 0.7 is the paper default. The
 // initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls above.
@@ -2396,6 +2404,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode M: photon map — tracing %lld photons on %d CPU threads "
                     "(light=%s), gather radius %.4g ...\n",
                     N, nThreads, lightLabel, radius);
+        if (g_pmFinalGather > 0)
+            std::printf("mode M: final gather ON — %d hemisphere sub-rays/sample "
+                        "(density query one bounce away)\n", g_pmFinalGather);
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm);
@@ -2411,7 +2422,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off);
+                                              diffraction, /*maxBounce*/32, off, g_pmFinalGather);
                 });
         };
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
@@ -2782,6 +2793,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
@@ -3222,8 +3234,9 @@ static int run(int argc, char** argv) {
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
         std::printf("[camera] shared photon map (mode M): %zu cameras, %lld photons, "
-                    "radius %.4g on %d CPU threads (light=%s) ...\n",
-                    idx.size(), N, radius, nThreads, lightLabel);
+                    "radius %.4g on %d CPU threads (light=%s)%s ...\n",
+                    idx.size(), N, radius, nThreads, lightLabel,
+                    g_pmFinalGather > 0 ? " [final gather]" : "");
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm);
@@ -3238,7 +3251,7 @@ static int run(int argc, char** argv) {
         for (size_t k = 0; k < idx.size(); ++k) {
             const RenderCam& rc = toRender[idx[k]];
             Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
-                                        nThreads, diffraction, /*maxBounce*/32, 0);
+                                        nThreads, diffraction, /*maxBounce*/32, 0, g_pmFinalGather);
             std::string op = outFor(rc.name);
             if (toRender.size() > 1)
                 std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",

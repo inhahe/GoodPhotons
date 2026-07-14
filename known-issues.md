@@ -5,6 +5,32 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Recently fixed
 
+### Mode `M` optional Jensen final gather (`-pmfg`) — ADDED 2026-07-14
+
+Mode `M` was a **direct** radius density query at the visible point, which inherits the
+density estimate's low-frequency blur *at that surface* (softening contact shadows / fine
+detail at large gather radii). Added an optional true **final gather** (`-pmfg <K>`,
+`g_pmFinalGather`): at the first diffuse hit it shoots `K` cosine-weighted hemisphere
+sub-rays (`photonGatherSub` in `photonmap_render.h`), traces one bounce each, and queries
+the map at *those* points — so the blur now lives one bounce away, decoupling the visible-
+surface sharpness from the gather radius. **Direct** lighting at the visible point is done
+with low-variance next-event estimation (`BackwardRenderer::neeLight`) instead of relying
+on gather rays randomly striking the light; the gather rays therefore collect indirect
+(+ env + specular-direct via a `specularSeen` gate) only, so there is no double-count. The
+cosine/pdf and Lambertian `1/pi` cancel to `rho(x)`, folded per-photon at the gather hit
+(spectrally, at each photon's wavelength) so two-bounce colour bleed stays correct.
+`K = 0` (default) keeps the original direct query — a pure superset. Validated on the
+diffuse Cornell box: direct query reproduces the prior numbers (M/R=0.989, relRMSE 4.7%,
+r=0.998) and final gather matches mode `R` in energy (diffuse-mask M/R=1.010). The point
+of the feature shows up at a large gather radius (`-pmradius 0.06`), in the darkest 10% of
+the reference (contact shadows / corner creases): the direct query suffers the classic
+photon-map **boundary/corner-darkening bias** (the `1/(pi r^2)` normalisation overshoots
+where the gather disc runs off the surface or into shadow) reading **M/R=0.929**, while
+final gather is essentially unbiased at **M/R=0.994** (see `scraps/_shadow_bias.py`). Cost
+~`K`× per sample, so pair with fewer `-spp`. `DiffuseTransmit`/`Fluorescent` visible points
+fall back to the direct query. `README.md` mode-`M` description + CLI table updated. (A
+secondary-hemisphere final gather is what this file previously listed as future work.)
+
 ### GPU forward camera-splat out-of-bounds write (illegal memory access) — FIXED 2026-07-12
 
 The GPU forward/light-tracing kernel (modes A/B/C, and the splat in M/S/U) could
@@ -30,23 +56,6 @@ _(none currently open — see Resolved for the former `light cylinder` entry, wh
 turned out to be a misdiagnosis.)_
 
 ## Tech debt
-
-### Mode `M` (photon map) is a direct density query, not a true final gather — 2026-07-13
-`photonGather` (`photonmap_render.h`) estimates diffuse radiance by a **direct radius
-density query** at the *first* diffuse hit of each camera ray — it reads the photon
-density right at the visible point. This is correct and matches mode `R` on a diffuse
-Cornell box (validated 2026-07-13: M/R=0.990, diffuse-mask relRMSE 4.7%, Pearson r=0.9980),
-but it is *not* a **secondary-hemisphere final gather** (where you'd shoot a cosine-weighted
-gather ray from the visible point and query the map at that *second* bounce). The direct
-query inherits the density estimate's low-frequency blur at the visible surface itself, so
-it **softens sharp contact shadows and small-scale detail** at large gather radii (mitigated
-by `-pmradius`/`-pmradiusfrac`, at the cost of noise). Proper enhancement: add an optional
-final-gather pass — at the first diffuse hit, sample K hemisphere directions, trace one
-bounce each, and query the map at those hit points — which decouples the visible-surface
-sharpness from the gather radius (standard Jensen photon mapping). Naming in README/roadmap
-was corrected to say "density query" rather than "final gather"; the real final gather is
-left as future work. Low priority — mode `M` already meets its done-criteria and `S`/`U`
-(SPPM/VCM) cover the unbiased/caustic cases.
 
 ### `-export-mesh` QEM decimation is pathologically slow on huge/self-intersecting meshes — 2026-07-13
 `isomesh::decimateAdaptive` (QEM edge-collapse) is fine at small/medium counts but effectively
