@@ -5402,7 +5402,12 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         for (size_t i = 0; i < npix; ++i)
             out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
         cudaFree(d_film); cudaFree(d_hits);
+        if (nc > 1) {   // watchable per-frame progress on a multi-camera (flythrough) render
+            std::printf("\r[camera] mode-M GPU gather %d/%d ...", c + 1, nc);
+            std::fflush(stdout);
+        }
     }
+    if (nc > 1) { std::printf("\n"); std::fflush(stdout); }
 
     freeUpload(up);
     return out;

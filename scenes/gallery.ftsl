@@ -265,7 +265,7 @@ camera_curve "fly" {
     point 3.80  3.60  9.60     # glide forward, high above the glass orb
     point 4.30  3.10 13.40     # top-of-loop turnaround at the front, above & ahead of the start
     point 4.55  2.35 12.60     # curl back down toward the start from the front
-    up 0 1 0   fov_y 72   mode R   frames 90
+    up 0 1 0   fov_y 72   mode R   frames 180
     look tangent
     # dwell on the orb + tunnel, race through the high return (t is normalised curve position)
     density_at 0.00 8   density_at 0.10 16   density_at 0.24 22   density_at 0.48 22
