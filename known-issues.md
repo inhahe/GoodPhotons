@@ -50,12 +50,14 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
      after a crash tells us whether the fault is *inside* our `cudaDeviceReset` call (last
      line = "cudaDeviceReset enter", no "returned") or purely the driver's post-exit DPC
      (last line = "cudaDeviceReset returned") — which we can't touch from user space.
-3. **OS-side (RECOMMENDED, needs admin + reboot — not auto-applied):** re-enable TDR with a
+3. **OS-side (APPLIED 2026-07-14, takes effect after a reboot):** re-enabled TDR with a
    generous delay so the OS *recovers* a hung GPU instead of bugchecking, while still not
-   killing legitimate multi-second kernels. As elevated `reg add`:
-   `HKLM\...\GraphicsDrivers  TdrLevel=3 (REG_DWORD)`, `TdrDelay=60`, `TdrDdiDelay=60`.
-   Revert with `TdrLevel=0`. Also worth doing: update the NVIDIA driver (591.86 is months
-   old) or DDU clean-reinstall.
+   killing legitimate multi-second kernels. Set via elevated `reg add` under
+   `HKLM\System\CurrentControlSet\Control\GraphicsDrivers`:
+   `TdrLevel=3 (REG_DWORD)`, `TdrDelay=60` (0x3c s), `TdrDdiDelay=60`. (Was `TdrLevel=0`,
+   TDR fully disabled.) Verified present in the registry; **requires a reboot** to take
+   effect. Revert with `TdrLevel=0`. Also worth doing: update the NVIDIA driver (591.86 is
+   months old) or DDU clean-reinstall.
 
 ## Recently fixed
 
