@@ -5295,7 +5295,8 @@ bool cudaPhotonMapSupported(const Scene& scene) {
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
-                                            bool diffraction, long long spp) {
+                                            bool diffraction, long long spp,
+                                            const SppProgress* prog) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -5378,7 +5379,18 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     dpm.cellStart = (const int*)up.keep(uploadVec(pm.cellStart));
 
     // ---- gather each camera ----
-    for (int c = 0; c < nc; ++c) {
+    // Pull the current device accumulation for camera c into out[c] (film + hit map).
+    auto downloadFilm = [&](int c, const double* d_film, const double* d_hits, size_t npix) {
+        std::vector<double> film(npix * 3);
+        CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)
+            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+    };
+    const bool live = (prog && prog->report);
+    auto lastReport = std::chrono::steady_clock::now();
+    bool stopped = false;
+    for (int c = 0; c < nc && !stopped; ++c) {
         DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
         const size_t npix = (size_t)resX[c] * resY[c];
         double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
@@ -5395,12 +5407,22 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             kGather<<<2048, 128>>>(up.sc, dpm, hc, d_film, d_hits, total, cs2, spp, base,
                                    resX[c], diffraction ? 1 : 0, seed);
             cudaCheckKernel("photon-gather");
+            // Live view: after a chunk, hand the host the frame-so-far so it can refresh the
+            // window/preview. Throttle to ~10 Hz (a high-res gather chunks one spp at a time,
+            // which is far finer than the eye needs) but always report the completed frame.
+            if (live) {
+                long long done = base + cs2;
+                bool frameDone = (done >= spp);
+                auto now = std::chrono::steady_clock::now();
+                if (frameDone || std::chrono::duration<double>(now - lastReport).count() >= 0.1) {
+                    downloadFilm(c, d_film, d_hits, npix);
+                    if (prog->report(out[c], done, frameDone)) stopped = true;
+                    lastReport = now;
+                    if (stopped) break;
+                }
+            }
         }
-        std::vector<double> film(npix * 3);
-        CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < npix; ++i)
-            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+        downloadFilm(c, d_film, d_hits, npix);   // ensure out[c] holds the final accumulation
         cudaFree(d_film); cudaFree(d_hits);
         if (nc > 1) {   // watchable per-frame progress on a multi-camera (flythrough) render
             std::printf("\r[camera] mode-M GPU gather %d/%d ...", c + 1, nc);

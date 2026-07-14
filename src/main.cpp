@@ -3179,10 +3179,14 @@ static int run(int argc, char** argv) {
         else if (rc.mode == 'M' && plainRender)                               groupM.push_back(i);
         else                                                                  restIdx.push_back(i);
     }
-    // A single-camera group has nothing to share — fold it back into the per-camera path.
+    // A single-camera forward group has nothing to share — fold it back into the per-camera
+    // path (models A/B still get the GPU there via renderForwardCuda).
     if (groupB.size() < 2) { for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
     if (groupA.size() < 2) { for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
-    if (groupM.size() < 2) { for (int i : groupM) restIdx.push_back(i); groupM.clear(); }
+    // Mode M is different: the per-camera fallback is CPU-only, so the shared photon-map path
+    // is the ONLY GPU route for mode M and it handles a single camera fine. Keep even one
+    // plain mode-M camera here so `-camera #N`/`near=`/name can aim the live window at one
+    // frame of a long camera_curve and still render it on the GPU.
     std::sort(restIdx.begin(), restIdx.end());
 
     bool sharedWriteFail = false;
@@ -3251,7 +3255,21 @@ static int run(int argc, char** argv) {
                             "photons, radius %.4g (light=%s) ...\n",
                             cudaDeviceName(), cams.size(), N, radius, lightLabel);
                 EnergyReport e;
-                auto films = renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e, diffraction, spp);
+                // Drive the live window (per the always-`-window` rule): the shared gather
+                // reports each frame's converging film here so the window shows it build up
+                // and, on a flythrough, flips through the frames as they complete. Only armed
+                // when a window is open so a headless batch pays no extra device->host copies.
+                SppProgress liveProg;
+                if (g_showWindow) {
+                    const double liveExp = toRender[idx[0]].exposure;
+                    liveProg.report = [&, liveExp](const Film& f, long long sppDone, bool) -> bool {
+                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute);
+                        return g_stopRequested != 0;   // window closed -> stop after this chunk
+                    };
+                }
+                auto films = renderPhotonMapSharedCuda(scene, cams, rxs, rys, N, radius, e,
+                                                       diffraction, spp,
+                                                       g_showWindow ? &liveProg : nullptr);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,

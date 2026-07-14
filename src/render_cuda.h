@@ -82,10 +82,16 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // SUM over `spp` (display divides by spp: writeFilm(film, spp)). Only the DIRECT density
 // estimate is implemented (final gather stays on the CPU). Requires cudaAvailable() &&
 // cudaPhotonMapSupported(scene) and pinhole cameras; otherwise returns empty films.
+// When `prog` is non-null the per-camera gather reports its converging film through
+// prog->report(sumFilm, sppDone, final) — the same hook modes R/D use — so the host can
+// drive the live window / preview as each frame builds up (final is true on the chunk that
+// completes a camera). Returning true from report() stops the render after the current
+// chunk (e.g. the live window was closed). A null `prog` renders silently as before.
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
-                                            bool diffraction, long long spp);
+                                            bool diffraction, long long spp,
+                                            const SppProgress* prog = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
