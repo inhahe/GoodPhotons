@@ -3429,9 +3429,29 @@ static int run(int argc, char** argv) {
     // camera from it. This is where the photon map pays off over per-camera backward
     // tracing — the (expensive) forward photon flight amortizes across all frames.
     auto runSharedPhotonMap = [&](const std::vector<int>& idx) {
-        if (idx.empty()) return;
+        if (idx.empty() || g_stopRequested) return;
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
+        // Trap Ctrl-C for the whole mode-M gather. Without this the default SIGINT action
+        // terminates the process, which on a -window-less / backgrounded run would abruptly
+        // kill a live CUDA context mid-gather — the exact scenario cudaGracefulShutdown()
+        // exists to avoid (async nvlddmkm teardown BSOD). With the handler, an interrupt
+        // just sets g_stopRequested; the gather finishes the current frame (the writeFrame /
+        // liveProg callbacks and the CPU loop below both poll it), returns, and main() runs
+        // the orderly teardown. The RAII guard restores the prior handlers on every exit
+        // path (including the GPU branch's early return). A window close already routes
+        // through the same g_stopRequested via liveWindowUpdate.
+        struct SigGuard {
+            void (*prevInt)(int) = std::signal(SIGINT, onInterrupt);
+#ifdef SIGBREAK
+            void (*prevBrk)(int) = std::signal(SIGBREAK, onInterrupt);
+#endif
+            ~SigGuard() { std::signal(SIGINT, prevInt);
+#ifdef SIGBREAK
+                          std::signal(SIGBREAK, prevBrk);
+#endif
+            }
+        } sigGuard;
 #ifdef HAVE_CUDA
         // GPU photon map: build the map once on the device and gather every frame there —
         // the same amortization as the CPU shared path, but the (expensive) gather runs on
@@ -3509,6 +3529,10 @@ static int run(int argc, char** argv) {
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — images "
                                  "will be black.\n");
         for (size_t k = 0; k < idx.size(); ++k) {
+            // Poll the interrupt between frames: a window close / Ctrl-C sets g_stopRequested,
+            // and we stop after finishing (writing) the current frame rather than abandoning
+            // the whole flythrough or abruptly terminating a live render mid-gather.
+            if (g_stopRequested) break;
             const RenderCam& rc = toRender[idx[k]];
             Film f = renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, spp,
                                         nThreads, diffraction, /*maxBounce*/32, 0, g_pmFinalGather);

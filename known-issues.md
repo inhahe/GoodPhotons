@@ -5,19 +5,28 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — TODO
+### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14
 
-The shared photon-map path (mode M, both CPU and GPU) now writes each frame to disk the
-moment its gather completes (crash-safe incremental output; see 2026-07-14 fix). The
-shared **forward** models A/B (`renderForwardShared` / `renderForwardSharedCuda`, dispatched
-from `main.cpp runSharedGroup`) do NOT: they trace one photon set that splats to every
-camera simultaneously, so all films finish together and are written in a single loop at the
-end. A long forward-mode flythrough (large `-n`, many cameras) that is interrupted/crashes
-mid-pass therefore loses everything. **Proper fix:** chunk the N-photon pass, accumulate
-into the per-camera films, and every `-interval` seconds write all current films to disk
-(and support `-resume` from them), mirroring how the single-camera chunked modes (R/D,
-budgeted forward) already checkpoint. Lower priority than mode M was because the gallery
-flythrough renders in mode M; revisit if forward-mode flythroughs become common.
+With a very dense saved map (the 60M-photon gallery map deposits ~58.3M photons), each
+per-camera density-estimate gather is expensive (~90–120 s/frame at 960×540, 48 spp on a
+4090), so a 180-frame flythrough runs ~3–4.5 h. The dense map already yields a smooth
+density estimate, so most of the per-frame spp is spent on anti-aliasing rather than noise
+reduction. **Tuning opportunity:** once the map is saved (`-savemap`), re-gather via
+`-loadmap` at reduced spp (~16–20) for roughly a 2–3× speedup with near-identical quality
+(the map deposit — the physically expensive part — is skipped entirely). Not a bug; a
+knob worth remembering when iterating on camera angles / radius on a fixed map.
+
+### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — FIXED 2026-07-14
+
+The shared photon-map path (mode M, both CPU and GPU) writes each frame to disk the moment
+its gather completes (crash-safe incremental output). The shared **forward** models A/B
+(`renderForwardShared` / `renderForwardSharedCuda`, dispatched from `main.cpp runSharedGroup`)
+now do too: `runSharedGroup` was rewritten to chunk the N-photon pass (folding a per-chunk
+`seedBase` into the RNG so successive chunks draw independent photons and seedBase==0 stays
+bit-identical), accumulate into per-camera SUM films, write all current films + per-camera
+`.ftbuf` checkpoints every `-interval` seconds, and support `-resume` from them — mirroring
+the single-camera chunked modes. Verified GPU+CPU bit-identity vs standalone, checkpoint,
+resume, time budget, and energy conservation (sum/emitted = 1.000000). See commit d43fb6b.
 
 ### System BSOD/reboot on GPU context teardown (nvlddmkm.sys driver bug) — MITIGATED 2026-07-14
 
@@ -72,6 +81,17 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
    TDR fully disabled.) Verified present in the registry; **requires a reboot** to take
    effect. Revert with `TdrLevel=0`. Also worth doing: update the NVIDIA driver (591.86 is
    months old) or DDU clean-reinstall.
+4. **App-side follow-up (done 2026-07-14):** the shared **mode-M** gather
+   (`main.cpp runSharedPhotonMap`) was the ONE render path that never installed a SIGINT
+   handler — every other mode wraps its loop in `signal(SIGINT, onInterrupt)`, but this one
+   relied on the default terminate action. A backgrounded / headless Ctrl-C therefore
+   abruptly killed the live CUDA context mid-gather instead of routing through
+   `g_stopRequested` + `cudaGracefulShutdown()` — the exact abrupt-teardown scenario above.
+   Fixed with a `SigGuard` RAII (installs SIGINT+SIGBREAK on entry, restores on every exit
+   path incl. the GPU early-return) plus stop-checks: the GPU path's `writeFrame`/`liveProg`
+   callbacks already return `g_stopRequested`, and the CPU fallback gather loop now breaks on
+   `g_stopRequested` between frames. So an interrupt now finishes the current frame, writes
+   it, and returns for the orderly teardown.
 
 ## Recently fixed
 
