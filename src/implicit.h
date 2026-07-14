@@ -213,6 +213,7 @@ enum class Container : int { Box = 0, Sphere = 1 };
 struct Implicit {
     std::vector<FieldNode> nodes;   // postfix field expression
     std::vector<PatNode> exprNodes; // shared pool backing FieldOp::Expr leaves (f(x,y,z))
+    std::string name;               // authored ftsl block name (used to name -export-mesh groups)
     int    matId = 0;
     Aabb   bounds;                  // conservative world AABB (BVH leaf box + ray clip)
     // Container shape + cap policy (expression isosurfaces only; SDF/CSG leaves are

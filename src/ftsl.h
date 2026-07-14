@@ -1668,6 +1668,7 @@ private:
         }
         im.uvBounds = im.bounds;
         im.uvBoundsSet = true;
+        im.name = b.name;                         // authored name -> -export-mesh group name
         L.scene.implicits.push_back(std::move(im));
         if (!b.name.empty()) implicitByName_[b.name] = (int)L.scene.implicits.size() - 1;
         return true;

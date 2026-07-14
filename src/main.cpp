@@ -2975,7 +2975,21 @@ static int run(int argc, char** argv) {
                 std::printf("[export-mesh]   decimated: %zu -> %zu tris (target %.0f%%)\n",
                             before, m.tri.size() / 3, mo.decimate * 100.0);
             }
-            groups.emplace_back("isosurface_" + std::to_string(k), std::move(m));
+            // Name the OBJ group after the object's authored ftsl name when it has
+            // one; fall back to isosurface_<k> for unnamed blocks. Sanitise to a safe
+            // OBJ group token (OBJ `g` names can't contain whitespace) and de-duplicate.
+            std::string gname = scene.implicits[k].name;
+            for (char& c : gname) { if (std::isspace((unsigned char)c)) c = '_'; }
+            if (gname.empty()) gname = "isosurface_" + std::to_string(k);
+            {
+                std::string base = gname; int dup = 1;
+                auto taken = [&](const std::string& n) {
+                    for (const auto& g : groups) if (g.first == n) return true;
+                    return false;
+                };
+                while (taken(gname)) gname = base + "_" + std::to_string(++dup);
+            }
+            groups.emplace_back(std::move(gname), std::move(m));
         }
         bool ok = isomesh::writeObj(exportMeshPath, groups, logfn);
         return ok ? 0 : 1;
