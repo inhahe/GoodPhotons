@@ -55,9 +55,8 @@
     <div class="row">
       <label>model</label>
       <select id="model">
-        <option value="bottle">Classic bottle (sphere-chain SDF)</option>
+        <option value="bottle">Classic bottle (bulb + swept-tube neck)</option>
         <option value="quartic">Algebraic quartic (POV-Ray)</option>
-        <option value="fig8">Figure-8 immersion</option>
       </select>
       <div class="desc" id="modelDesc"></div>
     </div>
@@ -65,14 +64,19 @@
     <!-- ============ CLASSIC BOTTLE (default) ============ -->
     <div class="mgroup" data-m="bottle">
       <div class="row">
-        <label>wall / tube thickness <b id="vbt">1.00</b></label>
-        <input id="bt" type="range" min="0.55" max="1.6" step="0.01" value="1.00">
-        <div class="desc">scales every tube radius — thin = delicate glass, fat = chunky</div>
+        <label>body size (bulb radius) <b id="vbs">0.55</b></label>
+        <input id="bs" type="range" min="0.40" max="0.72" step="0.005" value="0.55">
+        <div class="desc">the round belly — bigger = fatter, more spherical bulb</div>
       </div>
       <div class="row">
-        <label>blend smoothness (k) <b id="vbk">0.040</b></label>
-        <input id="bk" type="range" min="0.01" max="0.12" step="0.005" value="0.040">
-        <div class="desc">how softly the chain fuses; higher = more molten</div>
+        <label>neck thickness (tube radius) <b id="vnt">0.110</b></label>
+        <input id="nt" type="range" min="0.05" max="0.20" step="0.005" value="0.110">
+        <div class="desc">the swept tube that arcs over — independent of the body</div>
+      </div>
+      <div class="row">
+        <label>blend smoothness (k) <b id="vbk">0.020</b></label>
+        <input id="bk" type="range" min="0.005" max="0.08" step="0.005" value="0.020">
+        <div class="desc">how softly the neck fuses into the bulb</div>
       </div>
     </div>
 
@@ -107,19 +111,6 @@
         <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
         <button class="preset" data-p="2.7,1.0,9,16">low re-entry</button>
         <button class="preset" data-p="2.0,1.2,9,16">big body</button>
-      </div>
-    </div>
-
-    <!-- ============ FIGURE-8 IMMERSION ============ -->
-    <div class="mgroup" data-m="fig8" hidden>
-      <div class="row">
-        <label>R₀ — main loop radius <b id="vf0">0.70</b></label>
-        <input id="f0" type="range" min="0.30" max="1.40" step="0.01" value="0.70">
-      </div>
-      <div class="row">
-        <label>A — figure-8 tube size <b id="vfa">0.50</b></label>
-        <input id="fa" type="range" min="0.25" max="0.90" step="0.01" value="0.50">
-        <div class="desc">a genuine immersion — reads as a bottle in profile, a twisted torus from the side</div>
       </div>
     </div>
 
@@ -166,34 +157,33 @@ const cv = document.getElementById('gl');
 const gl = cv.getContext('webgl2', {antialias:false, preserveDrawingBuffer:true});
 if (!gl) { document.body.innerHTML = '<p style="padding:20px">WebGL2 not available in this browser.</p>'; }
 
-// The iconic "glassblower's" Klein bottle, traced as a chain of spheres (object-local,
-// +Y up). smooth_union of these = an SDF that reads as the classic bottle: vase body,
-// thin neck arcing over the top and diving back into the belly. [x,y,z,radius].
-const BOTTLE = [
-  [ 0.00,-0.75, 0.00, 0.300],
-  [ 0.00,-0.55, 0.00, 0.360],
-  [ 0.00,-0.35, 0.00, 0.380],
-  [ 0.00,-0.15, 0.00, 0.360],
-  [ 0.00, 0.05, 0.00, 0.300],
-  [ 0.00, 0.22, 0.00, 0.220],
-  [ 0.00, 0.36, 0.00, 0.160],
-  [ 0.02, 0.52, 0.00, 0.115],
-  [ 0.06, 0.68, 0.00, 0.105],
-  [ 0.16, 0.80, 0.00, 0.100],
-  [ 0.30, 0.84, 0.00, 0.098],
-  [ 0.43, 0.78, 0.00, 0.097],
-  [ 0.50, 0.64, 0.00, 0.097],
-  [ 0.50, 0.46, 0.00, 0.098],
-  [ 0.44, 0.28, 0.00, 0.100],
-  [ 0.33, 0.10, 0.00, 0.105],
-  [ 0.20,-0.06, 0.00, 0.110],
-  [ 0.08,-0.18, 0.00, 0.115],
-  [ 0.00,-0.28, 0.00, 0.120],
+// The iconic "glassblower's" Klein bottle as a signed-distance field: a round bulb
+// (one sphere) plus a smooth swept-tube neck that rises from the top, arcs over,
+// stands clear of the body and dives back into the side. The neck is the polyline
+// below swept by a constant-radius sphere (an exact rounded tube — no visible lumps).
+// Body size and neck thickness are independent uniforms. Object-local, +Y up, z=0.
+const BODY_C = [0.0, -0.25, 0.0];        // bulb centre (radius = body-size slider)
+const NECK = [                            // neck centreline (radius = neck slider)
+  [ 0.00, -0.10, 0.00],
+  [ 0.00,  0.18, 0.00],
+  [ 0.00,  0.40, 0.00],
+  [ 0.04,  0.58, 0.00],
+  [ 0.14,  0.71, 0.00],
+  [ 0.30,  0.76, 0.00],
+  [ 0.46,  0.71, 0.00],
+  [ 0.59,  0.57, 0.00],
+  [ 0.66,  0.37, 0.00],
+  [ 0.64,  0.17, 0.00],
+  [ 0.55, -0.01, 0.00],
+  [ 0.40, -0.14, 0.00],
+  [ 0.22, -0.19, 0.00],
+  [ 0.07, -0.12, 0.00],
 ];
 const bottleGLSL =
-  'const int NB = ' + BOTTLE.length + ';\n' +
-  'const vec4 BOTTLE[' + BOTTLE.length + '] = vec4[' + BOTTLE.length + '](\n' +
-  BOTTLE.map(s => '  vec4(' + s.map(v => v.toFixed(3)).join(',') + ')').join(',\n') + ');';
+  'const int NN = ' + NECK.length + ';\n' +
+  'const vec3 BODY_C = vec3(' + BODY_C.map(v=>v.toFixed(3)).join(',') + ');\n' +
+  'const vec3 NECK[' + NECK.length + '] = vec3[' + NECK.length + '](\n' +
+  NECK.map(s => '  vec3(' + s.map(v => v.toFixed(3)).join(',') + ')').join(',\n') + ');';
 
 const VS = `#version 300 es
 in vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
@@ -205,8 +195,8 @@ uniform vec2  uRes;
 uniform vec3  uCam;      // camera position (object space)
 uniform mat3  uBasis;    // right, up, forward
 uniform float uA,uB,uC,uD,uL,uR;
-uniform float uThick,uBk,uR0,uAt;
-uniform int   uModel;    // 0 = bottle (SDF), 1 = quartic, 2 = figure-8
+uniform float uBodyR,uNeckR,uBk;
+uniform int   uModel;    // 0 = bottle (SDF), 1 = quartic
 uniform int   uSteps;
 uniform int   uCap;
 const int MAXSTEPS = 512;
@@ -221,38 +211,26 @@ float fieldP(vec3 p){
   return bd*(A*A - uC*p.z*p.z) + uD*p.x*p.z*A;
 }
 
-// ---- model 0: classic bottle, smooth-union of spheres (a signed distance field) ----
+// ---- model 0: rounded bulb + smooth swept-tube neck (a signed distance field) ----
 float smin(float a, float b, float k){
   float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
   return mix(b, a, h) - k*h*(1.0-h);
 }
-float field_bottle(vec3 p){
-  float d = 1e9;
-  for (int i=0;i<NB;i++){
-    vec4 s = BOTTLE[i];
-    float di = length(p - s.xyz) - s.w*uThick;
-    d = smin(d, di, uBk);
-  }
-  return -d;               // interior (d<0) -> field>0
+float sdCapsule(vec3 p, vec3 a, vec3 b, float r){
+  vec3 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0);
+  return length(pa - ba*h) - r;      // exact rounded tube along the segment
 }
-
-// ---- model 2: figure-8 immersion (Gerono lemniscate swept with a half-twist) ----
-float field_fig8(vec3 p){
-  float th = 0.5*atan(p.z, p.x);
-  float ct = cos(th), st = sin(th);
-  float s = length(p.xz) - uR0;
-  float w = p.y;
-  float inv = 1.0/uAt;
-  float X = (s*ct + w*st)*inv;
-  float Y = (w*ct - s*st)*inv;
-  float F = Y*Y - 4.0*X*X*(1.0 - X*X);
-  return -F;               // solid F<0 -> field>0
+float field_bottle(vec3 p){
+  float body = length(p - BODY_C) - uBodyR;          // the round bulb
+  float neck = 1e9;                                   // swept-sphere tube (no lumps)
+  for (int i=0;i<NN-1;i++) neck = min(neck, sdCapsule(p, NECK[i], NECK[i+1], uNeckR));
+  return -smin(body, neck, uBk);                      // interior (d<0) -> field>0
 }
 
 // solid interior where field > 0 (ftrace's expr < 0 convention, negated)
 float field(vec3 p){
   if (uModel==0) return field_bottle(p);
-  if (uModel==2) return field_fig8(p);
   return fieldP(p) - uL;
 }
 
@@ -353,38 +331,36 @@ gl.vertexAttribPointer(ploc, 2, gl.FLOAT, false, 0, 0);
 
 const U = {};
 ['uRes','uCam','uBasis','uA','uB','uC','uD','uL','uR','uSteps','uCap',
- 'uThick','uBk','uR0','uAt','uModel']
+ 'uBodyR','uNeckR','uBk','uModel']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 // ---- controls ----
 const el = id => document.getElementById(id);
 const ctl = { model:el('model'),
               a:el('a'), b:el('b'), c:el('c'), d:el('d'), L:el('L'),
-              bt:el('bt'), bk:el('bk'), f0:el('f0'), fa:el('fa'),
+              bs:el('bs'), nt:el('nt'), bk:el('bk'),
               R:el('R'), S:el('S') };
 const val = { a:el('va'), b:el('vb'), c:el('vc'), d:el('vd'), L:el('vL'),
-              bt:el('vbt'), bk:el('vbk'), f0:el('vf0'), fa:el('vfa'),
+              bs:el('vbs'), nt:el('vnt'), bk:el('vbk'),
               R:el('vR'), S:el('vS') };
 const cap = el('cap'), spin = el('spin');
 
-const MODEL_IDX  = { bottle:0, quartic:1, fig8:2 };
-const MODEL_R    = { bottle:1.35, quartic:1.10, fig8:1.45 };   // default clip radius per model
+const MODEL_IDX  = { bottle:0, quartic:1 };
+const MODEL_R    = { bottle:1.05, quartic:1.10 };   // default clip radius per model
 const MODEL_DESC = {
-  bottle: "The iconic glassblower's Klein bottle: a vase whose thin neck arcs over the top, "
-        + "pierces the wall and opens back into the belly. Built as a smooth union of spheres "
-        + "(a signed-distance field), so it also exports to a clean watertight mesh.",
+  bottle: "The iconic glassblower's Klein bottle: a round bulb whose neck rises from the top, "
+        + "arcs over, stands clear of the body and dives back into the side. The bulb is one "
+        + "sphere and the neck is a smooth swept tube — body and neck sized independently, and "
+        + "it exports to a clean watertight mesh.",
   quartic: "Ian Stewart's quartic — exactly POV-Ray's classic klein.pov isosurface (a=2, b=1, "
         + "c=8, d=16). Mathematically a Klein bottle, but it renders as a smooth blob, never the "
         + "familiar bottle shape, no matter how you tune it.",
-  fig8: "The figure-8 immersion — a Gerono lemniscate (∞-shaped cross-section) swept around a "
-        + "circle with a half-twist. A genuine Klein bottle: bottle-like in profile, a twisted "
-        + "torus from other angles.",
 };
 
 function nums(){
   return { model: ctl.model.value,
            a:+ctl.a.value, b:+ctl.b.value, c:+ctl.c.value, d:+ctl.d.value, L:+ctl.L.value,
-           bt:+ctl.bt.value, bk:+ctl.bk.value, f0:+ctl.f0.value, fa:+ctl.fa.value,
+           bs:+ctl.bs.value, nt:+ctl.nt.value, bk:+ctl.bk.value,
            R:+ctl.R.value, S:+ctl.S.value };
 }
 function refreshLabels(){
@@ -392,8 +368,8 @@ function refreshLabels(){
   val.a.textContent = n.a.toFixed(2); val.b.textContent = n.b.toFixed(2);
   val.c.textContent = n.c.toFixed(1); val.d.textContent = n.d.toFixed(1);
   val.L.textContent = n.L.toFixed(2);
-  val.bt.textContent = n.bt.toFixed(2); val.bk.textContent = n.bk.toFixed(3);
-  val.f0.textContent = n.f0.toFixed(2); val.fa.textContent = n.fa.toFixed(2);
+  val.bs.textContent = n.bs.toFixed(2); val.nt.textContent = n.nt.toFixed(3);
+  val.bk.textContent = n.bk.toFixed(3);
   val.R.textContent = n.R.toFixed(2);  val.S.textContent = n.S.toFixed(0);
   updateSnippet(n);
 }
@@ -420,7 +396,6 @@ document.querySelectorAll('.preset').forEach(btn=>{
 
 function updateSnippet(n){
   if (n.model === 'bottle')  { el('snippet').textContent = snippetBottle(n); return; }
-  if (n.model === 'fig8')    { el('snippet').textContent = snippetFig8(n);   return; }
   el('snippet').textContent = snippetQuartic(n);
 }
 
@@ -447,40 +422,29 @@ isosurface {
 }`;
 }
 
-function snippetFig8(n){
-  const R0 = n.f0.toFixed(3), inv = (1/n.fa).toFixed(4);
-  const th = `0.5*atan2(z,x)`;
-  const s  = `(sqrt(x*x+z*z)-${R0})`;
-  const Y  = `((y*cos(${th}) - ${s}*sin(${th}))*${inv})`;
-  const X  = `((${s}*cos(${th}) + y*sin(${th}))*${inv})`;
-  const F  = `${Y}*${Y} - 4.0*${X}*${X}*(1.0 - ${X}*${X})`;
-  const expr = `clamp( ${F}, -4.0, 4.0 )`;
-  const scale = 1.0;
-  const rWorld = (scale * n.R).toFixed(3);
-  return `# Klein bottle — figure-8 immersion (Gerono lemniscate swept with a half-twist)
-isosurface {
-    material glass
-    function {
-        expr "${expr}"
-        scale ${scale}   translate 0 1.25 0   rotate 8 22 0
-    }
-    contained_by { sphere { center 0 1.25 0  radius ${rWorld} } }
-    max_gradient 30
-    open
-}`;
-}
-
 function snippetBottle(n){
-  const t = n.bt;
-  const rows = BOTTLE.map(s =>
-    `        sphere { center ${s[0].toFixed(2)} ${s[1].toFixed(2)} ${s[2].toFixed(2)}` +
-    `  radius ${(s[3]*t).toFixed(3)} }`).join('\n');
-  return `# Klein bottle — classic "glassblower" form, smooth-union of spheres (SDF, exports cleanly)
+  const Rb = n.bs, Rn = n.nt;
+  const rows = [];
+  rows.push(`        # round bulb`);
+  rows.push(`        sphere { center ${BODY_C[0].toFixed(2)} ${BODY_C[1].toFixed(2)} ${BODY_C[2].toFixed(2)}  radius ${Rb.toFixed(3)} }`);
+  rows.push(`        # neck: a smooth swept tube — rounded joints + oriented cylinders`);
+  for (const p of NECK)
+    rows.push(`        sphere { center ${p[0].toFixed(3)} ${p[1].toFixed(3)} ${p[2].toFixed(2)}  radius ${Rn.toFixed(3)} }`);
+  for (let i=0;i<NECK.length-1;i++){
+    const a=NECK[i], b=NECK[i+1];
+    const dx=b[0]-a[0], dy=b[1]-a[1];
+    const len=Math.hypot(dx,dy);
+    const mx=(a[0]+b[0])/2, my=(a[1]+b[1])/2;
+    const deg=Math.atan2(-dx, dy)*180/Math.PI;    // orient local +y along the segment (z-rot)
+    rows.push(`        cylinder { radius ${Rn.toFixed(3)}  height ${len.toFixed(3)}` +
+              `  translate ${mx.toFixed(3)} ${my.toFixed(3)} 0  rotate 0 0 ${deg.toFixed(2)} }`);
+  }
+  return `# Klein bottle — round bulb + smooth swept-tube neck (SDF; body & neck sized independently)
 isosurface {
     material glass
-    translate 0 1.15 0   scale 1.0   rotate 0 25 0
+    translate 0 1.05 0   scale 1.0   rotate 0 25 0
     smooth_union { k ${n.bk.toFixed(3)}
-${rows}
+${rows.join('\n')}
     }
 }`;
 }
@@ -505,15 +469,19 @@ const kTet    = [[0,1,5,6],[0,1,2,6],[0,4,5,6],[0,4,7,6],[0,3,2,6],[0,3,7,6]];
 function makeSolid(n){
   if (n.model === 'bottle'){
     const smin = (a,b,k)=>{ const h=Math.max(0,Math.min(1,0.5+0.5*(b-a)/k)); return (b + (a-b)*h) - k*h*(1-h); };
-    return (x,y,z)=>{ let d=1e9;
-      for (const s of BOTTLE){ const di = Math.hypot(x-s[0],y-s[1],z-s[2]) - s[3]*n.bt; d = smin(d,di,n.bk); }
-      return -d; };
-  }
-  if (n.model === 'fig8'){
-    return (x,y,z)=>{ const th=0.5*Math.atan2(z,x), ct=Math.cos(th), st=Math.sin(th);
-      const s=Math.hypot(x,z)-n.f0, w=y, inv=1/n.fa;
-      const X=(s*ct+w*st)*inv, Y=(w*ct-s*st)*inv;
-      return -(Y*Y - 4*X*X*(1 - X*X)); };
+    const cap = (px,py,pz,a,b,r)=>{        // segment SDF (exact rounded tube)
+      const bax=b[0]-a[0], bay=b[1]-a[1], baz=b[2]-a[2];
+      const pax=px-a[0], pay=py-a[1], paz=pz-a[2];
+      let h=(pax*bax+pay*bay+paz*baz)/(bax*bax+bay*bay+baz*baz);
+      h=Math.max(0,Math.min(1,h));
+      return Math.hypot(pax-bax*h, pay-bay*h, paz-baz*h) - r;
+    };
+    return (x,y,z)=>{
+      let body = Math.hypot(x-BODY_C[0], y-BODY_C[1], z-BODY_C[2]) - n.bs;
+      let neck = 1e9;
+      for (let i=0;i<NECK.length-1;i++) neck = Math.min(neck, cap(x,y,z, NECK[i], NECK[i+1], n.nt));
+      return -smin(body, neck, n.bk);
+    };
   }
   return (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-n.a*y-n.b, bd=S+n.a*y-n.b;
     return (bd*(A*A - n.c*z*z) + n.d*x*z*A) - n.L; };
@@ -607,8 +575,7 @@ function buildMesh(n, N){
 function toOBJ(pos, nrm, tris, scale, n){
   const P=[];
   P.push('# Klein bottle isosurface — exported from klein_explorer.html');
-  const desc = n.model==='bottle' ? `bottle thickness=${n.bt} k=${n.bk}`
-             : n.model==='fig8'   ? `figure-8 R0=${n.f0} A=${n.fa}`
+  const desc = n.model==='bottle' ? `bottle body=${n.bs} neck=${n.nt} k=${n.bk}`
              : `quartic a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L}`;
   P.push(`# model=${n.model}  ${desc}  clip_radius=${n.R}`);
   P.push('# watertight marching-tetrahedra mesh, +Y up, 1 unit = 1 cm (Unreal)');
@@ -653,8 +620,7 @@ el('export').addEventListener('click', ()=>{
       const scale = targetCm / dim;
       const obj = toOBJ(m.pos, m.nrm, m.tris, scale, n);
       const nv = m.pos.length/3, nt = m.tris.length/3;
-      const fn = n.model==='bottle' ? `klein_bottle_t${n.bt.toFixed(2)}.obj`
-               : n.model==='fig8'   ? `klein_fig8_R${n.f0.toFixed(2)}_A${n.fa.toFixed(2)}.obj`
+      const fn = n.model==='bottle' ? `klein_bottle_b${n.bs.toFixed(2)}_n${n.nt.toFixed(2)}.obj`
                : `klein_quartic_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
       downloadText(fn, obj);
       const dt = ((performance.now()-t0)/1000).toFixed(1);
@@ -713,8 +679,7 @@ function frame(now){
     r[0],r[1],r[2], up[0],up[1],up[2], fwd[0],fwd[1],fwd[2] ]));
   gl.uniform1f(U.uA,n.a); gl.uniform1f(U.uB,n.b); gl.uniform1f(U.uC,n.c);
   gl.uniform1f(U.uD,n.d); gl.uniform1f(U.uL,n.L); gl.uniform1f(U.uR,n.R);
-  gl.uniform1f(U.uThick,n.bt); gl.uniform1f(U.uBk,n.bk);
-  gl.uniform1f(U.uR0,n.f0); gl.uniform1f(U.uAt,n.fa);
+  gl.uniform1f(U.uBodyR,n.bs); gl.uniform1f(U.uNeckR,n.nt); gl.uniform1f(U.uBk,n.bk);
   gl.uniform1i(U.uModel, MODEL_IDX[n.model]|0);
   gl.uniform1i(U.uSteps, n.S|0); gl.uniform1i(U.uCap, cap.checked?1:0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
