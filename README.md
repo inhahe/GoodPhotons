@@ -959,9 +959,19 @@ static scene.
 
 The `A`, `B`, and `M` cameras form **separate** shared passes (`A` perturbs the RNG
 stream during the trace, `B` doesn't, and `M` gathers backward instead of splatting).
-`A`/`B` sharing applies to plain `-n` renders with per-frame auto-exposure; `M` sharing
-applies to any plain `-n` render (including exposure-locked paths). The budget flags
-(`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera in every mode.
+`A`/`B` sharing applies to any per-frame-auto-exposed group; `M` sharing applies to any
+group (including exposure-locked paths).
+
+The `A`/`B` shared pass is **crash-safe and resumable** just like the single-camera
+forward path: it traces the group's one photon flight in accumulation chunks (each
+seeded off the cumulative photon count so successive chunks draw independent photons),
+drives the live `-window`, and every chunk writes each camera's image plus a per-camera
+`<out>.ftbuf` checkpoint. So `-checkpoint`, `-resume`, `-time`, `-noise`, and `-forever`
+all work **while still sharing** the flight — a crash or Ctrl-C loses at most one
+interval, and `-resume` reloads every camera's film and continues (the whole group
+resumes together; a half-written or mismatched sidecar set falls back to a fresh start).
+(`-resume`/budget flags still render per camera for mode `M`, whose per-camera gather is
+independent anyway.)
 
 **Shared vs. independent randomness across cameras (matters for video and for
 side-by-side cameras).** This is the key per-mode difference in how randomness is

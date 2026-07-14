@@ -1227,7 +1227,8 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                                              const std::vector<int>& resY,
                                              long long N, int nThreads,
                                              EnergyReport& eOut, bool diffraction = true,
-                                             bool lensMode = false) {
+                                             bool lensMode = false,
+                                             unsigned long long seedBase = 0) {
     int nc = (int)cams.size();
     // Per-thread × per-camera films (each thread accumulates into its own copies to
     // avoid shared-pixel races; merged per camera at the end).
@@ -1238,10 +1239,14 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
-        // Identical seeding to renderForward (seedBase 0). For model B this makes each
-        // camera's shared film bit-identical to its standalone single-camera render; for
+        // Identical seeding to renderForward. For model B this makes each camera's shared
+        // film bit-identical to its standalone single-camera render (at seedBase 0); for
         // model A the aperture draws perturb the stream, so it matches in distribution.
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1, 0x9e3779b97f4a7c15ULL ^ (uint64_t)tid);
+        // `seedBase` (the cumulative photon count) decorrelates successive accumulation
+        // chunks so a checkpointed / resumed / budgeted shared render draws independent
+        // photons each pass; seedBase==0 reproduces the original single-shot stream.
+        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
+                            (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
         for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
@@ -3184,7 +3189,13 @@ static int run(int argc, char** argv) {
     std::vector<int> groupB, groupA, groupM, restIdx;
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
-        bool base = (rc.expGroup < 0) && plainRender;
+        // Forward A/B sharing no longer requires `plainRender`: the shared pass itself
+        // now chunks the photons, drives the live window, and writes a per-camera .ftbuf
+        // so it is crash-safe / resumable / budgetable exactly like the single-camera
+        // path (Feature B). Only the per-frame-auto-exposure requirement remains (an
+        // exposure-locked camera_path animation is still rendered un-shared so its frames
+        // don't all carry the same fixed noise realisation).
+        bool base = (rc.expGroup < 0);
         if (base && rc.mode == 'B')                                           groupB.push_back(i);
         else if (base && rc.mode == 'A' && rc.cam.projection == CAM_RECTILINEAR) groupA.push_back(i);
         // Mode M (photon map): the map is view-INDEPENDENT, so build it once and gather
@@ -3207,42 +3218,209 @@ static int run(int argc, char** argv) {
     std::sort(restIdx.begin(), restIdx.end());
 
     bool sharedWriteFail = false;
+    // Shared forward A/B pass with the SAME crash-safety machinery as the single-camera
+    // path (Feature B): the group's ONE photon flight is traced in accumulation chunks,
+    // each chunk seeded off the cumulative photon count so it draws independent photons;
+    // every camera keeps its own SUM-film accumulator; and periodically we write each
+    // camera's image plus a per-camera .ftbuf checkpoint so a crash/Ctrl-C loses at most
+    // one interval and `-resume` continues from the saved films. This mirrors the forward
+    // A/B/C loop in runRender, generalised to N cameras riding one shared flight.
     auto runSharedGroup = [&](const std::vector<int>& idx, char groupMode) {
-        if (idx.empty()) return;
+        if (idx.empty() || g_stopRequested) return;
+        const int nc = (int)idx.size();
         std::vector<Camera> cams; std::vector<int> rxs, rys;
         for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
-#ifdef HAVE_CUDA
-        if (useGpuForward)
-            std::printf("[camera] shared model-%c pass: %zu cameras, %lld photons on %s (light=%s) ...\n",
-                        groupMode, cams.size(), N, cudaDeviceName(), lightLabel);
-        else
-#endif
-            std::printf("[camera] shared model-%c pass: %zu cameras, %lld photons on %d CPU threads (light=%s) ...\n",
-                        groupMode, cams.size(), N, nThreads, lightLabel);
-        EnergyReport e;
-        std::vector<Film> films;
-#ifdef HAVE_CUDA
-        if (useGpuForward)
-            films = renderForwardSharedCuda(scene, cams, rxs, rys, N, e, diffraction, groupMode, 0, wavefront);
-        else
-#endif
-            films = renderForwardShared(scene, cams, rxs, rys, N, nThreads, e, diffraction, groupMode == 'A');
-        double tot = e.absorbed + e.sensor + e.escaped + e.residual;
-        if (e.emitted > 0.0)
-            std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
-                        e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
-                        e.residual / e.emitted, tot / e.emitted);
-        for (size_t k = 0; k < idx.size(); ++k) {
-            const RenderCam& rc = toRender[idx[k]];
-            Film disp = films[k];
-            addEnvBackground(disp, scene, rc.cam, N);     // directly-viewed sky (env scenes)
-            std::string op = outFor(rc.name);
-            if (toRender.size() > 1)
-                std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
-                            rc.name.c_str(), groupMode, rc.res, rc.resY, op.c_str());
-            if (!writeFilm(op.c_str(), disp, (double)N, rc.exposure, false, nullptr, scene.absolute))
-                sharedWriteFail = true;
+
+        // Per-camera SUM-film accumulators sharing one photon count + energy tally (all
+        // cameras see the same flight, so accN / energy are group-wide).
+        std::vector<Film> acc(nc);
+        for (int c = 0; c < nc; ++c) { acc[c].resX = rxs[c]; acc[c].resY = rys[c]; acc[c].alloc(); }
+        long long accN = 0;
+        EnergyReport accE;
+
+        const bool progressive   = timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0;
+        const bool wantCheckpoint = resume || progressive || wantCheckpointFlag;
+
+        // Resume: load every camera's sidecar. A shared flight can only resume as a whole
+        // (all cameras must be at the same photon count), so any missing / mismatched /
+        // inconsistent sidecar falls the whole group back to a fresh start.
+        if (resume) {
+            std::vector<Checkpoint> cks(nc);
+            bool ok = true; long long n0 = -1;
+            for (int c = 0; c < nc && ok; ++c) {
+                uint64_t g = checkpointGuard(scene, groupMode, rxs[c], rys[c]);
+                if (!readCheckpoint(outFor(toRender[idx[c]].name), rxs[c], rys[c], g, groupMode, cks[c])) ok = false;
+                else if (n0 < 0) n0 = cks[c].N;
+                else if (cks[c].N != n0) ok = false;
+            }
+            if (ok && n0 > 0) {
+                for (int c = 0; c < nc; ++c) acc[c] = cks[c].film;
+                accN = n0; accE = cks[0].energy;
+                std::printf("[resume] loaded shared model-%c group (%d cameras): %lld photons accumulated so far\n",
+                            groupMode, nc, accN);
+            } else if (n0 > 0) {
+                // Camera 0 loaded but a later camera was missing / mismatched: a shared
+                // flight can't resume half-done, so drop it and start fresh. (acc[] was never
+                // populated with the loaded films — that only happens in the success branch —
+                // so it is still zero here; an all-missing set stays silent like single-cam.)
+                std::fprintf(stderr, "[resume] shared model-%c group is inconsistent across cameras; starting fresh\n",
+                             groupMode);
+            }
         }
+
+        const std::string backend =
+#ifdef HAVE_CUDA
+            useGpuForward ? std::string(cudaDeviceName()) :
+#endif
+            (std::to_string(nThreads) + " CPU threads");
+
+        // One accumulation chunk of `batchN` photons across the whole group.
+        auto runBatch = [&](long long batchN) {
+            EnergyReport e;
+            std::vector<Film> films;
+#ifdef HAVE_CUDA
+            if (useGpuForward)
+                films = renderForwardSharedCuda(scene, cams, rxs, rys, batchN, e, diffraction,
+                                                groupMode, (unsigned long long)accN, wavefront);
+            else
+#endif
+                films = renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
+                                            groupMode == 'A', (unsigned long long)accN);
+            for (int c = 0; c < nc; ++c) acc[c].merge(films[c]);
+            accN += batchN;
+            accE.emitted += e.emitted; accE.absorbed += e.absorbed; accE.sensor += e.sensor;
+            accE.escaped += e.escaped; accE.residual += e.residual;
+        };
+
+        // Write every camera's image (+ optional .ftbuf). `quiet` suppresses the per-file
+        // announce for intermediate saves; these groups are per-frame-auto-exposed
+        // (expGroup < 0) so no shared exposure anchor is involved.
+        auto writeOut = [&](bool quiet) {
+            for (int c = 0; c < nc; ++c) {
+                const RenderCam& rc = toRender[idx[c]];
+                Film disp = acc[c];
+                addEnvBackground(disp, scene, rc.cam, accN);   // directly-viewed sky (env scenes)
+                std::string op = outFor(rc.name);
+                if (!quiet && toRender.size() > 1)
+                    std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
+                                rc.name.c_str(), groupMode, rc.res, rc.resY, op.c_str());
+                if (!writeFilm(op.c_str(), disp, (double)accN, rc.exposure, quiet, nullptr, scene.absolute))
+                    sharedWriteFail = true;
+                if (wantCheckpoint) {
+                    Checkpoint ck; ck.film = acc[c]; ck.N = accN; ck.energy = accE;
+                    if (!writeCheckpoint(op, ck, checkpointGuard(scene, groupMode, rxs[c], rys[c]), groupMode))
+                        std::fprintf(stderr, "[checkpoint] could not write %s\n", checkpointPath(op).c_str());
+                }
+            }
+        };
+
+        using clk = std::chrono::steady_clock;
+        // A plain fixed-N render with -window (no budget) still wants a live view, so chunk
+        // N and stop at the total; a budgeted render loops until its time/noise/forever stop.
+        const bool chunkFixed = !progressive && g_showWindow;
+        if (progressive || chunkFixed) {
+            long long batchN = chunkFixed ? std::max(1LL, ((N > 0) ? N : 2'000'000) / 16)
+                                          : ((N > 0) ? N : 2'000'000);
+            const char* resumeTag = (resume && accN > 0) ? " [resuming]" : "";
+            char noiseSuffix[64] = "";
+            if (noiseTarget > 0.0) std::snprintf(noiseSuffix, sizeof noiseSuffix, " or until ~%.2g%% noise", noiseTarget);
+            if (chunkFixed)
+                std::printf("[camera] shared model-%c pass: %d cameras, %lld photons in %lld-photon "
+                            "batches on %s (light=%s)%s — live window; Ctrl-C to stop early ...\n",
+                            groupMode, nc, N, batchN, backend.c_str(), lightLabel, resumeTag);
+            else if (runForever)
+                std::printf("[camera] shared model-%c pass: %d cameras, tracing indefinitely in "
+                            "%lld-photon batches on %s (light=%s)%s%s — Ctrl-C to stop ...\n",
+                            groupMode, nc, batchN, backend.c_str(), lightLabel, resumeTag, noiseSuffix);
+            else if (timeBudgetSec > 0.0)
+                std::printf("[camera] shared model-%c pass: %d cameras, tracing for %.3gs%s in "
+                            "%lld-photon batches on %s (light=%s)%s (Ctrl-C to stop early) ...\n",
+                            groupMode, nc, timeBudgetSec, noiseSuffix, batchN, backend.c_str(), lightLabel, resumeTag);
+            else
+                std::printf("[camera] shared model-%c pass: %d cameras, tracing until ~%.2g%% noise in "
+                            "%lld-photon batches on %s (light=%s)%s (Ctrl-C to stop early) ...\n",
+                            groupMode, nc, noiseTarget, batchN, backend.c_str(), lightLabel, resumeTag);
+            if (preview) { enableAnsiTerminal(); g_previewRows = 0; }
+            auto prev = std::signal(SIGINT, onInterrupt);
+#ifdef SIGBREAK
+            auto prevBrk = std::signal(SIGBREAK, onInterrupt);
+#endif
+            auto t0 = clk::now();
+            auto lastSave = t0;
+            long long batches = 0;
+            bool metNoise = false;
+            for (;;) {
+                runBatch(batchN); ++batches;
+                double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+                double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
+                bool stopped = g_stopRequested != 0;
+                bool timeUp  = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
+                bool wantStatus = sinceSave >= intervalSec;
+                // Graininess estimate from camera 0's lit-pixel hit count (mirrors the
+                // single-camera path); drives the status line and the -noise stop.
+                double noisePct = 0.0, meanHits = 0.0;
+                if (noiseTarget > 0.0 || wantStatus || stopped || timeUp) {
+                    double sumHits = 0.0; long long lit = 0;
+                    for (double h : acc[0].hits) if (h > 0.0) { sumHits += h; ++lit; }
+                    meanHits = lit ? sumHits / (double)lit : 0.0;
+                    noisePct = meanHits > 0.0 ? 100.0 / std::sqrt(meanHits) : 0.0;
+                }
+                bool noiseMet = (noiseTarget > 0.0 && meanHits > 0.0 && noisePct <= noiseTarget);
+                if (noiseMet) metNoise = true;
+                bool totalDone = chunkFixed && N > 0 && accN >= N;
+                bool done = stopped || timeUp || noiseMet || totalDone;
+                if (done || wantStatus) {
+                    writeOut(/*quiet*/preview);
+                    lastSave = clk::now();
+                    const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)"
+                                    : totalDone ? " (done)" : "";
+                    char st[240];
+                    if (chunkFixed)
+                        std::snprintf(st, sizeof st, "[live] %.1fs, %lld / %lld photons, %d cams, ~%.1f%% noise%s",
+                                      elapsed, accN, N, nc, noisePct, why);
+                    else if (runForever)
+                        std::snprintf(st, sizeof st, "[forever] %.1fs, %lld batches, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      elapsed, batches, accN, nc, noisePct, why);
+                    else if (timeBudgetSec > 0.0)
+                        std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      elapsed, timeBudgetSec, accN, nc, noisePct, why);
+                    else
+                        std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %.1fs, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      noiseTarget, elapsed, accN, nc, noisePct, why);
+                    if (preview || g_showWindow) {
+                        Film disp = acc[0];
+                        addEnvBackground(disp, scene, toRender[idx[0]].cam, accN);
+                        if (preview) ansiPreview(disp, (double)accN, toRender[idx[0]].exposure, st);
+                        else { std::printf("%s\n", st); std::fflush(stdout); }
+                        liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure, scene.absolute);
+                    } else { std::printf("%s\n", st); std::fflush(stdout); }
+                }
+                if (done) break;
+            }
+            std::signal(SIGINT, prev);
+#ifdef SIGBREAK
+            std::signal(SIGBREAK, prevBrk);
+#endif
+            if (g_stopRequested) std::printf("\n[stop] interrupted — images and checkpoints saved.\n");
+            else if (metNoise) std::printf("[noise] reached the ~%.2g%% target at %lld photons — images saved.\n",
+                                           noiseTarget, accN);
+            if (wantCheckpoint)
+                std::printf("[checkpoint] shared model-%c group holds %lld photons — rerun with -resume to add more\n",
+                            groupMode, accN);
+        } else {
+            // Fixed photon count, no window: one batch of N (seedBase 0 unless resumed),
+            // bit-identical to the historical single-shot shared pass.
+            std::printf("[camera] shared model-%c pass: %d cameras, %lld photons on %s (light=%s)%s ...\n",
+                        groupMode, nc, N, backend.c_str(), lightLabel, (resume && accN > 0) ? " [resuming]" : "");
+            runBatch(N);
+            writeOut(/*quiet*/false);
+        }
+
+        double tot = accE.absorbed + accE.sensor + accE.escaped + accE.residual;
+        if (accE.emitted > 0.0)
+            std::printf("[energy] absorbed=%.4f sensor=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
+                        accE.absorbed / accE.emitted, accE.sensor / accE.emitted, accE.escaped / accE.emitted,
+                        accE.residual / accE.emitted, tot / accE.emitted);
     };
     runSharedGroup(groupB, 'B');
     runSharedGroup(groupA, 'A');
