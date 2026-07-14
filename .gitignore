@@ -30,6 +30,10 @@
 /tools/.pov_noise.cpp
 /tools/.pov_portablenoise.cpp
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
 # Editor / IDE
 .vs/
 .vscode/
