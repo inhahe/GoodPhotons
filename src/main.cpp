@@ -132,6 +132,7 @@
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
 #include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
+#include "priority_audit.h"     // ahead-of-time nested-dielectric priority ambiguity warning
 #include "camera.h"
 #include "render.h"
 #include "backward.h"
@@ -2807,6 +2808,12 @@ static int run(int argc, char** argv) {
         }
         fromFtsl = true;
         std::printf("[ftsl] loaded scene from %s\n", inFile);
+        // Ahead-of-time nested-dielectric priority audit: warn where two overlapping
+        // dielectric solids can't be disambiguated (missing/equal `priority`), so the
+        // exterior IOR in the overlap would be picked arbitrarily. Read-only; renders
+        // still proceed (Level-0 uses priority where present, else assumes exterior air).
+        for (const std::string& w : pri::audit(ftslScene.scene))
+            std::fprintf(stderr, "[priority] WARNING: %s\n", w.c_str());
         if (ftslScene.photons >= 0)       N = ftslScene.photons;
         if (ftslScene.res > 0)            res = ftslScene.res;
         if (ftslScene.mode)               mode = ftslScene.mode;

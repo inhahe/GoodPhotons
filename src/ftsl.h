@@ -1062,6 +1062,11 @@ private:
         } else {
             fail("unknown material type '" + type + "'");
         }
+        // Nested-dielectric priority (§ nested dielectrics): `priority <N>` — integer,
+        // higher wins where dielectric solids overlap. Common to every material type
+        // (only consulted for dielectric-like ones); unset => the ahead-of-time audit
+        // warns if this material overlaps another dielectric without a priority.
+        if (find(b, "priority")) m.priority = (int)std::lround(dblOf(b, "priority", 0.0));
         return m;
     }
 
