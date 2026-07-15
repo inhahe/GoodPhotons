@@ -3682,10 +3682,17 @@ static int run(int argc, char** argv) {
         // fly the camera with the keyboard and read off the eye/look_at to author a
         // .ftsl camera. Six controls, all along WORLD axes: the camera EYE (x,y,z) and
         // a LOOK-AT TARGET (x,y,z) which the camera always points at and which is drawn
-        // as a red crosshair. A multi-camera flyby keeps animating (above) and is not
-        // made interactive.
-        if (g_showWindow && g_liveWin && !g_stopRequested && toRender.size() == 1) {
-            const RenderCam& rc0 = toRender.front();
+        // as a red crosshair.
+        //
+        // A multi-camera flyby animates all its frames first (the loop above) and is NOT
+        // interactive during the animation. But once it finishes, if the window is being
+        // held open (-keepwindow), we hand control to the user too — seeded from the LAST
+        // frame's camera (the one still on screen) — so the flyby doesn't just freeze on
+        // its final frame with no way to look around. Without -keepwindow a flyby is a
+        // batch sequence render, so we leave it non-interactive and let the process exit.
+        if (g_showWindow && g_liveWin && !g_stopRequested &&
+            (toRender.size() == 1 || g_keepWindow)) {
+            const RenderCam& rc0 = toRender.back();   // == the only / last-shown camera
             const int    W = rc0.res, H = rc0.resY, proj = rc0.cam.projection;
             const Vec3   eye0 = rc0.cam.eye, tgt0 = rc0.lookAt, up = rc0.up;
             const double fovY = rc0.fovY;
