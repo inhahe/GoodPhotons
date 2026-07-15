@@ -5,35 +5,63 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### Forward modes (A/B/C/D + forward passes of M/S/U) don't smooth-shade interpolated normals — NEEDS Veach adjoint correction 2026-07-15
+### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
 
-A smooth-shaded mesh (authored `vn` **or** crease-smoothed via `mesh { smooth }`)
-renders **smooth in the backward reference mode R** but **faceted in the forward
-tracer (modes A/B/C)** — verified with `scraps/_smooth_on.ftsl`: `-mode R` gives a
-clean gradient, `-mode B` shows the flat facet panels. Root cause is the classic
-**shading-normal adjoint asymmetry** (Veach §5.3): a *backward* estimator applies the
-incident cosine through the *shading* normal (`dot(Ns, wi)` in `neeLight`), so
-interpolated normals smooth the shading; a *forward/particle* tracer instead deposits
-irradiance per unit **geometric** area (photon density ∝ `cos(Ng, wi_light)`), so the
-incident term is per-facet and the shading normal only weakly modulates the outgoing
-camera cosine — the surface stays faceted. The two transport directions therefore
-**disagree** on any smooth-normal mesh (mode V would fail on such a scene). No
-correction factor exists anywhere in `render.h` today (grep confirms).
+A smooth-shaded mesh (authored `vn` **or** crease-smoothed via `mesh { smooth }`) used
+to render smooth in the backward reference mode R but **faceted in the forward modes**.
+Root cause was the **shading-normal adjoint asymmetry** (Veach §5.3): a backward
+estimator integrates the incident cosine through the *shading* normal, so interpolated
+normals smooth the shading for free; a forward/particle tracer deposits irradiance per
+**geometric** area and stays faceted.
 
-**Proper fix.** Multiply the particle throughput by Veach's shading-normal correction
-at every surface scattering vertex and camera connection in the forward tracer:
-`corr = |cos(wi,Ns)·cos(wo,Ng)| / |cos(wi,Ng)·cos(wo,Ns)|` (wi = toward the previous /
-light-side vertex = `-ray.d`; wo = the outgoing direction — the continuation dir for
-the scatter, or `toCam` for the connection). Guard the `cos(wo,Ns)` denominator against
-grazing→0 (cap the factor, as Veach does) to avoid fireflies. Apply consistently in
-`render.h` (modes A/B/C), `bdpt.h` (mode D — light subpath vertices), and the forward
-passes of `vcm.h`/`photonmap_render.h`/`sppm_render.h`, plus the GPU twins in
-`render_cuda.cu`. **Safety:** the factor is exactly 1 when `Ns == Ng`, so it cannot
-regress any non-smooth (flat / analytic) scene — the whole existing validation suite is
-untouched; validate the change by re-rendering `scraps/_smooth_on.ftsl` in `-mode B`
-(should become smooth, matching `-mode R`) and checking mode V agreement on a smooth
-mesh. This is a core-transport change that wants a dedicated, supervised pass — deferred
-from the 2026-07-15 crease-smoothing work, which correctly ships smoothing for mode R.
+**Fix shipped.** `shadingAdjointCorr(wi, wo, ns, ng)` in `geometry.h`
+(`corr = |cos(wi,Ns)·cos(wo,Ng)| / |cos(wi,Ng)·cos(wo,Ns)|`, guarded denom, exactly 1
+when Ns==Ng) is multiplied into the **particle throughput** at every non-specular
+continuation and every camera connection of the LIGHT/importance subpath:
+- `render.h` modes A/B/C — `connect`/`connectLens` splats + Diffuse/Fluorescent/
+  DiffuseTransmit continuations (shared `tracePhoton` walk, so the M/S deposit inherits it).
+- `bdpt.h` mode D — `randomWalk` (gated `mode == Importance`) + `connectBDPT` light-side `f`.
+- `vcm.h` mode U — light-subpath continuation + light-image splat + the VC connection's
+  light-vertex `fLit`. The eye/Radiance side is never corrected (it smooth-shades for free).
+- GPU twins in `render_cuda.cu` — `dShadingAdjointCorr` threaded through `connect`/
+  `connectLens`/`splatSurfaceAll` (forward tracer) and `dRandomWalk`(importance flag)/
+  `dConnectBDPT` (GPU BDPT).
+
+Validated smooth against mode R on `scraps/_smooth_on.ftsl` and the harsher
+`scraps/_iso_sphere.ftsl` (directional-lit sphere, no indirect): modes B, D (CPU+GPU),
+and U all match the mode-R gradient. Exactly 1 when Ns==Ng ⇒ every flat/analytic scene is
+bit-identical (whole existing validation suite untouched).
+
+**Surprising finding — photon-density gathers (modes M/S) did NOT need a gather-side
+correction.** An initial hypothesis added a `cos_s/cos_g` gather reweight to the mode-M
+photon-map and mode-S SPPM density estimates. Empirically this was WRONG: mode M/S already
+smooth-shade (verified matching mode R by center-column brightness profile on both the
+Cornell and isolated directional scenes, at gather radii from 0.004 to 0.017), and adding
+the reweight *introduced* facet banding. That speculative correction was reverted; M/S
+gathers are left uncorrected. See the tech-debt note below for the one place a gather-side
+correction WAS needed (VCM's vertex-merge) and why the asymmetry isn't fully understood.
+
+### TECH DEBT: VCM vertex-merge needs a gather-side shading-normal reweight that M/S don't — asymmetry not fully understood 2026-07-15
+
+Direct consequence of the DONE entry above. The mode-M photon-map and mode-S SPPM
+photon-density gathers **smooth-shade correctly with no gather-side correction** (verified
+against mode R). But mode U's **VCM vertex-merge (VM) strategy** genuinely *facets* on the
+same smooth meshes — strong full faceting on `scraps/_iso_sphere.ftsl` — even though its VM
+density estimate is mathematically the same kind of radius gather. The current fix is a
+**scoped, file-local `vmGatherCorr(wp, ns, ng) = |cos(wp,Ns)| / |cos(wp,Ng)|`** in `vcm.h`,
+multiplied into the merge's camera-side `fCam` only (the `vmNorm` carries no geometric
+cosine, so the raw VM value is as smooth as mode M — the faceting instead enters through the
+per-facet MIS coupling between the VM and VC strategies).
+
+**Why the asymmetry exists is not fully understood.** Best current hypothesis: the VM/VC
+MIS weights assume normal consistency between the merged light-vertex and camera-vertex
+BSDF evaluations, and the shading/geometric-normal mismatch breaks that assumption for VM in
+a way the standalone M/S estimators (no competing MIS strategy) never see. The **cleaner
+future fix** is to make the VM↔VC MIS-weight derivation consistent under interpolated
+normals (so no ad-hoc `fCam` reweight is needed), rather than patching `fCam`. The current
+`vmGatherCorr` is a no-op on flat tris / analytic spheres (`Ns==Ng` ⇒ ratio 1), so it
+cannot regress any existing (non-smooth) scene. Low priority — mode U smooth-shades
+correctly today; this is about *why* and a tidier derivation.
 
 ### Shading-normal geometric-hemisphere clamp only wired into mode R + the forward tracer's camera connection — REMAINING MODES 2026-07-15
 

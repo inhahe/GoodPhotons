@@ -370,7 +370,7 @@ inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, double lambda,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path) {
-    (void)cam; (void)mode;   // cam/mode reserved for future NEE-to-camera & adjoint use
+    (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;   // solid-angle density of the current ray direction
     // Nested-dielectric medium stack (Schmidt & Budge 2002): the solids the subpath is
@@ -610,6 +610,18 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         prev.pdfRev = convertDensity(pdfRevW, cur, prev);
 
         beta *= betaFactor;
+        // Veach shading-normal ADJOINT correction (§5.3) for the LIGHT (Importance)
+        // subpath only: a particle tracer deposits irradiance per GEOMETRIC area, so an
+        // interpolated shading normal must be reweighted at each non-specular vertex or
+        // the mesh facets in mode D (exactly as in modes A/B/C, render.h). `wo` points
+        // toward the previous (light-side) vertex (= Veach's wi); the sampled
+        // continuation `wi` is the outgoing direction (= Veach's wo). Exactly 1 when
+        // ns==ng, so flat triangles / analytic spheres stay bit-identical, and the eye
+        // (Radiance) subpath — which smooth-shades for free — is untouched.
+        if (mode == Mode::Importance && !delta) {
+            Vec3 ngo = (dot(cur.ng, cur.ns) >= 0.0) ? cur.ng : cur.ng * -1.0;
+            beta *= shadingAdjointCorr(wo, normalize(wi), cur.ns, ngo);
+        }
         // Spawn the continuation from the correct side of the geometric normal.
         double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
@@ -853,6 +865,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
             if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
             f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
+            // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
+            // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
+            Vec3 ngo = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            f *= shadingAdjointCorr(wo, wcam, qs.ns, ngo);
         }
         if (f <= 0.0) return 0.0;
         if (scene.occluded(connOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
@@ -930,6 +946,11 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             cosL = dot(qs.ns, w * -1.0);
             if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
             fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
+            // Adjoint shading-normal correction on the LIGHT-subpath endpoint qs (particle
+            // vertex; outgoing = w*-1 toward the eye vertex). The eye endpoint pt is a
+            // Radiance vertex and gets NO correction. 1 when ns==ng (flat/analytic).
+            Vec3 ngoL = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            fL *= shadingAdjointCorr(woL, w * -1.0, qs.ns, ngoL);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
         if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6)) return 0.0;

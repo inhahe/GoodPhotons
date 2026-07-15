@@ -59,6 +59,36 @@ inline Vec3 orientedGeoN(const Hit& h) {
     return (dot(h.ng, h.n) >= 0.0) ? h.ng : Vec3{-h.ng.x, -h.ng.y, -h.ng.z};
 }
 
+// Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT
+// `CorrectShadingNormal`, importance/light-transport mode). A BSDF evaluated with
+// an interpolated *shading* normal `ns` instead of the true *geometric* normal `ng`
+// is non-symmetric: a backward path tracer (radiance transport) gets smooth shading
+// for free, but a forward/particle tracer (light transport) deposits irradiance per
+// GEOMETRIC area and would leave the surface faceted. Multiplying the particle
+// throughput by this factor at every scattering vertex (for the sampled continuation
+// direction `wo`) and at every camera connection (for `wo` = toward the camera)
+// restores agreement, so smooth-normal meshes shade smoothly in the forward modes too.
+//
+//   corr = |cos(wi,Ns)·cos(wo,Ng)| / |cos(wi,Ng)·cos(wo,Ns)|
+//
+// with wi = direction toward the PREVIOUS (light-side) vertex (= -ray.d) and
+// wo = the outgoing direction. It is **exactly 1 when Ns == Ng** (flat triangles,
+// analytic spheres): num and denom are the identical products, so every non-smooth
+// scene is bit-identical and the whole existing validation suite is untouched.
+//
+// The grazing `cos(wo,Ns)` denominator is guarded: at a camera connection the caller
+// multiplies an existing `cosSurf = cos(wo,Ns)` term, so `cosSurf·corr` cancels that
+// factor analytically (→ cos(wo,Ng)·cos(wi,Ns)/cos(wi,Ng)) and stays bounded; the
+// explicit denom guard here only trips on a genuinely degenerate (measure-zero)
+// grazing sample, where returning 1 (no correction) is the safe, low-bias fallback.
+inline double shadingAdjointCorr(const Vec3& wi, const Vec3& wo,
+                                 const Vec3& ns, const Vec3& ng) {
+    double denom = std::fabs(dot(wi, ng)) * std::fabs(dot(wo, ns));
+    if (denom <= 1e-8) return 1.0;                 // degenerate grazing -> no correction
+    double num = std::fabs(dot(wi, ns)) * std::fabs(dot(wo, ng));
+    return num / denom;
+}
+
 inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
     const double EPS = 1e-9;
     Vec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;

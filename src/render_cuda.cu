@@ -1844,9 +1844,21 @@ __device__ static void filmAdd(double* film, double* hits, int resX, int px, int
     atomicAdd(&film[idx + 2], (double)(cieZ(lambda) * w));
     if (hits) atomicAdd(&hits[pix], 1.0);
 }
+// Device twin of geometry.h's shadingAdjointCorr (Veach §5.3 adjoint shading-normal
+// correction). Reweights a forward/particle vertex so an interpolated shading normal
+// `ns` shades smoothly instead of faceting; EXACTLY 1 when ns==ng (flat tris, analytic
+// spheres), so every flat/analytic GPU scene stays bit-identical. `wi` = toward the
+// previous (light-side) vertex, `wo` = the outgoing direction.
+__device__ static Real dShadingAdjointCorr(const DVec3& wi, const DVec3& wo,
+                                           const DVec3& ns, const DVec3& ng) {
+    Real denom = (Real)fabs((double)dot(wi, ng)) * (Real)fabs((double)dot(wo, ns));
+    if (denom <= (Real)1e-8) return (Real)1;          // degenerate grazing -> no correction
+    Real num = (Real)fabs((double)dot(wi, ns)) * (Real)fabs((double)dot(wo, ng));
+    return num / denom;
+}
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
-                               const DVec3& p, const DVec3& n, Real lambda, Real beta, Real rho,
-                               DRng& rng) {
+                               const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+                               Real lambda, Real beta, Real rho, DRng& rng) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
@@ -1856,11 +1868,13 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real f = rho / (Real)DPI;
-    // Projection-general splat: contrib = beta*f*cosSurf / (dist^2 * pixelSolidAngle).
+    // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
     // classic 1/(A_pix cos^4) form; fisheye/panoramic uses the remapped solid angle.
+    // corr is the Veach adjoint shading-normal factor (1 when ns==ng).
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
-    Real contrib = beta * f * cosSurf / (Real)((double)dist2 * solidAngle);
+    Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1892,8 +1906,8 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
 // so A and C share both scale and shape. Weight beta*rho*cosSurf*cosLens*R^2/dist^2
 // (the BRDF's 1/pi cancels the pupil pdf's pi R^2).
 __device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film, double* hits,
-                                   const DVec3& p, const DVec3& n, Real lambda, Real beta,
-                                   Real rho, DRng& rng) {
+                                   const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+                                   Real lambda, Real beta, Real rho, DRng& rng) {
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -1909,7 +1923,8 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
-    Real contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
+    Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1998,11 +2013,12 @@ struct DPhotonMap {
 // camera draws its own aperture sample, so the loop consumes RNG proportional to nCam
 // (deterministic given the camera order).
 __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int camMode,
-                                        const DVec3& p, const DVec3& n, Real lambda,
+                                        const DVec3& p, const DVec3& n, const DVec3& ng,
+                                        const DVec3& wi, Real lambda,
                                         Real beta, Real rho, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
-        else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
+        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+        else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
     }
 }
 // Append a photon record at a diffuse / translucent vertex (device twin of
@@ -2852,7 +2868,9 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // C instead catches photons that physically arrive. A spot is a point light
     // with no projected area, so it has no direct term.
     if (em.shape != 2 && em.shape != 3) {
-        splatSurfaceAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
+        // Emitter vertex: ns==ng==emitN, so the adjoint correction is identically 1
+        // (wi is irrelevant here — pass emitN).
+        splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, (Real)1, rng);
         camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
     }
 
@@ -2984,11 +3002,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Elastic splat at the incoming lambda, then a glow splat at a Stokes-shifted
         // lambda' drawn ONCE (camera-independent) — matching the CPU camSplatAll order,
         // so a multi-camera model-B pass stays bit-identical. Skipped for model C.
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         if (camMode == CAM_A || camMode == CAM_B) {
-            splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
+            splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
             if (canGlow) {
                 Real lp = sampleFluoEmit(sc, m, rng);
-                splatSurfaceAll(sc, cs, camMode, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield), rng);
+                splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lp, beta, (Real)(aEff * m.fluoYield), rng);
             }
         }
         // Stochastic interaction (fluoroInteract): elastic / reemit / absorb. Beta is
@@ -3002,7 +3022,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         } else {
             eAbsorbed += beta; return WF_TERMINATE;
         }
-        ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
+        { DVec3 wo = cosineHemisphere(h.n, rng);
+          beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
+          ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -3014,25 +3036,33 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real sum = rhoR + rhoT;
         if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
         DVec3 nb = h.n * (Real)(-1);
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
-        splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
-        splatSurfaceAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
+        // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
+        // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
+        splatSurfaceAll(sc, cs, camMode, h.p, nb,  ngo * (Real)(-1), wiPrev, lambda, beta, rhoT, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
-        // unchanged on a scatter (like the diffuse case).
+        // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
-        if (u < rhoR)      { ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE; }
-        else if (u < sum)  { ro = h.p + nb  * RAY_EPS; rd = cosineHemisphere(nb,  rng); return WF_CONTINUE; }
+        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); ro = h.p + nb  * RAY_EPS; rd = wo; return WF_CONTINUE; }
         eAbsorbed += beta; return WF_TERMINATE;
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
-        splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
-        ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
+        { DVec3 wo = cosineHemisphere(h.n, rng);
+          beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
+          ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
     }
 }
 
@@ -3733,9 +3763,13 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
 
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
 // until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
+// `importance` marks the LIGHT (particle) subpath: only then is the Veach adjoint
+// shading-normal correction applied at each non-specular vertex (mode==Importance in
+// bdpt.h). The eye (Radiance) subpath smooth-shades for free and passes false.
 __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int diffraction,
                                    DVec3 ro, DVec3 rd, double beta, double pdfDir, Real lambda,
-                                   int maxDepth, DRng& rng, DVertex* path, int& n) {
+                                   int maxDepth, DRng& rng, DVertex* path, int& n,
+                                   bool importance) {
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
@@ -3885,6 +3919,12 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         path[cur - 1].pdfRev = dConvertDensity(pdfRevW, path[cur], path[cur - 1]);
 
         beta *= betaFactor;
+        // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
+        // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
+        if (importance && !delta) {
+            DVec3 ngo = (dot(path[cur].ng, path[cur].ns) >= 0.0) ? path[cur].ng : path[cur].ng * (Real)(-1);
+            beta *= (double)dShadingAdjointCorr(wo, normalize(wi), path[cur].ns, ngo);
+        }
         double sgn = dot(wi, path[cur].ng) >= 0.0 ? 1.0 : -1.0;
         ro = path[cur].p + path[cur].ng * (Real)(sgn * 1e-6);
         rd = normalize(wi);
@@ -3923,7 +3963,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         c.delta = 1;             // no closed-form lens inverse: not connectible (t=1 off)
         path[0] = c; int n = 1;
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
-        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, lambda, maxDepth - 1, rng, path, n);
+        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
         return n;
     }
     c.p = cam.eye;
@@ -3934,7 +3974,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     DVec3 rd = normalize(cam.w + cam.u * (sx * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
-    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n);
+    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
@@ -3964,7 +4004,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     double pdfDir = cosLight / DPI;
     double betaWalk = Le * cosLight / (pdfChoice * pdfPos * pdfDir);
     DVec3 ro = y + nOut * (Real)1e-6;
-    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, lambda, maxDepth - 1, rng, path, n);
+    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, lambda, maxDepth - 1, rng, path, n, true);
     return n;
 }
 
@@ -4077,6 +4117,10 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             cosSurf = ddot(qs.ns, wcam);
             if (cosSurf <= 0.0) return 0.0;
             f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
+            // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
+            // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
+            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ);
             double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
             o = qs.p + qs.ng * (Real)(sgn * 1e-6);
         }
@@ -4153,6 +4197,10 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             cosL = ddot(qs.ns, w * (Real)-1);
             if (cosL <= 0.0) return 0.0;
             fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
+            // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
+            // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
+            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
         if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;

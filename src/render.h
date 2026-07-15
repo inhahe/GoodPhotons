@@ -421,8 +421,8 @@ struct Renderer {
     // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
-                 const Vec3& p, const Vec3& n, const Vec3& ng, double lambda, double beta,
-                 double rho, Pcg32& rng) const {
+                 const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                 double lambda, double beta, double rho, Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
@@ -438,7 +438,12 @@ struct Renderer {
 
         double f = rho / PI;
         double omega = cam.pixelSolidAngle(cosCam);
-        double contrib = beta * f * cosSurf / (dist2 * omega);
+        // Veach shading-normal adjoint correction for this particle connection
+        // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
+        // cosSurf * corr = cos(wo,Ng)*cos(wi,Ns)/cos(wi,Ng), so the grazing cosSurf
+        // cancels analytically and this stays bounded. Exactly 1 when Ns == Ng.
+        double corr = shadingAdjointCorr(wi, wdir, n, ng);
+        double contrib = beta * f * cosSurf * corr / (dist2 * omega);
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
@@ -486,8 +491,8 @@ struct Renderer {
     // the depth-of-field spread automatically. Rectilinear film mapping only — a real
     // fisheye needs a wide-angle lens element, so author fisheye with model B instead.
     void connectLens(const Scene& scene, const Camera& cam, Film& film,
-                     const Vec3& p, const Vec3& n, const Vec3& ng, double lambda, double beta,
-                     double rho, Pcg32& rng) const {
+                     const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                     double lambda, double beta, double rho, Pcg32& rng) const {
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -506,7 +511,9 @@ struct Renderer {
         if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
-        double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
+        // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
+        double corr = shadingAdjointCorr(wi, wdir, n, ng);
+        double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist);
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
@@ -541,21 +548,21 @@ struct Renderer {
 
     // Route a camera connection to the pinhole (model B) or the finite lens (model A).
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
-                  const Vec3& n, const Vec3& ng, double lambda, double beta, double rho,
-                  Pcg32& rng) const {
-        if (lensMode) connectLens(scene, cam, film, p, n, ng, lambda, beta, rho, rng);
-        else          connect(scene, cam, film, p, n, ng, lambda, beta, rho, rng);
+                  const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
+                  double rho, Pcg32& rng) const {
+        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
+        else          connect(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
     // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
     // exactly the old single-camera call (model A draws its aperture sample once here).
     void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
-                     const Vec3& n, const Vec3& ng, double lambda, double beta, double rho,
-                     Pcg32& rng) const {
+                     const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
+                     double rho, Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
-                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, lambda, beta, rho, rng);
+                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng);
     }
 
     // ===================================================================
@@ -1072,7 +1079,7 @@ struct Renderer {
         // term (its cone illuminates surfaces, which then connect to the camera).
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
-            camSplatAll(scene, cams, nCam, origin, emitN, emitN, lambda, beta, 1.0, rng);
+            camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
         }
 
@@ -1299,23 +1306,26 @@ struct Renderer {
                 }
                 case MatType::Fluorescent: {
                     double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Model-B connections: the elastic channel splats at the
                     // incoming lambda; the fluorescent channel samples one
                     // lambda' ~ M and splats the glow (albedo aEff*Q) with the
                     // camera-response evaluated at lambda' (Stokes-shifted colour).
                     if (nCam > 0 && !forwardCatch) {
-                        Vec3 ngo = orientedGeoN(h);
-                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, lambda, beta, rho, rng);
+                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
                             double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
-                            camSplatAll(scene, cams, nCam, h.p, h.n, ngo, lp, beta, aEff * m.fluoYield, rng);
+                            camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lp, beta, aEff * m.fluoYield, rng);
                         }
                     }
                     FluoroResult fr = fluoroInteract(m, lambda, rng);
                     if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return; }
                     lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
-                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
-                    continue;                           // beta unchanged (see above)
+                    Vec3 wo = cosineHemisphere(h.n, rng);
+                    beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                    ray = Ray{h.p + h.n * 1e-6, wo};
+                    continue;                           // beta otherwise unchanged (see above)
                 }
                 case MatType::DiffuseTransmit: {
                     // Two-lobe Lambertian: reflect albedo into the front hemisphere
@@ -1329,38 +1339,52 @@ struct Renderer {
                     double rhoT = clamp01(m.transmit(lambda));
                     double sum = rhoR + rhoT;
                     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
                     depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
-                        Vec3 ngo = orientedGeoN(h);
-                        camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, lambda, beta, rhoR, rng);
-                        camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, lambda, beta, rhoT, rng);
+                        camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
+                        camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
                     }
                     // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else
-                    // absorb — throughput unchanged on a scatter.
+                    // absorb — throughput unchanged on a scatter (bar the Veach adjoint
+                    // correction, which is 1 for a flat/analytic surface). |cos| in the
+                    // factor makes it lobe-agnostic, so (h.n, ngo) serve both lobes.
                     double u = rng.uniform();
-                    if (u < rhoR)      { ray = Ray{h.p + h.n * 1e-6, cosineHemisphere( h.n, rng)}; continue; }
-                    else if (u < sum)  { ray = Ray{h.p - h.n * 1e-6, cosineHemisphere(-h.n, rng)}; continue; }
+                    if (u < rhoR) {
+                        Vec3 wo = cosineHemisphere(h.n, rng);
+                        beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
+                        ray = Ray{h.p + h.n * 1e-6, wo}; continue;
+                    } else if (u < sum) {
+                        Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
+                        beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
+                        ray = Ray{h.p - h.n * 1e-6, wo}; continue;
+                    }
                     e.absorbed += beta; return;
                 }
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
                     depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), lambda, beta, rho, rng);
+                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
                     }
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.
                     if (rng.uniform() >= rho) { e.absorbed += beta; return; }
-                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
+                    Vec3 wo = cosineHemisphere(h.n, rng);
+                    beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                    ray = Ray{h.p + h.n * 1e-6, wo};
                     continue;
                 }
             }

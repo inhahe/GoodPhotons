@@ -77,6 +77,28 @@ inline Vec3 offsetOrigin(const Vec3& p, const Vec3& ng, const Vec3& dir) {
     return p + ng * (sgn * 1e-6);
 }
 
+// Gather-side shading-normal correction for the VERTEX-MERGE (VM / photon-density) strategy.
+// The VM contribution is a Jensen density estimate MIS-combined with the vertex-connection
+// (VC) strategies; on a smooth (interpolated-normal) mesh the merge reads incident flux per
+// GEOMETRIC area and shades per facet, while the reference backward path tracer (mode R) and
+// the VC strategies integrate against the SHADING cosine. Reweighting each merged light
+// vertex (incident direction `wp`, back toward its source) by cos_s/cos_g rebalances the
+// merge onto the shading cosine so mode U smooth-shades like mode R:
+//
+//   gcorr = |cos(wp, Ns)| / |cos(wp, Ng)|
+//
+// EXACTLY 1 when Ns==Ng (flat tris, analytic spheres), so every non-smooth scene — and the
+// whole existing mode-U validation suite — is bit-identical. The grazing `cos(wp,Ng)`
+// denominator is guarded (measure-zero, ~0 flux) so a degenerate sample falls back to no
+// correction. NOTE: the standalone photon-map / SPPM gathers (modes M/S) already smooth-shade
+// in this renderer and must NOT use this — only the MIS-coupled VM merge needs it. Why the
+// coupling makes the difference is logged as tech debt in known-issues.md.
+inline double vmGatherCorr(const Vec3& wp, const Vec3& ns, const Vec3& ng) {
+    double denom = std::fabs(dot(wp, ng));
+    if (denom <= 1e-8) return 1.0;
+    return std::fabs(dot(wp, ns)) / denom;
+}
+
 // A stored light-subpath vertex (only connectible/non-delta surface vertices are kept).
 struct LightVertex {
     Vec3   p;             // world position
@@ -420,6 +442,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         misArrival(dist, cosThetaIn, dVCM, dVC, dVM);
 
         Vec3 wo = normalize(prevP - h.p);        // toward the previous light vertex
+        // Geometric normal oriented onto the shading-normal side, for the Veach adjoint
+        // shading-normal correction on this LIGHT (particle) subpath (§5.3; identical role
+        // to render.h/bdpt.h). Exactly a no-op when h.n==h.ng (flat tris, analytic spheres).
+        Vec3 ngo = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
 
         // Store the vertex + connect to camera (only for connectible, non-delta surfaces).
         bool connectible = isConnectibleMat(*mp);
@@ -446,6 +472,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                         int px, py; double cc, d2c;
                         if (cam.project(h.p, px, py, cc, d2c)) {
                             double f = bsdfF(*mp, h.n, wo, wcam, lambda, scene, &h);
+                            f *= shadingAdjointCorr(wo, wcam, h.n, ngo);   // adjoint (→camera)
                             if (f > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wcam), wcam, distc - 2e-6)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
@@ -478,6 +505,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
                    dVCM, dVC, dVM);
         beta *= betaFactor;
+        if (!delta) beta *= shadingAdjointCorr(wo, normalize(wi), h.n, ngo);  // adjoint (continuation)
         prevP = h.p;
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
@@ -608,6 +636,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 if (!camSide || !litSide) continue;
                 double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h);
                 double fLit = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene, &lv.hit);
+                // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
+                // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
+                // Uses lv.ng oriented to lv.ns; a no-op when the mesh is flat.
+                Vec3 ngoLit = (dot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                fLit *= shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit);
                 if (fCam <= 0.0 || fLit <= 0.0) continue;
                 double camDirPdfW = bsdfPdf(*mp, h.n, wo, w, lambda, scene, &h);
                 double camRevPdfW = bsdfPdf(*mp, h.n, w, wo, lambda, scene, &h);
@@ -635,6 +668,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     double lam = (double)lv.lambda;
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h);
                     if (fCam <= 0.0) return;
+                    // Gather-side shading-normal correction (cos_s/cos_g at the merge point):
+                    // rebalances the geometric-cosine density estimate onto the shading cosine
+                    // so a smooth mesh merges smoothly like mode R. 1 when h.n==h.ng (flat).
+                    Vec3 ngoCam = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
+                    fCam *= vmGatherCorr(wMerge, h.n, ngoCam);
                     double camDirPdfW = bsdfPdf(*mp, h.n, wo, wMerge, lam, scene, &h);
                     double camRevPdfW = bsdfPdf(*mp, h.n, wMerge, wo, lam, scene, &h);
                     double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * Mis(camDirPdfW);

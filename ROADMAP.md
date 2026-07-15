@@ -274,10 +274,15 @@ already drops into a scene, scaled/rotated as a transform. This item is the **re
    barycentric-interpolate a shading normal at the hit (geometric normal kept as `hit.ng`). Normals
    transform by the inverse-transpose of the mesh transform (`Affine::applyNormal`). A mesh without
    `vn` falls each per-vertex normal back to the geometric normal in `Tri::finalize()`, so untouched
-   meshes stay exactly flat-shaded (bit-identical). ⚠️ **Caveat found 2026-07-15:** the interpolated
-   shading normal only smooth-shades correctly in the **backward reference mode `R`**; the forward
-   tracers `A/B/C` (and `D`/forward passes of `M/S/U`) still show geometric facets because they lack
-   Veach's shading-normal adjoint correction factor — see `known-issues.md`. **Crease-angle auto-smoothing** is also ✅ **DONE**
+   meshes stay exactly flat-shaded (bit-identical). ✅ **Forward-mode smooth shading FIXED
+   2026-07-15:** an earlier caveat noted the interpolated normal only smooth-shaded in the backward
+   reference mode `R`. Veach's shading-normal **adjoint correction** (`shadingAdjointCorr` in
+   `geometry.h`) is now applied to the light/particle throughput across the forward modes — `A/B/C`
+   (`render.h`), `D` (`bdpt.h`), and `U` (`vcm.h`), plus the GPU twins (`render_cuda.cu`) — so they
+   smooth-shade to match mode R. Modes `M`/`S` (photon-density gathers) needed **no** correction
+   (they already smooth-shade); the one gather-side patch was the VCM vertex-merge (`vmGatherCorr`).
+   Exactly 1 when `Ns==Ng`, so flat/analytic scenes stay bit-identical. See `known-issues.md`.
+   **Crease-angle auto-smoothing** is also ✅ **DONE**
    (2026-07-15): `mesh { smooth [<deg>] }` (default `40°`) welds coincident positions and synthesizes
    angle-weighted per-corner shading normals (Thürmer & Wüthrich) from adjacent faces under the
    dihedral threshold — so a low-poly OBJ with no `vn` smooths its gentle facets while hard edges stay
@@ -316,19 +321,21 @@ render_cuda.cu), and `addMesh` in ftsl.h.
    transform each by `Affine::applyNormal` (inverse-transpose), and fill the three `Tri` normals.
    Both `intersectTri` (CPU + GPU) interpolate `hit.n = normalize(w0*n0+u*n1+v*n2)` and orient it
    against the ray, keeping `hit.ng` geometric. `Tri::finalize()` falls absent normals back to `gn`
-   so non-`vn` meshes stay flat-shaded. Validated in the **backward reference mode `R`**: low-poly UV
-   sphere renders smooth vs the flat version's facets. ⚠️ Correction 2026-07-15: the earlier "mode R/B"
-   claim was wrong — the *forward* tracer (`B`, and A/C/D) still facets smooth normals (missing Veach
-   adjoint correction; see `known-issues.md`). ✅ **Crease-angle
+   so non-`vn` meshes stay flat-shaded. ✅ **Forward modes now smooth-shade (2026-07-15):** Veach's
+   shading-normal **adjoint correction** (`shadingAdjointCorr`, `geometry.h`) is applied to the
+   light/particle throughput at every non-specular continuation and camera connection of the forward
+   modes — `A/B/C` (`render.h`), `D` (`bdpt.h`), `U` (`vcm.h`) + GPU twins (`render_cuda.cu`) — so
+   the forward tracer smooth-shades to match mode R (validated on `scraps/_smooth_on.ftsl` and
+   `scraps/_iso_sphere.ftsl`). Modes `M`/`S` needed no gather-side correction (already smooth); the
+   VCM vertex-merge needed a scoped `vmGatherCorr` (see `known-issues.md` tech-debt note). ✅ **Crease-angle
    auto-smoothing DONE** (2026-07-15) — `mesh { smooth [<deg>] }` in `loadObj` (position-weld +
    angle-weighted per-corner normals under the dihedral threshold); host-only, so the GPU `DTri`
    picks it up for free. **Shading-normal geometric-hemisphere clamp** — ✅ partly DONE (2026-07-15):
    `orientedGeoN()` (`geometry.h`) + clamp wired into the backward reference (`backward.h`
    `neeLight`/`neeEnv`) and the forward tracer's camera connection (`render.h` `connect`/`connectLens`),
    stopping smoothed normals from leaking light through the geometric back face (no-op for flat/analytic).
-   *Remaining:* propagate the clamp to `bdpt.h`/`vcm.h`/`photonmap_render.h`/`sppm_render.h` + GPU, and —
-   the bigger prize — add Veach's shading-normal **adjoint correction** so forward modes smooth-shade at
-   all (both tracked in `known-issues.md`).
+   *Remaining:* propagate the clamp to `bdpt.h`/`vcm.h`/`photonmap_render.h`/`sppm_render.h` + GPU
+   (tracked in `known-issues.md`).
 2. ✅ **DONE** — glTF loader (`src/gltf.h`) + minimal JSON parser (`src/third_party/json.h`): parses
    nodes/meshes/accessors/bufferViews/buffers (GLB BIN chunk, external `.bin`, base64 data URIs),
    bakes node transforms (matrix or TRS), maps metallic-roughness → spectral BSDFs; `addMesh`
