@@ -23,9 +23,12 @@
 //   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
+//                   preset <archetype>  # cinema|pocket|portable|vintage|vintage-slr (fills optics)
 //                   lens <mm>  fstop <N>  zoom <x>  # photographic authoring (overrides fov_y/aperture)
 //                   projection <name> | fisheye [type]  # lens projection (rectilinear default; §8.5)
 //                   film { res W H  format <name>  size <Wmm> <Hmm>  iso .. shutter .. exposure .. } }
+//     preset picks a physically-plausible camera archetype (sensor+focal+f-stop); any
+//     knob after it overrides. Works in mode A/C (real DOF) and pinhole modes (fov only).
 //     zoom <x> multiplies the focal length (x>1 tele/narrower, x<1 wider). projection
 //     picks the lens map: rectilinear (default), equidistant/fisheye, equisolid,
 //     stereographic, orthographic — the fisheye modes allow fov_y >= 180.
@@ -2114,12 +2117,56 @@ private:
         }
     }
 
+    // A camera archetype preset: physically-plausible optics for a real camera *type*,
+    // filled BEFORE the block's own knobs so any dial (`lens`, `fstop`, `film{size}`)
+    // still overrides it — exactly like `material { preset gold }`. One preset serves
+    // both worlds: in the finite-lens catch modes (A/C) the sensor size + focal + f-stop
+    // give real depth of field; in the pinhole/backward modes (R/B/U) the same sensor +
+    // focal still set the correct field of view and the aperture collapses to a point.
+    struct CamPreset { double filmW_mm = 0, filmH_mm = 0, lensMM = 0, fstop = 0; };
+
+    // Resolve a camera archetype name -> CamPreset. Names are normalised (lowercased,
+    // spaces/underscores/hyphens stripped) so `vintage-slr`, `vintage slr`, `vintageslr`
+    // all match. Specs are drawn from the reference archetypes in `cameras/`. Returns
+    // false for an unknown name.
+    static bool resolveCameraPreset(const std::string& raw, CamPreset& p) {
+        std::string k;
+        for (char c : raw) { if (c==' '||c=='_'||c=='-') continue; k += (char)std::tolower((unsigned char)c); }
+        // cinema: Blackmagic-style cine ("35 T2.1", "4K") — Super35, 35mm, ~T2.1.
+        if (k=="cinema"||k=="cine"||k=="cinemacamera")      { p={24.6,13.8,35.0,2.1}; return true; }
+        // pocket: Sony RX0-style rugged compact — 1" sensor, ~24mm-equiv wide, deep DOF.
+        if (k=="pocket"||k=="compact"||k=="pocketcamera")   { p={13.2, 8.8, 8.8,4.0}; return true; }
+        // portable: full-frame mirrorless with a bright ~35mm prime.
+        if (k=="portable"||k=="mirrorless"||k=="portablecamera") { p={36.0,24.0,35.0,1.8}; return true; }
+        // vintage: purple folding rangefinder (FED/Zorki) — 35mm film, ~50mm, collapsible.
+        if (k=="vintage"||k=="rangefinder"||k=="vintagecamera")  { p={36.0,24.0,50.0,3.5}; return true; }
+        // vintage-slr: classic 35mm SLR with a fast 50mm normal.
+        if (k=="vintageslr"||k=="slr"||k=="vintageslrcamera")    { p={36.0,24.0,50.0,1.4}; return true; }
+        return false;
+    }
+
     // Read the film sub-block + photographic exposure/f-stop/lens controls shared by
     // `camera` and `camera_path`, and resolve the film size (named format or explicit
     // mm), the focal length (from `lens <mm>` or `fov_y`), the f-stop -> aperture
     // radius, the physical-optics film distance, and the manual exposure multiplier.
     // `cs.fov` must already be set. Returns false only on an unknown film format.
     bool readFilmExposure(const Block& b, CamSpec& cs) {
+        // Camera archetype preset (`preset <name>`) fills default optics first, so the
+        // block's own knobs below override it. Applies to camera/path/orbit/curve alike.
+        CamPreset preset;
+        bool hasPreset = false;
+        {
+            std::string pn = strOf(b, "preset");
+            if (!pn.empty()) {
+                if (!resolveCameraPreset(pn, preset)) {
+                    fail("unknown camera preset '" + pn + "' (cinema, pocket, portable, "
+                         "vintage, vintage-slr)");
+                    return false;
+                }
+                hasPreset = true;
+                cs.filmW_mm = preset.filmW_mm; cs.filmH_mm = preset.filmH_mm;
+            }
+        }
         const Stmt* film = find(b, "film");
         if (film && film->val.block) {
             const Block& fb = *film->val.block;
@@ -2159,11 +2206,13 @@ private:
         // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a 35mm
         // full-frame 24mm height when no physical size is authored.
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
-        double lensMM = dblOf(b, "lens", 0.0);     // focal length in mm (physical, unit-independent)
+        // `lens`/`fstop` default to the archetype preset's values when one is named, so
+        // the preset supplies focal length + aperture unless the block overrides them.
+        double lensMM = dblOf(b, "lens", hasPreset ? preset.lensMM : 0.0);  // focal length in mm
         // `zoom <x>` multiplies the focal length (x>1 = tele/narrower fov; x<1 = wider).
         // It is the animatable "zoom ring" and composes on top of `lens`/`fov_y`.
         double zoom  = dblOf(b, "zoom", 1.0);
-        double fstop = dblOf(b, "fstop", 0.0);
+        double fstop = dblOf(b, "fstop", hasPreset ? preset.fstop : 0.0);
         // Resolve focal/fov/aperture/film-distance. cs.focus is already in metres (Len-scaled).
         deriveCameraOptics(cs, cs.fov, lensMM, zoom, fstop, hmm, cs.focus);
         // Manual exposure multiplier (see CamSpec). Active iff any control authored.

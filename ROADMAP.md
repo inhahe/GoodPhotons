@@ -394,19 +394,48 @@ catch the cap-clipping case. Report leak fraction + worst offenders. Non-destruc
 **Request.** Replace the hardcoded exterior IOR 1.0 so glass-in-water and intersecting
 dielectrics are modeled correctly, for **all** modes.
 
-**Flagged (pushback).** Large, invasive: touches every integrator (forward A/B/C,
-composite P, backward R/D, photon M/S, VCM U) on CPU + CUDA. Two designs:
-- **Priority-based nested dielectrics** (Schmidt & Budge 2002) — integer priority per
-  dielectric; boundary hits consult which medium wins. Cheap, handles coincident
-  surfaces, industry-standard; needs a `priority` material field.
-- **Full per-path medium stack** — push/pop on entry/exit. More general (ordered
-  nesting, participating media) but heavier and subtle across the bidirectional modes.
+**Decision (tiered — expose all three as options).** A convenience/speed/ability ladder:
+- **Level 0 — priority field (Schmidt & Budge 2002).** Integer `priority` per dielectric;
+  where solids overlap the highest priority wins that region, so each boundary hit deduces
+  the true from/to IOR from the two sides' priorities — no per-ray state. **Essentially
+  free** (a couple of int compares per hit). Covers nested gem-in-water + coatings. This is
+  the **default** fix. *Limitation:* can't stack genuinely co-located media (resolves
+  overlap by ranking, not physical stacking).
+- **Level 1 — per-path medium stack, nested only.** Each ray/photon path carries a tiny
+  LIFO of the media it is inside (push on entry, pop on exit). Trivial on CPU; on GPU the
+  cost is register/local-mem pressure → **low single-digit %** on scenes that use it.
+- **Level 2 — per-path stack with overlap support.** Same stack but allows interpenetrating
+  volumes, so each crossing must be resolved against all active media → GPU divergence →
+  **~5–15%** on affected scenes only.
 
-**Questions:** which model, and is a `priority` material field acceptable? Do you need
-*overlapping/interpenetrating* dielectrics or just *nested non-overlapping* (glass in
-water)? Not starting until settled.
+Default Level 0 (fixes the common cases "for all modes" at zero cost); scenes opt into
+Level 1/2 when they need true nesting/overlap. Only paths touching dielectrics pay anything.
 
-## (8) Mesh/animation formats + OBJ-sequence → video — PARTIALLY NEEDS DECISION
+**Missing-priority warning (required).** If a place needs a priority definition and none is
+given, warn — both ahead-of-time and at render time:
+- *Ahead-of-time (scene analysis, cheap, primary UX):* pairwise-test dielectric bounding
+  volumes for overlap; if two overlap and either lacks an explicit `priority`, warn naming
+  both materials ("exterior IOR is ambiguous — add `priority N`"). Conservative
+  (bounds-overlap ⊇ surface-overlap) so it's a warning, not an error.
+- *At render time (definitive safety net):* when a refraction crosses an ambiguous overlap
+  (equal/undefined priorities), accumulate a per-material-pair counter and print one summary
+  at the end ("N rays hit ambiguous dielectric overlap X↔Y — set priorities").
+
+**Isosurface overlap detection (for the same warning).** Isosurfaces don't have plain box
+bounds — they're clipped to a `contained_by` container (box or sphere). Two ways to detect
+that two isosurfaces overlap / nest:
+- **Bounding-volume comparison (chosen for the warning):** compare the `contained_by`
+  boxes/spheres. Cheap, and *conservative in the right direction* — because each field is
+  clipped to its container, the surfaces can only overlap where the **containers** overlap,
+  so container-overlap never misses a real function-overlap. If one container sits inside
+  another, the functions almost certainly overlap somewhere, so warn. May over-warn
+  (containers overlap but the zero-sets happen not to), which is acceptable for a warning.
+- **Marching cubes (rejected for the warning):** mesh both fields and test mesh
+  intersection. More precise on false positives but expensive *and itself resolution-limited*
+  (can miss a thin overlap between grid cells) — the wrong trade for a cheap conservative
+  warning. Bounding-volume wins here.
+
+## (8) Mesh/animation formats + OBJ-sequence → video — PARTIALLY DECIDED
 
 **Already shipped (correction):** `.obj` **and** `.gltf`/`.glb` import already work
 (roadmap item 5.2, done 2026-07-12) — static-mesh loading with node transforms,
@@ -414,31 +443,50 @@ smooth normals, and PBR material mapping. So the new asks are the animation/vide
 pipeline and the two heavy formats.
 - **OBJ-sequence → MP4 driver** — self-contained Python driving ftrace per frame +
   ffmpeg; no new C++ deps. *Ready to start.*
-- **Alembic (.abc)** — heavy SDK (Imath + HDF5/Ogawa). **Question:** worth the build
-  weight, or is an OBJ/glTF sequence enough for animation?
-- **FBX** — only robust reader is Autodesk's proprietary, license-gated **FBX SDK** (not
-  a package-manager install). Per project tooling rules I won't pull it in without a
-  go-ahead. **Question:** need FBX enough to accept the Autodesk SDK, or is glTF enough?
+- **FBX — DECIDED: vendor ufbx (MIT).** For a *renderer's import path* the proprietary
+  Autodesk FBX SDK offers nothing we'd use: its exclusive strengths are FBX *writing*,
+  evaluating **authored constraint rigs** (artist-built IK/aim/parent-constraint control
+  networks), and DCC round-tripping — all authoring concerns. An importer consumes the
+  **baked** result (geometry, normals/UVs, materials, skinning/blend-shapes, animation
+  curves), which **ufbx** (MIT, single-file, zero-dep) reads and samples itself. So vendor
+  ufbx into `src/third_party/` like the glTF/JSON headers — no Autodesk EULA, no manual
+  install. (Optional future: an SDK-backed build behind a compile flag only if ftrace ever
+  needs to *write* FBX or evaluate live rigs. Low priority.)
+- **Alembic (.abc)** — heavy SDK (Imath + HDF5/Ogawa). **Still open:** worth the build
+  weight, or is an OBJ/glTF/FBX sequence enough for animation? Defer until asked.
 
-**Not starting the heavy formats unilaterally.** Give me the priority order; I'll begin
-with the OBJ-sequence video driver.
+**Start order:** OBJ-sequence → MP4 driver first, then ufbx FBX import. Alembic deferred.
 
-## (9) Camera presets from `cameras/` simulating real optics — NEEDS DECISION
+## (9) Camera archetype presets — DECIDED
 
-**Request.** Camera objects from each model in `cameras/` that simulate them in mode A
-(finite-lens), plus a pinhole twin centered at the aperture.
+**Request (clarified).** NOT props in the scene. Make **named camera preset objects**
+users can reference (like `material { preset gold }`), one per archetype in `cameras/`,
+each supplying physically-plausible optics. One preset serves both worlds: a finite-lens
+simulation in **mode A/C** and a correct-FOV **pinhole** in the backward modes (R/B/U) —
+same preset, aperture just collapses to a point where there's no DOF.
 
-**Flagged.** `cameras/` holds decorative 3D **models** (`.glb`/`.usdz` of a cinema,
-pocket, portable, vintage, and vintage-SLR camera) — not optical spec sheets. Mode A
-needs focal length, sensor size, f-number, focus distance, none recoverable from an
-exterior mesh. **Question — which did you mean?**
-- (a) **Archetype presets:** physically-plausible mode-A presets per *type* (cinema =
-  full-frame 36×24, 50mm T2.0; pocket = 1/2.3" sensor; vintage SLR = 35mm, 50mm f/1.8),
-  each with a pinhole twin. Self-contained; doesn't need the mesh. *(My recommendation.)*
-- (b) **Prop + camera:** load each `.glb` as a visible prop and attach a matching
-  camera at its lens. glTF import already exists, but still needs spec numbers.
+**Mechanism (no new format needed).** The camera grammar already exposes the "knobs":
+`film { format|size }` (sensor mm), `lens <mm>` (focal length → fov), `fstop <N>`
+(aperture), `focus`, `zoom`, `film { iso shutter exposure }`, `projection`. A preset is
+pure shorthand — a `resolveCameraPreset(name, CamSpec&)` (mirroring the existing
+`resolveMaterialPreset` / `resolveLensPreset`) that pre-fills those same `CamSpec` fields
+from a table, *before* the user's own lines, so any dial can still be overridden after
+`preset <name>`.
 
-## (10) Re-render golden gyroid hero (`scenes/showcase.ftsl`) — IN PROGRESS
+**Archetypes (specs confirmed from the reference photos in `cameras/`):**
+- **cinema** — lens reads "35 T2.1", body "4K" (Blackmagic-style cine): Super35 sensor,
+  35mm, ~T2.1 (f/2.1). Shallow, cinematic.
+- **pocket** — "RX0818" (Sony RX0-style rugged compact): 1" sensor (13.2×8.8mm), fixed
+  ~24mm-equiv wide, ~f/4 → deep DOF.
+- **portable** — white mirrorless w/ bright prime: full-frame 36×24, ~35mm, f/1.8.
+- **vintage** — purple folding rangefinder (FED/Zorki lineage): 35mm film 36×24, ~50mm,
+  f/3.5 collapsible.
+- **vintage-slr** — silver/black classic w/ big fast lens: 35mm film 36×24, ~50mm, ~f/1.4.
+
+**Plan.** Add `resolveCameraPreset`, wire `preset <name>` into the camera-block parser,
+ship the five archetypes, document in README. Self-contained; doesn't touch the meshes.
+
+## (10) Re-render golden gyroid hero (`scenes/showcase.ftsl`) — DONE (2026-07-14)
 
 **Request.** Re-render the non-flyby golden gyroid hero, which previously read dark at
 the front because the fourth wall was blank (wall + front fill light have since been

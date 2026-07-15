@@ -294,6 +294,33 @@ block. Film size can be a preset **format** — `full-frame`, `aps-c`,
 `micro-four-thirds`, `super35`, `medium-format`, `6x6`, `6x7`, `large-format`,
 `4x5`, `8x10` — or an explicit `size W H` in millimetres.
 
+**Camera archetype presets** (`preset <name>`): one line that fills in a
+physically-plausible **sensor size + focal length + f-number** for a real camera
+*type*, exactly like `material { preset gold }`. It runs *before* the block's own
+knobs, so any dial (`lens`, `fstop`, `film { size }`, …) written afterward
+overrides it. A single preset serves both worlds — in the finite-lens catch modes
+(`A`/`C`) the sensor + focal + f-stop give real depth of field, while in the
+pinhole/backward modes (`R`/`B`/`U`) the same numbers set the correct field of view
+and the aperture simply collapses to a point (no DOF). Available archetypes:
+
+| `preset` | Sensor | Focal | f-stop | Character |
+|---|---|---|---|---|
+| `cinema` | Super35 (24.6×13.8 mm) | 35 mm | f/2.1 | Blackmagic-style cine; shallow, filmic |
+| `pocket` | 1″ (13.2×8.8 mm) | 8.8 mm | f/4 | RX0-style compact; wide, deep DOF |
+| `portable` | full-frame (36×24 mm) | 35 mm | f/1.8 | mirrorless with a bright prime |
+| `vintage` | 35 mm film (36×24 mm) | 50 mm | f/3.5 | folding rangefinder normal |
+| `vintage-slr` | 35 mm film (36×24 mm) | 50 mm | f/1.4 | classic fast fifty |
+
+```ftsl
+camera "cine" {
+    preset cinema          # Super35, 35mm, T2.1 — DOF in mode A/C, right FOV in R/B/U
+    eye 0 0.7 3   look_at 0 0.5 0   up 0 1 0
+    focus 3
+    # fstop 4              # ← would override the preset's f/2.1 if uncommented
+    film { res 512 512 }
+}
+```
+
 **Projections** (`projection …`): `rectilinear` (default perspective),
 `equidistant` and `equisolid` fisheye, `stereographic` ("little planet"), and
 `orthographic`. These are analytic remaps available in the forward pinhole mode.
