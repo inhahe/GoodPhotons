@@ -173,11 +173,19 @@ struct Parser {
             firstWasString = is(Tok::String);
             v.words.push_back(cur().text); adv();
         }
-        while (is(Tok::Word)) {
-            const std::string& tx = cur().text;
-            bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
-            if (!cont) break;
-            v.words.push_back(tx); adv();
+        while (is(Tok::Word) || is(Tok::String)) {
+            // A quoted string never begins a new statement (statement keys are always
+            // barewords), so a String that follows the value's tokens is part of THIS
+            // value — e.g. a name argument: `exposure_lock camera "meter"`. (Without this
+            // the string was silently swallowed as a stray statement key.) Barewords only
+            // continue when they are numbers or `key=val` named params; a plain bareword
+            // still ends the value (it begins the next statement's key).
+            if (is(Tok::Word)) {
+                const std::string& tx = cur().text;
+                bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
+                if (!cont) break;
+            }
+            v.words.push_back(cur().text); adv();
         }
         if (is(Tok::LBrace)) {
             std::string btype = key, bname;
@@ -453,14 +461,27 @@ struct CamSpec {
     double exposureMul = 0.0;
 
     // Exposure-lock across a `camera_path` (Phase 3a intermediate win): frames of a
-    // path that authored `exposure_lock` share the auto-exposure anchor computed from
-    // the first frame, so a dolly/zoom doesn't flicker as scene brightness shifts.
-    // `pathGroup` (>=0) identifies the owning path (all its frames share the value);
-    // -1 for a standalone `camera`. `exposureLock` is set on every frame of a locked
-    // path. A CLI `-exposure-lock` can additionally force a single shared anchor
-    // across *all* rendered cameras regardless of these fields.
+    // path that authored `exposure_lock` share ONE auto-exposure anchor, so a dolly/
+    // zoom doesn't flicker as scene brightness shifts. `pathGroup` (>=0) identifies the
+    // owning path (all its frames share the value); -1 for a standalone `camera`.
+    // `exposureLock` is set on every frame of a locked path. A CLI `-exposure-lock` can
+    // additionally force a single shared anchor across *all* rendered cameras.
+    //
+    // Which frame's exposure the whole group locks to is chosen by the lock *selector*
+    // (authored as an argument to `exposure_lock`; every frame of the path carries the
+    // same resolved selector):
+    //   EXPLOCK_FIRST   `exposure_lock`            -> the path's first frame (default)
+    //   EXPLOCK_INDEX   `exposure_lock index N`    -> frame N (0-based; N<0 counts from end)
+    //   EXPLOCK_NEAR    `exposure_lock near X Y Z` -> the frame whose eye is nearest (X,Y,Z)
+    //   EXPLOCK_CAMERA  `exposure_lock <name>`     -> a separately-defined camera "<name>"
+    //   EXPLOCK_AVERAGE `exposure_lock average`    -> the mean anchor over all frames
+    enum { EXPLOCK_FIRST = 0, EXPLOCK_INDEX, EXPLOCK_NEAR, EXPLOCK_CAMERA, EXPLOCK_AVERAGE };
     int  pathGroup   = -1;
     bool exposureLock = false;
+    int  expLockSel   = EXPLOCK_FIRST;   // which frame the group meters from (enum above)
+    int  expLockIndex = 0;               // EXPLOCK_INDEX: frame index (may be negative)
+    Vec3 expLockPoint{0, 0, 0};          // EXPLOCK_NEAR: metering viewpoint
+    std::string expLockCam;              // EXPLOCK_CAMERA: name of the metering camera
 
     // Physical multi-element lens (the "mesh-lens" camera), built from a `lens { ... }`
     // block. When set, main renders this camera through the backward realistic-camera
@@ -2384,6 +2405,47 @@ private:
     //   }
     // Frame i (0..frames-1) samples t = i/(frames-1); its output name is
     // "<path><i>" (zero-padded), so the multi-camera loop writes one file per frame.
+    // Parse an `exposure_lock [selector]` statement (shared by camera_path/orbit/curve)
+    // into the selector fields of `cs`. Returns whether the lock is enabled. The selector
+    // words are: (none)/on/true/1/first -> FIRST; off/false/0 -> disabled; average/avg/mean
+    // -> AVERAGE; `index N`/`frame N` -> INDEX; `near X Y Z` -> NEAR; anything else (a
+    // quoted or bare word) -> CAMERA metering from a separately-defined camera of that name.
+    bool parseExposureLock(const Block& b, CamSpec& cs) {
+        const Stmt* el = find(b, "exposure_lock");
+        if (!el) return false;
+        const auto& w = el->val.words;
+        if (w.empty()) { cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true; }
+        const std::string v0 = w[0];
+        if (v0 == "off" || v0 == "false" || v0 == "0") return false;
+        if (v0 == "on" || v0 == "true" || v0 == "1" || v0 == "first") {
+            cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true;
+        }
+        if (v0 == "average" || v0 == "avg" || v0 == "mean") {
+            cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true;
+        }
+        if (v0 == "index" || v0 == "frame") {
+            cs.expLockSel = CamSpec::EXPLOCK_INDEX;
+            cs.expLockIndex = (w.size() >= 2) ? (int)num(w[1]) : 0;
+            return true;
+        }
+        if (v0 == "near") {
+            cs.expLockSel = CamSpec::EXPLOCK_NEAR;
+            if (w.size() >= 4) cs.expLockPoint = P(Vec3{num(w[1]), num(w[2]), num(w[3])});
+            else fail("exposure_lock near needs: near X Y Z");
+            return true;
+        }
+        if (v0 == "camera" || v0 == "cam") {
+            // Explicit `exposure_lock camera "name"` — the name follows the keyword.
+            if (w.size() >= 2) { cs.expLockSel = CamSpec::EXPLOCK_CAMERA; cs.expLockCam = w[1]; return true; }
+            fail("exposure_lock camera needs a name: exposure_lock camera \"name\" "
+                 "(or just exposure_lock \"name\")");
+            return true;
+        }
+        cs.expLockSel = CamSpec::EXPLOCK_CAMERA;   // a camera name given directly (quoted or bare)
+        cs.expLockCam = v0;
+        return true;
+    }
+
     bool addCameraPath(const Block& b, Loaded& L) {
         std::string base = b.name.empty() ? ("path" + std::to_string(L.cameras.size())) : b.name;
         CamSpec shared;
@@ -2409,16 +2471,12 @@ private:
         }
         const double DEG = 3.141592653589793 / 180.0;
 
-        // Exposure-lock: a bare `exposure_lock` (or `exposure_lock on`) makes every
-        // frame of this path share the auto-exposure anchor from frame 0 (no
-        // flicker); `off`/`false`/`0` disables (the default). The group id is this
-        // path's starting index in L.cameras — unique because paths occupy disjoint
-        // contiguous ranges.
-        bool pathLock = false;
-        if (const Stmt* el = find(b, "exposure_lock")) {
-            if (el->val.words.empty()) pathLock = true;
-            else { const std::string& v = el->val.words[0]; pathLock = !(v=="off"||v=="false"||v=="0"); }
-        }
+        // Exposure-lock: a bare `exposure_lock` (or a selector — see parseExposureLock)
+        // makes every frame of this path share ONE auto-exposure anchor (no flicker);
+        // `off`/`false`/`0` disables (the default). The selector fields land on `shared`
+        // so they copy into every frame's CamSpec. The group id is this path's starting
+        // index in L.cameras — unique because paths occupy disjoint contiguous ranges.
+        bool pathLock = parseExposureLock(b, shared);
         const int pathGroup = (int)L.cameras.size();
 
         // Collect keyframes (t, eye, optional look_at, optional fov), sorted by t.
@@ -2532,11 +2590,7 @@ private:
         Vec3 U = normalize(cross(ref, A));
         Vec3 W = normalize(cross(A, U));
 
-        bool pathLock = false;
-        if (const Stmt* el = find(b, "exposure_lock")) {
-            if (el->val.words.empty()) pathLock = true;
-            else { const std::string& v = el->val.words[0]; pathLock = !(v == "off" || v == "false" || v == "0"); }
-        }
+        bool pathLock = parseExposureLock(b, shared);
         const int pathGroup = (int)L.cameras.size();
         const double DEG = 3.141592653589793 / 180.0;
 
@@ -2817,11 +2871,7 @@ private:
                           fstopTrk.active() || focusTrk.active();
         const double DEG = 3.141592653589793 / 180.0;
 
-        bool pathLock = false;
-        if (const Stmt* el = find(b, "exposure_lock")) {
-            if (el->val.words.empty()) pathLock = true;
-            else { const std::string& v = el->val.words[0]; pathLock = !(v == "off" || v == "false" || v == "0"); }
-        }
+        bool pathLock = parseExposureLock(b, shared);
         const int pathGroup = (int)L.cameras.size();
 
         // ---- Tangent look-direction pre-pass (fold-robust) -------------------------

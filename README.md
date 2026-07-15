@@ -1099,9 +1099,10 @@ extension), which ffmpeg concatenates into a video.
 - **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
   keyframed fly-through: the eye (and optionally look_at / fov) is linearly
   interpolated across `key` frames. Optional `dolly_zoom` holds the subject's
-  on-screen size (Vertigo effect); optional `exposure_lock` shares frame 0's exposure.
+  on-screen size (Vertigo effect); optional `exposure_lock [selector]` shares one
+  auto-exposure across all frames (metered from a selectable viewpoint — see below).
 - **`camera_orbit "name" { center <x y z> radius <m> [height <m>] [axis x|y|z] frames N
-  [start_deg <d>] [sweep_deg <d>] [look_at <x y z>] [exposure_lock] }`** — a turntable /
+  [start_deg <d>] [sweep_deg <d>] [look_at <x y z>] [exposure_lock [selector]] }`** — a turntable /
   fly-around whose eye rides a circle around `center` (the default look_at). The circle
   lies in the plane perpendicular to `axis` (default y); `height` offsets the eye along
   the axis. A full 360° sweep is sampled so frame N == frame 0 (seamless loop); a
@@ -1135,6 +1136,29 @@ extension), which ffmpeg concatenates into a video.
   field only in the physical catch modes `A`/`C`; in the pinhole splat `B` the aperture is
   virtual, so there `roll`/`fov`/`zoom` are the visible ones. Lens *projection*/fisheye is
   a discrete whole-flight mode, not a continuous track — set it once with `projection`.)
+
+**`exposure_lock` — one shared auto-exposure across a whole path.** On any
+`camera_path`/`camera_orbit`/`camera_curve`, `exposure_lock` freezes a single
+auto-exposure anchor and applies it to *every* frame of that path, so a fly-through
+doesn't pump brighter/darker as the framing changes (the flicker you'd get if each
+frame metered itself). A **selector** chooses which viewpoint the whole path meters
+from — before any frame renders, a quick reduced-sample **meter pre-pass** renders
+just that viewpoint, computes its exposure, and locks the path to it (the same happens
+in the `-raster` preview, so preview and final agree):
+
+  - **`exposure_lock`** (bare, or `first`) — meter the **first** frame (the historical behaviour).
+  - **`exposure_lock index <i>`** (alias `frame`) — meter frame **`i`** (0-based; negative counts from the end, so `-1` = last frame).
+  - **`exposure_lock near <x> <y> <z>`** — meter whichever frame's **eye is nearest** the world point `x y z`.
+  - **`exposure_lock camera "name"`** (or just **`exposure_lock "name"`**) — meter a **separately-defined `camera "name"`** — a purpose-built metering viewpoint that need not be on the path at all.
+  - **`exposure_lock average`** (alias `avg`/`mean`) — meter the **average** exposure across *all* frames of the path (a compromise that won't clip the brightest frame or crush the darkest as hard as locking to one end).
+  - **`exposure_lock off`** (alias `false`/`0`) — disable; each frame meters itself.
+
+  Metering is exact for the CPU forward models (`A`/`B`/`C`) and the backward
+  reference (`R`); other modes (`D`/`M`/`P`) have no reduced-sample meter yet and fall
+  back to locking on the first frame that renders. Absolute-EV scenes have no
+  auto-exposure to lock, so `exposure_lock` is a no-op there. The global `-exposure-lock`
+  CLI flag locks *all* rendered cameras to one anchor (metered from the first frame),
+  overriding per-path selectors.
 
 ### Multi-camera shared photon pass (modes `A`, `B`, and `M`)
 
@@ -1325,7 +1349,7 @@ alone can't restore, so they are not disk-resumable.
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window). See the preview note under **Render modes**. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
-| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
+| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (`first`/`index i`/`near x y z`/`camera "name"`/`average`) |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,

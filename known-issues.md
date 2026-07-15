@@ -5,6 +5,25 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-07-15): `exposure_lock` selector meter pre-pass only covers modes A/B/C/R
+
+The `exposure_lock <selector>` meter pre-pass (main.cpp, the `meterPlan` loop just
+after the `-raster` block ~line 3520, and its raster twin inside the `doRaster` block)
+pre-populates `expAnchors[group]` by rendering the selector-chosen viewpoint at reduced
+samples and reading its p99 anchor via `filmToRgb8`. It handles the CPU **forward models
+(A/B/C)** via `renderForward` and the **backward reference (R)** via `renderBackward`.
+Modes **D (BDPT), M (photon map), P (composite)**, and the diagnostic modes have **no
+reduced-sample meter path** here, so a locked `camera_path` in those modes falls back to
+the historical **lazy lock** (the first frame that renders computes & writes the anchor,
+the rest reuse it). That still gives a flicker-free flyby, but it *ignores the selector*:
+`index`/`near`/`camera`/`average` all collapse to "meter the first rendered frame" for
+D/M/P. **Proper fix:** add reduced-sample metering for those modes — for M, meter one
+gather off the shared photon map; for D/P, a low-spp `renderBdpt`/composite pass — mirror
+the A/B/C/R branches so `filmToRgb8` sees a representative film and the selector is
+honoured. (Note mode M currently *shares* the photon map across a locked path, so its
+lazy-lock frame ordering means the anchor comes from `restIdx`/`groupM` order, not
+necessarily file frame 0.) Absolute-EV scenes are unaffected (no auto-exposure to lock).
+
 ### OPEN (2026-07-15): absolute-EV scenes render near-black in the finite-lens catch modes (A/C)
 
 `ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) — the fixed sensor gain that

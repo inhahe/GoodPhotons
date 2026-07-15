@@ -3325,9 +3325,94 @@ static int run(int argc, char** argv) {
     };
 
     // Shared auto-exposure anchors, one per exposure-lock group (see RenderCam.expGroup).
-    // The first frame in a group computes its anchor and stores it here; later frames
-    // in the same group reuse it (no dolly flicker). A null anchor = per-frame auto.
+    // A group's anchor is normally computed by the first frame rendered and reused by the
+    // rest (no dolly flicker); the meter pre-pass below can instead *pre-populate* it from
+    // a chosen metering frame so every frame locks to that viewpoint's exposure. A null
+    // anchor (group -1) = per-frame auto.
     std::map<int, double> expAnchors;
+
+    // --- Exposure-lock metering plan (which frame each locked group meters from) --------
+    // The `exposure_lock <selector>` on a camera_path/orbit/curve chooses the viewpoint the
+    // whole group locks to (see CamSpec::EXPLOCK_*). Here we resolve that selector to the
+    // concrete metering camera(s) for every locked group actually being rendered, so the
+    // meter pre-pass (preview: raster; real: a reduced-sample render) can compute each
+    // group's shared anchor up front. Skipped for absolute-EV scenes (fixed sensor gain,
+    // no auto-exposure to lock) and when a global -exposure-lock is forcing one anchor.
+    struct MeterCam { Camera cam; char mode; int res; int resY; std::string name; };
+    std::map<int, std::vector<MeterCam>> meterPlan;   // group -> metering camera(s) (>1 = average)
+    if (fromFtsl && !ftslScene.cameras.empty() && !scene.absolute && !forceExposureLock) {
+        // Build a camera the same way the render loop does, minus the verbose lens logging.
+        auto buildMeterCam = [&](const ftsl::CamSpec& cs) -> MeterCam {
+            MeterCam m;
+            m.res  = resFromCli ? res : (cs.res  > 0 ? cs.res  : res);
+            m.resY = resFromCli ? (resYCli > 0 ? resYCli : res) : (cs.resY > 0 ? cs.resY : m.res);
+            m.cam.lookAt(cs.eye, cs.look, cs.up, cs.fov, m.res, m.resY);
+            m.cam.setProjection(cs.projection);
+            m.cam.apertureR = cs.aperture;
+            if (cs.filmDist_m > 0.0) { m.cam.filmDist = cs.filmDist_m; m.cam.lensF = cs.lensF_m; }
+            else                     { m.cam.setFocus(cs.focus); }
+            m.mode = effMode(cs.mode);
+            if (cs.lens) { m.cam.lens = cs.lens; if (m.mode != 'D' && m.mode != 'P') m.mode = 'R'; }
+            m.name = cs.name;
+            return m;
+        };
+        // Which locked groups are actually in the render set?
+        std::map<int, int> activeGroups;   // group -> count (presence)
+        for (const auto& rc : toRender) if (rc.expGroup >= 0) ++activeGroups[rc.expGroup];
+        for (const auto& [g, cnt] : activeGroups) {
+            (void)cnt;
+            // Gather this path's frames (pathGroup == g) in file order, and its selector.
+            std::vector<const ftsl::CamSpec*> members;
+            for (const auto& cs : ftslScene.cameras)
+                if (cs.exposureLock && cs.pathGroup == g) members.push_back(&cs);
+            if (members.empty()) continue;               // e.g. a forced/standalone group
+            const ftsl::CamSpec& rep = *members.front(); // all frames share the selector
+            std::vector<MeterCam>& plan = meterPlan[g];
+            auto addFrame = [&](const ftsl::CamSpec& cs) { plan.push_back(buildMeterCam(cs)); };
+            switch (rep.expLockSel) {
+                case ftsl::CamSpec::EXPLOCK_AVERAGE:
+                    for (const auto* cs : members) addFrame(*cs);
+                    break;
+                case ftsl::CamSpec::EXPLOCK_INDEX: {
+                    int n = (int)members.size(), i = rep.expLockIndex;
+                    if (i < 0) i += n;
+                    if (i < 0 || i >= n) {
+                        std::fprintf(stderr, "[exposure] lock index %d out of range for '%s' "
+                                     "(%d frames); metering the first frame instead\n",
+                                     rep.expLockIndex, rep.name.c_str(), n);
+                        i = 0;
+                    }
+                    addFrame(*members[i]);
+                    break;
+                }
+                case ftsl::CamSpec::EXPLOCK_NEAR: {
+                    const ftsl::CamSpec* best = members.front(); double bd2 = 1e300;
+                    for (const auto* cs : members) {
+                        Vec3 d = cs->eye - rep.expLockPoint; double d2 = dot(d, d);
+                        if (d2 < bd2) { bd2 = d2; best = cs; }
+                    }
+                    addFrame(*best);
+                    break;
+                }
+                case ftsl::CamSpec::EXPLOCK_CAMERA: {
+                    const ftsl::CamSpec* named = nullptr;
+                    for (const auto& cs : ftslScene.cameras)
+                        if (cs.name == rep.expLockCam) { named = &cs; break; }
+                    if (!named) {
+                        std::fprintf(stderr, "[exposure] lock camera '%s' not found for '%s'; "
+                                     "metering the first frame instead\n",
+                                     rep.expLockCam.c_str(), rep.name.c_str());
+                        addFrame(rep);
+                    } else addFrame(*named);
+                    break;
+                }
+                case ftsl::CamSpec::EXPLOCK_FIRST:
+                default:
+                    addFrame(rep);
+                    break;
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------------
     // Fast solid-shaded PREVIEW (-raster). Bypass ALL light transport: tessellate the
@@ -3348,6 +3433,33 @@ static int run(int argc, char** argv) {
                     prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
                     toRender.size(), nThreads, g_showWindow ? " — live window" : "");
         std::fflush(stdout);
+
+        // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
+        // frame(s) and pre-populate expAnchors[group] (averaging for EXPLOCK_AVERAGE), so
+        // every frame of the group previews at the chosen viewpoint's exposure — mirroring
+        // what the meter pre-pass does for the real render. Uses the same raster shading, so
+        // the anchor matches the frames' own pipeline exactly.
+        for (const auto& [g, cams] : meterPlan) {
+            if (cams.empty()) continue;
+            double sum = 0.0; int m = 0;
+            for (const auto& mc : cams) {
+                double a = 0.0;
+                raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
+                                    /*exposure*/1.0, /*autoExpose*/true, &a);
+                if (a > 0.0) { sum += a; ++m; }
+            }
+            if (m > 0) {
+                expAnchors[g] = sum / m;
+                if (cams.size() > 1)
+                    std::printf("[raster] exposure lock: group %d meters the average of %zu "
+                                "frames (anchor %.4g)\n", g, cams.size(), expAnchors[g]);
+                else
+                    std::printf("[raster] exposure lock: group %d meters '%s' (anchor %.4g)\n",
+                                g, cams.front().name.c_str(), expAnchors[g]);
+            }
+        }
+        std::fflush(stdout);
+
         int frame = 0;
         auto ft0 = std::chrono::steady_clock::now();
         for (const auto& rc : toRender) {
@@ -3405,6 +3517,62 @@ static int run(int argc, char** argv) {
         std::printf("[raster] done: %d frame(s) in %.2fs (%.1f fps).\n",
                     frame, secs, frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
         return 0;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Exposure-lock meter pre-pass (REAL render). For every locked group being
+    // rendered, meter its selector-chosen frame(s) with a quick *reduced-sample* CPU
+    // render and pre-populate expAnchors[group] (averaging for EXPLOCK_AVERAGE) BEFORE
+    // any full frame runs. Because filmToRgb8's p99 anchor is sample-count-invariant
+    // (norm = 1/(N*cieYIntegral) cancels the photon/spp count), a cheap metering render
+    // yields the same eAuto the full frame would — just noisier, and p99 is noise-robust.
+    // Once expAnchors[g] > 0, every render path reuses it untouched (no per-frame
+    // recompute, no dolly flicker), so the whole group locks to the chosen viewpoint's
+    // exposure. Supported for the CPU-metered forward models (A/B/C) and the backward
+    // reference (R); modes D/M/P/etc. have no reduced-sample metering here and fall back
+    // to the historical lazy lock (first rendered frame sets the anchor). Skipped for
+    // absolute-EV scenes and forced global locks (meterPlan is empty then).
+    for (const auto& [g, cams] : meterPlan) {
+        if (cams.empty() || g_stopRequested) continue;
+        double sum = 0.0; int m = 0; bool unsupported = false;
+        for (const auto& mc : cams) {
+            // Reduced metering budget: enough coverage for a clean p99 without paying for
+            // a full render. eAuto is sample-count-invariant so this matches the real frame.
+            double eAuto = 0.0;
+            Film mf;
+            if (mc.mode == 'A' || mc.mode == 'B' || mc.mode == 'C') {
+                long long meterN = std::clamp((long long)mc.res * mc.resY * 40LL, 500000LL, 4000000LL);
+                EnergyReport e;
+                mf = renderForward(scene, &mc.cam, mc.res, mc.resY, meterN, nThreads,
+                                   /*forwardCatch*/mc.mode == 'C', /*lensMode*/mc.mode == 'A',
+                                   /*useCamera*/true, e, diffraction, /*useGpu*/false);
+                addEnvBackground(mf, scene, mc.cam, meterN);
+                filmToRgb8(mf, (double)meterN, /*expComp*/1.0, /*absolute*/false,
+                           /*lockAnchor*/nullptr, &eAuto);
+            } else if (mc.mode == 'R') {
+                const long long meterSpp = 16;
+                mf = renderBackward(scene, mc.cam, mc.res, mc.resY, meterSpp, nThreads, diffraction);
+                filmToRgb8(mf, (double)meterSpp, /*expComp*/1.0, /*absolute*/false,
+                           /*lockAnchor*/nullptr, &eAuto);
+            } else {
+                unsupported = true;
+                continue;   // D/M/P/S/U/V: no reduced-sample meter — leave lazy lock
+            }
+            if (eAuto > 0.0) { sum += eAuto; ++m; }
+        }
+        if (m > 0) {
+            expAnchors[g] = sum / m;
+            if (cams.size() > 1)
+                std::printf("[meter] exposure lock: group %d meters the average of %zu frame(s) "
+                            "(anchor %.4g)\n", g, cams.size(), expAnchors[g]);
+            else
+                std::printf("[meter] exposure lock: group %d meters '%s' (anchor %.4g)\n",
+                            g, cams.front().name.c_str(), expAnchors[g]);
+        } else if (unsupported) {
+            std::printf("[meter] exposure lock: group %d uses a render mode with no reduced-sample "
+                        "metering; falling back to first-frame lock\n", g);
+        }
+        std::fflush(stdout);
     }
 
     // Shared multi-camera forward pass. When several plain-`-n` forward cameras of the
