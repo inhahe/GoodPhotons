@@ -336,3 +336,114 @@ polygon geometry is needed rather than treating it as part of the (1)→(3) sequ
 
 GPU note for (1)–(3): prefer a **uniform hash grid** over a kd-tree throughout — it's the
 CUDA-friendly structure the shared photon/light-vertex passes all reuse.
+
+---
+
+# User requests — 2026-07-14
+
+Five requests captured from a planning conversation. Status: **IN PROGRESS** /
+**TODO** / **NEEDS DECISION** (blocked on a question) / **DONE**.
+
+## (6) Isosurface airtightness audit — ray-parity test — DONE 2026-07-14
+
+**Shipped** as `-check-airtight` (`src/airtight.h`, wired in `main.cpp`; chord count via
+`-check-airtight-rays`, default 4000). Fires random exterior→exterior chords through
+each isosurface's container and counts the boundary crossings the renderer's *own*
+marcher (`intersectImplicit`) reports — odd parity ⇒ leak. Also samples the container
+boundary for interior (f<0) area (the definitive open-cap signature on `open` surfaces)
+and runs a dense reference sampling to flag marcher overshoot even when parity stays
+even. Validated: a `capped` box-clipped gyroid and the CSG sphere-clipped showcase ball
+report `[OK]`; the same gyroid marked `open` is correctly flagged (≈49% odd-parity
+chords, 50% of boundary inside the solid). Documented in README under *Auditing the
+marched field directly*. Original request/analysis below.
+
+
+
+**Request.** A tool that detects whether an isosurface is air-tight *as the renderer
+actually marches it* (the analytic field), not just via a polygonised proxy like
+`-check-watertight`. Proposed method: shoot chords across the container bbox/sphere and
+flag any chord whose inside/outside **parity** is inconsistent (crosses the zero
+level-set an odd number of times between two exterior endpoints, or is inside the solid
+at a container face).
+
+**Answers to the questions raised:**
+- *Can an isosurface self-intersect?* No. The rendered surface is a level set {f = 0} of
+  a continuous scalar field; at every regular point (grad f ≠ 0) it is locally a smooth
+  manifold and cannot cross itself. Self-intersection is a *mesh* pathology (two
+  triangles passing through each other) — an analytic level set has no triangles to
+  cross. (grad f = 0 points can pinch/degenerate, but that's not self-intersection.)
+- *Would marching cubes catch everything?* No. MC samples the field on a finite grid, so
+  any leak/thin-wall/spike narrower than a cell is missed or mis-resolved — it audits a
+  *resampled copy*, not the marched field.
+- *Analytic test?* Not for arbitrary `expr` fields — no closed form for closedness of the
+  zero set. Monte-Carlo ray parity probes the exact field the renderer marches, so it's
+  the right pragmatic tool.
+
+**Leak risks it must catch:** (a) `contained_by` clipping the solid into an open cap
+(solid region touches a container face); (b) march overshoot from a wrong
+Lipschitz/`max_gradient` bound; (c) features thinner than the marcher step.
+
+**Plan.** New read-only `-check-airtight` audit in C++ (reuses the field evaluator so it
+probes the true marched field). For N random exterior→exterior chords across the
+container: densely sample f, count zero-crossings, compare crossing parity against the
+sign of f at both boundary endpoints; separately sample f on the container faces to
+catch the cap-clipping case. Report leak fraction + worst offenders. Non-destructive.
+
+## (7) Nested / overlapping dielectrics (medium stack) — NEEDS DECISION
+
+**Request.** Replace the hardcoded exterior IOR 1.0 so glass-in-water and intersecting
+dielectrics are modeled correctly, for **all** modes.
+
+**Flagged (pushback).** Large, invasive: touches every integrator (forward A/B/C,
+composite P, backward R/D, photon M/S, VCM U) on CPU + CUDA. Two designs:
+- **Priority-based nested dielectrics** (Schmidt & Budge 2002) — integer priority per
+  dielectric; boundary hits consult which medium wins. Cheap, handles coincident
+  surfaces, industry-standard; needs a `priority` material field.
+- **Full per-path medium stack** — push/pop on entry/exit. More general (ordered
+  nesting, participating media) but heavier and subtle across the bidirectional modes.
+
+**Questions:** which model, and is a `priority` material field acceptable? Do you need
+*overlapping/interpenetrating* dielectrics or just *nested non-overlapping* (glass in
+water)? Not starting until settled.
+
+## (8) Mesh/animation formats + OBJ-sequence → video — PARTIALLY NEEDS DECISION
+
+**Already shipped (correction):** `.obj` **and** `.gltf`/`.glb` import already work
+(roadmap item 5.2, done 2026-07-12) — static-mesh loading with node transforms,
+smooth normals, and PBR material mapping. So the new asks are the animation/video
+pipeline and the two heavy formats.
+- **OBJ-sequence → MP4 driver** — self-contained Python driving ftrace per frame +
+  ffmpeg; no new C++ deps. *Ready to start.*
+- **Alembic (.abc)** — heavy SDK (Imath + HDF5/Ogawa). **Question:** worth the build
+  weight, or is an OBJ/glTF sequence enough for animation?
+- **FBX** — only robust reader is Autodesk's proprietary, license-gated **FBX SDK** (not
+  a package-manager install). Per project tooling rules I won't pull it in without a
+  go-ahead. **Question:** need FBX enough to accept the Autodesk SDK, or is glTF enough?
+
+**Not starting the heavy formats unilaterally.** Give me the priority order; I'll begin
+with the OBJ-sequence video driver.
+
+## (9) Camera presets from `cameras/` simulating real optics — NEEDS DECISION
+
+**Request.** Camera objects from each model in `cameras/` that simulate them in mode A
+(finite-lens), plus a pinhole twin centered at the aperture.
+
+**Flagged.** `cameras/` holds decorative 3D **models** (`.glb`/`.usdz` of a cinema,
+pocket, portable, vintage, and vintage-SLR camera) — not optical spec sheets. Mode A
+needs focal length, sensor size, f-number, focus distance, none recoverable from an
+exterior mesh. **Question — which did you mean?**
+- (a) **Archetype presets:** physically-plausible mode-A presets per *type* (cinema =
+  full-frame 36×24, 50mm T2.0; pocket = 1/2.3" sensor; vintage SLR = 35mm, 50mm f/1.8),
+  each with a pinhole twin. Self-contained; doesn't need the mesh. *(My recommendation.)*
+- (b) **Prop + camera:** load each `.glb` as a visible prop and attach a matching
+  camera at its lens. glTF import already exists, but still needs spec numbers.
+
+## (10) Re-render golden gyroid hero (`scenes/showcase.ftsl`) — IN PROGRESS
+
+**Request.** Re-render the non-flyby golden gyroid hero, which previously read dark at
+the front because the fourth wall was blank (wall + front fill light have since been
+added).
+
+**Status.** Confirmed `scenes/showcase.ftsl` already has the closed front wall
+(`front (behind camera)`) and front fill light. Re-rendering with the live window to
+confirm the gold reads correctly head-on.
