@@ -1863,10 +1863,13 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
     Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;
+    // Reject below the shading OR geometric horizon (ng = geo normal on the shading side):
+    // a smoothed shading normal must not splat a vertex whose true geometry faces away from
+    // the camera. No-op for flat tris / analytic spheres (ng == n). Matches CPU render.h.
+    if (cosSurf <= 0 || dot(ng, wdir) <= 0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real f = rho / (Real)DPI;
     // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
@@ -1917,12 +1920,13 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (dist < (Real)1e-9) return;
     DVec3 wdir = toA / dist;
     Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;                        // pupil behind the surface
+    // Below the shading OR geometric horizon (see connect()): no-op for flat/sphere.
+    if (cosSurf <= 0 || dot(ng, wdir) <= 0) return;  // pupil behind the surface
     Real cosLens = -dot(wdir, cam.w);                // cosine at the lens (w faces scene)
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
@@ -3587,9 +3591,14 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         DVec3 wi = toL / dist;
         Real cosSurf = dot(h.n, wi);
         if (cosSurf <= 0) continue;
+        // Geometric-hemisphere clamp (matches CPU backward.h neeLight): the light must lie on
+        // the geometric front side too. No-op when h.n==h.ng (flat tris / analytic spheres);
+        // shadow ray offset along the geometric normal so it clears the true surface.
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+        if (dot(ngo, wi) <= 0) continue;
         Real cosLight = dot(nL, -wi);                 // light is one-sided
         if (cosLight <= 0) continue;
-        if (occluded(sc, h.p + h.n * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        if (occluded(sc, h.p + ngo * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(f * G) * emitW * (double)em.area;
@@ -4116,10 +4125,14 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosSurf = ddot(qs.ns, wcam);
             if (cosSurf <= 0.0) return 0.0;
+            // Geometric-hemisphere clamp (matches CPU bdpt.h): the camera must lie on the
+            // geometric front side too, else a smoothed shading normal leaks light through the
+            // back face. No-op when ns==ng. GPU BDPT is reflect-only (v1), so unconditional.
+            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            if (ddot(ngoQ, wcam) <= 0.0) return 0.0;
             f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
-            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ);
             double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
             o = qs.p + qs.ng * (Real)(sgn * 1e-6);
@@ -4156,6 +4169,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosSurf = ddot(pt.ns, wi);
             if (cosSurf <= 0.0) return 0.0;
+            // Geometric-hemisphere clamp on the eye/radiance vertex (matches CPU bdpt.h).
+            DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+            if (ddot(ngoP, wi) <= 0.0) return 0.0;
             f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda);
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
@@ -4187,6 +4203,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosE = ddot(pt.ns, w);
             if (cosE <= 0.0) return 0.0;
+            // Geometric-hemisphere clamp on the eye endpoint (connection dir w). No-op ns==ng.
+            DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+            if (ddot(ngoE, w) <= 0.0) return 0.0;
             fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda);
             double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
@@ -4196,10 +4215,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosL = ddot(qs.ns, w * (Real)-1);
             if (cosL <= 0.0) return 0.0;
+            // Geometric-hemisphere clamp on the light endpoint (connection dir -w). No-op ns==ng.
+            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            if (ddot(ngoQ, w * (Real)-1) <= 0.0) return 0.0;
             fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
-            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;

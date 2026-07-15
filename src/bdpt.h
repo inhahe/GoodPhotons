@@ -864,10 +864,15 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // Reflect-only vertices require the +ns side; a two-sided vertex may connect on
             // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
             if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
+            Vec3 ngo = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            // Geometric-hemisphere clamp: a reflect-only vertex must also see the camera on
+            // its GEOMETRIC front side, else a smoothed shading normal leaks light through the
+            // back face (shading-normal problem; matches backward.h/render.h). No-op when
+            // ns==ng (flat/analytic); skipped for two-sided (transmissive) materials.
+            if (!isTwoSidedMat(*qs.mat) && dot(ngo, wcam) <= 0.0) return 0.0;
             f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
             // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
-            Vec3 ngo = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
             f *= shadingAdjointCorr(wo, wcam, qs.ns, ngo);
         }
         if (f <= 0.0) return 0.0;
@@ -904,6 +909,12 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosSurf = dot(pt.ns, wi);
             if (cosSurf == 0.0 || (!isTwoSidedMat(*pt.mat) && cosSurf < 0.0)) return 0.0;
+            // Geometric-hemisphere clamp (see t==1 splat above): the eye/radiance vertex must
+            // also see the sampled light point on its geometric front side. No-op when ns==ng.
+            if (!isTwoSidedMat(*pt.mat)) {
+                Vec3 ngo = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
+                if (dot(ngo, wi) <= 0.0) return 0.0;
+            }
             f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
         }
         if (f <= 0.0) return 0.0;
@@ -938,6 +949,11 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosE = dot(pt.ns, w);
             if (cosE == 0.0 || (!isTwoSidedMat(*pt.mat) && cosE < 0.0)) return 0.0;
+            // Geometric-hemisphere clamp on the eye endpoint (connection dir w). No-op ns==ng.
+            if (!isTwoSidedMat(*pt.mat)) {
+                Vec3 ngoE = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
+                if (dot(ngoE, w) <= 0.0) return 0.0;
+            }
             fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
         }
         if (qs.type == VType::Medium) {
@@ -945,11 +961,13 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosL = dot(qs.ns, w * -1.0);
             if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
+            Vec3 ngoL = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            // Geometric-hemisphere clamp on the light endpoint (connection dir -w). No-op ns==ng.
+            if (!isTwoSidedMat(*qs.mat) && dot(ngoL, w * -1.0) <= 0.0) return 0.0;
             fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction on the LIGHT-subpath endpoint qs (particle
             // vertex; outgoing = w*-1 toward the eye vertex). The eye endpoint pt is a
             // Radiance vertex and gets NO correction. 1 when ns==ng (flat/analytic).
-            Vec3 ngoL = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
             fL *= shadingAdjointCorr(woL, w * -1.0, qs.ns, ngoL);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;

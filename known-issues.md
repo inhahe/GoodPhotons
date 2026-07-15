@@ -63,19 +63,40 @@ normals (so no ad-hoc `fCam` reweight is needed), rather than patching `fCam`. T
 cannot regress any existing (non-smooth) scene. Low priority — mode U smooth-shades
 correctly today; this is about *why* and a tidier derivation.
 
-### Shading-normal geometric-hemisphere clamp only wired into mode R + the forward tracer's camera connection — REMAINING MODES 2026-07-15
+### DONE (2026-07-15): Shading-normal geometric-hemisphere clamp propagated to all connection sites (+ fixed a pre-existing GPU mode-R light leak)
 
 The geometric-hemisphere clamp (stop a smoothed shading normal from leaking light in
-through the geometric back face; `orientedGeoN()` in `geometry.h`) is implemented in
-the backward reference (`backward.h` `neeLight`/`neeEnv`) and in the forward tracer's
-camera connection (`render.h` `connect`/`connectLens`). It is **not yet** applied to the
-NEE / connection sites in `bdpt.h`, `vcm.h`, `photonmap_render.h`, `sppm_render.h`, or the
-GPU twins (`render_cuda.cu` `connect`/`connectLens` and device NEE). **Recipe (per site):**
-alongside the existing `dot(Ns, wi) <= 0` shading-side test, also require
-`dot(orientedGeoN(hit), wi) > 0`, and offset the shadow/connection ray by
-`orientedGeoN(hit) * 1e-6` instead of `Ns * 1e-6`. It is a no-op for flat tris / analytic
-spheres (`ngo == Ns` there), so it cannot regress existing scenes. Lower priority than the
-adjoint correction above (which is what actually makes forward smoothing look right).
+through the geometric back face; `orientedGeoN()` in `geometry.h`) was previously only in
+the backward reference (`backward.h` `neeLight`/`neeEnv`) and the forward tracer's camera
+connection (`render.h` `connect`/`connectLens`). It is now applied at **every** NEE /
+connection site: `bdpt.h` (mode D — the t==1 splat, s==1 NEE, and interior connection, each
+endpoint), `vcm.h` (mode U — light-image splat, NEE, and both VC-connection endpoints), and
+the GPU twins in `render_cuda.cu` (`connect`/`connectLens` for A/B/C, `dConnectBDPT` for
+mode D, and `bkNeeLight` for backward). **Per-site recipe applied:** alongside the existing
+`dot(Ns, wi) <= 0` shading-side test, also require `dot(ngo, wi) > 0` (ngo = geo normal
+oriented to Ns) and offset the shadow/connection ray along `ngo`. In `bdpt.h`/`vcm.h` the
+clamp is **guarded by `!isTwoSidedMat`** so transmissive (glass) connections through the
+back hemisphere are not wrongly killed; GPU BDPT is reflect-only (v1) so the clamp is
+unconditional there. No-op for flat tris / analytic spheres (`ngo == Ns`), so every
+non-smooth scene is bit-identical.
+
+**Modes M/S need nothing:** mode M's direct lighting reuses `bw.neeLight` (already clamped)
+and its photon gather has no shadow ray; SPPM's visible-point walk does no NEE at all.
+
+**Pre-existing bug fixed as a side effect.** The GPU backward NEE (`bkNeeLight`) was missing
+the clamp its CPU twin (`backward.h neeLight`) already had, so **GPU mode R silently leaked
+light through geometric back faces** — on `scraps/_iso_sphere.ftsl` GPU-R showed a smooth
+(leaking) terminator while CPU-R showed the correct leak-free (faceted) one. Adding the
+clamp to `bkNeeLight` makes CPU-R and GPU-R identical.
+
+**Caveat — shadow terminator.** A *hard* geometric clamp reveals the shadow-terminator
+problem: on a low-poly smooth-normal sphere under grazing light the terminator shows the
+underlying facets (hard dark slivers) rather than a smooth gradient. This is **the mode-R
+reference's existing behavior** (CPU-R has always done it), so propagating the clamp makes
+the forward modes *consistent with the reference*, not worse than it. Softening it (e.g.
+Chiang et al. 2019, "Taming the Shadow Terminator") is a separate future enhancement that
+would be applied uniformly to **all** modes including R — tracked as a possible follow-up,
+not part of this clamp-propagation work.
 
 ### Headless-spawned `-window` render on gallery.ftsl hangs with no output — NEEDS INVESTIGATION 2026-07-14
 

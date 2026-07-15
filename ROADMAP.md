@@ -331,11 +331,15 @@ render_cuda.cu), and `addMesh` in ftsl.h.
    auto-smoothing DONE** (2026-07-15) — `mesh { smooth [<deg>] }` in `loadObj` (position-weld +
    angle-weighted per-corner normals under the dihedral threshold); host-only, so the GPU `DTri`
    picks it up for free. **Shading-normal geometric-hemisphere clamp** — ✅ partly DONE (2026-07-15):
-   `orientedGeoN()` (`geometry.h`) + clamp wired into the backward reference (`backward.h`
-   `neeLight`/`neeEnv`) and the forward tracer's camera connection (`render.h` `connect`/`connectLens`),
-   stopping smoothed normals from leaking light through the geometric back face (no-op for flat/analytic).
-   *Remaining:* propagate the clamp to `bdpt.h`/`vcm.h`/`photonmap_render.h`/`sppm_render.h` + GPU
-   (tracked in `known-issues.md`).
+   `orientedGeoN()` (`geometry.h`) + clamp now wired into **every** NEE/connection site:
+   the backward reference (`backward.h` `neeLight`/`neeEnv`), the forward tracer's camera
+   connection (`render.h` `connect`/`connectLens`), `bdpt.h` (mode D), `vcm.h` (mode U), and
+   the GPU twins (`render_cuda.cu` `connect`/`connectLens`, `dConnectBDPT`, `bkNeeLight`) —
+   stopping smoothed normals from leaking light through the geometric back face (no-op for
+   flat/analytic; guarded by `!isTwoSidedMat` so glass transmission isn't killed). Modes M/S
+   need nothing (M reuses the clamped `neeLight`; SPPM does no NEE). This also fixed a
+   pre-existing **GPU mode-R** back-face light leak (its `bkNeeLight` lacked the clamp its CPU
+   twin had). ✅ **DONE 2026-07-15** (see `known-issues.md`).
 2. ✅ **DONE** — glTF loader (`src/gltf.h`) + minimal JSON parser (`src/third_party/json.h`): parses
    nodes/meshes/accessors/bufferViews/buffers (GLB BIN chunk, external `.bin`, base64 data URIs),
    bakes node transforms (matrix or TRS), maps metallic-roughness → spectral BSDFs; `addMesh`

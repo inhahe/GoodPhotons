@@ -466,7 +466,11 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                     double distc = std::sqrt(dist2c);
                     Vec3 wcam = toCam / distc;
                     double cosToCamera = dot(h.n, wcam);
-                    bool sideOk = isTwoSidedMat(*mp) ? (cosToCamera != 0.0) : (cosToCamera > 0.0);
+                    // Geometric-hemisphere clamp for a reflect-only vertex: the camera must lie
+                    // on the geometric front side too (no back-face light leak). `ngo` is the
+                    // geo normal oriented to h.n (line above). No-op when h.n==h.ng.
+                    bool sideOk = isTwoSidedMat(*mp) ? (cosToCamera != 0.0)
+                                                     : (cosToCamera > 0.0 && dot(ngo, wcam) > 0.0);
                     double cosAtCamera = dot(cam.w, wcam * -1.0);   // forward vs camera->point
                     if (sideOk && cosAtCamera > 1e-9) {
                         int px, py; double cc, d2c;
@@ -596,7 +600,12 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double distL = std::sqrt(dist2); Vec3 wi = toL / distL;
                         double cosAtLight = dot(nL, wi * -1.0);
                         double cosToLight = dot(h.n, wi);
-                        bool sideOk = isTwoSidedMat(*mp) ? (cosToLight != 0.0) : (cosToLight > 0.0);
+                        // Geometric-hemisphere clamp on this eye/radiance vertex (matches
+                        // backward.h neeLight): the sampled light point must be on h's geometric
+                        // front side too. No-op when h.n==h.ng; skipped for two-sided.
+                        bool sideOk = isTwoSidedMat(*mp)
+                                          ? (cosToLight != 0.0)
+                                          : (cosToLight > 0.0 && dot(orientedGeoN(h), wi) > 0.0);
                         if (cosAtLight > 0.0 && sideOk) {
                             double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h);
                             double Le = em.spdFn(lambda) * invPdfLambda;
@@ -631,15 +640,21 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double distc = std::sqrt(dist2); Vec3 w = d / distc;   // camera -> light vertex
                 double cosCam = dot(h.n, w);
                 double cosLit = dot(lv.ns, w * -1.0);
-                bool camSide = isTwoSidedMat(*mp) ? (cosCam != 0.0) : (cosCam > 0.0);
-                bool litSide = isTwoSidedMat(*lv.mat) ? (cosLit != 0.0) : (cosLit > 0.0);
+                // Geometric-hemisphere clamp on BOTH reflect-only endpoints (connection dir w
+                // at the camera vertex, -w at the light vertex): each must see the other on its
+                // geometric front side. No-op when ns==ng; skipped for two-sided materials.
+                Vec3 ngoCam = orientedGeoN(h);
+                Vec3 ngoLit = (dot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                bool camSide = isTwoSidedMat(*mp)
+                                   ? (cosCam != 0.0) : (cosCam > 0.0 && dot(ngoCam, w) > 0.0);
+                bool litSide = isTwoSidedMat(*lv.mat)
+                                   ? (cosLit != 0.0) : (cosLit > 0.0 && dot(ngoLit, w * -1.0) > 0.0);
                 if (!camSide || !litSide) continue;
                 double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h);
                 double fLit = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene, &lv.hit);
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
-                // Uses lv.ng oriented to lv.ns; a no-op when the mesh is flat.
-                Vec3 ngoLit = (dot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                // Uses lv.ng oriented to lv.ns (ngoLit above); a no-op when the mesh is flat.
                 fLit *= shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit);
                 if (fCam <= 0.0 || fLit <= 0.0) continue;
                 double camDirPdfW = bsdfPdf(*mp, h.n, wo, w, lambda, scene, &h);
