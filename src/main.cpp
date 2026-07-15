@@ -3781,8 +3781,8 @@ static int run(int argc, char** argv) {
             };
             std::printf(
               "[viewer] interactive raster camera — fly it, then copy the eye/look_at:\n"
-              "         fly:    W/S = forward/back   A/D = strafe left/right   R/F = up/down   (camera-relative)\n"
-              "         aim:    Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   Shift/Ctrl/Alt+Up/Dn = farther/nearer\n"
+              "         fly:    W/S = forward/back   A/D = strafe left/right   R/F = rise/drop   (camera-relative)\n"
+              "         aim:    Left/Right = crosshair left/right   Up/Down = crosshair up/down   PgUp/PgDn = farther/nearer  (all screen-relative)\n"
               "         mouse:  drag = slide the red crosshair L/R/U/D across the view    wheel = push it farther/nearer\n"
               "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
@@ -3811,6 +3811,15 @@ static int run(int argc, char** argv) {
                     Vec3 d = dir * (step / L);
                     eye = eye + d; tgt = tgt + d; changed = true;
                 };
+                // Screen-relative crosshair basis: the arrow keys slide the look-at
+                // target across the current VIEW plane (camera right = cc.u, camera up
+                // = cc.v), exactly like the mouse-drag path, so Left/Right always move
+                // it left/right on screen and Up/Down always move it up/down — no matter
+                // how the camera is oriented. (Previously these nudged the target in
+                // WORLD X/Y/Z, which scrambled on-screen once the camera turned.)
+                Camera vc; vc.projection = proj;
+                vc.lookAt(eye, tgt, up, fovY, VW, VH);
+                const Vec3 camRight = vc.u, camUp = vc.v;
                 for (NudgeCmd c : cmds) {
                     Vec3 fwd = tgt - eye;
                     switch (c) {
@@ -3820,12 +3829,12 @@ static int run(int argc, char** argv) {
                         case NudgeCmd::FlyLeft:  fly(cross(up, fwd));  break;
                         case NudgeCmd::FlyUp:    fly(up);  break;
                         case NudgeCmd::FlyDown:  fly(up * -1.0); break;
-                        case NudgeCmd::TgtXNeg: tgt.x -= step; changed = true; break;
-                        case NudgeCmd::TgtXPos: tgt.x += step; changed = true; break;
-                        case NudgeCmd::TgtYNeg: tgt.y -= step; changed = true; break;
-                        case NudgeCmd::TgtYPos: tgt.y += step; changed = true; break;
-                        case NudgeCmd::TgtZNeg: tgt.z -= step; changed = true; break;
-                        case NudgeCmd::TgtZPos: tgt.z += step; changed = true; break;
+                        case NudgeCmd::TgtXNeg: tgt = tgt - camRight * step; changed = true; break;  // screen-left
+                        case NudgeCmd::TgtXPos: tgt = tgt + camRight * step; changed = true; break;  // screen-right
+                        case NudgeCmd::TgtYNeg: tgt = tgt - camUp    * step; changed = true; break;  // screen-down
+                        case NudgeCmd::TgtYPos: tgt = tgt + camUp    * step; changed = true; break;  // screen-up
+                        case NudgeCmd::TgtZNeg: tgt = tgt - camUp    * step; changed = true; break;  // (unused key) screen-down
+                        case NudgeCmd::TgtZPos: tgt = tgt + camUp    * step; changed = true; break;  // (unused key) screen-up
                         case NudgeCmd::TgtFar: {   // push the target away along the view axis
                             Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
                             if (L > 1e-9) { tgt = tgt + f * (step / L); changed = true; }

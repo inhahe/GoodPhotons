@@ -170,14 +170,11 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         case WM_KEYDOWN:
             // Map keys to interactive camera nudges (queued; the render loop applies
             // them). WASD + R/F fly the whole camera in ITS OWN frame (forward/back,
-            // strafe left/right, rise/drop); arrows + PgUp/Dn aim the look-at target
-            // (world axes). [ / ] resize the step, 0 resets, P prints a camera block.
+            // strafe left/right, rise/drop); the arrows slide the look-at crosshair
+            // across the SCREEN (Left/Right = screen L/R, Up/Down = screen U/D), and
+            // PgUp/PgDn push it farther / pull it nearer along the view axis.
+            // [ / ] resize the step, 0 resets, P prints a camera block.
             if (self) {
-                // A held Shift/Ctrl/Alt turns Up/Down into move-along-the-view-axis
-                // (farther / nearer) instead of the plain world-Z target nudge.
-                bool mod = (GetKeyState(VK_SHIFT)   & 0x8000) ||
-                           (GetKeyState(VK_CONTROL) & 0x8000) ||
-                           (GetKeyState(VK_MENU)    & 0x8000);
                 NudgeCmd c; bool hit = true;
                 switch (wp) {
                     case 'A':        c = NudgeCmd::FlyLeft;  break;   // strafe left
@@ -186,12 +183,12 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                     case 'R':        c = NudgeCmd::FlyUp;    break;   // rise (world up)
                     case 'S':        c = NudgeCmd::FlyBack;  break;   // back off the view axis
                     case 'W':        c = NudgeCmd::FlyFwd;   break;   // fly into the view axis
-                    case VK_LEFT:    c = NudgeCmd::TgtXNeg; break;
-                    case VK_RIGHT:   c = NudgeCmd::TgtXPos; break;
-                    case VK_NEXT:    c = NudgeCmd::TgtYNeg; break;   // PageDown
-                    case VK_PRIOR:   c = NudgeCmd::TgtYPos; break;   // PageUp
-                    case VK_DOWN:    c = mod ? NudgeCmd::TgtNear : NudgeCmd::TgtZNeg; break;
-                    case VK_UP:      c = mod ? NudgeCmd::TgtFar  : NudgeCmd::TgtZPos; break;
+                    case VK_LEFT:    c = NudgeCmd::TgtXNeg; break;   // crosshair screen-left
+                    case VK_RIGHT:   c = NudgeCmd::TgtXPos; break;   // crosshair screen-right
+                    case VK_DOWN:    c = NudgeCmd::TgtYNeg; break;   // crosshair screen-down
+                    case VK_UP:      c = NudgeCmd::TgtYPos; break;   // crosshair screen-up
+                    case VK_NEXT:    c = NudgeCmd::TgtNear; break;   // PageDown -> pull nearer
+                    case VK_PRIOR:   c = NudgeCmd::TgtFar;  break;   // PageUp   -> push farther
                     case VK_OEM_4:   c = NudgeCmd::StepDown; break;  // [
                     case VK_OEM_6:   c = NudgeCmd::StepUp;   break;  // ]
                     case '0': case VK_HOME: c = NudgeCmd::Reset; break;

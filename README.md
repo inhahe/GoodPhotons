@@ -171,9 +171,9 @@ paths they can capture at all**.
 > |---|---|
 > | **left-drag** | slide the target across the current view plane — left/right/up/down **relative to the view direction** (the aim, hence the whole view, pans with the drag) |
 > | **mouse wheel** | push the target **farther / nearer** along the view axis (watch the crosshair shrink / grow) |
-> | `Shift`/`Ctrl`/`Alt` + `↑`/`↓` | same farther / nearer along the view axis, from the keyboard |
 > | `W`/`S` · `A`/`D` · `R`/`F` | **fly the camera** forward/back · strafe left/right · up/down — **camera-relative** (eye and target move together, so the view direction is kept; `R`/`F` rise/drop along world up) |
-> | `←`/`→` · `PgUp`/`PgDn` · `↑`/`↓` | aim the target −X/+X · +Y/−Y · −Z/+Z (world axes; plain `↑`/`↓` = world Z) |
+> | `←`/`→` · `↑`/`↓` | slide the crosshair **left/right · up/down on screen** — **view-relative** (the same view-plane basis as left-drag), so the arrows always match what you see regardless of camera orientation |
+> | `PgUp` / `PgDn` | push the crosshair **farther / nearer** along the view axis (same as the mouse wheel, from the keyboard; watch the crosshair shrink / grow) |
 > | `[` / `]` | finer / coarser keyboard/wheel move step (starts at 3 % of the scene radius) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
