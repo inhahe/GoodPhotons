@@ -17,8 +17,12 @@
 // scene scale) drains these and turns each into a camera nudge. Eye/target moves are
 // along the WORLD axes so the resulting numbers drop straight into a `.ftsl` camera.
 enum class NudgeCmd {
-    EyeXNeg, EyeXPos, EyeYNeg, EyeYPos, EyeZNeg, EyeZPos,   // move the camera eye
-    TgtXNeg, TgtXPos, TgtYNeg, TgtYPos, TgtZNeg, TgtZPos,   // move the look-at target (world axes)
+    // Camera-relative FLYTHROUGH: translate the whole camera (eye AND target together)
+    // along the camera's own axes, so the view direction is preserved while you fly
+    // forward/back, strafe, and rise/drop — the intuitive WASD+RF flightpath. The window
+    // reports the intent; the render loop (which knows the camera basis) resolves it.
+    FlyFwd, FlyBack, FlyLeft, FlyRight, FlyUp, FlyDown,
+    TgtXNeg, TgtXPos, TgtYNeg, TgtYPos, TgtZNeg, TgtZPos,   // aim the look-at target (world axes)
     TgtNear, TgtFar,                                         // move the target along the view axis
     StepDown, StepUp,                                        // finer / coarser move step
     Reset,                                                   // back to the authored camera

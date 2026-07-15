@@ -3459,9 +3459,29 @@ static int run(int argc, char** argv) {
             std::vector<MeterCam>& plan = meterPlan[g];
             auto addFrame = [&](const ftsl::CamSpec& cs) { plan.push_back(buildMeterCam(cs)); };
             switch (rep.expLockSel) {
-                case ftsl::CamSpec::EXPLOCK_AVERAGE:
-                    for (const auto* cs : members) addFrame(*cs);
+                case ftsl::CamSpec::EXPLOCK_AVERAGE: {
+                    // Average the per-frame anchors — but metering every frame of a long
+                    // flyby is wasteful. Each meter frame projects the WHOLE scene (the
+                    // dominant, resolution-independent cost), and the locked anchor is a
+                    // smooth statistic of the path, so a stratified subsample estimates the
+                    // same mean to well within a tenth of a stop. Cap at kMeterFrames evenly
+                    // spaced frames (endpoints included) instead of all N. Measured on
+                    // gallery.ftsl (144-frame camera_curve, 4.65 M tris): all-144 average
+                    // anchor 1.597 vs 32-frame subsample 1.697 — a 0.088-stop difference
+                    // (invisible), for a ~4.5x cheaper meter pre-pass.
+                    constexpr int kMeterFrames = 32;
+                    const int n = (int)members.size();
+                    if (n <= kMeterFrames) {
+                        for (const auto* cs : members) addFrame(*cs);
+                    } else {
+                        // Evenly spaced indices in [0, n-1], endpoints included.
+                        for (int j = 0; j < kMeterFrames; ++j) {
+                            long long idx = (long long)j * (n - 1) / (kMeterFrames - 1);
+                            addFrame(*members[(size_t)idx]);
+                        }
+                    }
                     break;
+                }
                 case ftsl::CamSpec::EXPLOCK_INDEX: {
                     int n = (int)members.size(), i = rep.expLockIndex;
                     if (i < 0) i += n;
@@ -3588,7 +3608,10 @@ static int run(int argc, char** argv) {
                 if (a > 0.0) { sum += a; ++m; }
                 ++meterDone;
                 // Show the metering pass converging + report a throttled percentage so the
-                // window/console isn't silent while this (often long) pre-pass runs.
+                // window/console isn't silent while this (often long) pre-pass runs. The
+                // shown frames are per-frame auto-exposed — a rough, NOT-yet-exposure-locked
+                // preview whose brightness varies frame to frame — so the title says as much
+                // to avoid the impression that this flickering sweep is the final look.
                 auto now = std::chrono::steady_clock::now();
                 bool last = (meterDone == meterTotal);
                 if (meterDone == 1 || last ||
@@ -3596,9 +3619,10 @@ static int run(int argc, char** argv) {
                     int pct = meterTotal ? (int)std::lround(100.0 * meterDone / meterTotal) : 100;
                     if (g_liveWin && !g_liveWin->closed()) {
                         g_liveWin->update(mc.res, mc.resY, mimg);
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure (" +
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure "
+                                            "(preview NOT locked yet) " +
                                             std::to_string(meterDone) + "/" +
-                                            std::to_string(meterTotal) + ", " +
+                                            std::to_string(meterTotal) + " (" +
                                             std::to_string(pct) + "%)");
                     }
                     std::printf("[raster] metering exposure %zu/%zu (%d%%)\n",
@@ -3736,10 +3760,10 @@ static int run(int argc, char** argv) {
                 return std::string(b);
             };
             std::printf(
-              "[viewer] interactive raster camera — move it, then copy the eye/look_at:\n"
+              "[viewer] interactive raster camera — fly it, then copy the eye/look_at:\n"
+              "         fly:    W/S = forward/back   A/D = strafe left/right   R/F = up/down   (camera-relative)\n"
+              "         aim:    Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   Shift/Ctrl/Alt+Up/Dn = farther/nearer\n"
               "         mouse:  drag = slide the red crosshair L/R/U/D across the view    wheel = push it farther/nearer\n"
-              "         eye:    A/D = -X/+X    R/F = +Y/-Y    W/S = -Z/+Z\n"
-              "         target: Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   Shift/Ctrl/Alt+Up/Dn = farther/nearer\n"
               "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
               step);
@@ -3757,14 +3781,25 @@ static int run(int argc, char** argv) {
                   } }
                 std::vector<NudgeCmd> cmds = g_liveWin->drainNudges();
                 bool doPrint = false;
+                // Camera-relative flythrough moves eye AND target together along the
+                // camera's own basis, so the view direction is preserved. forward =
+                // normalize(tgt-eye); right = forward × worldUp (screen-right); flyUp uses
+                // the WORLD up axis so "rise/drop" stays vertical regardless of pitch.
+                auto fly = [&](const Vec3& dir) {
+                    double L = std::sqrt(dot(dir, dir));
+                    if (L < 1e-12) return;
+                    Vec3 d = dir * (step / L);
+                    eye = eye + d; tgt = tgt + d; changed = true;
+                };
                 for (NudgeCmd c : cmds) {
+                    Vec3 fwd = tgt - eye;
                     switch (c) {
-                        case NudgeCmd::EyeXNeg: eye.x -= step; changed = true; break;
-                        case NudgeCmd::EyeXPos: eye.x += step; changed = true; break;
-                        case NudgeCmd::EyeYNeg: eye.y -= step; changed = true; break;
-                        case NudgeCmd::EyeYPos: eye.y += step; changed = true; break;
-                        case NudgeCmd::EyeZNeg: eye.z -= step; changed = true; break;
-                        case NudgeCmd::EyeZPos: eye.z += step; changed = true; break;
+                        case NudgeCmd::FlyFwd:   fly(fwd);  break;
+                        case NudgeCmd::FlyBack:  fly(fwd * -1.0); break;
+                        case NudgeCmd::FlyRight: fly(cross(fwd, up));  break;
+                        case NudgeCmd::FlyLeft:  fly(cross(up, fwd));  break;
+                        case NudgeCmd::FlyUp:    fly(up);  break;
+                        case NudgeCmd::FlyDown:  fly(up * -1.0); break;
                         case NudgeCmd::TgtXNeg: tgt.x -= step; changed = true; break;
                         case NudgeCmd::TgtXPos: tgt.x += step; changed = true; break;
                         case NudgeCmd::TgtYNeg: tgt.y -= step; changed = true; break;

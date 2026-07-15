@@ -169,8 +169,9 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             return 0;
         case WM_KEYDOWN:
             // Map keys to interactive camera nudges (queued; the render loop applies
-            // them). Eye = WASD + R/F (world X/Z + Y); look-at target = arrows + PgUp/Dn.
-            // [ / ] resize the step, 0 resets, P prints a paste-ready camera block.
+            // them). WASD + R/F fly the whole camera in ITS OWN frame (forward/back,
+            // strafe left/right, rise/drop); arrows + PgUp/Dn aim the look-at target
+            // (world axes). [ / ] resize the step, 0 resets, P prints a camera block.
             if (self) {
                 // A held Shift/Ctrl/Alt turns Up/Down into move-along-the-view-axis
                 // (farther / nearer) instead of the plain world-Z target nudge.
@@ -179,12 +180,12 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                            (GetKeyState(VK_MENU)    & 0x8000);
                 NudgeCmd c; bool hit = true;
                 switch (wp) {
-                    case 'A':        c = NudgeCmd::EyeXNeg; break;
-                    case 'D':        c = NudgeCmd::EyeXPos; break;
-                    case 'F':        c = NudgeCmd::EyeYNeg; break;
-                    case 'R':        c = NudgeCmd::EyeYPos; break;
-                    case 'S':        c = NudgeCmd::EyeZNeg; break;
-                    case 'W':        c = NudgeCmd::EyeZPos; break;
+                    case 'A':        c = NudgeCmd::FlyLeft;  break;   // strafe left
+                    case 'D':        c = NudgeCmd::FlyRight; break;   // strafe right
+                    case 'F':        c = NudgeCmd::FlyDown;  break;   // drop (world down)
+                    case 'R':        c = NudgeCmd::FlyUp;    break;   // rise (world up)
+                    case 'S':        c = NudgeCmd::FlyBack;  break;   // back off the view axis
+                    case 'W':        c = NudgeCmd::FlyFwd;   break;   // fly into the view axis
                     case VK_LEFT:    c = NudgeCmd::TgtXNeg; break;
                     case VK_RIGHT:   c = NudgeCmd::TgtXPos; break;
                     case VK_NEXT:    c = NudgeCmd::TgtYNeg; break;   // PageDown
