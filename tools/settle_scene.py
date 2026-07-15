@@ -42,6 +42,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 from settle import euler_xyz_deg  # R -> (rx,ry,rz) deg such that R = Rz·Ry·Rx
 
+# Cap on the triangle count of a dynamic object's VHACD collision proxy. Convex
+# decomposition time scales with tri count and only the gross shape matters for
+# resting a rigid body, so meshes above this are quadric-decimated first (needs the
+# `fast_simplification` package; falls back to the full mesh if unavailable).
+COLLISION_TRI_CAP = 40000
+
 
 # ---------------------------------------------------------------- ftsl parsing
 def strip_comments(text):
@@ -180,13 +186,24 @@ def export_isosurface_meshes(scene_path, res):
     if not os.path.exists(tmp):
         sys.stderr.write(r.stdout + '\n' + r.stderr + '\n')
         sys.exit('[settle_scene] -export-mesh produced no file')
-    scene = trimesh.load(tmp, process=False, group_material=False)
+    # `-export-mesh` writes one `o <block-name>` object per isosurface. Force a Scene
+    # so those object names survive even when there is a SINGLE isosurface (a bare
+    # `trimesh.load` collapses one object to an un-named Trimesh, losing the name and
+    # breaking the match back to the ftsl block). Fall back to the file's `o` tokens.
+    scene = trimesh.load(tmp, process=False, group_material=False, force='scene')
+    obj_names = [ln.split(None, 1)[1].strip()
+                 for ln in open(tmp) if ln.startswith('o ') and len(ln.split(None, 1)) > 1]
     out = {}
     if isinstance(scene, trimesh.Scene):
-        for name, geom in scene.geometry.items():
+        geoms = list(scene.geometry.items())
+        # If trimesh named geometries generically (e.g. "geometry_0") but the OBJ has
+        # the authored `o` names, prefer the authored names by position.
+        for i, (name, geom) in enumerate(geoms):
+            if len(geoms) == len(obj_names):
+                name = obj_names[i]
             out[name] = geom
     else:
-        out['isosurface_0'] = scene
+        out[obj_names[0] if obj_names else 'isosurface_0'] = scene
     return out
 
 
@@ -214,9 +231,29 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction):
     for name, mesh in worlds.items():
         path = os.path.join(tmpdir, re.sub(r'\W+', '_', name) + '.obj')
         if name in selected:
-            # dynamic: center on COM, convex-decompose, spawn at COM so v_work=v_world-c
+            # dynamic: center on COM, convex-decompose, spawn at COM so v_work=v_world-c.
+            # center_mass needs a clean watertight volume; a repaired art mesh can have
+            # degenerate faces / inconsistent winding that make it NaN, so fall back to
+            # the vertex centroid and finally the bbox centre — any finite interior-ish
+            # point works (it's only the spawn reference for the rigid delta).
             c = np.asarray(mesh.center_mass if mesh.is_watertight else mesh.centroid, float)
+            if not np.all(np.isfinite(c)):
+                c = np.asarray(mesh.centroid, float)
+            if not np.all(np.isfinite(c)):
+                c = mesh.bounds.mean(axis=0)
             cen = mesh.copy(); cen.apply_translation(-c)
+            # VHACD's cost scales with triangle count and it only needs the gross shape,
+            # so cap the collision proxy (a fine art mesh can be 100s of k tris, which
+            # makes convex decomposition take many minutes). The visual mesh in the scene
+            # is untouched — this proxy is thrown away after the pose delta is computed.
+            if len(cen.faces) > COLLISION_TRI_CAP:
+                try:
+                    cen = cen.simplify_quadric_decimation(face_count=COLLISION_TRI_CAP)
+                    print(f'[settle_scene] decimated "{name}" collision proxy to '
+                          f'{len(cen.faces)} tris (from {len(mesh.faces)})')
+                except Exception as e:
+                    print(f'[settle_scene] proxy decimation of "{name}" failed ({e}); '
+                          'using full-resolution mesh (VHACD may be slow)')
             cen.export(path)
             vh = path[:-4] + '_vhacd.obj'
             try:
