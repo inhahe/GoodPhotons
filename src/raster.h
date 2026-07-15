@@ -79,46 +79,69 @@ inline Vec3 materialColor(const Material& m, bool& emissive) {
     return albedo;
 }
 
-// A directional/positional key light distilled from the scene's emitters for shading.
+// One positional/spot source distilled from a scene emitter for preview shading.
+struct PLight {
+    Vec3   pos{0, 0, 0};        // world position of the source
+    Vec3   dir{0, 0, 1};        // spot axis (source -> cone centre); unit
+    bool   spot = false;        // apply cone falloff via spotFalloff()
+    double cosInner = 1.0, cosOuter = 1.0;  // spot penumbra cosines
+    double weight = 1.0;        // power-normalised key weight (Σ weights = 1)
+    double falloff2 = 0.0;      // squared reference distance for 1/(1+d²/r²) (0 = none)
+};
+
+// The scene's lights distilled for shading: every positional/spot emitter shades
+// from its own real direction, plus flat ambient + a subtle camera-headlight fill.
 struct PreviewLight {
-    bool   positional = false;  // has a world position to point toward
-    Vec3   pos{0, 0, 0};
-    double ambient = 0.12;      // flat fill so nothing is pure black (kept low for contrast)
-    double key     = 1.15;      // directional key weight (multiplied by N·L and falloff)
-    double fill    = 0.08;      // subtle headlight so back faces aren't crushed to black
-    double falloff2 = 0.0;      // squared reference distance for the 1/(1+d²/r²) falloff (0 = none)
+    std::vector<PLight> lights;  // one entry per positional/spot emitter
+    double ambient  = 0.12;      // flat fill so nothing is pure black (kept low for contrast)
+    double keyScale = 1.15;      // overall multiplier on the summed weighted N·L
+    double fill     = 0.08;      // subtle headlight so back faces aren't crushed to black
 };
 
 inline PreviewLight deriveLight(const Scene& sc) {
     PreviewLight L;
-    double best = -1.0;
+    const double refR = sc.sceneRadius > 0 ? sc.sceneRadius * 0.6 : 0.0;
+    const double fall2 = refR * refR;
     bool anyEnv = false;
+    double totalPow = 0.0;
+
     for (const auto& e : sc.emitters) {
         if (e.shape == EmitterShape::Env) { anyEnv = true; continue; }
-        double p = e.power;
-        if (p <= best) continue;
-        best = p;
-        L.positional = true;
-        if (e.shape == EmitterShape::Quad)      L.pos = e.origin + (e.u + e.v) * 0.5;
-        else                                    L.pos = e.origin;   // sphere/cyl/spot
+        PLight p;
+        switch (e.shape) {
+            case EmitterShape::Quad:     p.pos = e.origin + (e.u + e.v) * 0.5; break;
+            case EmitterShape::Cylinder: p.pos = e.origin + e.v * 0.5;         break;  // tube centre
+            default:                     p.pos = e.origin;                     break;  // sphere / spot
+        }
+        if (e.shape == EmitterShape::Spot) {
+            p.spot = true;
+            p.dir = normalize(e.beamDir);
+            p.cosInner = e.spotCosInner;
+            p.cosOuter = e.spotCosOuter;
+        }
+        p.weight   = std::max(e.power, 0.0);
+        p.falloff2 = fall2;
+        totalPow  += p.weight;
+        L.lights.push_back(p);
     }
-    if (anyEnv && !L.positional) {
-        // No positional source (env-only): lean on the headlight for shape, with a
-        // higher ambient so it doesn't look flat-black on the far side.
-        L.ambient = 0.30; L.key = 0.0; L.fill = 0.75;
+
+    // Normalise weights so total key intensity is stable regardless of light count.
+    if (totalPow > 0.0)
+        for (auto& p : L.lights) p.weight /= totalPow;
+    else
+        for (auto& p : L.lights) p.weight = 1.0 / (double)L.lights.size();
+
+    if (L.lights.empty() && anyEnv) {
+        // Env-only: lean on the headlight for shape, higher ambient so the far side
+        // doesn't read flat-black.
+        L.ambient = 0.30; L.keyScale = 0.0; L.fill = 0.75;
     } else if (anyEnv) {
-        // Positional key PLUS an environment fill: moderate ambient, softer falloff.
-        L.ambient = 0.24; L.key = 0.95; L.fill = 0.12;
-        L.falloff2 = sc.sceneRadius > 0 ? sc.sceneRadius * sc.sceneRadius : 0.0;
+        // Positional/spot keys PLUS an environment fill: moderate ambient, softer key.
+        L.ambient = 0.24; L.keyScale = 0.95; L.fill = 0.12;
     } else {
-        // Lone bulb (the gallery case): low ambient + inverse-square-ish falloff from
-        // the source so near walls read bright and far ones fall into shadow — the
-        // single-source contrast that was washing out before.
-        L.ambient = 0.10; L.key = 1.25; L.fill = 0.06;
-        // Reference distance ~ scene radius: N·L is halved at that range, so the
-        // room shades from the bulb outward instead of being uniformly bright.
-        double r = sc.sceneRadius > 0 ? sc.sceneRadius * 0.6 : 0.0;
-        L.falloff2 = r * r;
+        // Lone bulb / multiple bulbs, no env (the gallery case): low ambient +
+        // inverse-square-ish falloff so surfaces shade from each source outward.
+        L.ambient = 0.10; L.keyScale = 1.25; L.fill = 0.06;
     }
     return L;
 }
@@ -314,16 +337,23 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 Vec3 N = normalize(wn);
                 Vec3 V = normalize(cam.eye - wp);           // toward camera
                 if (dot(N, V) < 0.0) N = -N;                 // two-sided
-                double ndl = 0.0, atten = 1.0;
-                if (light.positional) {
-                    Vec3 d = light.pos - wp;
+                // Sum diffuse contributions from every scene light, each from its own
+                // real direction (with distance falloff and spot cone shaping).
+                double lit = 0.0;
+                for (const auto& lp : light.lights) {
+                    Vec3 d = lp.pos - wp;
                     double dist2 = dot(d, d);
                     Vec3 Ld = (dist2 > 1e-12) ? d / std::sqrt(dist2) : V;
-                    ndl = std::max(0.0, dot(N, Ld));
-                    if (light.falloff2 > 0.0) atten = light.falloff2 / (light.falloff2 + dist2);
+                    double ndl = std::max(0.0, dot(N, Ld));
+                    if (ndl <= 0.0) continue;
+                    double atten = 1.0;
+                    if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
+                    double cone = 1.0;
+                    if (lp.spot) cone = spotFalloff(dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
+                    lit += lp.weight * ndl * atten * cone;
                 }
                 double head = std::max(0.0, dot(N, V));      // headlight fill
-                double k = light.ambient + light.key * ndl * atten + light.fill * head;
+                double k = light.ambient + light.keyScale * lit + light.fill * head;
                 // Mild S-curve contrast around mid-grey so lit/shadow separation reads
                 // stronger without crushing either end (applied per-channel, linear).
                 Vec3 c = col * k;
