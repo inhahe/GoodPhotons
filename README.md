@@ -400,7 +400,7 @@ Declared with `material "name" { type <type> … }`.
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
 | `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). CPU only. Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
-| `dielectric` | Refractive glass with dispersion, optional **frosting** and **colored-glass tint** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption |
+| `dielectric` | Refractive glass with dispersion, optional **frosting**, **colored-glass tint** and **nested-dielectric priority** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption; `priority <N>` (integer) disambiguates overlapping dielectrics — see below |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`) |
@@ -446,6 +446,30 @@ two physically-motivated translucency controls (both compose with dispersion):
   absorption is threaded through all three CPU transport loops (forward, backward,
   BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
   frosting and colored-glass tint; mode-`D` BDPT still falls back to the CPU.)*
+
+**Nested dielectrics (`priority`).** When two glass/liquid solids overlap — a glass
+ice cube in a whisky, a lens cemented to another, a coating flush against a body — the
+exterior index at the shared boundary is ambiguous: is the ray leaving *into air* or
+*into the other medium*? Give each `dielectric` an integer `priority <N>` and the
+higher priority wins wherever they overlap (Schmidt & Budge 2002). The winning medium's
+surface refracts; the losing (lower-priority) surface inside it is *suppressed* — the
+ray passes straight through it — and the exterior IOR at each real interface is taken
+from the medium actually enclosing the ray (so glass-in-water refracts 1.33↔1.52, not
+1.0↔1.52). Every render mode honours it (CPU forward/backward/BDPT/VCM/photon/SPPM and
+the GPU forward/backward/BDPT/photon backends).
+
+Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
+exactly as before (each dielectric treated against air). Because that flat model is
+ambiguous precisely where dielectrics overlap, ftrace runs an **ahead-of-time audit** at
+load and prints `[priority] WARNING: …` for every pair of overlapping *different*
+dielectrics that don't both carry a disambiguating priority (spheres, meshes, and
+isosurfaces alike — isosurface overlap is detected conservatively by comparing their
+`contained_by` bounds). Add distinct priorities to the flagged materials to silence it.
+
+```
+material "water" { type dielectric ior 1.33  priority 1 }
+material "glass" { type dielectric ior 1.52  priority 2 }   # wins where it overlaps water
+```
 
 ---
 

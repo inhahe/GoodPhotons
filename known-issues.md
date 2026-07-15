@@ -662,6 +662,32 @@ diffuse-transmission approximation, not volumetric SSS.
 
 ## Resolved
 
+### Nested-dielectric exterior IOR hardcoded to 1.0 (glass-in-water wrong) — DONE 2026-07-14 (Level 0)
+Every dielectric interface previously assumed the exterior medium was vacuum (IOR 1.0), so
+glass-in-water refracted 1.0↔1.52 instead of 1.33↔1.52 and nested/overlapping solids were
+wrong in **all** modes. Fixed at ROADMAP §7 **Level 0** (Schmidt & Budge 2002 priority
+field): each path now carries a tiny LIFO medium stack (`src/medium_stack.h`, device
+`DMediumStack` in `render_cuda.cu`); at every dielectric hit the exterior IOR comes from the
+enclosing highest-priority medium, and the lower-priority surface inside an overlap is
+suppressed (ray passes straight through). Wired through **all** integrators: CPU R/A/B/C/D/M/S/U
+(`backward.h`, `render.h`, `bdpt.h`, `photonmap_render.h`, `sppm_render.h`, `vcm.h`) and GPU
+forward/backward/BDPT/photon (`render_cuda.cu`). **Safe fallback:** the priority rule fires
+only when *both* sides carry an explicit `priority` (air/empty stack always valid at 1.0), so
+priority-free scenes render bit-identically. An ahead-of-time scene audit warns when two
+dielectric bounding volumes overlap and either lacks a `priority` (isosurfaces compared by
+their `contained_by` container bounds — conservative, never misses a real overlap). Validated:
+mode-R priority vs no-priority differ across 33.6% of pixels (mean 5.5/255) — well above render
+noise; GPU-priority matches CPU-priority reference to mean 1.3/255; modes C/M energy-conserving.
+- **Remaining gap (pre-existing, not a regression):** device BDPT (`dRandomWalk` in
+  `render_cuda.cu`) still does **not** apply Beer-Lambert interior absorption across in-glass
+  segments — it never did, and Level 0 only added the priority-driven exterior-IOR resolution
+  there, not absorption. GPU BDPT already falls back to CPU for frosted/colored glass anyway
+  (`cudaBdptSupported`), so colored-glass absorption is exercised on the CPU path; clear-glass
+  device BDPT is unaffected. Proper fix: thread `stk.topMat()` absorption into `dRandomWalk`'s
+  segment loop the way the forward/backward device paths do.
+- **Future (ROADMAP §7 Levels 1/2, deferred):** true physical stacking of co-located media and
+  interpenetrating volumes remain opt-in tiers beyond Level 0.
+
 ### Mode `P` composite is not progressive; `R`/`D` have no disk resume — DONE 2026-07-13
 Both gaps closed. `-time`/`-noise`/`-forever`/`-preview`/`-interval` and `-resume`/
 `-checkpoint` now cover **all** the accumulating image modes — the forward camera models

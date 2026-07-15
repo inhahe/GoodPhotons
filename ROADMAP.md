@@ -389,10 +389,27 @@ container: densely sample f, count zero-crossings, compare crossing parity again
 sign of f at both boundary endpoints; separately sample f on the container faces to
 catch the cap-clipping case. Report leak fraction + worst offenders. Non-destructive.
 
-## (7) Nested / overlapping dielectrics (medium stack) — NEEDS DECISION
+## (7) Nested / overlapping dielectrics (medium stack) — LEVEL 0 DONE
 
 **Request.** Replace the hardcoded exterior IOR 1.0 so glass-in-water and intersecting
 dielectrics are modeled correctly, for **all** modes.
+
+**Status.** Level 0 (priority field) is **implemented and validated across every
+integrator**: CPU modes R/A/B/C/D/M/S/U (`backward.h`, `render.h`, `bdpt.h`,
+`photonmap_render.h`, `sppm_render.h`, `vcm.h`) and the GPU forward/backward/BDPT/photon
+backends (`render_cuda.cu`). Each path now carries a tiny LIFO medium stack
+(`medium_stack.h`, device `DMediumStack`); at every dielectric hit the exterior IOR is
+taken from the enclosing (highest-priority) medium instead of hardcoded 1.0, and the
+lower-priority surface inside an overlap is suppressed (ray passes straight through).
+**Safe fallback:** the priority rule only fires when *both* sides of an interface carry an
+explicit priority (air/empty stack is always valid at IOR 1.0), so priority-free scenes
+render bit-identically to before. Validation: mode-R priority vs no-priority scenes differ
+across 33.6% of pixels; GPU matches the CPU reference to mean 1.3/255; modes C/M stay
+energy-conserving. The ahead-of-time missing-priority warning (below) is also implemented.
+
+Levels 1/2 (true physical stacking of co-located media / interpenetrating volumes) remain
+future opt-in tiers; Level 0 already fixes the common nested/overlap cases "for all modes"
+at essentially zero cost.
 
 **Decision (tiered — expose all three as options).** A convenience/speed/ability ladder:
 - **Level 0 — priority field (Schmidt & Budge 2002).** Integer `priority` per dielectric;
