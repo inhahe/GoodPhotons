@@ -1255,8 +1255,17 @@ private:
                 fail("mesh: " + gerr); return false;
             }
         } else {
+            // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
+            // smooth shading normals, merging faces across edges softer than <deg>
+            // (default 40°) and leaving sharper creases faceted. Authored `vn` wins.
+            double creaseAngleDeg = -1.0;
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
             loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                    uvProj, uvAxis);
+                    uvProj, uvAxis, creaseAngleDeg);
         }
         // Record the object as a named mesh group (for -check-watertight): the range of
         // world triangles this block just appended. Unnamed blocks get a synthesized
@@ -1325,7 +1334,14 @@ private:
                 fail("mesh_asset: " + gerr); return false;
             }
         } else {
-            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr);
+            double creaseAngleDeg = -1.0;
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
+            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                    UvProjection::None, 1, creaseAngleDeg);
         }
         Blas blas;
         blas.tris.assign(L.scene.tris.begin() + start, L.scene.tris.end());

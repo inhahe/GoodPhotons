@@ -564,7 +564,14 @@ supports `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UV
 OBJ **vertex normals (`vn`) are read as smooth shading normals** — a hit
 barycentric-interpolates them (CPU and GPU) for smooth-shaded curved meshes, with
 no visible faceting; a mesh with no `vn` stays exactly flat-shaded (geometric
-normal). Meshes without their own `vt` coordinates can be textured via a procedural
+normal). For low-poly OBJs that ship **no** `vn`, opt into **crease-angle
+auto-smoothing** with `mesh { smooth [<deg>] }` (default `40°`): the loader welds
+coincident positions (so split-vertex exporters still smooth), then synthesizes a
+per-corner shading normal as the **angle-weighted** average (Thürmer & Wüthrich) of
+the adjacent faces whose dihedral angle is **below** the threshold — so a sphere's
+gentle facets fuse into a smooth gradient while a cube's 90° edges stay crisp.
+Only the shading normal is affected; the silhouette stays true to the geometry.
+Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).

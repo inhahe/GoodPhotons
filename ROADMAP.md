@@ -61,7 +61,16 @@ of cameras while keeping backward-tracer quality." Build it first.
 
 ---
 
-## (1) Photon map / view-independent radiance cache
+## (1) Photon map / view-independent radiance cache — DONE (mode `M`)
+
+**Status.** Shipped as `-mode M` (`src/photonmap_render.h`): a forward photon pass deposits
+records into a uniform hash grid (`src/photonmap.h`), and a backward camera pass gathers by
+radius with optional one-bounce final gather (`-pmfg`). All five design steps are covered,
+including **step 5 — cross-camera reuse:** `runSharedPhotonMap` (`main.cpp`) builds the map
+**once** and calls `renderPhotonCamera` per camera, so a flythrough of a static scene pays the
+forward trace once and only re-gathers per frame (each frame's gather noise is independent).
+Runs on CPU and GPU (`dPhotonGather` in `render_cuda.cu`). This structure is also the base
+that PPM/SPPM (item 2, mode `S`) and VCM (item 3, mode `U`) build on. Original design below.
 
 **Goal.** A stored, **view-independent** spatial structure of photon records that a backward
 camera pass can query by radius (density estimation) — so light transport is computed once and
@@ -265,8 +274,12 @@ already drops into a scene, scaled/rotated as a transform. This item is the **re
    barycentric-interpolate a shading normal at the hit (geometric normal kept as `hit.ng`). Normals
    transform by the inverse-transpose of the mesh transform (`Affine::applyNormal`). A mesh without
    `vn` falls each per-vertex normal back to the geometric normal in `Tri::finalize()`, so untouched
-   meshes stay exactly flat-shaded (bit-identical). *Not yet done:* auto-generating smoothed normals
-   from a crease-angle threshold when `vn` is absent (a mesh with no `vn` stays flat) — see follow-ups.
+   meshes stay exactly flat-shaded (bit-identical). **Crease-angle auto-smoothing** is also ✅ **DONE**
+   (2026-07-15): `mesh { smooth [<deg>] }` (default `40°`) welds coincident positions and synthesizes
+   angle-weighted per-corner shading normals (Thürmer & Wüthrich) from adjacent faces under the
+   dihedral threshold — so a low-poly OBJ with no `vn` smooths its gentle facets while hard edges stay
+   crisp. Opt-in (flat by default). Validated visually: a 280-tri UV sphere's facet panels collapse to
+   a smooth gradient (mode R) with `smooth 60`, silhouette unchanged.
 2. **glTF/GLB** — ✅ **DONE** (2026-07-12). A second loader (`src/gltf.h` + a self-contained JSON
    parser `src/third_party/json.h`) handles `.gltf` (embedded/external/base64 buffers) and `.glb`
    (binary container), bakes the node transform hierarchy (matrix or TRS quaternion), reads
@@ -301,8 +314,10 @@ render_cuda.cu), and `addMesh` in ftsl.h.
    Both `intersectTri` (CPU + GPU) interpolate `hit.n = normalize(w0*n0+u*n1+v*n2)` and orient it
    against the ray, keeping `hit.ng` geometric. `Tri::finalize()` falls absent normals back to `gn`
    so non-`vn` meshes stay flat-shaded. Validated: low-poly UV sphere renders smooth (mode R/B, CPU
-   and GPU) vs the flat version's facets; energy balance bit-identical CPU↔GPU. *Follow-up:* crease-
-   angle auto-smoothing when `vn` is absent; shading-normal hemisphere clamp for transmission.
+   and GPU) vs the flat version's facets; energy balance bit-identical CPU↔GPU. ✅ **Crease-angle
+   auto-smoothing DONE** (2026-07-15) — `mesh { smooth [<deg>] }` in `loadObj` (position-weld +
+   angle-weighted per-corner normals under the dihedral threshold); host-only, so the GPU `DTri`
+   picks it up for free. *Remaining follow-up:* shading-normal hemisphere clamp for transmission.
 2. ✅ **DONE** — glTF loader (`src/gltf.h`) + minimal JSON parser (`src/third_party/json.h`): parses
    nodes/meshes/accessors/bufferViews/buffers (GLB BIN chunk, external `.bin`, base64 data URIs),
    bakes node transforms (matrix or TRS), maps metallic-roughness → spectral BSDFs; `addMesh`
