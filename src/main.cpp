@@ -3566,15 +3566,48 @@ static int run(int argc, char** argv) {
         // every frame of the group previews at the chosen viewpoint's exposure — mirroring
         // what the meter pre-pass does for the real render. Uses the same raster shading, so
         // the anchor matches the frames' own pipeline exactly.
+        //
+        // This pass can dwarf the tessellation for an averaged lock (e.g. a 145-frame
+        // camera_path meters ~144 frames), so it drives its own progress: a throttled
+        // stdout percentage + a window title, and it pushes each freshly-metered frame to
+        // the live window so the preview animates through the metering instead of sitting
+        // blank on the last tessellation frame.
+        size_t meterTotal = 0;
+        for (const auto& [g, cams] : meterPlan) meterTotal += cams.size();
+        size_t meterDone = 0;
+        auto   meterTick = std::chrono::steady_clock::now();
         for (const auto& [g, cams] : meterPlan) {
             if (cams.empty()) continue;
             double sum = 0.0; int m = 0;
             for (const auto& mc : cams) {
+                if (g_liveWin && g_liveWin->closed()) { g_stopRequested = 1; break; }
                 double a = 0.0;
-                raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
-                                    /*exposure*/1.0, /*autoExpose*/true, &a);
+                std::vector<uint8_t> mimg =
+                    raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
+                                        /*exposure*/1.0, /*autoExpose*/true, &a);
                 if (a > 0.0) { sum += a; ++m; }
+                ++meterDone;
+                // Show the metering pass converging + report a throttled percentage so the
+                // window/console isn't silent while this (often long) pre-pass runs.
+                auto now = std::chrono::steady_clock::now();
+                bool last = (meterDone == meterTotal);
+                if (meterDone == 1 || last ||
+                    std::chrono::duration<double>(now - meterTick).count() >= 1.0) {
+                    int pct = meterTotal ? (int)std::lround(100.0 * meterDone / meterTotal) : 100;
+                    if (g_liveWin && !g_liveWin->closed()) {
+                        g_liveWin->update(mc.res, mc.resY, mimg);
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure (" +
+                                            std::to_string(meterDone) + "/" +
+                                            std::to_string(meterTotal) + ", " +
+                                            std::to_string(pct) + "%)");
+                    }
+                    std::printf("[raster] metering exposure %zu/%zu (%d%%)\n",
+                                meterDone, meterTotal, pct);
+                    std::fflush(stdout);
+                    meterTick = now;
+                }
             }
+            if (g_stopRequested) break;
             if (m > 0) {
                 expAnchors[g] = sum / m;
                 if (cams.size() > 1)
