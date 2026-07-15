@@ -756,6 +756,45 @@ cubes output is watertight by construction; warnings there usually mean a `conta
 clipped the surface open. Imported OBJ meshes are the common offender — self-intersections and
 mouth openings show up as non-manifold or boundary edges.)
 
+Note the renderer intersects an isosurface by **ray-marching the analytic field directly** at
+render time — it never builds a mesh. Marching cubes runs only offline, for `-export-mesh` and
+for the `-check-watertight` audit (which polygonises the field purely to reuse the same mesh
+edge-checker). So the audit on an isosurface is a faithful *proxy* for the field's closedness,
+not the exact geometry the renderer marches.
+
+##### Repairing a non-airtight mesh (`tools/repair_mesh.py`)
+
+There are two philosophies for getting watertight geometry, and they are complementary, not
+ranked:
+
+- **Author it airtight** with **`manifold3d`** (Emmett Lalish's Manifold library). Its guarantee
+  is a *closure property* — **manifold in ⇒ manifold out**: its boolean/offset operations, given
+  valid 2-manifold inputs, are algorithmically guaranteed to produce a valid 2-manifold, so you
+  never *introduce* a leak. It achieves that by **requiring clean input** — hand it a broken mesh
+  and it reports a non-manifold error rather than fixing it. Reach for it when you build/combine
+  geometry (CSG) and want to never produce a self-intersection or crack in the first place. It is
+  *not* a repair tool.
+- **Repair a broken mesh** after the fact with **`tools/repair_mesh.py`**, which wraps two
+  engines (both `pip install`-able):
+  - **pymeshlab** (default) — MeshLab's repair filters: welds coincident vertices, drops
+    duplicate/null faces, removes faces at non-manifold edges, splits non-manifold vertices, and
+    fills the resulting holes. Best for the "pinch vertex" defect (N surface sheets snapped to one
+    point) that AI mesh generators emit.
+  - **pymeshfix** (`--engine meshfix`) — Marco Attene's MeshFix: best for genuine self-intersections
+    and large holes; weaker on pure non-manifold pinches.
+
+```
+python tools/repair_mesh.py broken.obj fixed.obj            # MeshLab engine
+python tools/repair_mesh.py broken.obj fixed.obj --engine meshfix
+# repair a master mesh, then place the result exactly where a derived copy sat:
+python tools/repair_mesh.py master.obj staged.obj --place-like staged_original.obj
+```
+
+Re-audit the output with `-check-watertight` to confirm `[OK]`. (Example: the `klein_hunyuan`
+glass mesh had a single 3-sheet pinch vertex — invisible in raw OBJ indexing but a non-manifold
+singularity once coincident vertices are welded; `repair_mesh.py` with the MeshLab engine removes
+the pinch and closes the hole, taking it to `[OK]`.)
+
 ## Textures
 
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap

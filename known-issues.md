@@ -236,44 +236,41 @@ See `render_cuda.cu` ~line 555/577/624.
 
 ## Open bugs
 
-### `scraps/klein_staged.obj` is not watertight (non-manifold edges) — glass refraction is subtly wrong — 2026-07-14
-The staged Klein mesh used by `scraps/settle_test_settled.ftsl` (and other Klein-glass
-scenes) fails the new `-check-watertight` audit: `ftrace -in scraps/settle_test_settled.ftsl
--check-watertight` reports **9 non-manifold edge(s)** on `klein_a` and **8** on `klein_b`
-(the two instances get slightly different counts because welding tolerance scales with each
-instance's post-transform world-space bbox diagonal). Non-manifold edges (3+ faces sharing
-an edge) are NOT holes, so simple boundary-loop hole-filling won't fix them — they come from
-the Klein immersion's self-touching neck / mouth geometry and need true mesh repair
-(dedup/split coincident faces, resolve the self-intersection). Because the surface is
-`dielectric`, the renderer's enter/exit + interior-medium tracking is ambiguous at those
-edges, so refraction is subtly wrong there. **Proper fix:** run the source Klein OBJ through a
-robust repair pass (e.g. `pymeshfix` / the `manifold3d` library, or a `tools/repair_mesh.py`)
-to produce a watertight 2-manifold, then re-stage; re-audit with `-check-watertight` to confirm
-`[OK]`. Detection is now automated by the audit flag; the repair tooling itself is still TODO
-(see the matching Tech-debt entry).
+### Klein glass mesh had a non-manifold pinch vertex — FIXED 2026-07-14
+The Klein mesh (`scraps/klein_hunyuan_clean.obj` and its staged copy `klein_staged.obj`, used
+by `settle_test_settled.ftsl` / `klein_glass_ior152.ftsl` / `klein_glass_ior242.ftsl`) failed
+the new `-check-watertight` audit. Diagnosis: in RAW OBJ indexing the mesh is a *perfect* closed
+2-manifold (951420 edges, every one shared by exactly 2 faces, zero boundary, zero non-manifold).
+The defect was a single **3-sheet pinch vertex** — three distinct vertices (ids 151608/151609/
+153154, 7+5+5=17 incident faces) snapped by the AI mesh generator to the *same* point
+(~(-0.008, 0.331, -0.453), within 9.5e-8) — which only shows as a non-manifold vertex once the
+audit welds coincident vertices (weld eps = bbox_diag·1e-7). The audit reported different counts
+per instance (3 at full scale, 8–9 on the smaller staged copy) because the weld eps scales with
+each mesh's post-transform bbox diagonal. Not a hole and not a broad self-intersection, so
+MeshFix ("could not fix everything", changed nothing) was the wrong tool. **Fixed** with
+`tools/repair_mesh.py` (MeshLab engine): merge-close-vertices → repair-non-manifold-edges
+(remove faces) → repair-non-manifold-vertices → close-holes, taking `klein_hunyuan_clean.obj`
+and `klein_staged.obj` to `[OK] … watertight, dielectric` (317038 v / 634076 f, −102 v / −204 f).
+Pre-repair copies kept locally as `*.orig.obj` (scraps/ is git-ignored, so the meshes aren't
+versioned — only the repair tool is). NB: this pinch was measure-zero and its render impact was
+negligible; the audit is just strict about it.
 
 _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
 ## Tech debt
 
-### No mesh/isosurface *repair* to complement `-check-watertight` — 2026-07-14
-`-check-watertight` now DETECTS non-airtight geometry but there is no *fix* yet. Two distinct
-repair problems, often conflated:
-- **Boundary holes** (edges used by 1 face): the tractable case. Extract boundary edge loops,
-  triangulate each (fan / minimum-weight / advancing-front). For an isosurface the cleanest
-  fix is upstream — when `contained_by` clips the surface, emit the flat cap on the clip plane
-  at polygonise time so the marched mesh is closed by construction (marching cubes is already
-  watertight otherwise), rather than hole-filling after the fact.
-- **Non-manifold edges / self-intersections** (the Klein case): NOT holes; hole-filling does
-  nothing. Needs true repair — dedup/split coincident faces, resolve self-intersection,
-  re-orient. Hand-rolling this robustly in C++ is a large job; the pragmatic proper fix is a
-  `tools/repair_mesh.py` wrapping a proven library (`pymeshfix` = Attene's MeshFix, or Lalish's
-  `manifold3d` which guarantees manifold output; both pip-installable, neither installed yet).
-Suggested shape: `tools/repair_mesh.py <in.obj> <out.obj>` (boundary fill + self-intersection
-repair) that you re-audit with `-check-watertight`; optionally a later `-repair-mesh` CLI once
-the approach is proven. The user's own instinct was right — "find the holes and add triangles
-there" is the correct move for the *hole* subcase, and it's the same operation for a polygonised
-isosurface once it's a mesh; it just doesn't address non-manifold/self-intersection.
+### Mesh repair exists (`tools/repair_mesh.py`); isosurface cap-at-polygonise still TODO — 2026-07-14 — MESH PART DONE
+`-check-watertight` DETECTS non-airtight geometry and **`tools/repair_mesh.py`** now FIXES meshes
+(MeshLab engine by default: merge-close-vertices → repair non-manifold edges/vertices → close
+holes; `--engine meshfix` for Attene's MeshFix on self-intersection/hole-heavy meshes; `--place-like`
+re-applies a derived copy's transform). Used it to make the Klein glass mesh airtight (see the
+FIXED bug entry above).
+Still open — **isosurfaces**: `-check-watertight` polygonises the field and audits that, but a
+`contained_by` box that clips the surface open would need a fix at *polygonise* time — emit the
+flat cap on the clip plane so the marched mesh is closed by construction (marching cubes is already
+watertight otherwise). `repair_mesh.py` could also just be run on an exported isosurface OBJ, but
+the cap-at-source approach is cleaner. Also optional: a `-repair-mesh` CLI wrapper if we ever want
+it in-process (currently repair is a separate Python step, which is fine).
 
 ### `-export-mesh` QEM decimation is pathologically slow on huge/self-intersecting meshes — 2026-07-13
 `isomesh::decimateAdaptive` (QEM edge-collapse) is fine at small/medium counts but effectively
