@@ -138,7 +138,12 @@ paths they can capture at all**.
 > one anchor across all its frames, so a preview flyby doesn't flicker
 > frame-to-frame just as the final render won't. It honours the `-camera`
 > selection and the `-window` live view, and a `camera_curve` flyby animates
-> through every frame in the window. Control the
+> through every frame in the window. On a heavy scene the live window **pops up
+> immediately** — before tessellation finishes — showing a dark placeholder and a
+> **`tessellating (N/M, P%)`** progress readout in the title bar (and matching
+> `[raster] tessellating implicit N/M` lines on stdout) as each isosurface/CSG
+> implicit is marched, so you're never left staring at a blank screen wondering
+> whether it hung. Control the
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.

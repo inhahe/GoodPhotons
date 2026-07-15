@@ -3514,8 +3514,46 @@ static int run(int argc, char** argv) {
     if (doRaster) {
         std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
         std::fflush(stdout);
+
+        // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
+        // so heavy scenes don't sit with a blank screen while the isosurfaces march.
+        // Size it to the first camera we'll render; fill a dark placeholder frame and
+        // show a "tessellating…" title, then update N/M progress as each implicit is
+        // marched (see the tessellate() callback below).
+        if (g_showWindow && !toRender.empty() && !g_liveWin) {
+            int pw = toRender.front().res, ph = toRender.front().resY;
+            std::vector<uint8_t> placeholder((size_t)pw * ph * 3);
+            for (size_t i = 0; i < placeholder.size(); i += 3) {
+                placeholder[i] = 24; placeholder[i + 1] = 26; placeholder[i + 2] = 30;
+            }
+            g_liveWin = std::make_unique<LiveWindow>(pw, ph, g_windowTitle.c_str());
+            g_liveWin->update(pw, ph, placeholder);
+            const size_t nImp = scene.implicits.size();
+            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
+                                (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
+        }
+
         auto rt0 = std::chrono::steady_clock::now();
-        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso);
+        // Progress callback: update the window title (and a periodic stdout line) as the
+        // heavy isosurface/CSG implicits are marched one by one.
+        auto lastTick = std::chrono::steady_clock::now();
+        auto tessProgress = [&](int done, int total) {
+            if (total <= 0) return;
+            int pct = (int)std::lround(100.0 * done / total);
+            if (g_liveWin && !g_liveWin->closed()) {
+                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
+                                    std::to_string(done) + "/" + std::to_string(total) +
+                                    ", " + std::to_string(pct) + "%)");
+            }
+            auto now = std::chrono::steady_clock::now();
+            if (done == 0 || done == total ||
+                std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
+                std::printf("[raster] tessellating implicit %d/%d (%d%%)\n", done, total, pct);
+                std::fflush(stdout);
+                lastTick = now;
+            }
+        };
+        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso, tessProgress);
         raster::PreviewLight plight = raster::deriveLight(scene);
         auto rt1 = std::chrono::steady_clock::now();
         std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",

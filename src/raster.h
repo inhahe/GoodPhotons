@@ -19,6 +19,7 @@
 #include <cmath>
 #include <algorithm>
 #include <thread>
+#include <functional>
 #include "scene.h"
 #include "camera.h"
 #include "color.h"
@@ -147,7 +148,12 @@ inline PreviewLight deriveLight(const Scene& sc) {
 }
 
 // ---- Scene -> world-space preview triangles (done once, reused for every frame) --
-inline std::vector<PTri> tessellate(const Scene& sc, int isoRes) {
+// `progress`, if set, is called as each heavy implicit (isosurface/CSG/metaball) is
+// about to be marched: progress(done, total) where `total` is the implicit count and
+// `done` runs 0..total (0 before the first, total after the last). Marching implicits
+// is by far the slow part of tessellation, so this drives the "tessellating N/M" UI.
+inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
+                                    const std::function<void(int, int)>& progress = {}) {
     std::vector<PTri> out;
     // Precompute one solid colour per material.
     std::vector<Vec3> matCol(sc.mats.size());
@@ -200,7 +206,11 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes) {
     // (3) Isosurfaces / metaballs / CSG -> marching-tetrahedra mesh.
     if (isoRes > 0) {
         isomesh::Options opt; opt.res = isoRes; opt.adaptive = false; opt.refineIters = 3;
+        const int nImp = (int)sc.implicits.size();
+        int impIdx = 0;
         for (const auto& im : sc.implicits) {
+            if (progress) progress(impIdx, nImp);
+            ++impIdx;
             isomesh::Mesh m = isomesh::marchImplicit(im, opt);
             Vec3 col = colOf(im.matId); bool em = emOf(im.matId);
             for (size_t f = 0; f + 2 < m.tri.size(); f += 3) {
@@ -212,6 +222,7 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes) {
                 out.push_back(p);
             }
         }
+        if (progress) progress(nImp, nImp);
     }
 
     // (4) Instanced mesh assets (BLAS) baked into world space.
