@@ -123,16 +123,22 @@ paths they can capture at all**.
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
 > elongating toward the frame edge) and the fisheye/panoramic lenses reproduce
-> faithfully, and it applies each camera's **photographic exposure** (film
-> `iso`/`shutter`/`exposure` compensation) as a brightness multiplier so an
-> ISO 200 camera previews a stop brighter than ISO 100. **Aperture** feeds
-> preview brightness only where the real renderer does — an *absolute-EV* scene
-> (a light with `power`/`lumens`) shot in a finite-lens catch mode (A/C), where a
-> wider pupil is genuinely brighter (∝ 1/N²); in the default auto-exposed pipeline
-> the p99 anchor divides that back out, and mode B is a pinhole, so aperture
-> changes only depth of field there and the preview leaves brightness alone. It
-> honours the `-camera` selection and the `-window` live view, and a
-> `camera_curve` flyby animates through every frame in the window. Control the
+> faithfully. It **emulates the same auto-exposure as the real render**: the raw
+> shaded image is anchored by a 99th-percentile tone map (lit surfaces → ~0.9,
+> emitters clip to white) exactly like `filmToRgb8`, then each camera's
+> **photographic exposure** (film `iso`/`shutter`/`exposure` compensation) is
+> applied on top as exact stops — so an ISO 200 camera previews one stop brighter
+> than ISO 100, and the composition sits at the brightness it will render at
+> instead of an arbitrary fixed level. Because that p99 anchor divides out any
+> uniform scale, **aperture** is (correctly) invisible in the default pipeline;
+> it feeds preview brightness only where the real renderer keeps it — an
+> *absolute-EV* scene (a light with `power`/`lumens`) shot in a finite-lens catch
+> mode (A/C), where a wider pupil is genuinely brighter (∝ 1/N²) and the auto-
+> exposure is bypassed. A `camera_curve`/`camera_path` with `exposure_lock` shares
+> one anchor across all its frames, so a preview flyby doesn't flicker
+> frame-to-frame just as the final render won't. It honours the `-camera`
+> selection and the `-window` live view, and a `camera_curve` flyby animates
+> through every frame in the window. Control the
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.

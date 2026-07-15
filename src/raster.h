@@ -255,6 +255,7 @@ template <class ShadeFn>
 inline void fillTriangle(const VtxScreen& A, const VtxScreen& B, const VtxScreen& C,
                          int W, int H, int y0, int y1,
                          std::vector<float>& zbuf, std::vector<Vec3>& accum,
+                         std::vector<uint8_t>& emisMask, bool triEmis,
                          ShadeFn&& shade) {
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
@@ -278,6 +279,7 @@ inline void fillTriangle(const VtxScreen& A, const VtxScreen& B, const VtxScreen
             size_t idx = (size_t)y * W + x;
             if (invd <= zbuf[idx]) continue;   // farther than (or equal to) stored
             zbuf[idx] = (float)invd;
+            emisMask[idx] = triEmis ? 1 : 0;   // emitters excluded from the auto-exposure anchor
             // Perspective-correct attribute recovery.
             double d = 1.0 / std::max(invd, 1e-12);
             Vec3 wpos = (A.wpos * (w0 * A.invd) + B.wpos * (w1 * B.invd) + C.wpos * (w2 * C.invd)) * d;
@@ -318,16 +320,32 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
 
 // Render one camera to an 8-bit RGB image (row 0 = image top), multithreaded by
 // horizontal bands (each band owns its slice of the z-buffer, no locking).
+//
+// Exposure model mirrors the real renderer's `filmToRgb8` so the preview brightness
+// tracks the final render instead of drifting off:
+//   * `expComp` (the `exposure` arg) is the photographic *compensation* the caller
+//     folded together — iso*shutter*exposure-comp, plus the absolute aperture 1/N²
+//     term when applicable — with 1.0 = neutral.
+//   * When `autoExpose` is true (the default, matching a non-absolute scene) the raw
+//     shaded image is anchored by a p99 auto-exposure: the 99th-percentile luminance
+//     over z-buffer-hit pixels maps to ~0.9, exactly like `filmToRgb8`. This is why
+//     aperture is (correctly) invisible here — auto-exposure divides it back out —
+//     while ISO/shutter/exposure still give exact photographic stops via `expComp`.
+//   * When `autoExpose` is false (absolute EV) the p99 anchor is bypassed and the raw
+//     colour is scaled by `expComp` directly, so aperture/power differences survive.
+//   * `lockAnchor` (optional) shares one auto-exposure anchor across a camera_path's
+//     frames: >0 reuses the stored anchor (no flicker on a dolly), ==0 writes the
+//     freshly-computed one back for later frames, null => per-frame auto-exposure.
 inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Camera& cam,
                                         int W, int H, const PreviewLight& light,
-                                        int nThreads, double exposure = 1.0) {
-    // Photographic exposure as a linear brightness multiplier (from the camera's
-    // iso*shutter*exposure comp; 1 = neutral). Applied to the shaded linear colour
-    // *before* the tonemap shoulder, so ISO/exposure brighten or darken the preview
-    // like a real EV control while highlights roll off gracefully instead of clipping.
-    const double expo = (exposure > 0.0) ? exposure : 1.0;
-    std::vector<float> zbuf((size_t)W * H, 0.0f);       // z-buffer key = 1/depth (bigger=closer)
-    std::vector<Vec3>  accum((size_t)W * H, Vec3{0.06, 0.07, 0.09});   // background tint
+                                        int nThreads, double exposure = 1.0,
+                                        bool autoExpose = true, double* lockAnchor = nullptr) {
+    const double expComp = (exposure > 0.0) ? exposure : 1.0;
+    const double EMIS_BOOST = 4.0;    // emitters read as bright light sources (clip to white)
+    const Vec3 bg{0.06, 0.07, 0.09};                    // background tint (unlit, unexposed)
+    std::vector<float>  zbuf((size_t)W * H, 0.0f);      // z-buffer key = 1/depth (bigger=closer)
+    std::vector<Vec3>   accum((size_t)W * H, bg);       // raw linear shade (pre-exposure)
+    std::vector<uint8_t> emisMask((size_t)W * H, 0);    // 1 where an emitter was drawn
 
     const double zn = 1e-3;   // near plane (camera-forward) for rectilinear clipping
     const bool rect = (cam.projection == CAM_RECTILINEAR);
@@ -338,7 +356,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         for (const auto& t : tris) {
             Vec3 col = t.color; bool emis = t.emissive;
             auto shade = [&](const Vec3& wp, const Vec3& wn) -> Vec3 {
-                if (emis) return col * expo;   // emitters scale with exposure too
+                if (emis) return col * EMIS_BOOST;   // raw emitter radiance (exposed later)
                 Vec3 N = normalize(wn);
                 Vec3 V = normalize(cam.eye - wp);           // toward camera
                 if (dot(N, V) < 0.0) N = -N;                 // two-sided
@@ -359,15 +377,9 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 }
                 double head = std::max(0.0, dot(N, V));      // headlight fill
                 double k = light.ambient + light.keyScale * lit + light.fill * head;
-                // Mild S-curve contrast around mid-grey so lit/shadow separation reads
-                // stronger without crushing either end (applied per-channel, linear).
-                Vec3 c = col * k * expo;
-                auto contrast = [](double v) {
-                    v = v < 0.0 ? 0.0 : v;
-                    double t = v / (v + 0.35);               // gentle shoulder (Reinhard-ish)
-                    return v * (0.55 + 0.9 * t);             // boost mids/highs, keep shadows low
-                };
-                return Vec3{contrast(c.x), contrast(c.y), contrast(c.z)};
+                // Raw linear shade; the p99 auto-exposure + gamma below (mirroring the
+                // real renderer's filmToRgb8) handle the tone map, so no local S-curve.
+                return col * k;
             };
             auto toCS = [&](const Vec3& P, const Vec3& N) -> VtxCS {
                 Vec3 d = P - cam.eye; VtxCS c;
@@ -393,7 +405,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 for (int i = 1; i + 1 < np; ++i) {
                     VtxScreen sc1 = projectVtx(cam, poly[i], W, H);
                     VtxScreen sc2 = projectVtx(cam, poly[i+1], W, H);
-                    fillTriangle(sc0, sc1, sc2, W, H, y0, y1, zbuf, accum, shade);
+                    fillTriangle(sc0, sc1, sc2, W, H, y0, y1, zbuf, accum, emisMask, emis, shade);
                 }
             } else {
                 bool bad = false;
@@ -405,7 +417,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 VtxScreen sc0 = projectVtx(cam, cs[0], W, H);
                 VtxScreen sc1 = projectVtx(cam, cs[1], W, H);
                 VtxScreen sc2 = projectVtx(cam, cs[2], W, H);
-                fillTriangle(sc0, sc1, sc2, W, H, y0, y1, zbuf, accum, shade);
+                fillTriangle(sc0, sc1, sc2, W, H, y0, y1, zbuf, accum, emisMask, emis, shade);
             }
         }
     };
@@ -424,10 +436,38 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         for (auto& th : pool) th.join();
     }
 
-    // Tone map (plain sRGB gamma; preview colours are already in a sane 0..~1 range).
+    // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
+    // lit surfaces to ~0.9. Background (unhit) pixels are excluded so an empty frame
+    // margin can't skew the anchor; emitters are excluded too so the *subject* drives the
+    // exposure (they just clip to white, as in the real render, instead of dragging the
+    // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
+    // bypasses this so aperture/power brightness differences survive into the preview.
+    double eAuto = 1.0;
+    if (autoExpose) {
+        if (lockAnchor && *lockAnchor > 0.0) {
+            eAuto = *lockAnchor;                    // reuse the path's locked anchor
+        } else {
+            std::vector<double> lum; lum.reserve(accum.size());
+            for (size_t i = 0; i < accum.size(); ++i) {
+                if (zbuf[i] <= 0.0f || emisMask[i]) continue;   // skip background + emitters
+                const Vec3& c = accum[i];
+                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
+            }
+            if (!lum.empty()) {
+                std::sort(lum.begin(), lum.end());
+                double p99 = lum[(size_t)(0.99 * (lum.size() - 1))];
+                eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
+            }
+            if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
+        }
+    }
+    const double finalExp = eAuto * expComp;
+
+    // Tone map: exposed hit pixels through sRGB gamma; background tint left unexposed.
     std::vector<uint8_t> img((size_t)W * H * 3);
     for (size_t i = 0; i < accum.size(); ++i) {
-        const Vec3& c = accum[i];
+        Vec3 c = accum[i];
+        if (zbuf[i] > 0.0f) c = c * finalExp;       // hit pixels get the exposure
         img[i * 3 + 0] = (uint8_t)std::clamp(srgbGamma(std::max(0.0, c.x)) * 255.0 + 0.5, 0.0, 255.0);
         img[i * 3 + 1] = (uint8_t)std::clamp(srgbGamma(std::max(0.0, c.y)) * 255.0 + 0.5, 0.0, 255.0);
         img[i * 3 + 2] = (uint8_t)std::clamp(srgbGamma(std::max(0.0, c.z)) * 255.0 + 0.5, 0.0, 255.0);

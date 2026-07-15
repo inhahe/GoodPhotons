@@ -3369,7 +3369,14 @@ static int run(int argc, char** argv) {
                 double R = rc.cam.apertureR;
                 if (R > 0.0) ev *= (R * R) / (Rref * Rref);   // brightness ∝ pupil area
             }
-            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev);
+            // Emulate the real renderer's tone map: non-absolute scenes get the p99
+            // auto-exposure (aperture cancels out; iso/shutter/exposure stay as stops),
+            // absolute EV bypasses it so power/aperture brightness survives. Honour the
+            // same exposure-lock groups as filmToRgb8 so a camera_curve preview doesn't
+            // flicker frame-to-frame (shared anchor per group; per-frame when expGroup<0).
+            const bool autoExp = !scene.absolute;
+            double* lockAnchor = (autoExp && rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
+            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev, autoExp, lockAnchor);
             std::string path = outFor(rc.name);
             if (!writeImage(path, W, H, img)) {
                 std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());
