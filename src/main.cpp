@@ -131,6 +131,7 @@
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
+#include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
 #include "camera.h"
 #include "render.h"
 #include "backward.h"
@@ -2755,6 +2756,8 @@ static int run(int argc, char** argv) {
     bool   exportMeshAdaptive = false;     // -mesh-adaptive: curvature-driven QEM decimation
     double exportMeshDecimate = 0.5;       // -mesh-decimate <f>: keep this fraction of triangles
     bool   checkWatertight = false;        // -check-watertight: audit every mesh/isosurface + exit
+    bool   checkAirtight = false;          // -check-airtight: ray-parity audit of the marched field + exit
+    long long airtightRays = 4000;         // -check-airtight chord count per isosurface
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
     double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
     double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
@@ -2862,6 +2865,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-mesh-res") && i + 1 < argc) exportMeshRes = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-mesh-adaptive")) exportMeshAdaptive = true;
         else if (!std::strcmp(argv[i], "-check-watertight") || !std::strcmp(argv[i], "-airtight")) checkWatertight = true;
+        else if (!std::strcmp(argv[i], "-check-airtight")) checkAirtight = true;
+        else if (!std::strcmp(argv[i], "-check-airtight-rays") && i + 1 < argc) airtightRays = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
@@ -3018,6 +3023,73 @@ static int run(int argc, char** argv) {
         else
             std::printf("[check-watertight] %d of %d object(s) are NOT airtight (see warnings above).\n",
                         failures, checked);
+        return failures ? 1 : 0;
+    }
+
+    // -check-airtight: ray-parity audit of every isosurface's *marched* field — the
+    // exact zero level-set the renderer sphere-traces, not a polygonised proxy. Fires
+    // random exterior->exterior chords; a closed solid crosses the boundary an even
+    // number of times, so any ODD count is a leak (an open cap on an uncapped surface,
+    // or a Lipschitz/thin-feature overshoot the renderer would show as a light leak).
+    if (checkAirtight) {
+        auto dielectric = [&](int matId) {
+            return matId >= 0 && matId < (int)scene.mats.size() &&
+                   scene.mats[matId].type == MatType::Dielectric;
+        };
+        if (scene.implicits.empty()) {
+            std::printf("[check-airtight] scene has no isosurfaces to audit\n");
+            return 0;
+        }
+        std::printf("[check-airtight] auditing %zu isosurface(s) with %lld chords each "
+                    "(probing the marched field directly)\n",
+                    scene.implicits.size(), airtightRays);
+        int failures = 0;
+        for (size_t k = 0; k < scene.implicits.size(); ++k) {
+            const Implicit& im = scene.implicits[k];
+            std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
+            airtight::Report r = airtight::check(im, airtightRays, 0x9E3779B97F4A7C15ull + k);
+            bool glass = dielectric(im.matId);
+            if (r.degenerate) {
+                std::printf("  [SKIP] \"%s\"  degenerate/unbounded container — no valid chords\n",
+                            name.c_str());
+                continue;
+            }
+            if (r.airtight()) {
+                std::printf("  [OK]   \"%s\"  airtight  (%lld chords, %s, %s%s)\n",
+                            name.c_str(), r.chords, r.open ? "open" : "capped",
+                            r.overshoot ? "marcher-clean" : "no overshoot",
+                            glass ? ", dielectric" : "");
+                if (r.overshoot)
+                    std::printf("           note: %.2f%% of chords show the marcher finding fewer\n"
+                                "           crossings than a dense reference — thin features near the\n"
+                                "           march step; parity still even. Consider raising max_gradient.\n",
+                                100.0 * r.overFrac());
+                continue;
+            }
+            ++failures;
+            std::printf("  [WARN%s] \"%s\"  NOT airtight  (%lld chords):\n",
+                        glass ? "!" : " ", name.c_str(), r.chords);
+            if (r.oddParity)
+                std::printf("           - %.2f%% of chords cross the boundary an ODD number of times\n"
+                            "             (%lld/%lld) — the interior connects to the exterior (a leak)\n",
+                            100.0 * r.oddFrac(), r.oddParity, r.chords);
+            if (r.open && r.boundaryInside)
+                std::printf("           - the solid touches the container wall on %.2f%% of boundary\n"
+                            "             samples (%lld/%lld, worst f=%.3g) while the surface is OPEN —\n"
+                            "             an open cap. Add `capped` or shrink `contained_by` to seal it.\n",
+                            100.0 * r.capFrac(), r.boundaryInside, r.boundarySamples, r.worstMinF);
+            if (r.overshoot)
+                std::printf("           - %.2f%% of chords: marcher misses crossings the dense reference\n"
+                            "             finds — Lipschitz/max_gradient overshoot or sub-step features\n",
+                            100.0 * r.overFrac());
+            if (glass)
+                std::printf("           ! this object is DIELECTRIC (glass) — refraction WILL leak light\n");
+        }
+        if (failures == 0)
+            std::printf("[check-airtight] all %zu isosurface(s) are airtight.\n", scene.implicits.size());
+        else
+            std::printf("[check-airtight] %d of %zu isosurface(s) are NOT airtight (see above).\n",
+                        failures, scene.implicits.size());
         return failures ? 1 : 0;
     }
 

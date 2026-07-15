@@ -762,6 +762,38 @@ for the `-check-watertight` audit (which polygonises the field purely to reuse t
 edge-checker). So the audit on an isosurface is a faithful *proxy* for the field's closedness,
 not the exact geometry the renderer marches.
 
+##### Auditing the *marched* field directly (`-check-airtight`)
+
+Because `-check-watertight` audits a polygonised *copy* of an isosurface, it inherits marching
+cubes' resolution blind spot: a leak, a thin wall, or a spike narrower than a grid cell can slip
+through. `-check-airtight` instead probes the **exact zero level-set the renderer sphere-traces** —
+it calls the same field marcher the camera rays use, so there is no proxy.
+
+```
+ftrace -in scene.ftsl -check-airtight              # 4000 chords/isosurface
+ftrace -in scene.ftsl -check-airtight -check-airtight-rays 20000
+```
+
+The test is a Monte-Carlo **ray-parity** audit: it fires random chords that start and end
+*outside* the container, so both endpoints are unambiguously outside the solid. A closed,
+airtight solid crosses its boundary an **even** number of times along any such chord (every entry
+is matched by an exit), so the renderer's marcher must report an even hit count. An **odd** count
+means the interior connects to the exterior — a leak:
+
+- on an **`open`** (uncapped) surface, the solid poking through a `contained_by` wall (an open
+  cap) — the audit also directly samples the container boundary and reports the interior area and
+  its worst `f`, and suggests `capped` / shrinking `contained_by`;
+- on a **`capped`** surface, a crossing the marcher *skipped* — a wrong `max_gradient`/Lipschitz
+  bound overshooting, or a feature thinner than the march step — which shows up as a real light
+  leak at render time.
+
+A dense reference sampling (finer than the march step) runs alongside; where the marcher finds
+*fewer* crossings than the reference it flags **overshoot** even when parity stays even (two
+missed crossings). Non-destructive, exits non-zero on any leak (so it too works as a CI gate).
+An analytic isosurface, unlike a mesh, cannot self-intersect — it is a level set of a continuous
+field, locally a smooth manifold at every regular point — so this audit only tests closedness,
+not self-intersection.
+
 ##### Repairing a non-airtight mesh (`tools/repair_mesh.py`)
 
 There are two philosophies for getting watertight geometry, and they are complementary, not
@@ -1135,6 +1167,8 @@ add-on), this doubles as a Blender → FTSL path.
 | `-mesh-res <N>` | Mesh export fineness: grid cells along the longest bounds axis (default 128) |
 | `-mesh-adaptive` / `-mesh-decimate <f>` | Curvature-adaptive QEM decimation of the exported mesh; `<f>` = triangle fraction to keep (default 0.5) |
 | `-check-watertight` / `-airtight` | Audit every named `mesh` and every `isosurface` in the scene for a closed, consistently-oriented surface, print a per-object `[OK]`/`[WARN]` report, then exit (no render). Warns per object about **boundary edges** (holes / open border), **non-manifold edges** (3+ faces share an edge), and **flipped** (inconsistently-wound) facets; a dielectric object is flagged with `!` because a leak breaks its refraction / interior-medium tracking. Isosurfaces are polygonised at `-mesh-res` first. Exit code is non-zero if any object is not airtight. |
+| `-check-airtight` | Audit every `isosurface` by **ray-parity on the marched field** (not a polygonised proxy): fire chords from outside the container and flag any that cross the boundary an odd number of times (a leak — an open cap on an `open` surface, or a `max_gradient`/thin-feature overshoot the marcher skips), plus a dense-reference **overshoot** check. Prints `[OK]`/`[WARN]` and exits non-zero on any leak. See **Auditing the marched field directly**. |
+| `-check-airtight-rays <N>` | Chord count per isosurface for `-check-airtight` (default 4000). |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
