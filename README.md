@@ -734,6 +734,28 @@ on flat areas and stay dense on detailed ones — the requested curvature-driven
 the collapses. (The mesher runs on the CPU; it reads `Implicit::eval`/`gradient` from
 `src/isomesh.h`.)
 
+##### Auditing airtightness (`-check-watertight`)
+
+Glass (`dielectric`) surfaces must be **watertight** — a closed 2-manifold where every edge
+is shared by exactly two triangles. The renderer decides *entering vs exiting* from the
+surface normal at each hit and carries the "which medium am I inside" state along the whole
+photon path, so a **hole** (boundary edge) lets a ray reach the interior without a refraction
+event and desyncs that bookkeeping, a **non-manifold** edge (3+ faces) is geometrically
+ambiguous, and a **flipped** (inconsistently-wound) facet inverts the enter/exit test — any of
+which bends light wrong for the rest of that path and can splash artifacts far from the object.
+
+```
+ftrace -in scene.ftsl -check-watertight      # or the -airtight alias
+```
+
+audits every named `mesh` and every `isosurface` (polygonised at `-mesh-res` first), prints a
+per-object `[OK]`/`[WARN]` report with the offending edge counts, then exits without rendering.
+Dielectric objects are flagged with `!` since a leak actively corrupts their refraction. The
+process exit code is non-zero if any object is not airtight, so it doubles as a CI gate. (Marching
+cubes output is watertight by construction; warnings there usually mean a `contained_by` box
+clipped the surface open. Imported OBJ meshes are the common offender — self-intersections and
+mouth openings show up as non-manifold or boundary edges.)
+
 ## Textures
 
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap
@@ -1068,6 +1090,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-export-mesh <out.obj>` | Polygonise the scene's isosurfaces into a watertight OBJ mesh (marching tetrahedra, box-capped) and exit, instead of rendering — for Unreal / Blender import (see **Exporting an isosurface to a mesh**) |
 | `-mesh-res <N>` | Mesh export fineness: grid cells along the longest bounds axis (default 128) |
 | `-mesh-adaptive` / `-mesh-decimate <f>` | Curvature-adaptive QEM decimation of the exported mesh; `<f>` = triangle fraction to keep (default 0.5) |
+| `-check-watertight` / `-airtight` | Audit every named `mesh` and every `isosurface` in the scene for a closed, consistently-oriented surface, print a per-object `[OK]`/`[WARN]` report, then exit (no render). Warns per object about **boundary edges** (holes / open border), **non-manifold edges** (3+ faces share an edge), and **flipped** (inconsistently-wound) facets; a dielectric object is flagged with `!` because a leak breaks its refraction / interior-medium tracking. Isosurfaces are polygonised at `-mesh-res` first. Exit code is non-zero if any object is not airtight. |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |

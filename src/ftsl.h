@@ -165,7 +165,11 @@ struct Parser {
     // begins the next statement's key. A trailing `{` opens a nested brace block
     // (table/film/…) whose type is the preceding word, or the statement key.
     void parseValue(const std::string& key, Value& v) {
-        if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
+        bool firstWasString = false;
+        if (is(Tok::Word) || is(Tok::String)) {
+            firstWasString = is(Tok::String);
+            v.words.push_back(cur().text); adv();
+        }
         while (is(Tok::Word)) {
             const std::string& tx = cur().text;
             bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
@@ -173,10 +177,18 @@ struct Parser {
             v.words.push_back(tx); adv();
         }
         if (is(Tok::LBrace)) {
-            std::string btype = key;
-            if (!v.words.empty()) { btype = v.words.back(); v.words.pop_back(); }
+            std::string btype = key, bname;
+            if (!v.words.empty()) {
+                // A single *quoted* word before `{` is the block's NAME (e.g. a nested
+                // `mesh "klein_a" { ... }` inside a group), so the type stays = key.
+                // A bareword before `{` is instead the block's TYPE (e.g. `table { }`,
+                // `light sphere { }`) — the historical behaviour for subtyped blocks.
+                if (v.words.size() == 1 && firstWasString) { bname = v.words.back(); v.words.pop_back(); }
+                else { btype = v.words.back(); v.words.pop_back(); }
+            }
             v.block = std::make_shared<Block>();
             v.block->type = btype;
+            v.block->name = bname;
             parseBraceBody(*v.block);
         }
     }
@@ -1238,6 +1250,18 @@ private:
             loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
                     uvProj, uvAxis);
         }
+        // Record the object as a named mesh group (for -check-watertight): the range of
+        // world triangles this block just appended. Unnamed blocks get a synthesized
+        // "mesh#N" label so the report can still point at them.
+        if (L.scene.tris.size() > triStart) {
+            MeshGroup g;
+            g.name = b.name.empty() ? ("mesh#" + std::to_string(L.scene.meshGroups.size())) : b.name;
+            g.triStart = triStart;
+            g.triCount = L.scene.tris.size() - triStart;
+            g.blasId   = -1;
+            g.matId    = id;
+            L.scene.meshGroups.push_back(std::move(g));
+        }
         // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
         // is approximated by its box — true containment is deferred, see known-issues).
         if (!b.name.empty() && L.scene.tris.size() > triStart) {
@@ -1303,6 +1327,9 @@ private:
         int blasId = (int)L.scene.blasList.size();
         L.scene.blasList.push_back(std::move(blas));
         blasIndex_[b.name] = blasId;
+        // Named mesh group backed by the shared BLAS (for -check-watertight).
+        MeshGroup g; g.name = b.name; g.blasId = blasId; g.matId = id;
+        L.scene.meshGroups.push_back(std::move(g));
         return true;
     }
 

@@ -576,12 +576,24 @@ struct MeshInstance {
     int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
 };
 
+// A named mesh object as authored (one `mesh` or `mesh_asset` block), kept so tools
+// like `-check-watertight` can report per-object (which the flattened Scene::tris /
+// blasList otherwise lose). Either a contiguous run of world triangles in Scene::tris
+// (blasId < 0) or a shared BLAS asset (blasId >= 0).
+struct MeshGroup {
+    std::string name;
+    size_t triStart = 0, triCount = 0;   // range into Scene::tris  (blasId < 0)
+    int    blasId   = -1;                // >=0: geometry lives in Scene::blasList[blasId]
+    int    matId    = 0;                 // representative material (dielectric emphasis)
+};
+
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
+    std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)

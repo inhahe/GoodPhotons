@@ -130,6 +130,7 @@
 #include <memory>
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
+#include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
 #include "camera.h"
 #include "render.h"
 #include "backward.h"
@@ -2745,6 +2746,7 @@ static int run(int argc, char** argv) {
     int    exportMeshRes = 128;            // -mesh-res <N>: cells along longest bounds axis
     bool   exportMeshAdaptive = false;     // -mesh-adaptive: curvature-driven QEM decimation
     double exportMeshDecimate = 0.5;       // -mesh-decimate <f>: keep this fraction of triangles
+    bool   checkWatertight = false;        // -check-watertight: audit every mesh/isosurface + exit
     long long spp = 256;      // backward reference samples/pixel (modes R and V)
     double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
     double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
@@ -2851,6 +2853,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-mesh-res") && i + 1 < argc) exportMeshRes = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-mesh-adaptive")) exportMeshAdaptive = true;
+        else if (!std::strcmp(argv[i], "-check-watertight") || !std::strcmp(argv[i], "-airtight")) checkWatertight = true;
         else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
         else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-fog") && i + 1 < argc) fogSigmaT = std::atof(argv[++i]);
@@ -2945,6 +2948,63 @@ static int run(int argc, char** argv) {
         return checkBvh(scene, rays) == 0 ? 0 : 1;
     }
     if (bvhStatsOnly) { bvhStats(scene, 500'000); return 0; }
+
+    // -check-watertight (alias -airtight): audit every named mesh and every isosurface
+    // for a closed, consistently-oriented surface, warn about any that aren't, then exit.
+    // Non-watertight geometry (holes / non-manifold edges) or flipped-normal facets break
+    // the renderer's dielectric enter/exit + interior-medium tracking, so glass built on
+    // such a surface refracts wrong and can splash artifacts elsewhere in the scene. The
+    // check is informational for opaque materials but emphasised (!) for dielectrics.
+    // Isosurfaces are polygonised at -mesh-res (default 128) before checking.
+    if (checkWatertight) {
+        auto dielectric = [&](int matId) {
+            return matId >= 0 && matId < (int)scene.mats.size() &&
+                   scene.mats[matId].type == MatType::Dielectric;
+        };
+        int failures = 0, checked = 0;
+        std::printf("[check-watertight] auditing %zu mesh object(s) and %zu isosurface(s)\n",
+                    scene.meshGroups.size(), scene.implicits.size());
+        auto report = [&](const std::string& kind, const std::string& name, int matId,
+                          const watertight::Report& r) {
+            ++checked;
+            bool glass = dielectric(matId);
+            if (r.ok()) {
+                std::printf("  [OK]   %-11s \"%s\"  (%zu tris, %zu verts, watertight%s)\n",
+                            kind.c_str(), name.c_str(), r.tris, r.verts,
+                            glass ? ", dielectric" : "");
+                return;
+            }
+            ++failures;
+            std::printf("  [WARN%s] %-9s \"%s\"  NOT airtight (%zu tris):\n",
+                        glass ? "!" : " ", kind.c_str(), name.c_str(), r.tris);
+            if (r.boundary)    std::printf("           - %zu boundary edge(s) (holes / open border)\n", r.boundary);
+            if (r.nonManifold) std::printf("           - %zu non-manifold edge(s) (3+ faces share an edge)\n", r.nonManifold);
+            if (r.flipped)     std::printf("           - %zu inconsistently-wound edge(s) (some normals point inward)\n", r.flipped);
+            if (glass)         std::printf("           ! this object is DIELECTRIC (glass) — refraction WILL be wrong\n");
+        };
+        for (const auto& g : scene.meshGroups) {
+            watertight::Report r = (g.blasId >= 0 && g.blasId < (int)scene.blasList.size())
+                ? watertight::checkTris(scene.blasList[g.blasId].tris.data(), scene.blasList[g.blasId].tris.size())
+                : watertight::checkTris(scene.tris.data() + g.triStart, g.triCount);
+            report("mesh", g.name, g.matId, r);
+        }
+        for (size_t k = 0; k < scene.implicits.size(); ++k) {
+            const Implicit& im = scene.implicits[k];
+            std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
+            isomesh::Options mo; mo.res = std::max(2, exportMeshRes);
+            isomesh::Mesh m = isomesh::marchImplicit(im, mo);
+            watertight::Report r = watertight::check(m.pos, m.tri);
+            report("isosurface", name, im.matId, r);
+        }
+        if (checked == 0)
+            std::printf("[check-watertight] scene has no named mesh or isosurface objects to check\n");
+        else if (failures == 0)
+            std::printf("[check-watertight] all %d object(s) are airtight.\n", checked);
+        else
+            std::printf("[check-watertight] %d of %d object(s) are NOT airtight (see warnings above).\n",
+                        failures, checked);
+        return failures ? 1 : 0;
+    }
 
     // -export-mesh <file.obj>: polygonise every isosurface in the scene into a
     // watertight triangle mesh (marching cubes) and write an OBJ for import into
