@@ -118,9 +118,14 @@ paths they can capture at all**.
 > to world space) and z-buffers each camera as solid, flat diffuse+headlight
 > triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
-> ghost and a mirror as a flat tint. It reuses the **same camera projection** as
-> the real renderer, so the pinhole's off-axis stretch (spheres elongating toward
-> the frame edge) and the fisheye/panoramic lenses reproduce faithfully. It
+> ghost and a mirror as a flat tint. Shading sums a diffuse term from **every**
+> scene light using its real position/direction (spot cones included), so multi-
+> light rooms read with their true key directions. It reuses the **same camera
+> projection** as the real renderer, so the pinhole's off-axis stretch (spheres
+> elongating toward the frame edge) and the fisheye/panoramic lenses reproduce
+> faithfully, and it applies each camera's **photographic exposure** (film
+> `iso`/`shutter`/`exposure` compensation) as a brightness multiplier so an
+> ISO 200 camera previews a stop brighter than ISO 100. It
 > honours the `-camera` selection and the `-window` live view, and a
 > `camera_curve` flyby animates through every frame in the window. Control the
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the

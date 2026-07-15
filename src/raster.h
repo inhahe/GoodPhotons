@@ -320,7 +320,12 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
 // horizontal bands (each band owns its slice of the z-buffer, no locking).
 inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Camera& cam,
                                         int W, int H, const PreviewLight& light,
-                                        int nThreads) {
+                                        int nThreads, double exposure = 1.0) {
+    // Photographic exposure as a linear brightness multiplier (from the camera's
+    // iso*shutter*exposure comp; 1 = neutral). Applied to the shaded linear colour
+    // *before* the tonemap shoulder, so ISO/exposure brighten or darken the preview
+    // like a real EV control while highlights roll off gracefully instead of clipping.
+    const double expo = (exposure > 0.0) ? exposure : 1.0;
     std::vector<float> zbuf((size_t)W * H, 0.0f);       // z-buffer key = 1/depth (bigger=closer)
     std::vector<Vec3>  accum((size_t)W * H, Vec3{0.06, 0.07, 0.09});   // background tint
 
@@ -333,7 +338,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         for (const auto& t : tris) {
             Vec3 col = t.color; bool emis = t.emissive;
             auto shade = [&](const Vec3& wp, const Vec3& wn) -> Vec3 {
-                if (emis) return col;
+                if (emis) return col * expo;   // emitters scale with exposure too
                 Vec3 N = normalize(wn);
                 Vec3 V = normalize(cam.eye - wp);           // toward camera
                 if (dot(N, V) < 0.0) N = -N;                 // two-sided
@@ -356,7 +361,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 double k = light.ambient + light.keyScale * lit + light.fill * head;
                 // Mild S-curve contrast around mid-grey so lit/shadow separation reads
                 // stronger without crushing either end (applied per-channel, linear).
-                Vec3 c = col * k;
+                Vec3 c = col * k * expo;
                 auto contrast = [](double v) {
                     v = v < 0.0 ? 0.0 : v;
                     double t = v / (v + 0.35);               // gentle shoulder (Reinhard-ish)

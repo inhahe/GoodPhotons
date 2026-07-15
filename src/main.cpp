@@ -3353,7 +3353,7 @@ static int run(int argc, char** argv) {
         for (const auto& rc : toRender) {
             if (g_stopRequested) break;
             int W = rc.res, H = rc.resY;
-            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads);
+            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, rc.exposure);
             std::string path = outFor(rc.name);
             if (!writeImage(path, W, H, img)) {
                 std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());
