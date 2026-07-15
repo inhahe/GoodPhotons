@@ -44,34 +44,42 @@ mis-seated. This is why the `-raster` preview's aperture-brightness term is gate
 previews the correct *ratio* even though the real render's absolute level is currently
 off.
 
-### OPEN (2026-07-15): absolute EV — mode B ignores the aperture's exposure (light-gathering)
+### DONE (2026-07-15): absolute EV — mode B now applies the aperture's exposure (light-gathering)
 
-Aperture controls two separable things: **depth of field** (geometric) and
-**exposure/light-gathering** (radiometric, `E ∝ 1/N²` from the camera equation
-`E = (π/4)·L·T·cos⁴θ / N²`). Mode B is a **pinhole**, so it correctly has no DoF —
-but it *also* drops the 1/N² exposure term, which is NOT a lens effect, just how
-much light the pupil admits. Consequence: in **absolute mode** two mode-B renders
-of the same scene at f/2 vs f/8 come out **identically bright**, when a real sensor
-would separate them by 4 stops. The authored `fstop`/`aperture` is inert in mode B.
-Under auto-exposure this is moot (the p99 meter cancels exposure shifts anyway, and
-B has no R² to cancel); it only bites in absolute EV.
+**Fixed** in `src/main.cpp` (~3380, the ftsl per-camera render setup): when a scene
+is in absolute EV *and* a physical aperture was actually authored (`fstop`/`lens`,
+detected by `c.lensF > 0`), a mode-B render now folds the camera-equation aperture
+term `camEq = (π/4)/N²` (with `N = c.lensF/(2·c.apertureR)`) into the exposure comp.
+This adds only the **radiometric** light-gathering factor — the pinhole keeps zero
+DoF. Gated tightly so it only *darkens* a mode-B camera that opted into an f-number;
+with no aperture authored (`c.lensF == 0`, e.g. shipped `scenes/absolute.ftsl`) the
+branch is skipped and the pinhole stays the pure radiance reference (comp unchanged,
+byte-identical). Modes A/C are untouched (they must NOT double-apply `1/N²` — their
+gross-scale mis-seat is the separate OPEN issue above).
+
+**Validated** (`scraps/abs_calib.ftsl`, Cornell box + 100 W area light, mode B, GPU):
+rendering the same scene at f/2 vs f/8 now separates by exactly 4 stops —
+patch linear-luminance mean `2.2225e-2` (f/2) vs `1.3919e-3` (f/8), ratio **15.97×**
+(≈ 16× = 4 stops); whole-image mean ratio 15.99×. The startup log shows the comp
+scaling correctly: `exposure=1.18 (absolute: gain 6 x 0.196 comp)` for f/2, where
+`0.196 = (π/4)/2²`. Author `fstop`/`lens` at the **camera-block** level (not inside
+`film{}` — the film block only reads res/size/format/iso/shutter/exposure).
+
+Note the remaining half of the "unification" (making A/B/C agree in *absolute*
+brightness at equal power) is still blocked on the A/C gross-scale gain mis-seat —
+see the OPEN "finite-lens catch modes (A/C) render near-black" issue above. Mode B
+is now internally correct wrt aperture.
 
 The old rationale for excluding aperture from the exposure comp ("in splat mode B
 the aperture is virtual, so an f-number term would double-count / be an artifact",
-CamSpec/main.cpp ~921) holds **only for modes A/C**, which already carry the physical
+CamSpec/main.cpp ~921) held **only for modes A/C**, which already carry the physical
 `R²` in their splat weight (render.h `connectLens`). Mode B has **no** `R²`, so a
-virtual-aperture exposure term there is clean and non-redundant — the correct place
-to "regard" the aperture.
-
-**Proper fix (unify with the A/C absolute-gain bug above):** replace the per-mode
-absolute scaling with one camera-equation-based absolute exposure model — apply the
-physical `π/4 · 1/N²` (and ideally `cos⁴θ` natural vignetting) once, seated so A, B
-and C agree at equal `power`. In A/C the `1/N²` comes from the pupil-area `R²` splat
-weight (keep it, fix the gain); in B it must be added as a pure exposure factor while
-keeping pinhole DoF. Do NOT double-apply it in A/C. Defensible alternative if we
-decline the fix: document that aperture is a *lens* property and absolute-EV exposure
-requires mode A/C (mode B stays a pure pinhole) — but then a mode-B `fstop` should
-warn/error rather than silently no-op.
+virtual-aperture exposure term there is clean and non-redundant — hence the fix above
+adds it in B only. When the A/C gross-scale gain is eventually re-seated (issue above),
+keep the two paths consistent: A/C get `1/N²` from the pupil-area `R²` splat weight
+(fix the gain, don't add `camEq`), B gets it as the pure exposure factor added here —
+do NOT double-apply. Ideal end state is one camera-equation absolute model (add
+`cos⁴θ` natural vignetting too) that makes A, B, C agree at equal `power`.
 
 ### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
 

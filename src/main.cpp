@@ -3378,6 +3378,26 @@ static int run(int argc, char** argv) {
             // locks only that path's frames (group = its pathGroup); -1 = per-frame.
             int eg = forceExposureLock ? 0 : (cs->exposureLock ? cs->pathGroup : -1);
             double cexp = (exposureCli > 0.0) ? exposureCli : cs->exposureMul;   // -exposure/-ev overrides the authored comp
+            // Absolute-EV aperture exposure (camera equation E = L·(π/4)/N²). The pinhole
+            // splat (mode B) measures scene RADIANCE and, unlike the finite-lens catch
+            // modes A/C (whose splat weight already carries the pupil area R²∝1/N²),
+            // ignores the aperture entirely — so an absolute mode-B render is identically
+            // bright at f/2 and f/8 when a real sensor separates them by 4 stops. Fold the
+            // camera-equation aperture term into the exposure comp, but ONLY when a
+            // physical aperture was actually authored (c.lensF>0 ⟺ an `fstop`/`lens` was
+            // given). With no aperture authored the pinhole stays the pure radiance
+            // reference (byte-identical to before — e.g. scenes/absolute.ftsl), so this
+            // only ever darkens a mode-B camera that opted into an f-number. Modes A/C are
+            // untouched here (they must NOT double-apply 1/N²; their gross-scale mis-seat
+            // is the separate issue #1). No effect outside absolute EV (auto-exposure's
+            // p99 anchor cancels any uniform aperture scale anyway).
+            if (scene.absolute && cmode == 'B' && c.lensF > 0.0 && c.apertureR > 0.0) {
+                double N = c.lensF / (2.0 * c.apertureR);           // f-number = focal / (2·apertureR)
+                if (N > 0.0) {
+                    double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
+                    cexp = (cexp > 0.0 ? cexp : 1.0) * camEq;
+                }
+            }
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov});
         }
     } else {

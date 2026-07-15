@@ -132,9 +132,13 @@ paths they can capture at all**.
 > instead of an arbitrary fixed level. Because that p99 anchor divides out any
 > uniform scale, **aperture** is (correctly) invisible in the default pipeline;
 > it feeds preview brightness only where the real renderer keeps it — an
-> *absolute-EV* scene (a light with `power`/`lumens`) shot in a finite-lens catch
-> mode (A/C), where a wider pupil is genuinely brighter (∝ 1/N²) and the auto-
-> exposure is bypassed. A `camera_curve`/`camera_path` with `exposure_lock` shares
+> *absolute-EV* scene (a light with `power`/`lumens`), where a wider pupil is
+> genuinely brighter (∝ 1/N²) and the auto-exposure is bypassed. This holds in the
+> finite-lens catch modes (A/C), where the pupil area rides in the splat weight, and
+> now in the pinhole splat (**mode B**) too: when an `fstop`/`lens` is authored, an
+> absolute mode-B render applies the camera-equation light-gathering term `(π/4)/N²`
+> as a pure exposure factor (f/2 renders exactly four stops brighter than f/8) while
+> keeping the pinhole's zero depth of field. A `camera_curve`/`camera_path` with `exposure_lock` shares
 > one anchor across all its frames, so a preview flyby doesn't flicker
 > frame-to-frame just as the final render won't. It honours the `-camera`
 > selection and the `-window` live view, and a `camera_curve` flyby animates
@@ -202,7 +206,10 @@ paths they can capture at all**.
   an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and it
   **cannot render specular-first pixels** (a mirror/glass surface seen directly
   splats nothing and stays black — use `P`, `D`, or `R` for those). Best default
-  for diffuse and caustic-heavy scenes.
+  for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
+  `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
+  applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four
+  stops brighter than f/8, matching a real sensor (and A/C, once their gain is fixed).
 - **`A` — finite-lens camera (efficient depth of field).** A physical finite
   aperture + thin lens + film, but imaged by **next-event splatting** each photon to
   the lens pupil (like `B`'s splat, through a real aperture instead of a pinhole).
