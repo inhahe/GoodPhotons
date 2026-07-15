@@ -5,6 +5,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
+
+Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** crashes with
+`[cuda] bdpt kernel failed: unspecified launch failure` reproducibly at **spp 14**
+(~232 s in; earlier spp complete fine and write correct images). It is an illegal
+memory access inside the BDPT megakernel (`kBdpt`, `render_cuda.cu` ~4283), NOT a TDR
+timeout (chunks are ~0.15 s) and NOT GPU contention (single process).
+
+**Ruled out by inspection:** the per-thread `eye[]`/`light[]` subpath arrays
+(`BDPT_MAXV=11`), the `DMediumStack` (CAP 8, push guarded), the media free-flight
+loops, and the `double st[64]` pattern/field VM stacks are all bounds-safe. The fault
+is **data-dependent** (RNG seeded by the global sample index `gidx`, so it reproduces
+deterministically regardless of timing) — some specific path at spp 14 indexes out of
+bounds or dereferences a bad pointer, likely a rare geometric/CSG/medium configuration
+hit only by that sample's random walk.
+
+**Investigation status:** a `compute-sanitizer --tool memcheck` run (build has
+`-lineinfo`, so it would report the exact `render_cuda.cu:<line>`) was launched but
+**stopped before it reached the crash sample** (memcheck ~20× slowdown ⇒ ~80 min to
+spp 14; killed to free the exe lock for the -raster preview work). **Next step:**
+re-run compute-sanitizer memcheck to completion for the fault line, then fix the OOB.
+Repro (headless — sanitizer runs instrumented):
+`compute-sanitizer.bat --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
+Mode B on the same scene is stable, and the new `-raster` preview is unaffected.
+
 ### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
 
 A smooth-shaded mesh (authored `vn` **or** crease-smoothed via `mesh { smooth }`) used

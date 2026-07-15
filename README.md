@@ -111,6 +111,22 @@ paths they can capture at all**.
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
+> **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
+> and *camera motion* before committing to a full render, `-raster` skips light
+> transport entirely: it tessellates the whole scene once (analytic spheres →
+> UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, instanced meshes baked
+> to world space) and z-buffers each camera as solid, flat diffuse+headlight
+> triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
+> reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
+> ghost and a mirror as a flat tint. It reuses the **same camera projection** as
+> the real renderer, so the pinhole's off-axis stretch (spheres elongating toward
+> the frame edge) and the fisheye/panoramic lenses reproduce faithfully. It
+> honours the `-camera` selection and the `-window` live view, and a
+> `camera_curve` flyby animates through every frame in the window. Control the
+> isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
+> longest axis; `0` skips implicit surfaces). Example:
+> `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+
 ### Speed / accuracy / ability tradeoffs
 
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
@@ -586,7 +602,10 @@ projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UV
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
 `group { translate … rotate … scale … <children> }` composes transform
-hierarchies (baked to world space at load).
+hierarchies (baked to world space at load). Children may be `sphere`, `quad`,
+`triangle`, `mesh`, `mesh_instance`, `isosurface`, `light`, or nested `group`s —
+so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap an
+isosurface CSG/implicit just as easily as a mesh.
 
 **Instancing.** `mesh_asset "name" { file … material … }` loads a mesh once into
 its local space; `mesh_instance { of "name"  translate … rotate … scale …
@@ -1287,6 +1306,8 @@ alone can't restore, so they are not disk-resumable.
 | `-preview` | Live ANSI thumbnail while rendering |
 | `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
+| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window). See the preview note under **Render modes**. |
+| `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
 

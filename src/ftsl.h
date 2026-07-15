@@ -1429,9 +1429,10 @@ private:
             else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
             else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
+            else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
-            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, light, group)"); return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, light, group)"); return false; }
         }
         return true;
     }
@@ -1593,11 +1594,14 @@ private:
         return true;
     }
 
-    bool addIsosurface(const Block& b, Loaded& L) {
+    bool addIsosurface(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("isosurface needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        Affine rootXf = fieldXf(b, Affine::identity());
+        // The enclosing group's transform (identity at top level) composes OUTSIDE the
+        // isosurface's own translate/rotate/scale, so a settled `group { translate ..
+        // rotate .. <isosurface> }` rest pose bakes into the field's local->world map.
+        Affine rootXf = fieldXf(b, parentXf);
         std::vector<FieldNode> nodes;
         std::vector<PatNode> exprPool;
         int nRoot = 0;

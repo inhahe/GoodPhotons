@@ -134,6 +134,7 @@
 #include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
 #include "priority_audit.h"     // ahead-of-time nested-dielectric priority ambiguity warning
 #include "camera.h"
+#include "raster.h"             // -raster: fast solid-shaded preview rasterizer (no light transport)
 #include "render.h"
 #include "backward.h"
 #include "bdpt.h"
@@ -2790,6 +2791,8 @@ static int run(int argc, char** argv) {
     bool modeFromCli = false;     // did the CLI force a global -mode? (else per-camera)
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
     int  resYCli     = -1;        // optional height from `-r W H` (-1 = square, use res)
+    bool doRaster    = false;     // -raster: fast solid-shaded preview (no light transport)
+    int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
     // Load the scene from a file *before* parsing the rest of argv, so any explicit
@@ -2900,6 +2903,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
+        else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
+        else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
@@ -3323,6 +3328,61 @@ static int run(int argc, char** argv) {
     // The first frame in a group computes its anchor and stores it here; later frames
     // in the same group reuse it (no dolly flicker). A null anchor = per-frame auto.
     std::map<int, double> expAnchors;
+
+    // -----------------------------------------------------------------------------
+    // Fast solid-shaded PREVIEW (-raster). Bypass ALL light transport: tessellate the
+    // whole scene once (spheres, isosurfaces, instanced meshes) and z-buffer each
+    // selected camera with plain diffuse+headlight shading. No transparency, mirrors,
+    // caustics or GI — just the composition and, for a camera_curve, the flyby motion,
+    // in a fraction of a second per frame. Honours the same camera list / -camera
+    // selection / -window live view as the real renderer.
+    // -----------------------------------------------------------------------------
+    if (doRaster) {
+        std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
+        std::fflush(stdout);
+        auto rt0 = std::chrono::steady_clock::now();
+        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso);
+        raster::PreviewLight plight = raster::deriveLight(scene);
+        auto rt1 = std::chrono::steady_clock::now();
+        std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
+                    prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
+                    toRender.size(), nThreads, g_showWindow ? " — live window" : "");
+        std::fflush(stdout);
+        int frame = 0;
+        auto ft0 = std::chrono::steady_clock::now();
+        for (const auto& rc : toRender) {
+            if (g_stopRequested) break;
+            int W = rc.res, H = rc.resY;
+            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads);
+            std::string path = outFor(rc.name);
+            if (!writeImage(path, W, H, img)) {
+                std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());
+                return 1;
+            }
+            if (g_showWindow) {
+                if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
+                g_liveWin->update(W, H, img);
+                std::string title = g_windowTitle + "  \xE2\x80\x94  raster " +
+                                    (rc.name.empty() ? std::string("preview") : rc.name) + " (" +
+                                    std::to_string(frame + 1) + "/" + std::to_string(toRender.size()) + ")";
+                g_liveWin->setTitle(title);
+                if (g_liveWin->closed()) g_stopRequested = 1;
+            }
+            if (toRender.size() > 1) {
+                if (frame % 15 == 0 || frame + 1 == (int)toRender.size())
+                    std::printf("[raster] frame %d/%zu -> %s\n", frame + 1, toRender.size(), path.c_str());
+            } else {
+                std::printf("[raster] wrote %s (%dx%d)\n", path.c_str(), W, H);
+            }
+            std::fflush(stdout);
+            ++frame;
+        }
+        auto ft1 = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(ft1 - ft0).count();
+        std::printf("[raster] done: %d frame(s) in %.2fs (%.1f fps).\n",
+                    frame, secs, frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
+        return 0;
+    }
 
     // Shared multi-camera forward pass. When several plain-`-n` forward cameras of the
     // same camera model render at once, trace ONE photon set and splat every vertex to
