@@ -242,6 +242,45 @@ struct DMaterial {
     int    roughnessPat;
     int    filmThicknessPat;
     int    mixWeightPat;
+    // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
+    // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
+    // twin of Material::priority.
+    int    priority;
+};
+// Sentinel for an unset dielectric priority (device twin of host INT_MIN).
+#define D_NO_PRIORITY (-2147483647 - 1)
+__device__ __host__ static inline bool dHasPriority(const DMaterial& m) { return m.priority != D_NO_PRIORITY; }
+
+// Per-path nested-dielectric medium stack (device twin of host MediumStack). The current
+// optical medium (for Beer-Lambert absorption + exterior IOR at the next interface) is the
+// highest-priority entry. A smaller CAP than the host (deep dielectric nesting is rare;
+// overflow degrades gracefully) keeps per-slot wavefront memory and megakernel local
+// footprint modest.
+struct DMediumStack {
+    static const int CAP = 8;
+    int matIdx[CAP];
+    int pri[CAP];
+    int n;
+    __device__ __host__ void clear() { n = 0; }
+    __device__ __host__ bool empty() const { return n == 0; }
+    __device__ __host__ int topPri() const {
+        int bp = D_NO_PRIORITY;
+        for (int i = 0; i < n; ++i) if (pri[i] > bp) bp = pri[i];
+        return n ? bp : D_NO_PRIORITY;
+    }
+    __device__ __host__ int topMat() const {
+        int bp = D_NO_PRIORITY, bm = -1;
+        for (int i = 0; i < n; ++i) if (pri[i] >= bp) { bp = pri[i]; bm = matIdx[i]; }
+        return bm;
+    }
+    __device__ __host__ void push(int mi, int p) { if (n < CAP) { matIdx[n] = mi; pri[n] = p; ++n; } }
+    __device__ __host__ void popMat(int mi) {
+        for (int i = n - 1; i >= 0; --i)
+            if (matIdx[i] == mi) {
+                for (int j = i; j < n - 1; ++j) { matIdx[j] = matIdx[j + 1]; pri[j] = pri[j + 1]; }
+                --n; return;
+            }
+    }
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId; };
@@ -1611,11 +1650,12 @@ __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const
 // medium it is now inside (interior absorption). Mirrors host refractOrReflect.
 __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
                                          const DVec3& d, Real lambda, DRng& rng,
-                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr) {
+                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr,
+                                         Real extIor = (Real)1) {
     Real ng = specLookup(m.ior, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
-    Real n1 = entering ? (Real)1 : ng, n2 = entering ? ng : (Real)1;
+    Real n1 = entering ? extIor : ng, n2 = entering ? ng : extIor;
     Real eta = n1 / n2;
     Real cosI = -dot(d, nl);
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
@@ -1640,6 +1680,50 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
     }
     if (transmitted) *transmitted = refracted;
     ro = h.p + outDir * RAY_EPS; rd = outDir;
+}
+
+// Nested-dielectric PRIORITY step (Schmidt & Budge 2002), shared by every device transport
+// loop. Resolves the exterior IOR at a dielectric interface from the enclosing medium (the
+// highest-priority stack entry), suppresses lower-priority overlapping boundaries (straight
+// pass-through), and maintains `stk`. `mi` is the resolved material index (Mix/Layered
+// aware). SAFE FALLBACK: the priority rule applies only when BOTH sides carry an explicit
+// priority (air always counts, IOR 1.0); otherwise this degrades to the old flat
+// air<->glass model, so priority-free scenes render bit-identically. Mirrors the host.
+__device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
+                                        const DVec3& d, Real lambda, DRng& rng,
+                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD) {
+    bool entering = dot(d, h.ng) < 0;
+    int pr = m.priority;
+    if (entering) {
+        int outMat = stk.topMat();
+        int outPri = stk.topPri();
+        bool ranked = dHasPriority(m) &&
+            (stk.empty() || (outMat >= 0 && dHasPriority(sc.mats[outMat])));
+        if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+            stk.push(mi, pr);
+            outO = h.p + d * RAY_EPS; outD = d; return;
+        }
+        Real extIor = (ranked && outMat >= 0) ? specLookup(sc.mats[outMat].ior, lambda) : (Real)1;
+        bool transmitted = false; DVec3 nro, nrd;
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor);
+        if (transmitted) stk.push(mi, pr);
+        outO = nro; outD = nrd;
+    } else {
+        DMediumStack after = stk; after.popMat(mi);
+        int newMat = after.topMat();
+        int newPri = after.topPri();
+        bool ranked = dHasPriority(m) &&
+            (after.empty() || (newMat >= 0 && dHasPriority(sc.mats[newMat])));
+        if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+            stk.popMat(mi);
+            outO = h.p + d * RAY_EPS; outD = d; return;
+        }
+        Real extIor = (ranked && newMat >= 0) ? specLookup(sc.mats[newMat].ior, lambda) : (Real)1;
+        bool transmitted = false; DVec3 nro, nrd;
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor);
+        if (transmitted) stk.popMat(mi);                // TIR stays inside mi
+        outO = nro; outD = nrd;
+    }
 }
 // Returns false if the photon is absorbed by an opaque (absorbing) substrate.
 // Forward decl: the per-hit thin-film thickness helper (definition with the other
@@ -2784,7 +2868,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
-                                int& interior) {
+                                DMediumStack& stk) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
@@ -2813,8 +2897,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // Beer-Lambert attenuation over the free path just travelled inside a dielectric
     // (colored/attenuating glass), applied before the event is processed (matches the
     // host: attenuate over dEvent using the medium carried from the previous vertex).
-    if (interior >= 0) {
-        Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+    {
+        int cm = stk.topMat();
+        Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
         if (a > 0) beta *= exp(-a * dEvent);
     }
 
@@ -2845,10 +2930,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     }
     const DMaterial& m = *mptr;
     if (m.type == D_DIELECTRIC) {
-        bool entering = dot(rd, h.ng) < 0;
-        bool transmitted = false;
-        DVec3 nro, nrd; refractOrReflect(sc, m, h, rd, lambda, rng, nro, nrd, &transmitted);
-        if (transmitted) interior = entering ? matIndex : -1;   // track medium for Beer-Lambert
+        DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matIndex, stk, nro, nrd);
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_THINFILM) {
         DVec3 nro, nrd;
@@ -2967,11 +3049,11 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         DVec3 ro, rd; Real beta, lambda;
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
-        int interior = -1;   // dielectric the photon is currently inside (-1 = vacuum)
+        DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped, interior) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, stk) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -3009,7 +3091,12 @@ struct WFState {
     DRng*  rng;
     int*   bounce;   // bounces already shaded for the photon currently in this slot
     int*   alive;    // 1 = slot holds a live photon, 0 = drained (budget spent)
-    int*   interior; // dielectric material index the photon is inside (-1 = vacuum)
+    // Nested-dielectric medium stack per slot (SoA): stkMat/stkPri are CAP-strided
+    // (slot*CAP + i), stkN is the entry count. Empty = vacuum. Replaces the old single
+    // `interior` material index so overlapping dielectrics resolve by priority.
+    int*   stkMat;
+    int*   stkPri;
+    int*   stkN;
     DHit*  hit;      // extend-stage intersection, consumed by shade
 };
 
@@ -3029,7 +3116,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
         if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
-            st.bounce[slot] = 0; st.alive[slot] = 1; st.interior[slot] = -1;
+            st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -3067,10 +3154,15 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
     DVec3 ro = st.ro[slot], rd = st.rd[slot];
     Real beta = st.beta[slot], lambda = st.lambda[slot];
     DHit h = st.hit[slot];
-    int interior = st.interior[slot];
+    // Load the per-slot medium stack from SoA into a local (CAP-strided).
+    DMediumStack stk; stk.n = st.stkN[slot];
+    for (int i = 0; i < stk.n; ++i) {
+        stk.matIdx[i] = st.stkMat[slot * DMediumStack::CAP + i];
+        stk.pri[i]    = st.stkPri[slot * DMediumStack::CAP + i];
+    }
     double eAbs = 0, eSen = 0, eEsc = 0;
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                        eAbs, eSen, eEsc, interior);
+                        eAbs, eSen, eEsc, stk);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -3083,7 +3175,12 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
         st.bounce[slot] = bounce; st.rng[slot] = rng;
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
-        st.interior[slot] = interior;   // carry the dielectric medium to the next segment
+        // Store the medium stack back to SoA (carry to the next segment).
+        st.stkN[slot] = stk.n;
+        for (int i = 0; i < stk.n; ++i) {
+            st.stkMat[slot * DMediumStack::CAP + i] = stk.matIdx[i];
+            st.stkPri[slot * DMediumStack::CAP + i] = stk.pri[i];
+        }
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
@@ -3482,15 +3579,16 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                     Real lambda, double invPdfLambda, DRng& rng) {
     double L = 0.0, thr = 1.0;
     bool specularArrival = true;                       // camera ray may see a light directly
-    int interior = -1;                                 // dielectric the ray is inside (-1 = vacuum)
+    DMediumStack stk; stk.clear();                     // nested-dielectric medium stack (empty = vacuum)
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
         if (!h.valid) return L;                        // escaped (no env in v1)
         // Beer-Lambert attenuation over the in-glass segment up to this surface
-        // (colored/attenuating glass carried from the previous vertex).
-        if (interior >= 0) {
-            Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+        // (current medium = highest-priority stack entry).
+        {
+            int cm = stk.topMat();
+            Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0) thr *= exp(-(double)a * (double)h.t);
         }
         const DMaterial* mp = &sc.mats[h.matId];
@@ -3507,10 +3605,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 
         switch (mp->type) {
             case D_DIELECTRIC: {
-                bool entering = dot(rd, h.ng) < 0;
-                bool transmitted = false;
-                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd, &transmitted);
-                if (transmitted) interior = entering ? matId : -1;
+                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_THINFILM: {
@@ -3643,6 +3738,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    int maxDepth, DRng& rng, DVertex* path, int& n) {
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
+    DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
     for (int bounces = 0;;) {
         DHit h = closestHit(sc, ro, rd);
         if (h.valid && h.sensorId >= 0) return;
@@ -3741,7 +3837,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd);
+                // Nested-dielectric priority: exterior IOR from the medium stack; overlapping
+                // dielectrics ranked by priority (SAFE FALLBACK to flat air<->glass otherwise).
+                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
                 wi = nrd; betaFactor = 1.0; delta = 1;
                 break;
             }
@@ -4132,7 +4230,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                                      double& oX, double& oY, double& oZ) {
     oX = oY = oZ = 0.0;
     double thr = 1.0;
-    int interior = -1;
+    DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
     const double area = DPI * (double)pm.radius * (double)pm.radius;
     const double norm = (pm.nEmitted > 0 && area > 0.0) ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
     const double r2 = (double)pm.radius * (double)pm.radius;
@@ -4140,8 +4238,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
-        if (interior >= 0 && h.valid) {                 // Beer-Lambert inside glass
-            Real a = specLookup(sc.mats[interior].absorb, lambda);
+        if (h.valid) {                                   // Beer-Lambert in current medium
+            int cm = stk.topMat();
+            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0) thr *= exp(-(double)a * (double)h.t);
         }
         if (!h.valid) return;                            // escaped (env gated out of mode-M GPU)
@@ -4207,10 +4306,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 ro = h.p + h.n * RAY_EPS; rd = o; break;
             }
             case D_DIELECTRIC: {
-                bool entering = dot(rd, h.ng) < 0;
-                bool transmitted = false;
-                DVec3 nro, nrd; refractOrReflect(sc, m, h, rd, lambda, rng, nro, nrd, &transmitted);
-                if (transmitted) interior = entering ? matId : -1;
+                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
@@ -4607,6 +4703,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(m.substrateK, d.substrateK);
         bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
         bakeSpec(m.transmit, d.transmit); // diffuse-transmission back-lobe albedo (translucent)
+        d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
@@ -4927,7 +5024,9 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng)));
     CUDA_CHECK(cudaMalloc(&st.bounce, (size_t)W * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&st.alive,  (size_t)W * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.interior, (size_t)W * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.stkMat, (size_t)W * DMediumStack::CAP * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.stkPri, (size_t)W * DMediumStack::CAP * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.stkN,   (size_t)W * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
@@ -4961,7 +5060,8 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     }
 
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
-    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.interior); cudaFree(st.hit);
+    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
+    cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
