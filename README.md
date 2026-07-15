@@ -1159,6 +1159,35 @@ which falls back to per-camera passes) so each draws its own photons.
 > (re-tracing the full sample budget per camera), so it costs the same as running them
 > one at a time. Only `A`, `B`, and `M` amortise the forward trace across cameras.
 
+### Animated geometry (OBJ sequences) → video
+
+Camera animation (above) moves the camera over **one static scene**. To animate the
+*geometry* itself — a cloth/fluid sim, a growing crystal, a Blender/Houdini point-cache
+baked to one OBJ per frame — use **`tools/obj_sequence_to_video.py`**, a self-contained
+driver that renders each OBJ frame with ftrace and encodes the frames into an MP4 with
+ffmpeg (no new renderer dependencies).
+
+You supply a **template** scene (camera, lights, materials, render mode) with a `{obj}`
+placeholder where the animated mesh goes; the driver substitutes each frame's OBJ, renders
+`frame_NNNNN.png`, then ffmpeg concatenates them:
+
+```
+# make a starter template, then edit its camera/lights/materials
+python tools/obj_sequence_to_video.py --write-template anim.ftsl
+
+# render the sequence to a 24fps clip (~4s/frame, mode B, on the GPU)
+python tools/obj_sequence_to_video.py "cache/*.obj" --template anim.ftsl \
+    -o png/growth.mp4 --mode B --device gpu -r 960 --time 4 --fps 24
+```
+
+The template's mesh block just references the placeholder: `mesh { file "{obj}" … }`
+(other tokens: `{frame}`, `{frame1}`, `{obj_stem}`). `FRAMES` is a directory of `*.obj` or
+a quoted glob, naturally sorted. Per-frame budget is `--time`/`--spp`/`--noise`; other
+useful flags: `--resume` (skip already-rendered frames), `--start/--end/--step` (sub-range),
+`--encode-only` (re-encode existing PNGs at a new `--fps` without re-rendering),
+`--no-encode`, `--keep-frames`, `--crf`/`--codec`/`--pix-fmt`, and `--dry-run`. Run with
+`--help` for the full list.
+
 ### Importing Mitsuba scenes
 
 `tools/mitsuba_to_ftsl.py` converts a Mitsuba (0.6 / 2 / 3) XML scene to FTSL:

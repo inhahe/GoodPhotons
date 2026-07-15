@@ -458,8 +458,15 @@ that two isosurfaces overlap / nest:
 (roadmap item 5.2, done 2026-07-12) — static-mesh loading with node transforms,
 smooth normals, and PBR material mapping. So the new asks are the animation/video
 pipeline and the two heavy formats.
-- **OBJ-sequence → MP4 driver** — self-contained Python driving ftrace per frame +
-  ffmpeg; no new C++ deps. *Ready to start.*
+- **OBJ-sequence → MP4 driver** — ✅ **DONE 2026-07-15** (`tools/obj_sequence_to_video.py`).
+  Self-contained Python: renders a sequence of per-frame OBJ files with ftrace (a template
+  scene with a `{obj}` placeholder substituted per frame) and encodes the frames to MP4 with
+  ffmpeg — no new C++ deps. Supports directory/glob frame input (natural sort), per-frame
+  `--time`/`--spp`/`--noise` budgets, `--resume`, `--start/--end/--step` sub-ranges,
+  `--encode-only`/`--no-encode`, `--write-template`, `--dry-run`, and `--crf/--codec/--pix-fmt`
+  encode controls. Validated end-to-end on a 5-frame rotating/growing-cube sequence (frames
+  differ as expected; H.264 yuv420p MP4 produced; resume + encode-only paths confirmed).
+  Documented in README ("Animated geometry (OBJ sequences) → video").
 - **FBX — DECIDED: vendor ufbx (MIT).** For a *renderer's import path* the proprietary
   Autodesk FBX SDK offers nothing we'd use: its exclusive strengths are FBX *writing*,
   evaluating **authored constraint rigs** (artist-built IK/aim/parent-constraint control
@@ -474,7 +481,18 @@ pipeline and the two heavy formats.
 
 **Start order:** OBJ-sequence → MP4 driver first, then ufbx FBX import. Alembic deferred.
 
-## (9) Camera archetype presets — DECIDED
+## (9) Camera archetype presets — DONE 2026-07-14
+
+**Shipped.** `resolveCameraPreset()` (`src/ftsl.h`) + `preset <name>` in the camera-block
+parser (`readFilmExposure`, applies to `camera`/`camera_path`/`camera_orbit`/`camera_curve`
+alike). The preset pre-fills the `CamSpec` film size / focal length / f-stop **before** the
+block's own lines, so any dial can still be overridden after `preset <name>`, and the same
+preset serves a finite-lens sim (mode A/C) or a correct-FOV pinhole (R/B/U — aperture
+collapses to a point). Five archetypes ship (sensor mm / focal mm / f-stop): **cinema**
+(Super35 24.6×13.8, 35mm, f/2.1), **pocket** (1″ 13.2×8.8, 8.8mm, f/4), **portable**
+(full-frame 36×24, 35mm, f/1.8), **vintage** (35mm film, 50mm, f/3.5), **vintage-slr**
+(35mm film, 50mm, f/1.4). Aliases accepted (cine/compact/mirrorless/rangefinder/slr).
+Documented in README. Original decision below.
 
 **Request (clarified).** NOT props in the scene. Make **named camera preset objects**
 users can reference (like `material { preset gold }`), one per archetype in `cameras/`,
