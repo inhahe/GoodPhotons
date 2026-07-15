@@ -5,24 +5,21 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-07-15): `exposure_lock` selector meter pre-pass only covers modes A/B/C/R
+### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode
 
-The `exposure_lock <selector>` meter pre-pass (main.cpp, the `meterPlan` loop just
-after the `-raster` block ~line 3520, and its raster twin inside the `doRaster` block)
-pre-populates `expAnchors[group]` by rendering the selector-chosen viewpoint at reduced
-samples and reading its p99 anchor via `filmToRgb8`. It handles the CPU **forward models
-(A/B/C)** via `renderForward` and the **backward reference (R)** via `renderBackward`.
-Modes **D (BDPT), M (photon map), P (composite)**, and the diagnostic modes have **no
-reduced-sample meter path** here, so a locked `camera_path` in those modes falls back to
-the historical **lazy lock** (the first frame that renders computes & writes the anchor,
-the rest reuse it). That still gives a flicker-free flyby, but it *ignores the selector*:
-`index`/`near`/`camera`/`average` all collapse to "meter the first rendered frame" for
-D/M/P. **Proper fix:** add reduced-sample metering for those modes — for M, meter one
-gather off the shared photon map; for D/P, a low-spp `renderBdpt`/composite pass — mirror
-the A/B/C/R branches so `filmToRgb8` sees a representative film and the selector is
-honoured. (Note mode M currently *shares* the photon map across a locked path, so its
-lazy-lock frame ordering means the anchor comes from `restIdx`/`groupM` order, not
-necessarily file frame 0.) Absolute-EV scenes are unaffected (no auto-exposure to lock).
+Previously the real-render `exposure_lock <selector>` meter pre-pass only metered the
+forward models (A/B/C) and the backward reference (R); modes D/M/P silently fell back to
+locking on whichever frame rendered first, *ignoring the selector*. Fixed: the meter
+pre-pass (`meterAnchor` lambda in main.cpp, the `meterPlan` loop just after the `-raster`
+block) now renders the selector-chosen viewpoint in its **own** mode — `renderBdpt` for
+D, a lazily-built shared reduced photon map + `renderPhotonCamera` for M, and
+`classifyComposite`+forward+backward+`compositeFromFilms` for P — and any other mode
+(S/U/V/…) falls back to a **general forward mode-B light-trace** (still a correct
+scene-brightness anchor, never an arbitrary frame). Because the p99 anchor is a property
+of the radiance, not the integrator, every mode yields a consistent anchor. There is now
+**no silent frame-0 fallback anywhere**; a bare `exposure_lock` also defaults to the path
+**average** rather than the first frame. Validated on scraps/lock_test.ftsl in modes
+B/M/D/P with `index`/`average` selectors (all honoured, all frames flicker-free).
 
 ### OPEN (2026-07-15): absolute-EV scenes render near-black in the finite-lens catch modes (A/C)
 

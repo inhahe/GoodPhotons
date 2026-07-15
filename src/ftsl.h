@@ -470,11 +470,11 @@ struct CamSpec {
     // Which frame's exposure the whole group locks to is chosen by the lock *selector*
     // (authored as an argument to `exposure_lock`; every frame of the path carries the
     // same resolved selector):
-    //   EXPLOCK_FIRST   `exposure_lock`            -> the path's first frame (default)
+    //   EXPLOCK_AVERAGE `exposure_lock`            -> mean anchor over all frames (DEFAULT)
+    //   EXPLOCK_FIRST   `exposure_lock first`      -> the path's first frame (expose for it)
     //   EXPLOCK_INDEX   `exposure_lock index N`    -> frame N (0-based; N<0 counts from end)
     //   EXPLOCK_NEAR    `exposure_lock near X Y Z` -> the frame whose eye is nearest (X,Y,Z)
     //   EXPLOCK_CAMERA  `exposure_lock <name>`     -> a separately-defined camera "<name>"
-    //   EXPLOCK_AVERAGE `exposure_lock average`    -> the mean anchor over all frames
     enum { EXPLOCK_FIRST = 0, EXPLOCK_INDEX, EXPLOCK_NEAR, EXPLOCK_CAMERA, EXPLOCK_AVERAGE };
     int  pathGroup   = -1;
     bool exposureLock = false;
@@ -2414,12 +2414,16 @@ private:
         const Stmt* el = find(b, "exposure_lock");
         if (!el) return false;
         const auto& w = el->val.words;
-        if (w.empty()) { cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true; }
+        // A bare `exposure_lock` (or `on`/`true`/`1`) defaults to metering the AVERAGE of
+        // the whole path — a robust choice that won't expose the entire flythrough for one
+        // possibly-atypical opening frame. `first` is the explicit "expose for frame 0".
+        if (w.empty()) { cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true; }
         const std::string v0 = w[0];
         if (v0 == "off" || v0 == "false" || v0 == "0") return false;
-        if (v0 == "on" || v0 == "true" || v0 == "1" || v0 == "first") {
-            cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true;
+        if (v0 == "on" || v0 == "true" || v0 == "1") {
+            cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true;
         }
+        if (v0 == "first") { cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true; }
         if (v0 == "average" || v0 == "avg" || v0 == "mean") {
             cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true;
         }

@@ -3528,37 +3528,89 @@ static int run(int argc, char** argv) {
     // yields the same eAuto the full frame would — just noisier, and p99 is noise-robust.
     // Once expAnchors[g] > 0, every render path reuses it untouched (no per-frame
     // recompute, no dolly flicker), so the whole group locks to the chosen viewpoint's
-    // exposure. Supported for the CPU-metered forward models (A/B/C) and the backward
-    // reference (R); modes D/M/P/etc. have no reduced-sample metering here and fall back
-    // to the historical lazy lock (first rendered frame sets the anchor). Skipped for
-    // absolute-EV scenes and forced global locks (meterPlan is empty then).
-    for (const auto& [g, cams] : meterPlan) {
-        if (cams.empty() || g_stopRequested) continue;
-        double sum = 0.0; int m = 0; bool unsupported = false;
-        for (const auto& mc : cams) {
-            // Reduced metering budget: enough coverage for a clean p99 without paying for
-            // a full render. eAuto is sample-count-invariant so this matches the real frame.
-            double eAuto = 0.0;
-            Film mf;
-            if (mc.mode == 'A' || mc.mode == 'B' || mc.mode == 'C') {
-                long long meterN = std::clamp((long long)mc.res * mc.resY * 40LL, 500000LL, 4000000LL);
+    // exposure — the selector is ALWAYS honoured (there is no silent frame-0 fallback).
+    // Skipped for absolute-EV scenes and forced global locks (meterPlan is empty then).
+    //
+    // The anchor is a measure of scene brightness AT the viewpoint — a property of the
+    // radiance, not of the integrator — so every render mode yields the same value in
+    // expectation. We meter each frame in its OWN mode where a cheap pass exists
+    // (A/B/C forward, R backward, D BDPT, M photon-map, P composite) and fall back to a
+    // general forward mode-B light-trace for anything else (S/U/V/…, which still converge
+    // to the same radiance). One reduced, view-independent photon map (built lazily once)
+    // serves every mode-M meter.
+    PhotonMap meterPmap; bool meterPmapBuilt = false;
+    auto meterAnchor = [&](const MeterCam& mc) -> double {
+        const int W = mc.res, H = mc.resY;
+        // Reduced budgets: enough coverage for a clean p99 without paying for a full render.
+        const long long meterN   = std::clamp((long long)W * H * 40LL, 500000LL, 4000000LL);
+        const long long meterSpp = 16;
+        char mode = mc.mode;
+        // A scene outside BDPT's transport scope can't meter in mode D (the real render
+        // will itself refuse it later, loudly) — meter it with the general forward pass.
+        if (mode == 'D' && bdptUnsupportedFeature(scene)) mode = 'B';
+        Film mf; double eAuto = 0.0;
+        switch (mode) {
+            case 'A': case 'B': case 'C': {
                 EnergyReport e;
-                mf = renderForward(scene, &mc.cam, mc.res, mc.resY, meterN, nThreads,
-                                   /*forwardCatch*/mc.mode == 'C', /*lensMode*/mc.mode == 'A',
+                mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
+                                   /*forwardCatch*/mode == 'C', /*lensMode*/mode == 'A',
                                    /*useCamera*/true, e, diffraction, /*useGpu*/false);
                 addEnvBackground(mf, scene, mc.cam, meterN);
-                filmToRgb8(mf, (double)meterN, /*expComp*/1.0, /*absolute*/false,
-                           /*lockAnchor*/nullptr, &eAuto);
-            } else if (mc.mode == 'R') {
-                const long long meterSpp = 16;
-                mf = renderBackward(scene, mc.cam, mc.res, mc.resY, meterSpp, nThreads, diffraction);
-                filmToRgb8(mf, (double)meterSpp, /*expComp*/1.0, /*absolute*/false,
-                           /*lockAnchor*/nullptr, &eAuto);
-            } else {
-                unsupported = true;
-                continue;   // D/M/P/S/U/V: no reduced-sample meter — leave lazy lock
+                filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
+                break;
             }
-            if (eAuto > 0.0) { sum += eAuto; ++m; }
+            case 'R': {
+                mf = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
+                filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                break;
+            }
+            case 'D': {
+                mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
+                filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                break;
+            }
+            case 'M': {
+                if (!meterPmapBuilt) {
+                    double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                                          : scene.sceneRadius * g_pmRadiusFactor;
+                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap);
+                    meterPmap.build(radius);
+                    meterPmapBuilt = true;
+                }
+                mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
+                                        diffraction, /*maxBounce*/32, 0, g_pmFinalGather);
+                filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                break;
+            }
+            case 'P': {
+                // Composite = forward (model B) + backward, combined at radiance scale 1.0.
+                CompositeClass cc = classifyComposite(scene, mc.cam, W, H);
+                EnergyReport e;
+                Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
+                                         false, false, true, e, diffraction, false);
+                Film ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
+                mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc,
+                                        scene.envIndex >= 0, /*verbose*/false);
+                filmToRgb8(mf, 1.0, 1.0, false, nullptr, &eAuto);
+                break;
+            }
+            default: {   // S/U/V and any future mode: general forward mode-B light-trace
+                EnergyReport e;
+                mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
+                                   false, false, true, e, diffraction, false);
+                addEnvBackground(mf, scene, mc.cam, meterN);
+                filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
+                break;
+            }
+        }
+        return eAuto;
+    };
+    for (const auto& [g, cams] : meterPlan) {
+        if (cams.empty() || g_stopRequested) continue;
+        double sum = 0.0; int m = 0;
+        for (const auto& mc : cams) {
+            double a = meterAnchor(mc);
+            if (a > 0.0) { sum += a; ++m; }
         }
         if (m > 0) {
             expAnchors[g] = sum / m;
@@ -3568,9 +3620,9 @@ static int run(int argc, char** argv) {
             else
                 std::printf("[meter] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                             g, cams.front().name.c_str(), expAnchors[g]);
-        } else if (unsupported) {
-            std::printf("[meter] exposure lock: group %d uses a render mode with no reduced-sample "
-                        "metering; falling back to first-frame lock\n", g);
+        } else {
+            std::fprintf(stderr, "[meter] exposure lock: group %d produced no valid anchor "
+                         "(all-black meter?); its frames will meter individually\n", g);
         }
         std::fflush(stdout);
     }
