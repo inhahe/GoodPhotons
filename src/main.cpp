@@ -3353,7 +3353,23 @@ static int run(int argc, char** argv) {
         for (const auto& rc : toRender) {
             if (g_stopRequested) break;
             int W = rc.res, H = rc.resY;
-            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, rc.exposure);
+            // Effective preview brightness = photographic exposure comp * aperture term.
+            double ev = (rc.exposure > 0.0) ? rc.exposure : 1.0;   // iso*shutter*exposure (<=0 = neutral)
+            // Aperture only changes OUTPUT brightness in absolute-EV scenes shot through
+            // a physical finite-lens catch mode (A/C): there the mode-A splat deposits
+            // energy ∝ pupil area R² (render.h connectLens: contrib *= R*R) and the fixed
+            // absolute sensor gain does NOT renormalise it, so a wider aperture is
+            // genuinely brighter (∝ 1/N²). In the default auto-exposed pipeline the
+            // 99th-percentile anchor divides that uniform R² scale straight back out
+            // (aperture then affects only depth of field + noise), and mode B is a pure
+            // pinhole (the authored aperture is virtual) — so in both those cases the
+            // real render's brightness is aperture-independent and we leave it neutral.
+            if (scene.absolute && (rc.mode == 'A' || rc.mode == 'C')) {
+                const double Rref = 0.02;               // engine default aperture radius = neutral
+                double R = rc.cam.apertureR;
+                if (R > 0.0) ev *= (R * R) / (Rref * Rref);   // brightness ∝ pupil area
+            }
+            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev);
             std::string path = outFor(rc.name);
             if (!writeImage(path, W, H, img)) {
                 std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());

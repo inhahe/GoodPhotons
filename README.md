@@ -125,7 +125,12 @@ paths they can capture at all**.
 > elongating toward the frame edge) and the fisheye/panoramic lenses reproduce
 > faithfully, and it applies each camera's **photographic exposure** (film
 > `iso`/`shutter`/`exposure` compensation) as a brightness multiplier so an
-> ISO 200 camera previews a stop brighter than ISO 100. It
+> ISO 200 camera previews a stop brighter than ISO 100. **Aperture** feeds
+> preview brightness only where the real renderer does — an *absolute-EV* scene
+> (a light with `power`/`lumens`) shot in a finite-lens catch mode (A/C), where a
+> wider pupil is genuinely brighter (∝ 1/N²); in the default auto-exposed pipeline
+> the p99 anchor divides that back out, and mode B is a pinhole, so aperture
+> changes only depth of field there and the preview leaves brightness alone. It
 > honours the `-camera` selection and the `-window` live view, and a
 > `camera_curve` flyby animates through every frame in the window. Control the
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the

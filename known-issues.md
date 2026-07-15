@@ -5,6 +5,29 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-07-15): absolute-EV scenes render near-black in the finite-lens catch modes (A/C)
+
+`ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) — the fixed sensor gain that
+replaces the p99 auto-exposure in absolute mode (any light with `power`/`lumens`) —
+is calibrated **only for mode B** (the pinhole splat; the shipped `scenes/absolute.ftsl`
+uses mode B and exposes to mid-tone at gain 6). The **finite-lens catch modes A and C**
+produce a radiometric film scale that is ~10^3–10^4× dimmer at the same gain, so an
+absolute scene shot in mode A/C comes out essentially **black** unless the user cranks
+`exposure` to ~1e4 in the `film` block. Repro:
+`ftrace -in scraps/ap_abs.ftsl -time 10 -o png/x.png` (mode-A cams) → max pixel ≈ 5/255,
+vs the same scene in mode B which is fine. Root cause is the mode-A/C splat weight
+(render.h `connectLens`: `contrib *= cosSurf*cosLens*R^2/dist^2`) carrying pupil-area/
+geometry factors that mode B's pinhole weight does not, so the two modes don't share an
+absolute scale. **Proper fix:** derive a per-mode absolute calibration (or fold the
+missing `1/(π R_ref^2)`-style normalisation into the A/C splat) so gain 6 lands mid-tone
+in every mode, then re-validate B vs A vs C at equal `power`. NOTE: the aperture→
+brightness relationship itself is *correct* in absolute A/C (verified: doubling the
+aperture radius quadruples brightness, linear ratio 3.97≈4.0) — only the overall gain is
+mis-seated. This is why the `-raster` preview's aperture-brightness term is gated to
+`absolute && mode∈{A,C}` and uses a *relative* reference aperture (Rref=0.02), so it
+previews the correct *ratio* even though the real render's absolute level is currently
+off.
+
 ### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
 
 Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** crashes with
