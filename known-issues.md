@@ -5,6 +5,50 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### Forward modes (A/B/C/D + forward passes of M/S/U) don't smooth-shade interpolated normals — NEEDS Veach adjoint correction 2026-07-15
+
+A smooth-shaded mesh (authored `vn` **or** crease-smoothed via `mesh { smooth }`)
+renders **smooth in the backward reference mode R** but **faceted in the forward
+tracer (modes A/B/C)** — verified with `scraps/_smooth_on.ftsl`: `-mode R` gives a
+clean gradient, `-mode B` shows the flat facet panels. Root cause is the classic
+**shading-normal adjoint asymmetry** (Veach §5.3): a *backward* estimator applies the
+incident cosine through the *shading* normal (`dot(Ns, wi)` in `neeLight`), so
+interpolated normals smooth the shading; a *forward/particle* tracer instead deposits
+irradiance per unit **geometric** area (photon density ∝ `cos(Ng, wi_light)`), so the
+incident term is per-facet and the shading normal only weakly modulates the outgoing
+camera cosine — the surface stays faceted. The two transport directions therefore
+**disagree** on any smooth-normal mesh (mode V would fail on such a scene). No
+correction factor exists anywhere in `render.h` today (grep confirms).
+
+**Proper fix.** Multiply the particle throughput by Veach's shading-normal correction
+at every surface scattering vertex and camera connection in the forward tracer:
+`corr = |cos(wi,Ns)·cos(wo,Ng)| / |cos(wi,Ng)·cos(wo,Ns)|` (wi = toward the previous /
+light-side vertex = `-ray.d`; wo = the outgoing direction — the continuation dir for
+the scatter, or `toCam` for the connection). Guard the `cos(wo,Ns)` denominator against
+grazing→0 (cap the factor, as Veach does) to avoid fireflies. Apply consistently in
+`render.h` (modes A/B/C), `bdpt.h` (mode D — light subpath vertices), and the forward
+passes of `vcm.h`/`photonmap_render.h`/`sppm_render.h`, plus the GPU twins in
+`render_cuda.cu`. **Safety:** the factor is exactly 1 when `Ns == Ng`, so it cannot
+regress any non-smooth (flat / analytic) scene — the whole existing validation suite is
+untouched; validate the change by re-rendering `scraps/_smooth_on.ftsl` in `-mode B`
+(should become smooth, matching `-mode R`) and checking mode V agreement on a smooth
+mesh. This is a core-transport change that wants a dedicated, supervised pass — deferred
+from the 2026-07-15 crease-smoothing work, which correctly ships smoothing for mode R.
+
+### Shading-normal geometric-hemisphere clamp only wired into mode R + the forward tracer's camera connection — REMAINING MODES 2026-07-15
+
+The geometric-hemisphere clamp (stop a smoothed shading normal from leaking light in
+through the geometric back face; `orientedGeoN()` in `geometry.h`) is implemented in
+the backward reference (`backward.h` `neeLight`/`neeEnv`) and in the forward tracer's
+camera connection (`render.h` `connect`/`connectLens`). It is **not yet** applied to the
+NEE / connection sites in `bdpt.h`, `vcm.h`, `photonmap_render.h`, `sppm_render.h`, or the
+GPU twins (`render_cuda.cu` `connect`/`connectLens` and device NEE). **Recipe (per site):**
+alongside the existing `dot(Ns, wi) <= 0` shading-side test, also require
+`dot(orientedGeoN(hit), wi) > 0`, and offset the shadow/connection ray by
+`orientedGeoN(hit) * 1e-6` instead of `Ns * 1e-6`. It is a no-op for flat tris / analytic
+spheres (`ngo == Ns` there), so it cannot regress existing scenes. Lower priority than the
+adjoint correction above (which is what actually makes forward smoothing look right).
+
 ### Headless-spawned `-window` render on gallery.ftsl hangs with no output — NEEDS INVESTIGATION 2026-07-14
 
 A `ftrace -in scenes/gallery.ftsl -mode R -n 1500000 -spp 8 -window` invocation *spawned

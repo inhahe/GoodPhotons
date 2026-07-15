@@ -59,6 +59,12 @@ struct BackwardRenderer {
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng) const {
         double total = 0.0;
+        // Geometric normal on the shading-normal side: every light connection must lie
+        // in this hemisphere too, else a smoothed shading normal would leak light in
+        // through the geometric back face (shading-normal problem). No-op for flat
+        // tris / analytic spheres (ngo == h.n there). The shadow ray is also offset
+        // along ngo so it clears the true surface rather than the shading normal.
+        const Vec3 ngo = orientedGeoN(h);
         for (const auto& em : scene.emitters) {
             if (em.collimated) continue;                  // beams aren't area-samplable
             if (em.shape == EmitterShape::Spot) {
@@ -69,10 +75,10 @@ struct BackwardRenderer {
                 double dist = std::sqrt(dist2);
                 Vec3 wi = toL / dist;
                 double cosSurf = dot(h.n, wi);
-                if (cosSurf <= 0) continue;
+                if (cosSurf <= 0 || dot(ngo, wi) <= 0) continue;
                 double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0) continue;
-                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 double f = rho / PI;
                 double emitW = em.spdFn(lambda) * invPdfLambda;
                 double contrib = f * emitW * fall * cosSurf / dist2;  // I(w)/dist^2
@@ -104,8 +110,8 @@ struct BackwardRenderer {
             double emitW = em.spdFn(lambda) * invPdfLambda;   // Le(lambda)/pdf_lambda
             if (coneSampled) {
                 cosSurf = dot(h.n, wi);
-                if (cosSurf <= 0) continue;
-                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                if (cosSurf <= 0 || dot(ngo, wi) <= 0) continue;
+                if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 contrib = f * emitW * cosSurf / pdfW;     // solid-angle measure
             } else {
                 if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
@@ -114,10 +120,10 @@ struct BackwardRenderer {
                 dist = std::sqrt(dist2);
                 wi = toL / dist;
                 cosSurf = dot(h.n, wi);
-                if (cosSurf <= 0) continue;
+                if (cosSurf <= 0 || dot(ngo, wi) <= 0) continue;
                 double cosLight = dot(nLight, -wi);       // light is one-sided
                 if (cosLight <= 0) continue;
-                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 double G = cosSurf * cosLight / dist2;    // geometry term
                 contrib = f * emitW * G * effArea;        // pdf_area = 1/effArea (visible area for cylinder)
             }
@@ -206,9 +212,10 @@ struct BackwardRenderer {
         Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return 0.0;
         double cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0.0) return 0.0;                 // below the horizon
+        const Vec3 ngo = orientedGeoN(h);
+        if (cosSurf <= 0.0 || dot(ngo, wi) <= 0.0) return 0.0;   // below the shading OR geometric horizon
         double farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
-        if (scene.occluded(h.p + h.n * 1e-6, wi, farDist)) return 0.0;
+        if (scene.occluded(h.p + ngo * 1e-6, wi, farDist)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double f = rho / PI;                            // Lambertian BRDF

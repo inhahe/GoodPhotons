@@ -571,6 +571,10 @@ per-corner shading normal as the **angle-weighted** average (Thürmer & Wüthric
 the adjacent faces whose dihedral angle is **below** the threshold — so a sphere's
 gentle facets fuse into a smooth gradient while a cube's 90° edges stay crisp.
 Only the shading normal is affected; the silhouette stays true to the geometry.
+(Smooth shading of interpolated normals — both authored `vn` and this — is currently
+faithful in the **backward reference mode `R`**; the forward tracers `A/B/C` still
+show geometric facets pending the Veach shading-normal correction, tracked in
+`known-issues.md`.)
 Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the

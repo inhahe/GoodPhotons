@@ -421,16 +421,20 @@ struct Renderer {
     // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
-                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
-                 Pcg32& rng) const {
+                 const Vec3& p, const Vec3& n, const Vec3& ng, double lambda, double beta,
+                 double rho, Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
         double cosSurf = dot(n, wdir);
-        if (cosSurf <= 0) return;                       // camera behind surface
+        // Reject connections below the shading OR geometric horizon (`ng` is the
+        // geometric normal on the shading side): a smoothed shading normal must not
+        // splat a vertex whose true geometry faces away from the camera. No-op for
+        // flat tris / analytic spheres, where ng == n.
+        if (cosSurf <= 0 || dot(ng, wdir) <= 0) return; // camera behind surface
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
 
         double f = rho / PI;
         double omega = cam.pixelSolidAngle(cosCam);
@@ -482,8 +486,8 @@ struct Renderer {
     // the depth-of-field spread automatically. Rectilinear film mapping only — a real
     // fisheye needs a wide-angle lens element, so author fisheye with model B instead.
     void connectLens(const Scene& scene, const Camera& cam, Film& film,
-                     const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
-                     Pcg32& rng) const {
+                     const Vec3& p, const Vec3& n, const Vec3& ng, double lambda, double beta,
+                     double rho, Pcg32& rng) const {
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -493,12 +497,13 @@ struct Renderer {
         if (dist < 1e-9) return;
         Vec3 wdir = toA / dist;
         double cosSurf = dot(n, wdir);
-        if (cosSurf <= 0) return;                        // pupil behind the surface
+        // Below the shading OR geometric horizon (see connect()): no-op for flat/sphere.
+        if (cosSurf <= 0 || dot(ng, wdir) <= 0) return;  // pupil behind the surface
         double cosLens = -dot(wdir, cam.w);              // cosine at the lens (w faces the scene)
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
@@ -536,19 +541,21 @@ struct Renderer {
 
     // Route a camera connection to the pinhole (model B) or the finite lens (model A).
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
-                  const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
-        if (lensMode) connectLens(scene, cam, film, p, n, lambda, beta, rho, rng);
-        else          connect(scene, cam, film, p, n, lambda, beta, rho, rng);
+                  const Vec3& n, const Vec3& ng, double lambda, double beta, double rho,
+                  Pcg32& rng) const {
+        if (lensMode) connectLens(scene, cam, film, p, n, ng, lambda, beta, rho, rng);
+        else          connect(scene, cam, film, p, n, ng, lambda, beta, rho, rng);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
     // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
     // exactly the old single-camera call (model A draws its aperture sample once here).
     void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
-                     const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
+                     const Vec3& n, const Vec3& ng, double lambda, double beta, double rho,
+                     Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
-                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, lambda, beta, rho, rng);
+                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, lambda, beta, rho, rng);
     }
 
     // ===================================================================
@@ -1065,7 +1072,7 @@ struct Renderer {
         // term (its cone illuminates surfaces, which then connect to the camera).
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
-            camSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
+            camSplatAll(scene, cams, nCam, origin, emitN, emitN, lambda, beta, 1.0, rng);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
         }
 
@@ -1297,10 +1304,11 @@ struct Renderer {
                     // lambda' ~ M and splats the glow (albedo aEff*Q) with the
                     // camera-response evaluated at lambda' (Stokes-shifted colour).
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                        Vec3 ngo = orientedGeoN(h);
+                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, lambda, beta, rho, rng);
                         if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
                             double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
-                            camSplatAll(scene, cams, nCam, h.p, h.n, lp, beta, aEff * m.fluoYield, rng);
+                            camSplatAll(scene, cams, nCam, h.p, h.n, ngo, lp, beta, aEff * m.fluoYield, rng);
                         }
                     }
                     FluoroResult fr = fluoroInteract(m, lambda, rng);
@@ -1324,8 +1332,9 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this translucent vertex.
                     depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
-                        camSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
+                        Vec3 ngo = orientedGeoN(h);
+                        camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, lambda, beta, rhoR, rng);
+                        camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, lambda, beta, rhoT, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
                     }
@@ -1344,7 +1353,7 @@ struct Renderer {
                     // the arriving power (direct on the first hit, indirect thereafter).
                     depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                        camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
                     }
                     // Russian roulette: absorb with prob (1-rho), else scatter

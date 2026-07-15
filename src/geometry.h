@@ -48,6 +48,17 @@ struct Hit {
                            // non-implicit hits). Exposed to procedural patterns as `f`.
 };
 
+// Geometric surface normal oriented onto the SAME side as the (ray-oriented) shading
+// normal h.n. For a flat triangle or an analytic sphere the shading and geometric
+// normals coincide, so this returns exactly h.n's direction (the helper is a no-op
+// there). It only differs when a smooth/interpolated shading normal (authored `vn`
+// or crease-smoothing) diverges from the true geometry — the case where next-event
+// estimation and BSDF continuations must be clamped to the geometric hemisphere to
+// stop light leaking through the back of the surface (the shading-normal problem).
+inline Vec3 orientedGeoN(const Hit& h) {
+    return (dot(h.ng, h.n) >= 0.0) ? h.ng : Vec3{-h.ng.x, -h.ng.y, -h.ng.z};
+}
+
 inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
     const double EPS = 1e-9;
     Vec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
