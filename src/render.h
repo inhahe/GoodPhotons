@@ -1317,13 +1317,20 @@ struct Renderer {
     // (interior absorption). A non-zero `roughness` frosts the interface: BOTH the
     // reflected and refracted lobes are jittered by a power-cosine lobe (rough glass),
     // rejecting samples that would cross to the wrong side so no light leaks through.
+    // `extIor` is the refractive index of the medium on the NON-material side of this
+    // interface — i.e. what the ray is travelling through when it enters, or what it
+    // returns to when it exits. Defaults to 1.0 (vacuum/air), which reproduces the old
+    // exterior-is-air behaviour bit-for-bit. Nested-dielectric callers pass the enclosing
+    // medium's index (from the per-path priority stack) so glass-in-water refracts across
+    // 1.33<->1.52 instead of 1.0<->1.52.
     Ray refractOrReflect(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
-                         double lambda, Pcg32& rng, bool* transmitted = nullptr) const {
+                         double lambda, Pcg32& rng, bool* transmitted = nullptr,
+                         double extIor = 1.0) const {
         double ng = m.ior(lambda);
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
-        double n1 = entering ? 1.0 : ng;
-        double n2 = entering ? ng : 1.0;
+        double n1 = entering ? extIor : ng;
+        double n2 = entering ? ng : extIor;
         double eta = n1 / n2;
         double cosI = -dot(d, nl);              // > 0
         double sin2t = eta * eta * (1.0 - cosI * cosI);
