@@ -205,13 +205,14 @@ inline void misScatter(bool specular, double cosThetaOut, double bsdfDirPdfW, do
 // but returned as a standalone step). On return: `wi` continuation dir, `betaFactor` the
 // throughput multiplier (f*|cos|/pdf for non-delta, reflectance for delta), `pdfW`/`pdfRevW`
 // the forward/reverse solid-angle densities (0 for delta), `cosThetaOut = |dot(wi,ns)|`,
-// `delta` the specular flag. `terminate` requests ending the walk. `interior` tracks the
-// dielectric the path is inside (colored-glass Beer-Lambert). Media are out of VCM scope.
+// `delta` the specular flag. `terminate` requests ending the walk. `stk` is the nested-
+// dielectric medium stack the path carries (colored-glass Beer-Lambert + exterior IOR at
+// each interface; Schmidt & Budge 2002). Media are out of VCM scope.
 inline void scatterSample(const Scene& scene, const Renderer& mats, const Material* mp,
                           const Hit& h, const Vec3& rayDir, double lambda, Pcg32& rng,
                           Vec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
                           double& cosThetaOut, bool& delta, bool& terminate,
-                          const Material*& interior) {
+                          MediumStack& stk) {
     const Vec3 ns = h.n;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
@@ -258,11 +259,47 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Dielectric: {
+            // Nested-dielectric PRIORITY resolution: exterior IOR = the medium the path is
+            // currently inside (highest-priority stack entry). Overlapping dielectrics are
+            // ranked by `priority` (higher wins; lower is suppressed -> straight pass-
+            // through). SAFE FALLBACK to flat air<->glass (extIor 1.0) unless BOTH sides
+            // carry an explicit priority, keeping priority-free scenes bit-identical.
             bool entering = dot(rayDir, h.ng) < 0.0;
-            bool transmitted = false;
-            Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted);
-            wi = nr.d; betaFactor = 1.0; delta = true;
-            if (transmitted) interior = entering ? mp : nullptr;
+            const int mi = (int)(mp - scene.mats.data());   // true index (Mix/Layered aware)
+            const int pr = mp->priority;
+            delta = true; betaFactor = 1.0;
+            if (entering) {
+                const int outMat = stk.topMat();
+                const int outPri = stk.topPri();
+                const bool ranked = mp->hasPriority() &&
+                    (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                    wi = rayDir; stk.push(mi, pr);
+                } else {
+                    const double extIor = (ranked && outMat >= 0)
+                        ? scene.mats[outMat].ior(lambda) : 1.0;
+                    bool transmitted = false;
+                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor);
+                    wi = nr.d;
+                    if (transmitted) stk.push(mi, pr);
+                }
+            } else {
+                MediumStack after = stk; after.popMat(mi);
+                const int newMat = after.topMat();
+                const int newPri = after.topPri();
+                const bool ranked = mp->hasPriority() &&
+                    (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                    wi = rayDir; stk.popMat(mi);
+                } else {
+                    const double extIor = (ranked && newMat >= 0)
+                        ? scene.mats[newMat].ior(lambda) : 1.0;
+                    bool transmitted = false;
+                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor);
+                    wi = nr.d;
+                    if (transmitted) stk.popMat(mi);            // TIR stays inside mi
+                }
+            }
             break;
         }
         case MatType::HalfMirror: {
@@ -354,15 +391,16 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     double dVM  = dVC * ctx.misVcWeight;
 
     const Vec3 cie(cieX(lambda), cieY(lambda), cieZ(lambda));
-    const Material* interior = nullptr;
+    MediumStack stk;                              // nested-dielectric medium stack
     Vec3 prevP = y;
     Ray ray{y + nOut * 1e-6, dir};
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
         Hit h = scene.closestHit(ray);
         if (!h.valid) return;                    // escaped (no env in scope)
-        if (interior) {
-            double a = interior->absorb(lambda);
+        {
+            int mi = stk.topMat();
+            double a = (mi >= 0) ? scene.mats[mi].absorb(lambda) : 0.0;
             if (a > 0.0) beta *= std::exp(-a * h.t);
         }
         double dist = h.t;
@@ -433,7 +471,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, interior);
+                      cosThetaOut, delta, terminate, stk);
         if (terminate || betaFactor <= 0.0) return;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return;
 
@@ -465,7 +503,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     double beta = 1.0;
     double dVCM = Mis(ctx.nLightPaths / cameraPdfW);
     double dVC = 0.0, dVM = 0.0;
-    const Material* interior = nullptr;
+    MediumStack stk;                              // nested-dielectric medium stack
     Vec3 prevP = cam.eye;
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
@@ -474,8 +512,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // Directly-viewed environment (no env in scope; ignore).
             return result;
         }
-        if (interior) {
-            double a = interior->absorb(lambda);
+        {
+            int mi = stk.topMat();
+            double a = (mi >= 0) ? scene.mats[mi].absorb(lambda) : 0.0;
             if (a > 0.0) beta *= std::exp(-a * h.t);
         }
         double dist = h.t;
@@ -613,7 +652,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, interior);
+                      cosThetaOut, delta, terminate, stk);
         if (terminate || betaFactor <= 0.0) return result;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return result;
 

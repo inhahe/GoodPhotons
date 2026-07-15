@@ -376,7 +376,7 @@ struct BackwardRenderer {
                     // interface degrades to the old flat air<->glass model (extIor 1.0),
                     // so priority-free scenes render bit-identically.
                     bool entering = dot(ray.d, h.ng) < 0.0;
-                    const int mi = h.matId;
+                    const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
                     const int pr = m.priority;               // INT_MIN if unset
                     specularArrival = true;
 

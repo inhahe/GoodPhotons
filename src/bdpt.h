@@ -373,7 +373,15 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
     (void)cam; (void)mode;   // cam/mode reserved for future NEE-to-camera & adjoint use
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;   // solid-angle density of the current ray direction
-    const Material* interior = nullptr;   // dielectric the subpath is inside (colored glass)
+    // Nested-dielectric medium stack (Schmidt & Budge 2002): the solids the subpath is
+    // currently inside. Current medium (Beer-Lambert absorption + exterior IOR at the
+    // next interface) = the highest-priority entry. Behaves like the old single-pointer
+    // `interior` for a lone dielectric.
+    MediumStack stk;
+    auto curAbsorb = [&](double lam) -> double {
+        int mi = stk.topMat();
+        return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
+    };
     for (int bounces = 0;;) {
         Hit h = scene.closestHit(ray);
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
@@ -400,8 +408,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // event (surface hit OR medium collision, whichever is nearer). NOTE: this
         // attenuates only the *subpath walk*; connection edges (connectBDPT) that cross
         // glass are NOT absorption-weighted (see known-issues.md).
-        if (interior) {
-            double a = interior->absorb(lambda);
+        {
+            double a = curAbsorb(lambda);
             if (a > 0.0) beta *= std::exp(-a * dEvent);
         }
 
@@ -511,11 +519,48 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Dielectric: {
+                // Nested-dielectric PRIORITY resolution: exterior IOR = the medium the
+                // subpath is currently inside (highest-priority stack entry). Overlapping
+                // dielectrics are ranked by `priority` (higher wins; lower is suppressed
+                // -> straight pass-through). SAFE FALLBACK to flat air<->glass (extIor 1.0)
+                // unless BOTH sides carry an explicit priority, keeping priority-free
+                // scenes bit-identical.
                 bool entering = dot(ray.d, h.ng) < 0.0;
-                bool transmitted = false;
-                Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted);
-                wi = nr.d; betaFactor = 1.0; delta = true;
-                if (transmitted) interior = entering ? mp : nullptr;
+                const int mi = (int)(mp - scene.mats.data());   // true index (Mix/Layered aware)
+                const int pr = mp->priority;
+                delta = true; betaFactor = 1.0;
+                if (entering) {
+                    const int outMat = stk.topMat();
+                    const int outPri = stk.topPri();
+                    const bool ranked = mp->hasPriority() &&
+                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                        wi = ray.d; stk.push(mi, pr);
+                    } else {
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted, extIor);
+                        wi = nr.d;
+                        if (transmitted) stk.push(mi, pr);
+                    }
+                } else {
+                    MediumStack after = stk; after.popMat(mi);
+                    const int newMat = after.topMat();
+                    const int newPri = after.topPri();
+                    const bool ranked = mp->hasPriority() &&
+                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                        wi = ray.d; stk.popMat(mi);
+                    } else {
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted, extIor);
+                        wi = nr.d;
+                        if (transmitted) stk.popMat(mi);            // TIR stays inside mi
+                    }
+                }
                 break;
             }
             case MatType::HalfMirror: {

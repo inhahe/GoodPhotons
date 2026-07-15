@@ -1179,7 +1179,7 @@ struct Renderer {
                     // counts, IOR 1.0); otherwise this degrades to the old flat
                     // air<->glass model so priority-free scenes are bit-identical.
                     bool entering = dot(ray.d, h.ng) < 0.0;
-                    const int mi = h.matId;
+                    const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
                     const int pr = m.priority;               // INT_MIN if unset
 
                     if (entering) {
