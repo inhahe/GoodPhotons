@@ -228,6 +228,22 @@ struct Medium {
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
 
+    // --- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
+    // When `ior` is non-empty, this region is a GRADIENT-INDEX medium: light
+    // rays do NOT travel straight through it — they bend continuously, obeying
+    // the Eikonal ray equation d/ds(n · dr/ds) = ∇n. `ior` is a compiled pattern
+    // program over world `x y z r` (same VM as `density`), giving the local
+    // refractive index n(x,y,z) (≥ ~1). The tracer integrates the ray in small
+    // steps of `iorStep` world units inside the region's bound (so a GRIN medium
+    // needs a `bounds{}`), using central differences of n for ∇n. This produces
+    // mirages, gradient lenses, hot-air shimmer, etc. A GRIN region may also be
+    // absorbing/scattering, but the classic use is a clear bending field
+    // (sigma_a = sigma_s = 0). NOTE (experimental): only the CPU backward tracer
+    // marches GRIN today; the forward (A/B/C), BDPT (D) and GPU paths still treat
+    // the region as straight-line until GRIN is wired through them.
+    std::vector<PatNode> ior;   // compiled n(x,y,z) program; empty => not GRIN
+    double iorStep = 0.0;       // Eikonal march step (world units); 0 => auto from bound
+
     // --- Optional imported .vdb/.nvdb sparse volume (baked to a dense grid) -----
     // When set, the density multiplier is TRILINEARLY sampled from a real NanoVDB
     // FloatGrid (`density vdb:"cloud.nvdb"`) instead of a formula. Shared so copies
@@ -294,6 +310,38 @@ struct Medium {
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
         double d = patternEval(density.data(), (int)density.size(), c);
         return d > 0.0 ? d : 0.0;
+    }
+
+    // --- Gradient-index (GRIN) helpers ---------------------------------------
+    bool grin() const { return !ior.empty(); }
+
+    // Local refractive index n at a world point (>= a small floor). 1 when this
+    // is not a GRIN medium. Evaluated by the shared pattern VM (x y z r live).
+    double nAt(const Vec3& p) const {
+        if (ior.empty()) return 1.0;
+        PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        double n = patternEval(ior.data(), (int)ior.size(), c);
+        return n > 1e-3 ? n : 1e-3;
+    }
+    // ∇n at a world point via central differences with step h (world units).
+    Vec3 gradNAt(const Vec3& p, double h) const {
+        double inv = 0.5 / h;
+        double gx = nAt(p + Vec3(h, 0, 0)) - nAt(p - Vec3(h, 0, 0));
+        double gy = nAt(p + Vec3(0, h, 0)) - nAt(p - Vec3(0, h, 0));
+        double gz = nAt(p + Vec3(0, 0, h)) - nAt(p - Vec3(0, 0, h));
+        return Vec3(gx, gy, gz) * inv;
+    }
+    // Point-in-bound test (a GRIN region must be bounded). Mirrors clipToBounds'
+    // membership: sphere chord / AABB / implicit field. Unbounded => everywhere.
+    bool insideBound(const Vec3& p) const {
+        if (!bounded) return true;
+        if (boundShape == MediumBound::Sphere) {
+            Vec3 d = p - bcenter;
+            return dot(d, d) <= bradius * bradius;
+        }
+        if (boundShape == MediumBound::Implicit) return insideField(p);
+        return p.x >= bmin.x && p.x <= bmax.x && p.y >= bmin.y &&
+               p.y <= bmax.y && p.z >= bmin.z && p.z <= bmax.z;
     }
 
     // Clip a ray (o + t*d, t in [t0,t1]) to the bound, returning the sub-interval

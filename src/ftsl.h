@@ -2122,6 +2122,49 @@ private:
                 med.densityMax = (dmax > 0.0) ? dmax : 1.0;
             }
         }
+
+        // ---- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
+        // `ior pattern:<name>` (a named pattern) or `ior "<expr>"` (inline infix
+        // formula over world x y z r, §6.1) — the local refractive index. When set,
+        // rays bend through the region (Eikonal march) instead of going straight.
+        // A GRIN region must be bounded (the march needs a finite region to enter),
+        // and the march step is `ior_step <v>` world units (default: 1/64 of the
+        // smallest bound extent). EXPERIMENTAL: CPU backward tracer only for now.
+        if (const Stmt* is = find(b, "ior")) {
+            if (!med.bounded) {
+                fail("a `medium` with an `ior` (gradient-index) field needs `bounds { .. }` "
+                     "so the ray-bending march has a finite region to enter");
+                return false;
+            }
+            std::vector<PatNode> prog;
+            if (!is->val.words.empty() && is->val.words[0].rfind("pattern:", 0) == 0) {
+                std::string nm = is->val.words[0].substr(8);
+                auto it = patternIndex_.find(nm);
+                if (it == patternIndex_.end()) {
+                    fail("medium ior references unknown pattern '" + nm + "'"); return false;
+                }
+                prog = L.scene.patterns[it->second].nodes;
+            } else {
+                std::string expr;
+                for (size_t k = 0; k < is->val.words.size(); ++k) { if (k) expr += " "; expr += is->val.words[k]; }
+                std::string perr;
+                if (!compilePatternExpr(expr, prog, perr)) {
+                    fail("medium ior: " + perr); return false;
+                }
+            }
+            med.ior = std::move(prog);
+            // March step: explicit `ior_step`, else 1/64 of the smallest bound extent.
+            double step = dblOf(b, "ior_step", 0.0);
+            if (step <= 0.0) {
+                double ext;
+                if (med.boundShape == MediumBound::Sphere) ext = 2.0 * med.bradius;
+                else ext = std::min(med.bmax.x - med.bmin.x,
+                             std::min(med.bmax.y - med.bmin.y, med.bmax.z - med.bmin.z));
+                step = (ext > 0.0) ? ext / 64.0 : 0.01;
+            }
+            med.iorStep = step;
+        }
+
         L.scene.media.push_back(std::move(med));
         return true;
     }

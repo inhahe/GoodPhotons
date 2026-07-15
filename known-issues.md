@@ -5,6 +5,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-07-15): gradient-index (GRIN) media only bend rays in the CPU backward tracer (mode R)
+
+**New feature, Phase 1 landed.** A `medium { ior "<expr over x y z r>" bounds { .. } }`
+now defines a **gradient-index region**: rays entering its bound bend continuously via a
+symplectic Eikonal march (`d/ds(n·dr/ds)=∇n`) instead of travelling straight. Data model
+(`Medium::ior`/`iorStep`, `nAt`/`gradNAt`/`insideBound` in `scene.h`), ftsl parsing
+(`ior` / `ior_step` in `ftsl.h addMedium`), and the marcher (`backward.h radiance()`,
+gated behind `grinAny` so `ior`-free scenes are bit-identical) are done and validated:
+`scenes/grin_lens.ftsl` (a radial `n=1.6→1.0` sphere over a checkerboard) shows the
+expected circular lens warp in **mode R**, while the control (medium removed) is an
+undistorted checker.
+
+**Tech debt — the other renderers still trace GRIN regions straight** (no bending):
+the forward catch/splat modes A/B/C (`render.h`), volumetric BDPT mode D (`bdpt.h`), and
+**all GPU paths** (`render_cuda.cu`) ignore the `ior` field. So a GRIN scene only renders
+correctly in mode R today. **Proper fix:** lift the same Eikonal march into each tracer's
+main loop (the pre-`closestHit` step), and on the GPU add `ior`/`iorStep` + `nAt`/`gradNAt`
+to `DMedium` and march in the megakernels. Also: (1) at a dielectric interface *inside* a
+GRIN region the exterior IOR should be `nAt(hit)` not 1.0 (POC assumes GRIN regions sit in
+open air); (2) a GRIN medium that is *also* absorbing/scattering isn't handled (POC treats
+`ior` regions as clear — the classic use); (3) the mode-R "single global homogeneous haze"
+warning wrongly claims bounds are ignored, which is no longer true for GRIN. Fixed-step
+RK1 march (`iorStep`, default bound/64) is adequate for smooth fields; steep gradients may
+want RK4 / adaptive stepping.
+
 ### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode
 
 Previously the real-render `exposure_lock <selector>` meter pre-pass only metered the

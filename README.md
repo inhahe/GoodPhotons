@@ -1128,6 +1128,19 @@ volumes are bounded by a safety cap; a native sparse device sampler is a future
 optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
 `density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
+**Gradient-index (GRIN) media — bending light *(experimental, mode `R` only)*.** Give a
+medium an `ior "<expr over x y z r>"` field (or `ior pattern:<name>`) and it becomes a
+**gradient-index region**: rays that enter its `bounds{}` no longer travel straight — they
+**bend continuously**, integrating the Eikonal ray equation `d/ds(n·dr/ds)=∇n` with a
+small symplectic march step (`ior_step <v>`, default 1/64 of the smallest bound extent).
+This makes mirages, hot-air shimmer, and **gradient lenses that focus/warp with no glass
+surface at all**. E.g. `medium { bounds { center 0 0 2 radius 0.9 } ior "1.6 - 0.6*(sqrt(x*x+y*y+(z-2)*(z-2))/0.9)" }`
+is a radial index ball (n=1.6 core → 1.0 rim) that visibly lenses a checkerboard behind it
+(`scenes/grin_lens.ftsl`). **Currently only the CPU backward tracer (mode `R`) bends GRIN
+rays** — the forward modes (A/B/C), BDPT `D`, and all GPU paths still trace these regions
+straight (they ignore `ior`), so render a GRIN scene with `-mode R -device cpu` for now.
+Wiring the Eikonal march through the other tracers/GPU is tracked in `known-issues.md`.
+
 ---
 
 ## Scene language (FTSL)
