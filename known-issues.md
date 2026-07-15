@@ -94,8 +94,10 @@ hit only by that sample's random walk.
 **stopped before it reached the crash sample** (memcheck ~20× slowdown ⇒ ~80 min to
 spp 14; killed to free the exe lock for the -raster preview work). **Next step:**
 re-run compute-sanitizer memcheck to completion for the fault line, then fix the OOB.
-Repro (headless — sanitizer runs instrumented):
-`compute-sanitizer.bat --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
+Repro (headless — sanitizer runs instrumented). Use the real `compute-sanitizer.exe`
+(in the CUDA `compute-sanitizer/` subdir), NOT the `bin/compute-sanitizer.bat` wrapper —
+the `.bat` exits 127 (no useful output) when launched from the bash tool:
+`"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/compute-sanitizer/compute-sanitizer.exe" --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
 Mode B on the same scene is stable, and the new `-raster` preview is unaffected.
 
 ### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
