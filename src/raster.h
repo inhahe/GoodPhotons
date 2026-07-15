@@ -81,9 +81,12 @@ inline Vec3 materialColor(const Material& m, bool& emissive) {
 
 // A directional/positional key light distilled from the scene's emitters for shading.
 struct PreviewLight {
-    bool  positional = false;   // has a world position to point toward
-    Vec3  pos{0, 0, 0};
-    double ambient = 0.30;      // flat fill so nothing is pure black
+    bool   positional = false;  // has a world position to point toward
+    Vec3   pos{0, 0, 0};
+    double ambient = 0.12;      // flat fill so nothing is pure black (kept low for contrast)
+    double key     = 1.15;      // directional key weight (multiplied by N·L and falloff)
+    double fill    = 0.08;      // subtle headlight so back faces aren't crushed to black
+    double falloff2 = 0.0;      // squared reference distance for the 1/(1+d²/r²) falloff (0 = none)
 };
 
 inline PreviewLight deriveLight(const Scene& sc) {
@@ -99,9 +102,24 @@ inline PreviewLight deriveLight(const Scene& sc) {
         if (e.shape == EmitterShape::Quad)      L.pos = e.origin + (e.u + e.v) * 0.5;
         else                                    L.pos = e.origin;   // sphere/cyl/spot
     }
-    // A bright environment lifts the ambient fill; a lone bulb keeps it low so
-    // the single-source falloff (the whole point of the gallery lighting) shows.
-    L.ambient = anyEnv ? 0.5 : 0.28;
+    if (anyEnv && !L.positional) {
+        // No positional source (env-only): lean on the headlight for shape, with a
+        // higher ambient so it doesn't look flat-black on the far side.
+        L.ambient = 0.30; L.key = 0.0; L.fill = 0.75;
+    } else if (anyEnv) {
+        // Positional key PLUS an environment fill: moderate ambient, softer falloff.
+        L.ambient = 0.24; L.key = 0.95; L.fill = 0.12;
+        L.falloff2 = sc.sceneRadius > 0 ? sc.sceneRadius * sc.sceneRadius : 0.0;
+    } else {
+        // Lone bulb (the gallery case): low ambient + inverse-square-ish falloff from
+        // the source so near walls read bright and far ones fall into shadow — the
+        // single-source contrast that was washing out before.
+        L.ambient = 0.10; L.key = 1.25; L.fill = 0.06;
+        // Reference distance ~ scene radius: N·L is halved at that range, so the
+        // room shades from the bulb outward instead of being uniformly bright.
+        double r = sc.sceneRadius > 0 ? sc.sceneRadius * 0.6 : 0.0;
+        L.falloff2 = r * r;
+    }
     return L;
 }
 
@@ -296,11 +314,25 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 Vec3 N = normalize(wn);
                 Vec3 V = normalize(cam.eye - wp);           // toward camera
                 if (dot(N, V) < 0.0) N = -N;                 // two-sided
-                Vec3 Ld = light.positional ? normalize(light.pos - wp) : V;
-                double ndl  = std::max(0.0, dot(N, Ld));
+                double ndl = 0.0, atten = 1.0;
+                if (light.positional) {
+                    Vec3 d = light.pos - wp;
+                    double dist2 = dot(d, d);
+                    Vec3 Ld = (dist2 > 1e-12) ? d / std::sqrt(dist2) : V;
+                    ndl = std::max(0.0, dot(N, Ld));
+                    if (light.falloff2 > 0.0) atten = light.falloff2 / (light.falloff2 + dist2);
+                }
                 double head = std::max(0.0, dot(N, V));      // headlight fill
-                double k = light.ambient + 0.75 * ndl + 0.30 * head;
-                return col * k;
+                double k = light.ambient + light.key * ndl * atten + light.fill * head;
+                // Mild S-curve contrast around mid-grey so lit/shadow separation reads
+                // stronger without crushing either end (applied per-channel, linear).
+                Vec3 c = col * k;
+                auto contrast = [](double v) {
+                    v = v < 0.0 ? 0.0 : v;
+                    double t = v / (v + 0.35);               // gentle shoulder (Reinhard-ish)
+                    return v * (0.55 + 0.9 * t);             // boost mids/highs, keep shadows low
+                };
+                return Vec3{contrast(c.x), contrast(c.y), contrast(c.z)};
             };
             auto toCS = [&](const Vec3& P, const Vec3& N) -> VtxCS {
                 Vec3 d = P - cam.eye; VtxCS c;
