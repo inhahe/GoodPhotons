@@ -51,6 +51,15 @@ material "basalt"    { type diffuse  reflect rgb 0.17 0.17 0.19 }   # dark basal
 material "travertine"{ type diffuse  reflect rgb 0.66 0.58 0.46 }   # cream travertine
 material "socketmat" { type diffuse  reflect rgb 0.05 0.05 0.06 }   # dark lamp socket
 
+# --- Xenon short-arc lamp assembly (nested-dielectric quartz envelope) ----------
+# Outer fused-silica (quartz) shell with real wall thickness; a slightly-shrunk,
+# HIGHER-priority copy of the same bulb mesh (Schmidt-Budge nesting) carves the
+# interior to xenon gas at operating pressure/temperature (glass:xenon-lamp).
+material "lamp_quartz"   { type dielectric ior glass:fused-silica  priority 20 }
+material "lamp_xenon"    { type dielectric ior glass:xenon-lamp    priority 30 }
+material "lamp_electrode"{ type glossy reflect metal:chrome roughness 0.28 }
+material "lamp_cordmat"  { type diffuse reflect rgb 0.05 0.05 0.06 }
+
 # --- Hero-object materials -----------------------------------------------------
 material "gold"     { preset gold }
 material "chrome"   { preset chrome }
@@ -281,7 +290,17 @@ isosurface "chrome_ring" {
 # caustics through the diamond gyroid and glass sphere. Xenon short-arc spectrum via a
 # 6000 K Planckian (the validated xenon proxy; see data/README.md).
 isosurface "socket" { material socketmat  cylinder { translate 5.0 3.27 3.0  radius 0.018  height 0.26 } }
-light sphere { center 5.0 3.10 3.0   radius 0.05   spd blackbody 6000 }
+
+# The envelope: a real quartz bulb (built from a photo of a short-arc lamp) hangs
+# from the socket. Native mesh: electrode axis = X, cord = +Y (points up to socket).
+# Uniform 0.11 scale -> envelope radius ~0.046 (matches the old bare 0.05 bulb). The
+# xenon copy is 0.94x (0.1034) so the (1-0.94) gap = the glass wall thickness.
+mesh "lamp_bulb" { file "assets/lamp/bulb.obj"  translate 5.0 3.10 3.0  scale 0.11    material lamp_quartz }
+mesh "lamp_xe"   { file "assets/lamp/bulb.obj"  translate 5.0 3.10 3.0  scale 0.1034  material lamp_xenon }
+mesh "lamp_elec" { file "assets/lamp/inner.obj" translate 5.0 3.10 3.0  scale 0.11    material lamp_electrode }
+mesh "lamp_cord" { file "assets/lamp/cord.obj"  translate 5.0 3.10 3.0  scale 0.11    material lamp_cordmat }
+# The arc itself: a tiny emitter at the electrode gap (mesh centre) is the whole hall's light.
+light sphere { center 5.0 3.10 3.0   radius 0.008   spd blackbody 6000 }
 
 # ==============================  ATMOSPHERE  ==================================
 # (1) A very faint GLOBAL haze so the single bulb casts soft volumetric shafts + aerial depth.

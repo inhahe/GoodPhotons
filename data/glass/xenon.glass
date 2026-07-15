@@ -1,0 +1,26 @@
+# Xenon gas refractive index.
+# aliases: Xe
+#
+# REFERENCE VALUE (this file): xenon at STP — 0 degC (273.15 K), 1 atm (101.325 kPa),
+# sodium-D 589 nm:  n = 1.000702  (n-1 = 7.02e-4).  Air at the same STP is n-1 = 2.93e-4,
+# so xenon is ~2.4x as optically dense as air per unit of (n-1). Visible-range dispersion
+# is mild (n-1 rises <~5% from 650 nm to 480 nm) and utterly negligible at this magnitude,
+# so a constant is faithful; swap to `form cauchy` if you ever want the tiny blue-ward rise.
+#
+# PRESSURE / TEMPERATURE SCALING (important for a real lamp — see below):
+# For a dilute gas (n-1) is proportional to number density, i.e. to P/T (Gladstone-Dale):
+#     n-1  =  7.02e-4 * (P / 1 atm) * (273.15 K / T)
+# Xenon SHORT-ARC lamps (cinema/projection XBO, Ushio UXL, endoscopy) are HIGH PRESSURE,
+# NOT a vacuum — that overpressure is exactly why they are an explosion hazard. Typical:
+#     cold fill    ~3-15 atm   (bigger/higher-wattage lamps toward the top)
+#     operating    ~20-50 atm  (high-power cinema lamps can reach ~100 atm hot)
+# Worked examples of the interior index this produces:
+#     10 atm cold  @ 293 K  ->  n-1 = 7.02e-4 * 10 * 273.15/293  ~= 6.5e-3  ->  n ~= 1.0065
+#     30 atm hot   @ 1500 K ->  n-1 = 7.02e-4 * 30 * 273.15/1500 ~= 3.8e-3  ->  n ~= 1.0038
+#     30 atm arc   @ 8000 K ->  n-1 = 7.02e-4 * 30 * 273.15/8000 ~= 7.2e-4  ->  n ~= 1.0007
+# So an OPERATING lamp interior is really a refractive-index GRADIENT (rarefied ~1.0007 in
+# the hot arc core, denser ~1.006 in the cool wall gas), not one uniform value. A single
+# homogeneous medium can only approximate it; the shimmering arc "mirage"/schlieren needs a
+# gradient-index medium the renderer does not model. Pick the value for your fill regime.
+form constant
+n 1.000702

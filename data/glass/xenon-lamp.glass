@@ -1,0 +1,15 @@
+# Xenon fill of a RUNNING short-arc lamp (operating pressure/temperature).
+# aliases: xenon-arc xenon-operating
+#
+# Derived from the STP reference in xenon.glass (n-1 = 7.02e-4 at 273.15 K, 1 atm)
+# via the Gladstone-Dale density scaling  n-1 = 7.02e-4 * (P/1 atm) * (273.15 K / T).
+# A lit xenon short-arc runs at high pressure (~20-50 atm) with a strong temperature
+# gradient: rarefied hot plasma in the arc core (~1.0007) grading to denser, cooler
+# gas near the quartz wall (~1.006). This file uses a single representative BULK value
+# for the operating gas the emitted light traverses:
+#     30 atm @ 1500 K ->  n-1 = 7.02e-4 * 30 * 273.15/1500 = 3.84e-3  ->  n = 1.00384
+# (A truly faithful arc would need a gradient-index medium; a homogeneous medium can
+# only take one value, so we pick the operating bulk. For the pure gas at lab STP use
+# glass:xenon; for a cold-fill unlit lamp scale to ~1.0065 at 10 atm/293 K.)
+form constant
+n 1.00384
