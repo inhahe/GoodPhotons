@@ -3667,21 +3667,30 @@ static int run(int argc, char** argv) {
             // World-space size of the red crosshair: a fixed fraction of the scene, so it
             // shrinks/grows with the target's distance under the camera's perspective.
             const double crossR = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0) * 0.06;
-            // Interactive render resolution: cap the long edge so mouse-dragging stays
-            // responsive on a heavy scene. The window letterboxes to roughly this size
-            // anyway, and the eye/look_at readout + world-scaled crosshair are resolution-
-            // independent, so this only softens the live preview while navigating — same
-            // aspect ratio, so the projection is unchanged.
-            int VW = W, VH = H;
-            {
-                const int kInteractiveLong = 900;
-                int lo = std::max(VW, VH);
-                if (lo > kInteractiveLong) {
-                    double sc = (double)kInteractiveLong / lo;
-                    VW = std::max(1, (int)std::lround(VW * sc));
-                    VH = std::max(1, (int)std::lround(VH * sc));
+            // Interactive render resolution FOLLOWS THE LIVE WINDOW: fit the authored
+            // W:H aspect into the current client area so the raster renders at (roughly)
+            // one pixel per displayed pixel. Shrinking the window renders fewer pixels
+            // (faster while navigating a heavy scene); growing it renders more (crisper),
+            // up to the authored resolution. The aspect ratio is preserved, so the camera
+            // projection is unchanged, and the eye/look_at readout + world-scaled crosshair
+            // are resolution-independent. Recomputed every loop so a live resize retunes it.
+            auto fitRes = [&](int& outW, int& outH) {
+                int cw = 0, ch = 0;
+                if (!g_liveWin->clientSize(cw, ch)) { outW = W; outH = H; return; }
+                double s = std::min(std::min((double)cw / W, (double)ch / H), 1.0);  // never supersample
+                int vw = std::max(1, (int)std::lround(W * s));
+                int vh = std::max(1, (int)std::lround(H * s));
+                const int kMinLong = 160;   // guard against an absurdly tiny render
+                int lo = std::max(vw, vh);
+                if (lo < kMinLong) {
+                    double up = (double)kMinLong / lo;
+                    vw = std::max(1, (int)std::lround(vw * up));
+                    vh = std::max(1, (int)std::lround(vh * up));
                 }
-            }
+                outW = vw; outH = vh;
+            };
+            int VW = W, VH = H;
+            fitRes(VW, VH);
             auto fmt3 = [](const Vec3& p) {
                 char b[64]; std::snprintf(b, sizeof b, "%.2f, %.2f, %.2f", p.x, p.y, p.z);
                 return std::string(b);
@@ -3691,12 +3700,21 @@ static int run(int argc, char** argv) {
               "         mouse:  drag = slide the red crosshair L/R/U/D across the view    wheel = push it farther/nearer\n"
               "         eye:    A/D = -X/+X    R/F = +Y/-Y    W/S = -Z/+Z\n"
               "         target: Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   Shift/Ctrl/Alt+Up/Dn = farther/nearer\n"
-              "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n",
+              "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n"
+              "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
               step);
             std::fflush(stdout);
 
             bool changed = true;   // draw a first crosshair frame immediately
             while (!g_liveWin->closed() && !g_stopRequested) {
+                // Match the render resolution to the live window: a user resize re-renders
+                // at the new size (smaller = faster, larger = crisper).
+                { int nvw = VW, nvh = VH; fitRes(nvw, nvh);
+                  if (nvw != VW || nvh != VH) {
+                      VW = nvw; VH = nvh; changed = true;
+                      std::printf("[viewer] preview resolution %dx%d\n", VW, VH);
+                      std::fflush(stdout);
+                  } }
                 std::vector<NudgeCmd> cmds = g_liveWin->drainNudges();
                 bool doPrint = false;
                 for (NudgeCmd c : cmds) {

@@ -65,6 +65,13 @@ public:
     // Thread-safe. See PointerInput for units.
     PointerInput drainPointer();
 
+    // Current client-area size in pixels (what the image is letterboxed into). Lets the
+    // interactive render loop match its raster resolution to the live window, so shrinking
+    // the window renders fewer pixels (faster) and growing it renders more (crisper).
+    // Returns false (and leaves w/h untouched) on headless/stub builds or before the
+    // window exists. Thread-safe.
+    bool clientSize(int& w, int& h) const;
+
     LiveWindow(const LiveWindow&) = delete;
     LiveWindow& operator=(const LiveWindow&) = delete;
 

@@ -173,12 +173,14 @@ paths they can capture at all**.
 > | `[` / `]` | finer / coarser keyboard/wheel move step (starts at 3 % of the scene radius) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
+> | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
 >
 > The window title shows the live `eye(…) look(…)` as you move. Frames re-rasterize
-> at a capped resolution (≤ 900 px on the long edge) so dragging stays responsive on
-> a heavy scene — the readout and the world-scaled crosshair are resolution-
-> independent, so this only softens the live preview while you navigate. Close the
-> window to finish. (Click the window first so it has keyboard focus.)
+> at the live window's resolution — drag a corner to make the preview smaller (and
+> snappier) or larger (and sharper); the aspect ratio, the readout, and the world-
+> scaled crosshair are all resolution-independent, so this only trades preview
+> sharpness for speed while you navigate. Close the window to finish. (Click the
+> window first so it has keyboard focus.)
 >
 > **Double-click / bare invocation.** Running ftrace with just a scene file and
 > nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,

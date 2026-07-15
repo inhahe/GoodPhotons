@@ -10,6 +10,7 @@ void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
 std::vector<NudgeCmd> LiveWindow::drainNudges() { return {}; }
 PointerInput LiveWindow::drainPointer() { return {}; }
+bool LiveWindow::clientSize(int&, int&) const { return false; }
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -332,6 +333,16 @@ PointerInput LiveWindow::drainPointer() {
     p.dragDx = impl_->dragDx; p.dragDy = impl_->dragDy; p.wheel = impl_->wheelAcc;
     impl_->dragDx = impl_->dragDy = impl_->wheelAcc = 0.0;
     return p;
+}
+
+bool LiveWindow::clientSize(int& w, int& h) const {
+    if (!impl_ || !impl_->hwnd) return false;
+    RECT cr;
+    if (!GetClientRect(impl_->hwnd, &cr)) return false;
+    int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+    if (cw <= 0 || ch <= 0) return false;
+    w = cw; h = ch;
+    return true;
 }
 
 #endif // _WIN32
