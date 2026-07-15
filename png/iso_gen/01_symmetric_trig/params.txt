@@ -1,0 +1,8 @@
+approach   : trig  (01_symmetric_trig)
+Symmetric trigonometric / minimal-surface / Chmutov family
+
+count      : 12
+base seed  : 1
+size       : 480px
+raymarch   : 300 steps
+backend    : gpu(angle-d3d11)

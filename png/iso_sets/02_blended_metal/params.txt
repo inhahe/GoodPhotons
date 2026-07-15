@@ -1,0 +1,13 @@
+Parameter set: 02_blended_metal
+Smooth blobby metal combos: blob/ellipsoid/spike families blended with + - *.
+
+material        : copper  (material "iso" { preset copper roughness 0.12 })
+coord frequency : 1.1
+clip radius R   : 1.7
+leaf mix        : function 0.78  variable 0.1  number 0.12
+number range    : -1.5 .. 1.5
+operators       : +(w1) -(w1) *(w0.6)
+nesting walk    : open 0.25  add 0.55  close 0.2
+max terms/depth : 5 / 2
+unary wrap      : p=0  [(none)]
+functions       : blob2, cross_ellipsoids, isect_ellipsoids, glob, ellipsoid, spikes, superellipsoid, sphere, torus, pillow, torus_gumdrop

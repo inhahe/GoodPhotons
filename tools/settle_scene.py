@@ -186,24 +186,50 @@ def export_isosurface_meshes(scene_path, res):
     if not os.path.exists(tmp):
         sys.stderr.write(r.stdout + '\n' + r.stderr + '\n')
         sys.exit('[settle_scene] -export-mesh produced no file')
-    # `-export-mesh` writes one `o <block-name>` object per isosurface. Force a Scene
-    # so those object names survive even when there is a SINGLE isosurface (a bare
-    # `trimesh.load` collapses one object to an un-named Trimesh, losing the name and
-    # breaking the match back to the ftsl block). Fall back to the file's `o` tokens.
-    scene = trimesh.load(tmp, process=False, group_material=False, force='scene')
-    obj_names = [ln.split(None, 1)[1].strip()
-                 for ln in open(tmp) if ln.startswith('o ') and len(ln.split(None, 1)) > 1]
+    # `-export-mesh` writes one `o <block-name>` object per isosurface, with GLOBAL
+    # cumulative 1-based vertex indices in `f a//na …` faces. Parse the `o` groups
+    # DIRECTLY rather than via `trimesh.load(force='scene')`: without `usemtl` lines
+    # (marching-cubes output has none), some trimesh versions silently merge every `o`
+    # group into a single Trimesh, collapsing all names to the first — which breaks the
+    # match back to the ftsl blocks (only the first object survives). A manual parse is
+    # robust regardless of trimesh's grouping heuristics.
+    return parse_obj_groups(tmp)
+
+
+def parse_obj_groups(path):
+    """Parse a Wavefront OBJ into {object-name: trimesh} by its `o` groups. Vertices are
+    global/cumulative; each group's faces (0-based into the shared vertex pool) are
+    remapped onto just the vertices that group references, so bounds/centroid are exact."""
+    verts = []            # all `v` positions (global, 0-based after read)
+    groups = []           # list of (name, [ (i,j,k) 0-based tris ])
+    cur = None
+    with open(path) as fh:
+        for ln in fh:
+            if ln.startswith('v '):
+                verts.append([float(t) for t in ln.split()[1:4]])
+            elif ln.startswith('o '):
+                name = ln.split(None, 1)[1].strip() if len(ln.split(None, 1)) > 1 else f'obj{len(groups)}'
+                cur = (name, [])
+                groups.append(cur)
+            elif ln.startswith('f '):
+                if cur is None:
+                    cur = ('obj0', [])
+                    groups.append(cur)
+                # each token is `v`, `v/vt`, or `v//vn`; take the vertex index (1-based)
+                idx = [int(tok.split('/', 1)[0]) - 1 for tok in ln.split()[1:]]
+                # fan-triangulate any n-gon (marching cubes emits tris, but be safe)
+                for t in range(1, len(idx) - 1):
+                    cur[1].append((idx[0], idx[t], idx[t + 1]))
+    V = np.asarray(verts, float)
     out = {}
-    if isinstance(scene, trimesh.Scene):
-        geoms = list(scene.geometry.items())
-        # If trimesh named geometries generically (e.g. "geometry_0") but the OBJ has
-        # the authored `o` names, prefer the authored names by position.
-        for i, (name, geom) in enumerate(geoms):
-            if len(geoms) == len(obj_names):
-                name = obj_names[i]
-            out[name] = geom
-    else:
-        out[obj_names[0] if obj_names else 'isosurface_0'] = scene
+    for name, tris in groups:
+        if not tris:
+            continue
+        F = np.asarray(tris, np.int64)
+        used = np.unique(F)
+        remap = {g: i for i, g in enumerate(used)}
+        localF = np.vectorize(remap.__getitem__)(F)
+        out[name] = trimesh.Trimesh(vertices=V[used], faces=localF, process=False)
     return out
 
 

@@ -1,0 +1,22 @@
+[ftsl] loaded scene from scenes/gallery.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 1280x720 on GPU (light=bb6500) ...
+wrote png/gallery.png (1280x720), exposure=2.21e-14 (auto 1.47e-14 x 1.5EV-comp)
+[time] 21.0s / 1.5e+03s, 22 spp, ~21.32% noise
+wrote png/gallery.png (1280x720), exposure=2.49e-14 (auto 1.66e-14 x 1.5EV-comp)
+[time] 42.4s / 1.5e+03s, 51 spp, ~14.00% noise
+wrote png/gallery.png (1280x720), exposure=2.59e-14 (auto 1.73e-14 x 1.5EV-comp)
+[time] 63.6s / 1.5e+03s, 75 spp, ~11.55% noise
+wrote png/gallery.png (1280x720), exposure=2.67e-14 (auto 1.78e-14 x 1.5EV-comp)
+[time] 85.5s / 1.5e+03s, 106 spp, ~9.71% noise
+wrote png/gallery.png (1280x720), exposure=2.7e-14 (auto 1.8e-14 x 1.5EV-comp)
+[time] 106.0s / 1.5e+03s, 127 spp, ~8.87% noise
+wrote png/gallery.png (1280x720), exposure=2.75e-14 (auto 1.83e-14 x 1.5EV-comp)
+[time] 127.5s / 1.5e+03s, 158 spp, ~7.96% noise
+wrote png/gallery.png (1280x720), exposure=2.77e-14 (auto 1.85e-14 x 1.5EV-comp)
+[time] 148.2s / 1.5e+03s, 187 spp, ~7.31% noise
+wrote png/gallery.png (1280x720), exposure=2.79e-14 (auto 1.86e-14 x 1.5EV-comp)
+[time] 168.6s / 1.5e+03s, 218 spp, ~6.77% noise
+wrote png/gallery.png (1280x720), exposure=2.81e-14 (auto 1.88e-14 x 1.5EV-comp)
+[time] 189.9s / 1.5e+03s, 248 spp, ~6.35% noise

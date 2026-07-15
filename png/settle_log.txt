@@ -1,0 +1,519 @@
+pybullet build time: Jul 14 2026 13:49:01
+V-HACD V2.2
+Syntax: testVHACD [options] --input infile.obj --output outfile.obj --log logfile.txt
+
+Options:
+       --input                     Wavefront .obj input file name
+       --output                    VRML 2.0 output file name
+       --log                       Log file name
+       --resolution                Maximum number of voxels generated during the voxelization stage (default=100,000, range=10,000-16,000,000)
+       --depth                     Maximum number of clipping stages. During each split stage, parts with a concavity higher than the user defined threshold are clipped according the "best" clipping plane (default=20, range=1-32)
+       --concavity                 Maximum allowed concavity (default=0.0025, range=0.0-1.0)
+       --planeDownsampling         Controls the granularity of the search for the "best" clipping plane (default=4, range=1-16)
+       --convexhullDownsampling    Controls the precision of the convex-hull generation process during the clipping plane selection stage (default=4, range=1-16)
+       --alpha                     Controls the bias toward clipping along symmetry planes (default=0.05, range=0.0-1.0)
+       --beta                      Controls the bias toward clipping along revolution axes (default=0.05, range=0.0-1.0)
+       --gamma                     Controls the maximum allowed concavity during the merge stage (default=0.00125, range=0.0-1.0)
+       --delta                     Controls the bias toward maximaxing local concavity (default=0.05, range=0.0-1.0)
+       --pca                       Enable/disable normalizing the mesh before applying the convex decomposition (default=0, range={0,1})
+       --mode                      0: voxel-based approximate convex decomposition, 1: tetrahedron-based approximate convex decomposition (default=0, range={0,1})
+       --maxNumVerticesPerCH       Controls the maximum number of triangles per convex-hull (default=64, range=4-1024)
+       --minVolumePerCH            Controls the adaptive sampling of the generated convex-hulls (default=0.0001, range=0.0-0.01)
+       --convexhullApproximation   Enable/disable approximation when computing convex-hulls (default=1, range={0,1})
+       --oclAcceleration           Enable/disable OpenCL acceleration (default=0, range={0,1})
+       --oclPlatformID             OpenCL platform id (default=0, range=0-# OCL platforms)
+       --oclDeviceID               OpenCL device id (default=0, range=0-# OCL devices)
+       --help                      Print usage
+
+Examples:
+       testVHACD.exe --input bunny.obj --output bunny_acd.obj --log log.txt
+
++ OpenCL (OFF)
++ Parameters
+	 input                                       C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\klein.obj
+	 resolution                                  1000000
+	 max. depth                                  20
+	 max. concavity                              0.001
+	 plane down-sampling                         4
+	 convex-hull down-sampling                   4
+	 alpha                                       0.05
+	 beta                                        0.05
+	 gamma                                       0.0005
+	 pca                                         0
+	 mode                                        0
+	 max. vertices per convex-hull               64
+	 min. volume to add vertices to convex-hulls 0.0001
+	 convex-hull approximation                   1
+	 OpenCL acceleration                         1
+	 OpenCL platform ID                          0
+	 OpenCL device ID                            0
+	 output                                      C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\klein_vhacd.obj
+	 log                                         C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\vhacd.log
++ Load mesh
+  0% [ Voxelization  20% ] Iteration 1   0%
+  0% [ Voxelization  20% ] Iteration 1 100%
+  0% [ Voxelization  40% ] Iteration 2   0%
+  0% [ Voxelization  40% ] Iteration 2 100%
+  0% [ Voxelization  60% ] Iteration 3   0%
+  0% [ Voxelization  60% ] Iteration 3 100%
+ 10% [ Voxelization 100% ] Iteration 3 100%
+ 10% [ Compute primitive set   0% ] Convert volume to pset   0%
+ 15% [ Compute primitive set 100% ] Convert volume to pset 100%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition  82% ] Subdivision level 1 100%
+ 15% [ Approximate Convex Decomposition  82% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  82% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  82% ] Subdivision level 2  50%
+ 15% [ Approximate Convex Decomposition  89% ] Subdivision level 2 100%
+ 15% [ Approximate Convex Decomposition  89% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  89% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  89% ] Subdivision level 3  25%
+ 15% [ Approximate Convex Decomposition  89% ] Subdivision level 3  50%
+ 15% [ Approximate Convex Decomposition  89% ] Subdivision level 3  75%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 3 100%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 4   0%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 4   0%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 4  25%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 4  50%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 4  75%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 4 100%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5   0%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5   0%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5  17%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5  33%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5  50%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5  67%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 5  83%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 5 100%
+ 90% [ Approximate Convex Decomposition  95% ] Subdivision level 5 100%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  11%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  22%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  33%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  44%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  56%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  67%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  78%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  89%
+ 95% [ Approximate Convex Decomposition 100% ] Generate convex-hulls 100%
+ 99% [ Merge Convex Hulls 100% ] Iteration 0 100%
+ 99% [ Simplify convex-hulls   0% ] Simplify convex-hulls   0%
+100% [ Simplify convex-hulls 100% ] Simplify convex-hulls 100%
+V-HACD V2.2
+Syntax: testVHACD [options] --input infile.obj --output outfile.obj --log logfile.txt
+
+Options:
+       --input                     Wavefront .obj input file name
+       --output                    VRML 2.0 output file name
+       --log                       Log file name
+       --resolution                Maximum number of voxels generated during the voxelization stage (default=100,000, range=10,000-16,000,000)
+       --depth                     Maximum number of clipping stages. During each split stage, parts with a concavity higher than the user defined threshold are clipped according the "best" clipping plane (default=20, range=1-32)
+       --concavity                 Maximum allowed concavity (default=0.0025, range=0.0-1.0)
+       --planeDownsampling         Controls the granularity of the search for the "best" clipping plane (default=4, range=1-16)
+       --convexhullDownsampling    Controls the precision of the convex-hull generation process during the clipping plane selection stage (default=4, range=1-16)
+       --alpha                     Controls the bias toward clipping along symmetry planes (default=0.05, range=0.0-1.0)
+       --beta                      Controls the bias toward clipping along revolution axes (default=0.05, range=0.0-1.0)
+       --gamma                     Controls the maximum allowed concavity during the merge stage (default=0.00125, range=0.0-1.0)
+       --delta                     Controls the bias toward maximaxing local concavity (default=0.05, range=0.0-1.0)
+       --pca                       Enable/disable normalizing the mesh before applying the convex decomposition (default=0, range={0,1})
+       --mode                      0: voxel-based approximate convex decomposition, 1: tetrahedron-based approximate convex decomposition (default=0, range={0,1})
+       --maxNumVerticesPerCH       Controls the maximum number of triangles per convex-hull (default=64, range=4-1024)
+       --minVolumePerCH            Controls the adaptive sampling of the generated convex-hulls (default=0.0001, range=0.0-0.01)
+       --convexhullApproximation   Enable/disable approximation when computing convex-hulls (default=1, range={0,1})
+       --oclAcceleration           Enable/disable OpenCL acceleration (default=0, range={0,1})
+       --oclPlatformID             OpenCL platform id (default=0, range=0-# OCL platforms)
+       --oclDeviceID               OpenCL device id (default=0, range=0-# OCL devices)
+       --help                      Print usage
+
+Examples:
+       testVHACD.exe --input bunny.obj --output bunny_acd.obj --log log.txt
+
++ OpenCL (OFF)
++ Parameters
+	 input                                       C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\brass_dumbbell.obj
+	 resolution                                  1000000
+	 max. depth                                  20
+	 max. concavity                              0.001
+	 plane down-sampling                         4
+	 convex-hull down-sampling                   4
+	 alpha                                       0.05
+	 beta                                        0.05
+	 gamma                                       0.0005
+	 pca                                         0
+	 mode                                        0
+	 max. vertices per convex-hull               64
+	 min. volume to add vertices to convex-hulls 0.0001
+	 convex-hull approximation                   1
+	 OpenCL acceleration                         1
+	 OpenCL platform ID                          0
+	 OpenCL device ID                            0
+	 output                                      C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\brass_dumbbell_vhacd.obj
+	 log                                         C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\vhacd.log
++ Load mesh
+  0% [ Voxelization  20% ] Iteration 1   0%
+  0% [ Voxelization  20% ] Iteration 1 100%
+  0% [ Voxelization  40% ] Iteration 2   0%
+  0% [ Voxelization  40% ] Iteration 2 100%
+  0% [ Voxelization  60% ] Iteration 3   0%
+  0% [ Voxelization  60% ] Iteration 3 100%
+ 10% [ Voxelization 100% ] Iteration 3 100%
+ 10% [ Compute primitive set   0% ] Convert volume to pset   0%
+ 15% [ Compute primitive set 100% ] Convert volume to pset 100%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition  85% ] Subdivision level 1 100%
+ 15% [ Approximate Convex Decomposition  85% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  85% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  85% ] Subdivision level 2  50%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 2 100%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 3  50%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 3 100%
+ 90% [ Approximate Convex Decomposition  95% ] Subdivision level 3 100%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  33%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  67%
+ 95% [ Approximate Convex Decomposition 100% ] Generate convex-hulls 100%
+ 99% [ Merge Convex Hulls 100% ] Iteration 0 100%
+ 99% [ Simplify convex-hulls   0% ] Simplify convex-hulls   0%
+100% [ Simplify convex-hulls 100% ] Simplify convex-hulls 100%
+V-HACD V2.2
+Syntax: testVHACD [options] --input infile.obj --output outfile.obj --log logfile.txt
+
+Options:
+       --input                     Wavefront .obj input file name
+       --output                    VRML 2.0 output file name
+       --log                       Log file name
+       --resolution                Maximum number of voxels generated during the voxelization stage (default=100,000, range=10,000-16,000,000)
+       --depth                     Maximum number of clipping stages. During each split stage, parts with a concavity higher than the user defined threshold are clipped according the "best" clipping plane (default=20, range=1-32)
+       --concavity                 Maximum allowed concavity (default=0.0025, range=0.0-1.0)
+       --planeDownsampling         Controls the granularity of the search for the "best" clipping plane (default=4, range=1-16)
+       --convexhullDownsampling    Controls the precision of the convex-hull generation process during the clipping plane selection stage (default=4, range=1-16)
+       --alpha                     Controls the bias toward clipping along symmetry planes (default=0.05, range=0.0-1.0)
+       --beta                      Controls the bias toward clipping along revolution axes (default=0.05, range=0.0-1.0)
+       --gamma                     Controls the maximum allowed concavity during the merge stage (default=0.00125, range=0.0-1.0)
+       --delta                     Controls the bias toward maximaxing local concavity (default=0.05, range=0.0-1.0)
+       --pca                       Enable/disable normalizing the mesh before applying the convex decomposition (default=0, range={0,1})
+       --mode                      0: voxel-based approximate convex decomposition, 1: tetrahedron-based approximate convex decomposition (default=0, range={0,1})
+       --maxNumVerticesPerCH       Controls the maximum number of triangles per convex-hull (default=64, range=4-1024)
+       --minVolumePerCH            Controls the adaptive sampling of the generated convex-hulls (default=0.0001, range=0.0-0.01)
+       --convexhullApproximation   Enable/disable approximation when computing convex-hulls (default=1, range={0,1})
+       --oclAcceleration           Enable/disable OpenCL acceleration (default=0, range={0,1})
+       --oclPlatformID             OpenCL platform id (default=0, range=0-# OCL platforms)
+       --oclDeviceID               OpenCL device id (default=0, range=0-# OCL devices)
+       --help                      Print usage
+
+Examples:
+       testVHACD.exe --input bunny.obj --output bunny_acd.obj --log log.txt
+
++ OpenCL (OFF)
++ Parameters
+	 input                                       C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\brass_cluster.obj
+	 resolution                                  1000000
+	 max. depth                                  20
+	 max. concavity                              0.001
+	 plane down-sampling                         4
+	 convex-hull down-sampling                   4
+	 alpha                                       0.05
+	 beta                                        0.05
+	 gamma                                       0.0005
+	 pca                                         0
+	 mode                                        0
+	 max. vertices per convex-hull               64
+	 min. volume to add vertices to convex-hulls 0.0001
+	 convex-hull approximation                   1
+	 OpenCL acceleration                         1
+	 OpenCL platform ID                          0
+	 OpenCL device ID                            0
+	 output                                      C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\brass_cluster_vhacd.obj
+	 log                                         C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\vhacd.log
++ Load mesh
+  0% [ Voxelization  20% ] Iteration 1   0%
+  0% [ Voxelization  20% ] Iteration 1 100%
+  0% [ Voxelization  40% ] Iteration 2   0%
+  0% [ Voxelization  40% ] Iteration 2 100%
+  0% [ Voxelization  60% ] Iteration 3   0%
+  0% [ Voxelization  60% ] Iteration 3 100%
+ 10% [ Voxelization 100% ] Iteration 3 100%
+ 10% [ Compute primitive set   0% ] Convert volume to pset   0%
+ 15% [ Compute primitive set 100% ] Convert volume to pset 100%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition  64% ] Subdivision level 1 100%
+ 15% [ Approximate Convex Decomposition  64% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  64% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  64% ] Subdivision level 2  50%
+ 15% [ Approximate Convex Decomposition  81% ] Subdivision level 2 100%
+ 15% [ Approximate Convex Decomposition  81% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  81% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  81% ] Subdivision level 3  25%
+ 15% [ Approximate Convex Decomposition  81% ] Subdivision level 3  50%
+ 15% [ Approximate Convex Decomposition  81% ] Subdivision level 3  75%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 3 100%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4   0%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4   0%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  13%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  25%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  38%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  50%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  63%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  75%
+ 15% [ Approximate Convex Decomposition  87% ] Subdivision level 4  88%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 4 100%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5   0%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5   0%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  10%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  20%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  30%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  40%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  50%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  60%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  70%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  80%
+ 15% [ Approximate Convex Decomposition  92% ] Subdivision level 5  90%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 5 100%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6   0%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6   0%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  13%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  25%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  38%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  50%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  63%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  75%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  88%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 6 100%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7   0%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7   0%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7  17%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7  33%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7  50%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7  67%
+ 15% [ Approximate Convex Decomposition  94% ] Subdivision level 7  83%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 7 100%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8   0%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8   0%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8  17%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8  33%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8  50%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8  67%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8  83%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 8 100%
+ 90% [ Approximate Convex Decomposition  95% ] Subdivision level 8 100%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   4%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   9%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  13%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  17%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  22%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  26%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  30%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  35%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  39%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  43%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  48%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  52%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  57%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  61%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  65%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  70%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  74%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  78%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  83%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  87%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  91%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  96%
+ 95% [ Approximate Convex Decomposition 100% ] Generate convex-hulls 100%
+ 99% [ Merge Convex Hulls 100% ] Iteration 2 100%
+ 99% [ Simplify convex-hulls   0% ] Simplify convex-hulls   0%
+100% [ Simplify convex-hulls 100% ] Simplify convex-hulls 100%
+V-HACD V2.2
+Syntax: testVHACD [options] --input infile.obj --output outfile.obj --log logfile.txt
+
+Options:
+       --input                     Wavefront .obj input file name
+       --output                    VRML 2.0 output file name
+       --log                       Log file name
+       --resolution                Maximum number of voxels generated during the voxelization stage (default=100,000, range=10,000-16,000,000)
+       --depth                     Maximum number of clipping stages. During each split stage, parts with a concavity higher than the user defined threshold are clipped according the "best" clipping plane (default=20, range=1-32)
+       --concavity                 Maximum allowed concavity (default=0.0025, range=0.0-1.0)
+       --planeDownsampling         Controls the granularity of the search for the "best" clipping plane (default=4, range=1-16)
+       --convexhullDownsampling    Controls the precision of the convex-hull generation process during the clipping plane selection stage (default=4, range=1-16)
+       --alpha                     Controls the bias toward clipping along symmetry planes (default=0.05, range=0.0-1.0)
+       --beta                      Controls the bias toward clipping along revolution axes (default=0.05, range=0.0-1.0)
+       --gamma                     Controls the maximum allowed concavity during the merge stage (default=0.00125, range=0.0-1.0)
+       --delta                     Controls the bias toward maximaxing local concavity (default=0.05, range=0.0-1.0)
+       --pca                       Enable/disable normalizing the mesh before applying the convex decomposition (default=0, range={0,1})
+       --mode                      0: voxel-based approximate convex decomposition, 1: tetrahedron-based approximate convex decomposition (default=0, range={0,1})
+       --maxNumVerticesPerCH       Controls the maximum number of triangles per convex-hull (default=64, range=4-1024)
+       --minVolumePerCH            Controls the adaptive sampling of the generated convex-hulls (default=0.0001, range=0.0-0.01)
+       --convexhullApproximation   Enable/disable approximation when computing convex-hulls (default=1, range={0,1})
+       --oclAcceleration           Enable/disable OpenCL acceleration (default=0, range={0,1})
+       --oclPlatformID             OpenCL platform id (default=0, range=0-# OCL platforms)
+       --oclDeviceID               OpenCL device id (default=0, range=0-# OCL devices)
+       --help                      Print usage
+
+Examples:
+       testVHACD.exe --input bunny.obj --output bunny_acd.obj --log log.txt
+
++ OpenCL (OFF)
++ Parameters
+	 input                                       C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\heart.obj
+	 resolution                                  1000000
+	 max. depth                                  20
+	 max. concavity                              0.001
+	 plane down-sampling                         4
+	 convex-hull down-sampling                   4
+	 alpha                                       0.05
+	 beta                                        0.05
+	 gamma                                       0.0005
+	 pca                                         0
+	 mode                                        0
+	 max. vertices per convex-hull               64
+	 min. volume to add vertices to convex-hulls 0.0001
+	 convex-hull approximation                   1
+	 OpenCL acceleration                         1
+	 OpenCL platform ID                          0
+	 OpenCL device ID                            0
+	 output                                      C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\heart_vhacd.obj
+	 log                                         C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\vhacd.log
++ Load mesh
+  0% [ Voxelization  20% ] Iteration 1   0%
+  0% [ Voxelization  20% ] Iteration 1 100%
+  0% [ Voxelization  40% ] Iteration 2   0%
+  0% [ Voxelization  40% ] Iteration 2 100%
+  0% [ Voxelization  60% ] Iteration 3   0%
+  0% [ Voxelization  60% ] Iteration 3 100%
+ 10% [ Voxelization 100% ] Iteration 3 100%
+ 10% [ Compute primitive set   0% ] Convert volume to pset   0%
+ 15% [ Compute primitive set 100% ] Convert volume to pset 100%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 1 100%
+ 90% [ Approximate Convex Decomposition  95% ] Subdivision level 1 100%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 95% [ Approximate Convex Decomposition 100% ] Generate convex-hulls 100%
+ 99% [ Merge Convex Hulls 100% ] Generate convex-hulls 100%
+ 99% [ Simplify convex-hulls   0% ] Simplify convex-hulls   0%
+100% [ Simplify convex-hulls 100% ] Simplify convex-hulls 100%
+V-HACD V2.2
+Syntax: testVHACD [options] --input infile.obj --output outfile.obj --log logfile.txt
+
+Options:
+       --input                     Wavefront .obj input file name
+       --output                    VRML 2.0 output file name
+       --log                       Log file name
+       --resolution                Maximum number of voxels generated during the voxelization stage (default=100,000, range=10,000-16,000,000)
+       --depth                     Maximum number of clipping stages. During each split stage, parts with a concavity higher than the user defined threshold are clipped according the "best" clipping plane (default=20, range=1-32)
+       --concavity                 Maximum allowed concavity (default=0.0025, range=0.0-1.0)
+       --planeDownsampling         Controls the granularity of the search for the "best" clipping plane (default=4, range=1-16)
+       --convexhullDownsampling    Controls the precision of the convex-hull generation process during the clipping plane selection stage (default=4, range=1-16)
+       --alpha                     Controls the bias toward clipping along symmetry planes (default=0.05, range=0.0-1.0)
+       --beta                      Controls the bias toward clipping along revolution axes (default=0.05, range=0.0-1.0)
+       --gamma                     Controls the maximum allowed concavity during the merge stage (default=0.00125, range=0.0-1.0)
+       --delta                     Controls the bias toward maximaxing local concavity (default=0.05, range=0.0-1.0)
+       --pca                       Enable/disable normalizing the mesh before applying the convex decomposition (default=0, range={0,1})
+       --mode                      0: voxel-based approximate convex decomposition, 1: tetrahedron-based approximate convex decomposition (default=0, range={0,1})
+       --maxNumVerticesPerCH       Controls the maximum number of triangles per convex-hull (default=64, range=4-1024)
+       --minVolumePerCH            Controls the adaptive sampling of the generated convex-hulls (default=0.0001, range=0.0-0.01)
+       --convexhullApproximation   Enable/disable approximation when computing convex-hulls (default=1, range={0,1})
+       --oclAcceleration           Enable/disable OpenCL acceleration (default=0, range={0,1})
+       --oclPlatformID             OpenCL platform id (default=0, range=0-# OCL platforms)
+       --oclDeviceID               OpenCL device id (default=0, range=0-# OCL devices)
+       --help                      Print usage
+
+Examples:
+       testVHACD.exe --input bunny.obj --output bunny_acd.obj --log log.txt
+
++ OpenCL (OFF)
++ Parameters
+	 input                                       C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\oiljack.obj
+	 resolution                                  1000000
+	 max. depth                                  20
+	 max. concavity                              0.001
+	 plane down-sampling                         4
+	 convex-hull down-sampling                   4
+	 alpha                                       0.05
+	 beta                                        0.05
+	 gamma                                       0.0005
+	 pca                                         0
+	 mode                                        0
+	 max. vertices per convex-hull               64
+	 min. volume to add vertices to convex-hulls 0.0001
+	 convex-hull approximation                   1
+	 OpenCL acceleration                         1
+	 OpenCL platform ID                          0
+	 OpenCL device ID                            0
+	 output                                      C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\oiljack_vhacd.obj
+	 log                                         C:\Users\inhah\AppData\Local\Temp\settlescene_sim_pf2u_w86\vhacd.log
++ Load mesh
+  0% [ Voxelization  20% ] Iteration 1   0%
+  0% [ Voxelization  20% ] Iteration 1 100%
+  0% [ Voxelization  40% ] Iteration 2   0%
+  0% [ Voxelization  40% ] Iteration 2 100%
+  0% [ Voxelization  60% ] Iteration 3   0%
+  0% [ Voxelization  60% ] Iteration 3 100%
+ 10% [ Voxelization 100% ] Iteration 3 100%
+ 10% [ Compute primitive set   0% ] Convert volume to pset   0%
+ 15% [ Compute primitive set 100% ] Convert volume to pset 100%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition   0% ] Subdivision level 1   0%
+ 15% [ Approximate Convex Decomposition  62% ] Subdivision level 1 100%
+ 15% [ Approximate Convex Decomposition  62% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  62% ] Subdivision level 2   0%
+ 15% [ Approximate Convex Decomposition  62% ] Subdivision level 2  50%
+ 15% [ Approximate Convex Decomposition  76% ] Subdivision level 2 100%
+ 15% [ Approximate Convex Decomposition  76% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  76% ] Subdivision level 3   0%
+ 15% [ Approximate Convex Decomposition  76% ] Subdivision level 3  25%
+ 15% [ Approximate Convex Decomposition  76% ] Subdivision level 3  50%
+ 15% [ Approximate Convex Decomposition  76% ] Subdivision level 3  75%
+ 15% [ Approximate Convex Decomposition  84% ] Subdivision level 3 100%
+ 15% [ Approximate Convex Decomposition  84% ] Subdivision level 4   0%
+ 15% [ Approximate Convex Decomposition  84% ] Subdivision level 4   0%
+ 15% [ Approximate Convex Decomposition  84% ] Subdivision level 4  25%
+ 15% [ Approximate Convex Decomposition  84% ] Subdivision level 4  50%
+ 15% [ Approximate Convex Decomposition  84% ] Subdivision level 4  75%
+ 15% [ Approximate Convex Decomposition  91% ] Subdivision level 4 100%
+ 15% [ Approximate Convex Decomposition  91% ] Subdivision level 5   0%
+ 15% [ Approximate Convex Decomposition  91% ] Subdivision level 5   0%
+ 15% [ Approximate Convex Decomposition  91% ] Subdivision level 5  50%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 5 100%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6   0%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6   0%
+ 15% [ Approximate Convex Decomposition  93% ] Subdivision level 6  50%
+ 15% [ Approximate Convex Decomposition  95% ] Subdivision level 6 100%
+ 90% [ Approximate Convex Decomposition  95% ] Subdivision level 6 100%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls   0%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  13%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  25%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  38%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  50%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  63%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  75%
+ 90% [ Approximate Convex Decomposition  95% ] Generate convex-hulls  88%
+ 95% [ Approximate Convex Decomposition 100% ] Generate convex-hulls 100%
+ 99% [ Merge Convex Hulls 100% ] Iteration 0 100%
+ 99% [ Simplify convex-hulls   0% ] Simplify convex-hulls   0%
+100% [ Simplify convex-hulls 100% ] Simplify convex-hulls 100%
+[settle_scene] polygonising isosurfaces: D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in scenes/gallery.ftsl -export-mesh C:\Users\inhah\AppData\Local\Temp\settlescene_1wgst4j5\iso.obj -mesh-res 96
+[settle_scene] objects: stand_gyroid, stand_glass, stand_diamond, stand_klein, stand_dumbbell, stand_chrome, stand_heart, stand_brass, stand_oil, gyroid, gyroid_gem, klein, brass_dumbbell, brass_cluster, heart, oiljack, chrome_ring, socket
+[settle_scene] settling: klein, heart, brass_cluster, brass_dumbbell, oiljack  (others are static colliders)
+[settle_scene] floor: y=0.0
+[settle_scene] decimated "klein" collision proxy to 40000 tris (from 634076)
+[settle_scene] decimated "brass_dumbbell" collision proxy to 40000 tris (from 73624)
+[settle_scene] decimated "brass_cluster" collision proxy to 40000 tris (from 64392)
+[settle_scene] decimated "heart" collision proxy to 40000 tris (from 102808)
+[settle_scene] decimated "oiljack" collision proxy to 40000 tris (from 110024)
+  klein:  translate 1.06309 3.89508 -0.0051743   rotate -86.397 -51.4446 -68.2146
+  heart:  translate 8.41218 -2.52473 6.25875   rotate -13.8218 64.9453 109.351
+  brass_cluster:  translate 1.11317 -2.32079 -0.754347   rotate 49.5976 -4.28807 41.4886
+  brass_dumbbell:  translate 0.00871237 0.535262 -0.257396   rotate 9.41412 -1.16782 -5.4048
+  oiljack:  translate 2.16296 -2.41084 -1.8893   rotate 40.7811 -15.9262 45.6637
+[settle_scene] wrote scenes/gallery_settled.ftsl

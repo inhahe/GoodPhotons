@@ -1,0 +1,254 @@
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\01_gyroid.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png (320x320), auto-exposure=1.41e-14
+[time] 15.2s / 90s, 55 spp, ~13.48% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png (320x320), auto-exposure=1.57e-14
+[time] 30.5s / 90s, 110 spp, ~9.53% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png (320x320), auto-exposure=1.64e-14
+[time] 45.6s / 90s, 165 spp, ~7.78% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png (320x320), auto-exposure=1.69e-14
+[time] 60.9s / 90s, 221 spp, ~6.73% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png (320x320), auto-exposure=1.72e-14
+[time] 76.0s / 90s, 277 spp, ~6.01% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png (320x320), auto-exposure=1.74e-14
+[time] 90.1s / 90s, 328 spp, ~5.52% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\02_blobA.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png (320x320), auto-exposure=1.39e-14
+[time] 15.0s / 90s, 51 spp, ~14.00% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png (320x320), auto-exposure=1.55e-14
+[time] 30.3s / 90s, 103 spp, ~9.85% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png (320x320), auto-exposure=1.64e-14
+[time] 45.5s / 90s, 155 spp, ~8.03% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png (320x320), auto-exposure=1.69e-14
+[time] 60.6s / 90s, 207 spp, ~6.95% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png (320x320), auto-exposure=1.72e-14
+[time] 75.8s / 90s, 259 spp, ~6.21% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png (320x320), auto-exposure=1.74e-14
+[time] 90.1s / 90s, 308 spp, ~5.70% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\03_blobB.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png (320x320), auto-exposure=1.34e-14
+[time] 15.2s / 90s, 41 spp, ~15.62% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png (320x320), auto-exposure=1.49e-14
+[time] 30.6s / 90s, 83 spp, ~10.98% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png (320x320), auto-exposure=1.58e-14
+[time] 45.8s / 90s, 125 spp, ~8.94% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png (320x320), auto-exposure=1.64e-14
+[time] 61.2s / 90s, 167 spp, ~7.74% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png (320x320), auto-exposure=1.68e-14
+[time] 76.6s / 90s, 209 spp, ~6.92% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png (320x320), auto-exposure=1.69e-14
+[time] 90.2s / 90s, 245 spp, ~6.39% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\04_schwarzP.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png (320x320), auto-exposure=1.41e-14
+[time] 15.0s / 90s, 51 spp, ~14.00% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png (320x320), auto-exposure=1.56e-14
+[time] 30.4s / 90s, 104 spp, ~9.81% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png (320x320), auto-exposure=1.65e-14
+[time] 45.8s / 90s, 157 spp, ~7.98% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png (320x320), auto-exposure=1.69e-14
+[time] 60.8s / 90s, 210 spp, ~6.90% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png (320x320), auto-exposure=1.72e-14
+[time] 76.1s / 90s, 264 spp, ~6.15% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png (320x320), auto-exposure=1.74e-14
+[time] 90.2s / 90s, 314 spp, ~5.64% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\05_cluster.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\05_cluster.png (320x320), auto-exposure=1.76e-14
+[time] 15.0s / 90s, 374 spp, ~5.17% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\05_cluster.png (320x320), auto-exposure=1.84e-14
+[time] 30.2s / 90s, 758 spp, ~3.63% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\05_cluster.png (320x320), auto-exposure=1.85e-14
+[time] 32.6s / 90s, 818 spp, ~3.50% noise (noise target met)
+[noise] reached the ~3.5% target at 818 spp — image saved.
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\06_torusA.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png (320x320), auto-exposure=1.6e-14
+[time] 15.1s / 90s, 125 spp, ~8.94% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png (320x320), auto-exposure=1.7e-14
+[time] 30.2s / 90s, 245 spp, ~6.39% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png (320x320), auto-exposure=1.77e-14
+[time] 45.8s / 90s, 370 spp, ~5.20% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png (320x320), auto-exposure=1.8e-14
+[time] 60.9s / 90s, 492 spp, ~4.51% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png (320x320), auto-exposure=1.83e-14
+[time] 76.1s / 90s, 614 spp, ~4.04% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png (320x320), auto-exposure=1.84e-14
+[time] 90.0s / 90s, 730 spp, ~3.70% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\07_heart.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png (320x320), auto-exposure=1.22e-14
+[time] 15.1s / 90s, 25 spp, ~20.00% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png (320x320), auto-exposure=1.39e-14
+[time] 30.3s / 90s, 51 spp, ~14.00% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png (320x320), auto-exposure=1.48e-14
+[time] 45.7s / 90s, 77 spp, ~11.40% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png (320x320), auto-exposure=1.55e-14
+[time] 61.2s / 90s, 103 spp, ~9.85% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png (320x320), auto-exposure=1.59e-14
+[time] 77.0s / 90s, 129 spp, ~8.80% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png (320x320), auto-exposure=1.62e-14
+[time] 90.4s / 90s, 151 spp, ~8.14% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\08_genus2.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png (320x320), auto-exposure=1.47e-14
+[time] 15.2s / 90s, 69 spp, ~12.04% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png (320x320), auto-exposure=1.62e-14
+[time] 30.4s / 90s, 139 spp, ~8.48% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png (320x320), auto-exposure=1.69e-14
+[time] 45.6s / 90s, 207 spp, ~6.95% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png (320x320), auto-exposure=1.72e-14
+[time] 60.9s / 90s, 277 spp, ~6.01% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png (320x320), auto-exposure=1.76e-14
+[time] 76.1s / 90s, 346 spp, ~5.38% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png (320x320), auto-exposure=1.78e-14
+[time] 90.0s / 90s, 410 spp, ~4.94% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\09_star.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png (320x320), auto-exposure=1.47e-14
+[time] 15.2s / 90s, 69 spp, ~12.04% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png (320x320), auto-exposure=1.62e-14
+[time] 30.3s / 90s, 138 spp, ~8.51% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png (320x320), auto-exposure=1.69e-14
+[time] 45.5s / 90s, 207 spp, ~6.95% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png (320x320), auto-exposure=1.73e-14
+[time] 60.7s / 90s, 276 spp, ~6.02% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png (320x320), auto-exposure=1.76e-14
+[time] 75.7s / 90s, 345 spp, ~5.38% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png (320x320), auto-exposure=1.78e-14
+[time] 90.0s / 90s, 410 spp, ~4.94% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\10_metaballs.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\10_metaballs.png (320x320), auto-exposure=1.78e-14
+[time] 15.1s / 90s, 453 spp, ~4.70% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\10_metaballs.png (320x320), auto-exposure=1.84e-14
+[time] 27.1s / 90s, 817 spp, ~3.50% noise (noise target met)
+[noise] reached the ~3.5% target at 817 spp — image saved.
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\11_mech.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\11_mech.png (320x320), auto-exposure=1.84e-14
+[time] 15.1s / 90s, 716 spp, ~3.74% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\11_mech.png (320x320), auto-exposure=1.85e-14
+[time] 17.3s / 90s, 821 spp, ~3.49% noise (noise target met)
+[noise] reached the ~3.5% target at 821 spp — image saved.
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\12_torusB.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png (320x320), auto-exposure=1.65e-14
+[time] 15.0s / 90s, 159 spp, ~7.93% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png (320x320), auto-exposure=1.74e-14
+[time] 30.1s / 90s, 321 spp, ~5.58% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png (320x320), auto-exposure=1.79e-14
+[time] 45.2s / 90s, 481 spp, ~4.56% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png (320x320), auto-exposure=1.83e-14
+[time] 60.2s / 90s, 642 spp, ~3.95% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png (320x320), auto-exposure=1.85e-14
+[time] 75.3s / 90s, 804 spp, ~3.53% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png (320x320), auto-exposure=1.85e-14
+[time] 76.6s / 90s, 817 spp, ~3.50% noise (noise target met)
+[noise] reached the ~3.5% target at 817 spp — image saved.
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\13_diamond.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png (320x320), auto-exposure=1.58e-14
+[time] 15.1s / 90s, 113 spp, ~9.41% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png (320x320), auto-exposure=1.7e-14
+[time] 30.3s / 90s, 226 spp, ~6.65% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png (320x320), auto-exposure=1.75e-14
+[time] 45.4s / 90s, 338 spp, ~5.44% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png (320x320), auto-exposure=1.79e-14
+[time] 60.5s / 90s, 451 spp, ~4.71% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png (320x320), auto-exposure=1.81e-14
+[time] 75.6s / 90s, 564 spp, ~4.21% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png (320x320), auto-exposure=1.83e-14
+[time] 90.0s / 90s, 671 spp, ~3.86% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\14_noise.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png (320x320), auto-exposure=1.3e-14
+[time] 15.2s / 90s, 32 spp, ~17.68% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png (320x320), auto-exposure=1.45e-14
+[time] 30.4s / 90s, 64 spp, ~12.50% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png (320x320), auto-exposure=1.54e-14
+[time] 45.7s / 90s, 96 spp, ~10.21% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png (320x320), auto-exposure=1.6e-14
+[time] 61.0s / 90s, 128 spp, ~8.84% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png (320x320), auto-exposure=1.65e-14
+[time] 76.5s / 90s, 161 spp, ~7.88% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png (320x320), auto-exposure=1.68e-14
+[time] 90.2s / 90s, 190 spp, ~7.25% noise
+[ftsl] loaded scene from D:\visual studio projects\forward raytracer\scraps\iso_gallery\15_goursat.ftsl
+[selftest] equal-energy XYZ=(0.998,1.000,0.999) Y=1.000  linsRGB=(1.198,0.950,0.908)
+[device] gpu -> GPU: NVIDIA GeForce RTX 4090
+mode R: backward reference at 320x320 on GPU (light=bb6500) ...
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png (320x320), auto-exposure=1.42e-14
+[time] 15.2s / 90s, 58 spp, ~13.13% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png (320x320), auto-exposure=1.57e-14
+[time] 30.4s / 90s, 117 spp, ~9.25% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png (320x320), auto-exposure=1.64e-14
+[time] 45.6s / 90s, 176 spp, ~7.54% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png (320x320), auto-exposure=1.68e-14
+[time] 60.8s / 90s, 235 spp, ~6.52% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png (320x320), auto-exposure=1.72e-14
+[time] 76.0s / 90s, 293 spp, ~5.84% noise
+wrote D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png (320x320), auto-exposure=1.74e-14
+[time] 90.1s / 90s, 347 spp, ~5.37% noise
+[render] 01_gyroid  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\01_gyroid.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\01_gyroid.png
+[render] 02_blobA  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\02_blobA.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\02_blobA.png
+[render] 03_blobB  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\03_blobB.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\03_blobB.png
+[render] 04_schwarzP  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\04_schwarzP.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\04_schwarzP.png
+[render] 05_cluster  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\05_cluster.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\05_cluster.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\05_cluster.png
+[render] 06_torusA  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\06_torusA.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\06_torusA.png
+[render] 07_heart  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\07_heart.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\07_heart.png
+[render] 08_genus2  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\08_genus2.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\08_genus2.png
+[render] 09_star  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\09_star.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\09_star.png
+[render] 10_metaballs  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\10_metaballs.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\10_metaballs.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\10_metaballs.png
+[render] 11_mech  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\11_mech.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\11_mech.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\11_mech.png
+[render] 12_torusB  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\12_torusB.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\12_torusB.png
+[render] 13_diamond  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\13_diamond.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\13_diamond.png
+[render] 14_noise  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\14_noise.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\14_noise.png
+[render] 15_goursat  ->  D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png
+         D:\visual studio projects\forward raytracer\build_cuda\bin\ftrace.exe -in D:\visual studio projects\forward raytracer\scraps\iso_gallery\15_goursat.ftsl -device gpu -mode R -res 320 320 -noise 3.5 -time 90.0 -interval 15 -o D:\visual studio projects\forward raytracer\png\iso_gallery\15_goursat.png
+
+[grid] wrote D:\visual studio projects\forward raytracer\png\iso_gallery_grid.png  (1310x1414, 4x4)

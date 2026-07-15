@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <thread>
 #include <functional>
+#include <array>
 #include "scene.h"
 #include "camera.h"
 #include "color.h"
@@ -259,15 +260,33 @@ struct VtxScreen {
     Vec3   wpos, wn;
 };
 
-// Rasterize a single (already screen-projected) triangle into the frame + z-buffer.
-// Attributes are interpolated perspective-correctly via invd. Shading is deferred to
-// the caller-supplied `shade` lambda so both projection paths share the fill loop.
-template <class ShadeFn>
-inline void fillTriangle(const VtxScreen& A, const VtxScreen& B, const VtxScreen& C,
-                         int W, int H, int y0, int y1,
-                         std::vector<float>& zbuf, std::vector<Vec3>& accum,
-                         std::vector<uint8_t>& emisMask, bool triEmis,
-                         ShadeFn&& shade) {
+// A screen-space triangle: three projected vertices plus the shared per-triangle
+// attributes and a precomputed y-band [iy0,iy1] for O(1) band rejection. Produced once
+// by the project-once pass and consumed by the deferred rasterizer, so projection and
+// near-plane clipping happen a single time per triangle instead of once per thread.
+struct STri {
+    VtxScreen v0, v1, v2;
+    Vec3   color;
+    bool   emissive;
+    int    iy0, iy1;   // inclusive pixel-row span the triangle can touch
+};
+
+// Deferred G-buffer: per-pixel geometry captured during rasterization, shaded once in a
+// later pass (so overlapping triangles never shade the same covered pixel twice).
+struct GBuffer {
+    std::vector<float>   zbuf;    // 1/depth key (bigger = closer); 0 = background
+    std::vector<Vec3>    wpos;    // world position of the winning surface
+    std::vector<Vec3>    wn;      // world normal of the winning surface
+    std::vector<Vec3>    color;   // base albedo of the winning triangle
+    std::vector<uint8_t> emis;    // 1 where the winning triangle is an emitter
+};
+
+// Rasterize one screen-space triangle into the deferred G-buffer over rows [y0,y1).
+// Only geometry/albedo is stored here — shading is deferred to a single later pass so
+// each covered pixel is shaded exactly once regardless of overdraw. Attributes are
+// interpolated perspective-correctly via invd.
+inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& g) {
+    const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
     double maxx = std::ceil (std::max({A.sx, B.sx, C.sx}));
     double miny = std::floor(std::min({A.sy, B.sy, C.sy}));
@@ -278,24 +297,28 @@ inline void fillTriangle(const VtxScreen& A, const VtxScreen& B, const VtxScreen
     double area = (B.sx - A.sx) * (C.sy - A.sy) - (B.sy - A.sy) * (C.sx - A.sx);
     if (std::fabs(area) < 1e-9) return;
     double inv = 1.0 / area;
+    // Incremental barycentric edge functions: w0,w1 are affine in (x,y), so step them
+    // per pixel with adds instead of recomputing the full cross products each sample.
+    const double dw0dx = (C.sy - B.sy) * inv, dw0dy = (B.sx - C.sx) * inv;
+    const double dw1dx = (A.sy - C.sy) * inv, dw1dy = (C.sx - A.sx) * inv;
+    const uint8_t triEmis = t.emissive ? 1 : 0;
     for (int y = ylo; y <= yhi; ++y) {
-        double py = y + 0.5;
-        for (int x = xlo; x <= xhi; ++x) {
-            double px = x + 0.5;
-            double w0 = ((B.sx - px) * (C.sy - py) - (B.sy - py) * (C.sx - px)) * inv;
-            double w1 = ((C.sx - px) * (A.sy - py) - (C.sy - py) * (A.sx - px)) * inv;
+        double py = y + 0.5, pxL = xlo + 0.5;
+        double w0 = ((B.sx - pxL) * (C.sy - py) - (B.sy - py) * (C.sx - pxL)) * inv;
+        double w1 = ((C.sx - pxL) * (A.sy - py) - (C.sy - py) * (A.sx - pxL)) * inv;
+        size_t row = (size_t)y * W + xlo;
+        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
             double w2 = 1.0 - w0 - w1;
             if (w0 < 0 || w1 < 0 || w2 < 0) continue;
             double invd = w0 * A.invd + w1 * B.invd + w2 * C.invd;   // = 1/depth
-            size_t idx = (size_t)y * W + x;
-            if (invd <= zbuf[idx]) continue;   // farther than (or equal to) stored
-            zbuf[idx] = (float)invd;
-            emisMask[idx] = triEmis ? 1 : 0;   // emitters excluded from the auto-exposure anchor
+            if (invd <= g.zbuf[row]) continue;   // farther than (or equal to) stored
+            g.zbuf[row] = (float)invd;
+            g.emis[row] = triEmis;               // emitters excluded from the auto-exposure anchor
             // Perspective-correct attribute recovery.
             double d = 1.0 / std::max(invd, 1e-12);
-            Vec3 wpos = (A.wpos * (w0 * A.invd) + B.wpos * (w1 * B.invd) + C.wpos * (w2 * C.invd)) * d;
-            Vec3 wn   = (A.wn   * (w0 * A.invd) + B.wn   * (w1 * B.invd) + C.wn   * (w2 * C.invd)) * d;
-            accum[idx] = shade(wpos, wn);
+            g.wpos[row]  = (A.wpos * (w0 * A.invd) + B.wpos * (w1 * B.invd) + C.wpos * (w2 * C.invd)) * d;
+            g.wn[row]    = (A.wn   * (w0 * A.invd) + B.wn   * (w1 * B.invd) + C.wn   * (w2 * C.invd)) * d;
+            g.color[row] = t.color;
         }
     }
 }
@@ -354,56 +377,56 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
     const double EMIS_BOOST = 4.0;    // emitters read as bright light sources (clip to white)
     const Vec3 bg{0.06, 0.07, 0.09};                    // background tint (unlit, unexposed)
-    std::vector<float>  zbuf((size_t)W * H, 0.0f);      // z-buffer key = 1/depth (bigger=closer)
-    std::vector<Vec3>   accum((size_t)W * H, bg);       // raw linear shade (pre-exposure)
-    std::vector<uint8_t> emisMask((size_t)W * H, 0);    // 1 where an emitter was drawn
+    const size_t N = (size_t)W * H;
 
     const double zn = 1e-3;   // near plane (camera-forward) for rectilinear clipping
     const bool rect = (cam.projection == CAM_RECTILINEAR);
 
-    // Each band owns rows [y0,y1); it walks every triangle but only fills pixels in
-    // its own row range, so bands never touch the same z-buffer entry (no locking).
-    auto band = [&](int y0, int y1) {
-        for (const auto& t : tris) {
-            Vec3 col = t.color; bool emis = t.emissive;
-            auto shade = [&](const Vec3& wp, const Vec3& wn) -> Vec3 {
-                if (emis) return col * EMIS_BOOST;   // raw emitter radiance (exposed later)
-                Vec3 N = normalize(wn);
-                Vec3 V = normalize(cam.eye - wp);           // toward camera
-                if (dot(N, V) < 0.0) N = -N;                 // two-sided
-                // Sum diffuse contributions from every scene light, each from its own
-                // real direction (with distance falloff and spot cone shaping).
-                double lit = 0.0;
-                for (const auto& lp : light.lights) {
-                    Vec3 d = lp.pos - wp;
-                    double dist2 = dot(d, d);
-                    Vec3 Ld = (dist2 > 1e-12) ? d / std::sqrt(dist2) : V;
-                    double ndl = std::max(0.0, dot(N, Ld));
-                    if (ndl <= 0.0) continue;
-                    double atten = 1.0;
-                    if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
-                    double cone = 1.0;
-                    if (lp.spot) cone = spotFalloff(dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
-                    lit += lp.weight * ndl * atten * cone;
-                }
-                double head = std::max(0.0, dot(N, V));      // headlight fill
-                double k = light.ambient + light.keyScale * lit + light.fill * head;
-                // Raw linear shade; the p99 auto-exposure + gamma below (mirroring the
-                // real renderer's filmToRgb8) handle the tone map, so no local S-curve.
-                return col * k;
-            };
-            auto toCS = [&](const Vec3& P, const Vec3& N) -> VtxCS {
-                Vec3 d = P - cam.eye; VtxCS c;
-                c.x = dot(d, cam.u); c.y = dot(d, cam.v); c.z = dot(d, cam.w);
-                c.wpos = P; c.wn = N; return c;
-            };
+    if (nThreads < 1) nThreads = 1;
+
+    // Tiny parallel-for over [0,n): splits into nThreads contiguous chunks. Used by the
+    // shading + tone-map passes (each pixel is independent, so no locking needed).
+    auto parallelFor = [&](size_t n, const std::function<void(size_t, size_t)>& body) {
+        if (n == 0) return;
+        if (nThreads == 1) { body(0, n); return; }
+        std::vector<std::thread> pool;
+        size_t chunk = (n + nThreads - 1) / nThreads;
+        for (int ti = 0; ti < nThreads; ++ti) {
+            size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
+            if (a >= b) break;
+            pool.emplace_back(body, a, b);
+        }
+        for (auto& th : pool) th.join();
+    };
+
+    // -- Pass 1: project every triangle ONCE (parallel over the triangle list). Each
+    // thread clips + projects its slice into a local STri buffer; the buffers are then
+    // concatenated. This removes the old per-thread redundancy where every rasterizer
+    // band re-projected the entire scene (an nThreads-fold projection cost).
+    auto projectRange = [&](size_t a, size_t b, std::vector<STri>& out) {
+        auto toCS = [&](const Vec3& P, const Vec3& Nn) -> VtxCS {
+            Vec3 d = P - cam.eye; VtxCS c;
+            c.x = dot(d, cam.u); c.y = dot(d, cam.v); c.z = dot(d, cam.w);
+            c.wpos = P; c.wn = Nn; return c;
+        };
+        auto push = [&](const VtxScreen& s0, const VtxScreen& s1, const VtxScreen& s2,
+                        const Vec3& col, bool emis) {
+            double lo = std::min({s0.sy, s1.sy, s2.sy});
+            double hi = std::max({s0.sy, s1.sy, s2.sy});
+            int iy0 = std::max(0, (int)std::floor(lo));
+            int iy1 = std::min(H - 1, (int)std::ceil(hi));
+            if (iy0 > iy1) return;
+            out.push_back(STri{s0, s1, s2, col, emis, iy0, iy1});
+        };
+        for (size_t ti = a; ti < b; ++ti) {
+            const PTri& t = tris[ti];
             VtxCS cs[3] = { toCS(t.p0, t.n0), toCS(t.p1, t.n1), toCS(t.p2, t.n2) };
             if (rect) {
                 VtxCS poly[8]; int np = 0;
-                auto emit = [&](const VtxCS& a){ if (np < 8) poly[np++] = a; };
-                auto lerpV = [&](const VtxCS& a, const VtxCS& b, double s) -> VtxCS {
-                    VtxCS r; r.x=a.x+(b.x-a.x)*s; r.y=a.y+(b.y-a.y)*s; r.z=a.z+(b.z-a.z)*s;
-                    r.wpos=a.wpos+(b.wpos-a.wpos)*s; r.wn=a.wn+(b.wn-a.wn)*s; return r;
+                auto emit = [&](const VtxCS& a2){ if (np < 8) poly[np++] = a2; };
+                auto lerpV = [&](const VtxCS& a2, const VtxCS& b2, double s) -> VtxCS {
+                    VtxCS r; r.x=a2.x+(b2.x-a2.x)*s; r.y=a2.y+(b2.y-a2.y)*s; r.z=a2.z+(b2.z-a2.z)*s;
+                    r.wpos=a2.wpos+(b2.wpos-a2.wpos)*s; r.wn=a2.wn+(b2.wn-a2.wn)*s; return r;
                 };
                 for (int i = 0; i < 3; ++i) {
                     const VtxCS& A = cs[i]; const VtxCS& B = cs[(i+1)%3];
@@ -416,7 +439,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 for (int i = 1; i + 1 < np; ++i) {
                     VtxScreen sc1 = projectVtx(cam, poly[i], W, H);
                     VtxScreen sc2 = projectVtx(cam, poly[i+1], W, H);
-                    fillTriangle(sc0, sc1, sc2, W, H, y0, y1, zbuf, accum, emisMask, emis, shade);
+                    push(sc0, sc1, sc2, t.color, t.emissive);
                 }
             } else {
                 bool bad = false;
@@ -428,12 +451,49 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 VtxScreen sc0 = projectVtx(cam, cs[0], W, H);
                 VtxScreen sc1 = projectVtx(cam, cs[1], W, H);
                 VtxScreen sc2 = projectVtx(cam, cs[2], W, H);
-                fillTriangle(sc0, sc1, sc2, W, H, y0, y1, zbuf, accum, emisMask, emis, shade);
+                push(sc0, sc1, sc2, t.color, t.emissive);
             }
         }
     };
 
-    if (nThreads < 1) nThreads = 1;
+    std::vector<STri> stris;
+    {
+        int pT = std::min<int>(nThreads, std::max<size_t>(1, tris.size()));
+        if (pT <= 1) {
+            stris.reserve(tris.size());
+            projectRange(0, tris.size(), stris);
+        } else {
+            std::vector<std::vector<STri>> parts(pT);
+            std::vector<std::thread> pool;
+            size_t chunk = (tris.size() + pT - 1) / pT;
+            for (int ti = 0; ti < pT; ++ti) {
+                size_t a = (size_t)ti * chunk, b = std::min(tris.size(), a + chunk);
+                if (a >= b) break;
+                parts[ti].reserve((b - a));
+                pool.emplace_back([&, ti, a, b]{ projectRange(a, b, parts[ti]); });
+            }
+            for (auto& th : pool) th.join();
+            size_t tot = 0; for (auto& p : parts) tot += p.size();
+            stris.reserve(tot);
+            for (auto& p : parts) stris.insert(stris.end(), p.begin(), p.end());
+        }
+    }
+
+    // -- Pass 2: deferred G-buffer rasterization, parallel by horizontal row-bands. Each
+    // band owns rows [y0,y1) so bands never touch the same pixel (no locking). Triangles
+    // whose y-span misses the band are skipped in O(1) via the precomputed iy0/iy1.
+    GBuffer g;
+    g.zbuf.assign(N, 0.0f);
+    g.wpos.assign(N, Vec3{0,0,0});
+    g.wn.assign(N, Vec3{0,0,0});
+    g.color.assign(N, bg);
+    g.emis.assign(N, 0);
+    auto band = [&](int y0, int y1) {
+        for (const STri& s : stris) {
+            if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
+            fillTriangleG(s, W, H, y0, y1, g);
+        }
+    };
     if (nThreads == 1) {
         band(0, H);
     } else {
@@ -447,6 +507,36 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         for (auto& th : pool) th.join();
     }
 
+    // -- Pass 3: shade each covered pixel exactly once (parallel over pixels). Overlapping
+    // triangles no longer re-shade the same pixel — only the winning surface is shaded.
+    std::vector<Vec3> accum(N, bg);
+    parallelFor(N, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            if (g.zbuf[i] <= 0.0f) continue;         // background stays bg tint
+            const Vec3& col = g.color[i];
+            if (g.emis[i]) { accum[i] = col * EMIS_BOOST; continue; }  // raw emitter radiance
+            Vec3 N3 = normalize(g.wn[i]);
+            Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
+            if (dot(N3, V) < 0.0) N3 = -N3;              // two-sided
+            double lit = 0.0;
+            for (const auto& lp : light.lights) {
+                Vec3 d = lp.pos - g.wpos[i];
+                double dist2 = dot(d, d);
+                Vec3 Ld = (dist2 > 1e-12) ? d / std::sqrt(dist2) : V;
+                double ndl = std::max(0.0, dot(N3, Ld));
+                if (ndl <= 0.0) continue;
+                double atten = 1.0;
+                if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
+                double cone = 1.0;
+                if (lp.spot) cone = spotFalloff(dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
+                lit += lp.weight * ndl * atten * cone;
+            }
+            double head = std::max(0.0, dot(N3, V));     // headlight fill
+            double k = light.ambient + light.keyScale * lit + light.fill * head;
+            accum[i] = col * k;
+        }
+    });
+
     // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
     // lit surfaces to ~0.9. Background (unhit) pixels are excluded so an empty frame
     // margin can't skew the anchor; emitters are excluded too so the *subject* drives the
@@ -458,15 +548,18 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         if (lockAnchor && *lockAnchor > 0.0) {
             eAuto = *lockAnchor;                    // reuse the path's locked anchor
         } else {
-            std::vector<double> lum; lum.reserve(accum.size());
-            for (size_t i = 0; i < accum.size(); ++i) {
-                if (zbuf[i] <= 0.0f || emisMask[i]) continue;   // skip background + emitters
+            std::vector<double> lum; lum.reserve(N);
+            for (size_t i = 0; i < N; ++i) {
+                if (g.zbuf[i] <= 0.0f || g.emis[i]) continue;   // skip background + emitters
                 const Vec3& c = accum[i];
                 lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
             }
             if (!lum.empty()) {
-                std::sort(lum.begin(), lum.end());
-                double p99 = lum[(size_t)(0.99 * (lum.size() - 1))];
+                // Only the 99th-percentile order statistic matters, so partition instead
+                // of a full sort (O(n) vs O(n log n)).
+                size_t k = (size_t)(0.99 * (lum.size() - 1));
+                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
+                double p99 = lum[k];
                 eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
             }
             if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
@@ -474,15 +567,32 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     }
     const double finalExp = eAuto * expComp;
 
+    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
+    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
+    // [0,1] replaces three std::pow calls per pixel with a table read + round.
+    static const std::array<uint8_t, 4097> kSrgbLut = [] {
+        std::array<uint8_t, 4097> t{};
+        for (int i = 0; i <= 4096; ++i)
+            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
+        return t;
+    }();
+    auto encode = [&](double c) -> uint8_t {
+        if (c <= 0.0) return kSrgbLut[0];
+        if (c >= 1.0) return 255;
+        return kSrgbLut[(int)(c * 4096.0 + 0.5)];
+    };
+
     // Tone map: exposed hit pixels through sRGB gamma; background tint left unexposed.
-    std::vector<uint8_t> img((size_t)W * H * 3);
-    for (size_t i = 0; i < accum.size(); ++i) {
-        Vec3 c = accum[i];
-        if (zbuf[i] > 0.0f) c = c * finalExp;       // hit pixels get the exposure
-        img[i * 3 + 0] = (uint8_t)std::clamp(srgbGamma(std::max(0.0, c.x)) * 255.0 + 0.5, 0.0, 255.0);
-        img[i * 3 + 1] = (uint8_t)std::clamp(srgbGamma(std::max(0.0, c.y)) * 255.0 + 0.5, 0.0, 255.0);
-        img[i * 3 + 2] = (uint8_t)std::clamp(srgbGamma(std::max(0.0, c.z)) * 255.0 + 0.5, 0.0, 255.0);
-    }
+    std::vector<uint8_t> img(N * 3);
+    parallelFor(N, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            Vec3 c = accum[i];
+            if (g.zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
+            img[i * 3 + 0] = encode(c.x);
+            img[i * 3 + 1] = encode(c.y);
+            img[i * 3 + 2] = encode(c.z);
+        }
+    });
     return img;
 }
 

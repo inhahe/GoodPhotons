@@ -68,7 +68,8 @@
       <div class="row">
         <label>body size (bulb radius) <b id="vbs">0.55</b></label>
         <input id="bs" type="range" min="0.40" max="0.72" step="0.005" value="0.55">
-        <div class="desc">the round belly — bigger = fatter, more spherical bulb</div>
+        <div class="desc">the round belly — bigger = fatter bulb; the neck's loop scales
+          and stays attached with it (thickness stays independent below)</div>
       </div>
       <div class="row">
         <label>neck thickness (tube radius) <b id="vnt">0.110</b></label>
@@ -76,15 +77,17 @@
         <div class="desc">the thin part of the swept tube — independent of the body</div>
       </div>
       <div class="row">
-        <label>base flare (shoulder) <b id="vfl">0.260</b></label>
-        <input id="fl" type="range" min="0.11" max="0.42" step="0.005" value="0.260">
-        <div class="desc">how fat the neck starts where it leaves the belly, then tapers to the
-          neck thickness — set equal to the neck for a plain untapered tube</div>
+        <label>base flare (shoulder radius) <b id="vfl">0.340</b></label>
+        <input id="fl" type="range" min="0.11" max="0.50" step="0.005" value="0.340">
+        <div class="desc">how fat the neck swells where it leaves the belly, then tapers to the
+          neck thickness up the arc — a bigger flare plus a higher blend k below melts the join
+          into a smooth, borderless shoulder</div>
       </div>
       <div class="row">
-        <label>blend smoothness (k) <b id="vbk">0.020</b></label>
-        <input id="bk" type="range" min="0.005" max="0.08" step="0.005" value="0.020">
-        <div class="desc">how softly the neck fuses into the bulb</div>
+        <label>shoulder blend (melt) <b id="vbk">0.100</b></label>
+        <input id="bk" type="range" min="0.01" max="0.22" step="0.005" value="0.100">
+        <div class="desc">how wide the body↔neck junction melts together — higher dissolves the
+          shoulder into the belly so there's no visible border (the neck's own joints stay crisp)</div>
       </div>
     </div>
 
@@ -188,10 +191,10 @@ const NECK_CP = [                         // neck control points + shoulder weig
   [ 0.59,  0.57, 0.00, 0.00],
   [ 0.66,  0.37, 0.00, 0.00],
   [ 0.64,  0.17, 0.00, 0.00],
-  [ 0.55, -0.01, 0.00, 0.00],
-  [ 0.40, -0.14, 0.00, 0.00],
-  [ 0.22, -0.19, 0.00, 0.00],
-  [ 0.07, -0.12, 0.00, 0.00],
+  [ 0.55, -0.01, 0.00, 0.15],
+  [ 0.40, -0.14, 0.00, 0.42],
+  [ 0.22, -0.19, 0.00, 0.72],
+  [ 0.07, -0.12, 0.00, 0.95],
 ];
 // Uniform Catmull-Rom through the 4-vectors (position + weight), `sub` samples/segment.
 function catmullRom(pts, sub){
@@ -210,7 +213,7 @@ function catmullRom(pts, sub){
   out.push(P(n-1).slice());
   return out;
 }
-const NECK_SAMP = catmullRom(NECK_CP, 3);    // [x,y,z,w] per sample — the smooth centreline
+const NECK_SAMP = catmullRom(NECK_CP, 4);    // [x,y,z,w] per sample — the smooth centreline
 const bottleGLSL =
   'const int NS = ' + NECK_SAMP.length + ';\n' +
   'const vec3 BODY_C = vec3(' + BODY_C.map(v=>v.toFixed(3)).join(',') + ');\n' +
@@ -261,15 +264,23 @@ float sdRoundCone(vec3 p, vec3 a, vec3 b, float r1, float r2){
   if (sign(y)*a2*y2 < k) return sqrt(x2+y2)*il2 - r1;
   return (sqrt(x2*a2*il2) + y*rr)*il2 - r1;
 }
-float neckRadius(float w){ return mix(uNeckR, uFlareR, w); }   // taper: thin->flare by weight
+// taper: neck thickness (w=0) swelling to the flare radius (w=1) at the base. A generous
+// flare + a generous blend k below give a tangent, crease-free shoulder with no border.
+float neckRadius(float w){ return mix(uNeckR, uFlareR, w); }
+const float BS0 = 0.55;     // reference bulb radius the neck centreline was authored at
+const float NECK_K = 0.02;  // tight blend for the neck's own joints (keeps the tube crisp)
 float field_bottle(vec3 p){
-  float body = length(p - BODY_C) - uBodyR;          // the round bulb
+  float sc = uBodyR / BS0;                            // neck layout scales with the bulb
+  float body = length(p - BODY_C) - uBodyR;           // the round bulb
   float neck = 1e9;
-  for (int i=0;i<NS-1;i++)
-    neck = min(neck, sdRoundCone(p, SAMP[i].xyz, SAMP[i+1].xyz,
-                                 neckRadius(SAMP[i].w), neckRadius(SAMP[i+1].w)));
-  return -smin(body, neck, uBk);                      // interior (d<0) -> field>0
-}
+  for (int i=0;i<NS-1;i++){
+    vec3 a = BODY_C + (SAMP[i].xyz   - BODY_C) * sc;   // centreline tracks body size
+    vec3 b = BODY_C + (SAMP[i+1].xyz - BODY_C) * sc;
+    float seg = sdRoundCone(p, a, b, neckRadius(SAMP[i].w), neckRadius(SAMP[i+1].w));
+    neck = smin(neck, seg, NECK_K);                    // crease-free tube, no bulging
+  }
+  return -smin(body, neck, uBk);                       // WIDE shoulder blend melts the body<->neck
+}                                                      // border away; d<0 -> field>0
 
 // solid interior where field > 0 (ftrace's expr < 0 convention, negated)
 float field(vec3 p){
@@ -393,8 +404,9 @@ const MODEL_R    = { bottle:1.05, quartic:1.10 };   // default clip radius per m
 const MODEL_DESC = {
   bottle: "The iconic glassblower's Klein bottle: a round bulb whose neck rises from the top, "
         + "arcs over, stands clear of the body and dives back into the side. The bulb is one "
-        + "sphere and the neck is a smooth swept tube — body and neck sized independently, and "
-        + "it exports to a clean watertight mesh.",
+        + "sphere and the neck is a smooth swept tube, smooth-unioned so there are no facets; "
+        + "both ends flare into the belly. Neck thickness is an independent knob, but its loop "
+        + "scales with body size so it stays attached. Exports to a clean watertight mesh.",
   quartic: "Ian Stewart's quartic — exactly POV-Ray's classic klein.pov isosurface (a=2, b=1, "
         + "c=8, d=16). Mathematically a Klein bottle, but it renders as a smooth blob, never the "
         + "familiar bottle shape, no matter how you tune it.",
@@ -466,29 +478,38 @@ isosurface {
 }
 
 function snippetBottle(n){
-  const nr = w => n.nt + (n.fl - n.nt)*w;        // taper radius from shoulder weight
-  const rows = [];
-  rows.push(`        # round bulb`);
-  rows.push(`        sphere { center ${BODY_C[0].toFixed(2)} ${BODY_C[1].toFixed(2)} ${BODY_C[2].toFixed(2)}  radius ${n.bs.toFixed(3)} }`);
-  rows.push(`        # neck: tapering swept tube (spline-sampled round-cone chain)`);
-  for (const p of NECK_SAMP)                      // rounded joints at every sample
-    rows.push(`        sphere { center ${p[0].toFixed(3)} ${p[1].toFixed(3)} ${p[2].toFixed(2)}  radius ${nr(p[3]).toFixed(3)} }`);
-  for (let i=0;i<NECK_SAMP.length-1;i++){         // tapering frusta between samples
-    const a=NECK_SAMP[i], b=NECK_SAMP[i+1];
+  const sc = n.bs / 0.55;                         // neck centreline scales with the bulb
+  const scale = p => [ BODY_C[0] + (p[0]-BODY_C[0])*sc,
+                       BODY_C[1] + (p[1]-BODY_C[1])*sc,
+                       BODY_C[2] + (p[2]-BODY_C[2])*sc, p[3] ];
+  const SAMP = NECK_SAMP.map(scale);              // body-coupled samples
+  const nr = w => n.nt + (n.fl - n.nt)*w;        // taper: neck thickness -> flare radius at base
+  const neck = [];                                // neck primitives -> inner (tight) smooth_union
+  for (const p of SAMP)                           // rounded joints at every sample
+    neck.push(`            sphere { center ${p[0].toFixed(3)} ${p[1].toFixed(3)} ${p[2].toFixed(2)}  radius ${nr(p[3]).toFixed(3)} }`);
+  for (let i=0;i<SAMP.length-1;i++){              // tapering frusta between samples
+    const a=SAMP[i], b=SAMP[i+1];
     const dx=b[0]-a[0], dy=b[1]-a[1];
     const len=Math.hypot(dx,dy);
     if (len < 1e-5) continue;
     const mx=(a[0]+b[0])/2, my=(a[1]+b[1])/2;
     const deg=Math.atan2(-dx, dy)*180/Math.PI;    // orient local +y (bottom->top) along segment
-    rows.push(`        cone { radius ${nr(a[3]).toFixed(3)}  radius2 ${nr(b[3]).toFixed(3)}  height ${len.toFixed(3)}` +
+    neck.push(`            cone { radius ${nr(a[3]).toFixed(3)}  radius2 ${nr(b[3]).toFixed(3)}  height ${len.toFixed(3)}` +
               `  translate ${mx.toFixed(3)} ${my.toFixed(3)} 0  rotate 0 0 ${deg.toFixed(2)} }`);
   }
+  // Nested smooth_union: a WIDE outer blend (k ${n.bk}) melts the body<->neck shoulder so
+  // there's no border; the neck's own joints use a tight inner blend so the tube stays crisp.
   return `# Klein bottle — round bulb + tapering swept-tube neck (SDF; body, neck & flare independent)
 isosurface {
     material glass
     translate 0 1.05 0   scale 1.0   rotate 0 25 0
     smooth_union { k ${n.bk.toFixed(3)}
-${rows.join('\n')}
+        # round bulb
+        sphere { center ${BODY_C[0].toFixed(2)} ${BODY_C[1].toFixed(2)} ${BODY_C[2].toFixed(2)}  radius ${n.bs.toFixed(3)} }
+        # neck: tapering swept tube (spline-sampled round-cone chain, scaled with body)
+        smooth_union { k 0.020
+${neck.join('\n')}
+        }
     }
 }`;
 }
@@ -513,7 +534,7 @@ const kTet    = [[0,1,5,6],[0,1,2,6],[0,4,5,6],[0,4,7,6],[0,3,2,6],[0,3,7,6]];
 function makeSolid(n){
   if (n.model === 'bottle'){
     const smin = (a,b,k)=>{ const h=Math.max(0,Math.min(1,0.5+0.5*(b-a)/k)); return (b + (a-b)*h) - k*h*(1-h); };
-    const nr = w => n.nt + (n.fl - n.nt)*w;      // taper radius from shoulder weight
+    const nr = w => n.nt + (n.fl - n.nt)*w;      // taper: neck thickness -> flare radius at base
     const rcone = (px,py,pz,a,b,r1,r2)=>{        // iq round cone (matches the shader)
       const bx=b[0]-a[0], by=b[1]-a[1], bz=b[2]-a[2], l2=bx*bx+by*by+bz*bz;
       const rr=r1-r2, a2=l2-rr*rr, il2=1/l2;
@@ -526,14 +547,19 @@ function makeSolid(n){
       if (Math.sign(yv)*a2*y2 < k) return Math.sqrt(x2+y2)*il2 - r1;
       return (Math.sqrt(x2*a2*il2) + yv*rr)*il2 - r1;
     };
+    const sc = n.bs / 0.55;                        // neck centreline scales with the bulb
+    const S = p => [ BODY_C[0] + (p[0]-BODY_C[0])*sc,
+                     BODY_C[1] + (p[1]-BODY_C[1])*sc,
+                     BODY_C[2] + (p[2]-BODY_C[2])*sc, p[3] ];
+    const SAMP = NECK_SAMP.map(S);                 // body-coupled samples
     return (x,y,z)=>{
       let body = Math.hypot(x-BODY_C[0], y-BODY_C[1], z-BODY_C[2]) - n.bs;
       let neck = 1e9;
-      for (let i=0;i<NECK_SAMP.length-1;i++){
-        const a=NECK_SAMP[i], b=NECK_SAMP[i+1];
-        neck = Math.min(neck, rcone(x,y,z, a, b, nr(a[3]), nr(b[3])));
+      for (let i=0;i<SAMP.length-1;i++){
+        const a=SAMP[i], b=SAMP[i+1];
+        neck = smin(neck, rcone(x,y,z, a, b, nr(a[3]), nr(b[3])), 0.02);  // tight neck joints
       }
-      return -smin(body, neck, n.bk);
+      return -smin(body, neck, n.bk);                                     // wide shoulder melt
     };
   }
   return (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-n.a*y-n.b, bd=S+n.a*y-n.b;

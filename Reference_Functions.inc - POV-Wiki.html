@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<!-- saved from url=(0055)https://wiki.povray.org/content/Reference:Functions.inc -->
+<html class="client-js ve-available" lang="en" dir="ltr"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<title>Reference:Functions.inc - POV-Wiki</title>
+<script type="text/javascript" async="" src="./Reference_Functions.inc - POV-Wiki_files/js"></script><script>document.documentElement.className="client-js";RLCONF={"wgBreakFrames":!1,"wgSeparatorTransformTable":["",""],"wgDigitTransformTable":["",""],"wgDefaultDateFormat":"dmy","wgMonthNames":["","January","February","March","April","May","June","July","August","September","October","November","December"],"wgRequestId":"alSz-KKQpgUqtiOGqXxngQAAAAA","wgCSPNonce":!1,"wgCanonicalNamespace":"Reference","wgCanonicalSpecialPageName":!1,"wgNamespaceNumber":108,"wgPageName":"Reference:Functions.inc","wgTitle":"Functions.inc","wgCurRevisionId":8226,"wgRevisionId":8226,"wgArticleId":2260,"wgIsArticle":!0,"wgIsRedirect":!1,"wgAction":"view","wgUserName":null,"wgUserGroups":["*"],"wgCategories":["Include Files"],"wgPageContentLanguage":"en","wgPageContentModel":"wikitext","wgRelevantPageName":"Reference:Functions.inc","wgRelevantArticleId":2260,"wgIsProbablyEditable":!1,"wgRelevantPageIsProbablyEditable":!1,"wgRestrictionEdit":[],"wgRestrictionMove":[],"wgVisualEditor":{
+"pageLanguageCode":"en","pageLanguageDir":"ltr","pageVariantFallbacks":"en"},"wgEditSubmitButtonLabelPublish":!1};RLSTATE={"site.styles":"ready","noscript":"ready","user.styles":"ready","user":"ready","user.options":"loading","skins.vector.styles.legacy":"ready","mediawiki.toc.styles":"ready","ext.visualEditor.desktopArticleTarget.noscript":"ready"};RLPAGEMODULES=["site","mediawiki.page.startup","mediawiki.page.ready","mediawiki.toc","skins.vector.legacy.js","ext.MultiLinkAndIndex","ext.visualEditor.desktopArticleTarget.init","ext.visualEditor.targetLoader"];</script>
+<script>(RLQ=window.RLQ||[]).push(function(){mw.loader.implement("user.options@1hzgi",function($,jQuery,require,module){/*@nomin*/mw.user.tokens.set({"patrolToken":"+\\","watchToken":"+\\","csrfToken":"+\\"});
+});});</script>
+<link rel="stylesheet" href="./Reference_Functions.inc - POV-Wiki_files/load.php">
+<script async="" src="./Reference_Functions.inc - POV-Wiki_files/load(1).php"></script>
+<style>
+.mw-editfont-monospace{font-family:monospace,monospace}.mw-editfont-sans-serif{font-family:sans-serif}.mw-editfont-serif{font-family:serif} .mw-editfont-monospace,.mw-editfont-sans-serif,.mw-editfont-serif{font-size:13px; }.mw-editfont-monospace.oo-ui-textInputWidget,.mw-editfont-sans-serif.oo-ui-textInputWidget,.mw-editfont-serif.oo-ui-textInputWidget{font-size:inherit}.mw-editfont-monospace.oo-ui-textInputWidget > .oo-ui-inputWidget-input,.mw-editfont-sans-serif.oo-ui-textInputWidget > .oo-ui-inputWidget-input,.mw-editfont-serif.oo-ui-textInputWidget > .oo-ui-inputWidget-input{font-size:13px}.mw-editfont-monospace.oo-ui-textInputWidget > input.oo-ui-inputWidget-input,.mw-editfont-sans-serif.oo-ui-textInputWidget > input.oo-ui-inputWidget-input,.mw-editfont-serif.oo-ui-textInputWidget > input.oo-ui-inputWidget-input{min-height:32px}
+.ve-init-mw-progressBarWidget{height:1em;overflow:hidden;margin:0 25%}.ve-init-mw-progressBarWidget-bar{height:1em;width:0} .ve-init-mw-progressBarWidget{background-color:#fff;-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;height:0.875em;border:1px solid #36c;border-radius:0.875em;box-shadow:0 1px 1px rgba(0,0,0,0.15)}.ve-init-mw-progressBarWidget-bar{background-color:#36c;height:0.875em}
+@media screen {
+	.toctoggle{-moz-user-select:none;-webkit-user-select:none;-ms-user-select:none;user-select:none;font-size:94%}}</style><style>
+.ve-init-mw-tempWikitextEditorWidget{border:0;padding:0;color:inherit;line-height:1.5em;width:100%;-moz-tab-size:4;tab-size:4; }.ve-init-mw-tempWikitextEditorWidget:focus{outline:0;padding:0}.ve-init-mw-tempWikitextEditorWidget::selection{background:rgba(109,169,247,0.5); }</style><style>
+.ve-activated .ve-init-mw-desktopArticleTarget-editableContent #toc,.ve-activated #siteNotice,.ve-activated .mw-indicators,.ve-activated #t-print,.ve-activated #t-permalink,.ve-activated #p-coll-print_export,.ve-activated #t-cite,.ve-deactivating .ve-ui-surface,.ve-active .ve-init-mw-desktopArticleTarget-editableContent,.ve-active .ve-init-mw-tempWikitextEditorWidget{display:none} .ve-activating .ve-ui-surface{height:0;padding:0 !important; overflow:hidden} .ve-loading #content > :not(.ve-init-mw-desktopArticleTarget-loading-overlay), .ve-activated .ve-init-mw-desktopArticleTarget-uneditableContent{pointer-events:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;opacity:0.5}.ve-activated #firstHeading{ -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;pointer-events:auto;cursor:text}.ve-activated #firstHeading a{ pointer-events:none}.ve-activated #catlinks{cursor:pointer}.ve-activated #catlinks a{opacity:1}.ve-activated #content{position:relative} .ve-init-mw-desktopArticleTarget-loading-overlay{position:absolute;top:1.25em;left:0;right:0;z-index:1;margin-top:-0.5em}.ve-init-mw-desktopArticleTarget-toolbarPlaceholder{transition:height 250ms ease;height:0; } .oo-ui-element-hidden{display:none !important; }  .mw-editsection{ unicode-bidi:-moz-isolate;unicode-bidi:-webkit-isolate;unicode-bidi:isolate}.mw-editsection:before{content:'\200B'}.mw-editsection a{white-space:nowrap}.mw-editsection-divider{color:#54595d}  .ve-init-mw-desktopArticleTarget-toolbarPlaceholder{border-bottom:1px solid #c8ccd1;box-shadow:0 1px 1px 0 rgba(0,0,0,0.1)}.ve-init-mw-desktopArticleTarget-toolbarPlaceholder-open{height:42px} .ve-init-mw-desktopArticleTarget-toolbar,.ve-init-mw-desktopArticleTarget-toolbarPlaceholder{font-size:0.875em; margin:-1.14em -1.14em 1.14em -1.14em; }@media screen and (min-width:982px){ .skin-vector-legacy .ve-init-mw-desktopArticleTarget-toolbar,.skin-vector-legacy .ve-init-mw-desktopArticleTarget-toolbarPlaceholder{ margin:-1.43em -1.71em 1.43em -1.71em}}</style><meta name="ResourceLoaderDynamicStyles" content="">
+<link rel="stylesheet" href="./Reference_Functions.inc - POV-Wiki_files/load(2).php">
+<meta name="generator" content="MediaWiki 1.35.1">
+<link rel="shortcut icon" href="https://wiki.povray.org/favicon.ico">
+<link rel="search" type="application/opensearchdescription+xml" href="https://wiki.povray.org/opensearch_desc.php" title="POV-Wiki (en)">
+<link rel="EditURI" type="application/rsd+xml" href="https://wiki.povray.org/api.php?action=rsd">
+<link rel="license" href="https://wiki.povray.org/content/wiki.povray.org:Copyrights">
+<link rel="alternate" type="application/atom+xml" title="POV-Wiki Atom feed" href="https://wiki.povray.org/content?title=Special:RecentChanges&amp;feed=atom">
+<!--[if lt IE 9]><script src="/resources/lib/html5shiv/html5shiv.js"></script><![endif]-->
+</head>
+<body class="mediawiki ltr sitedir-ltr mw-hide-empty-elt ns-108 ns-subject page-Reference_Functions_inc rootpage-Reference_Functions_inc skin-vector action-view skin-vector-legacy">
+<div id="mw-page-base" class="noprint"></div>
+<div id="mw-head-base" class="noprint"></div>
+<div id="content" class="mw-body" role="main">
+	<a id="top"></a>
+	<div id="siteNotice" class="mw-body-content"></div>
+	<div class="mw-indicators mw-body-content">
+	</div>
+	<h1 id="firstHeading" class="firstHeading" lang="en">Reference:Functions.inc</h1>
+	<div id="bodyContent" class="mw-body-content">
+		<div id="siteSub" class="noprint">From POV-Wiki</div>
+		<div id="contentSub"></div>
+		<div id="contentSub2"></div>
+		
+		<div id="jump-to-nav"></div>
+		<a class="mw-jump-link" href="https://wiki.povray.org/content/Reference:Functions.inc#mw-head">Jump to navigation</a>
+		<a class="mw-jump-link" href="https://wiki.povray.org/content/Reference:Functions.inc#searchInput">Jump to search</a>
+		<div id="mw-content-text" lang="en" dir="ltr" class="mw-content-ltr"><div class="mw-parser-output"><div id="Index_Entry_internal_functions.inc"></div>
+<p>
+This include file contains interfaces to internal functions as well as several predefined functions. The ID's used to access the internal
+functions through calls to <em>internal(XX)</em>, are not guaranteed to stay the same between POV-Ray versions, so users are encouraged to
+use the functions declared here.
+</p>
+<p>
+The number of required parameters and what they control are also given in the include file, this chapter gives more information. For starter
+values of the parameters, see the <code>~scenes/incdemo/i_internal.pov</code> demo file.
+</p>
+<p>Syntax to be used:</p>
+<pre>#include "functions.inc"
+isosurface {
+  function { f_torus_gumdrop(x,y,z, P0) }
+  ...
+  }
+
+pigment {
+  function { f_cross_ellipsoids(x,y,z, P0, P1, P2, P3) }
+  COLOR_MAP ...
+  }
+</pre>
+<p>Some special parameters are found in several of these functions. These are described in the next section and later referred to as
+<em>Cross section type</em>, <em>Field Strength</em>, <em>Field Limit</em>, <em>SOR</em> parameters.</p>
+<div id="toc" class="toc" role="navigation" aria-labelledby="mw-toc-heading"><input type="checkbox" role="button" id="toctogglecheckbox" class="toctogglecheckbox" style="display:none"><div class="toctitle" lang="en" dir="ltr"><h2 id="mw-toc-heading">Contents</h2><span class="toctogglespan"><label class="toctogglelabel" for="toctogglecheckbox"></label></span></div>
+<ul>
+<li class="toclevel-1 tocsection-1"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Common_Parameters"><span class="tocnumber">1</span> <span class="toctext">Common Parameters</span></a>
+<ul>
+<li class="toclevel-2 tocsection-2"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Cross_Section_Type"><span class="tocnumber">1.1</span> <span class="toctext">Cross Section Type</span></a></li>
+<li class="toclevel-2 tocsection-3"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength"><span class="tocnumber">1.2</span> <span class="toctext">Field Strength</span></a></li>
+<li class="toclevel-2 tocsection-4"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Limit"><span class="tocnumber">1.3</span> <span class="toctext">Field Limit</span></a></li>
+<li class="toclevel-2 tocsection-5"><a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch"><span class="tocnumber">1.4</span> <span class="toctext">SOR Switch</span></a></li>
+<li class="toclevel-2 tocsection-6"><a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset"><span class="tocnumber">1.5</span> <span class="toctext">SOR Offset</span></a></li>
+<li class="toclevel-2 tocsection-7"><a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle"><span class="tocnumber">1.6</span> <span class="toctext">SOR Angle</span></a></li>
+<li class="toclevel-2 tocsection-8"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Invert_Isosurface"><span class="tocnumber">1.7</span> <span class="toctext">Invert Isosurface</span></a></li>
+</ul>
+</li>
+<li class="toclevel-1 tocsection-9"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Internal_Functions"><span class="tocnumber">2</span> <span class="toctext">Internal Functions</span></a></li>
+<li class="toclevel-1 tocsection-10"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Pre_defined_functions"><span class="tocnumber">3</span> <span class="toctext">Pre defined functions</span></a>
+<ul>
+<li class="toclevel-2 tocsection-11"><a href="https://wiki.povray.org/content/Reference:Functions.inc#Pattern_functions"><span class="tocnumber">3.1</span> <span class="toctext">Pattern functions</span></a></li>
+</ul>
+</li>
+</ul>
+</div>
+
+<h4><span class="mw-headline" id="Common_Parameters">Common Parameters</span></h4>
+<h5><span class="mw-headline" id="Cross_Section_Type">Cross Section Type</span></h5>
+<div id="Index_Entry_include_files_Cross_Section_Type"></div>
+<p>In the helixes and spiral functions, the 9th parameter is the cross section type.</p>
+<p>Some shapes are:</p>
+<ul>
+<li><code>0</code>: square</li>
+<li><code>0.0 to 1.0</code>: rounded squares</li>
+<li><code>1</code>: circle</li>
+<li><code>1.0 to 2.0</code>: rounded diamonds</li>
+<li><code>2</code>: diamond</li>
+<li><code>2.0 to 3.0</code>: partially concave diamonds</li>
+<li><code>3</code>: concave diamond</li>
+</ul>
+<h5><span class="mw-headline" id="Field_Strength">Field Strength</span></h5>
+<p>The numerical value at a point in space generated by the function is multiplied by the Field Strength. The set of points where the
+function evaluates to zero are unaffected by any positive value of this parameter, so if you are just using the function on its own with
+threshold = 0, the generated surface is still the same.</p>
+<p>In some cases, the field strength has a considerable effect on the speed and accuracy of rendering the surface. In general, increasing
+the field strength speeds up the rendering, but if you set the value too high the surface starts to break up and may disappear
+completely.</p>
+<p>Setting the field strength to a negative value produces the inverse of the surface, like making the function negative.</p>
+<h5><span class="mw-headline" id="Field_Limit">Field Limit</span></h5>
+<p>This will not make any difference to the generated surface if you are using threshold that is within the field limit (and will kill the
+surface completely if the threshold is greater than the field limit). However, it may make a huge difference to the rendering times.</p>
+<p>If you use the function to generate a pigment, then all points that are a long way from the surface will have the same color, the color
+that corresponds to the numerical value of the field limit.</p>
+<h5><span class="mw-headline" id="SOR_Switch">SOR Switch</span></h5>
+<p>If greater than zero, the curve is swept out as a surface of revolution (SOR). If the value is zero or negative, the curve is extruded
+linearly in the Z direction.</p>
+<h5><span class="mw-headline" id="SOR_Offset">SOR Offset</span></h5>
+<p>If the SOR switch is on, then the curve is shifted this distance in the X direction before being swept out.</p>
+<h5><span class="mw-headline" id="SOR_Angle">SOR Angle</span></h5>
+<p>If the SOR switch is on, then the curve is rotated this number of degrees about the Z axis before being swept out.</p>
+<h5><span class="mw-headline" id="Invert_Isosurface">Invert Isosurface</span></h5>
+<p>Sometimes, when you render a surface, you may find that you get only the shape of the container. This could be caused by the fact that
+some of the build in functions are defined inside out.</p>
+<p>We can invert the isosurface by negating the whole function: <code>-(function) - threshold</code></p>
+<h4><span class="mw-headline" id="Internal_Functions">Internal Functions</span></h4>
+<p>Here is a list of the internal functions in the order they appear in the <em>functions.inc</em> include file</p>
+<div id="Index_Entry_include_files_f_algbr_cyl1"></div>
+<p><code>f_algbr_cyl1(x,y,z, P0, P1, P2, P3, P4)</code>: An algebraic cylinder is what you get if you take any 2d curve and plot it in 3d.
+The 2d curve is simply extruded along the third axis, in this case the z axis. With the SOR Switch switched on, the figure-of-eight curve
+will be rotated around the Y axis instead of being extruded along the Z axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a></li>
+<li><code>P1</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Limit" title="Reference:Functions.inc">Field Limit</a></li>
+<li><code>P2</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_algbr_cyl2"></div>  
+<p><code>f_algbr_cyl2(x,y,z, P0, P1, P2, P3, P4)</code>: An algebraic cylinder is what you 
+get if you take any 2d curve and plot it in 3d.
+The 2d curve is simply extruded along the third axis, in this case the z axis.With the SOR Switch switched on, the cross section curve will
+be rotated around the Y axis instead of being extruded along the Z axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Limit" title="Reference:Functions.inc">Field Limit</a></li>
+<li><code>P2</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_algbr_cyl3"></div>
+<p><code>f_algbr_cyl3(x,y,z, P0, P1, P2, P3, P4)</code>: An algebraic cylinder is what you get
+if you take any 2d curve and plot it in 3d. The 2d curve
+is simply extruded along the third axis, in this case the Z axis. With the SOR Switch switched on, the cross section curve will be rotated
+around the Y axis instead of being extruded along the Z axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Limit" title="Reference:Functions.inc">Field Limit</a></li>
+<li><code>P2</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_algbr_cyl4"></div>
+<p><code>f_algbr_cyl4(x,y,z, P0, P1, P2, P3, P4)</code>: An algebraic cylinder is what you get
+if you take any 2d curve and plot it in 3d. The 2d curve
+is simply extruded along the third axis, in this case the z axis. With the SOR Switch switched on, the cross section curve will be rotated
+around the Y axis instead of being extruded along the Z axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Limit" title="Reference:Functions.inc">Field Limit</a></li>
+<li><code>P2</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_bicorn"></div>
+<p><code>f_bicorn(x,y,z, P0, P1)</code>: The surface is a surface of revolution.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Scale. The mathematics of this surface suggest that the shape should be different
+for different values of this parameter. In practice the difference in shape is hard to spot.
+Setting the scale to 3 gives a surface with a radius of about 1 unit</li>
+</ul>
+<div id="Index_Entry_include_files_f_bifolia"></div>
+<p><code>f_bifolia(x,y,z, P0, P1)</code>: The bifolia surface looks something like the top part of
+a a paraboloid bounded below by another paraboloid.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Scale. The surface is always the same shape. Changing this parameter has the
+same effect as adding a scale modifier. Setting the scale to 1 gives a surface with a radius
+of about 1 unit</li>
+</ul>
+<div id="Index_Entry_include_files_f_blob"></div>
+<p><code>f_blob(x,y,z, P0, P1, P2, P3, P4)</code>: This function generates blobs that are
+similar to a CSG blob with two spherical components. This function only seems to work
+with negative threshold settings.</p>
+<ul>
+<li><code>P0</code>&nbsp;: X distance between the two components</li>
+<li><code>P1</code>&nbsp;: Blob strength of component 1</li>
+<li><code>P2</code>&nbsp;: Inverse blob radius of component 1</li>
+<li><code>P3</code>&nbsp;: Blob strength of component 2</li>
+<li><code>P4</code>&nbsp;: Inverse blob radius of component 2</li>
+</ul>
+<div id="Index_Entry_include_files_f_blob2"></div>
+<p><code>f_blob2(x,y,z, P0, P1, P2, P3)</code>: The surface is similar to a CSG blob
+with two spherical components.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Separation. One blob component is at the origin, and the other is this distance away on the X axis</li>
+<li><code>P1</code>&nbsp;: Inverse size. Increase this to decrease the size of the surface</li>
+<li><code>P2</code>&nbsp;: Blob strength</li>
+<li><code>P3</code>&nbsp;: Threshold. Setting this parameter to 1 and the threshold to zero has exactly the same effect as setting this parameter to zero and the threshold to -1</li>
+</ul>
+<div id="Index_Entry_include_files_f_boy_surface"></div>
+<p><code>f_boy_surface(x,y,z, P0, P1)</code>: For this surface, it helps if the field strength
+is set low, otherwise the surface has a tendency to break up or disappear entirely. This has
+the side effect of making the rendering times extremely long.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Scale. The surface is always the same shape. Changing this parameter has the
+same effect as adding a scale modifier</li>
+</ul>
+<div id="Index_Entry_include_files_f_comma"></div>
+<p><code>f_comma(x,y,z, P0)</code>: The <em>comma</em> surface is very much like a comma-shape.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Scale</li></ul>
+<div id="Index_Entry_include_files_f_cross_ellipsoids"></div>
+<p><code>f_cross_ellipsoids(x,y,z, P0, P1, P2, P3)</code>: The <em>cross ellipsoids</em> surface is
+like the union of three crossed ellipsoids, one oriented along each axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Eccentricity. When less than 1, the ellipsoids are oblate, when greater than 1 the
+ellipsoids are prolate, when zero the ellipsoids are spherical (and hence the whole surface is a sphere)</li>
+<li><code>P1</code>&nbsp;: Inverse size. Increase this to decrease the size of the surface</li>
+<li><code>P2</code>&nbsp;: Diameter. Increase this to increase the size of the ellipsoids</li>
+<li><code>P3</code>&nbsp;: Threshold. Setting this parameter to 1 and the threshold to zero has exactly the same
+effect as setting this parameter to zero and the threshold to -1</li>
+</ul>
+<div id="Index_Entry_include_files_f_crossed_trough"></div>
+<p><code>f_crossed_trough(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_cubic_saddle"></div>
+<p><code>f_cubic_saddle(x,y,z, P0)</code>: For this surface, it helps if the field strength is set quite low, otherwise the surface has a
+tendency to break up or disappear entirely.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_cushion"></div>
+<p><code>f_cushion(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_devils_curve"></div>
+<p><code>f_devils_curve(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Field Strength (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_devils_curve_2d"></div>
+<p><code>f_devils_curve_2d(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The <code>f_devils_curve_2d</code> curve can be
+extruded along the z axis, or using the SOR parameters it can be made into a surface of revolution.
+The X and Y factors control the size of the central feature.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: X factor</li>
+<li><code>P2</code>&nbsp;: Y factor</li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_dupin_cyclid"></div>
+<p><code>f_dupin_cyclid(x,y,z, P0, P1, P2, P3, P4, P5)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Major radius of torus</li>
+<li><code>P2</code>&nbsp;: Minor radius of torus</li>
+<li><code>P3</code>&nbsp;: X displacement of torus</li>
+<li><code>P4</code>&nbsp;: Y displacement of torus</li>
+<li><code>P5</code>&nbsp;: Radius of inversion</li>
+</ul>
+<div id="Index_Entry_include_files_f_ellipsoid"></div>
+<p><code>f_ellipsoid(x,y,z, P0, P1, P2)</code>: <code>f_ellipsoid</code> generates spheres and ellipsoids. Needs <code>threshold 1</code>.
+Setting these scaling parameters to 1/n gives exactly the same effect as performing a scale operation to increase the scaling by <em>n</em>
+in the corresponding direction.</p>
+<ul>
+<li><code>P0</code>&nbsp;: X scale (inverse)</li>
+<li><code>P1</code>&nbsp;: Y scale (inverse)</li>
+<li><code>P2</code>&nbsp;: Z scale (inverse)</li>
+</ul>
+<div id="Index_Entry_include_files_f_enneper"></div>
+<p><code>f_enneper(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_flange_cover"></div>
+<p><code>f_flange_cover(x,y,z, P0, P1, P2, P3)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Spikiness. Set this to very low values to increase the spikes. Set it to 1 and you get a sphere</li>
+<li><code>P1</code>&nbsp;: Inverse size. Increase this to decrease the size of the surface. (The other parameters
+also drastically affect the size, but this parameter has no other effects)</li>
+<li><code>P2</code>&nbsp;: Flange. Increase this to increase the flanges that appear between the spikes. Set it to 1 for no flanges</li>
+<li><code>P3</code>&nbsp;: Threshold. Setting this parameter to 1 and the threshold to zero has exactly the
+same effect as setting this parameter to zero and the threshold to -1</li>
+</ul>
+<div id="Index_Entry_include_files_f_folium_surface"></div>
+<p><code>f_folium_surface(x,y,z, P0, P1, P2)</code>: A <em>folium surface</em> looks something like a paraboloid glued to a plane.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Neck width factor - the larger you set this, the narrower the neck where the
+paraboloid meets the plane</li>
+<li><code>P2</code>&nbsp;: Divergence - the higher you set this value, the wider the paraboloid gets</li>
+</ul>
+<div id="Index_Entry_include_files_f_folium_surface_2d"></div>
+<p><code>f_folium_surface_2d(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The <code>f_folium_surface_2d</code> curve can be
+rotated around the X axis to generate the same 3d surface as the <code>f_folium_surface</code>, or it can be extruded 
+in the Z direction (by switching the SOR switch off) </p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Neck width factor - same as the 3d surface if you are revolving it around the Y axis</li>
+<li><code>P2</code>&nbsp;: Divergence - same as the 3d surface if you are revolving it around the Y axis</li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_glob"></div>
+<p><code>f_glob(x,y,z, P0)</code>: One part of this surface would actually go off to
+infinity if it were not restricted by the contained_by shape.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_heart"></div>
+<p><code>f_heart(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_helical_torus"></div>
+<p><code>f_helical_torus(x,y,z, P0, P1, P2, P3, P4, P5, P6, P7, P8, P9)</code>: With some sets of parameters, it looks like a torus with a
+helical winding around it. The
+winding optionally has grooves around the outside.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Major radius</li>
+<li><code>P1</code>&nbsp;: Number of winding loops</li>
+<li><code>P2</code>&nbsp;: Twistiness of winding. When zero, each winding loop is separate. When set to one,
+each loop twists into the next one. When set to two, each loop twists into the one after next</li>
+<li><code>P3</code>&nbsp;: Fatness of winding?</li>
+<li><code>P4</code>&nbsp;: Threshold. Setting this parameter to 1 and the threshold to zero has s similar effect
+as setting this parameter to zero and the threshold to 1</li>
+<li><code>P5</code>&nbsp;: Negative minor radius? Reducing this parameter increases the minor radius of the
+central torus. Increasing it can make the torus disappear and be replaced by a vertical column.
+The value at which the surface switches from one form to the other depends on several other parameters</li>
+<li><code>P6</code>&nbsp;: Another fatness of winding control?</li>
+<li><code>P7</code>&nbsp;: Groove period. Increase this for more grooves</li>
+<li><code>P8</code>&nbsp;: Groove amplitude. Increase this for deeper grooves</li>
+<li><code>P9</code>&nbsp;: Groove phase. Set this to zero for symmetrical grooves</li>
+</ul>
+<div id="Index_Entry_include_files_f_helix1"></div>
+<p><code>f_helix1(x,y,z, P0, P1, P2, P3, P4, P5, P6)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Number of helixes - e.g. 2 for a double helix</li>
+<li><code>P1</code>&nbsp;: Period - is related to the number of turns per unit length</li>
+<li><code>P2</code>&nbsp;: Minor radius (major radius &gt; minor radius)</li>
+<li><code>P3</code>&nbsp;: Major radius</li>
+<li><code>P4</code>&nbsp;: Shape parameter. If this is greater than 1 then the tube becomes fatter in the y direction</li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Cross_Section_Type" title="Reference:Functions.inc">Cross section type</a></li>
+<li><code>P6</code>&nbsp;: Cross section rotation angle (degrees)</li>
+</ul>
+<div id="Index_Entry_include_files_f_helix2"></div>
+<p><code>f_helix2(x,y,z, P0, P1, P2, P3, P4, P5, P6)</code>: Needs a negated function</p>
+<ul>
+<li><code>P0</code>&nbsp;: Not used</li>
+<li><code>P1</code>&nbsp;: Period - is related to the number of turns per unit length</li>
+<li><code>P2</code>&nbsp;: Minor radius (minor radius &gt; major radius)</li>
+<li><code>P3</code>&nbsp;: Major radius</li>
+<li><code>P4</code>&nbsp;: Not used</li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Cross_Section_Type" title="Reference:Functions.inc">Cross section type</a></li>
+<li><code>P6</code>&nbsp;: Cross section rotation angle (degrees)</li>
+</ul>
+<div id="Index_Entry_include_files_f_hex_x"></div>
+<p><code>f_hex_x(x,y,z, P0)</code>: This creates a grid of hexagonal cylinders stretching along 
+the z-axis. The fatness is controlled
+by the threshold value. When this value equals 0.8660254 or cos(30) the sides will touch, because
+this is the distance between centers. Negating the function will inverse the surface and create a
+honey-comb structure. This function is also useful as pigment function.</p>
+<ul>
+<li><code>P0</code>&nbsp;: No effect (but the syntax requires at least one parameter)</li>
+</ul>
+<div id="Index_Entry_include_files_f_hex_y"></div>
+<p><code>f_hex_y(x,y,z, P0)</code>: This is function forms a lattice of infinite boxes 
+stretching along the z-axis. The fatness is
+controlled by the threshold value. These boxes are rotated 60 degrees around centers, which
+are 0.8660254 or cos(30) away from each other. This function is also useful as pigment function.</p>
+<ul>
+<li><code>P0</code>&nbsp;: No effect (but the syntax requires at least one parameter)</li>
+</ul>
+<div id="Index_Entry_include_files_f_hetero_mf"></div>
+<p><code>f_hetero_mf(x,y,z, P0, P1, P2, P3, P4, P5)</code>: <code>f_hetero_mf (x,0,z)</code> makes multifractal height fields and patterns
+of <em>1/f</em> noise. <em>Multifractal</em> refers to their characteristic of having a fractal dimension which varies with
+altitude. Built from summing noise of a number of frequencies, the hetero_mf parameters determine how many, and which frequencies are to be
+summed. An advantage to using these instead of a height_field {} from an image (a number of height field programs output multifractal types
+of images) is that the hetero_mf function domain extends arbitrarily far in the x and z directions so huge landscapes can be made without
+losing resolution or having to tile a height field. Other functions of interest are <code>f_ridged_mf</code> and <code>f_ridge</code>.</p>
+<ul>
+<li><code>P0</code>&nbsp;: H is the negative of the exponent of the basic noise frequencies used in building these functions (each frequency
+<em>f's</em> amplitude is weighted by the factor <em>f - H</em> ). In landscapes, and many natural forms, the amplitude of high frequency
+contributions are usually less than the lower frequencies. When H is 1, the fractalization is relatively smooth (<em>1/f noise</em>). As H
+nears 0, the high frequencies contribute equally with low frequencies as in <em>white noise</em>.</li>
+<li><code>P1</code>&nbsp;: <em>Lacunarity</em> is the multiplier used to get from one <em>octave</em> to the next. This parameter affects the
+size of the frequency gaps in the pattern. Make this greater than 1.0</li>
+<li><code>P2</code>&nbsp;: Octaves is the number of different frequencies added to the fractal. Each <em>Octave</em> frequency is the previous
+one multiplied by <em>Lacunarity</em>, so that using a large number of octaves can get into very high frequencies very quickly.</li>
+<li><code>P3</code>&nbsp;: Offset is the <em>base altitude</em> (sea level) used for the heterogeneous scaling</li>
+<li><code>P4</code>&nbsp;: T scales the <em>heterogeneity</em> of the fractal. T=0 gives <em>straight 1/f</em> (no heterogeneous
+scaling). T=1 suppresses higher frequencies at lower altitudes</li>
+<li><code>P5</code>&nbsp;: Generator type used to generate the noise3d. 0, 1, 2 and 3 are legal values.</li>
+</ul>
+<div id="Index_Entry_include_files_f_hunt_surface"></div>
+<p><code>f_hunt_surface(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_hyperbolic_torus"></div>
+<p><code>f_hyperbolic_torus(x,y,z, P0, P1, P2)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Major radius: separation between the centers of the tubes at the closest point</li>
+<li><code>P2</code>&nbsp;: Minor radius: thickness of the tubes at the closest point</li>
+</ul>
+<div id="Index_Entry_include_files_f_isect_ellipsoids"></div>
+<p><code>f_isect_ellipsoids(x,y,z, P0, P1, P2, P3)</code>: The <em>isect ellipsoids</em> surface is like the
+intersection of three crossed ellipsoids, one oriented along each axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Eccentricity. When less than 1, the ellipsoids are oblate, when greater than 1 the
+ellipsoids are prolate, when zero the ellipsoids are spherical (and hence the whole surface is a sphere)</li>
+<li><code>P1</code>&nbsp;: Inverse size. Increase this to decrease the size of the surface</li>
+<li><code>P2</code>&nbsp;: Diameter. Increase this to increase the size of the ellipsoids</li>
+<li><code>P3</code>&nbsp;: Threshold. Setting this parameter to 1 and the threshold to zero has exactly
+the same effect as setting this parameter to zero and the threshold to -1</li>
+</ul>
+<div id="Index_Entry_include_files_f_kampyle_of_eudoxus"></div>
+<p><code>f_kampyle_of_eudoxus(x,y,z, P0, P1, P2)</code>: The <em>kampyle of eudoxus</em> is like two infinite planes with a dimple at the
+center.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Dimple: When zero, the two dimples punch right through and meet at the center.
+Non-zero values give less dimpling</li>
+<li><code>P2</code>&nbsp;: Closeness: Higher values make the two planes become closer</li>
+</ul>
+<div id="Index_Entry_include_files_f_kampyle_of_eudoxus_2d"></div>
+<p><code>f_kampyle_of_eudoxus_2d(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The 2d curve that generates the above surface can be extruded in the
+Z direction or rotated about various axes by using the SOR parameters.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Dimple: When zero, the two dimples punch right through and meet at the center.
+Non-zero values give less dimpling</li>
+<li><code>P2</code>&nbsp;: Closeness: Higher values make the two planes become closer</li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_klein_bottle"></div>
+<p><code>f_klein_bottle(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_kummer_surface_v1"></div>
+<p><code>f_kummer_surface_v1(x,y,z, P0)</code>: The Kummer surface consists of a collection of radiating rods.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_kummer_surface_v2"></div>
+<p><code>f_kummer_surface_v2(x,y,z, P0, P1, P2, P3)</code>: Version 2 of the kummer surface only looks like radiating rods when the
+parameters are set to particular negative values. For positive values it tends to look rather like a superellipsoid.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Rod width (negative): Setting this parameter to larger negative values increases the diameter of the rods</li>
+<li><code>P2</code>&nbsp;: Divergence (negative): Setting this number to -1 causes the rods to become
+approximately cylindrical. Larger negative values cause the rods to become fatter further
+from the origin. Smaller negative numbers cause the rods to become narrower away from
+the origin, and have a finite length</li>
+<li><code>P3</code>&nbsp;: Influences the length of half of the rods.Changing the sign affects the other half of the rods. 0 has no effect</li>
+</ul>
+<div id="Index_Entry_include_files_f_lemniscate_of_gerono"></div>
+<p><code>f_lemniscate_of_gerono(x,y,z, P0)</code>: The <em>Lemniscate of Gerono</em> surface is an hourglass shape, or two teardrops with
+their ends connected.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_lemniscate_of_gerono_2d"></div>
+<p><code>f_lemniscate_of_gerono_2d(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The 2d version of the Lemniscate can be extruded in the Z
+direction, or used as a surface of revolution to generate the equivalent of the 3d version, or revolved in different ways.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Size: increasing this makes the 2d curve larger and less rounded</li>
+<li><code>P2</code>&nbsp;: Width: increasing this makes the 2d curve fatter</li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_mesh1"></div>
+<p><code>f_mesh1(x,y,z, P0, P1, P2, P3, P4)</code>: The overall thickness of the threads is controlled by the isosurface threshold, not
+by a parameter. If you render a mesh1 with zero threshold, the threads have zero thickness and are therefore invisible. Parameters P2 and P4
+control the shape of the thread relative to this threshold parameter.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Distance between neighboring threads in the x direction</li>
+<li><code>P1</code>&nbsp;: Distance between neighboring threads in the z direction</li>
+<li><code>P2</code>&nbsp;: Relative thickness in the x and z directions</li>
+<li><code>P3</code>&nbsp;: Amplitude of the weaving effect. Set to zero for a flat grid</li>
+<li><code>P4</code>&nbsp;: Relative thickness in the y direction</li>
+</ul>
+<div id="Index_Entry_include_files_f_mitre"></div>
+<p><code>f_mitre(x,y,z, P0)</code>: The <em>Mitre</em> surface looks a bit like an ellipsoid which has been nipped at each end with a pair
+of sharp nosed pliers.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_nodal_cubic"></div>
+<p><code>f_nodal_cubic(x,y,z, P0)</code>: The <em>Nodal Cubic</em> is something like what you would get if you were to extrude the Stophid2D
+curve along the X axis and then lean it over.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_noise3d"></div>
+<p><code>f_noise3d(x,y,z)</code>:</p>
+<div id="Index_Entry_include_files_f_noise_generator"></div>
+<p><code>f_noise_generator(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Noise generator number</li>
+</ul>
+<div id="Index_Entry_include_files_f_odd"></div>
+<p><code>f_odd(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_ovals_of_cassini"></div>
+<p><code>f_ovals_of_cassini(x,y,z, P0, P1, P2, P3)</code>: The Ovals of Cassini are a generalization of the torus shape.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Major radius - like the major radius of a torus</li>
+<li><code>P2</code>&nbsp;: Filling. Set this to zero, and you get a torus. Set this to a higher value and the hole in the middle starts to heal
+up. Set it even higher and you get an ellipsoid with a dimple</li>
+<li><code>P3</code>&nbsp;: Thickness. The higher you set this value, the plumper is the result</li>
+</ul>
+<div id="Index_Entry_include_files_f_paraboloid"></div>
+<p><code>f_paraboloid(x,y,z, P0)</code>: This paraboloid is the surface of revolution that you get if you rotate a parabola about the Y
+axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_parabolic_torus"></div>
+<p><code>f_parabolic_torus(x,y,z, P0, P1, P2)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Major radius</li>
+<li><code>P2</code>&nbsp;: Minor radius</li>
+</ul>
+<div id="Index_Entry_include_files_f_ph"></div>
+<p><code>f_ph(x,y,z)</code>: When used alone, the <em>PH</em> function gives a surface that consists of all points that are at a particular
+latitude, i.e. a cone. If you use a threshold of zero (the default) this gives a cone of width zero, which is invisible. Also look at
+<code>f_th</code> and <code>f_r</code>
+</p>
+<div id="Index_Entry_include_files_f_pillow"></div>
+<p><code>f_pillow(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_piriform"></div>
+<p><code>f_piriform(x,y,z, P0)</code>: The piriform surface looks rather like half a lemniscate.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_piriform_2d"></div>
+<p><code>f_piriform_2d(x,y,z, P0, P1, P2, P3, P4, P5, P6)</code>: The 2d version of the <em>Piriform</em> can be extruded in the Z
+direction, or used as a surface of revolution to generate the equivalent of the 3d version.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Size factor 1: increasing this makes the curve larger</li>
+<li><code>P2</code>&nbsp;: Size factor 2: making this less negative makes the curve larger but also thinner</li>
+<li><code>P3</code>&nbsp;: Fatness: increasing this makes the curve fatter</li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P6</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_poly4"></div>
+<p><code>f_poly4(x,y,z, P0, P1, P2, P3, P4)</code>: This <code>f_poly4</code> can be used to generate the surface of revolution of any
+polynomial up to degree 4. To put it another way: If we call the parameters A, B, C, D, E; then this function generates the surface of
+revolution formed by revolving <code>x = A + By + Cy2 + Dy3 + Ey4</code> around the Y axis.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Constant</li>
+<li><code>P1</code>&nbsp;: Y coefficient</li>
+<li><code>P2</code>&nbsp;: Y2 coefficient</li>
+<li><code>P3</code>&nbsp;: Y3 coefficient</li>
+<li><code>P4</code>&nbsp;: Y4 coefficient</li>
+</ul>
+<div id="Index_Entry_include_files_f_polytubes"></div>
+<p><code>f_polytubes(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The <em>Polytubes</em> surface consists of a number of tubes. Each tube follows
+a 2d curve which is specified by a polynomial of degree 4 or less. If we look at the parameters, then this function generates <em>P0</em>
+tubes which all follow the equation <code>x = P1 + P2y + P3y2 + P4y3 + P5y4</code> arranged around the Y axis. This function needs a
+positive threshold (fatness of the tubes).</p>
+<ul>
+<li><code>P0</code>&nbsp;: Number of tubes</li>
+<li><code>P1</code>&nbsp;: Constant</li>
+<li><code>P2</code>&nbsp;: Y coefficient</li>
+<li><code>P3</code>&nbsp;: Y2 coefficient</li>
+<li><code>P4</code>&nbsp;: Y3 coefficient</li>
+<li><code>P5</code>&nbsp;: Y4 coefficient</li>
+</ul>
+<div id="Index_Entry_include_files_f_quantum"></div>
+<p><code>f_quantum(x,y,z, P0)</code>: It resembles the shape of the electron density cloud for one of the d orbitals.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Not used, but required</li>
+</ul>
+<div id="Index_Entry_include_files_f_quartic_paraboloid"></div>
+<p><code>f_quartic_paraboloid(x,y,z, P0)</code>: The <em>Quartic Paraboloid</em> is similar to a paraboloid, but has a squarer shape.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_quartic_saddle"></div>
+<p><code>f_quartic_saddle(x,y,z, P0)</code>: The <em>Quartic saddle</em> is similar to a saddle, but has a squarer shape.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_quartic_cylinder"></div>
+<p><code>f_quartic_cylinder(x,y,z, P0, P1, P2)</code>: The <em>Quartic cylinder</em> looks a bit like a cylinder that is swallowed an
+egg.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Diameter of the <em>egg</em></li>
+<li><code>P2</code>&nbsp;: Controls the width of the tube and the vertical scale of the <em>egg</em></li>
+</ul>
+<div id="Index_Entry_include_files_f_r"></div>
+<p><code>f_r(x,y,z)</code>: When used alone, the <em>R</em> function gives a surface that consists of all the points that are a specific
+distance (threshold value) from the origin, i.e. a sphere. Also look at <code>f_ph</code> and <code>f_th</code></p>
+<div id="Index_Entry_include_files_f_ridge"></div>
+<p><code>f_ridge(x,y,z, P0, P1, P2, P3, P4, P5)</code>: This function is mainly intended for modifying other surfaces as you might use a
+height field or to use as pigment function. Other functions of interest are <code>f_hetero_mf</code> and <code>f_ridged_mf</code>.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Lambda</li>
+<li><code>P1</code>&nbsp;: Octaves</li>
+<li><code>P2</code>&nbsp;: Omega</li>
+<li><code>P3</code>&nbsp;: Offset</li>
+<li><code>P4</code>&nbsp;: Ridge</li>
+<li><code>P5</code>&nbsp;: Generator type used to generate the noise3d. 0, 1, 2 and 3 are legal values.</li>
+</ul>
+<div id="Index_Entry_include_files_f_ridged_mf"></div>
+<p><code>f_ridged_mf(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The <em>Ridged Multifractal</em> surface can be used to create multifractal
+height fields and patterns. <em>Multifractal</em> refers to their characteristic of having a fractal dimension which varies with altitude.
+They are built from summing noise of a number of frequencies. The f_ridged_mf parameters determine how many, and which frequencies are to be
+summed, and how the different frequencies are weighted in the sum.</p>
+<p>An advantage to using these instead of a <code>height_field{}</code> from an image is that the ridged_mf function domain extends
+arbitrarily far in the x and z directions so huge landscapes can be made without losing resolution or having to tile a height field. Other
+functions of interest are <code>f_hetero_mf</code> and <code>f_ridge</code>.</p>
+<ul>
+<li><code>P0</code>&nbsp;: H is the negative of the exponent of the basic noise frequencies used in building these
+functions (each frequency f's amplitude is weighted by the factor fE- H ). When H is 1, the
+fractalization is relatively smooth. As H nears 0, the high frequencies contribute equally with
+low frequencies</li>
+<li><code>P1</code>&nbsp;: Lacunarity is the multiplier used to get from one <em>octave</em> to the next in the <em>fractalization</em>. This
+parameter affects the size of the frequency gaps in the pattern. (Use values greater than 1.0)</li>
+<li><code>P2</code>&nbsp;: Octaves is the number of different frequencies added to the fractal. Each octave
+frequency is the previous one multiplied by <em>Lacunarity</em>. So, using a large number of octaves can
+get into very high frequencies very quickly</li>
+<li><code>P3</code>&nbsp;: Offset gives a fractal whose fractal dimension changes from altitude to altitude. The high
+frequencies at low altitudes are more damped than at higher altitudes, so that lower altitudes are
+smoother than higher areas</li>
+<li><code>P4</code>&nbsp;: Gain weights the successive contributions to the accumulated fractal result to make
+creases stick up as ridges</li>
+<li><code>P5</code>&nbsp;: Generator type used to generate the noise3d. 0, 1, 2 and 3 are legal values.</li>
+</ul>
+<div id="Index_Entry_include_files_f_rounded_box"></div>
+<p><code>f_rounded_box(x,y,z, P0, P1, P2, P3)</code>: The Rounded Box is defined in a cube from &lt;-1, -1, -1&gt; to &lt;1, 1, 1&gt;. By
+changing the <em>Scale</em> parameters, the size can be adjusted, without affecting the Radius of curvature.</p>
+<ul>
+<li><code>P0</code>&nbsp;: Radius of curvature. Zero gives square corners, 0.1 gives corners that match <code>sphere {0, 0.1}</code></li>
+<li><code>P1</code>&nbsp;: Scale x</li>
+<li><code>P2</code>&nbsp;: Scale y</li>
+<li><code>P3</code>&nbsp;: Scale z</li>
+</ul>
+<div id="Index_Entry_include_files_f_sphere"></div>
+<p><code>f_sphere(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>: radius of the sphere</li>
+</ul>
+<div id="Index_Entry_include_files_f_spikes"></div>
+<p><code>f_spikes(x,y,z, P0, P1, P2, P3, P4)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Spikiness. Set this to very low values to increase the spikes. Set it to 1 and you get a sphere</li>
+<li><code>P1</code>&nbsp;: Hollowness. Increasing this causes the sides to bend in more</li>
+<li><code>P2</code>&nbsp;: Size. Increasing this increases the size of the object</li>
+<li><code>P3</code>&nbsp;: Roundness. This parameter has a subtle effect on the roundness of the spikes</li>
+<li><code>P4</code>&nbsp;: Fatness. Increasing this makes the spikes fatter</li>
+</ul>
+<div id="Index_Entry_include_files_f_spikes_2d"></div>
+<p><code>f_spikes_2d(x,y,z, P0, P1, P2, P3)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Height of central spike</li>
+<li><code>P1</code>&nbsp;: Frequency of spikes in the X direction</li>
+<li><code>P2</code>&nbsp;: Frequency of spikes in the Z direction</li>
+<li><code>P3</code>&nbsp;: Rate at which the spikes reduce as you move away from the center</li>
+</ul>
+<div id="Index_Entry_include_files_f_spiral"></div>
+<p><code>f_spiral(x,y,z, P0, P1, P2, P3, P4, P5)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Distance between windings</li>
+<li><code>P1</code>&nbsp;: Thickness</li>
+<li><code>P2</code>&nbsp;: Outer radius of the spiral. The surface behaves as if it is contained_by a sphere of this diameter</li>
+<li><code>P3</code>&nbsp;: Not used</li>
+<li><code>P4</code>&nbsp;: Not used</li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Cross_Section_Type" title="Reference:Functions.inc">Cross section type</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_steiners_roman"></div>
+<p><code>f_steiners_roman(x,y,z, P0)</code>: The <em>Steiners Roman</em> is composed of four identical triangular pads which together make
+up a sort of rounded tetrahedron. There are creases along the X, Y and Z axes where the pads meet.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_strophoid"></div>
+<p><code>f_strophoid(x,y,z, P0, P1, P2, P3)</code>: The <em>Strophoid</em> is like an infinite plane with a bulb sticking out of it.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Size of bulb. Larger values give larger bulbs. Negative values give a bulb on the other side of the plane</li>
+<li><code>P2</code>&nbsp;: Sharpness. When zero, the bulb is like a sphere that just touches the plane. When
+positive, there is a crossover point. When negative the bulb simply bulges out of the plane like a pimple</li>
+<li><code>P3</code>&nbsp;: Flatness. Higher values make the top end of the bulb fatter</li>
+</ul>
+<div id="Index_Entry_include_files_f_strophoid_2d"></div>
+<p><code>f_strophoid_2d(x,y,z, P0, P1, P2, P3, P4, P5, P6)</code>: The 2d strophoid curve can be extruded in the Z direction or rotated
+about various axes by using the SOR parameters.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a></li>
+<li><code>P1</code>&nbsp;: Size of bulb. Larger values give larger bulbs. Negative values give a bulb on the other side of the plane</li>
+<li><code>P2</code>&nbsp;: Sharpness. When zero, the bulb is like a sphere that just touches the plane. When positive, there is a crossover
+point. When negative the bulb simply bulges out of the plane like a pimple</li>
+<li><code>P3</code>&nbsp;: Fatness. Higher values make the top end of the bulb fatter</li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P6</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<div id="Index_Entry_include_files_f_superellipsoid"></div>
+<p><code>f_superellipsoid(x,y,z, P0, P1)</code>: Needs a negative field strength or a negated function.</p>
+<ul>
+<li><code>P0</code>&nbsp;: east-west exponentx</li>
+<li><code>P1</code>&nbsp;: north-south exponent</li>
+</ul>
+<div id="Index_Entry_include_files_f_th"></div>
+<p><code>f_th(x,y,z)</code>: <code>f_th()</code> is a function that is only useful when combined with other surfaces. It produces a value
+which is equal to the <em>theta</em> angle, in radians, at any point. The theta angle is like the longitude coordinate on the Earth. It
+stays the same as you move north or south, but varies from east to west. Also look at <code>f_ph</code> and <code>f_r</code>
+</p>
+<div id="Index_Entry_include_files_f_torus"></div>
+<p><code>f_torus(x,y,z, P0, P1)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: Major radius</li>
+<li><code>P1</code>&nbsp;: Minor radius</li>
+</ul>
+<div id="Index_Entry_include_files_f_torus2"></div>
+<p><code>f_torus2(x,y,z, P0, P1, P2)</code>: This is different from the f_torus function which just has the major and minor radii as
+parameters.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a 
+   negated function)</li>
+<li><code>P1</code>&nbsp;: Major radius</li>
+<li><code>P2</code>&nbsp;: Minor radius</li>
+</ul>
+<div id="Index_Entry_include_files_f_torus_gumdrop"></div>
+<p><code>f_torus_gumdrop(x,y,z, P0)</code>: The <em>Torus Gumdrop</em> surface is something like a torus with a couple of gumdrops hanging
+off the end.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_umbrella"></div>
+<p><code>f_umbrella(x,y,z, P0)</code>:</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+</ul>
+<div id="Index_Entry_include_files_f_witch_of_agnesi"></div>
+<p><code>f_witch_of_agnesi(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The <em>Witch of Agnesi</em> surface looks something like a witches
+hat.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Controls the width of the spike. The height of the spike is always about 1 unit</li>
+</ul>
+<div id="Index_Entry_include_files_f_witch_of_agnesi_2d"></div>
+<p><code>f_witch_of_agnesi_2d(x,y,z, P0, P1, P2, P3, P4, P5)</code>: The 2d version of the <em>Witch of Agnesi</em> curve can be extruded in
+the Z direction or rotated about various axes by use of the SOR parameters.</p>
+<ul>
+<li><code>P0</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#Field_Strength" title="Reference:Functions.inc">Field Strength</a> (Needs a negative field strength or a negated function)</li>
+<li><code>P1</code>&nbsp;: Controls the size of the spike</li>
+<li><code>P2</code>&nbsp;: Controls the height of the spike</li>
+<li><code>P3</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Switch" title="Reference:Functions.inc">SOR Switch</a></li>
+<li><code>P4</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Offset" title="Reference:Functions.inc">SOR Offset</a></li>
+<li><code>P5</code>&nbsp;: <a href="https://wiki.povray.org/content/Reference:Functions.inc#SOR_Angle" title="Reference:Functions.inc">SOR Angle</a></li>
+</ul>
+<h4><span class="mw-headline" id="Pre_defined_functions">Pre defined functions</span></h4>
+<div id="Index_Entry_include_files_eval_pigment"></div>	
+<p><code>eval_pigment(Pigm, Vect)</code>: This macro evaluates the color of a pigment at a specific point. Some pigments require more
+information than simply a point, slope pattern based pigments for example, and will not work with this macro. However, most pigments will
+work fine.</p>
+<p>Parameters:</p>
+<ul>
+	<li><code>Vect</code> = The point at which to evaluate the pigment.</li>
+	<li><code>Pigm</code> = The pigment to evaluate.</li>
+</ul>
+<div id="Index_Entry_include_files_f_snoise3d"></div>
+<p><code>f_snoise3d(x, y, z)</code>: Just like f_noise3d(), but returns values in the range [-1, 1].</p>
+<div id="Index_Entry_include_files_f_sine_wave"></div>
+<p><code>f_sine_wave(val, amplitude, frequency)</code>: Turns a ramping waveform into a sine waveform.</p>
+<div id="Index_Entry_include_files_f_scallop_wave"></div>
+<p><code>f_scallop_wave(val, amplitude, frequency)</code>: Turns a ramping waveform into a <em>scallop wave</em> waveform.
+</p>
+<h5><span class="mw-headline" id="Pattern_functions">Pattern functions</span></h5>
+<p>Predefined pattern functions, useful for building custom function patterns or performing <em>displacement mapping</em> on isosurfaces.
+Many of them are not really useful for these purposes, they are simply included for completeness.</p>
+<p>Some are not implemented at all because they require special parameters that must be specified in the definition, or information that is
+not available to pattern functions. For this reason, you probably would want to define your own versions of these functions.
+</p>
+<p>All of these functions take three parameters, the XYZ coordinates of the point to evaluate the pattern at.</p>
+<dl>
+<dt><code>f_agate(x, y, z)</code>
+</dt><dt><code>f_boxed(x, y, z)</code>
+</dt><dt><code>f_bozo(x, y, z)</code>
+</dt><dt><code>f_brick(x, y, z)</code>
+</dt><dt><code>f_bumps(x, y, z)</code>
+</dt><dt><code>f_checker(x, y, z)</code>
+</dt><dt><code>f_crackle(x, y, z)</code>
+</dt><dd> This pattern has many more options, this function uses the defaults.
+</dd><dt><code>f_cylindrical(x, y, z)</code>
+</dt><dt><code>f_dents(x, y, z)</code>
+</dt><dt><code>f_gradientX(x, y, z)</code>
+</dt><dt><code>f_gradientY(x, y, z)</code>
+</dt><dt><code>f_gradientZ(x, y, z)</code>
+</dt><dt><code>f_granite(x, y, z)</code>
+</dt><dt><code>f_hexagon(x, y, z)</code>
+</dt><dt><code>f_leopard(x, y, z)</code>
+</dt><dt><code>f_mandel(x, y, z)</code>
+</dt><dd> Only the basic mandel pattern is implemented, its variants 
+and the other fractal patterns are not implemented.
+</dd><dt><code>f_marble(x, y, z)</code>
+</dt><dt><code>f_onion(x, y, z)</code>
+</dt><dt><code>f_planar(x, y, z)</code>
+</dt><dt><code>f_radial(x, y, z)</code>
+</dt><dt><code>f_ripples(x, y, z)</code>
+</dt><dt><code>f_spherical(x, y, z)</code>
+</dt><dt><code>f_spiral1(x, y, z)</code>
+</dt><dt><code>f_spiral2(x, y, z)</code>
+</dt><dt><code>f_spotted(x, y, z)</code>
+</dt><dt><code>f_waves(x, y, z)</code>
+</dt><dt><code>f_wood(x, y, z)</code>
+</dt><dt><code>f_wrinkles(x, y, z)</code>
+</dt></dl>
+<!-- 
+NewPP limit report
+Cached time: 20260713094633
+Cache expiry: 86400
+Dynamic content: false
+Complications: []
+CPU time usage: 0.171 seconds
+Real time usage: 0.216 seconds
+Preprocessor visited node count: 546/1000000
+Post‐expand include size: 4643/2097152 bytes
+Template argument size: 0/2097152 bytes
+Highest expansion depth: 2/40
+Expensive parser function count: 0/100
+Unstrip recursion depth: 0/20
+Unstrip post‐expand size: 200/5000000 bytes
+-->
+<!--
+Transclusion expansion time report (%,ms,calls,template)
+100.00%    0.000      1 -total
+-->
+
+<!-- Saved in parser cache with key wikidb:pcache:idhash:2260-0!canonical and timestamp 20260713094632 and revision id 8226
+ -->
+</div></div><div class="printfooter">Retrieved from "<a dir="ltr" href="https://wiki.povray.org/content?title=Reference:Functions.inc&amp;oldid=8226">https://wiki.povray.org/content?title=Reference:Functions.inc&amp;oldid=8226</a>"</div>
+		<div id="catlinks" class="catlinks" data-mw="interface"><div id="mw-normal-catlinks" class="mw-normal-catlinks"><a href="https://wiki.povray.org/content/Special:Categories" title="Special:Categories">Category</a>: <ul><li><a href="https://wiki.povray.org/content/Category:Include_Files" title="Category:Include Files">Include Files</a></li></ul></div></div>
+	</div>
+</div>
+
+<div id="mw-navigation">
+	<h2>Navigation menu</h2>
+	<div id="mw-head">
+		<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-personal" class="vector-menu" aria-labelledby="p-personal-label" role="navigation">
+	<h3 id="p-personal-label">
+		<span>Personal tools</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="pt-login"><a href="https://wiki.povray.org/content?title=Special:UserLogin&amp;returnto=Reference%3AFunctions.inc" title="You are encouraged to log in; however, it is not mandatory [alt-shift-o]" accesskey="o">Log in</a></li></ul>
+		
+	</div>
+</nav>
+
+
+		<div id="left-navigation">
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-namespaces" class="vector-menu vector-menu-tabs vectorTabs" aria-labelledby="p-namespaces-label" role="navigation">
+	<h3 id="p-namespaces-label">
+		<span>Namespaces</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="ca-nstab-reference" class="selected"><a href="https://wiki.povray.org/content/Reference:Functions.inc">Reference</a></li><li id="ca-talk" class="new"><a href="https://wiki.povray.org/content?title=Reference_Talk:Functions.inc&amp;action=edit&amp;redlink=1" rel="discussion" title="Discussion about the content page (page does not exist) [alt-shift-t]" accesskey="t">Discussion</a></li></ul>
+		
+	</div>
+</nav>
+
+
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-variants" class="vector-menu-empty emptyPortlet vector-menu vector-menu-dropdown vectorMenu" aria-labelledby="p-variants-label" role="navigation">
+	<input type="checkbox" class="vector-menu-checkbox vectorMenuCheckbox" aria-labelledby="p-variants-label">
+	<h3 id="p-variants-label">
+		<span>Variants</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="menu vector-menu-content-list"></ul>
+		
+	</div>
+</nav>
+
+
+		</div>
+		<div id="right-navigation">
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-views" class="vector-menu vector-menu-tabs vectorTabs" aria-labelledby="p-views-label" role="navigation">
+	<h3 id="p-views-label">
+		<span>Views</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="ca-view" class="collapsible selected"><a href="https://wiki.povray.org/content/Reference:Functions.inc">Read</a></li><li id="ca-viewsource" class="collapsible"><a href="https://wiki.povray.org/content?title=Reference:Functions.inc&amp;action=edit" title="This page is protected.
+You can view its source [alt-shift-e]" accesskey="e">View source</a></li><li id="ca-history" class="collapsible"><a href="https://wiki.povray.org/content?title=Reference:Functions.inc&amp;action=history" title="Past revisions of this page [alt-shift-h]" accesskey="h">View history</a></li></ul>
+		
+	</div>
+</nav>
+
+
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-cactions" class="vector-menu-empty emptyPortlet vector-menu vector-menu-dropdown vectorMenu" aria-labelledby="p-cactions-label" role="navigation">
+	<input type="checkbox" class="vector-menu-checkbox vectorMenuCheckbox" aria-labelledby="p-cactions-label">
+	<h3 id="p-cactions-label">
+		<span>More</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="menu vector-menu-content-list"></ul>
+		
+	</div>
+</nav>
+
+
+			<div id="p-search" role="search">
+	<h3>
+		<label for="searchInput">Search</label>
+	</h3>
+	<form action="https://wiki.povray.org/content" id="searchform">
+		<div id="simpleSearch">
+			<input type="search" name="search" placeholder="Search POV-Wiki" title="Search POV-Wiki [alt-shift-f]" accesskey="f" id="searchInput">
+			<input type="hidden" name="title" value="Special:Search">
+			<input type="submit" name="fulltext" value="Search" title="Search the pages for this text" id="mw-searchButton" class="searchButton mw-fallbackSearchButton">
+			<input type="submit" name="go" value="Go" title="Go to a page with this exact name if it exists" id="searchButton" class="searchButton">
+		</div>
+	</form>
+</div>
+
+		</div>
+	</div>
+	
+<div id="mw-panel">
+	<div id="p-logo" role="banner">
+		<a title="Visit the main page" class="mw-wiki-logo" href="https://wiki.povray.org/content/Main_Page"></a>
+	</div>
+	<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-Content" class="vector-menu vector-menu-portal portal portal-first" aria-labelledby="p-Content-label" role="navigation">
+	<h3 id="p-Content-label">
+		<span>Content</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="n-mainpage"><a href="https://wiki.povray.org/content/Main_Page" title="Visit the main page [alt-shift-z]" accesskey="z">Main Page</a></li><li id="n-How-Tos"><a href="https://wiki.povray.org/content/HowTo:Contents">How Tos</a></li><li id="n-Knowledge-Base"><a href="https://wiki.povray.org/content/Knowledgebase:Contents">Knowledge Base</a></li><li id="n-Documentation"><a href="https://wiki.povray.org/content/Documentation:Contents">Documentation</a></li><li id="n-help"><a href="https://wiki.povray.org/content/Special:MyLanguage/Help:Contents" title="The place to find out">Help</a></li></ul>
+		
+	</div>
+</nav>
+
+
+	<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-Other Pages" class="vector-menu vector-menu-portal portal" aria-labelledby="p-Other Pages-label" role="navigation">
+	<h3 id="p-Other Pages-label">
+		<span>Other Pages</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="n-about"><a href="https://wiki.povray.org/content/wiki.povray.org:About">About POV-Wiki</a></li><li id="n-Main-POV-Ray-Site"><a href="http://www.povray.org/" rel="nofollow">Main POV-Ray Site</a></li><li id="n-Recent-Changes"><a href="https://wiki.povray.org/content/Special:RecentChanges">Recent Changes</a></li></ul>
+		
+	</div>
+</nav>
+
+<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-tb" class="vector-menu vector-menu-portal portal" aria-labelledby="p-tb-label" role="navigation">
+	<h3 id="p-tb-label">
+		<span>Tools</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="t-whatlinkshere"><a href="https://wiki.povray.org/content/Special:WhatLinksHere/Reference:Functions.inc" title="A list of all wiki pages that link here [alt-shift-j]" accesskey="j">What links here</a></li><li id="t-recentchangeslinked"><a href="https://wiki.povray.org/content/Special:RecentChangesLinked/Reference:Functions.inc" rel="nofollow" title="Recent changes in pages linked from this page [alt-shift-k]" accesskey="k">Related changes</a></li><li id="t-specialpages"><a href="https://wiki.povray.org/content/Special:SpecialPages" title="A list of all special pages [alt-shift-q]" accesskey="q">Special pages</a></li><li id="t-print"><a href="javascript:print();" rel="alternate" title="Printable version of this page [alt-shift-p]" accesskey="p">Printable version</a></li><li id="t-permalink"><a href="https://wiki.povray.org/content?title=Reference:Functions.inc&amp;oldid=8226" title="Permanent link to this revision of the page">Permanent link</a></li><li id="t-info"><a href="https://wiki.povray.org/content?title=Reference:Functions.inc&amp;action=info" title="More information about this page">Page information</a></li></ul>
+		
+	</div>
+</nav>
+
+
+	
+</div>
+
+</div>
+
+<footer id="footer" class="mw-footer" role="contentinfo">
+	<ul id="footer-info">
+		<li id="footer-info-lastmod"> This page was last edited on 30 December 2013, at 21:32.</li>
+		<li id="footer-info-copyright">Content is available under <a href="https://wiki.povray.org/content/wiki.povray.org:Copyrights" title="wiki.povray.org:Copyrights">a Creative Commons Attribution-Noncommercial-ShareAlike 2.5 license</a> unless otherwise noted.</li>
+	</ul>
+	<ul id="footer-places">
+		<li id="footer-places-privacy"><a href="https://wiki.povray.org/content/wiki.povray.org:Privacy_policy" title="wiki.povray.org:Privacy policy">Privacy policy</a></li>
+		<li id="footer-places-about"><a href="https://wiki.povray.org/content/wiki.povray.org:About" title="wiki.povray.org:About">About POV-Wiki</a></li>
+		<li id="footer-places-disclaimer"><a href="https://wiki.povray.org/content/wiki.povray.org:General_disclaimer" title="wiki.povray.org:General disclaimer">Disclaimers</a></li>
+	</ul>
+	<ul id="footer-icons" class="noprint">
+		<li id="footer-copyrightico"><a href="http://creativecommons.org/licenses/by-nc-sa/2.5/au/"><img src="./Reference_Functions.inc - POV-Wiki_files/cc-by-nc-sa.png" alt="a Creative Commons Attribution-Noncommercial-ShareAlike 2.5 license" width="88" height="31" loading="lazy"></a></li>
+		<li id="footer-poweredbyico"><a href="https://www.mediawiki.org/"><img src="./Reference_Functions.inc - POV-Wiki_files/poweredby_mediawiki_88x31.png" alt="Powered by MediaWiki" srcset="/resources/assets/poweredby_mediawiki_132x47.png 1.5x, /resources/assets/poweredby_mediawiki_176x62.png 2x" width="88" height="31" loading="lazy"></a></li>
+	</ul>
+	<div style="clear: both;"></div>
+</footer>
+
+
+
+<script>(RLQ=window.RLQ||[]).push(function(){mw.config.set({"wgPageParseReport":{"limitreport":{"cputime":"0.171","walltime":"0.216","ppvisitednodes":{"value":546,"limit":1000000},"postexpandincludesize":{"value":4643,"limit":2097152},"templateargumentsize":{"value":0,"limit":2097152},"expansiondepth":{"value":2,"limit":40},"expensivefunctioncount":{"value":0,"limit":100},"unstrip-depth":{"value":0,"limit":20},"unstrip-size":{"value":200,"limit":5000000},"timingprofile":["100.00%    0.000      1 -total"]},"cachereport":{"timestamp":"20260713094633","ttl":86400,"transientcontent":false}}});mw.config.set({"wgBackendResponseTime":367});});</script>
+</body></html>

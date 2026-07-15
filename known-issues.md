@@ -2394,3 +2394,21 @@ correctly on **both** backends.
   primitive** (sphere-traced, GPU-portable) would give metaballs/isosurfaces *exactly*
   without lossy tessellation — useful independent of any importer, and the right way to
   ever support POV-Ray-style implicit geometry. Not started.
+
+## Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons)
+
+- **Symptom:** `renderPhotonMapSharedCuda` on `scenes/gallery_settled.ftsl` (via
+  `scraps/gallery_fly.ftsl`) with `-n 4000000 -spp 6 -r 320 180` ran **67 min pegging
+  ~6 CPU cores (24,255 CPU-s) with GPU util ~1-6% and never wrote the `-savemap` file**
+  (i.e. the one-time deposit+build phase never completed). Working set stayed ~1 GB, so
+  it is NOT a huge-photon-set RAM blowup.
+- **Contrast:** the identical pipeline with `-device gpu -n 2000000 -spp 4` on the SAME
+  scene completed fully (deposit+build+2 gathers+mode-D still) in ~2 min. So 4M is >30x
+  slower than 2M — wildly super-linear, pointing at a pathological host-side phase
+  (suspect `PhotonMap::build` counting sort or the device->host photon download/convert
+  loop in render_cuda.cu ~5680-5698), not simple scaling.
+- **Repro:** `ftrace -in scraps/gallery_fly.ftsl -n 4000000 -spp 6 -r 320 180 -window
+  -savemap gallery/hero_map.ftpmap -o png/fly/fly.png`
+- **Proper fix (TODO):** profile the deposit/build with 2M vs 4M; find why host CPU
+  scales super-linearly (likely an O(n^2) or lock-contended path, or grid cellSize
+  degenerating so build buckets explode). Until fixed, cap flyby photons at ~2M.

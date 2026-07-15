@@ -1,0 +1,13 @@
+Parameter set: 01_clean_solids
+Bold, legible closed surfaces. Function-heavy leaves, +/- only, shallow nesting.
+
+material        : gold  (material "iso" { preset gold roughness 0.12 })
+coord frequency : 1
+clip radius R   : 1.6
+leaf mix        : function 0.9  variable 0.05  number 0.05
+number range    : -2 .. 2
+operators       : +(w1) -(w1)
+nesting walk    : open 0.15  add 0.62  close 0.23
+max terms/depth : 3 / 1
+unary wrap      : p=0  [(none)]
+functions       : heart, torus, torus2, torus_gumdrop, ellipsoid, superellipsoid, pillow, glob, piriform, bicorn, kummer_surface_v1, steiners_roman, lemniscate_of_gerono, hunt_surface, ovals_of_cassini, blob2, cross_ellipsoids, isect_ellipsoids, devils_curve, mitre

@@ -1,0 +1,13 @@
+Parameter set: 04_wild_algebraic
+Deep-nested algebraic tangles: all functions, + - * ops, abs/sin/cos wrap.
+
+material        : chrome  (material "iso" { preset chrome roughness 0.08 })
+coord frequency : 1.2
+clip radius R   : 1.8
+leaf mix        : function 0.7  variable 0.15  number 0.15
+number range    : -2.5 .. 2.5
+operators       : +(w1) -(w1) *(w0.6)
+nesting walk    : open 0.32  add 0.5  close 0.18
+max terms/depth : 8 / 4
+unary wrap      : p=0.25  [sin cos abs]
+functions       : ALL

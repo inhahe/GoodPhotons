@@ -1,0 +1,8 @@
+approach   : sdf  (02_sdf_assembly)
+Signed-distance CSG assembly (smooth-min of primitives)
+
+count      : 12
+base seed  : 1
+size       : 480px
+raymarch   : 300 steps
+backend    : gpu(angle-d3d11)

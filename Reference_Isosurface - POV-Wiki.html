@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<!-- saved from url=(0052)https://wiki.povray.org/content/Reference:Isosurface -->
+<html class="client-js ve-available" lang="en" dir="ltr"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<title>Reference:Isosurface - POV-Wiki</title>
+<script type="text/javascript" async="" src="./Reference_Isosurface - POV-Wiki_files/js"></script><script>document.documentElement.className="client-js";RLCONF={"wgBreakFrames":!1,"wgSeparatorTransformTable":["",""],"wgDigitTransformTable":["",""],"wgDefaultDateFormat":"dmy","wgMonthNames":["","January","February","March","April","May","June","July","August","September","October","November","December"],"wgRequestId":"alS0BqR3ZI5IhcRCtAIdPAAAAAM","wgCSPNonce":!1,"wgCanonicalNamespace":"Reference","wgCanonicalSpecialPageName":!1,"wgNamespaceNumber":108,"wgPageName":"Reference:Isosurface","wgTitle":"Isosurface","wgCurRevisionId":9248,"wgRevisionId":9248,"wgArticleId":2282,"wgIsArticle":!0,"wgIsRedirect":!1,"wgAction":"view","wgUserName":null,"wgUserGroups":["*"],"wgCategories":["Objects","Finite Solid Primitives"],"wgPageContentLanguage":"en","wgPageContentModel":"wikitext","wgRelevantPageName":"Reference:Isosurface","wgRelevantArticleId":2282,"wgIsProbablyEditable":!1,"wgRelevantPageIsProbablyEditable":!1,"wgRestrictionEdit":[],"wgRestrictionMove":[],"wgVisualEditor":{
+"pageLanguageCode":"en","pageLanguageDir":"ltr","pageVariantFallbacks":"en"},"wgEditSubmitButtonLabelPublish":!1};RLSTATE={"site.styles":"ready","noscript":"ready","user.styles":"ready","user":"ready","user.options":"loading","skins.vector.styles.legacy":"ready","ext.visualEditor.desktopArticleTarget.noscript":"ready"};RLPAGEMODULES=["site","mediawiki.page.startup","mediawiki.page.ready","skins.vector.legacy.js","ext.MultiLinkAndIndex","ext.visualEditor.desktopArticleTarget.init","ext.visualEditor.targetLoader"];</script>
+<script>(RLQ=window.RLQ||[]).push(function(){mw.loader.implement("user.options@1hzgi",function($,jQuery,require,module){/*@nomin*/mw.user.tokens.set({"patrolToken":"+\\","watchToken":"+\\","csrfToken":"+\\"});
+});});</script>
+<link rel="stylesheet" href="./Reference_Isosurface - POV-Wiki_files/load.php">
+<script async="" src="./Reference_Isosurface - POV-Wiki_files/load(1).php"></script>
+<style>
+.mw-editfont-monospace{font-family:monospace,monospace}.mw-editfont-sans-serif{font-family:sans-serif}.mw-editfont-serif{font-family:serif} .mw-editfont-monospace,.mw-editfont-sans-serif,.mw-editfont-serif{font-size:13px; }.mw-editfont-monospace.oo-ui-textInputWidget,.mw-editfont-sans-serif.oo-ui-textInputWidget,.mw-editfont-serif.oo-ui-textInputWidget{font-size:inherit}.mw-editfont-monospace.oo-ui-textInputWidget > .oo-ui-inputWidget-input,.mw-editfont-sans-serif.oo-ui-textInputWidget > .oo-ui-inputWidget-input,.mw-editfont-serif.oo-ui-textInputWidget > .oo-ui-inputWidget-input{font-size:13px}.mw-editfont-monospace.oo-ui-textInputWidget > input.oo-ui-inputWidget-input,.mw-editfont-sans-serif.oo-ui-textInputWidget > input.oo-ui-inputWidget-input,.mw-editfont-serif.oo-ui-textInputWidget > input.oo-ui-inputWidget-input{min-height:32px}
+.ve-init-mw-progressBarWidget{height:1em;overflow:hidden;margin:0 25%}.ve-init-mw-progressBarWidget-bar{height:1em;width:0} .ve-init-mw-progressBarWidget{background-color:#fff;-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;height:0.875em;border:1px solid #36c;border-radius:0.875em;box-shadow:0 1px 1px rgba(0,0,0,0.15)}.ve-init-mw-progressBarWidget-bar{background-color:#36c;height:0.875em}</style><style>
+.ve-init-mw-tempWikitextEditorWidget{border:0;padding:0;color:inherit;line-height:1.5em;width:100%;-moz-tab-size:4;tab-size:4; }.ve-init-mw-tempWikitextEditorWidget:focus{outline:0;padding:0}.ve-init-mw-tempWikitextEditorWidget::selection{background:rgba(109,169,247,0.5); }</style><style>
+.ve-activated .ve-init-mw-desktopArticleTarget-editableContent #toc,.ve-activated #siteNotice,.ve-activated .mw-indicators,.ve-activated #t-print,.ve-activated #t-permalink,.ve-activated #p-coll-print_export,.ve-activated #t-cite,.ve-deactivating .ve-ui-surface,.ve-active .ve-init-mw-desktopArticleTarget-editableContent,.ve-active .ve-init-mw-tempWikitextEditorWidget{display:none} .ve-activating .ve-ui-surface{height:0;padding:0 !important; overflow:hidden} .ve-loading #content > :not(.ve-init-mw-desktopArticleTarget-loading-overlay), .ve-activated .ve-init-mw-desktopArticleTarget-uneditableContent{pointer-events:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;opacity:0.5}.ve-activated #firstHeading{ -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;pointer-events:auto;cursor:text}.ve-activated #firstHeading a{ pointer-events:none}.ve-activated #catlinks{cursor:pointer}.ve-activated #catlinks a{opacity:1}.ve-activated #content{position:relative} .ve-init-mw-desktopArticleTarget-loading-overlay{position:absolute;top:1.25em;left:0;right:0;z-index:1;margin-top:-0.5em}.ve-init-mw-desktopArticleTarget-toolbarPlaceholder{transition:height 250ms ease;height:0; } .oo-ui-element-hidden{display:none !important; }  .mw-editsection{ unicode-bidi:-moz-isolate;unicode-bidi:-webkit-isolate;unicode-bidi:isolate}.mw-editsection:before{content:'\200B'}.mw-editsection a{white-space:nowrap}.mw-editsection-divider{color:#54595d}  .ve-init-mw-desktopArticleTarget-toolbarPlaceholder{border-bottom:1px solid #c8ccd1;box-shadow:0 1px 1px 0 rgba(0,0,0,0.1)}.ve-init-mw-desktopArticleTarget-toolbarPlaceholder-open{height:42px} .ve-init-mw-desktopArticleTarget-toolbar,.ve-init-mw-desktopArticleTarget-toolbarPlaceholder{font-size:0.875em; margin:-1.14em -1.14em 1.14em -1.14em; }@media screen and (min-width:982px){ .skin-vector-legacy .ve-init-mw-desktopArticleTarget-toolbar,.skin-vector-legacy .ve-init-mw-desktopArticleTarget-toolbarPlaceholder{ margin:-1.43em -1.71em 1.43em -1.71em}}</style><meta name="ResourceLoaderDynamicStyles" content="">
+<link rel="stylesheet" href="./Reference_Isosurface - POV-Wiki_files/load(2).php">
+<meta name="generator" content="MediaWiki 1.35.1">
+<link rel="shortcut icon" href="https://wiki.povray.org/favicon.ico">
+<link rel="search" type="application/opensearchdescription+xml" href="https://wiki.povray.org/opensearch_desc.php" title="POV-Wiki (en)">
+<link rel="EditURI" type="application/rsd+xml" href="https://wiki.povray.org/api.php?action=rsd">
+<link rel="license" href="https://wiki.povray.org/content/wiki.povray.org:Copyrights">
+<link rel="alternate" type="application/atom+xml" title="POV-Wiki Atom feed" href="https://wiki.povray.org/content?title=Special:RecentChanges&amp;feed=atom">
+<!--[if lt IE 9]><script src="/resources/lib/html5shiv/html5shiv.js"></script><![endif]-->
+</head>
+<body class="mediawiki ltr sitedir-ltr mw-hide-empty-elt ns-108 ns-subject page-Reference_Isosurface rootpage-Reference_Isosurface skin-vector action-view skin-vector-legacy">
+<div id="mw-page-base" class="noprint"></div>
+<div id="mw-head-base" class="noprint"></div>
+<div id="content" class="mw-body" role="main">
+	<a id="top"></a>
+	<div id="siteNotice" class="mw-body-content"></div>
+	<div class="mw-indicators mw-body-content">
+	</div>
+	<h1 id="firstHeading" class="firstHeading" lang="en">Reference:Isosurface</h1>
+	<div id="bodyContent" class="mw-body-content">
+		<div id="siteSub" class="noprint">From POV-Wiki</div>
+		<div id="contentSub"></div>
+		<div id="contentSub2"></div>
+		
+		<div id="jump-to-nav"></div>
+		<a class="mw-jump-link" href="https://wiki.povray.org/content/Reference:Isosurface#mw-head">Jump to navigation</a>
+		<a class="mw-jump-link" href="https://wiki.povray.org/content/Reference:Isosurface#searchInput">Jump to search</a>
+		<div id="mw-content-text" lang="en" dir="ltr" class="mw-content-ltr"><div class="mw-parser-output"><div id="Index_Entry_isosurface_keyword"></div>
+<div id="Index_Entry_keyword_isosurface"></div> 
+<div id="Index_Entry_function_isosurface"></div>
+<div id="Index_Entry_keyword_function"></div>
+<div id="Index_Entry_keyword_polarity"></div>   
+<p>See the <code>isosurface</code> <a href="https://wiki.povray.org/content/Documentation:Tutorial_Section_3.2#Isosurface_Object" title="Documentation:Tutorial Section 3.2">tutorial</a> for more about working with <em>isosurfaces</em>.</p>
+<p><font style="font-size:1.05em;color:#3300cc;font-weight:bold;font-style:oblique;">New</font> in version 3.8 a <code>potential</code> pattern has been added to define a pattern based on the <em>potential</em> field of a <code>blob</code> or <code>isosurface</code> object. See also: <a href="https://wiki.povray.org/content/Reference:Potential_Pattern" title="Reference:Potential Pattern">Potential Pattern</a>.</p>
+<p>The syntax basics are as follows:</p>
+<pre>isosurface {
+  function { FUNCTION_ITEMS }
+  [contained_by { SPHERE | BOX }]
+  [threshold FLOAT_VALUE]
+  [accuracy FLOAT_VALUE]
+  [max_gradient FLOAT_VALUE]
+  [evaluate P0, P1, P2]
+  [open]
+  [max_trace INTEGER] | [all_intersections]
+  [polarity on | +VALUE | off | -VALUE] 
+  [OBJECT_MODIFIERS...]
+  }
+</pre>
+<div id="Index_Entry_default_values_isosurface"></div>
+<p>Isosurface default values:</p>
+<pre>contained_by&nbsp;: box{-1,1}
+threshold    : 0.0
+accuracy     : 0.001
+max_gradient&nbsp;: 1.1
+polarity     : off
+</pre>
+<p>Since <em>isosurfaces</em> are defined by a user supplied <code>function { ... }</code> it must be specified as the first item of the <code>isosurface</code> statement. Here you place all the mathematical functions that will describe the surface.</p>
+<div id="Index_Entry_contained_by_isosurface"></div>
+<div id="Index_Entry_keyword_contained_by"></div>
+<p>The <code>contained_by</code> <em>object</em> limits the area where POV-Ray samples for the surface of the function. This container can either be a <code>sphere</code> or a <code>box</code> both of which use the standard POV-Ray syntax. If nothing is specified a default <code>box</code>, as noted above, will be used. See additional usage examples below:</p>
+<pre>contained_by { sphere { CENTER, RADIUS } }
+contained_by { box { CORNER1, CORNER2 } }
+</pre>
+<div id="Index_Entry_threshold_isosurface"></div>
+<div id="Index_Entry_keyword_threshold"></div>
+<p>Using <code>threshold</code> specifies how much strength, or substance to give the <code>isosurface</code>. The surface appears where the <code>function</code> value equals the <code>threshold</code> value. See above for the listed default value.</p>
+<div id="Index_Entry_accuracy_isosurface"></div>
+<div id="Index_Entry_keyword_accuracy"></div> 
+<p>The <code>isosurface</code> resolver uses a recursive subdivision method. This subdivision goes on until the length of the interval where POV-Ray finds a surface point is less than the specified <code>accuracy</code>. See above for the listed default value. Be aware that smaller values produce more accurate surfaces, but takes longer to render.</p>
+<div id="Index_Entry_max_gradient_isosurface"></div>
+<div id="Index_Entry_keyword_max_gradient"></div> 
+<p>POV-Ray can find the first intersecting point between a ray and the <code>isosurface</code> of any continuous function if the maximum gradient of the function is known. To that end you can specify a <code>max_gradient</code> for the function. See above for the listed default value. When the <code>max_gradient</code> used to find the intersecting point is too high, the render slows down considerably. Conversely, when it is too low, artifacts or holes may appear on the isosurface, and in some cases when it is way too low, the surface does not show at all. While rendering the <code>isosurface</code> POV-Ray stores the found gradient values and issues a warning, if these values are either higher or much lower than the specified <code>max_gradient</code> value:</p>
+<pre>Warning: The maximum gradient found was 5.257, but max_gradient of
+the isosurface was set to 5.000. The isosurface may contain holes!
+Adjust max_gradient to get a proper rendering of the isosurface.
+</pre>
+<pre>Warning: The maximum gradient found was 5.257, but max_gradient of
+the isosurface was set to 7.000. Adjust max_gradient to
+get a faster rendering of the isosurface.
+</pre>
+<div id="Index_Entry_evaluate_isosurface"></div>
+<div id="Index_Entry_keyword_evaluate"></div>
+<div id="Index_Entry_dynamic_max_gradient"></div>
+<p>For best performance you should specify a value close to the real maximum gradient.</p>
+<p><em>Isosurfaces</em> can also dynamically adapt the used <code>max_gradient</code>. To activate this technique you have to specify the <code>evaluate</code> keyword followed by these three parameters:</p>
+<ul>
+  <li><strong>P0:</strong> the minimum <code>max_gradient</code> in the estimation process.</li>
+  <li><strong>P1:</strong> an over-estimating factor. That is, the <code>max_gradient</code> is multiplied by the <em>P1</em> parameter.</li>
+  <li><strong>P2:</strong> an attenuation parameter of 1 or less</li>
+</ul>
+<p>In this case POV-Ray starts with the <code>max_gradient</code> value <em>P0</em> and dynamically changes it during the render using <em>P1</em> and <em>P2</em>. In the evaluation process, the <em>P1</em> and <em>P2</em> parameters are used in
+quadratic functions. This means that over-estimation increases more rapidly with higher values and attenuates more rapidly with lower values. It should also be noted that when using dynamic <code>max_gradient</code>, there can be artifacts or holes.</p>
+<p>If you are unsure what values to use, just start a render <em>without</em> using <code>evaluate</code> to get a value for the <code>max_gradient</code>, then use that value with <code>evaluate</code> like this:</p>
+<ul>
+  <li><strong>P0:</strong> <code>max_gradient * Min_Factor</code></li>
+  <li><strong>P1:</strong> <code>sqrt(max_gradient/(max_gradient * Min_Factor))</code></li>
+  <li><strong>P2:</strong> should be 1 or less use 0.7 as a good starting point.</li>
+</ul>
+<p>Where <em>Min_Factor</em> is a float between 0 and 1 to reduce the <code>max_gradient</code> to a <em>minimum</em> <code>max_gradient</code>. The ideal value for <em>P0</em> would be the average of the found maximum gradients, but we do not
+have access to that information. A good starting point for <em>Min_Factor</em> is 0.6</p>
+<p>If there are artifacts or holes in the <code>isosurface</code>, you can just increase <em>Min_Factor</em> and / or <em>P2</em>. For Example: when the first run gives a <em>found</em> <code>max_gradient</code> of 356, start with:</p>
+<pre>#declare Min_factor= 0.6;
+isosurface {
+  ...
+  evaluate 356*Min_factor,  sqrt(356/(356*Min_factor)),  0.7
+  //evaluate 213.6, 1.29, 0.7
+  ...
+  }
+</pre>
+<p>This method is only an approximation of what happens internally, but it gives faster rendering speeds with the majority of <em>isosurfaces</em>.</p>
+<div id="Index_Entry_open_isosurface"></div>
+<div id="Index_Entry_keyword_open"></div> 
+<p>When the <code>isosurface</code> is not fully contained within the <code>contained_by</code> object, there will be a cross section. When this happens, you will see the surface of the container. Using the <code>open</code> keyword, these cross section surfaces are removed, and the inside of the <code>isosurface</code> becomes visible.</p>
+<p class="Note"><strong>Note:</strong> Using <code>open</code> slows down the render speed, and it is not recommended for use with CSG operations.</p>
+<div id="Index_Entry_max_trace_isosurface"></div>
+<div id="Index_Entry_keyword_max_trace"></div> 
+<div id="Index_Entry_all_intersections_isosurface"></div>
+<div id="Index_Entry_keyword_all_intersections"></div>
+<p><em>Isosurfaces</em> can be used in CSG shapes since they are solid finite objects - if not finite by themselves, they are through the cross section with the container. By default POV-Ray searches only for the first surface which the ray intersects. However, when using an <code>isosurface</code> in CSG operations, the other surfaces must also be found. Consequently, the keyword <code>max_trace</code> followed by an integer value, must be added to the <code>isosurface</code> statement. To check for all surfaces, use the keyword <code>all_intersections</code> instead. With <code>max_trace</code> it only checks until that number is reached.</p>
+<p class="Note"><strong>Note:</strong> The current implementation has a <em>limit</em> of 10 <em>intersections</em> in all cases.</p>
+<p>By default, the inside of an <code>isosurface</code> is defined as the set of all points inside the <code>contained_by</code> shape where the function values are below the threshold. <font style="font-size:1.05em;color:#3300cc;font-weight:bold;font-style:oblique;">New</font> in version 3.8 this can be changed via the <code>polarity</code> keyword. Specifying a <em>positive</em> setting or <code>on</code> will instead cause function values <em>above</em> the threshold to be considered inside. Specifying a <em>negative</em> setting or <code>off</code> will give the default behavior.</p>
+<!-- 
+NewPP limit report
+Cached time: 20260713094646
+Cache expiry: 86400
+Dynamic content: false
+Complications: []
+CPU time usage: 0.037 seconds
+Real time usage: 0.046 seconds
+Preprocessor visited node count: 72/1000000
+Post‐expand include size: 1293/2097152 bytes
+Template argument size: 0/2097152 bytes
+Highest expansion depth: 2/40
+Expensive parser function count: 0/100
+Unstrip recursion depth: 0/20
+Unstrip post‐expand size: 1073/5000000 bytes
+-->
+<!--
+Transclusion expansion time report (%,ms,calls,template)
+100.00%   15.952      1 -total
+ 21.57%    3.441      2 Template:New
+-->
+
+<!-- Saved in parser cache with key wikidb:pcache:idhash:2282-0!canonical and timestamp 20260713094646 and revision id 9248
+ -->
+</div></div><div class="printfooter">Retrieved from "<a dir="ltr" href="https://wiki.povray.org/content?title=Reference:Isosurface&amp;oldid=9248">https://wiki.povray.org/content?title=Reference:Isosurface&amp;oldid=9248</a>"</div>
+		<div id="catlinks" class="catlinks" data-mw="interface"><div id="mw-normal-catlinks" class="mw-normal-catlinks"><a href="https://wiki.povray.org/content/Special:Categories" title="Special:Categories">Categories</a>: <ul><li><a href="https://wiki.povray.org/content/Category:Objects" class="mw-redirect" title="Category:Objects">Objects</a></li><li><a href="https://wiki.povray.org/content/Category:Finite_Solid_Primitives" class="mw-redirect" title="Category:Finite Solid Primitives">Finite Solid Primitives</a></li></ul></div></div>
+	</div>
+</div>
+
+<div id="mw-navigation">
+	<h2>Navigation menu</h2>
+	<div id="mw-head">
+		<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-personal" class="vector-menu" aria-labelledby="p-personal-label" role="navigation">
+	<h3 id="p-personal-label">
+		<span>Personal tools</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="pt-login"><a href="https://wiki.povray.org/content?title=Special:UserLogin&amp;returnto=Reference%3AIsosurface" title="You are encouraged to log in; however, it is not mandatory [alt-shift-o]" accesskey="o">Log in</a></li></ul>
+		
+	</div>
+</nav>
+
+
+		<div id="left-navigation">
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-namespaces" class="vector-menu vector-menu-tabs vectorTabs" aria-labelledby="p-namespaces-label" role="navigation">
+	<h3 id="p-namespaces-label">
+		<span>Namespaces</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="ca-nstab-reference" class="selected"><a href="https://wiki.povray.org/content/Reference:Isosurface">Reference</a></li><li id="ca-talk" class="new"><a href="https://wiki.povray.org/content?title=Reference_Talk:Isosurface&amp;action=edit&amp;redlink=1" rel="discussion" title="Discussion about the content page (page does not exist) [alt-shift-t]" accesskey="t">Discussion</a></li></ul>
+		
+	</div>
+</nav>
+
+
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-variants" class="vector-menu-empty emptyPortlet vector-menu vector-menu-dropdown vectorMenu" aria-labelledby="p-variants-label" role="navigation">
+	<input type="checkbox" class="vector-menu-checkbox vectorMenuCheckbox" aria-labelledby="p-variants-label">
+	<h3 id="p-variants-label">
+		<span>Variants</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="menu vector-menu-content-list"></ul>
+		
+	</div>
+</nav>
+
+
+		</div>
+		<div id="right-navigation">
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-views" class="vector-menu vector-menu-tabs vectorTabs" aria-labelledby="p-views-label" role="navigation">
+	<h3 id="p-views-label">
+		<span>Views</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="ca-view" class="collapsible selected"><a href="https://wiki.povray.org/content/Reference:Isosurface">Read</a></li><li id="ca-viewsource" class="collapsible"><a href="https://wiki.povray.org/content?title=Reference:Isosurface&amp;action=edit" title="This page is protected.
+You can view its source [alt-shift-e]" accesskey="e">View source</a></li><li id="ca-history" class="collapsible"><a href="https://wiki.povray.org/content?title=Reference:Isosurface&amp;action=history" title="Past revisions of this page [alt-shift-h]" accesskey="h">View history</a></li></ul>
+		
+	</div>
+</nav>
+
+
+			<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-cactions" class="vector-menu-empty emptyPortlet vector-menu vector-menu-dropdown vectorMenu" aria-labelledby="p-cactions-label" role="navigation">
+	<input type="checkbox" class="vector-menu-checkbox vectorMenuCheckbox" aria-labelledby="p-cactions-label">
+	<h3 id="p-cactions-label">
+		<span>More</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="menu vector-menu-content-list"></ul>
+		
+	</div>
+</nav>
+
+
+			<div id="p-search" role="search">
+	<h3>
+		<label for="searchInput">Search</label>
+	</h3>
+	<form action="https://wiki.povray.org/content" id="searchform">
+		<div id="simpleSearch">
+			<input type="search" name="search" placeholder="Search POV-Wiki" title="Search POV-Wiki [alt-shift-f]" accesskey="f" id="searchInput">
+			<input type="hidden" name="title" value="Special:Search">
+			<input type="submit" name="fulltext" value="Search" title="Search the pages for this text" id="mw-searchButton" class="searchButton mw-fallbackSearchButton">
+			<input type="submit" name="go" value="Go" title="Go to a page with this exact name if it exists" id="searchButton" class="searchButton">
+		</div>
+	</form>
+</div>
+
+		</div>
+	</div>
+	
+<div id="mw-panel">
+	<div id="p-logo" role="banner">
+		<a title="Visit the main page" class="mw-wiki-logo" href="https://wiki.povray.org/content/Main_Page"></a>
+	</div>
+	<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-Content" class="vector-menu vector-menu-portal portal portal-first" aria-labelledby="p-Content-label" role="navigation">
+	<h3 id="p-Content-label">
+		<span>Content</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="n-mainpage"><a href="https://wiki.povray.org/content/Main_Page" title="Visit the main page [alt-shift-z]" accesskey="z">Main Page</a></li><li id="n-How-Tos"><a href="https://wiki.povray.org/content/HowTo:Contents">How Tos</a></li><li id="n-Knowledge-Base"><a href="https://wiki.povray.org/content/Knowledgebase:Contents">Knowledge Base</a></li><li id="n-Documentation"><a href="https://wiki.povray.org/content/Documentation:Contents">Documentation</a></li><li id="n-help"><a href="https://wiki.povray.org/content/Special:MyLanguage/Help:Contents" title="The place to find out">Help</a></li></ul>
+		
+	</div>
+</nav>
+
+
+	<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-Other Pages" class="vector-menu vector-menu-portal portal" aria-labelledby="p-Other Pages-label" role="navigation">
+	<h3 id="p-Other Pages-label">
+		<span>Other Pages</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="n-about"><a href="https://wiki.povray.org/content/wiki.povray.org:About">About POV-Wiki</a></li><li id="n-Main-POV-Ray-Site"><a href="http://www.povray.org/" rel="nofollow">Main POV-Ray Site</a></li><li id="n-Recent-Changes"><a href="https://wiki.povray.org/content/Special:RecentChanges">Recent Changes</a></li></ul>
+		
+	</div>
+</nav>
+
+<!-- Please do not use role attribute as CSS selector, it is deprecated. -->
+<nav id="p-tb" class="vector-menu vector-menu-portal portal" aria-labelledby="p-tb-label" role="navigation">
+	<h3 id="p-tb-label">
+		<span>Tools</span>
+	</h3>
+	<!-- Please do not use the .body class, it is deprecated. -->
+	<div class="body vector-menu-content">
+		<!-- Please do not use the .menu class, it is deprecated. -->
+		<ul class="vector-menu-content-list"><li id="t-whatlinkshere"><a href="https://wiki.povray.org/content/Special:WhatLinksHere/Reference:Isosurface" title="A list of all wiki pages that link here [alt-shift-j]" accesskey="j">What links here</a></li><li id="t-recentchangeslinked"><a href="https://wiki.povray.org/content/Special:RecentChangesLinked/Reference:Isosurface" rel="nofollow" title="Recent changes in pages linked from this page [alt-shift-k]" accesskey="k">Related changes</a></li><li id="t-specialpages"><a href="https://wiki.povray.org/content/Special:SpecialPages" title="A list of all special pages [alt-shift-q]" accesskey="q">Special pages</a></li><li id="t-print"><a href="javascript:print();" rel="alternate" title="Printable version of this page [alt-shift-p]" accesskey="p">Printable version</a></li><li id="t-permalink"><a href="https://wiki.povray.org/content?title=Reference:Isosurface&amp;oldid=9248" title="Permanent link to this revision of the page">Permanent link</a></li><li id="t-info"><a href="https://wiki.povray.org/content?title=Reference:Isosurface&amp;action=info" title="More information about this page">Page information</a></li></ul>
+		
+	</div>
+</nav>
+
+
+	
+</div>
+
+</div>
+
+<footer id="footer" class="mw-footer" role="contentinfo">
+	<ul id="footer-info">
+		<li id="footer-info-lastmod"> This page was last edited on 30 June 2017, at 08:47.</li>
+		<li id="footer-info-copyright">Content is available under <a href="https://wiki.povray.org/content/wiki.povray.org:Copyrights" title="wiki.povray.org:Copyrights">a Creative Commons Attribution-Noncommercial-ShareAlike 2.5 license</a> unless otherwise noted.</li>
+	</ul>
+	<ul id="footer-places">
+		<li id="footer-places-privacy"><a href="https://wiki.povray.org/content/wiki.povray.org:Privacy_policy" title="wiki.povray.org:Privacy policy">Privacy policy</a></li>
+		<li id="footer-places-about"><a href="https://wiki.povray.org/content/wiki.povray.org:About" title="wiki.povray.org:About">About POV-Wiki</a></li>
+		<li id="footer-places-disclaimer"><a href="https://wiki.povray.org/content/wiki.povray.org:General_disclaimer" title="wiki.povray.org:General disclaimer">Disclaimers</a></li>
+	</ul>
+	<ul id="footer-icons" class="noprint">
+		<li id="footer-copyrightico"><a href="http://creativecommons.org/licenses/by-nc-sa/2.5/au/"><img src="./Reference_Isosurface - POV-Wiki_files/cc-by-nc-sa.png" alt="a Creative Commons Attribution-Noncommercial-ShareAlike 2.5 license" width="88" height="31" loading="lazy"></a></li>
+		<li id="footer-poweredbyico"><a href="https://www.mediawiki.org/"><img src="./Reference_Isosurface - POV-Wiki_files/poweredby_mediawiki_88x31.png" alt="Powered by MediaWiki" srcset="/resources/assets/poweredby_mediawiki_132x47.png 1.5x, /resources/assets/poweredby_mediawiki_176x62.png 2x" width="88" height="31" loading="lazy"></a></li>
+	</ul>
+	<div style="clear: both;"></div>
+</footer>
+
+
+
+<script>(RLQ=window.RLQ||[]).push(function(){mw.config.set({"wgPageParseReport":{"limitreport":{"cputime":"0.037","walltime":"0.046","ppvisitednodes":{"value":72,"limit":1000000},"postexpandincludesize":{"value":1293,"limit":2097152},"templateargumentsize":{"value":0,"limit":2097152},"expansiondepth":{"value":2,"limit":40},"expensivefunctioncount":{"value":0,"limit":100},"unstrip-depth":{"value":0,"limit":20},"unstrip-size":{"value":1073,"limit":5000000},"timingprofile":["100.00%   15.952      1 -total"," 21.57%    3.441      2 Template:New"]},"cachereport":{"timestamp":"20260713094646","ttl":86400,"transientcontent":false}}});mw.config.set({"wgBackendResponseTime":223});});</script>
+</body></html>

@@ -1,32 +1,36 @@
-# Gallery Hall — the showcase room, rebuilt. A large museum hall lit by a SINGLE warm
-# bulb, every hero piece resting (pybullet-settled) on its own museum stand — the stands
-# vary in dimensions, parts (base / column / cap) and stone/wood material. The gold GYROID
-# lattice ball sits close-up on the centre line in plain view; a second, smaller DIAMOND
-# gyroid (very high IOR, dispersive) throws coloured caustics from the left. A relocated
-# glass sphere (front-right, off the gyroid's sight-line), an intricate glass KLEIN bottle,
-# a morpho-iridescent algebraic HEART, a chrome MIRROR ring, and two brass CSG studies
-# (a fused cluster and a dumbbell-ring) fill out the set. A puffy CLOUD (bounded isosurface
-# density fog, a few lobes bolted together) hangs near the ceiling in the back-left corner.
+# Hero Room — the showcase still AND the showcase flyby scene.
 #
-# This is BOTH the showcase still and the showcase flyby scene. The flyby (`camera_curve
-# "fly"`) is a seamless closed loop that threads the gold gyroid's empty air channels and
-# passes straight THROUGH the glass sphere.
+# A WIDE, shallow museum hall (10 m wide x 7 m deep x 3.4 m tall — wider than long) lit by
+# a SINGLE small bulb: a socket-hung sphere the size of a real lamp envelope, given a
+# XENON SHORT-ARC spectrum (modelled as a 6000 K Planckian — the project's validated
+# xenon proxy, see data/README.md, confirmed vs Osram XBO / Ushio UXL). No area light.
 #
-# Pipeline: this file is the AUTHORED source (hero objects hover just above their stands).
-# Run tools/settle_scene.py to drop the physical pieces onto their stands, producing the
-# render-ready scenes/gallery_settled.ftsl:
+# Every hero piece rests (pybullet-settled) on its own museum stand; the stands vary in
+# dimensions, parts, and stone/wood material. All pieces are kept in a CENTRAL x-band so
+# the rectilinear (pinhole) lens doesn't elongate anything against the side walls.
+#
+# Hero set: the gold GYROID lattice ball (close-up, plain view, centrepiece); a clear
+# DIAMOND gyroid (very high IOR + dispersion -> real coloured caustics — the substitute
+# for the missing gyref_gyroid_adaptive mesh, a native isosurface so refraction uses the
+# analytic-ish gradient normal); a glass SPHERE the flyby dives through; a clear glass
+# KLEIN bottle; a tilted iridescent (MORPHO) algebraic HEART; a chrome MIRROR ring; an
+# OIL-SLICK iridescent jack (a second iridescent, different structural-colour model than
+# the morpho); and two brass CSG studies (a fused CLUSTER and a DUMBBELL-ring). A puffy
+# CLOUD (bounded heterogeneous isosurface-fog, a few lobes) hangs near the ceiling in the
+# back-left corner.
+#
+# Pipeline: this is the AUTHORED source (settled pieces hover just above their stands).
+# Run tools/settle_scene.py to drop them onto the stands, producing gallery_settled.ftsl:
 #   python tools/settle_scene.py --scene scenes/gallery.ftsl \
-#       --settle klein,heart,brass_cluster,brass_dumbbell --out scenes/gallery_settled.ftsl
-# The two gyroids, the chrome ring and the glass sphere are placed at ANALYTIC rest (a
-# lattice ball / ring / sphere resting tangent on its stand) and left OUT of the settle:
-# the threaded gyroid must keep its exact channel alignment with the flight path, and a
-# pybullet pose on a non-watertight lattice would rotate the channels off the camera path.
+#       --settle klein,heart,brass_cluster,brass_dumbbell,oiljack --out scenes/gallery_settled.ftsl
+# The gyroids, the chrome ring and the glass sphere are placed at ANALYTIC rest and left
+# OUT of the settle (the threaded gyroid must keep its exact channel/path alignment; a
+# pybullet pose on a non-watertight lattice would rotate the channel off the flight path).
 #
 # Render (still, mode D resolves the bounded cloud + dispersive caustics through glass):
-#   ftrace -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 2 -window -o png/gallery.png
-# Render (flyby, mode B = shared forward photon flight across all cameras — the multi-frame
-# speedup — which also images the bounded cloud on the camera side):
-#   ftrace -in scenes/gallery_settled.ftsl -mode B -device gpu -spp 16 -r 640 360 -window -o png/fly.png
+#   ftrace -in scenes/gallery_settled.ftsl -camera cam -mode D -noise 2 -window -o png/room.png
+# Render (flyby, mode M = photon-map: build one stored map, reuse it for every frame):
+#   ftrace -in scenes/gallery_settled.ftsl -mode M -spp 8 -r 960 540 -window -o png/roomfly.png
 
 scene { units meters  spectral 360 830 1 }
 
@@ -44,157 +48,172 @@ material "walnut"    { type diffuse  reflect rgb 0.30 0.18 0.10 }   # warm wood
 material "slate"     { type diffuse  reflect rgb 0.30 0.34 0.38 }   # blue-grey slate
 material "sandstone" { type diffuse  reflect rgb 0.60 0.49 0.34 }   # warm sandstone
 material "basalt"    { type diffuse  reflect rgb 0.17 0.17 0.19 }   # dark basalt
+material "travertine"{ type diffuse  reflect rgb 0.66 0.58 0.46 }   # cream travertine
+material "socketmat" { type diffuse  reflect rgb 0.05 0.05 0.06 }   # dark lamp socket
 
 # --- Hero-object materials -----------------------------------------------------
-material "gold"    { preset gold }
-material "chrome"  { preset chrome }
-material "brass"   { preset brass }
-material "glass"   { type dielectric ior glass:BK7 }
-material "diamond" { preset diamond }    # very high IOR (~2.42) + dispersion -> coloured caustics
-material "morpho"  { preset morpho }     # iridescent thin-film (blue morpho)
+material "gold"     { preset gold }
+material "chrome"   { preset chrome }
+material "brass"    { preset brass }
+material "glass"    { type dielectric ior glass:BK7 }
+material "diamond"  { preset diamond }      # n~2.42 + dispersion -> coloured caustics
+material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue morpho)
+material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
 
-# --- The hall: 9 wide (x) x 4.5 tall (y) x 15.5 deep (z). Camera sits well back
-# (z~14.4) with a NARROW 44deg lens so the outer pieces stay inside ~22deg of the axis,
-# where a rectilinear lens's off-axis solid-angle stretch is negligible. Every hero
-# piece is kept within x in [3.0, 6.0] so nothing hugs a side wall and gets elongated. ---
-quad { origin 0 0 0    u 9 0 0    v 0 0 15.5   material floor }   # floor
-quad { origin 0 4.5 0  u 0 0 15.5 v 9 0 0      material ceil  }   # ceiling
-quad { origin 0 0 0    u 0 4.5 0  v 9 0 0      material teal  }   # back  (z=0)
-quad { origin 0 0 15.5 u 0 4.5 0  v 9 0 0      material ceil  }   # front (z=15.5, behind camera)
-quad { origin 0 0 0    u 0 0 15.5 v 0 4.5 0    material red   }   # left  (x=0)
-quad { origin 9 0 0    u 0 4.5 0  v 0 0 15.5   material green }   # right (x=9)
+# --- The hall: 10 wide (x) x 7 deep (z) x 3.4 tall (y). Camera sits at the front
+# (z~6.55) with a moderate lens; every hero piece is kept within x in [3.2, 6.8] so
+# nothing hugs a side wall and stretches under the rectilinear projection. ----------
+quad { origin 0 0 0    u 10 0 0   v 0 0 7      material floor }   # floor
+quad { origin 0 3.4 0  u 0 0 7    v 10 0 0     material ceil  }   # ceiling
+quad { origin 0 0 0    u 0 3.4 0  v 10 0 0     material teal  }   # back  (z=0)
+quad { origin 0 0 7    u 0 3.4 0  v 10 0 0     material ceil  }   # front (z=7, behind camera)
+quad { origin 0 0 0    u 0 0 7    v 0 3.4 0    material red   }   # left  (x=0)
+quad { origin 10 0 0   u 0 3.4 0  v 0 0 7      material green }   # right (x=10)
 
 # ==============================  MUSEUM STANDS  ================================
-# Each stand is one isosurface = a union of a broad BASE slab, a narrower COLUMN, and a
-# thin CAP, with the parts' dimensions varied per stand and a different stone/wood
-# material each. They are NAMED so tools/settle_scene.py treats them as STATIC colliders
-# the hero pieces come to rest on (the settle drops only the physical objects, below).
+# Each stand = one isosurface union of a BASE slab, a COLUMN, and a thin CAP, with the
+# parts' dimensions varied per stand and a different stone/wood material each. NAMED so
+# settle_scene.py treats them as STATIC colliders the hero pieces come to rest on.
 
-isosurface "stand_gyroid" {   # centrepiece: broad low granite plinth, top y=0.60
+isosurface "stand_gyroid" {   # centrepiece: broad low granite plinth, top y=0.55
     material granite  union {
-        box { center 4.5 0.12 9.770  size 2.10 0.24 2.10  round 0.04 }
-        box { center 4.5 0.42 9.770  size 1.70 0.36 1.70  round 0.03 }
+        box { center 5.0 0.12 4.8  size 2.10 0.24 2.10  round 0.04 }
+        box { center 5.0 0.42 4.8  size 1.66 0.26 1.66  round 0.03 }
     }
 }
-isosurface "stand_orb" {      # front-right pale-marble pedestal, top y=0.90
+isosurface "stand_glass" {    # right-front pale-marble pedestal, top y=0.90
     material marble  union {
-        box { center 5.6 0.09 12.0  size 0.86 0.18 0.86  round 0.03 }
-        box { center 5.6 0.52 12.0  size 0.40 0.68 0.40  round 0.02 }
-        box { center 5.6 0.87 12.0  size 0.60 0.06 0.60  round 0.02 }
+        box { center 6.2 0.09 3.5  size 0.90 0.18 0.90  round 0.03 }
+        box { center 6.2 0.52 3.5  size 0.42 0.68 0.42  round 0.02 }
+        box { center 6.2 0.885 3.5 size 0.62 0.03 0.62  round 0.02 }
     }
 }
-isosurface "stand_diamond" {  # tall thin walnut jewel-column, top y=0.80
+isosurface "stand_diamond" {  # tall thin walnut jewel-column, top y=0.85
     material walnut  union {
-        box { center 3.2 0.10 8.2  size 0.60 0.20 0.60  round 0.03 }
-        box { center 3.2 0.47 8.2  size 0.24 0.54 0.24  round 0.02 }
-        box { center 3.2 0.77 8.2  size 0.42 0.06 0.42  round 0.02 }
+        box { center 3.5 0.10 3.6  size 0.60 0.20 0.60  round 0.03 }
+        box { center 3.5 0.50 3.6  size 0.24 0.62 0.24  round 0.02 }
+        box { center 3.5 0.825 3.6 size 0.44 0.05 0.44  round 0.02 }
     }
 }
-isosurface "stand_klein" {    # slate column, top y~1.00
+isosurface "stand_klein" {    # slate column, top y=1.00
     material slate  union {
-        box { center 5.7 0.11 7.4  size 0.72 0.22 0.72  round 0.03 }
-        box { center 5.7 0.59 7.4  size 0.34 0.74 0.34  round 0.02 }
-        box { center 5.7 0.98 7.4  size 0.52 0.06 0.52  round 0.02 }
+        box { center 5.9 0.11 2.6  size 0.72 0.22 0.72  round 0.03 }
+        box { center 5.9 0.60 2.6  size 0.34 0.76 0.34  round 0.02 }
+        box { center 5.9 0.985 2.6 size 0.52 0.03 0.52  round 0.02 }
+    }
+}
+isosurface "stand_dumbbell" { # granite column, top y=0.88
+    material granite  union {
+        box { center 4.5 0.11 2.7  size 0.66 0.22 0.66  round 0.03 }
+        box { center 4.5 0.54 2.7  size 0.34 0.66 0.34  round 0.02 }
+        box { center 4.5 0.865 2.7 size 0.50 0.03 0.50  round 0.02 }
     }
 }
 isosurface "stand_chrome" {   # warm sandstone column, top y=0.90
     material sandstone  union {
-        box { center 3.0 0.10 5.4  size 0.74 0.20 0.74  round 0.03 }
-        box { center 3.0 0.55 5.4  size 0.30 0.70 0.30  round 0.02 }
-        box { center 3.0 0.87 5.4  size 0.50 0.06 0.50  round 0.02 }
+        box { center 3.5 0.10 2.0  size 0.74 0.20 0.74  round 0.03 }
+        box { center 3.5 0.55 2.0  size 0.30 0.70 0.30  round 0.02 }
+        box { center 3.5 0.885 2.0 size 0.50 0.03 0.50  round 0.02 }
     }
 }
-isosurface "stand_brass05" {  # dark basalt column, top y~0.96
-    material basalt  union {
-        box { center 5.8 0.12 4.4  size 0.70 0.24 0.70  round 0.03 }
-        box { center 5.8 0.60 4.4  size 0.36 0.72 0.36  round 0.02 }
-        box { center 5.8 0.94 4.4  size 0.54 0.05 0.54  round 0.02 }
-    }
-}
-isosurface "stand_heart" {    # marble column, top y~1.00
+isosurface "stand_heart" {    # marble column, top y=1.00
     material marble  union {
-        box { center 3.4 0.11 3.4  size 0.68 0.22 0.68  round 0.03 }
-        box { center 3.4 0.60 3.4  size 0.32 0.76 0.32  round 0.02 }
-        box { center 3.4 0.99 3.4  size 0.50 0.05 0.50  round 0.02 }
+        box { center 4.6 0.11 1.9  size 0.68 0.22 0.68  round 0.03 }
+        box { center 4.6 0.60 1.9  size 0.32 0.76 0.32  round 0.02 }
+        box { center 4.6 0.985 1.9 size 0.50 0.03 0.50  round 0.02 }
     }
 }
-isosurface "stand_brass09" {  # granite column, top y=0.90
-    material granite  union {
-        box { center 4.5 0.11 2.8  size 0.66 0.22 0.66  round 0.03 }
-        box { center 4.5 0.55 2.8  size 0.34 0.68 0.34  round 0.02 }
-        box { center 4.5 0.87 2.8  size 0.50 0.06 0.50  round 0.02 }
+isosurface "stand_brass" {    # dark basalt column, top y=0.95
+    material basalt  union {
+        box { center 6.0 0.12 2.0  size 0.70 0.24 0.70  round 0.03 }
+        box { center 6.0 0.58 2.0  size 0.36 0.68 0.36  round 0.02 }
+        box { center 6.0 0.935 2.0 size 0.54 0.03 0.54  round 0.02 }
+    }
+}
+isosurface "stand_oil" {      # cream travertine column, top y=0.92
+    material travertine  union {
+        box { center 5.3 0.10 1.5  size 0.64 0.20 0.64  round 0.03 }
+        box { center 5.3 0.55 1.5  size 0.30 0.70 0.30  round 0.02 }
+        box { center 5.3 0.905 1.5 size 0.46 0.03 0.46  round 0.02 }
     }
 }
 
 # ==============================  HERO PIECES  =================================
 
-# --- GOLD GYROID (centrepiece, close-up, in plain view; NOT settled — threaded) -------
-# The k=10 lattice ball, IDENTICAL to the long-standing definition but translated +6 full
-# lattice periods in z (6 * 2*pi/10 = 3.76991), which moves it close to the camera while
-# leaving the periodic field EXACTLY phase-invariant: the empty air channel the flyby
-# threads is unchanged, so the flight's channel control points simply shift by the same
-# +3.76991 in z. Clip bottom sits at y=0.60 = stand_gyroid top.
+# --- GOLD GYROID (centrepiece, close-up, plain view; NOT settled — threaded) -----------
+# The long-standing k=10 / T=0.45 lattice ball, translated as a rigid unit to the new
+# front-centre. The flyby's channel control points are the same validated threaded points,
+# shifted by the SAME translation, so the empty-air tunnel still lines up exactly.
+# Clip bottom sits at y=0.55 = stand_gyroid top.
 isosurface "gyroid" {
     material gold
     intersect {
         function {
-            translate 4.5 1.38 9.770
+            translate 5.0 1.33 4.8
             expr "abs(sin(10*x)*cos(10*y) + sin(10*y)*cos(10*z) + sin(10*z)*cos(10*x)) - 0.45"
         }
-        sphere { center 4.5 1.38 9.770   radius 0.78 }
+        sphere { center 5.0 1.33 4.8   radius 0.78 }
     }
-    contained_by { min 3.70 0.58 8.970   max 5.30 2.18 10.570 }
+    contained_by { min 4.20 0.53 4.00   max 5.80 2.13 5.60 }
     max_gradient 40
 }
 
-# --- DIAMOND GYROID (coloured-caustic gem, left-mid; NOT settled) ---------------------
-# Replaces the missing gyref_gyroid_adaptive mesh with a NATIVE isosurface: a finer k=13
-# lattice clipped to a small sphere, in `diamond` (n~2.42, strongly dispersive). The high
-# IOR tightens its refractive focus and the dispersion splays the caustic into real colour
-# across its walnut stand. Clip bottom y=0.80 = stand_diamond top.
+# --- DIAMOND GYROID (coloured-caustic gem; NOT settled) --------------------------------
+# A finer k=13 lattice clipped to a small sphere in `diamond` (n~2.42, dispersive): the
+# high IOR tightens its refractive focus and the dispersion splays the caustic into real
+# colour across its walnut stand. Substitute for the missing gyref_gyroid_adaptive mesh.
+# Clip bottom y=0.85 = stand_diamond top.
 isosurface "gyroid_gem" {
     material diamond
     intersect {
         function {
-            translate 3.2 1.30 8.2
+            translate 3.5 1.35 3.6
             expr "abs(sin(13*x)*cos(13*y) + sin(13*y)*cos(13*z) + sin(13*z)*cos(13*x)) - 0.55"
         }
-        sphere { center 3.2 1.30 8.2   radius 0.50 }
+        sphere { center 3.5 1.35 3.6   radius 0.50 }
     }
-    contained_by { min 2.66 0.76 7.66   max 3.74 1.84 8.74 }
+    contained_by { min 3.00 0.85 3.10   max 4.00 1.85 4.10 }
     max_gradient 52
 }
 
-# --- GLASS SPHERE (relocated front-right, OFF the gyroid's sight-line; NOT settled) ---
+# --- GLASS SPHERE (fly-through orb; NOT settled — analytic rest) -----------------------
 # A plain BK7 orb resting tangent on its marble pedestal (centre y = 0.90 top + 0.5 r).
-# The flyby passes straight THROUGH it on the return curl. Kept at x=5.6 so it reads to
-# the RIGHT of the centred gyroid, never occluding it.
-sphere { center 5.6 1.40 12.0   radius 0.5   material glass }
+# The flyby dives straight THROUGH it. Native sphere for exact analytic refraction.
+sphere { center 6.2 1.40 3.5   radius 0.5   material glass }
 
-# --- KLEIN BOTTLE in glass (intricate transparent piece, right-mid; SETTLED) ----------
+# --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
 mesh "klein" {
     file "scraps/klein_staged.obj"
-    translate 5.7 1.55 7.4   rotate 8 40 0   scale 1.4
+    translate 5.9 1.70 2.6   rotate 8 40 0   scale 1.4
     material glass
 }
 
-# --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue (left-back; SETTLED) -
-isosurface "heart" {
-    material morpho
-    translate 2.975 1.075 2.975   scale 0.85
-    function {
-        translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
-        expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
+# --- BRASS DUMBBELL-ring (gallery pick 09): two spheres joined by a fused bar + ring,
+# with a small bite bored out; SETTLED. ---
+isosurface "brass_dumbbell" {
+    material brass
+    translate 4.16 1.00 2.36   scale 0.78
+    difference {
+    smooth_union { k 0.046
+        smooth_union { k 0.033
+        smooth_union { k 0.032
+        sphere { center 0.340 0.500 0.500  radius 0.150 }
+        sphere { center 0.660 0.500 0.500  radius 0.150 }
     }
-    contained_by { min 0.14 0.14 0.2   max 0.86 0.86 0.8 }
-    max_gradient 60
+        cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
+    }
+        torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.150  minor 0.045 }
+    }
+    sphere { center 0.369 0.528 0.501  radius 0.067 }
+    }
+    contained_by { min 0.08 0.08 0.12   max 0.92 0.92 0.88 }
 }
 
 # --- BRASS CSG cluster (gallery pick 05): nested smooth_union of spheres+tori with two
-# spheres bored out (right-back; SETTLED). SDF leaves stay unit-Lipschitz, no max_gradient. -
+# spheres bored out; SETTLED. SDF leaves stay unit-Lipschitz, no max_gradient. ---
 isosurface "brass_cluster" {
     material brass
-    translate 5.4 0.95 4.0   scale 0.8
+    translate 5.6 1.10 1.6   scale 0.8
     difference {
     difference {
     smooth_union { k 0.038
@@ -223,107 +242,115 @@ isosurface "brass_cluster" {
     contained_by { min 0.12 0.12 0.22   max 0.88 0.88 0.78 }
 }
 
+# --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue, tilted; SETTLED. -----
+isosurface "heart" {
+    material morpho
+    translate 4.30 1.20 1.75   scale 0.85
+    function {
+        translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
+        expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
+    }
+    contained_by { min 0.14 0.14 0.2   max 0.86 0.86 0.8 }
+    max_gradient 60
+}
+
+# --- OIL-SLICK iridescent JACK (2nd iridescent — thin-film rainbow, different structural
+# model + colour than the morpho heart): three fused orthogonal capsules; SETTLED. ------
+isosurface "oiljack" {
+    material oilslick
+    translate 5.3 1.10 1.5   scale 0.62
+    smooth_union { k 0.05
+        smooth_union { k 0.05
+        cylinder { translate 0.5 0.5 0.5  rotate 0 0 90  radius 0.14  height 0.78 }
+        cylinder { translate 0.5 0.5 0.5                 radius 0.14  height 0.78 }
+    }
+        cylinder { translate 0.5 0.5 0.5  rotate 90 0 0  radius 0.14  height 0.78 }
+    }
+    contained_by { min 0.04 0.04 0.04   max 0.96 0.96 0.96 }
+}
+
 # --- MIRRORED chrome ring (upright display mount, left-mid; NOT settled) ---------------
 isosurface "chrome_ring" {
     material chrome
-    torus { translate 3.0 1.34 5.4   rotate 90 0 0   major 0.34   minor 0.10 }
-}
-
-# --- BRASS dumbbell-ring (gallery pick 09): two spheres joined by a fused bar + ring,
-# with a small bite bored out (centre-back; SETTLED). ---
-isosurface "brass_dumbbell" {
-    material brass
-    translate 4.11 0.86 2.41   scale 0.78
-    difference {
-    smooth_union { k 0.046
-        smooth_union { k 0.033
-        smooth_union { k 0.032
-        sphere { center 0.340 0.500 0.500  radius 0.150 }
-        sphere { center 0.660 0.500 0.500  radius 0.150 }
-    }
-        cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
-    }
-        torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.150  minor 0.045 }
-    }
-    sphere { center 0.369 0.528 0.501  radius 0.067 }
-    }
-    contained_by { min 0.08 0.08 0.12   max 0.92 0.92 0.88 }
+    torus { translate 3.5 1.30 2.0   rotate 90 0 0   major 0.34   minor 0.10 }
 }
 
 # ==============================  LIGHTING  ====================================
-# A SINGLE warm ~4200 K bulb hung over the hall centre — the whole illumination. Strong
-# falloff pools light on the centre pieces and fades into the corners; the thin hall haze
-# turns it into a soft volumetric glow, and it back-lights the ceiling cloud. Small enough
-# (r=0.55) to throw crisp dispersive caustics through the diamond gyroid and glass sphere.
-light sphere { center 4.5 3.9 8.5   radius 0.55   spd blackbody 4200 }
+# A SINGLE small bulb — a socket-hung sphere the size of a real lamp envelope — is the
+# WHOLE illumination. Small radius throws crisp single-source shadows and tight dispersive
+# caustics through the diamond gyroid and glass sphere. Xenon short-arc spectrum via a
+# 6000 K Planckian (the validated xenon proxy; see data/README.md).
+isosurface "socket" { material socketmat  cylinder { translate 5.0 3.27 3.0  radius 0.018  height 0.26 } }
+light sphere { center 5.0 3.10 3.0   radius 0.05   spd blackbody 6000 }
 
 # ==============================  ATMOSPHERE  ==================================
-# (1) A faint GLOBAL hall haze (homogeneous) for aerial depth and soft volumetric shafts.
-medium { sigma_t 0.016   albedo 0.85   g 0.6 }
+# (1) A very faint GLOBAL haze so the single bulb casts soft volumetric shafts + aerial depth.
+medium { sigma_t 0.012   albedo 0.85   g 0.6 }
 
-# (2) A puffy CLOUD hanging near the ceiling in the back-left corner: a BOUNDED,
-# HETEROGENEOUS medium whose density is a hand-built isosurface field — three overlapping
-# spherical lobes ("a few bolted together") modulated by value noise for wispy edges. Only
-# the forward modes (A/B/C) and BDPT (D) image a bounded/heterogeneous medium on the camera
-# side, which is why the still renders in mode D and the flyby in mode B.
+# (2) A puffy CLOUD hanging near the ceiling in the BACK-LEFT corner (low x, low z, high y):
+# a BOUNDED, HETEROGENEOUS medium whose density is a hand-built isosurface field — three
+# overlapping spherical lobes modulated by value noise for wispy edges. Forward (A/B/C),
+# BDPT (D) and the photon-map camera (M) all image a bounded medium on the camera side.
 medium {
     sigma_t 2.6   albedo 0.9   g 0.45
-    bounds { min 0.4 2.3 2.0   max 4.0 4.45 5.6 }
-    density "clamp( (0.55 + 0.6*noise(1.7*x,1.7*y,1.7*z)) * max(max( 1 - sqrt((x-1.8)^2+(y-3.55)^2+(z-3.0)^2)/1.05, 1 - sqrt((x-2.9)^2+(y-3.75)^2+(z-4.2)^2)/0.82), 1 - sqrt((x-2.2)^2+(y-3.4)^2+(z-4.7)^2)/0.72) - 0.1, 0, 1)"
+    bounds { min 0.6 2.25 0.7   max 3.5 3.38 3.2 }
+    density "clamp( (0.55 + 0.6*noise(1.7*x,1.7*y,1.7*z)) * max(max( 1 - sqrt((x-1.8)^2+(y-3.00)^2+(z-1.6)^2)/0.90, 1 - sqrt((x-2.6)^2+(y-3.05)^2+(z-2.3)^2)/0.70), 1 - sqrt((x-1.5)^2+(y-2.85)^2+(z-2.4)^2)/0.60) - 0.1, 0, 1)"
     density_max 1.2
 }
 
 # ==============================  CAMERAS  =====================================
+# Still: front-centre, moderate 50 deg lens, looking down the shallow hall so the whole
+# central spread of pieces reads at once with the gold gyroid big in the foreground.
 camera "cam" {
-    eye 4.5 2.30 15.0   look_at 4.5 1.00 7.8   up 0 1 0   fov_y 46
+    eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
     mode D
-    film { res 1280 720   exposure 8.0 }
+    film { res 1280 720 }
 }
 
-# --- Flythrough: a SEAMLESS closed loop that (1) starts front-high, (2) descends down the
-# centre line to the gold gyroid's +z face, (3) threads its empty air channel to the -z
-# face WITHOUT touching a gold strut (channel control points are the long-standing k=10 /
-# T=0.45 path from scraps/gyroid_path.py, shifted +3.76991 in z with the gyroid), (4) banks
-# up-and-left across the back of the hall (past the cloud/heart/brass corner), (5) rises to
-# a near-level cruise gliding forward over the hall, (6) dives down-right straight THROUGH
-# the glass sphere (z=12), then (7) curls back up to REJOIN the start LEVEL, so `closed`
-# makes frame N == frame 0 for a gap-free loop. `look tangent` aims along travel;
-# `density_at` dwells on the money shots (channel + glass-sphere pass); `spline centripetal`
-# (alpha 0.5) keeps the unevenly-spaced waypoints tight with no overshoot; `exposure_lock`
-# freezes frame 0's auto-exposure so the loop never flickers.
+# --- Flyby: a SEAMLESS closed loop that (1) starts front-high, (2) descends the centre
+# line to the gold gyroid's +z face, (3) THREADS its empty-air channel to the -z face
+# without touching a strut (the k=10/T=0.45 path, rigidly shifted with the ball), (4) banks
+# up-and-left across the back-left corner (past the cloud / chrome / heart), (5) rises to a
+# forward cruise over the hall, (6) dives down-right straight THROUGH the glass sphere, then
+# (7) curls back up-and-forward to REJOIN the start LEVEL, so `closed` makes frame N == frame
+# 0 gap-free. `look tangent` aims along travel; `spline centripetal` keeps the unevenly
+# spaced waypoints tight with no overshoot (incl. the closure joint); `density_at` dwells on
+# the channel thread and the glass pass; `exposure_lock` freezes the loop's auto-exposure.
 camera_curve "fly" {
-    point 4.50 2.00 12.80     # START (front-high) — closure fold kept LEVEL
-    point 4.46 1.75 11.60     # descend down the centre line
-    point 4.42 1.55 10.90     # approach the gyroid
-    point 4.38 1.38 10.60     # final approach to the +z channel face
-    point 4.350 1.305 10.3849 # channel entry (+z face) — threaded points, z-shifted +3.76991
-    point 4.366 1.451 10.1149
-    point 4.260 1.316  9.8699
-    point 4.411 1.384  9.6049
-    point 4.261 1.432  9.3459
-    point 4.335 1.305  9.1549 # channel exit (-z face)
-    point 4.30  1.40   8.60   # emerge behind the ball
-    point 3.90  1.55   7.60   # bank up-and-LEFT across the hall
-    point 3.30  1.72   6.20
-    point 2.85  1.86   4.90   # sweep toward the back-left corner (cloud / chrome / heart)
-    point 2.70  1.95   3.60
-    point 2.90  2.02   2.70   # round the back-left corner (LEVEL across the fold)
-    point 3.40  2.14   3.60   # rise onto cruise, gliding forward
-    point 4.00  2.20   5.60   # near-level establishing sweep over the hall
-    point 4.60  2.20   8.00   # continue forward, right-of-centre, high above the gyroid
-    point 5.10  2.05  10.20   # descend toward the glass sphere, staying right
-    point 5.55  1.55  11.60   # dive down-right toward the orb
-    point 5.60  1.40  12.00   # THROUGH the glass sphere's centre
-    point 5.30  1.72  12.60   # rise back out
-    point 4.90  1.95  12.90   # curl back toward the start, LEVEL
-    up 0 1 0   fov_y 70   mode B   frames 150
+    point 5.00 2.10 6.10     # START (front-high) — closure fold kept LEVEL
+    point 4.98 1.85 5.85     # descend down the centre line
+    point 4.95 1.60 5.62     # approach the gyroid +z face
+    point 4.882 1.437 5.605  # final approach — held just OUTSIDE the clip sphere
+    point 4.850 1.255 5.4149 # channel entry (+z face) — threaded, ball-shifted
+    point 4.866 1.451 5.1449
+    point 4.760 1.316 4.8999
+    point 4.911 1.384 4.6349
+    point 4.761 1.432 4.3759
+    point 4.835 1.255 4.1849 # channel exit (-z face)
+    point 4.78 1.35 3.95     # emerge behind the ball
+    point 4.55 1.55 3.55     # bank up-and-LEFT
+    point 3.95 1.70 3.05
+    point 3.20 1.82 2.45     # sweep toward the back-left corner (cloud / chrome / heart)
+    point 2.75 1.92 1.85
+    point 2.72 2.00 1.35     # round the back-left corner (LEVEL across the fold)
+    point 3.10 2.06 1.20
+    point 3.85 2.10 1.45     # rise onto cruise, gliding forward-right
+    point 4.55 2.16 2.10
+    point 5.25 2.14 2.95     # near-level establishing sweep over the hall
+    point 5.80 1.98 3.75     # descend toward the glass sphere, staying right
+    point 6.18 1.62 3.80     # dive down-right toward the orb
+    point 6.20 1.40 3.50     # THROUGH the glass sphere's centre
+    point 5.95 1.68 3.15     # rise back out
+    point 5.55 1.95 3.95     # climb and turn forward
+    point 5.25 2.08 5.05     # forward toward the start
+    point 5.08 2.10 5.75     # curl back toward the start, LEVEL
+    up 0 1 0   fov_y 70   mode M   frames 144
     look tangent
     spline centripetal
-    # dwell on the channel thread and the glass-sphere pass, race the high return glide
-    density_at 0.00 7    density_at 0.15 18   density_at 0.32 20   density_at 0.42 8
-    density_at 0.60 6    density_at 0.78 8    density_at 0.85 16   density_at 0.92 8
+    density_at 0.00 7   density_at 0.16 18   density_at 0.30 20   density_at 0.42 8
+    density_at 0.60 6   density_at 0.75 8    density_at 0.82 16   density_at 0.90 8
     density_at 1.00 7
     closed
     exposure_lock
-    film { res 1280 720   exposure 11.0 }
+    film { res 960 540 }
 }
