@@ -8,6 +8,15 @@ directories (already created, and git-ignored):
 - **`ppm/`** — all `.ppm` render outputs and test images. Never write `.ppm` files to
   the repo root; pass `-o ppm/<name>.ppm`.
 - **`png/`** — all `.png` render outputs and test images. Pass `-o png/<name>.png`.
+  - **Flyby series get their own subdirectory.** Any multi-frame moving-camera
+    sequence (a `camera_curve` / `camera_path` / orbit flyby — files like
+    `<name>_fly000.png`, `<name>_swoop000.png`, `<name>_dolly0.png`, `<name>_orb0.png`)
+    must render into its own dedicated subdir `png/<setname>/`, not loose in `png/`.
+    Keep each set's companions (its `_cam` still, `_meter` frame, `.log`, palette,
+    `.ftbuf` checkpoints, assembled `.gif`/`.mp4`) in that same subdir so each series
+    is self-contained. Never let two different flyby series share a directory, and
+    never mix a flyby series in with unrelated one-off images. Point `-o` at the
+    subdir, e.g. `-o png/myflyby/myflyby.png`.
 - **`scraps/`** — all temporary / throwaway Python scripts (comparison helpers,
   one-off analysis, etc.) and any other scratch files. Don't leave temp `.py` files
   in the repo root or in `tools/` (which is for permanent, checked-in tooling).

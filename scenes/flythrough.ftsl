@@ -40,11 +40,11 @@ light area { origin 0.7 1.399 0.8   u 0.6 0 0   v 0 0 0.6   normal 0 -1 0   spd 
 # ball, and lifts back out on the left. 120 frames, aimed at the hero throughout.
 # The density curve makes the camera slow to a crawl during the close pass (t~0.5).
 camera_curve "swoop" {
-    point 1.7 0.9 2.2      # enter, high and back
-    point 1.5 0.5 1.5      # descend toward the ball
-    point 1.0 0.45 0.7     # close pass in front of the hero
-    point 0.5 0.55 1.5     # arc around the far side
-    point 0.4 1.0 2.2      # lift back out
+    point 1.7  0.9  2.2    # enter, high and back
+    point 1.85 0.5  1.1    # descend down the right side, ball depth
+    point 1.0  0.4  0.2    # close pass — whole ball fills the hero frame
+    point 0.2  0.6  1.5    # arc around the far/left side
+    point 0.4  1.0  2.2    # lift back out
 
     up 0 1 0   fov_y 52   mode R   frames 120
     density_at 0.0 8   density_at 0.5 40   density_at 1.0 8   # slow dwell mid-curve

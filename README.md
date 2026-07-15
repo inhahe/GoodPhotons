@@ -142,6 +142,16 @@ paths they can capture at all**.
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+>
+> **Double-click / bare invocation.** Running ftrace with just a scene file and
+> nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,
+> `.scene`, or `.fts`, as produced by a file association or drag-and-drop) —
+> defaults to exactly this quick preview: it turns on `-raster` **and** `-window`
+> automatically and shows the room in a live window, writing the preview PNG to a
+> temp file (no stray output in the working directory). Passing any real-render
+> control (`-mode`, `-n`, `-time`, `-noise`, `-forever`, `-device`, `-camera`,
+> `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
+> normally; `-in <path>` is likewise always an explicit render, never a preview.
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -1353,6 +1363,7 @@ alone can't restore, so they are not disk-resumable.
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
+| `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,

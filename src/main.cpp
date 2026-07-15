@@ -2793,6 +2793,7 @@ static int run(int argc, char** argv) {
     int  resYCli     = -1;        // optional height from `-r W H` (-1 = square, use res)
     bool doRaster    = false;     // -raster: fast solid-shaded preview (no light transport)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
     // Load the scene from a file *before* parsing the rest of argv, so any explicit
@@ -2801,6 +2802,25 @@ static int run(int argc, char** argv) {
     const char* inFile = nullptr;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
+    // Positional scene file: `ftrace scene.ftsl` (e.g. a double-click) with no -in.
+    // Accept a bare token that ends in a scene extension so a file association / drag-drop
+    // "just works" as a quick preview. Only scene-file extensions qualify, so this never
+    // swallows a flag value (no other flag takes a `.ftsl`/`.scene` argument).
+    bool positionalScene = false;
+    if (!inFile) {
+        auto hasSceneExt = [](const char* s) {
+            std::string t = s; for (auto& c : t) c = (char)std::tolower((unsigned char)c);
+            auto ends = [&](const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
+            return ends(".ftsl") || ends(".scene") || ends(".fts");
+        };
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i][0] == '-') continue;                 // a flag (or its value we skip below)
+            if (i > 0 && argv[i-1][0] == '-') {              // could be a flag's value; only take it if it's a scene file
+                if (!hasSceneExt(argv[i])) continue;
+            }
+            if (hasSceneExt(argv[i])) { inFile = argv[i]; positionalScene = true; break; }
+        }
+    }
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
     if (inFile) {
@@ -2841,6 +2861,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
+        else if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc) exposureCli = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
@@ -2912,6 +2933,41 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
     if (nThreads < 1) nThreads = 1;
+
+    // Bare-invocation quick preview: `ftrace scene.ftsl` (double-click / drag-drop, no
+    // other flags) defaults to a fast raster preview shown in a live window — no light
+    // transport, no stray output file. If the user asked for any real-render control
+    // (a mode/budget/device/camera flag, an explicit -raster, etc.) we respect that and
+    // don't force preview.
+    if (positionalScene && !doRaster) {
+        static const char* kRenderFlags[] = {
+            "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
+            "-camera","-view","-savemap","-loadmap","-wavefront","-o","-r","-window"
+        };
+        bool explicitControl = false;
+        for (int i = 1; i < argc && !explicitControl; ++i)
+            for (const char* f : kRenderFlags)
+                if (!std::strcmp(argv[i], f)) { explicitControl = true; break; }
+        if (!explicitControl) {
+            doRaster = true;
+            g_showWindow = true;
+            // Don't drop a stray cornell.ppm next to the cwd: send the preview PNG to a
+            // temp path derived from the scene name. (Window is the real deliverable.)
+            if (!std::strcmp(out, "cornell.ppm")) {
+                const char* tmp = std::getenv("TEMP");
+                if (!tmp) tmp = std::getenv("TMPDIR");
+                if (!tmp) tmp = ".";
+                std::string base = inFile;
+                size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) base = base.substr(slash + 1);
+                size_t dot = base.find_last_of('.');
+                if (dot != std::string::npos) base = base.substr(0, dot);
+                static std::string previewOut = std::string(tmp) + "/ftrace_preview_" + base + ".png";
+                out = previewOut.c_str();
+            }
+        }
+    }
+
     // Name the live-preview window after what it is rendering: "ftrace — <scene> → <out>"
     // (em dash + right-arrow are UTF-8; livewindow decodes them properly). The scene is
     // the -in file when given, else the built-in scene name; the output is the -o target.
@@ -3293,7 +3349,8 @@ static int run(int argc, char** argv) {
             // (group 0) across every camera; otherwise a per-path `exposure_lock`
             // locks only that path's frames (group = its pathGroup); -1 = per-frame.
             int eg = forceExposureLock ? 0 : (cs->exposureLock ? cs->pathGroup : -1);
-            toRender.push_back({cs->name, c, cmode, cresX, cresY, cs->exposureMul, eg});
+            double cexp = (exposureCli > 0.0) ? exposureCli : cs->exposureMul;   // -exposure/-ev overrides the authored comp
+            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
@@ -3310,7 +3367,7 @@ static int run(int argc, char** argv) {
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
-        toRender.push_back({"", c, mode, res, resY, 0.0, forceExposureLock ? 0 : -1});
+        toRender.push_back({"", c, mode, res, resY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1});
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file
