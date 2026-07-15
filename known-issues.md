@@ -89,14 +89,55 @@ light through geometric back faces** — on `scraps/_iso_sphere.ftsl` GPU-R show
 (leaking) terminator while CPU-R showed the correct leak-free (faceted) one. Adding the
 clamp to `bkNeeLight` makes CPU-R and GPU-R identical.
 
-**Caveat — shadow terminator.** A *hard* geometric clamp reveals the shadow-terminator
-problem: on a low-poly smooth-normal sphere under grazing light the terminator shows the
-underlying facets (hard dark slivers) rather than a smooth gradient. This is **the mode-R
-reference's existing behavior** (CPU-R has always done it), so propagating the clamp makes
-the forward modes *consistent with the reference*, not worse than it. Softening it (e.g.
-Chiang et al. 2019, "Taming the Shadow Terminator") is a separate future enhancement that
-would be applied uniformly to **all** modes including R — tracked as a possible follow-up,
-not part of this clamp-propagation work.
+**Caveat — shadow terminator (NOW SOFTENED, see DONE entry below).** A *hard* geometric
+clamp reveals the shadow-terminator problem: on a low-poly smooth-normal sphere under grazing
+light the terminator shows the underlying facets (hard dark slivers) rather than a smooth
+gradient. This was the mode-R reference's existing behavior too, so the clamp made the forward
+modes *consistent with the reference*. The hard cutoff has since been replaced everywhere by
+Chiang et al. 2019 softening — see the next DONE entry.
+
+### DONE (2026-07-15): Shadow-terminator softening (Chiang et al. 2019) replaces the hard geometric clamp everywhere
+
+The hard geometric-hemisphere cutoff from the entry above carved dark facet slivers at the
+terminator of low-poly smooth-normal meshes under grazing light (the classic shadow-terminator
+artifact). Replaced the hard `dot(ngo, wi) <= 0 ? reject` at **every** clamp site with a smooth
+ramp: `shadowTerminatorG(wi, ns, ng)` in `geometry.h` (Chiang, Li, Burley & Hovhannisyan 2019,
+"Taming the Shadow Terminator"; same cubic as Cycles' `bump_shadowing_term`).
+
+    g = cos(Ng,wi) / (cos(Ns,wi)·cos(Ng,Ns)),  softened by  -g³ + g² + g  on (0,1)
+
+Returns a `[0,1]` factor multiplied into the surface response (NEE/connection contrib): still
+**exactly 0** when `wi` is behind the true geometry (no back-face leak — leak-free is preserved),
+but ramps up smoothly off the geometric horizon instead of a step. Applied **uniformly to all
+modes including the mode-R reference** so R softens too and every mode stays mutually consistent:
+- `backward.h` mode R — `neeLight` (spot + sphere-cone + area/quad sites) and `neeEnv`.
+- `render.h` modes A/B/C — `connect` and `connectLens` camera splats.
+- `bdpt.h` mode D — t==1 splat, s==1 NEE, and both interior-connection endpoints (`!isTwoSidedMat` guarded).
+- `vcm.h` mode U — light-image splat, NEE, and both VC-connection endpoints (`!isTwoSidedMat` guarded).
+- GPU twins in `render_cuda.cu` — `dShadowTerminatorG` threaded through `connect`/`connectLens`,
+  `dConnectBDPT` (3 subsites), and `bkNeeLight`.
+
+**Bit-identity guard.** `shadowTerminatorG` short-circuits to a plain leak-free step (return
+exactly 1.0 when in front of the geometry, 0.0 behind — identical to the old hard clamp) whenever
+`dot(Ng,Ns) >= 1 - 1e-7`, i.e. the shading and geometric normals coincide (flat tris, analytic
+spheres). Without this guard a re-normalized `ns` differs from `ng` in the last bit, the cubic
+returns ~1 (not bit-exactly 1), and every flat/analytic scene would drift by ~1e-7. With it, the
+softening engages **only** once `ns` and `ng` genuinely diverge (a real smooth/crease-smoothed
+mesh), so the whole flat-scene validation suite stays bit-identical.
+
+Validated on `scraps/_iso_sphere.ftsl` (grazing directional-lit low-poly smooth sphere): the
+terminator is now a smooth gradient (no facet slivers) and mutually consistent across CPU R/D/U
+and GPU R/D; flat `scenes/cornell.ftsl` renders unchanged.
+
+**Diagnostic note — disabling the clamp entirely (the "option 2" that was considered).** A debug
+toggle to *fully disable* the geometric-hemisphere clamp (reverting to a pure shading-normal test,
+which leaks light through geometric back faces but never facets) was considered and **deliberately
+not implemented**: softening is the correct fix, so a disable toggle is only ever a diagnostic, and
+plumbing a runtime flag through the CUDA kernels (device-constant, kernel signatures, host parsing)
+isn't worth the surface area for a debug-only path. If ever needed to isolate a back-face-leak vs.
+terminator issue, edit `shadowTerminatorG` (and `dShadowTerminatorG`) to `return dot(ng,wi) > 0 ? 1
+: 1` (always 1 → no clamp, no softening) or `return 1` unconditionally, rebuild, and compare — a
+one-line local change, no scene/CLI plumbing.
 
 ### Headless-spawned `-window` render on gallery.ftsl hangs with no output — NEEDS INVESTIGATION 2026-07-14
 

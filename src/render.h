@@ -427,11 +427,15 @@ struct Renderer {
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
         double cosSurf = dot(n, wdir);
-        // Reject connections below the shading OR geometric horizon (`ng` is the
-        // geometric normal on the shading side): a smoothed shading normal must not
-        // splat a vertex whose true geometry faces away from the camera. No-op for
-        // flat tris / analytic spheres, where ng == n.
-        if (cosSurf <= 0 || dot(ng, wdir) <= 0) return; // camera behind surface
+        // Reject connections below the shading horizon; soften across the GEOMETRIC
+        // horizon (`ng` is the geometric normal on the shading side). A smoothed shading
+        // normal must not splat a vertex whose true geometry faces away from the camera,
+        // but a hard cutoff there carves facet slivers at the terminator, so ramp it
+        // smoothly (Chiang 2019). No-op for flat tris / analytic spheres, where ng == n
+        // (stG == 1), so those scenes stay bit-identical.
+        if (cosSurf <= 0) return;                       // camera behind shading surface
+        double stG = shadowTerminatorG(wdir, n, ng);
+        if (stG <= 0.0) return;                         // camera behind true geometry: hard cutoff
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
         if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
@@ -443,7 +447,7 @@ struct Renderer {
         // cosSurf * corr = cos(wo,Ng)*cos(wi,Ns)/cos(wi,Ng), so the grazing cosSurf
         // cancels analytically and this stays bounded. Exactly 1 when Ns == Ng.
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
-        double contrib = beta * f * cosSurf * corr / (dist2 * omega);
+        double contrib = beta * f * cosSurf * corr / (dist2 * omega) * stG;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
@@ -502,8 +506,11 @@ struct Renderer {
         if (dist < 1e-9) return;
         Vec3 wdir = toA / dist;
         double cosSurf = dot(n, wdir);
-        // Below the shading OR geometric horizon (see connect()): no-op for flat/sphere.
-        if (cosSurf <= 0 || dot(ng, wdir) <= 0) return;  // pupil behind the surface
+        // Below the shading horizon reject; soften across the geometric horizon (see
+        // connect()): no-op for flat/sphere (stG == 1).
+        if (cosSurf <= 0) return;                        // pupil behind the shading surface
+        double stG = shadowTerminatorG(wdir, n, ng);
+        if (stG <= 0.0) return;                          // pupil behind true geometry: hard cutoff
         double cosLens = -dot(wdir, cam.w);              // cosine at the lens (w faces the scene)
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
@@ -513,7 +520,7 @@ struct Renderer {
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
-        double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist);
+        double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);

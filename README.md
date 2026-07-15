@@ -575,8 +575,12 @@ Only the shading normal is affected; the silhouette stays true to the geometry.
 is faithful in **all** render modes: the backward reference `R`, and the forward
 tracers `A/B/C/D/M/S/U` (CPU and GPU), which apply Veach's shading-normal adjoint
 correction so the light/particle transport smooth-shades to match the reference.
-Flat meshes are unaffected — the correction is exactly 1 when the shading and
-geometric normals coincide.)
+Light connections are clamped to the geometric hemisphere so a smoothed normal never
+leaks light through the true back face, and the terminator where light grazes off is
+softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gradient
+instead of hard facet slivers — applied uniformly to every mode including `R`. Flat
+meshes are unaffected — both the correction and the softening are exactly a no-op when
+the shading and geometric normals coincide.)
 Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the

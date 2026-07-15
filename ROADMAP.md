@@ -330,16 +330,20 @@ render_cuda.cu), and `addMesh` in ftsl.h.
    VCM vertex-merge needed a scoped `vmGatherCorr` (see `known-issues.md` tech-debt note). ✅ **Crease-angle
    auto-smoothing DONE** (2026-07-15) — `mesh { smooth [<deg>] }` in `loadObj` (position-weld +
    angle-weighted per-corner normals under the dihedral threshold); host-only, so the GPU `DTri`
-   picks it up for free. **Shading-normal geometric-hemisphere clamp** — ✅ partly DONE (2026-07-15):
-   `orientedGeoN()` (`geometry.h`) + clamp now wired into **every** NEE/connection site:
-   the backward reference (`backward.h` `neeLight`/`neeEnv`), the forward tracer's camera
-   connection (`render.h` `connect`/`connectLens`), `bdpt.h` (mode D), `vcm.h` (mode U), and
-   the GPU twins (`render_cuda.cu` `connect`/`connectLens`, `dConnectBDPT`, `bkNeeLight`) —
-   stopping smoothed normals from leaking light through the geometric back face (no-op for
-   flat/analytic; guarded by `!isTwoSidedMat` so glass transmission isn't killed). Modes M/S
-   need nothing (M reuses the clamped `neeLight`; SPPM does no NEE). This also fixed a
-   pre-existing **GPU mode-R** back-face light leak (its `bkNeeLight` lacked the clamp its CPU
-   twin had). ✅ **DONE 2026-07-15** (see `known-issues.md`).
+   picks it up for free. **Shading-normal geometric-hemisphere clamp + shadow-terminator
+   softening** — ✅ DONE (2026-07-15): `orientedGeoN()` (`geometry.h`) + the hemisphere gate now
+   wired into **every** NEE/connection site: the backward reference (`backward.h`
+   `neeLight`/`neeEnv`), the forward tracer's camera connection (`render.h` `connect`/`connectLens`),
+   `bdpt.h` (mode D), `vcm.h` (mode U), and the GPU twins (`render_cuda.cu` `connect`/`connectLens`,
+   `dConnectBDPT`, `bkNeeLight`) — stopping smoothed normals from leaking light through the geometric
+   back face (guarded by `!isTwoSidedMat` so glass transmission isn't killed). The hard cutoff is
+   replaced by **Chiang et al. 2019 softening** (`shadowTerminatorG` / `dShadowTerminatorG`), a smooth
+   [0,1] ramp that stays leak-free (exactly 0 behind the true geometry) but eliminates the terminator
+   facet slivers on low-poly smooth meshes — applied **uniformly to all modes including R** so they
+   stay mutually consistent. A `dot(Ng,Ns) >= 1-1e-7` short-circuit keeps flat/analytic scenes
+   bit-identical. Modes M/S need nothing (M reuses `neeLight`; SPPM does no NEE). Also fixed a
+   pre-existing **GPU mode-R** back-face light leak (its `bkNeeLight` lacked the gate its CPU twin
+   had). ✅ **DONE 2026-07-15** (see `known-issues.md`).
 2. ✅ **DONE** — glTF loader (`src/gltf.h`) + minimal JSON parser (`src/third_party/json.h`): parses
    nodes/meshes/accessors/bufferViews/buffers (GLB BIN chunk, external `.bin`, base64 data URIs),
    bakes node transforms (matrix or TRS), maps metallic-roughness → spectral BSDFs; `addMesh`

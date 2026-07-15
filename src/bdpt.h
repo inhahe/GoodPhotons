@@ -865,15 +865,17 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
             if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
             Vec3 ngo = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
-            // Geometric-hemisphere clamp: a reflect-only vertex must also see the camera on
+            // Geometric-hemisphere softening: a reflect-only vertex must see the camera on
             // its GEOMETRIC front side, else a smoothed shading normal leaks light through the
-            // back face (shading-normal problem; matches backward.h/render.h). No-op when
-            // ns==ng (flat/analytic); skipped for two-sided (transmissive) materials.
-            if (!isTwoSidedMat(*qs.mat) && dot(ngo, wcam) <= 0.0) return 0.0;
+            // back face (shading-normal problem). A hard cutoff there facets the terminator,
+            // so ramp smoothly (Chiang 2019; matches backward.h/render.h). No-op when ns==ng
+            // (flat/analytic, stG==1); skipped for two-sided (transmissive) materials.
+            double stG = isTwoSidedMat(*qs.mat) ? 1.0 : shadowTerminatorG(wcam, qs.ns, ngo);
+            if (stG <= 0.0) return 0.0;
             f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
             // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
-            f *= shadingAdjointCorr(wo, wcam, qs.ns, ngo);
+            f *= shadingAdjointCorr(wo, wcam, qs.ns, ngo) * stG;
         }
         if (f <= 0.0) return 0.0;
         if (scene.occluded(connOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
@@ -902,18 +904,20 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
         Vec3 wo = normalize(eye[t - 2].p - pt.p);
         // Scattering value f and endpoint cosine (phase / cos=1 at a medium vertex).
-        double cosSurf, f;
+        double cosSurf, f, stG = 1.0;
         if (pt.type == VType::Medium) {
             cosSurf = 1.0;
             f = mediumScatterF(pt, wo, wi, lambda, scene);
         } else {
             cosSurf = dot(pt.ns, wi);
             if (cosSurf == 0.0 || (!isTwoSidedMat(*pt.mat) && cosSurf < 0.0)) return 0.0;
-            // Geometric-hemisphere clamp (see t==1 splat above): the eye/radiance vertex must
-            // also see the sampled light point on its geometric front side. No-op when ns==ng.
+            // Geometric-hemisphere softening (see t==1 splat above): the eye/radiance vertex
+            // must see the sampled light on its geometric front side; ramp smoothly instead of
+            // a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
             if (!isTwoSidedMat(*pt.mat)) {
                 Vec3 ngo = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
-                if (dot(ngo, wi) <= 0.0) return 0.0;
+                stG = shadowTerminatorG(wi, pt.ns, ngo);
+                if (stG <= 0.0) return 0.0;
             }
             f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
         }
@@ -926,7 +930,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (pdfA <= 0.0) return 0.0;
         double Tr = mats.mediaTransmittance(scene.media, pt.p, wi, dist, lambda, rng);
         double G = std::fabs(cosSurf) * cosLight / dist2;
-        L = pt.beta * f * Le * G / pdfA * Tr;
+        L = pt.beta * f * Le * G / pdfA * Tr * stG;
         if (L <= 0.0) return 0.0;
         sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.light = &em; sampled.matId = em.matId;
@@ -943,16 +947,18 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         Vec3 woE = normalize(eye[t - 2].p - pt.p);
         Vec3 woL = normalize(light[s - 2].p - qs.p);
         // Each endpoint is a surface (BSDF, cosine) or a medium (phase, cos=1).
-        double cosE, cosL, fE, fL;
+        double cosE, cosL, fE, fL, stGE = 1.0, stGL = 1.0;
         if (pt.type == VType::Medium) {
             cosE = 1.0; fE = mediumScatterF(pt, woE, w, lambda, scene);
         } else {
             cosE = dot(pt.ns, w);
             if (cosE == 0.0 || (!isTwoSidedMat(*pt.mat) && cosE < 0.0)) return 0.0;
-            // Geometric-hemisphere clamp on the eye endpoint (connection dir w). No-op ns==ng.
+            // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
             if (!isTwoSidedMat(*pt.mat)) {
                 Vec3 ngoE = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
-                if (dot(ngoE, w) <= 0.0) return 0.0;
+                stGE = shadowTerminatorG(w, pt.ns, ngoE);
+                if (stGE <= 0.0) return 0.0;
             }
             fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
         }
@@ -962,8 +968,12 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             cosL = dot(qs.ns, w * -1.0);
             if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
             Vec3 ngoL = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
-            // Geometric-hemisphere clamp on the light endpoint (connection dir -w). No-op ns==ng.
-            if (!isTwoSidedMat(*qs.mat) && dot(ngoL, w * -1.0) <= 0.0) return 0.0;
+            // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
+            if (!isTwoSidedMat(*qs.mat)) {
+                stGL = shadowTerminatorG(w * -1.0, qs.ns, ngoL);
+                if (stGL <= 0.0) return 0.0;
+            }
             fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction on the LIGHT-subpath endpoint qs (particle
             // vertex; outgoing = w*-1 toward the eye vertex). The eye endpoint pt is a
@@ -974,7 +984,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6)) return 0.0;
         double Tr = mats.mediaTransmittance(scene.media, pt.p, w, dist, lambda, rng);
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
-        L = pt.beta * fE * fL * qs.beta * G * Tr;
+        L = pt.beta * fE * fL * qs.beta * G * Tr * stGE * stGL;
     }
     if (L <= 0.0) return 0.0;
     return L * misWeight(scene, cam, light, eye, sampled, s, t, lambda);

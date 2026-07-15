@@ -75,13 +75,15 @@ struct BackwardRenderer {
                 double dist = std::sqrt(dist2);
                 Vec3 wi = toL / dist;
                 double cosSurf = dot(h.n, wi);
-                if (cosSurf <= 0 || dot(ngo, wi) <= 0) continue;
+                if (cosSurf <= 0) continue;
+                double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+                if (stG <= 0.0) continue;                        // behind true geometry: hard shadow
                 double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0) continue;
                 if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 double f = rho / PI;
                 double emitW = em.spdFn(lambda) * invPdfLambda;
-                double contrib = f * emitW * fall * cosSurf / dist2;  // I(w)/dist^2
+                double contrib = f * emitW * fall * cosSurf / dist2 * stG;  // I(w)/dist^2
                 if (scene.backwardMedium().enabled)
                     contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 total += contrib;
@@ -110,9 +112,11 @@ struct BackwardRenderer {
             double emitW = em.spdFn(lambda) * invPdfLambda;   // Le(lambda)/pdf_lambda
             if (coneSampled) {
                 cosSurf = dot(h.n, wi);
-                if (cosSurf <= 0 || dot(ngo, wi) <= 0) continue;
+                if (cosSurf <= 0) continue;
+                double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+                if (stG <= 0.0) continue;                        // behind true geometry: hard shadow
                 if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
-                contrib = f * emitW * cosSurf / pdfW;     // solid-angle measure
+                contrib = f * emitW * cosSurf / pdfW * stG;   // solid-angle measure
             } else {
                 if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
                 Vec3 toL = y - h.p;
@@ -120,12 +124,14 @@ struct BackwardRenderer {
                 dist = std::sqrt(dist2);
                 wi = toL / dist;
                 cosSurf = dot(h.n, wi);
-                if (cosSurf <= 0 || dot(ngo, wi) <= 0) continue;
+                if (cosSurf <= 0) continue;
+                double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+                if (stG <= 0.0) continue;                        // behind true geometry: hard shadow
                 double cosLight = dot(nLight, -wi);       // light is one-sided
                 if (cosLight <= 0) continue;
                 if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 double G = cosSurf * cosLight / dist2;    // geometry term
-                contrib = f * emitW * G * effArea;        // pdf_area = 1/effArea (visible area for cylinder)
+                contrib = f * emitW * G * effArea * stG;  // pdf_area = 1/effArea (visible area for cylinder)
             }
             if (scene.backwardMedium().enabled)                     // Beer-Lambert on the shadow ray
                 contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
@@ -213,7 +219,9 @@ struct BackwardRenderer {
         if (pdfW <= 0.0) return 0.0;
         double cosSurf = dot(h.n, wi);
         const Vec3 ngo = orientedGeoN(h);
-        if (cosSurf <= 0.0 || dot(ngo, wi) <= 0.0) return 0.0;   // below the shading OR geometric horizon
+        if (cosSurf <= 0.0) return 0.0;                          // below the shading horizon
+        double stG = shadowTerminatorG(wi, h.n, ngo);           // Chiang soft terminator (1 if flat)
+        if (stG <= 0.0) return 0.0;                              // behind true geometry: hard shadow
         double farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
         if (scene.occluded(h.p + ngo * 1e-6, wi, farDist)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
@@ -221,7 +229,7 @@ struct BackwardRenderer {
         double f = rho / PI;                            // Lambertian BRDF
         double pdfBsdf = cosSurf / PI;                  // cosine-hemisphere pdf for wi
         double wMis = pdfW / (pdfW + pdfBsdf);          // balance heuristic
-        double contrib = f * Lenv * cosSurf * invPdfLambda / pdfW * wMis;
+        double contrib = f * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
         if (scene.backwardMedium().enabled)                       // Beer-Lambert to the scene exit
             contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
         return contrib;

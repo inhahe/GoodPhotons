@@ -89,6 +89,42 @@ inline double shadingAdjointCorr(const Vec3& wi, const Vec3& wo,
     return num / denom;
 }
 
+// Shadow-terminator softening (Chiang, Li, Burley & Hovhannisyan 2019, "Taming the Shadow
+// Terminator"; the same cubic used by Blender Cycles' `bump_shadowing_term`). Returns a
+// factor in [0,1] to multiply a light connection / NEE contribution by, REPLACING the old
+// hard geometric-hemisphere cutoff (`dot(ng,wi) <= 0 ? reject`). It still returns exactly 0
+// when `wi` is behind the true geometry (no light leaks through the geometric back face), but
+// instead of a hard step it ramps up SMOOTHLY as `wi` climbs off the geometric horizon — so a
+// low-poly smooth-normal mesh under grazing light shows a smooth terminator instead of hard
+// facet slivers (the classic shading-normal / terminator artifact).
+//
+//   g = cos(Ng,wi) / (cos(Ns,wi) · cos(Ng,Ns)),   softened by  -g^3 + g^2 + g  on (0,1)
+//
+// `ns` = shading normal, `ng` = geometric normal ORIENTED onto the shading side (orientedGeoN),
+// `wi` = direction toward the light/connection. Callers gate on the shading cosine first, so
+// cos(Ns,wi) > 0 in practice. **Exactly 1 when Ns == Ng** (flat tris, analytic spheres): then
+// cos(Ng,Ns)=1 and cos(Ng,wi)=cos(Ns,wi) ⇒ g=1 ⇒ factor 1, so every non-smooth scene is
+// bit-identical and the whole validation suite is untouched. The cubic is C1 at g=1 (its
+// derivative there is 0), so the well-lit region blends in without a crease.
+inline double shadowTerminatorG(const Vec3& wi, const Vec3& ns, const Vec3& ng) {
+    double cosNgNs = dot(ng, ns);
+    // Exact no-op when the shading and geometric normals coincide (flat tris, analytic
+    // spheres): the softening cubic would otherwise return ~1 (not bit-exactly 1) because
+    // an interpolated `ns` is re-normalized and can differ from `ng` in the last bit, so
+    // every flat/analytic scene would drift by ~1e-7. Short-circuit to a plain leak-free
+    // step there — identical to the old hard geometric-hemisphere clamp — so the whole
+    // flat-scene validation suite stays bit-identical. Softening only engages once ns and
+    // ng genuinely diverge (a real smooth-normal / crease-smoothed mesh).
+    if (cosNgNs >= 1.0 - 1e-7) return (dot(ng, wi) > 0.0) ? 1.0 : 0.0;
+    double cosNgWi = dot(ng, wi);
+    if (cosNgWi <= 0.0) return 0.0;                // behind the true geometry -> hard shadow (no leak)
+    double denom = dot(ns, wi) * cosNgNs;
+    if (denom <= 1e-8) return 1.0;                 // degenerate (grazing / near-perpendicular): no softening
+    double g = cosNgWi / denom;
+    if (g >= 1.0) return 1.0;                      // fully lit -> no darkening
+    return g * g * (1.0 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
+}
+
 inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
     const double EPS = 1e-9;
     Vec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;

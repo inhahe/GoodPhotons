@@ -1856,6 +1856,29 @@ __device__ static Real dShadingAdjointCorr(const DVec3& wi, const DVec3& wo,
     Real num = (Real)fabs((double)dot(wi, ns)) * (Real)fabs((double)dot(wo, ng));
     return num / denom;
 }
+// Device twin of geometry.h's shadowTerminatorG (Chiang, Li, Burley & Hovhannisyan 2019
+// "Taming the Shadow Terminator"; Cycles' bump_shadowing_term). Returns a [0,1] factor
+// that REPLACES the old hard geometric-hemisphere cutoff (dot(ng,wi)<=0 ? reject): still
+// exactly 0 when `wi` is behind the true geometry (no back-face light leak), but ramps up
+// smoothly off the geometric horizon so a low-poly smooth-normal mesh shows a smooth
+// terminator instead of facet slivers. EXACTLY 1 when ns==ng (flat tris, analytic spheres),
+// so every flat/analytic GPU scene stays bit-identical. `wi` = direction toward the
+// light/connection, `ns` = shading normal, `ng` = geo normal oriented onto the shading side.
+__device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, const DVec3& ng) {
+    Real cosNgNs = dot(ng, ns);
+    // Exact no-op when ns==ng (flat tris, analytic spheres): the cubic would otherwise drift
+    // by ~1e-7 since a re-normalized `ns` differs from `ng` in the last bit. Short-circuit to
+    // a plain leak-free step (identical to the old hard clamp) so flat/analytic GPU scenes
+    // stay bit-identical; softening engages only once ns and ng genuinely diverge.
+    if (cosNgNs >= (Real)1 - (Real)1e-7) return (dot(ng, wi) > (Real)0) ? (Real)1 : (Real)0;
+    Real cosNgWi = dot(ng, wi);
+    if (cosNgWi <= (Real)0) return (Real)0;            // behind the true geometry -> hard shadow
+    Real denom = dot(ns, wi) * cosNgNs;
+    if (denom <= (Real)1e-8) return (Real)1;           // degenerate grazing -> no softening
+    Real g = cosNgWi / denom;
+    if (g >= (Real)1) return (Real)1;                  // fully lit -> no darkening
+    return g * g * ((Real)1 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
+}
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
                                Real lambda, Real beta, Real rho, DRng& rng) {
@@ -1863,10 +1886,14 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
     Real cosSurf = dot(n, wdir);
-    // Reject below the shading OR geometric horizon (ng = geo normal on the shading side):
-    // a smoothed shading normal must not splat a vertex whose true geometry faces away from
-    // the camera. No-op for flat tris / analytic spheres (ng == n). Matches CPU render.h.
-    if (cosSurf <= 0 || dot(ng, wdir) <= 0) return;
+    // Reject below the shading horizon; soften across the GEOMETRIC horizon (ng = geo normal
+    // on the shading side): a smoothed shading normal must not splat a vertex whose true
+    // geometry faces away from the camera, but a hard cutoff facets the terminator, so ramp
+    // it smoothly (Chiang 2019). No-op for flat tris / analytic spheres (ng == n, stG == 1).
+    // Matches CPU render.h.
+    if (cosSurf <= 0) return;
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
@@ -1877,7 +1904,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     // corr is the Veach adjoint shading-normal factor (1 when ns==ng).
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
-    Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle);
+    Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1920,15 +1947,18 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (dist < (Real)1e-9) return;
     DVec3 wdir = toA / dist;
     Real cosSurf = dot(n, wdir);
-    // Below the shading OR geometric horizon (see connect()): no-op for flat/sphere.
-    if (cosSurf <= 0 || dot(ng, wdir) <= 0) return;  // pupil behind the surface
+    // Below the shading horizon reject; soften across the geometric horizon (see connect()):
+    // no-op for flat/sphere (stG == 1).
+    if (cosSurf <= 0) return;                        // pupil behind the shading surface
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;                      // pupil behind true geometry: hard cutoff
     Real cosLens = -dot(wdir, cam.w);                // cosine at the lens (w faces scene)
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
-    Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist);
+    Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -3591,17 +3621,19 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         DVec3 wi = toL / dist;
         Real cosSurf = dot(h.n, wi);
         if (cosSurf <= 0) continue;
-        // Geometric-hemisphere clamp (matches CPU backward.h neeLight): the light must lie on
-        // the geometric front side too. No-op when h.n==h.ng (flat tris / analytic spheres);
-        // shadow ray offset along the geometric normal so it clears the true surface.
+        // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
+        // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
+        // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
+        // along the geometric normal so it clears the true surface.
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-        if (dot(ngo, wi) <= 0) continue;
+        Real stG = dShadowTerminatorG(wi, h.n, ngo);
+        if (stG <= (Real)0) continue;
         Real cosLight = dot(nL, -wi);                 // light is one-sided
         if (cosLight <= 0) continue;
         if (occluded(sc, h.p + ngo * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = (double)(f * G) * emitW * (double)em.area;
+        double contrib = (double)(f * G) * emitW * (double)em.area * (double)stG;
         // Backward (mode R) treats media as a single global HOMOGENEOUS haze (first
         // medium); GPU backward is only reached when no medium is present (cudaBackwardSupported
         // rejects any), so this is defensive parity with the host backwardMedium().
@@ -4125,15 +4157,17 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosSurf = ddot(qs.ns, wcam);
             if (cosSurf <= 0.0) return 0.0;
-            // Geometric-hemisphere clamp (matches CPU bdpt.h): the camera must lie on the
+            // Geometric-hemisphere softening (matches CPU bdpt.h): the camera must lie on the
             // geometric front side too, else a smoothed shading normal leaks light through the
-            // back face. No-op when ns==ng. GPU BDPT is reflect-only (v1), so unconditional.
+            // back face; ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng
+            // (stG==1). GPU BDPT is reflect-only (v1), so unconditional.
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
-            if (ddot(ngoQ, wcam) <= 0.0) return 0.0;
+            double stG = (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
+            if (stG <= 0.0) return 0.0;
             f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
-            f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ);
+            f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
             double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
             o = qs.p + qs.ng * (Real)(sgn * 1e-6);
         }
@@ -4169,10 +4203,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosSurf = ddot(pt.ns, wi);
             if (cosSurf <= 0.0) return 0.0;
-            // Geometric-hemisphere clamp on the eye/radiance vertex (matches CPU bdpt.h).
+            // Geometric-hemisphere softening on the eye/radiance vertex (matches CPU bdpt.h):
+            // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
             DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
-            if (ddot(ngoP, wi) <= 0.0) return 0.0;
-            f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda);
+            double stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
+            if (stG <= 0.0) return 0.0;
+            f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda) * stG;
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
@@ -4203,10 +4239,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosE = ddot(pt.ns, w);
             if (cosE <= 0.0) return 0.0;
-            // Geometric-hemisphere clamp on the eye endpoint (connection dir w). No-op ns==ng.
+            // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
             DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
-            if (ddot(ngoE, w) <= 0.0) return 0.0;
-            fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda);
+            double stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
+            if (stGE <= 0.0) return 0.0;
+            fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda) * stGE;
             double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
@@ -4215,10 +4253,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosL = ddot(qs.ns, w * (Real)-1);
             if (cosL <= 0.0) return 0.0;
-            // Geometric-hemisphere clamp on the light endpoint (connection dir -w). No-op ns==ng.
+            // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
-            if (ddot(ngoQ, w * (Real)-1) <= 0.0) return 0.0;
-            fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
+            double stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
+            if (stGL <= 0.0) return 0.0;
+            fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda) * stGL;
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
             fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);

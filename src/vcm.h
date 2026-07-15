@@ -466,17 +466,19 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                     double distc = std::sqrt(dist2c);
                     Vec3 wcam = toCam / distc;
                     double cosToCamera = dot(h.n, wcam);
-                    // Geometric-hemisphere clamp for a reflect-only vertex: the camera must lie
-                    // on the geometric front side too (no back-face light leak). `ngo` is the
-                    // geo normal oriented to h.n (line above). No-op when h.n==h.ng.
+                    // Geometric-hemisphere softening for a reflect-only vertex: the camera must
+                    // lie on the geometric front side too (no back-face light leak), but ramp
+                    // that boundary smoothly instead of a hard cutoff (Chiang 2019). `ngo` is the
+                    // geo normal oriented to h.n (line above). No-op when h.n==h.ng (stG==1).
+                    double stG = isTwoSidedMat(*mp) ? 1.0 : shadowTerminatorG(wcam, h.n, ngo);
                     bool sideOk = isTwoSidedMat(*mp) ? (cosToCamera != 0.0)
-                                                     : (cosToCamera > 0.0 && dot(ngo, wcam) > 0.0);
+                                                     : (cosToCamera > 0.0 && stG > 0.0);
                     double cosAtCamera = dot(cam.w, wcam * -1.0);   // forward vs camera->point
                     if (sideOk && cosAtCamera > 1e-9) {
                         int px, py; double cc, d2c;
                         if (cam.project(h.p, px, py, cc, d2c)) {
                             double f = bsdfF(*mp, h.n, wo, wcam, lambda, scene, &h);
-                            f *= shadingAdjointCorr(wo, wcam, h.n, ngo);   // adjoint (→camera)
+                            f *= shadingAdjointCorr(wo, wcam, h.n, ngo) * stG;   // adjoint (→camera) + soft terminator
                             if (f > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wcam), wcam, distc - 2e-6)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
@@ -600,14 +602,16 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double distL = std::sqrt(dist2); Vec3 wi = toL / distL;
                         double cosAtLight = dot(nL, wi * -1.0);
                         double cosToLight = dot(h.n, wi);
-                        // Geometric-hemisphere clamp on this eye/radiance vertex (matches
-                        // backward.h neeLight): the sampled light point must be on h's geometric
-                        // front side too. No-op when h.n==h.ng; skipped for two-sided.
+                        // Geometric-hemisphere softening on this eye/radiance vertex (matches
+                        // backward.h neeLight): the sampled light must be on h's geometric front
+                        // side too, ramped smoothly instead of a hard cutoff (Chiang 2019). No-op
+                        // when h.n==h.ng (stG==1); skipped for two-sided.
+                        double stG = isTwoSidedMat(*mp) ? 1.0 : shadowTerminatorG(wi, h.n, orientedGeoN(h));
                         bool sideOk = isTwoSidedMat(*mp)
                                           ? (cosToLight != 0.0)
-                                          : (cosToLight > 0.0 && dot(orientedGeoN(h), wi) > 0.0);
+                                          : (cosToLight > 0.0 && stG > 0.0);
                         if (cosAtLight > 0.0 && sideOk) {
-                            double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h);
+                            double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h) * stG;
                             double Le = em.spdFn(lambda) * invPdfLambda;
                             if (f > 0.0 && Le > 0.0 && em.area > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wi), wi, distL - 2e-6)) {
@@ -640,22 +644,25 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double distc = std::sqrt(dist2); Vec3 w = d / distc;   // camera -> light vertex
                 double cosCam = dot(h.n, w);
                 double cosLit = dot(lv.ns, w * -1.0);
-                // Geometric-hemisphere clamp on BOTH reflect-only endpoints (connection dir w
+                // Geometric-hemisphere softening on BOTH reflect-only endpoints (connection dir w
                 // at the camera vertex, -w at the light vertex): each must see the other on its
-                // geometric front side. No-op when ns==ng; skipped for two-sided materials.
+                // geometric front side, ramped smoothly instead of a hard cutoff (Chiang 2019).
+                // No-op when ns==ng (stG==1); skipped for two-sided materials.
                 Vec3 ngoCam = orientedGeoN(h);
                 Vec3 ngoLit = (dot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                double stGCam = isTwoSidedMat(*mp)     ? 1.0 : shadowTerminatorG(w, h.n, ngoCam);
+                double stGLit = isTwoSidedMat(*lv.mat) ? 1.0 : shadowTerminatorG(w * -1.0, lv.ns, ngoLit);
                 bool camSide = isTwoSidedMat(*mp)
-                                   ? (cosCam != 0.0) : (cosCam > 0.0 && dot(ngoCam, w) > 0.0);
+                                   ? (cosCam != 0.0) : (cosCam > 0.0 && stGCam > 0.0);
                 bool litSide = isTwoSidedMat(*lv.mat)
-                                   ? (cosLit != 0.0) : (cosLit > 0.0 && dot(ngoLit, w * -1.0) > 0.0);
+                                   ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
                 if (!camSide || !litSide) continue;
-                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h);
+                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h) * stGCam;
                 double fLit = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene, &lv.hit);
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
                 // Uses lv.ng oriented to lv.ns (ngoLit above); a no-op when the mesh is flat.
-                fLit *= shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit);
+                fLit *= shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit) * stGLit;
                 if (fCam <= 0.0 || fLit <= 0.0) continue;
                 double camDirPdfW = bsdfPdf(*mp, h.n, wo, w, lambda, scene, &h);
                 double camRevPdfW = bsdfPdf(*mp, h.n, w, wo, lambda, scene, &h);
