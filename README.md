@@ -776,10 +776,15 @@ ranked:
   *not* a repair tool.
 - **Repair a broken mesh** after the fact with **`tools/repair_mesh.py`**, which wraps two
   engines (both `pip install`-able):
-  - **pymeshlab** (default) — MeshLab's repair filters: welds coincident vertices, drops
-    duplicate/null faces, removes faces at non-manifold edges, splits non-manifold vertices, and
-    fills the resulting holes. Best for the "pinch vertex" defect (N surface sheets snapped to one
-    point) that AI mesh generators emit.
+  - **pymeshlab** (default, `pip install pymeshlab`) — MeshLab's repair filters, run as an
+    *ordered pipeline* (order matters): merge-close-vertices (welds coincident vertices so a
+    pinch becomes a visible singularity) → remove-duplicate/null-faces → repair-non-manifold-edges
+    (`method=0` removes the offending faces) → repair-non-manifold-vertices (splits pinched
+    sheets apart) → close-holes (caps the openings that leaves). This is the **go-to engine for
+    the "pinch vertex" defect** (N surface sheets snapped to one point) that AI mesh generators
+    emit — a defect that is a valid 2-manifold in raw OBJ indexing but non-manifold once
+    coincident vertices are welded, which is exactly the class MeshFix leaves untouched. It is
+    the engine that took the Klein bottle to `[OK]`.
   - **pymeshfix** (`--engine meshfix`) — Marco Attene's MeshFix: best for genuine self-intersections
     and large holes; weaker on pure non-manifold pinches.
 
@@ -1149,7 +1154,7 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). |
+| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |

@@ -9,6 +9,7 @@
 // callers need no platform guards.
 #pragma once
 #include <vector>
+#include <string>
 #include <cstdint>
 
 class LiveWindow {
@@ -22,6 +23,11 @@ public:
     // immediately. w/h may differ from the ctor size (the window stretches to fit,
     // preserving aspect with letterboxing).
     void update(int w, int h, const std::vector<uint8_t>& rgb);
+
+    // Replace the title-bar text (UTF-8). Safe to call from the render thread; the
+    // change is marshalled to the window's own message-pump thread. Used to show the
+    // live render status (scene/output + spp/noise) as the frame converges.
+    void setTitle(const std::string& utf8);
 
     // True once the user has closed the window — lets the render stop early.
     bool closed() const;

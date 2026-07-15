@@ -1506,14 +1506,22 @@ static void onInterrupt(int sig) {
 // window sets g_stopRequested so the render stops cleanly (writing its final image).
 static bool                        g_showWindow = false;
 static std::unique_ptr<LiveWindow> g_liveWin;
-static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute) {
+// Base window title identifying WHAT is being rendered — set in main() to
+// "ftrace - <scene> -> <output>" (see makeWindowTitle). The live status (spp / noise)
+// is appended per frame so the title bar shows both the subject and its progress.
+static std::string                 g_windowTitle = "ftrace live preview";
+static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
+                             const char* status = nullptr) {
     if (!g_showWindow || N <= 0.0) return;
     if (!g_liveWin)
-        g_liveWin = std::make_unique<LiveWindow>(f.resX, f.resY, "ftrace — live preview");
+        g_liveWin = std::make_unique<LiveWindow>(f.resX, f.resY, g_windowTitle.c_str());
     // Per-frame auto-expose (nullptr anchor) so the live view tracks the converging
     // image the same way the ANSI preview does.
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
+    // Reflect the render subject + live progress in the title bar.
+    if (status && *status) g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  " + status);
+    else                   g_liveWin->setTitle(g_windowTitle);
     if (g_liveWin->closed()) g_stopRequested = 1;
 }
 
@@ -1958,7 +1966,7 @@ static int runSppProgressive(
                               totalSpp, baseSpp + sppReq, elapsed, noisePct);
             if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
-            liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute);
+            liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, st);
         }
         return stop;
     };
@@ -2120,7 +2128,7 @@ static int runCompositeProgressive(
                               acc.spp, sppReq, acc.N, Nreq, elapsed, noisePct);
             if (preview) ansiPreview(comp, 1.0, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
-            liveWindowUpdate(comp, 1.0, manualExposure, absolute);
+            liveWindowUpdate(comp, 1.0, manualExposure, absolute, st);
         }
         if (done) break;
     }
@@ -2680,7 +2688,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
                     if (preview) ansiPreview(disp, (double)acc.N, manualExposure, st);
                     else { std::printf("%s\n", st); std::fflush(stdout); }
-                    liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute);
+                    liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, st);
                 } else { std::printf("%s\n", st); std::fflush(stdout); }
             }
             if (done) break;
@@ -2887,6 +2895,13 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
     if (nThreads < 1) nThreads = 1;
+    // Name the live-preview window after what it is rendering: "ftrace — <scene> → <out>"
+    // (em dash + right-arrow are UTF-8; livewindow decodes them properly). The scene is
+    // the -in file when given, else the built-in scene name; the output is the -o target.
+    {
+        std::string scene = inFile ? inFile : sceneName;
+        g_windowTitle = "ftrace  \xE2\x80\x94  " + scene + "  \xE2\x86\x92  " + out;
+    }
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
@@ -3466,7 +3481,7 @@ static int run(int argc, char** argv) {
                         addEnvBackground(disp, scene, toRender[idx[0]].cam, accN);
                         if (preview) ansiPreview(disp, (double)accN, toRender[idx[0]].exposure, st);
                         else { std::printf("%s\n", st); std::fflush(stdout); }
-                        liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure, scene.absolute);
+                        liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure, scene.absolute, st);
                     } else { std::printf("%s\n", st); std::fflush(stdout); }
                 }
                 if (done) break;
