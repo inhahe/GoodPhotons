@@ -1959,6 +1959,12 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+    // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
+    // Divide the pupil FLUX deposited in the cell by the physical cell area
+    // A_cell = pixelPlaneArea()*filmDist^2 to turn it into film IRRADIANCE, matching
+    // mode B's radiance*camEq absolute scale. Per-camera constant; auto-exposed scenes
+    // stay byte-identical, only absolute-EV A/C are re-seated to mid-tone at gain 6.
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1986,6 +1992,9 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     Real ph = hgPhase(dot(wIn, wdir), (Real)med.g);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
+    // Same flux->film-irradiance normaliser as connectLens (see there); per-camera
+    // constant, so auto-exposed scenes are unaffected.
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -2941,7 +2950,11 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         int px, py;
         // Model C never shares a trace (it consumes the photon), so nCam==1 here.
         if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
-            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta);
+            // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
+            // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
+            // scenes unaffected).
+            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
             eSensor += beta; return WF_TERMINATE;
         }
     }

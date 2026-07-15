@@ -21,28 +21,44 @@ of the radiance, not the integrator, every mode yields a consistent anchor. Ther
 **average** rather than the first frame. Validated on scraps/lock_test.ftsl in modes
 B/M/D/P with `index`/`average` selectors (all honoured, all frames flicker-free).
 
-### OPEN (2026-07-15): absolute-EV scenes render near-black in the finite-lens catch modes (A/C)
+### DONE (2026-07-15): A/B/C now agree in absolute brightness at equal `power` (finite-lens catch modes were near-black)
 
-`ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) — the fixed sensor gain that
-replaces the p99 auto-exposure in absolute mode (any light with `power`/`lumens`) —
-is calibrated **only for mode B** (the pinhole splat; the shipped `scenes/absolute.ftsl`
-uses mode B and exposes to mid-tone at gain 6). The **finite-lens catch modes A and C**
-produce a radiometric film scale that is ~10^3–10^4× dimmer at the same gain, so an
-absolute scene shot in mode A/C comes out essentially **black** unless the user cranks
-`exposure` to ~1e4 in the `film` block. Repro:
-`ftrace -in scraps/ap_abs.ftsl -time 10 -o png/x.png` (mode-A cams) → max pixel ≈ 5/255,
-vs the same scene in mode B which is fine. Root cause is the mode-A/C splat weight
-(render.h `connectLens`: `contrib *= cosSurf*cosLens*R^2/dist^2`) carrying pupil-area/
-geometry factors that mode B's pinhole weight does not, so the two modes don't share an
-absolute scale. **Proper fix:** derive a per-mode absolute calibration (or fold the
-missing `1/(π R_ref^2)`-style normalisation into the A/C splat) so gain 6 lands mid-tone
-in every mode, then re-validate B vs A vs C at equal `power`. NOTE: the aperture→
-brightness relationship itself is *correct* in absolute A/C (verified: doubling the
-aperture radius quadruples brightness, linear ratio 3.97≈4.0) — only the overall gain is
-mis-seated. This is why the `-raster` preview's aperture-brightness term is gated to
-`absolute && mode∈{A,C}` and uses a *relative* reference aperture (Rref=0.02), so it
-previews the correct *ratio* even though the real render's absolute level is currently
-off.
+Previously, `ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) was calibrated **only for
+mode B** (the pinhole splat). The finite-lens catch modes **A** (`connectLens`) and **C**
+(forward pupil catch) produced a film scale ~10^3–10^4× dimmer at the same gain, so an
+absolute scene shot in mode A/C came out essentially **black**. Root cause: mode B's
+`connect()` records **radiance** (i.e. it is implicitly divided by the pixel solid angle
+Ω_pix = `pixelPlaneArea()·cosCam³`), whereas the A/C splat records **flux-per-cell**
+(`× R²/dist²`, with no cell-area normalisation) — a dimensionally different quantity.
+
+**Fix (the F = 1/A_cell factor).** Fold a single per-camera constant
+`F = 1/(pixelPlaneArea()·filmDist²) = 1/A_cell` into the A/C splat, converting its
+flux deposit into film irradiance on the same scale mode B uses. Derivation: the raw A/C
+splat = `B·(π R²·A_pix)`; the target (camera equation) = `B·(π R²/filmDist²)`; on-axis
+`A_pix = pixelPlaneArea()`, so the correcting ratio is exactly `1/A_cell`. Because it is a
+per-camera constant it cancels under p99 auto-exposure (auto-exposed scenes stay
+byte-identical) and only re-seats the *absolute* level. Applied at four sites, CPU + GPU:
+- `render.h` `connectLens` and `connectLensVolume` (`contrib *= 1/(pixelPlaneArea()·filmDist²)`),
+- `render.h` mode-C catch (`cCell` factor on the film `add`),
+- `render_cuda.cu` `connectLens`, `connectLensVolume`, and CAM_C catch (same factor).
+
+Modes A/C use plain gain 6 (`comp = 1`); mode B keeps its aperture `camEq = (π/4)/N²` fold
+(the separate DONE issue below) — the two paths each carry the `1/N²` once, never doubled.
+
+**Validated** (`scraps/abs_calib.ftsl` / `_acalib_wide.ftsl`, Cornell box + 100 W area
+light), tone-mapped 8-bit whole-image mean, GPU **and** CPU:
+- f/4:   A `6.79` vs B `7.16` (95%).
+- f/1.4: GPU A `25.54` vs B `25.90` (**98.6%**); CPU A `25.49` vs B `25.86` (**98.6%**).
+- Mode C converges to B as its (pupil-catch) noise falls — mean `16.81 → 20.70 → 21.54`
+  as noise `82% → 35.8% → 31.6%` (residual gap is tone-map clamp bias on fireflies, not a
+  scale error). A and C now land at the same absolute brightness as B instead of black.
+
+NOTE: the `-raster` preview still uses its relative reference aperture (Rref=0.02) for the
+aperture-brightness *ratio*; that remains correct. Known wart (minor, logged for later):
+the **`-aperture` CLI override** changes A/C's physical pupil `R` but does **not** feed
+mode B's `camEq` comp (which reads the scene's `fstop`/`lens`), so cross-mode comparison
+via `-aperture` desyncs B — always set `fstop` in the scene for an apples-to-apples A/B/C
+comparison. Not a render-correctness bug (a normal single-mode render is unaffected).
 
 ### DONE (2026-07-15): absolute EV — mode B now applies the aperture's exposure (light-gathering)
 
@@ -55,7 +71,7 @@ DoF. Gated tightly so it only *darkens* a mode-B camera that opted into an f-num
 with no aperture authored (`c.lensF == 0`, e.g. shipped `scenes/absolute.ftsl`) the
 branch is skipped and the pinhole stays the pure radiance reference (comp unchanged,
 byte-identical). Modes A/C are untouched (they must NOT double-apply `1/N²` — their
-gross-scale mis-seat is the separate OPEN issue above).
+gross-scale mis-seat is the separate issue above, now DONE via `F = 1/A_cell`).
 
 **Validated** (`scraps/abs_calib.ftsl`, Cornell box + 100 W area light, mode B, GPU):
 rendering the same scene at f/2 vs f/8 now separates by exactly 4 stops —
@@ -65,10 +81,10 @@ scaling correctly: `exposure=1.18 (absolute: gain 6 x 0.196 comp)` for f/2, wher
 `0.196 = (π/4)/2²`. Author `fstop`/`lens` at the **camera-block** level (not inside
 `film{}` — the film block only reads res/size/format/iso/shutter/exposure).
 
-Note the remaining half of the "unification" (making A/B/C agree in *absolute*
-brightness at equal power) is still blocked on the A/C gross-scale gain mis-seat —
-see the OPEN "finite-lens catch modes (A/C) render near-black" issue above. Mode B
-is now internally correct wrt aperture.
+The other half of the "unification" (making A/B/C agree in *absolute* brightness at
+equal power) is now also DONE — see the "A/B/C now agree in absolute brightness"
+issue above (the `F = 1/A_cell` A/C re-seat). Mode B is internally correct wrt
+aperture, and A/B/C now match within noise at equal `power`.
 
 The old rationale for excluding aperture from the exposure comp ("in splat mode B
 the aperture is virtual, so an f-number term would double-count / be an artifact",
@@ -97,11 +113,17 @@ deterministically regardless of timing) — some specific path at spp 14 indexes
 bounds or dereferences a bad pointer, likely a rare geometric/CSG/medium configuration
 hit only by that sample's random walk.
 
-**Investigation status:** a `compute-sanitizer --tool memcheck` run (build has
-`-lineinfo`, so it would report the exact `render_cuda.cu:<line>`) was launched but
-**stopped before it reached the crash sample** (memcheck ~20× slowdown ⇒ ~80 min to
-spp 14; killed to free the exe lock for the -raster preview work). **Next step:**
-re-run compute-sanitizer memcheck to completion for the fault line, then fix the OOB.
+**Investigation status (2026-07-15 update):** a **bounded** `compute-sanitizer --tool
+memcheck` run — mode-D BDPT pinned to the single still camera (`-camera cam -spp 6`, so
+it terminates instead of rolling onto the 144-frame flyby) — completed with **ZERO
+memory errors**. So the fault does **not** reproduce on the still frame at low spp; it is
+either **flyby-camera-position specific** (a geometric configuration only some moving-cam
+viewpoint hits) or was already mitigated by unrelated fixes since the crash was first
+seen. The earlier unbounded attempt (`-noise 3`, no `-camera`) never reached spp 14
+(memcheck ~65× slowdown) and also rolled onto the flyby — avoid that; always bound it.
+**Next step:** reproduce at the *specific* crashing spp/camera (drive to spp 14 on the
+flyby camera under a bounded memcheck) to catch the exact `render_cuda.cu:<line>`, then
+fix the OOB. Earlier context: build has `-lineinfo`, so memcheck reports the exact line.
 Repro (headless — sanitizer runs instrumented). Use the real `compute-sanitizer.exe`
 (in the CUDA `compute-sanitizer/` subdir), NOT the `bin/compute-sanitizer.bat` wrapper —
 the `.bat` exits 127 (no useful output) when launched from the bash tool:

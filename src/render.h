@@ -521,6 +521,19 @@ struct Renderer {
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+        // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification). The line above deposits
+        // radiant FLUX through the pupil into the film CELL (it carries the pupil area
+        // R^2 but no 1/cell-area), whereas mode B's connect() deposits RADIANCE (it
+        // divides by the pixel solid angle). Dividing the flux by the physical cell
+        // area A_cell = pixelPlaneArea()*filmDist^2 turns it into film-plane IRRADIANCE
+        // E, so the finite lens now records exactly E = L * (pi/4)/N^2 (N = filmDist/2R)
+        // -- the same absolute scale as B*camEq. Equivalent derivation: current splat =
+        // B * (pi R^2 * A_pix); target = B * (pi R^2 / filmDist^2); ratio = 1/A_cell.
+        // A_cell depends only on the camera (fov/res/filmDist), so this is a per-camera
+        // constant: auto-exposed scenes stay byte-identical (the p99 anchor divides it
+        // out) and A stays consistent with C; only ABSOLUTE-EV A/C are corrected to
+        // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
+        contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
@@ -549,6 +562,11 @@ struct Renderer {
         double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
         double Lambda = med.albedo(lambda);
         double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
+        // Same flux->film-irradiance normaliser as connectLens (see there): divide the
+        // pupil flux deposited in the cell by the physical cell area so a fog vertex
+        // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
+        // exposed scenes unaffected).
+        contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // all media
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
@@ -1125,7 +1143,14 @@ struct Renderer {
             if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
                 int px, py;
                 if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
-                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
+                    // Same flux->film-irradiance normaliser as connectLens (model A): a
+                    // caught photon deposits pupil FLUX into the cell; divide by the cell
+                    // area A_cell = pixelPlaneArea()*filmDist^2 so brute-force C keeps the
+                    // SAME absolute scale as the importance-sampled A (validated equal),
+                    // and both now match B's radiance*camEq in absolute EV.
+                    const Camera& cc = *cams[0].cam;
+                    double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
+                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (beta * cCell));
                     e.sensor += beta;
                     return;
                 }
