@@ -42,6 +42,7 @@ struct LiveWindow::Impl {
     std::atomic<bool>    closedFlag{false};
     HWND                 hwnd = nullptr;
     int                  initW = 0, initH = 0;
+    int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     std::wstring         title;
     HANDLE               readyEvent = nullptr;
 
@@ -106,6 +107,20 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         case WM_SIZE:
             InvalidateRect(h, nullptr, FALSE);
             return 0;
+        case WM_GETMINMAXINFO:
+            // Keep the window from being dragged smaller than a readable floor, so the
+            // title bar (source -> destination) stays legible. The image itself is
+            // aspect-fit + letterboxed into whatever size the window is, so a wide
+            // minimum just adds black margins to a tall/square preview. (This can arrive
+            // before WM_CREATE sets USERDATA, so tolerate a null self.)
+            if (self) {
+                auto mmi = reinterpret_cast<MINMAXINFO*>(lp);
+                RECT r{0, 0, self->minW, self->minH};
+                AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+                mmi->ptMinTrackSize.x = r.right - r.left;
+                mmi->ptMinTrackSize.y = r.bottom - r.top;
+            }
+            return 0;
         case WM_CLOSE:
             if (self) self->closedFlag.store(true);
             DestroyWindow(h);
@@ -157,8 +172,12 @@ LiveWindow::LiveWindow(int w, int h, const char* title) {
     const int mw = 1600, mh = 900;
     double s = std::min(1.0, std::min((double)mw / std::max(1, w),
                                       (double)mh / std::max(1, h)));
-    impl_->initW = std::max(160, (int)(w * s));
-    impl_->initH = std::max(90,  (int)(h * s));
+    // Open at (and never shrink below) a readable floor so the title bar text — the
+    // source scene -> destination file — is legible even for a tiny image. Extra width
+    // beyond the image's aspect is just letterboxed by paint().
+    impl_->minW = 720; impl_->minH = 320;
+    impl_->initW = std::max(impl_->minW, (int)(w * s));
+    impl_->initH = std::max(impl_->minH, (int)(h * s));
     std::string t = title ? title : "ftrace";
     impl_->title = utf8ToWide(t);                  // proper UTF-8 -> UTF-16
     impl_->readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);

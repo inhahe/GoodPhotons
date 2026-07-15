@@ -142,13 +142,20 @@ paths they can capture at all**.
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+> Because rasterizing is nearly free, a preview whose size you haven't pinned with
+> `-r` is **upscaled so its long edge is at least 1440 px** (aspect preserved) —
+> a scene that authored a small `film { res 256 256 }` still previews big and
+> readable instead of a postage stamp; already-large cameras are left as-is, and a
+> real light-transport render always keeps its authored resolution.
 >
 > **Double-click / bare invocation.** Running ftrace with just a scene file and
 > nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,
 > `.scene`, or `.fts`, as produced by a file association or drag-and-drop) —
-> defaults to exactly this quick preview: it turns on `-raster` **and** `-window`
-> automatically and shows the room in a live window, writing the preview PNG to a
-> temp file (no stray output in the working directory). Passing any real-render
+> defaults to exactly this quick preview: it turns on `-raster`, `-window`, **and**
+> `-keepwindow` automatically and shows the room in a live window that **stays open
+> after the raster finishes** (so a double-click preview doesn't flash-and-vanish —
+> close the window yourself to exit), writing the preview PNG to a temp file (no
+> stray output in the working directory). Passing any real-render
 > control (`-mode`, `-n`, `-time`, `-noise`, `-forever`, `-device`, `-camera`,
 > `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
 > normally; `-in <path>` is likewise always an explicit render, never a preview.
@@ -1357,7 +1364,7 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. |
+| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window). See the preview note under **Render modes**. |

@@ -2958,6 +2958,8 @@ static int run(int argc, char** argv) {
         if (!explicitControl) {
             doRaster = true;
             g_showWindow = true;
+            g_keepWindow = true;   // double-click preview: hold the image open until the
+                                   // user closes the window (don't flash-and-vanish)
             // Don't drop a stray cornell.ppm next to the cwd: send the preview PNG to a
             // temp path derived from the scene name. (Window is the real deliverable.)
             if (!std::strcmp(out, "cornell.ppm")) {
@@ -3229,6 +3231,23 @@ static int run(int argc, char** argv) {
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup; };
     std::vector<RenderCam> toRender;
 
+    // Raster previews are cheap to compute, so unless the user pinned a size with -r,
+    // scale each preview camera UP so its long edge is at least kRasterPreviewLong px
+    // (aspect preserved — the same scale on both axes, so the camera's tanHalfX/Y still
+    // match). A 256²-authored test camera then previews large and readable in the live
+    // window instead of tiny; already-large cameras are left untouched, and real
+    // (light-transport) renders always keep their authored resolution.
+    const int kRasterPreviewLong = 1440;
+    auto previewUpscale = [&](int& rx, int& ry) {
+        if (!doRaster || resFromCli) return;
+        int lo = std::max(rx, ry);
+        if (lo > 0 && lo < kRasterPreviewLong) {
+            double s = (double)kRasterPreviewLong / lo;
+            rx = std::max(1, (int)std::lround(rx * s));
+            ry = std::max(1, (int)std::lround(ry * s));
+        }
+    };
+
     // -view against a loaded (-in) scene: inject an ad-hoc 'view' CamSpec and
     // render only it (so the live -window/-preview shows exactly that angle).
     // A built-in scene has no CamSpec list; its view override is applied in the
@@ -3299,6 +3318,7 @@ static int run(int argc, char** argv) {
             int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
             int cresY = resFromCli ? (resYCli > 0 ? resYCli : res)
                                    : (cs->resY > 0 ? cs->resY : cresX);
+            previewUpscale(cresX, cresY);   // big, readable raster preview (no-op for real renders)
             Camera c;
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cresX, cresY);
             c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
@@ -3365,16 +3385,17 @@ static int run(int argc, char** argv) {
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
                                 mode == 'P' || mode == 'D' || mode == 'M' ||
                                 mode == 'S' || mode == 'U' || refMode);
-        const int resY = (resYCli > 0) ? resYCli : res;
+        int fresX = res, fresY = (resYCli > 0) ? resYCli : res;
+        previewUpscale(fresX, fresY);   // big, readable raster preview (no-op for real renders)
         Camera c;
         if (useCamera) {
-            if (haveView)   c.lookAt(viewEye, viewLook, viewUp, viewFov, res, resY);   // -view overrides the demo camera
-            else if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, resY);
-            else            c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, resY);
+            if (haveView)   c.lookAt(viewEye, viewLook, viewUp, viewFov, fresX, fresY);   // -view overrides the demo camera
+            else if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, fresX, fresY);
+            else            c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, fresX, fresY);
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
-        toRender.push_back({"", c, mode, res, resY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1});
+        toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1});
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file
