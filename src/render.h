@@ -21,6 +21,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "photonmap.h"
+#include "medium_stack.h"
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -1069,9 +1070,15 @@ struct Renderer {
         }
 
         Ray ray{origin + dir * 1e-6, dir};
-        // Dielectric the photon is currently INSIDE (for Beer-Lambert interior
-        // absorption / colored glass), or null in vacuum. Assumes non-nested glass.
-        const Material* interior = nullptr;
+        // Nested-dielectric medium stack: the solids the photon is currently inside.
+        // The current medium (for Beer-Lambert absorption and the exterior IOR at the
+        // next interface) is the highest-priority entry (Schmidt & Budge 2002). Replaces
+        // the old single `interior` pointer; behaves identically for a lone dielectric.
+        MediumStack stk;
+        auto curAbsorb = [&](double lam) -> double {           // sigma_a of the current medium
+            int mi = stk.topMat();
+            return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
+        };
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             Hit h = scene.closestHit(ray);
@@ -1104,8 +1111,8 @@ struct Renderer {
             }
 
             // Beer-Lambert attenuation over the free path just travelled inside glass.
-            if (interior) {
-                double a = interior->absorb(lambda);
+            {
+                double a = curAbsorb(lambda);
                 if (a > 0.0) beta *= std::exp(-a * dEvent);
             }
 
@@ -1162,11 +1169,54 @@ struct Renderer {
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
                 case MatType::Dielectric: {
+                    // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): the
+                    // exterior IOR is the medium the photon is currently inside (the
+                    // highest-priority stack entry), not a hardcoded 1.0, so glass inside
+                    // water refracts 1.33<->1.52. Where dielectrics overlap the higher
+                    // `priority` wins and the lower one's boundary is suppressed (the
+                    // photon passes straight through). SAFE FALLBACK: the priority rule
+                    // applies only when BOTH sides carry an explicit priority (air always
+                    // counts, IOR 1.0); otherwise this degrades to the old flat
+                    // air<->glass model so priority-free scenes are bit-identical.
                     bool entering = dot(ray.d, h.ng) < 0.0;
-                    bool transmitted = false;
-                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
-                    if (transmitted) interior = entering ? &m : nullptr;  // track medium
-                    continue;                       // lossless (absorption applied per-segment)
+                    const int mi = h.matId;
+                    const int pr = m.priority;               // INT_MIN if unset
+
+                    if (entering) {
+                        const int outMat = stk.topMat();     // -1 == air
+                        const int outPri = stk.topPri();     // INT_MIN == air
+                        const bool ranked = m.hasPriority() &&
+                            (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                        if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                            stk.push(mi, pr);
+                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                            continue;
+                        }
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.push(mi, pr);
+                        continue;                   // lossless (absorption applied per-segment)
+                    } else {
+                        MediumStack after = stk;
+                        after.popMat(mi);
+                        const int newMat = after.topMat();   // -1 == air underneath
+                        const int newPri = after.topPri();
+                        const bool ranked = m.hasPriority() &&
+                            (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                        if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                            stk.popMat(mi);
+                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                            continue;
+                        }
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.popMat(mi);      // TIR stays inside mi
+                        continue;                   // lossless (absorption applied per-segment)
+                    }
                 }
                 case MatType::ThinFilm: {
                     // Iridescent coated interface: specular reflect-or-refract with a
