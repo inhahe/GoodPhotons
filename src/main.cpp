@@ -2802,6 +2802,25 @@ static int run(int argc, char** argv) {
     const char* inFile = nullptr;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
+    // Positional scene file: `ftrace scene.ftsl` (e.g. a double-click) with no -in.
+    // Accept a bare token that ends in a scene extension so a file association / drag-drop
+    // "just works" as a quick preview. Only scene-file extensions qualify, so this never
+    // swallows a flag value (no other flag takes a `.ftsl`/`.scene` argument).
+    bool positionalScene = false;
+    if (!inFile) {
+        auto hasSceneExt = [](const char* s) {
+            std::string t = s; for (auto& c : t) c = (char)std::tolower((unsigned char)c);
+            auto ends = [&](const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
+            return ends(".ftsl") || ends(".scene") || ends(".fts");
+        };
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i][0] == '-') continue;                 // a flag (or its value we skip below)
+            if (i > 0 && argv[i-1][0] == '-') {              // could be a flag's value; only take it if it's a scene file
+                if (!hasSceneExt(argv[i])) continue;
+            }
+            if (hasSceneExt(argv[i])) { inFile = argv[i]; positionalScene = true; break; }
+        }
+    }
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
     if (inFile) {
@@ -2914,6 +2933,41 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
     }
     if (nThreads < 1) nThreads = 1;
+
+    // Bare-invocation quick preview: `ftrace scene.ftsl` (double-click / drag-drop, no
+    // other flags) defaults to a fast raster preview shown in a live window — no light
+    // transport, no stray output file. If the user asked for any real-render control
+    // (a mode/budget/device/camera flag, an explicit -raster, etc.) we respect that and
+    // don't force preview.
+    if (positionalScene && !doRaster) {
+        static const char* kRenderFlags[] = {
+            "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
+            "-camera","-view","-savemap","-loadmap","-wavefront","-o","-r","-window"
+        };
+        bool explicitControl = false;
+        for (int i = 1; i < argc && !explicitControl; ++i)
+            for (const char* f : kRenderFlags)
+                if (!std::strcmp(argv[i], f)) { explicitControl = true; break; }
+        if (!explicitControl) {
+            doRaster = true;
+            g_showWindow = true;
+            // Don't drop a stray cornell.ppm next to the cwd: send the preview PNG to a
+            // temp path derived from the scene name. (Window is the real deliverable.)
+            if (!std::strcmp(out, "cornell.ppm")) {
+                const char* tmp = std::getenv("TEMP");
+                if (!tmp) tmp = std::getenv("TMPDIR");
+                if (!tmp) tmp = ".";
+                std::string base = inFile;
+                size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) base = base.substr(slash + 1);
+                size_t dot = base.find_last_of('.');
+                if (dot != std::string::npos) base = base.substr(0, dot);
+                static std::string previewOut = std::string(tmp) + "/ftrace_preview_" + base + ".png";
+                out = previewOut.c_str();
+            }
+        }
+    }
+
     // Name the live-preview window after what it is rendering: "ftrace — <scene> → <out>"
     // (em dash + right-arrow are UTF-8; livewindow decodes them properly). The scene is
     // the -in file when given, else the built-in scene name; the output is the -o target.

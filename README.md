@@ -142,6 +142,16 @@ paths they can capture at all**.
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+>
+> **Double-click / bare invocation.** Running ftrace with just a scene file and
+> nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,
+> `.scene`, or `.fts`, as produced by a file association or drag-and-drop) —
+> defaults to exactly this quick preview: it turns on `-raster` **and** `-window`
+> automatically and shows the room in a live window, writing the preview PNG to a
+> temp file (no stray output in the working directory). Passing any real-render
+> control (`-mode`, `-n`, `-time`, `-noise`, `-forever`, `-device`, `-camera`,
+> `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
+> normally; `-in <path>` is likewise always an explicit render, never a preview.
 
 ### Speed / accuracy / ability tradeoffs
 
