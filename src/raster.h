@@ -297,10 +297,12 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
     double area = (B.sx - A.sx) * (C.sy - A.sy) - (B.sy - A.sy) * (C.sx - A.sx);
     if (std::fabs(area) < 1e-9) return;
     double inv = 1.0 / area;
-    // Incremental barycentric edge functions: w0,w1 are affine in (x,y), so step them
-    // per pixel with adds instead of recomputing the full cross products each sample.
-    const double dw0dx = (C.sy - B.sy) * inv, dw0dy = (B.sx - C.sx) * inv;
-    const double dw1dx = (A.sy - C.sy) * inv, dw1dy = (C.sx - A.sx) * inv;
+    // Incremental barycentric edge functions: w0,w1 are affine in x, so step them along
+    // each row with a single add instead of recomputing the full cross products per
+    // sample. Rows recompute w0/w1 exactly from px=xlo+0.5, so only the x-derivative is
+    // needed: d w0/d px = (B.sy - C.sy)*inv, d w1/d px = (C.sy - A.sy)*inv.
+    const double dw0dx = (B.sy - C.sy) * inv;
+    const double dw1dx = (C.sy - A.sy) * inv;
     const uint8_t triEmis = t.emissive ? 1 : 0;
     for (int y = ylo; y <= yhi; ++y) {
         double py = y + 0.5, pxL = xlo + 0.5;
