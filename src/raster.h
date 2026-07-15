@@ -492,8 +492,15 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
 // gap plus a small box, so the exact aim point stays visible. Drawn on top (ignores
 // depth) so you can always see where the interactive camera is pointed. This is the
 // visible marker for the 6-DOF preview control (eye xyz + this target xyz).
+//
+// `worldRadius` (>0) makes the crosshair a fixed *world* size rather than a fixed
+// screen size: the arm length is the on-screen projection of a `worldRadius`-long
+// segment sitting at the target, so the marker SHRINKS as the target is pushed farther
+// and GROWS as it's pulled nearer, exactly per the camera's perspective — a visual cue
+// for the target's depth. `worldRadius==0` falls back to the old constant-screen size.
 inline void drawTargetMarker(std::vector<uint8_t>& img, int W, int H,
-                             const Camera& cam, const Vec3& target) {
+                             const Camera& cam, const Vec3& target,
+                             double worldRadius = 0.0) {
     Vec3 d = target - cam.eye;
     VtxCS c; c.x = dot(d, cam.u); c.y = dot(d, cam.v); c.z = dot(d, cam.w);
     c.wpos = target; c.wn = Vec3{0, 0, 1};
@@ -507,9 +514,24 @@ inline void drawTargetMarker(std::vector<uint8_t>& img, int W, int H,
         img[i + 0] = R; img[i + 1] = G; img[i + 2] = B;
     };
     const int icx = (int)std::lround(s.sx), icy = (int)std::lround(s.sy);
-    const int arm = std::max(10, W / 36);   // arm length (roughly constant on screen)
-    const int gap = std::max(4, arm / 4);   // centre gap so the exact point is unobscured
-    const int th  = std::max(1, W / 800);   // line half-thickness
+    int arm;
+    if (worldRadius > 0.0) {
+        // Project a point offset from the target by `worldRadius` along camera-right; the
+        // pixel gap to the centre is the perspective-correct on-screen size of that world
+        // length. Clamp so a very distant target still shows a tiny cross and a very near
+        // one doesn't swallow the whole frame.
+        Vec3 pw = target + cam.u * worldRadius;
+        Vec3 d2 = pw - cam.eye;
+        VtxCS o; o.x = dot(d2, cam.u); o.y = dot(d2, cam.v); o.z = dot(d2, cam.w);
+        o.wpos = pw; o.wn = Vec3{0, 0, 1};
+        VtxScreen so = projectVtx(cam, o, W, H);
+        double px = std::hypot(so.sx - s.sx, so.sy - s.sy);
+        arm = (int)std::lround(std::clamp(px, 3.0, 0.75 * std::max(W, H)));
+    } else {
+        arm = std::max(10, W / 36);   // arm length (roughly constant on screen)
+    }
+    const int gap = std::max(2, arm / 4);   // centre gap so the exact point is unobscured
+    const int th  = std::max(1, arm / 40);  // line half-thickness (scales with the cross)
     for (int t = -th; t <= th; ++t)
         for (int a = gap; a <= arm; ++a) {
             put(icx + a, icy + t); put(icx - a, icy + t);   // horizontal arms

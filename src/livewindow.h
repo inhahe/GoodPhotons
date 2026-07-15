@@ -18,10 +18,23 @@
 // along the WORLD axes so the resulting numbers drop straight into a `.ftsl` camera.
 enum class NudgeCmd {
     EyeXNeg, EyeXPos, EyeYNeg, EyeYPos, EyeZNeg, EyeZPos,   // move the camera eye
-    TgtXNeg, TgtXPos, TgtYNeg, TgtYPos, TgtZNeg, TgtZPos,   // move the look-at target
+    TgtXNeg, TgtXPos, TgtYNeg, TgtYPos, TgtZNeg, TgtZPos,   // move the look-at target (world axes)
+    TgtNear, TgtFar,                                         // move the target along the view axis
     StepDown, StepUp,                                        // finer / coarser move step
     Reset,                                                   // back to the authored camera
     Print,                                                   // dump a paste-ready camera block
+};
+
+// Accumulated pointer (mouse) input since the last drainPointer(). The window reports
+// raw motion only — it doesn't know the scene/camera — and the render loop maps it onto
+// the look-at target. `dragDx/dragDy` are in IMAGE PIXELS (the window divides the
+// client-space drag by the current letterbox scale so one image pixel dragged = one
+// image pixel of target motion), with +dragDx = cursor right and +dragDy = cursor down.
+// `wheel` is in notches (+ = wheel forward / push the target farther).
+struct PointerInput {
+    double dragDx = 0.0, dragDy = 0.0;   // left-drag, image-pixel space
+    double wheel  = 0.0;                  // wheel notches (+ = away/farther)
+    bool   any() const { return dragDx != 0.0 || dragDy != 0.0 || wheel != 0.0; }
 };
 
 class LiveWindow {
@@ -47,6 +60,10 @@ public:
     // Return (and clear) the interactive control commands queued from key presses
     // since the last call. Empty when nothing was pressed. Thread-safe.
     std::vector<NudgeCmd> drainNudges();
+
+    // Return (and clear) the accumulated mouse drag / wheel motion since the last call.
+    // Thread-safe. See PointerInput for units.
+    PointerInput drainPointer();
 
     LiveWindow(const LiveWindow&) = delete;
     LiveWindow& operator=(const LiveWindow&) = delete;

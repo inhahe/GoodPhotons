@@ -3664,14 +3664,33 @@ static int run(int argc, char** argv) {
             const bool autoExp = !scene.absolute;   // per-frame auto-exposure while navigating
             Vec3   eye = eye0, tgt = tgt0;
             double step = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0) * 0.03;
+            // World-space size of the red crosshair: a fixed fraction of the scene, so it
+            // shrinks/grows with the target's distance under the camera's perspective.
+            const double crossR = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0) * 0.06;
+            // Interactive render resolution: cap the long edge so mouse-dragging stays
+            // responsive on a heavy scene. The window letterboxes to roughly this size
+            // anyway, and the eye/look_at readout + world-scaled crosshair are resolution-
+            // independent, so this only softens the live preview while navigating — same
+            // aspect ratio, so the projection is unchanged.
+            int VW = W, VH = H;
+            {
+                const int kInteractiveLong = 900;
+                int lo = std::max(VW, VH);
+                if (lo > kInteractiveLong) {
+                    double sc = (double)kInteractiveLong / lo;
+                    VW = std::max(1, (int)std::lround(VW * sc));
+                    VH = std::max(1, (int)std::lround(VH * sc));
+                }
+            }
             auto fmt3 = [](const Vec3& p) {
                 char b[64]; std::snprintf(b, sizeof b, "%.2f, %.2f, %.2f", p.x, p.y, p.z);
                 return std::string(b);
             };
             std::printf(
               "[viewer] interactive raster camera — move it, then copy the eye/look_at:\n"
+              "         mouse:  drag = slide the red crosshair L/R/U/D across the view    wheel = push it farther/nearer\n"
               "         eye:    A/D = -X/+X    R/F = +Y/-Y    W/S = -Z/+Z\n"
-              "         target: Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   (red crosshair)\n"
+              "         target: Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   Shift/Ctrl/Alt+Up/Dn = farther/nearer\n"
               "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n",
               step);
             std::fflush(stdout);
@@ -3694,19 +3713,58 @@ static int run(int argc, char** argv) {
                         case NudgeCmd::TgtYPos: tgt.y += step; changed = true; break;
                         case NudgeCmd::TgtZNeg: tgt.z -= step; changed = true; break;
                         case NudgeCmd::TgtZPos: tgt.z += step; changed = true; break;
+                        case NudgeCmd::TgtFar: {   // push the target away along the view axis
+                            Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
+                            if (L > 1e-9) { tgt = tgt + f * (step / L); changed = true; }
+                            break;
+                        }
+                        case NudgeCmd::TgtNear: {  // pull the target toward the eye
+                            Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
+                            if (L > 1e-9) { tgt = tgt - f * (std::min(step, L * 0.5) / L); changed = true; }
+                            break;
+                        }
                         case NudgeCmd::StepUp:   step *= 1.5; std::printf("[viewer] step %.3f\n", step); std::fflush(stdout); break;
                         case NudgeCmd::StepDown: step /= 1.5; std::printf("[viewer] step %.3f\n", step); std::fflush(stdout); break;
                         case NudgeCmd::Reset:    eye = eye0; tgt = tgt0; changed = true; break;
                         case NudgeCmd::Print:    doPrint = true; break;
                     }
                 }
+                // Mouse: left-drag slides the target across the current view plane (so the
+                // crosshair tracks the cursor L/R/U/D), wheel pushes it along the view axis.
+                PointerInput pin = g_liveWin->drainPointer();
+                if (pin.any()) {
+                    Camera cc; cc.projection = proj;
+                    cc.lookAt(eye, tgt, up, fovY, VW, VH);
+                    if (pin.dragDx != 0.0 || pin.dragDy != 0.0) {
+                        // Target sits on the view axis, so its camera-forward depth is just
+                        // |tgt-eye|. Converting an image-pixel drag to a world offset in the
+                        // u/v plane at that depth makes one image pixel dragged move the
+                        // target one image pixel on screen (the crosshair follows the cursor).
+                        // Drag deltas are in the displayed image's pixel space (VW×VH).
+                        double zc = std::sqrt(dot(tgt - eye, tgt - eye));
+                        if (zc < 1e-4) zc = 1e-4;
+                        double du =  pin.dragDx * 2.0 * cc.tanHalfX * zc / std::max(1, VW);
+                        double dv = -pin.dragDy * 2.0 * cc.tanHalfY * zc / std::max(1, VH);  // screen down = -v
+                        tgt = tgt + cc.u * du + cc.v * dv;
+                        changed = true;
+                    }
+                    if (pin.wheel != 0.0) {   // +wheel = farther along the view axis
+                        Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
+                        if (L > 1e-9) {
+                            double d = pin.wheel * step;
+                            if (d < 0.0) d = -std::min(-d, L * 0.5);   // don't cross the eye
+                            tgt = tgt + f * (d / L);
+                            changed = true;
+                        }
+                    }
+                }
                 if (changed) {
                     Camera c; c.projection = proj;
-                    c.lookAt(eye, tgt, up, fovY, W, H);
+                    c.lookAt(eye, tgt, up, fovY, VW, VH);
                     std::vector<uint8_t> img =
-                        raster::renderFrame(prims, c, W, H, plight, nThreads, ev, autoExp, nullptr);
-                    raster::drawTargetMarker(img, W, H, c, tgt);
-                    g_liveWin->update(W, H, img);
+                        raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr);
+                    raster::drawTargetMarker(img, VW, VH, c, tgt, crossR);
+                    g_liveWin->update(VW, VH, img);
                     g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
                                         ")  look(" + fmt3(tgt) + ")");
                     changed = false;

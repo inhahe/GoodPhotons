@@ -9,12 +9,14 @@ void LiveWindow::update(int, int, const std::vector<uint8_t>&) {}
 void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
 std::vector<NudgeCmd> LiveWindow::drainNudges() { return {}; }
+PointerInput LiveWindow::drainPointer() { return {}; }
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>          // GET_X_LPARAM / GET_Y_LPARAM
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -46,8 +48,12 @@ struct LiveWindow::Impl {
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     std::wstring         title;
     HANDLE               readyEvent = nullptr;
-    std::mutex           inMtx;                     // guards `nudges`
+    std::mutex           inMtx;                     // guards `nudges` + pointer accumulators
     std::vector<NudgeCmd> nudges;                   // interactive control commands from key presses
+    bool                 dragging = false;          // left mouse button held (panning the target)
+    int                  lastMx = 0, lastMy = 0;    // last client-space cursor pos while dragging
+    double               dragDx = 0.0, dragDy = 0.0;// accumulated image-pixel drag since last drain
+    double               wheelAcc = 0.0;            // accumulated wheel notches since last drain
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
@@ -107,14 +113,69 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             EndPaint(h, &ps);
             return 0;
         }
+        case WM_PRINTCLIENT: {
+            // Render the current frame into the caller's DC so PrintWindow() captures the
+            // live image even when the window is occluded (used for off-screen grabs).
+            if (self) { RECT cr; GetClientRect(h, &cr); self->paint((HDC)wp, cr); }
+            return 0;
+        }
         case WM_SIZE:
             InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONDOWN:
+            // Begin panning the look-at target. Capture the mouse so a drag that leaves
+            // the client area still tracks, and seed the last-position for delta math.
+            if (self) {
+                SetCapture(h);
+                self->dragging = true;
+                self->lastMx = GET_X_LPARAM(lp);
+                self->lastMy = GET_Y_LPARAM(lp);
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            // Accumulate the drag as IMAGE-pixel motion: convert the client-space delta
+            // through the current letterbox scale (min fit of image into client), so the
+            // render loop can move the target one image pixel per image pixel dragged.
+            if (self && self->dragging) {
+                int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+                int dcx = mx - self->lastMx, dcy = my - self->lastMy;
+                self->lastMx = mx; self->lastMy = my;
+                double s;
+                {
+                    std::lock_guard<std::mutex> lk(self->mtx);
+                    RECT cr; GetClientRect(h, &cr);
+                    int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+                    s = (self->imgW > 0 && self->imgH > 0 && cw > 0 && ch > 0)
+                        ? std::min((double)cw / self->imgW, (double)ch / self->imgH)
+                        : 1.0;
+                }
+                if (s <= 1e-9) s = 1.0;
+                std::lock_guard<std::mutex> lk(self->inMtx);
+                self->dragDx += dcx / s;
+                self->dragDy += dcy / s;
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (self && self->dragging) { self->dragging = false; ReleaseCapture(); }
+            return 0;
+        case WM_MOUSEWHEEL:
+            // One detent (120 units) = one notch; +ve = wheel forward = push target away.
+            if (self) {
+                double notches = (double)GET_WHEEL_DELTA_WPARAM(wp) / 120.0;
+                std::lock_guard<std::mutex> lk(self->inMtx);
+                self->wheelAcc += notches;
+            }
             return 0;
         case WM_KEYDOWN:
             // Map keys to interactive camera nudges (queued; the render loop applies
             // them). Eye = WASD + R/F (world X/Z + Y); look-at target = arrows + PgUp/Dn.
             // [ / ] resize the step, 0 resets, P prints a paste-ready camera block.
             if (self) {
+                // A held Shift/Ctrl/Alt turns Up/Down into move-along-the-view-axis
+                // (farther / nearer) instead of the plain world-Z target nudge.
+                bool mod = (GetKeyState(VK_SHIFT)   & 0x8000) ||
+                           (GetKeyState(VK_CONTROL) & 0x8000) ||
+                           (GetKeyState(VK_MENU)    & 0x8000);
                 NudgeCmd c; bool hit = true;
                 switch (wp) {
                     case 'A':        c = NudgeCmd::EyeXNeg; break;
@@ -127,8 +188,8 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                     case VK_RIGHT:   c = NudgeCmd::TgtXPos; break;
                     case VK_NEXT:    c = NudgeCmd::TgtYNeg; break;   // PageDown
                     case VK_PRIOR:   c = NudgeCmd::TgtYPos; break;   // PageUp
-                    case VK_DOWN:    c = NudgeCmd::TgtZNeg; break;
-                    case VK_UP:      c = NudgeCmd::TgtZPos; break;
+                    case VK_DOWN:    c = mod ? NudgeCmd::TgtNear : NudgeCmd::TgtZNeg; break;
+                    case VK_UP:      c = mod ? NudgeCmd::TgtFar  : NudgeCmd::TgtZPos; break;
                     case VK_OEM_4:   c = NudgeCmd::StepDown; break;  // [
                     case VK_OEM_6:   c = NudgeCmd::StepUp;   break;  // ]
                     case '0': case VK_HOME: c = NudgeCmd::Reset; break;
@@ -262,6 +323,15 @@ std::vector<NudgeCmd> LiveWindow::drainNudges() {
     std::vector<NudgeCmd> out;
     out.swap(impl_->nudges);
     return out;
+}
+
+PointerInput LiveWindow::drainPointer() {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lk(impl_->inMtx);
+    PointerInput p;
+    p.dragDx = impl_->dragDx; p.dragDy = impl_->dragDy; p.wheel = impl_->wheelAcc;
+    impl_->dragDx = impl_->dragDy = impl_->wheelAcc = 0.0;
+    return p;
 }
 
 #endif // _WIN32
