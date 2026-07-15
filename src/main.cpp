@@ -3228,7 +3228,8 @@ static int run(int argc, char** argv) {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
-    struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup; };
+    struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
+                       Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0; };  // lookAt/up/fovY: for the interactive raster viewer
     std::vector<RenderCam> toRender;
 
     // Raster previews are cheap to compute, so unless the user pinned a size with -r,
@@ -3377,7 +3378,7 @@ static int run(int argc, char** argv) {
             // locks only that path's frames (group = its pathGroup); -1 = per-frame.
             int eg = forceExposureLock ? 0 : (cs->exposureLock ? cs->pathGroup : -1);
             double cexp = (exposureCli > 0.0) ? exposureCli : cs->exposureMul;   // -exposure/-ev overrides the authored comp
-            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg});
+            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
@@ -3387,15 +3388,18 @@ static int run(int argc, char** argv) {
                                 mode == 'S' || mode == 'U' || refMode);
         int fresX = res, fresY = (resYCli > 0) ? resYCli : res;
         previewUpscale(fresX, fresY);   // big, readable raster preview (no-op for real renders)
+        // Demo-camera eye/target/up/fov (captured for the interactive raster viewer).
+        Vec3 cEye  = haveView ? viewEye  : (prism ? Vec3{0.5, 0.5, 2.4} : Vec3{0.5, 0.5, 2.7});
+        Vec3 cLook = haveView ? viewLook : (prism ? Vec3{0.5, 0.45, 0.5} : Vec3{0.5, 0.5, 0.5});
+        Vec3 cUp   = haveView ? viewUp   : Vec3{0, 1, 0};
+        double cFov = haveView ? viewFov : (prism ? 45.0 : 40.0);
         Camera c;
         if (useCamera) {
-            if (haveView)   c.lookAt(viewEye, viewLook, viewUp, viewFov, fresX, fresY);   // -view overrides the demo camera
-            else if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, fresX, fresY);
-            else            c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, fresX, fresY);
+            c.lookAt(cEye, cLook, cUp, cFov, fresX, fresY);
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
-        toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1});
+        toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file
@@ -3601,6 +3605,86 @@ static int run(int argc, char** argv) {
         double secs = std::chrono::duration<double>(ft1 - ft0).count();
         std::printf("[raster] done: %d frame(s) in %.2fs (%.1f fps).\n",
                     frame, secs, frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
+
+        // ---------------------------------------------------------------------------
+        // Interactive raster viewer. For a single still camera shown in a live window,
+        // fly the camera with the keyboard and read off the eye/look_at to author a
+        // .ftsl camera. Six controls, all along WORLD axes: the camera EYE (x,y,z) and
+        // a LOOK-AT TARGET (x,y,z) which the camera always points at and which is drawn
+        // as a red crosshair. A multi-camera flyby keeps animating (above) and is not
+        // made interactive.
+        if (g_showWindow && g_liveWin && !g_stopRequested && toRender.size() == 1) {
+            const RenderCam& rc0 = toRender.front();
+            const int    W = rc0.res, H = rc0.resY, proj = rc0.cam.projection;
+            const Vec3   eye0 = rc0.cam.eye, tgt0 = rc0.lookAt, up = rc0.up;
+            const double fovY = rc0.fovY;
+            double ev = (rc0.exposure > 0.0) ? rc0.exposure : 1.0;
+            if (scene.absolute && (rc0.mode == 'A' || rc0.mode == 'C')) {
+                const double Rref = 0.02; double R = rc0.cam.apertureR;
+                if (R > 0.0) ev *= (R * R) / (Rref * Rref);
+            }
+            const bool autoExp = !scene.absolute;   // per-frame auto-exposure while navigating
+            Vec3   eye = eye0, tgt = tgt0;
+            double step = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0) * 0.03;
+            auto fmt3 = [](const Vec3& p) {
+                char b[64]; std::snprintf(b, sizeof b, "%.2f, %.2f, %.2f", p.x, p.y, p.z);
+                return std::string(b);
+            };
+            std::printf(
+              "[viewer] interactive raster camera — move it, then copy the eye/look_at:\n"
+              "         eye:    A/D = -X/+X    R/F = +Y/-Y    W/S = -Z/+Z\n"
+              "         target: Left/Right = -X/+X   PgUp/PgDn = +Y/-Y   Up/Down = -Z/+Z   (red crosshair)\n"
+              "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n",
+              step);
+            std::fflush(stdout);
+
+            bool changed = true;   // draw a first crosshair frame immediately
+            while (!g_liveWin->closed() && !g_stopRequested) {
+                std::vector<NudgeCmd> cmds = g_liveWin->drainNudges();
+                bool doPrint = false;
+                for (NudgeCmd c : cmds) {
+                    switch (c) {
+                        case NudgeCmd::EyeXNeg: eye.x -= step; changed = true; break;
+                        case NudgeCmd::EyeXPos: eye.x += step; changed = true; break;
+                        case NudgeCmd::EyeYNeg: eye.y -= step; changed = true; break;
+                        case NudgeCmd::EyeYPos: eye.y += step; changed = true; break;
+                        case NudgeCmd::EyeZNeg: eye.z -= step; changed = true; break;
+                        case NudgeCmd::EyeZPos: eye.z += step; changed = true; break;
+                        case NudgeCmd::TgtXNeg: tgt.x -= step; changed = true; break;
+                        case NudgeCmd::TgtXPos: tgt.x += step; changed = true; break;
+                        case NudgeCmd::TgtYNeg: tgt.y -= step; changed = true; break;
+                        case NudgeCmd::TgtYPos: tgt.y += step; changed = true; break;
+                        case NudgeCmd::TgtZNeg: tgt.z -= step; changed = true; break;
+                        case NudgeCmd::TgtZPos: tgt.z += step; changed = true; break;
+                        case NudgeCmd::StepUp:   step *= 1.5; std::printf("[viewer] step %.3f\n", step); std::fflush(stdout); break;
+                        case NudgeCmd::StepDown: step /= 1.5; std::printf("[viewer] step %.3f\n", step); std::fflush(stdout); break;
+                        case NudgeCmd::Reset:    eye = eye0; tgt = tgt0; changed = true; break;
+                        case NudgeCmd::Print:    doPrint = true; break;
+                    }
+                }
+                if (changed) {
+                    Camera c; c.projection = proj;
+                    c.lookAt(eye, tgt, up, fovY, W, H);
+                    std::vector<uint8_t> img =
+                        raster::renderFrame(prims, c, W, H, plight, nThreads, ev, autoExp, nullptr);
+                    raster::drawTargetMarker(img, W, H, c, tgt);
+                    g_liveWin->update(W, H, img);
+                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                        ")  look(" + fmt3(tgt) + ")");
+                    changed = false;
+                }
+                if (doPrint) {
+                    std::printf("camera \"cam\" { eye %.4g %.4g %.4g   look_at %.4g %.4g %.4g"
+                                "   up %.4g %.4g %.4g   fov_y %.4g }\n",
+                                eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z,
+                                up.x, up.y, up.z, fovY);
+                    std::fflush(stdout);
+                }
+                if (cmds.empty())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            g_stopRequested = 1;   // window closed → done
+        }
         return 0;
     }
 

@@ -475,4 +475,40 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     return img;
 }
 
+// Draw a red look-at crosshair at world point `target` onto an already-rendered RGB
+// frame (W*H*3, row 0 = top). Projects with the same camera math as the triangles;
+// if the point is in front and roughly on-screen it stamps a red '+' with a centre
+// gap plus a small box, so the exact aim point stays visible. Drawn on top (ignores
+// depth) so you can always see where the interactive camera is pointed. This is the
+// visible marker for the 6-DOF preview control (eye xyz + this target xyz).
+inline void drawTargetMarker(std::vector<uint8_t>& img, int W, int H,
+                             const Camera& cam, const Vec3& target) {
+    Vec3 d = target - cam.eye;
+    VtxCS c; c.x = dot(d, cam.u); c.y = dot(d, cam.v); c.z = dot(d, cam.w);
+    c.wpos = target; c.wn = Vec3{0, 0, 1};
+    if (cam.projection == CAM_RECTILINEAR && c.z <= 1e-6) return;   // behind the camera
+    VtxScreen s = projectVtx(cam, c, W, H);
+    if (s.sx < -W || s.sx > 2 * W || s.sy < -H || s.sy > 2 * H) return;  // wildly off-screen
+    const uint8_t R = 255, G = 40, B = 40;
+    auto put = [&](int x, int y) {
+        if (x < 0 || x >= W || y < 0 || y >= H) return;
+        size_t i = ((size_t)y * W + x) * 3;
+        img[i + 0] = R; img[i + 1] = G; img[i + 2] = B;
+    };
+    const int icx = (int)std::lround(s.sx), icy = (int)std::lround(s.sy);
+    const int arm = std::max(10, W / 36);   // arm length (roughly constant on screen)
+    const int gap = std::max(4, arm / 4);   // centre gap so the exact point is unobscured
+    const int th  = std::max(1, W / 800);   // line half-thickness
+    for (int t = -th; t <= th; ++t)
+        for (int a = gap; a <= arm; ++a) {
+            put(icx + a, icy + t); put(icx - a, icy + t);   // horizontal arms
+            put(icx + t, icy + a); put(icx + t, icy - a);   // vertical arms
+        }
+    const int bs = gap - 1;                                 // small centre box outline
+    for (int a = -bs; a <= bs; ++a) {
+        put(icx + a, icy - bs); put(icx + a, icy + bs);
+        put(icx - bs, icy + a); put(icx + bs, icy + a);
+    }
+}
+
 }  // namespace raster

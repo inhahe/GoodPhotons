@@ -148,6 +148,26 @@ paths they can capture at all**.
 > readable instead of a postage stamp; already-large cameras are left as-is, and a
 > real light-transport render always keeps its authored resolution.
 >
+> **Interactive camera (raster + live window).** When a **single** camera is
+> rasterized into a `-window` (a still preview, including the double-click default —
+> a `camera_curve` flyby instead animates through its frames), the window becomes an
+> interactive viewer: fly the camera around with the keyboard and read off the
+> numbers to author a `.ftsl` camera. Six controls, all along the **world axes** —
+> the camera **eye** `(x,y,z)` and a **look-at target** `(x,y,z)` that the camera
+> always points at and that is drawn in the scene as a **red crosshair**:
+>
+> | keys | moves |
+> |---|---|
+> | `A`/`D` · `R`/`F` · `W`/`S` | eye −X/+X · +Y/−Y · −Z/+Z |
+> | `←`/`→` · `PgUp`/`PgDn` · `↑`/`↓` | target −X/+X · +Y/−Y · −Z/+Z |
+> | `[` / `]` | finer / coarser move step (starts at 3 % of the scene radius) |
+> | `0` (or `Home`) | reset to the authored camera |
+> | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
+>
+> The window title shows the live `eye(…) look(…)` as you move, and each step
+> re-rasterizes instantly. Close the window to finish. (Click the window first so it
+> has keyboard focus.)
+>
 > **Double-click / bare invocation.** Running ftrace with just a scene file and
 > nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,
 > `.scene`, or `.fts`, as produced by a file association or drag-and-drop) —
@@ -1367,7 +1387,7 @@ alone can't restore, so they are not disk-resumable.
 | `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
-| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window). See the preview note under **Render modes**. |
+| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive keyboard-driven camera** — WASD/RF move the eye, arrows/PgUp/PgDn move a red-crosshair look-at target, `P` prints a paste-ready camera). See the preview note under **Render modes**. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |

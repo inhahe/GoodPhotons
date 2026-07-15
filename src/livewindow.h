@@ -12,6 +12,18 @@
 #include <string>
 #include <cstdint>
 
+// One interactive control command queued from a key press in the live window. The
+// window only reports *which* control was pressed; the render loop (which knows the
+// scene scale) drains these and turns each into a camera nudge. Eye/target moves are
+// along the WORLD axes so the resulting numbers drop straight into a `.ftsl` camera.
+enum class NudgeCmd {
+    EyeXNeg, EyeXPos, EyeYNeg, EyeYPos, EyeZNeg, EyeZPos,   // move the camera eye
+    TgtXNeg, TgtXPos, TgtYNeg, TgtYPos, TgtZNeg, TgtZPos,   // move the look-at target
+    StepDown, StepUp,                                        // finer / coarser move step
+    Reset,                                                   // back to the authored camera
+    Print,                                                   // dump a paste-ready camera block
+};
+
 class LiveWindow {
 public:
     // Create and show a window sized to (w,h) (clamped to the screen, aspect kept).
@@ -31,6 +43,10 @@ public:
 
     // True once the user has closed the window — lets the render stop early.
     bool closed() const;
+
+    // Return (and clear) the interactive control commands queued from key presses
+    // since the last call. Empty when nothing was pressed. Thread-safe.
+    std::vector<NudgeCmd> drainNudges();
 
     LiveWindow(const LiveWindow&) = delete;
     LiveWindow& operator=(const LiveWindow&) = delete;

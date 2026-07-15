@@ -8,6 +8,7 @@ LiveWindow::~LiveWindow() {}
 void LiveWindow::update(int, int, const std::vector<uint8_t>&) {}
 void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
+std::vector<NudgeCmd> LiveWindow::drainNudges() { return {}; }
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -45,6 +46,8 @@ struct LiveWindow::Impl {
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     std::wstring         title;
     HANDLE               readyEvent = nullptr;
+    std::mutex           inMtx;                     // guards `nudges`
+    std::vector<NudgeCmd> nudges;                   // interactive control commands from key presses
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
@@ -106,6 +109,37 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         }
         case WM_SIZE:
             InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_KEYDOWN:
+            // Map keys to interactive camera nudges (queued; the render loop applies
+            // them). Eye = WASD + R/F (world X/Z + Y); look-at target = arrows + PgUp/Dn.
+            // [ / ] resize the step, 0 resets, P prints a paste-ready camera block.
+            if (self) {
+                NudgeCmd c; bool hit = true;
+                switch (wp) {
+                    case 'A':        c = NudgeCmd::EyeXNeg; break;
+                    case 'D':        c = NudgeCmd::EyeXPos; break;
+                    case 'F':        c = NudgeCmd::EyeYNeg; break;
+                    case 'R':        c = NudgeCmd::EyeYPos; break;
+                    case 'S':        c = NudgeCmd::EyeZNeg; break;
+                    case 'W':        c = NudgeCmd::EyeZPos; break;
+                    case VK_LEFT:    c = NudgeCmd::TgtXNeg; break;
+                    case VK_RIGHT:   c = NudgeCmd::TgtXPos; break;
+                    case VK_NEXT:    c = NudgeCmd::TgtYNeg; break;   // PageDown
+                    case VK_PRIOR:   c = NudgeCmd::TgtYPos; break;   // PageUp
+                    case VK_DOWN:    c = NudgeCmd::TgtZNeg; break;
+                    case VK_UP:      c = NudgeCmd::TgtZPos; break;
+                    case VK_OEM_4:   c = NudgeCmd::StepDown; break;  // [
+                    case VK_OEM_6:   c = NudgeCmd::StepUp;   break;  // ]
+                    case '0': case VK_HOME: c = NudgeCmd::Reset; break;
+                    case 'P':        c = NudgeCmd::Print;   break;
+                    default:         hit = false; break;
+                }
+                if (hit) {
+                    std::lock_guard<std::mutex> lk(self->inMtx);
+                    self->nudges.push_back(c);
+                }
+            }
             return 0;
         case WM_GETMINMAXINFO:
             // Keep the window from being dragged smaller than a readable floor, so the
@@ -221,5 +255,13 @@ void LiveWindow::setTitle(const std::string& utf8) {
 }
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }
+
+std::vector<NudgeCmd> LiveWindow::drainNudges() {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lk(impl_->inMtx);
+    std::vector<NudgeCmd> out;
+    out.swap(impl_->nudges);
+    return out;
+}
 
 #endif // _WIN32
