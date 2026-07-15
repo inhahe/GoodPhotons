@@ -28,6 +28,35 @@ mis-seated. This is why the `-raster` preview's aperture-brightness term is gate
 previews the correct *ratio* even though the real render's absolute level is currently
 off.
 
+### OPEN (2026-07-15): absolute EV — mode B ignores the aperture's exposure (light-gathering)
+
+Aperture controls two separable things: **depth of field** (geometric) and
+**exposure/light-gathering** (radiometric, `E ∝ 1/N²` from the camera equation
+`E = (π/4)·L·T·cos⁴θ / N²`). Mode B is a **pinhole**, so it correctly has no DoF —
+but it *also* drops the 1/N² exposure term, which is NOT a lens effect, just how
+much light the pupil admits. Consequence: in **absolute mode** two mode-B renders
+of the same scene at f/2 vs f/8 come out **identically bright**, when a real sensor
+would separate them by 4 stops. The authored `fstop`/`aperture` is inert in mode B.
+Under auto-exposure this is moot (the p99 meter cancels exposure shifts anyway, and
+B has no R² to cancel); it only bites in absolute EV.
+
+The old rationale for excluding aperture from the exposure comp ("in splat mode B
+the aperture is virtual, so an f-number term would double-count / be an artifact",
+CamSpec/main.cpp ~921) holds **only for modes A/C**, which already carry the physical
+`R²` in their splat weight (render.h `connectLens`). Mode B has **no** `R²`, so a
+virtual-aperture exposure term there is clean and non-redundant — the correct place
+to "regard" the aperture.
+
+**Proper fix (unify with the A/C absolute-gain bug above):** replace the per-mode
+absolute scaling with one camera-equation-based absolute exposure model — apply the
+physical `π/4 · 1/N²` (and ideally `cos⁴θ` natural vignetting) once, seated so A, B
+and C agree at equal `power`. In A/C the `1/N²` comes from the pupil-area `R²` splat
+weight (keep it, fix the gain); in B it must be added as a pure exposure factor while
+keeping pinhole DoF. Do NOT double-apply it in A/C. Defensible alternative if we
+decline the fix: document that aperture is a *lens* property and absolute-EV exposure
+requires mode A/C (mode B stays a pure pinhole) — but then a mode-B `fstop` should
+warn/error rather than silently no-op.
+
 ### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
 
 Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** crashes with
