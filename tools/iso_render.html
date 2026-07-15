@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>iso_render — CLI isosurface raymarcher</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e1013;color:#e7e9ee;
+    font:13px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  #wrap{display:flex;flex-direction:column;height:100vh;}
+  #top{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;background:#000;}
+  canvas{max-width:100%;max-height:100%;}
+  #bar{padding:8px 12px;background:#181b21;border-top:1px solid #000;display:flex;
+    gap:12px;align-items:center;flex-wrap:wrap;}
+  button{background:#2a2f39;color:#e7e9ee;border:1px solid #000;border-radius:6px;
+    padding:5px 10px;cursor:pointer;}
+  button:hover{background:#343b47;}
+  #expr{font:12px/1.4 ui-monospace,Consolas,monospace;color:#c9cdd6;max-height:70px;
+    overflow:auto;flex:1;min-width:200px;white-space:pre-wrap;word-break:break-all;}
+  .acc{color:#e0b25a;font-weight:700;}
+  #out{display:none;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top"><canvas id="gl" width="480" height="480"></canvas></div>
+  <div id="bar">
+    <span class="acc" id="approach">—</span>
+    <button id="prev">◀ prev</button>
+    <span id="idx">—</span>
+    <button id="next">next ▶</button>
+    <span id="name" class="acc">—</span>
+    <div id="expr"></div>
+  </div>
+</div>
+<pre id="out">PENDING</pre>
+<script>
+// ================================================================
+// iso_render.html — headless-capable WebGL2 isosurface raymarcher.
+//
+// Three random-isosurface generators, each producing a *scalar* field
+// expression F(x,y,z) valid in BOTH GLSL and ftrace `expr` (the only
+// per-target difference is atan2 -> atan for GLSL). Surface at F=0.
+//
+// URL query args (all optional):
+//   approach = trig | sdf | super        (default trig)
+//   count    = N shapes                   (default 12)
+//   seed     = base seed                  (default 1)
+//   w,h      = image size                 (default 480)
+//   steps    = raymarch steps             (default 300)
+//   batch    = 1  -> render all, dump JSON [{i,seed,name,expr,glsl,R,png}]
+//                    into #out, set title to DONE (for headless --dump-dom).
+//                    Absent -> interactive viewer (drag to orbit, prev/next).
+// ================================================================
+
+const Q = new URLSearchParams(location.search);
+const APPROACH = (Q.get('approach')||'trig').toLowerCase();
+const COUNT = parseInt(Q.get('count')||'12',10);
+const SEED0 = parseInt(Q.get('seed')||'1',10);
+const W = parseInt(Q.get('w')||'480',10), H = parseInt(Q.get('h')||'480',10);
+const STEPS = parseInt(Q.get('steps')||'300',10);
+const BATCH = Q.get('batch')==='1';
+
+// ---------------- RNG + helpers ----------------
+function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0;
+  let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t;
+  return ((t^t>>>14)>>>0)/4294967296; }; }
+const F=x=>{ // format number -> always has a decimal point (valid GLSL float + ftrace)
+  if(!isFinite(x)) x=0;
+  let s=(+x).toFixed(4).replace(/0+$/,'').replace(/\.$/,'.0');
+  if(!/[.]/.test(s)) s+='.0';
+  return s; };
+const RR=(rng,lo,hi)=>lo+(hi-lo)*rng();
+const RI=(rng,lo,hi)=>Math.floor(lo+(hi-lo+1)*rng());
+const PICK=(rng,a)=>a[Math.floor(rng()*a.length)];
+const WPICK=(rng,pairs)=>{ // pairs=[[val,w],...]
+  let s=pairs.reduce((a,p)=>a+p[1],0), t=rng()*s;
+  for(const [v,w] of pairs){ if((t-=w)<=0) return v; } return pairs[0][0]; };
+
+// ================================================================
+// APPROACH 1 — symmetric trigonometric / minimal-surface / Chmutov
+// ================================================================
+function genTrig(seed){
+  const rng=mulberry32((seed*2654435761)>>>0);
+  const R=RR(rng,1.5,1.9);
+  const kind=WPICK(rng,[['tpms',0.7],['chmutov',0.3]]);
+  let body, name;
+  if(kind==='chmutov'){
+    // Chmutov: Tn(sx)+Tn(sy)+Tn(sz) + level ; scaled Chebyshev, faceted algebraic solids
+    const n=PICK(rng,[3,4,5]);
+    const s=RR(rng,1.0,1.5)/R;               // domain scale
+    const S=F(s);
+    const T=(u)=>{ // Chebyshev T_n of u, expanded
+      if(n===3) return `(4.0*${u}*${u}*${u} - 3.0*${u})`;
+      if(n===4) return `(8.0*${u}*${u}*${u}*${u} - 8.0*${u}*${u} + 1.0)`;
+      return `(16.0*${u}*${u}*${u}*${u}*${u} - 20.0*${u}*${u}*${u} + 5.0*${u})`; // T5
+    };
+    const ux=`(${S}*x)`, uy=`(${S}*y)`, uz=`(${S}*z)`;
+    const L=F(RR(rng,-1.2,1.2));
+    body=`${T(ux)} + ${T(uy)} + ${T(uz)} - (${L})`;
+    name=`chmutov T${n}  (scale ${S}, level ${L})`;
+  } else {
+    // Triply-periodic minimal surface family, cubic symmetry
+    const cells=RR(rng,1.6,3.0);
+    const w=cells*Math.PI/R, Wc=F(w);
+    const SX=`sin(${Wc}*x)`,SY=`sin(${Wc}*y)`,SZ=`sin(${Wc}*z)`;
+    const CX=`cos(${Wc}*x)`,CY=`cos(${Wc}*y)`,CZ=`cos(${Wc}*z)`;
+    const templates={
+      gyroid:  [`(${SX}*${CY} + ${SY}*${CZ} + ${SZ}*${CX})`, 'gyroid'],
+      diamond: [`(${SX}*${SY}*${SZ} + ${SX}*${CY}*${CZ} + ${CX}*${SY}*${CZ} + ${CX}*${CY}*${SZ})`, 'Schwarz-D (diamond)'],
+      neovius: [`(3.0*(${CX}+${CY}+${CZ}) + 4.0*${CX}*${CY}*${CZ})`, 'Neovius'],
+      primitiveP:[`(${CX} + ${CY} + ${CZ})`, 'Schwarz-P'],
+      iwp:     [`(2.0*(${CX}*${CY}+${CY}*${CZ}+${CZ}*${CX}) - (cos(2.0*${Wc}*x)+cos(2.0*${Wc}*y)+cos(2.0*${Wc}*z)))`, 'I-WP'],
+    };
+    const key=WPICK(rng,[['gyroid',0.34],['diamond',0.24],['neovius',0.18],['iwp',0.14],['primitiveP',0.10]]);
+    const [base,tname]=templates[key];
+    const L=F(RR(rng,-0.9,0.9));
+    // shell (thickened surface) reads as a solid foam nugget; plain reads as a half-space cut
+    if(rng()<0.55){
+      const t=F(RR(rng,0.18,0.55));
+      body=`abs(${base} - (${L})) - ${t}`;
+      name=`${tname} shell  (cells ${F(cells)}, level ${L}, t ${t})`;
+    } else {
+      body=`${base} - (${L})`;
+      name=`${tname}  (cells ${F(cells)}, level ${L})`;
+    }
+  }
+  return {name, body, R, invert:false};
+}
+
+// ================================================================
+// APPROACH 2 — SDF assembly (smooth-min CSG of primitives)
+//   Scalar SDF pieces; smooth union/subtract via polynomial smin.
+//   |grad| ~ 1 so marching is fast + clean (no poles).
+// ================================================================
+// centers are wrapped in parens so a negative value can't produce `x--0.03` (`--` is
+// a GLSL/ftrace syntax error): `(x-(-0.03))` is valid.
+function sub(p,c){ return `(${p}-(${F(c)}))`; }
+function sdSphere(px,py,pz,cx,cy,cz,r){
+  const X=sub(px,cx),Y=sub(py,cy),Z=sub(pz,cz);
+  return `(sqrt(${X}*${X}+${Y}*${Y}+${Z}*${Z}) - ${F(r)})`;
+}
+function sdBox(px,py,pz,cx,cy,cz,bx,by,bz,rd){
+  const dx=`max(abs(${sub(px,cx)})-${F(bx)},0.0)`,
+        dy=`max(abs(${sub(py,cy)})-${F(by)},0.0)`,
+        dz=`max(abs(${sub(pz,cz)})-${F(bz)},0.0)`;
+  return `(sqrt(${dx}*${dx}+${dy}*${dy}+${dz}*${dz}) - ${F(rd)})`;
+}
+function sdTorus(px,py,pz,cx,cy,cz,Rr,r){
+  const X=sub(px,cx),Y=sub(py,cy),Z=sub(pz,cz);
+  const q=`(sqrt(${X}*${X}+${Z}*${Z}) - ${F(Rr)})`;
+  return `(sqrt(${q}*${q}+${Y}*${Y}) - ${F(r)})`;
+}
+// log-sum-exp smooth-min: each operand appears EXACTLY ONCE, so chaining N
+// primitives grows the expression linearly (a polynomial smin duplicates operands
+// ~4x -> exponential blow-up -> a giant shader that software-rasterizes for minutes).
+// k is a sharpness (higher = crisper join).  smin(a,b) = -ln(e^-ka + e^-kb)/k
+function smin(a,b,k){
+  const K=F(k);
+  return `(-log(exp(${K}*-(${a})) + exp(${K}*-(${b})))/${K})`;
+}
+// smooth subtract B from A = smax(A,-B) = ln(e^kA + e^-kB)/k
+function ssub(a,b,k){
+  const K=F(k);
+  return `(log(exp(${K}*(${a})) + exp(${K}*-(${b})))/${K})`;
+}
+function genSDF(seed){
+  const rng=mulberry32((seed*2654435761)>>>0);
+  const R=RR(rng,1.7,2.0);
+  // symmetry folds make the assembly read as designed rather than accidental
+  const foldX=rng()<0.5, foldY=rng()<0.35, foldZ=rng()<0.5;
+  const px=foldX?`abs(x)`:`x`, py=foldY?`abs(y)`:`y`, pz=foldZ?`abs(z)`:`z`;
+  // centers kept fairly central so primitives overlap and blend into one solid
+  // rather than leaving disconnected floating pieces.
+  function prim(){
+    const t=WPICK(rng,[['sphere',0.4],['box',0.32],['torus',0.28]]);
+    const cx=foldX?RR(rng,0.12,0.5)*R:RR(rng,-0.42,0.42)*R;
+    const cy=foldY?RR(rng,0.08,0.45)*R:RR(rng,-0.4,0.4)*R;
+    const cz=foldZ?RR(rng,0.12,0.5)*R:RR(rng,-0.42,0.42)*R;
+    if(t==='sphere'){ const r=RR(rng,0.35,0.8); return [sdSphere(px,py,pz,cx,cy,cz,r),`sphere r${F(r)}`]; }
+    if(t==='box'){ const bx=RR(rng,0.2,0.6),by=RR(rng,0.2,0.6),bz=RR(rng,0.2,0.6),rd=RR(rng,0.08,0.22);
+      return [sdBox(px,py,pz,cx,cy,cz,bx,by,bz,rd),`rbox ${F(bx)},${F(by)},${F(bz)}`]; }
+    const Rr=RR(rng,0.45,0.85),r=RR(rng,0.14,0.32);
+    return [sdTorus(px,py,pz,cx,cy,cz,Rr,r),`torus R${F(Rr)} r${F(r)}`];
+  }
+  const n=RI(rng,3,4);
+  let [body,desc0]=prim();
+  const parts=[desc0];
+  for(let i=1;i<n;i++){
+    const [p,d]=prim();
+    const k=RR(rng,2.5,6.0);   // sharpness for log-sum-exp smin
+    if(rng()<0.72){ body=smin(body,p,k); parts.push('∪ '+d); }
+    else { body=ssub(body,p,k); parts.push('− '+d); }
+  }
+  const folds=[foldX?'x':'',foldY?'y':'',foldZ?'z':''].filter(Boolean).join('');
+  const name=`SDF ${parts.join('  ')}${folds?'   mirror('+folds+')':''}`;
+  return {name, body, R, invert:false};
+}
+
+// ================================================================
+// APPROACH 3 — superformula (Gielis) implicit radial field
+//   F = |p| - scale * super(lon) * super(lat)   (surface where |p| = radius)
+// ================================================================
+function superR(angle,m,n1,n2,n3,a,b){
+  const t1=`pow(abs(cos(${F(m)}*(${angle})/4.0)/${F(a)}),${F(n2)})`;
+  const t2=`pow(abs(sin(${F(m)}*(${angle})/4.0)/${F(b)}),${F(n3)})`;
+  return `pow(${t1}+${t2}, ${F(-1.0/n1)})`;
+}
+function genSuper(seed){
+  const rng=mulberry32((seed*2654435761)>>>0);
+  const R=RR(rng,1.7,2.0);
+  // lobe counts kept <=8: m=10/12 make many thin petals that alias under the
+  // fixed-step marcher (the ragged spiky degenerates).
+  const m1=PICK(rng,[3,4,5,6,7,8]);
+  const m2=rng()<0.5?m1:PICK(rng,[2,3,4,5,6]);
+  // n1 kept >=0.8 and n2,n3 capped: small n1 / huge n2,n3 make razor-thin spikes
+  // the fixed-step marcher can't resolve (degenerate aliased blobs).
+  const n1a=RR(rng,0.8,3.5),n2a=RR(rng,0.5,4.2),n3a=RR(rng,0.5,4.2);
+  const n1b=RR(rng,0.8,3.5),n2b=RR(rng,0.5,4.2),n3b=RR(rng,0.5,4.2);
+  const scale=RR(rng,0.9,1.25);
+  const lon=`atan2(y,x)`, lat=`atan2(z,sqrt(x*x+y*y))`;
+  const body=`sqrt(x*x+y*y+z*z) - ${F(scale)}*(${superR(lon,m1,n1a,n2a,n3a,1,1)})*(${superR(lat,m2,n1b,n2b,n3b,1,1)})`;
+  const name=`superformula m=${m1}/${m2}  n1=${F(n1a)}/${F(n1b)} n2=${F(n2a)}/${F(n2b)} n3=${F(n3a)}/${F(n3b)}`;
+  return {name, body, R, invert:false};
+}
+
+const GEN={trig:genTrig, sdf:genSDF, super:genSuper};
+const toGLSL=b=>b.replace(/atan2\(/g,'atan(');   // GLSL: 2-arg atan
+const toFT  =b=>b;                                // ftrace: atan2 stays
+
+// ---------------- WebGL2 raymarcher ----------------
+const cvs=document.getElementById('gl'); cvs.width=W; cvs.height=H;
+const gl=cvs.getContext('webgl2',{antialias:false,preserveDrawingBuffer:true});
+if(!gl){ document.getElementById('out').textContent=JSON.stringify({error:'NOGL'});
+  document.title='DONE'; throw new Error('no webgl2'); }
+const VS=`#version 300 es
+in vec2 p; void main(){ gl_Position=vec4(p,0.0,1.0); }`;
+function FS(glslBody){ return `#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform vec2 uRes; uniform vec3 uCam; uniform mat3 uBasis; uniform float uR;
+const int MAXSTEPS=1024; const int USTEPS=${STEPS};
+float field(vec3 P){ float x=P.x,y=P.y,z=P.z,r=length(P);
+  return clamp( ${glslBody} , -1e3, 1e3); }
+vec3 grad(vec3 p){ float e=0.002; vec2 h=vec2(e,0.0);
+  return vec3(field(p+h.xyy)-field(p-h.xyy),
+              field(p+h.yxy)-field(p-h.yxy),
+              field(p+h.yyx)-field(p-h.yyx)); }
+float ao(vec3 p, vec3 n){ float o=0.0,s=0.06;
+  for(int i=1;i<=4;i++){ float d=float(i)*0.11;
+    float f=field(p+n*d); o+=max(0.0,d-max(f,0.0))*s; s*=0.62; }
+  return clamp(1.0-4.5*o,0.0,1.0); }
+vec3 shade(vec3 p, vec3 n, vec3 rd){
+  if(dot(n,rd)>0.0) n=-n;
+  vec3 base=vec3(0.85,0.66,0.42);
+  vec3 L1=normalize(vec3(-0.5,0.95,0.55)), L2=normalize(vec3(0.65,0.30,0.62));
+  float d1=max(dot(n,L1),0.0), d2=max(dot(n,L2),0.0)*0.4;
+  float a=ao(p,n);
+  vec3 col=base*(0.16*a + d1*a + d2);
+  vec3 h1=normalize(L1-rd);
+  col+=vec3(1.0)*pow(max(dot(n,h1),0.0),42.0)*0.4*a;
+  float rim=pow(1.0-max(dot(n,-rd),0.0),3.0); col+=base*rim*0.30;
+  return pow(col, vec3(0.85)); }
+void main(){
+  vec2 uv=(gl_FragCoord.xy-0.5*uRes)/uRes.y;
+  vec3 ro=uCam, rd=normalize(uBasis*vec3(uv,1.0));
+  vec3 bg=mix(vec3(0.09,0.10,0.12),vec3(0.15,0.16,0.19),uv.y*0.5+0.5);
+  float b=dot(ro,rd), cc=dot(ro,ro)-uR*uR, disc=b*b-cc;
+  if(disc<0.0){ outColor=vec4(bg,1.0); return; }
+  float sq=sqrt(disc), t0=max(-b-sq,0.0), t1=-b+sq;
+  if(t1<t0){ outColor=vec4(bg,1.0); return; }
+  float dt=(t1-t0)/float(USTEPS), t=t0, f=field(ro+rd*t0);
+  for(int i=0;i<MAXSTEPS;i++){ if(i>=USTEPS) break;
+    float tn=t+dt; vec3 pp=ro+rd*tn; float fn=field(pp);
+    if(f*fn<0.0){ float ta=t,tb=tn,fa=f;
+      for(int k=0;k<18;k++){ float tm=0.5*(ta+tb); float fm=field(ro+rd*tm);
+        if(fa*fm<=0.0){ tb=tm; } else { ta=tm; fa=fm; } }
+      vec3 hp=ro+rd*(0.5*(ta+tb)); vec3 n=normalize(grad(hp));
+      outColor=vec4(shade(hp,n,rd),1.0); return; }
+    t=tn; f=fn; }
+  outColor=vec4(bg,1.0);
+}`; }
+function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src);
+  gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s)); return s; }
+const quad=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+let prog=null,U={};
+function buildProg(glslBody){
+  const p=gl.createProgram();
+  gl.attachShader(p,compile(gl.VERTEX_SHADER,VS));
+  gl.attachShader(p,compile(gl.FRAGMENT_SHADER,FS(glslBody)));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  if(prog) gl.deleteProgram(prog);
+  prog=p; gl.useProgram(p);
+  U={}; ['uRes','uCam','uBasis','uR'].forEach(n=>U[n]=gl.getUniformLocation(p,n));
+  const loc=gl.getAttribLocation(p,'p'); gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+}
+function camBasis(yaw,pitch){
+  const cp=Math.cos(pitch),sp=Math.sin(pitch),cy=Math.cos(yaw),sy=Math.sin(yaw);
+  const fwd=[-cp*sy,-sp,-cp*cy];
+  let r=[fwd[2],0,-fwd[0]]; const rl=Math.hypot(r[0],r[1],r[2])||1; r=r.map(v=>v/rl);
+  const up=[r[1]*fwd[2]-r[2]*fwd[1],r[2]*fwd[0]-r[0]*fwd[2],r[0]*fwd[1]-r[1]*fwd[0]];
+  return {fwd,r,up};
+}
+function draw(R,yaw,pitch){
+  const {fwd,r,up}=camBasis(yaw,pitch);
+  const dist=2.5*R, cam=fwd.map(v=>-v*dist);
+  gl.viewport(0,0,W,H);
+  gl.uniform2f(U.uRes,W,H);
+  gl.uniform3f(U.uCam,cam[0],cam[1],cam[2]);
+  gl.uniformMatrix3fv(U.uBasis,false,new Float32Array([r[0],r[1],r[2],up[0],up[1],up[2],fwd[0],fwd[1],fwd[2]]));
+  gl.uniform1f(U.uR,R);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+}
+// coverage of warm (surface) pixels, to pick a non-empty framing
+function coverage(){ const px=new Uint8Array(W*H*4);
+  gl.readPixels(0,0,W,H,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  let c=0; for(let i=0;i<W*H;i++){ const o=i*4; if(px[o]>60&&px[o]>px[o+2]+10)c++; }
+  return c/(W*H); }
+
+// ---------------- batch (headless) ----------------
+function renderShape(sh){
+  buildProg(toGLSL(sh.body));
+  // choose the framing with the most surface visible
+  const views=[[0.7,0.35],[2.3,0.2],[3.9,-0.3],[1.5,-0.55],[5.3,0.15]];
+  let best=null,bestC=-1;
+  for(const [yaw,pitch] of views){ draw(sh.R,yaw,pitch); const c=coverage();
+    if(c>bestC){ bestC=c; best=[yaw,pitch]; } }
+  draw(sh.R,best[0],best[1]);
+  return {png:cvs.toDataURL('image/png'), cov:+bestC.toFixed(3), yaw:best[0], pitch:best[1]};
+}
+function runBatch(){
+ try{
+  const results=[];
+  for(let i=0;i<COUNT;i++){
+    const seed=SEED0+i;
+    let sh; try{ sh=GEN[APPROACH](seed); }catch(e){ continue; }
+    let r; try{ r=renderShape(sh); }catch(e){ results.push({i,seed,error:String(e).slice(0,200),name:sh.name,expr:toFT(sh.body)}); continue; }
+    if(r.cov<0.004) continue;   // empty framing -> skip (degenerate)
+    results.push({i,seed,name:sh.name,expr:toFT(sh.body),glsl:toGLSL(sh.body),R:sh.R,cov:r.cov,png:r.png});
+  }
+  document.getElementById('out').textContent=JSON.stringify({approach:APPROACH,count:results.length,shapes:results});
+  document.title='DONE';
+ }catch(e){
+  document.getElementById('out').textContent=JSON.stringify({error:String(e&&e.stack||e).slice(0,500)});
+  document.title='DONE';
+ }
+}
+
+// ---------------- interactive viewer ----------------
+let cur=0, shapes=[], yaw=0.7, pitch=0.3, dragging=false, lx=0,ly=0;
+function showInteractive(){
+  const seed=SEED0+cur;
+  const sh=GEN[APPROACH](seed);
+  buildProg(toGLSL(sh.body));
+  document.getElementById('approach').textContent=APPROACH;
+  document.getElementById('idx').textContent=`seed ${seed} (${cur+1}/${COUNT})`;
+  document.getElementById('name').textContent=sh.name;
+  document.getElementById('expr').textContent=toFT(sh.body);
+  shapes[cur]=sh; frame();
+}
+function frame(){ if(shapes[cur]) draw(shapes[cur].R,yaw,pitch); }
+// setTimeout (not requestAnimationFrame): under headless --virtual-time-budget, rAF
+// callbacks are not reliably scheduled but timers are, so this fires deterministically.
+if(BATCH){ setTimeout(runBatch, 0); }
+else {
+  showInteractive();
+  document.getElementById('prev').onclick=()=>{ cur=(cur-1+COUNT)%COUNT; showInteractive(); };
+  document.getElementById('next').onclick=()=>{ cur=(cur+1)%COUNT; showInteractive(); };
+  cvs.onmousedown=e=>{ dragging=true; lx=e.clientX; ly=e.clientY; };
+  window.onmouseup=()=>dragging=false;
+  window.onmousemove=e=>{ if(!dragging)return; yaw+=(e.clientX-lx)*0.01; pitch+=(e.clientY-ly)*0.01;
+    pitch=Math.max(-1.5,Math.min(1.5,pitch)); lx=e.clientX; ly=e.clientY; frame(); };
+}
+</script>
+</body>
+</html>

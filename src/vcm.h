@@ -77,6 +77,28 @@ inline Vec3 offsetOrigin(const Vec3& p, const Vec3& ng, const Vec3& dir) {
     return p + ng * (sgn * 1e-6);
 }
 
+// Gather-side shading-normal correction for the VERTEX-MERGE (VM / photon-density) strategy.
+// The VM contribution is a Jensen density estimate MIS-combined with the vertex-connection
+// (VC) strategies; on a smooth (interpolated-normal) mesh the merge reads incident flux per
+// GEOMETRIC area and shades per facet, while the reference backward path tracer (mode R) and
+// the VC strategies integrate against the SHADING cosine. Reweighting each merged light
+// vertex (incident direction `wp`, back toward its source) by cos_s/cos_g rebalances the
+// merge onto the shading cosine so mode U smooth-shades like mode R:
+//
+//   gcorr = |cos(wp, Ns)| / |cos(wp, Ng)|
+//
+// EXACTLY 1 when Ns==Ng (flat tris, analytic spheres), so every non-smooth scene — and the
+// whole existing mode-U validation suite — is bit-identical. The grazing `cos(wp,Ng)`
+// denominator is guarded (measure-zero, ~0 flux) so a degenerate sample falls back to no
+// correction. NOTE: the standalone photon-map / SPPM gathers (modes M/S) already smooth-shade
+// in this renderer and must NOT use this — only the MIS-coupled VM merge needs it. Why the
+// coupling makes the difference is logged as tech debt in known-issues.md.
+inline double vmGatherCorr(const Vec3& wp, const Vec3& ns, const Vec3& ng) {
+    double denom = std::fabs(dot(wp, ng));
+    if (denom <= 1e-8) return 1.0;
+    return std::fabs(dot(wp, ns)) / denom;
+}
+
 // A stored light-subpath vertex (only connectible/non-delta surface vertices are kept).
 struct LightVertex {
     Vec3   p;             // world position
@@ -205,13 +227,14 @@ inline void misScatter(bool specular, double cosThetaOut, double bsdfDirPdfW, do
 // but returned as a standalone step). On return: `wi` continuation dir, `betaFactor` the
 // throughput multiplier (f*|cos|/pdf for non-delta, reflectance for delta), `pdfW`/`pdfRevW`
 // the forward/reverse solid-angle densities (0 for delta), `cosThetaOut = |dot(wi,ns)|`,
-// `delta` the specular flag. `terminate` requests ending the walk. `interior` tracks the
-// dielectric the path is inside (colored-glass Beer-Lambert). Media are out of VCM scope.
+// `delta` the specular flag. `terminate` requests ending the walk. `stk` is the nested-
+// dielectric medium stack the path carries (colored-glass Beer-Lambert + exterior IOR at
+// each interface; Schmidt & Budge 2002). Media are out of VCM scope.
 inline void scatterSample(const Scene& scene, const Renderer& mats, const Material* mp,
                           const Hit& h, const Vec3& rayDir, double lambda, Pcg32& rng,
                           Vec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
                           double& cosThetaOut, bool& delta, bool& terminate,
-                          const Material*& interior) {
+                          MediumStack& stk) {
     const Vec3 ns = h.n;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
@@ -258,11 +281,47 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Dielectric: {
+            // Nested-dielectric PRIORITY resolution: exterior IOR = the medium the path is
+            // currently inside (highest-priority stack entry). Overlapping dielectrics are
+            // ranked by `priority` (higher wins; lower is suppressed -> straight pass-
+            // through). SAFE FALLBACK to flat air<->glass (extIor 1.0) unless BOTH sides
+            // carry an explicit priority, keeping priority-free scenes bit-identical.
             bool entering = dot(rayDir, h.ng) < 0.0;
-            bool transmitted = false;
-            Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted);
-            wi = nr.d; betaFactor = 1.0; delta = true;
-            if (transmitted) interior = entering ? mp : nullptr;
+            const int mi = (int)(mp - scene.mats.data());   // true index (Mix/Layered aware)
+            const int pr = mp->priority;
+            delta = true; betaFactor = 1.0;
+            if (entering) {
+                const int outMat = stk.topMat();
+                const int outPri = stk.topPri();
+                const bool ranked = mp->hasPriority() &&
+                    (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                    wi = rayDir; stk.push(mi, pr);
+                } else {
+                    const double extIor = (ranked && outMat >= 0)
+                        ? scene.mats[outMat].ior(lambda) : 1.0;
+                    bool transmitted = false;
+                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor);
+                    wi = nr.d;
+                    if (transmitted) stk.push(mi, pr);
+                }
+            } else {
+                MediumStack after = stk; after.popMat(mi);
+                const int newMat = after.topMat();
+                const int newPri = after.topPri();
+                const bool ranked = mp->hasPriority() &&
+                    (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                    wi = rayDir; stk.popMat(mi);
+                } else {
+                    const double extIor = (ranked && newMat >= 0)
+                        ? scene.mats[newMat].ior(lambda) : 1.0;
+                    bool transmitted = false;
+                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor);
+                    wi = nr.d;
+                    if (transmitted) stk.popMat(mi);            // TIR stays inside mi
+                }
+            }
             break;
         }
         case MatType::HalfMirror: {
@@ -354,15 +413,16 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     double dVM  = dVC * ctx.misVcWeight;
 
     const Vec3 cie(cieX(lambda), cieY(lambda), cieZ(lambda));
-    const Material* interior = nullptr;
+    MediumStack stk;                              // nested-dielectric medium stack
     Vec3 prevP = y;
     Ray ray{y + nOut * 1e-6, dir};
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
         Hit h = scene.closestHit(ray);
         if (!h.valid) return;                    // escaped (no env in scope)
-        if (interior) {
-            double a = interior->absorb(lambda);
+        {
+            int mi = stk.topMat();
+            double a = (mi >= 0) ? scene.mats[mi].absorb(lambda) : 0.0;
             if (a > 0.0) beta *= std::exp(-a * h.t);
         }
         double dist = h.t;
@@ -382,6 +442,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         misArrival(dist, cosThetaIn, dVCM, dVC, dVM);
 
         Vec3 wo = normalize(prevP - h.p);        // toward the previous light vertex
+        // Geometric normal oriented onto the shading-normal side, for the Veach adjoint
+        // shading-normal correction on this LIGHT (particle) subpath (§5.3; identical role
+        // to render.h/bdpt.h). Exactly a no-op when h.n==h.ng (flat tris, analytic spheres).
+        Vec3 ngo = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
 
         // Store the vertex + connect to camera (only for connectible, non-delta surfaces).
         bool connectible = isConnectibleMat(*mp);
@@ -402,12 +466,19 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                     double distc = std::sqrt(dist2c);
                     Vec3 wcam = toCam / distc;
                     double cosToCamera = dot(h.n, wcam);
-                    bool sideOk = isTwoSidedMat(*mp) ? (cosToCamera != 0.0) : (cosToCamera > 0.0);
+                    // Geometric-hemisphere softening for a reflect-only vertex: the camera must
+                    // lie on the geometric front side too (no back-face light leak), but ramp
+                    // that boundary smoothly instead of a hard cutoff (Chiang 2019). `ngo` is the
+                    // geo normal oriented to h.n (line above). No-op when h.n==h.ng (stG==1).
+                    double stG = isTwoSidedMat(*mp) ? 1.0 : shadowTerminatorG(wcam, h.n, ngo);
+                    bool sideOk = isTwoSidedMat(*mp) ? (cosToCamera != 0.0)
+                                                     : (cosToCamera > 0.0 && stG > 0.0);
                     double cosAtCamera = dot(cam.w, wcam * -1.0);   // forward vs camera->point
                     if (sideOk && cosAtCamera > 1e-9) {
                         int px, py; double cc, d2c;
                         if (cam.project(h.p, px, py, cc, d2c)) {
                             double f = bsdfF(*mp, h.n, wo, wcam, lambda, scene, &h);
+                            f *= shadingAdjointCorr(wo, wcam, h.n, ngo) * stG;   // adjoint (→camera) + soft terminator
                             if (f > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wcam), wcam, distc - 2e-6)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
@@ -433,13 +504,14 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, interior);
+                      cosThetaOut, delta, terminate, stk);
         if (terminate || betaFactor <= 0.0) return;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
                    dVCM, dVC, dVM);
         beta *= betaFactor;
+        if (!delta) beta *= shadingAdjointCorr(wo, normalize(wi), h.n, ngo);  // adjoint (continuation)
         prevP = h.p;
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
@@ -465,7 +537,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     double beta = 1.0;
     double dVCM = Mis(ctx.nLightPaths / cameraPdfW);
     double dVC = 0.0, dVM = 0.0;
-    const Material* interior = nullptr;
+    MediumStack stk;                              // nested-dielectric medium stack
     Vec3 prevP = cam.eye;
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
@@ -474,8 +546,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // Directly-viewed environment (no env in scope; ignore).
             return result;
         }
-        if (interior) {
-            double a = interior->absorb(lambda);
+        {
+            int mi = stk.topMat();
+            double a = (mi >= 0) ? scene.mats[mi].absorb(lambda) : 0.0;
             if (a > 0.0) beta *= std::exp(-a * h.t);
         }
         double dist = h.t;
@@ -529,9 +602,16 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double distL = std::sqrt(dist2); Vec3 wi = toL / distL;
                         double cosAtLight = dot(nL, wi * -1.0);
                         double cosToLight = dot(h.n, wi);
-                        bool sideOk = isTwoSidedMat(*mp) ? (cosToLight != 0.0) : (cosToLight > 0.0);
+                        // Geometric-hemisphere softening on this eye/radiance vertex (matches
+                        // backward.h neeLight): the sampled light must be on h's geometric front
+                        // side too, ramped smoothly instead of a hard cutoff (Chiang 2019). No-op
+                        // when h.n==h.ng (stG==1); skipped for two-sided.
+                        double stG = isTwoSidedMat(*mp) ? 1.0 : shadowTerminatorG(wi, h.n, orientedGeoN(h));
+                        bool sideOk = isTwoSidedMat(*mp)
+                                          ? (cosToLight != 0.0)
+                                          : (cosToLight > 0.0 && stG > 0.0);
                         if (cosAtLight > 0.0 && sideOk) {
-                            double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h);
+                            double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h) * stG;
                             double Le = em.spdFn(lambda) * invPdfLambda;
                             if (f > 0.0 && Le > 0.0 && em.area > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wi), wi, distL - 2e-6)) {
@@ -564,11 +644,25 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double distc = std::sqrt(dist2); Vec3 w = d / distc;   // camera -> light vertex
                 double cosCam = dot(h.n, w);
                 double cosLit = dot(lv.ns, w * -1.0);
-                bool camSide = isTwoSidedMat(*mp) ? (cosCam != 0.0) : (cosCam > 0.0);
-                bool litSide = isTwoSidedMat(*lv.mat) ? (cosLit != 0.0) : (cosLit > 0.0);
+                // Geometric-hemisphere softening on BOTH reflect-only endpoints (connection dir w
+                // at the camera vertex, -w at the light vertex): each must see the other on its
+                // geometric front side, ramped smoothly instead of a hard cutoff (Chiang 2019).
+                // No-op when ns==ng (stG==1); skipped for two-sided materials.
+                Vec3 ngoCam = orientedGeoN(h);
+                Vec3 ngoLit = (dot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                double stGCam = isTwoSidedMat(*mp)     ? 1.0 : shadowTerminatorG(w, h.n, ngoCam);
+                double stGLit = isTwoSidedMat(*lv.mat) ? 1.0 : shadowTerminatorG(w * -1.0, lv.ns, ngoLit);
+                bool camSide = isTwoSidedMat(*mp)
+                                   ? (cosCam != 0.0) : (cosCam > 0.0 && stGCam > 0.0);
+                bool litSide = isTwoSidedMat(*lv.mat)
+                                   ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
                 if (!camSide || !litSide) continue;
-                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h);
+                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h) * stGCam;
                 double fLit = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene, &lv.hit);
+                // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
+                // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
+                // Uses lv.ng oriented to lv.ns (ngoLit above); a no-op when the mesh is flat.
+                fLit *= shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit) * stGLit;
                 if (fCam <= 0.0 || fLit <= 0.0) continue;
                 double camDirPdfW = bsdfPdf(*mp, h.n, wo, w, lambda, scene, &h);
                 double camRevPdfW = bsdfPdf(*mp, h.n, w, wo, lambda, scene, &h);
@@ -596,6 +690,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     double lam = (double)lv.lambda;
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h);
                     if (fCam <= 0.0) return;
+                    // Gather-side shading-normal correction (cos_s/cos_g at the merge point):
+                    // rebalances the geometric-cosine density estimate onto the shading cosine
+                    // so a smooth mesh merges smoothly like mode R. 1 when h.n==h.ng (flat).
+                    Vec3 ngoCam = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
+                    fCam *= vmGatherCorr(wMerge, h.n, ngoCam);
                     double camDirPdfW = bsdfPdf(*mp, h.n, wo, wMerge, lam, scene, &h);
                     double camRevPdfW = bsdfPdf(*mp, h.n, wMerge, wo, lam, scene, &h);
                     double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * Mis(camDirPdfW);
@@ -613,7 +712,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, interior);
+                      cosThetaOut, delta, terminate, stk);
         if (terminate || betaFactor <= 0.0) return result;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return result;
 

@@ -6,6 +6,7 @@ struct LiveWindow::Impl {};
 LiveWindow::LiveWindow(int, int, const char*) : impl_(nullptr) {}
 LiveWindow::~LiveWindow() {}
 void LiveWindow::update(int, int, const std::vector<uint8_t>&) {}
+void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
 
 #else
@@ -18,6 +19,19 @@ bool LiveWindow::closed() const { return false; }
 #include <atomic>
 #include <string>
 #include <algorithm>
+
+// Convert a UTF-8 byte string to UTF-16 for the Win32 *W APIs. The old code did a
+// naive `assign(begin, end)` byte-widen, which mangles any non-ASCII: an em dash
+// "—" (UTF-8 0xE2 0x80 0x94) became THREE junk wchars, so the title bar showed
+// "ftrace <3 garbage glyphs> live preview". MultiByteToWideChar decodes it properly.
+static std::wstring utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring(s.begin(), s.end());   // fall back to byte-widen
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -146,7 +160,7 @@ LiveWindow::LiveWindow(int w, int h, const char* title) {
     impl_->initW = std::max(160, (int)(w * s));
     impl_->initH = std::max(90,  (int)(h * s));
     std::string t = title ? title : "ftrace";
-    impl_->title.assign(t.begin(), t.end());       // ASCII widen
+    impl_->title = utf8ToWide(t);                  // proper UTF-8 -> UTF-16
     impl_->readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     impl_->ui = std::thread([this] { impl_->threadMain(); });
     if (impl_->readyEvent) WaitForSingleObject(impl_->readyEvent, 3000);
@@ -175,6 +189,16 @@ void LiveWindow::update(int w, int h, const std::vector<uint8_t>& rgb) {
         }
     }
     impl_->dirty.store(true);
+}
+
+void LiveWindow::setTitle(const std::string& utf8) {
+    if (!impl_ || !impl_->hwnd) return;
+    // SetWindowTextW marshals a WM_SETTEXT to the window's own thread, so this is safe
+    // to call from the render thread. Skip the OS call when the text is unchanged.
+    std::wstring w = utf8ToWide(utf8);
+    if (w == impl_->title) return;
+    impl_->title = w;
+    SetWindowTextW(impl_->hwnd, impl_->title.c_str());
 }
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }

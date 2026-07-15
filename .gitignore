@@ -1,6 +1,7 @@
 # Build output
 /build/
 /build_cuda/
+/build_cuda2/
 /build_het/
 /build_verify/
 /out/
@@ -28,6 +29,10 @@
 /tools/.pov_fnintern.cpp
 /tools/.pov_noise.cpp
 /tools/.pov_portablenoise.cpp
+
+# Python bytecode cache
+__pycache__/
+*.pyc
 
 # Editor / IDE
 .vs/

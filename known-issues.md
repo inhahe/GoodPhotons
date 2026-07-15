@@ -3,7 +3,418 @@
 Running log of unsolved bugs and accumulated tech debt. Fix items here as soon
 as practical; this file is the fallback for what can't be addressed immediately.
 
+## Open issues
+
+### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode
+
+Previously the real-render `exposure_lock <selector>` meter pre-pass only metered the
+forward models (A/B/C) and the backward reference (R); modes D/M/P silently fell back to
+locking on whichever frame rendered first, *ignoring the selector*. Fixed: the meter
+pre-pass (`meterAnchor` lambda in main.cpp, the `meterPlan` loop just after the `-raster`
+block) now renders the selector-chosen viewpoint in its **own** mode — `renderBdpt` for
+D, a lazily-built shared reduced photon map + `renderPhotonCamera` for M, and
+`classifyComposite`+forward+backward+`compositeFromFilms` for P — and any other mode
+(S/U/V/…) falls back to a **general forward mode-B light-trace** (still a correct
+scene-brightness anchor, never an arbitrary frame). Because the p99 anchor is a property
+of the radiance, not the integrator, every mode yields a consistent anchor. There is now
+**no silent frame-0 fallback anywhere**; a bare `exposure_lock` also defaults to the path
+**average** rather than the first frame. Validated on scraps/lock_test.ftsl in modes
+B/M/D/P with `index`/`average` selectors (all honoured, all frames flicker-free).
+
+### OPEN (2026-07-15): absolute-EV scenes render near-black in the finite-lens catch modes (A/C)
+
+`ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) — the fixed sensor gain that
+replaces the p99 auto-exposure in absolute mode (any light with `power`/`lumens`) —
+is calibrated **only for mode B** (the pinhole splat; the shipped `scenes/absolute.ftsl`
+uses mode B and exposes to mid-tone at gain 6). The **finite-lens catch modes A and C**
+produce a radiometric film scale that is ~10^3–10^4× dimmer at the same gain, so an
+absolute scene shot in mode A/C comes out essentially **black** unless the user cranks
+`exposure` to ~1e4 in the `film` block. Repro:
+`ftrace -in scraps/ap_abs.ftsl -time 10 -o png/x.png` (mode-A cams) → max pixel ≈ 5/255,
+vs the same scene in mode B which is fine. Root cause is the mode-A/C splat weight
+(render.h `connectLens`: `contrib *= cosSurf*cosLens*R^2/dist^2`) carrying pupil-area/
+geometry factors that mode B's pinhole weight does not, so the two modes don't share an
+absolute scale. **Proper fix:** derive a per-mode absolute calibration (or fold the
+missing `1/(π R_ref^2)`-style normalisation into the A/C splat) so gain 6 lands mid-tone
+in every mode, then re-validate B vs A vs C at equal `power`. NOTE: the aperture→
+brightness relationship itself is *correct* in absolute A/C (verified: doubling the
+aperture radius quadruples brightness, linear ratio 3.97≈4.0) — only the overall gain is
+mis-seated. This is why the `-raster` preview's aperture-brightness term is gated to
+`absolute && mode∈{A,C}` and uses a *relative* reference aperture (Rref=0.02), so it
+previews the correct *ratio* even though the real render's absolute level is currently
+off.
+
+### OPEN (2026-07-15): absolute EV — mode B ignores the aperture's exposure (light-gathering)
+
+Aperture controls two separable things: **depth of field** (geometric) and
+**exposure/light-gathering** (radiometric, `E ∝ 1/N²` from the camera equation
+`E = (π/4)·L·T·cos⁴θ / N²`). Mode B is a **pinhole**, so it correctly has no DoF —
+but it *also* drops the 1/N² exposure term, which is NOT a lens effect, just how
+much light the pupil admits. Consequence: in **absolute mode** two mode-B renders
+of the same scene at f/2 vs f/8 come out **identically bright**, when a real sensor
+would separate them by 4 stops. The authored `fstop`/`aperture` is inert in mode B.
+Under auto-exposure this is moot (the p99 meter cancels exposure shifts anyway, and
+B has no R² to cancel); it only bites in absolute EV.
+
+The old rationale for excluding aperture from the exposure comp ("in splat mode B
+the aperture is virtual, so an f-number term would double-count / be an artifact",
+CamSpec/main.cpp ~921) holds **only for modes A/C**, which already carry the physical
+`R²` in their splat weight (render.h `connectLens`). Mode B has **no** `R²`, so a
+virtual-aperture exposure term there is clean and non-redundant — the correct place
+to "regard" the aperture.
+
+**Proper fix (unify with the A/C absolute-gain bug above):** replace the per-mode
+absolute scaling with one camera-equation-based absolute exposure model — apply the
+physical `π/4 · 1/N²` (and ideally `cos⁴θ` natural vignetting) once, seated so A, B
+and C agree at equal `power`. In A/C the `1/N²` comes from the pupil-area `R²` splat
+weight (keep it, fix the gain); in B it must be added as a pure exposure factor while
+keeping pinhole DoF. Do NOT double-apply it in A/C. Defensible alternative if we
+decline the fix: document that aperture is a *lens* property and absolute-EV exposure
+requires mode A/C (mode B stays a pure pinhole) — but then a mode-B `fstop` should
+warn/error rather than silently no-op.
+
+### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
+
+Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** crashes with
+`[cuda] bdpt kernel failed: unspecified launch failure` reproducibly at **spp 14**
+(~232 s in; earlier spp complete fine and write correct images). It is an illegal
+memory access inside the BDPT megakernel (`kBdpt`, `render_cuda.cu` ~4283), NOT a TDR
+timeout (chunks are ~0.15 s) and NOT GPU contention (single process).
+
+**Ruled out by inspection:** the per-thread `eye[]`/`light[]` subpath arrays
+(`BDPT_MAXV=11`), the `DMediumStack` (CAP 8, push guarded), the media free-flight
+loops, and the `double st[64]` pattern/field VM stacks are all bounds-safe. The fault
+is **data-dependent** (RNG seeded by the global sample index `gidx`, so it reproduces
+deterministically regardless of timing) — some specific path at spp 14 indexes out of
+bounds or dereferences a bad pointer, likely a rare geometric/CSG/medium configuration
+hit only by that sample's random walk.
+
+**Investigation status:** a `compute-sanitizer --tool memcheck` run (build has
+`-lineinfo`, so it would report the exact `render_cuda.cu:<line>`) was launched but
+**stopped before it reached the crash sample** (memcheck ~20× slowdown ⇒ ~80 min to
+spp 14; killed to free the exe lock for the -raster preview work). **Next step:**
+re-run compute-sanitizer memcheck to completion for the fault line, then fix the OOB.
+Repro (headless — sanitizer runs instrumented):
+`compute-sanitizer.bat --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
+Mode B on the same scene is stable, and the new `-raster` preview is unaffected.
+
+### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
+
+A smooth-shaded mesh (authored `vn` **or** crease-smoothed via `mesh { smooth }`) used
+to render smooth in the backward reference mode R but **faceted in the forward modes**.
+Root cause was the **shading-normal adjoint asymmetry** (Veach §5.3): a backward
+estimator integrates the incident cosine through the *shading* normal, so interpolated
+normals smooth the shading for free; a forward/particle tracer deposits irradiance per
+**geometric** area and stays faceted.
+
+**Fix shipped.** `shadingAdjointCorr(wi, wo, ns, ng)` in `geometry.h`
+(`corr = |cos(wi,Ns)·cos(wo,Ng)| / |cos(wi,Ng)·cos(wo,Ns)|`, guarded denom, exactly 1
+when Ns==Ng) is multiplied into the **particle throughput** at every non-specular
+continuation and every camera connection of the LIGHT/importance subpath:
+- `render.h` modes A/B/C — `connect`/`connectLens` splats + Diffuse/Fluorescent/
+  DiffuseTransmit continuations (shared `tracePhoton` walk, so the M/S deposit inherits it).
+- `bdpt.h` mode D — `randomWalk` (gated `mode == Importance`) + `connectBDPT` light-side `f`.
+- `vcm.h` mode U — light-subpath continuation + light-image splat + the VC connection's
+  light-vertex `fLit`. The eye/Radiance side is never corrected (it smooth-shades for free).
+- GPU twins in `render_cuda.cu` — `dShadingAdjointCorr` threaded through `connect`/
+  `connectLens`/`splatSurfaceAll` (forward tracer) and `dRandomWalk`(importance flag)/
+  `dConnectBDPT` (GPU BDPT).
+
+Validated smooth against mode R on `scraps/_smooth_on.ftsl` and the harsher
+`scraps/_iso_sphere.ftsl` (directional-lit sphere, no indirect): modes B, D (CPU+GPU),
+and U all match the mode-R gradient. Exactly 1 when Ns==Ng ⇒ every flat/analytic scene is
+bit-identical (whole existing validation suite untouched).
+
+**Surprising finding — photon-density gathers (modes M/S) did NOT need a gather-side
+correction.** An initial hypothesis added a `cos_s/cos_g` gather reweight to the mode-M
+photon-map and mode-S SPPM density estimates. Empirically this was WRONG: mode M/S already
+smooth-shade (verified matching mode R by center-column brightness profile on both the
+Cornell and isolated directional scenes, at gather radii from 0.004 to 0.017), and adding
+the reweight *introduced* facet banding. That speculative correction was reverted; M/S
+gathers are left uncorrected. See the tech-debt note below for the one place a gather-side
+correction WAS needed (VCM's vertex-merge) and why the asymmetry isn't fully understood.
+
+### TECH DEBT: VCM vertex-merge needs a gather-side shading-normal reweight that M/S don't — asymmetry not fully understood 2026-07-15
+
+Direct consequence of the DONE entry above. The mode-M photon-map and mode-S SPPM
+photon-density gathers **smooth-shade correctly with no gather-side correction** (verified
+against mode R). But mode U's **VCM vertex-merge (VM) strategy** genuinely *facets* on the
+same smooth meshes — strong full faceting on `scraps/_iso_sphere.ftsl` — even though its VM
+density estimate is mathematically the same kind of radius gather. The current fix is a
+**scoped, file-local `vmGatherCorr(wp, ns, ng) = |cos(wp,Ns)| / |cos(wp,Ng)|`** in `vcm.h`,
+multiplied into the merge's camera-side `fCam` only (the `vmNorm` carries no geometric
+cosine, so the raw VM value is as smooth as mode M — the faceting instead enters through the
+per-facet MIS coupling between the VM and VC strategies).
+
+**Why the asymmetry exists is not fully understood.** Best current hypothesis: the VM/VC
+MIS weights assume normal consistency between the merged light-vertex and camera-vertex
+BSDF evaluations, and the shading/geometric-normal mismatch breaks that assumption for VM in
+a way the standalone M/S estimators (no competing MIS strategy) never see. The **cleaner
+future fix** is to make the VM↔VC MIS-weight derivation consistent under interpolated
+normals (so no ad-hoc `fCam` reweight is needed), rather than patching `fCam`. The current
+`vmGatherCorr` is a no-op on flat tris / analytic spheres (`Ns==Ng` ⇒ ratio 1), so it
+cannot regress any existing (non-smooth) scene. Low priority — mode U smooth-shades
+correctly today; this is about *why* and a tidier derivation.
+
+### DONE (2026-07-15): Shading-normal geometric-hemisphere clamp propagated to all connection sites (+ fixed a pre-existing GPU mode-R light leak)
+
+The geometric-hemisphere clamp (stop a smoothed shading normal from leaking light in
+through the geometric back face; `orientedGeoN()` in `geometry.h`) was previously only in
+the backward reference (`backward.h` `neeLight`/`neeEnv`) and the forward tracer's camera
+connection (`render.h` `connect`/`connectLens`). It is now applied at **every** NEE /
+connection site: `bdpt.h` (mode D — the t==1 splat, s==1 NEE, and interior connection, each
+endpoint), `vcm.h` (mode U — light-image splat, NEE, and both VC-connection endpoints), and
+the GPU twins in `render_cuda.cu` (`connect`/`connectLens` for A/B/C, `dConnectBDPT` for
+mode D, and `bkNeeLight` for backward). **Per-site recipe applied:** alongside the existing
+`dot(Ns, wi) <= 0` shading-side test, also require `dot(ngo, wi) > 0` (ngo = geo normal
+oriented to Ns) and offset the shadow/connection ray along `ngo`. In `bdpt.h`/`vcm.h` the
+clamp is **guarded by `!isTwoSidedMat`** so transmissive (glass) connections through the
+back hemisphere are not wrongly killed; GPU BDPT is reflect-only (v1) so the clamp is
+unconditional there. No-op for flat tris / analytic spheres (`ngo == Ns`), so every
+non-smooth scene is bit-identical.
+
+**Modes M/S need nothing:** mode M's direct lighting reuses `bw.neeLight` (already clamped)
+and its photon gather has no shadow ray; SPPM's visible-point walk does no NEE at all.
+
+**Pre-existing bug fixed as a side effect.** The GPU backward NEE (`bkNeeLight`) was missing
+the clamp its CPU twin (`backward.h neeLight`) already had, so **GPU mode R silently leaked
+light through geometric back faces** — on `scraps/_iso_sphere.ftsl` GPU-R showed a smooth
+(leaking) terminator while CPU-R showed the correct leak-free (faceted) one. Adding the
+clamp to `bkNeeLight` makes CPU-R and GPU-R identical.
+
+**Caveat — shadow terminator (NOW SOFTENED, see DONE entry below).** A *hard* geometric
+clamp reveals the shadow-terminator problem: on a low-poly smooth-normal sphere under grazing
+light the terminator shows the underlying facets (hard dark slivers) rather than a smooth
+gradient. This was the mode-R reference's existing behavior too, so the clamp made the forward
+modes *consistent with the reference*. The hard cutoff has since been replaced everywhere by
+Chiang et al. 2019 softening — see the next DONE entry.
+
+### DONE (2026-07-15): Shadow-terminator softening (Chiang et al. 2019) replaces the hard geometric clamp everywhere
+
+The hard geometric-hemisphere cutoff from the entry above carved dark facet slivers at the
+terminator of low-poly smooth-normal meshes under grazing light (the classic shadow-terminator
+artifact). Replaced the hard `dot(ngo, wi) <= 0 ? reject` at **every** clamp site with a smooth
+ramp: `shadowTerminatorG(wi, ns, ng)` in `geometry.h` (Chiang, Li, Burley & Hovhannisyan 2019,
+"Taming the Shadow Terminator"; same cubic as Cycles' `bump_shadowing_term`).
+
+    g = cos(Ng,wi) / (cos(Ns,wi)·cos(Ng,Ns)),  softened by  -g³ + g² + g  on (0,1)
+
+Returns a `[0,1]` factor multiplied into the surface response (NEE/connection contrib): still
+**exactly 0** when `wi` is behind the true geometry (no back-face leak — leak-free is preserved),
+but ramps up smoothly off the geometric horizon instead of a step. Applied **uniformly to all
+modes including the mode-R reference** so R softens too and every mode stays mutually consistent:
+- `backward.h` mode R — `neeLight` (spot + sphere-cone + area/quad sites) and `neeEnv`.
+- `render.h` modes A/B/C — `connect` and `connectLens` camera splats.
+- `bdpt.h` mode D — t==1 splat, s==1 NEE, and both interior-connection endpoints (`!isTwoSidedMat` guarded).
+- `vcm.h` mode U — light-image splat, NEE, and both VC-connection endpoints (`!isTwoSidedMat` guarded).
+- GPU twins in `render_cuda.cu` — `dShadowTerminatorG` threaded through `connect`/`connectLens`,
+  `dConnectBDPT` (3 subsites), and `bkNeeLight`.
+
+**Bit-identity guard.** `shadowTerminatorG` short-circuits to a plain leak-free step (return
+exactly 1.0 when in front of the geometry, 0.0 behind — identical to the old hard clamp) whenever
+`dot(Ng,Ns) >= 1 - 1e-7`, i.e. the shading and geometric normals coincide (flat tris, analytic
+spheres). Without this guard a re-normalized `ns` differs from `ng` in the last bit, the cubic
+returns ~1 (not bit-exactly 1), and every flat/analytic scene would drift by ~1e-7. With it, the
+softening engages **only** once `ns` and `ng` genuinely diverge (a real smooth/crease-smoothed
+mesh), so the whole flat-scene validation suite stays bit-identical.
+
+Validated on `scraps/_iso_sphere.ftsl` (grazing directional-lit low-poly smooth sphere): the
+terminator is now a smooth gradient (no facet slivers) and mutually consistent across CPU R/D/U
+and GPU R/D; flat `scenes/cornell.ftsl` renders unchanged.
+
+**Diagnostic note — disabling the clamp entirely (the "option 2" that was considered).** A debug
+toggle to *fully disable* the geometric-hemisphere clamp (reverting to a pure shading-normal test,
+which leaks light through geometric back faces but never facets) was considered and **deliberately
+not implemented**: softening is the correct fix, so a disable toggle is only ever a diagnostic, and
+plumbing a runtime flag through the CUDA kernels (device-constant, kernel signatures, host parsing)
+isn't worth the surface area for a debug-only path. If ever needed to isolate a back-face-leak vs.
+terminator issue, edit `shadowTerminatorG` (and `dShadowTerminatorG`) to `return dot(ng,wi) > 0 ? 1
+: 1` (always 1 → no clamp, no softening) or `return 1` unconditionally, rebuild, and compare — a
+one-line local change, no scene/CLI plumbing.
+
+### Headless-spawned `-window` render on gallery.ftsl hangs with no output — NEEDS INVESTIGATION 2026-07-14
+
+A `ftrace -in scenes/gallery.ftsl -mode R -n 1500000 -spp 8 -window` invocation *spawned
+as a background process without an interactive window station* ran for 15+ min burning
+~7 CPU cores (3400+ CPU-seconds) at **1% GPU**, producing **zero stdout and no image /
+checkpoint**, and never exited. Meanwhile the same scene stripped to room+lights (no
+isosurfaces/fog), rendered with `-mode R -device gpu -spp 64 -preview` (NO `-window`, no
+`-n`), built and rendered in seconds on the GPU concurrently. Two suspects, not yet
+isolated: (a) `-window` can't create its Win32 GDI window when the process has no window
+station (background/detached spawn) and the code spins instead of erroring; (b) passing
+`-n <photons>` to **mode R** (which is spp-based, not photon-count) mis-budgets into a
+huge CPU loop. Likely (a). **Repro to confirm:** run the heavy scene once with `-window`
++ no `-n`, and once with `-n` + no `-window`, from a detached shell. If (a): make the
+`-window` init detect a missing/invalid window station and fall back to `-preview`
+(or error cleanly) instead of hanging. NB: do NOT `taskkill /F` a live ftrace — the
+nvlddmkm teardown BSOD (below) has fired after an abrupt kill.
+
+### `look tangent` pitches hard at path folds (gallery fly cusps) — FIXED 2026-07-14
+
+`camera_curve` `look tangent` aims at a point a FIXED arc-length ahead (`sTgt =
+sHere + 0.045*Smax`, ftsl.h ~2726). Where the path makes a horizontal U-turn (a
+"fold") while also changing height, that look-ahead reaches across the fold to a
+point at a very different y, so the view pitches sharply — a visible frame-to-frame
+flick. The gallery `fly` curve had two folds: the dive turnaround (frames ~117-120,
+old peak pitch **+24.5°** staring UP into the y=4.48 ceiling lights — the jerk the
+user reported) and the loop closure (frames ~171-175, old peak **-70°** staring DOWN
+at the floor, pre-existing/unreported). **Fix (scene-level):** keep y as flat as
+possible ACROSS each fold and push the height change onto the straight opening
+corridor — return apex lowered from y~2.6 to ~2.2. New peaks +10.6° / -15°, worst
+frame-to-frame pitch swing ~30° → 6.5° (measured with `scraps/_cam_curve.py`, a
+faithful re-impl of the ftsl.h sampler). Commit d46cacb. **Engine-side fix (also
+done):** the latent general issue is now fixed in the `look tangent` branch. Root
+cause pinned down numerically: at a fold the look-ahead chord's HORIZONTAL reach
+collapses (e.g. closure frame 171: dy only -0.46 but h=0.17), so `asin(dy/L)` blows
+the pitch up to -70°. Two defences, both only touching near-fold frames (well-
+conditioned frames incl. legit steep dives keep their reach → byte-identical):
+(1) `min_reach <frac>` (default 0.5) floors the horizontal reach used for the pitch
+at `frac * lookAheadChord`; (2) `look_smooth <sigma_frames>` (default 0/off) does a
+wrap-aware Gaussian smooth of the decomposed yaw+pitch so a fold's unavoidable fast
+pan (the flight genuinely reverses direction) is spread over frames instead of
+snapping. Implemented as a pre-pass before the frame loop (ftsl.h ~2720). Validated
+A/B on the ORIGINAL unfixed control points (`scraps/_engine_fix_test.ftsl` vs
+`_engine_fix_legacy.ftsl`): legacy frame 11 rakes into a ceiling light, fixed frame
+11 is level. Numerically (`scraps/_cam_smooth_test.py`) the original -69.7° rake
+becomes a bounded ±30° near-level pan with `min_reach 0.5 look_smooth 2`. NOTE: the
+scene-level control-point fix is still the best-LOOKING result for the gallery (it
+removes the sharp reversal geometrically → jerk 6.5°); the engine fix is the general
+safety net so aggressive future paths degrade to a bounded pan instead of a rake.
+
+### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14
+
+With a very dense saved map (the 60M-photon gallery map deposits ~58.3M photons), each
+per-camera density-estimate gather is expensive (~90–120 s/frame at 960×540, 48 spp on a
+4090), so a 180-frame flythrough runs ~3–4.5 h. The dense map already yields a smooth
+density estimate, so most of the per-frame spp is spent on anti-aliasing rather than noise
+reduction. **Tuning opportunity:** once the map is saved (`-savemap`), re-gather via
+`-loadmap` at reduced spp (~16–20) for roughly a 2–3× speedup with near-identical quality
+(the map deposit — the physically expensive part — is skipped entirely). Not a bug; a
+knob worth remembering when iterating on camera angles / radius on a fixed map.
+
+### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — FIXED 2026-07-14
+
+The shared photon-map path (mode M, both CPU and GPU) writes each frame to disk the moment
+its gather completes (crash-safe incremental output). The shared **forward** models A/B
+(`renderForwardShared` / `renderForwardSharedCuda`, dispatched from `main.cpp runSharedGroup`)
+now do too: `runSharedGroup` was rewritten to chunk the N-photon pass (folding a per-chunk
+`seedBase` into the RNG so successive chunks draw independent photons and seedBase==0 stays
+bit-identical), accumulate into per-camera SUM films, write all current films + per-camera
+`.ftbuf` checkpoints every `-interval` seconds, and support `-resume` from them — mirroring
+the single-camera chunked modes. Verified GPU+CPU bit-identity vs standalone, checkpoint,
+resume, time budget, and energy conservation (sum/emitted = 1.000000). See commit d43fb6b.
+
+### System BSOD/reboot on GPU context teardown (nvlddmkm.sys driver bug) — MITIGATED 2026-07-14
+
+Twice, the whole machine bugchecked and rebooted **a couple of seconds after an ftrace
+render window closed** (once after an abrupt `taskkill /F`). Forensics (minidumps copied
+from `C:\Windows\Minidump` via elevated PowerShell, analyzed with `cdb -z <dump> -c
+"!analyze -v"`):
+
+- Both dumps fault **inside `nvlddmkm.sys`** (NVIDIA kernel driver, build ~Jan 2026,
+  driver 591.86) at the **same function** (+0xcff9xx), at **IRQL 2 (DISPATCH_LEVEL / DPC
+  context)** — bugcheck `0xBE` (ATTEMPTED_WRITE_TO_READONLY_MEMORY) and `0xD1`
+  (DRIVER_IRQL_NOT_LESS_OR_EQUAL). A DPC-level fault has **no attributable user process**;
+  it is the driver's own asynchronous context-teardown DPC, running *after* our process
+  has exited. `nvlddmkm` Event 13 (Xid 13, "Graphics FECS Exception") also appears in the
+  System log during render sessions. This is a **driver bug**, widely reported for
+  RTX 4090 + nvlddmkm across driver versions — not something ftrace causes directly.
+- **ftrace's own CUDA kernels are clean.** `compute-sanitizer --tool memcheck` and
+  `--tool initcheck` on a mode-M render (`scenes/gallery.ftsl -mode M -camera fly090 -n
+  150000 -spp 1 -r 64 48`) both report **0 errors** — no out-of-bounds or uninitialized
+  device memory access. So the crash is not an app-side OOB feeding the driver a bad
+  pointer; it is purely the driver's teardown path.
+
+**Root enabler found: TDR was disabled.** `HKLM\System\CurrentControlSet\Control\
+GraphicsDrivers\TdrLevel = 0` (Timeout Detection & Recovery **off** — no `TdrDelay`
+override). With TDR off, a wedged GPU op / driver fault has **no recovery path** and
+escalates straight to a bugcheck instead of the driver being reset. (TDR was likely
+disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.)
+
+**Mitigations:**
+1. **App-side (done):** added `cudaGracefulShutdown()` (`render_cuda.cu`) — a
+   `cudaDeviceSynchronize()` + `cudaDeviceReset()` called from `main()` on every exit path
+   (normal or exception, guarded by `HAVE_CUDA`). This destroys the CUDA context
+   **synchronously, in-process, while quiescent**, instead of leaving it for the driver to
+   reap asynchronously from a DPC after `main()` returns — closing the exact window in
+   which the fault fires. Build now also compiles device code with `-lineinfo` (free at
+   runtime) so any future GPU fault maps to `file:line`.
+2. **Operational (done):** always shut renders down **gracefully** (close the live window /
+   Ctrl-C / let it finish) — **never `taskkill /F`** a live CUDA process, which yanks the
+   context mid-flight and is the most reliable way to hit the teardown fault.
+   - **Teardown tracer:** set `FTRACE_TEARDOWN_LOG=<path>` to have `cudaGracefulShutdown()`
+     append a flushed line to `<path>` around each driver call (`cudaDeviceSynchronize` /
+     `cudaDeviceReset` enter+return). Each line is written with reopen+`fflush` so a hard
+     reboot mid-teardown leaves the **failing step as the last line on disk**. Reading it
+     after a crash tells us whether the fault is *inside* our `cudaDeviceReset` call (last
+     line = "cudaDeviceReset enter", no "returned") or purely the driver's post-exit DPC
+     (last line = "cudaDeviceReset returned") — which we can't touch from user space.
+3. **OS-side (APPLIED 2026-07-14, takes effect after a reboot):** re-enabled TDR with a
+   generous delay so the OS *recovers* a hung GPU instead of bugchecking, while still not
+   killing legitimate multi-second kernels. Set via elevated `reg add` under
+   `HKLM\System\CurrentControlSet\Control\GraphicsDrivers`:
+   `TdrLevel=3 (REG_DWORD)`, `TdrDelay=60` (0x3c s), `TdrDdiDelay=60`. (Was `TdrLevel=0`,
+   TDR fully disabled.) Verified present in the registry; **requires a reboot** to take
+   effect. Revert with `TdrLevel=0`. Also worth doing: update the NVIDIA driver (591.86 is
+   months old) or DDU clean-reinstall.
+4. **App-side follow-up (done 2026-07-14):** the shared **mode-M** gather
+   (`main.cpp runSharedPhotonMap`) was the ONE render path that never installed a SIGINT
+   handler — every other mode wraps its loop in `signal(SIGINT, onInterrupt)`, but this one
+   relied on the default terminate action. A backgrounded / headless Ctrl-C therefore
+   abruptly killed the live CUDA context mid-gather instead of routing through
+   `g_stopRequested` + `cudaGracefulShutdown()` — the exact abrupt-teardown scenario above.
+   Fixed with a `SigGuard` RAII (installs SIGINT+SIGBREAK on entry, restores on every exit
+   path incl. the GPU early-return) plus stop-checks: the GPU path's `writeFrame`/`liveProg`
+   callbacks already return `g_stopRequested`, and the CPU fallback gather loop now breaks on
+   `g_stopRequested` between frames. So an interrupt now finishes the current frame, writes
+   it, and returns for the orderly teardown.
+
 ## Recently fixed
+
+### Scene grammar: two value-less flag keywords can't share a line — FIXED (docs+scene) 2026-07-14
+
+`camera_curve "fly" { … closed   exposure_lock … }` silently dropped the exposure lock, so
+the gallery flythrough flickered (every frame auto-exposed independently). Cause: in the
+FTSL grammar (`ftsl.h parseValue`) a statement's value is *always* the next token — required
+for value-bearing barewords like `material white`, `look tangent`, `caps on`. So
+`closed exposure_lock` parses as key `closed` with value `"exposure_lock"`; there is no
+separate `exposure_lock` statement, `find(b,"exposure_lock")` returns null, and the lock
+never applies (`closed` still works by accident since any non-`off` value is truthy). The
+grammar genuinely can't tell `closed exposure_lock` from `material white`, so this is a
+by-design limitation, **not** a parser bug to "fix." **Resolution:** put each value-less
+flag on its own line — done in `scenes/gallery.ftsl`, and the misleading one-line example in
+the `camera_curve` doc comment (`ftsl.h`) is corrected with an explicit NOTE. The CLI
+`-exposure-lock` (global override) was always a reliable alternative. Workaround for authors:
+one flag keyword per line.
+
+### Mode `M` photon map ported to the GPU (direct density query) — ADDED 2026-07-14
+
+Mode `M` was **CPU-only** — a serious backend gap, since the shared photon map (build
+once, gather every camera) is exactly the workload a GPU wins at (e.g. a 90-frame
+flythrough). Ported the **direct density query** to CUDA (`render_cuda.cu`
+`renderPhotonMapSharedCuda`), reusing the existing pieces: the forward deposit runs on
+the **same** `kTrace`/`shadeStep` megakernel (added a `depositPhoton` branch at every
+`Diffuse`/`DiffuseTransmit` vertex, gated by a device deposit buffer — a two-pass
+count-then-fill for exact sizing), the grid build reuses the tested host
+`PhotonMap::build` (download hits → build → re-upload sorted photons + `cellStart`), and
+the gather is a new `kGather`/`dPhotonGather` kernel mirroring the CPU `photonGather`
+(specular walk, 3×3×3 grid query, per-photon-wavelength XYZ density estimate,
+cross-surface reject, emitter term, Beer–Lambert interior; no env term). Gather is
+spp-chunked to stay under the Windows TDR watchdog. Gated by `cudaPhotonMapSupported`
+(POD-bakeable materials, no env light) + pinhole cameras + no `-pmfg`; otherwise the CPU
+path runs. Host dispatch in `main.cpp runSharedPhotonMap` honors the shared
+`-exposure-lock` anchor so a flythrough doesn't flicker.
+
+**Validation** (`scenes/_gpumtest.ftsl`, dispersive-glass Cornell box, 2 mode-M cameras):
+energy conserves exactly (sum/emitted = 1.000000). CPU-vs-GPU converges *together* as
+photons rise (the signature of a correct port whose only difference is the RNG noise
+realisation): 4M/8spp → linear relRMSE 51%, Pearson 0.836; 40M/32spp → 28%, 0.954. After
+a heavy Gaussian blur to remove Monte-Carlo noise, the two radiance fields agree to
+**1.7% / 3.8% linear RMSE at Pearson 0.999** with a best-fit scale of **1.00** (no
+systematic brightness bias). The residual per-pixel error is pure caustic/light-source
+noise (bright in linear space, slow to converge). **`-pmfg` final gather and env-lit
+scenes still fall back to the CPU** — porting the final-gather sub-ray pass is future
+work. `README.md` mode-`M`/CUDA/`-device` sections updated.
 
 ### Mode `M` optional Jensen final gather (`-pmfg`) — ADDED 2026-07-14
 
@@ -52,10 +463,41 @@ See `render_cuda.cu` ~line 555/577/624.
 
 ## Open bugs
 
-_(none currently open — see Resolved for the former `light cylinder` entry, which
-turned out to be a misdiagnosis.)_
+### Klein glass mesh had a non-manifold pinch vertex — FIXED 2026-07-14
+The Klein mesh (`scraps/klein_hunyuan_clean.obj` and its staged copy `klein_staged.obj`, used
+by `settle_test_settled.ftsl` / `klein_glass_ior152.ftsl` / `klein_glass_ior242.ftsl`) failed
+the new `-check-watertight` audit. Diagnosis: in RAW OBJ indexing the mesh is a *perfect* closed
+2-manifold (951420 edges, every one shared by exactly 2 faces, zero boundary, zero non-manifold).
+The defect was a single **3-sheet pinch vertex** — three distinct vertices (ids 151608/151609/
+153154, 7+5+5=17 incident faces) snapped by the AI mesh generator to the *same* point
+(~(-0.008, 0.331, -0.453), within 9.5e-8) — which only shows as a non-manifold vertex once the
+audit welds coincident vertices (weld eps = bbox_diag·1e-7). The audit reported different counts
+per instance (3 at full scale, 8–9 on the smaller staged copy) because the weld eps scales with
+each mesh's post-transform bbox diagonal. Not a hole and not a broad self-intersection, so
+MeshFix ("could not fix everything", changed nothing) was the wrong tool. **Fixed** with
+`tools/repair_mesh.py` (MeshLab engine): merge-close-vertices → repair-non-manifold-edges
+(remove faces) → repair-non-manifold-vertices → close-holes, taking `klein_hunyuan_clean.obj`
+and `klein_staged.obj` to `[OK] … watertight, dielectric` (317038 v / 634076 f, −102 v / −204 f).
+Pre-repair copies kept locally as `*.orig.obj` (scraps/ is git-ignored, so the meshes aren't
+versioned — only the repair tool is). NB: this pinch was measure-zero and its render impact was
+negligible; the audit is just strict about it.
+
+_(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
 ## Tech debt
+
+### Mesh repair exists (`tools/repair_mesh.py`); isosurface cap-at-polygonise still TODO — 2026-07-14 — MESH PART DONE
+`-check-watertight` DETECTS non-airtight geometry and **`tools/repair_mesh.py`** now FIXES meshes
+(MeshLab engine by default: merge-close-vertices → repair non-manifold edges/vertices → close
+holes; `--engine meshfix` for Attene's MeshFix on self-intersection/hole-heavy meshes; `--place-like`
+re-applies a derived copy's transform). Used it to make the Klein glass mesh airtight (see the
+FIXED bug entry above).
+Still open — **isosurfaces**: `-check-watertight` polygonises the field and audits that, but a
+`contained_by` box that clips the surface open would need a fix at *polygonise* time — emit the
+flat cap on the clip plane so the marched mesh is closed by construction (marching cubes is already
+watertight otherwise). `repair_mesh.py` could also just be run on an exported isosurface OBJ, but
+the cap-at-source approach is cleaner. Also optional: a `-repair-mesh` CLI wrapper if we ever want
+it in-process (currently repair is a separate Python step, which is fine).
 
 ### `-export-mesh` QEM decimation is pathologically slow on huge/self-intersecting meshes — 2026-07-13
 `isomesh::decimateAdaptive` (QEM edge-collapse) is fine at small/medium counts but effectively
@@ -446,6 +888,32 @@ with proper mean-free-path blurring) is still not implemented — this material 
 diffuse-transmission approximation, not volumetric SSS.
 
 ## Resolved
+
+### Nested-dielectric exterior IOR hardcoded to 1.0 (glass-in-water wrong) — DONE 2026-07-14 (Level 0)
+Every dielectric interface previously assumed the exterior medium was vacuum (IOR 1.0), so
+glass-in-water refracted 1.0↔1.52 instead of 1.33↔1.52 and nested/overlapping solids were
+wrong in **all** modes. Fixed at ROADMAP §7 **Level 0** (Schmidt & Budge 2002 priority
+field): each path now carries a tiny LIFO medium stack (`src/medium_stack.h`, device
+`DMediumStack` in `render_cuda.cu`); at every dielectric hit the exterior IOR comes from the
+enclosing highest-priority medium, and the lower-priority surface inside an overlap is
+suppressed (ray passes straight through). Wired through **all** integrators: CPU R/A/B/C/D/M/S/U
+(`backward.h`, `render.h`, `bdpt.h`, `photonmap_render.h`, `sppm_render.h`, `vcm.h`) and GPU
+forward/backward/BDPT/photon (`render_cuda.cu`). **Safe fallback:** the priority rule fires
+only when *both* sides carry an explicit `priority` (air/empty stack always valid at 1.0), so
+priority-free scenes render bit-identically. An ahead-of-time scene audit warns when two
+dielectric bounding volumes overlap and either lacks a `priority` (isosurfaces compared by
+their `contained_by` container bounds — conservative, never misses a real overlap). Validated:
+mode-R priority vs no-priority differ across 33.6% of pixels (mean 5.5/255) — well above render
+noise; GPU-priority matches CPU-priority reference to mean 1.3/255; modes C/M energy-conserving.
+- **Remaining gap (pre-existing, not a regression):** device BDPT (`dRandomWalk` in
+  `render_cuda.cu`) still does **not** apply Beer-Lambert interior absorption across in-glass
+  segments — it never did, and Level 0 only added the priority-driven exterior-IOR resolution
+  there, not absorption. GPU BDPT already falls back to CPU for frosted/colored glass anyway
+  (`cudaBdptSupported`), so colored-glass absorption is exercised on the CPU path; clear-glass
+  device BDPT is unaffected. Proper fix: thread `stk.topMat()` absorption into `dRandomWalk`'s
+  segment loop the way the forward/backward device paths do.
+- **Future (ROADMAP §7 Levels 1/2, deferred):** true physical stacking of co-located media and
+  interpenetrating volumes remain opt-in tiers beyond Level 0.
 
 ### Mode `P` composite is not progressive; `R`/`D` have no disk resume — DONE 2026-07-13
 Both gaps closed. `-time`/`-noise`/`-forever`/`-preview`/`-interval` and `-resume`/

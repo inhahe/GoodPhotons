@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frame Scrubber — ftrace flythrough</title>
+<style>
+  :root { --bg:#101216; --panel:#191c22; --ink:#e7e9ee; --dim:#9aa0ad; --acc:#e0b25a;
+    --spike:#e0554a; --mark:#5aa0e0; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  #wrap { display:flex; flex-direction:column; height:100vh; }
+  #top { flex:1; display:flex; align-items:center; justify-content:center; min-height:0;
+    background:#000; position:relative; }
+  #img { max-width:100%; max-height:100%; image-rendering:auto; }
+  #drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:10px; color:var(--dim); pointer-events:none; text-align:center; }
+  #drop.hide { display:none; }
+  #drop a { pointer-events:auto; }   /* re-enable clicks on the picker link (parent is pointer-events:none so drops pass through) */
+  #badge { position:absolute; left:12px; top:10px; background:rgba(0,0,0,.5);
+    padding:5px 10px; border-radius:6px; font-variant-numeric:tabular-nums; }
+  #ctrl { background:var(--panel); border-top:1px solid #000; padding:10px 14px; }
+  .rowline { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  button { background:#2a2f39; color:var(--ink); border:1px solid #000; border-radius:6px;
+    padding:6px 11px; cursor:pointer; font-size:13px; }
+  button:hover { background:#333a46; }
+  button.acc { background:var(--acc); color:#1a1206; font-weight:700; }
+  input[type=range] { accent-color:var(--acc); }
+  #scrub { flex:1; min-width:200px; }
+  label { color:var(--dim); display:flex; align-items:center; gap:6px; }
+  #graphWrap { margin-top:8px; position:relative; }
+  #graph { width:100%; height:70px; display:block; background:#0e1014; border-radius:6px;
+    border:1px solid #000; cursor:pointer; }
+  .hint { color:var(--dim); font-size:12px; }
+  b { color:var(--ink); font-variant-numeric:tabular-nums; }
+  .pill { background:#0e1014; border:1px solid #2a2f39; border-radius:20px; padding:3px 10px; }
+  input[type=number] { background:#0e1014; color:var(--ink); border:1px solid #2a2f39;
+    border-radius:5px; padding:3px 6px; width:64px; font-size:12px; }
+  a { color:var(--acc); }
+  #loadbar { position:absolute; left:0; top:0; height:3px; width:100%; background:transparent;
+    pointer-events:none; }
+  #loadfill { height:100%; width:0; background:var(--acc); transition:width .08s linear; }
+  #status { background:#0e1014; border:1px solid #2a2f39; border-radius:20px; padding:3px 10px;
+    color:var(--dim); font-variant-numeric:tabular-nums; }
+  #status.load { color:var(--acc); border-color:#4a3d1f; }
+  #status.rdy  { color:#7fd081; border-color:#2f5233; }
+  button:disabled { opacity:.42; cursor:not-allowed; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <img id="img" alt="">
+    <div id="loadbar"><div id="loadfill"></div></div>
+    <div id="badge"></div>
+    <div id="drop">
+      <div style="font-size:15px;color:var(--ink)">Frame Scrubber</div>
+      <div>Drop a folder of frames here, or <a id="pick" href="#">pick a folder…</a></div>
+      <div class="hint">Loads png/ppm/jpg image sequences (sorted by the number in the filename).<br>
+        Drag the slider to scrub · <b>, / .</b> step one frame · <b>Space</b> play/pause ·
+        set <b>A</b>/<b>B</b> to loop a region · click the motion graph to jump to a spike.</div>
+    </div>
+  </div>
+  <div id="ctrl">
+    <div class="rowline">
+      <button id="play" class="acc" disabled>▶ Play</button>
+      <button id="prev">◀ ,</button>
+      <button id="next">. ▶</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+      <span class="pill" id="fnum">— / —</span>
+      <span class="pill" id="tc">0.00s</span>
+      <span class="pill" id="status">no frames</span>
+    </div>
+    <div class="rowline" style="margin-top:8px">
+      <label>fps <input id="fps" type="number" value="30" min="1" max="120" step="1"></label>
+      <label>speed <input id="speed" type="range" min="0.1" max="2" step="0.1" value="1" style="width:110px"><b id="vspeed">1.0×</b></label>
+      <button id="setA">Set A</button><button id="setB">Set B</button>
+      <span class="pill" id="ab">A — · B —</span>
+      <button id="clrAB">clear A/B</button>
+      <label><input id="loop" type="checkbox" checked> loop</label>
+      <span class="hint" id="jerk"></span>
+    </div>
+    <div id="graphWrap">
+      <canvas id="graph"></canvas>
+    </div>
+  </div>
+</div>
+<input id="folder" type="file" webkitdirectory directory multiple style="display:none">
+<script>
+const $=id=>document.getElementById(id);
+let frames=[];      // {url, name, num}
+let motion=[];      // mean abs diff to previous frame (motion[0]=0)
+let idx=0, playing=false, A=-1, B=-1, rafPlay=0, acc=0, lastNow=0, ready=false;
+
+// ---------- folder loading ----------
+$('pick').onclick=e=>{ e.preventDefault(); $('folder').click(); };
+$('folder').onchange=e=>loadFiles([...e.target.files]);
+document.addEventListener('dragover',e=>{ e.preventDefault(); });
+document.addEventListener('drop',async e=>{
+  e.preventDefault();
+  const items=[...(e.dataTransfer.items||[])];
+  const dir=items.map(i=>i.webkitGetAsEntry&&i.webkitGetAsEntry()).find(x=>x&&x.isDirectory);
+  if(dir){ loadFiles(await readDir(dir)); }
+  else { loadFiles([...e.dataTransfer.files]); }
+});
+function readDir(dir){ return new Promise(res=>{ const out=[]; const rd=dir.createReader();
+  const step=()=>rd.readEntries(ents=>{ if(!ents.length){ Promise.all(out.map(fileOf)).then(res); return; }
+    for(const en of ents) if(en.isFile) out.push(en); step(); }); step(); }); }
+function fileOf(entry){ return new Promise(r=>entry.file(f=>r(f))); }
+
+const IMG=/\.(png|jpe?g|ppm|bmp|webp)$/i;
+function numIn(name){ const m=name.match(/(\d+)(?!.*\d)/); return m?parseInt(m[1],10):0; }
+async function loadFiles(files){
+  let imgs=files.filter(f=>IMG.test(f.name));
+  if(!imgs.length){ alert('No image frames found in that folder.'); return; }
+  // PPM (P6) needs conversion to something <img> can show; decode manually.
+  imgs.sort((a,b)=>numIn(a.name)-numIn(b.name) || a.name.localeCompare(b.name));
+  frames.forEach(f=>f.url&&URL.revokeObjectURL(f.url));
+  frames=[];
+  for(const f of imgs){
+    if(/\.ppm$/i.test(f.name)) frames.push({name:f.name, num:numIn(f.name), ppm:f});
+    else frames.push({name:f.name, num:numIn(f.name), url:URL.createObjectURL(f)});
+  }
+  $('drop').classList.add('hide');
+  $('scrub').max=frames.length-1; A=-1; B=-1; updateAB();
+  idx=0; await show(0);
+  prepare();   // decode+cache every frame AND compute motion in one pass, then mark ready
+}
+
+// ---------- PPM (P6) decoder for the few .ppm frames ----------
+async function ppmToUrl(file){
+  const buf=new Uint8Array(await file.arrayBuffer());
+  let p=0; const tok=()=>{ while(p<buf.length&&/\s/.test(String.fromCharCode(buf[p])))p++;
+    if(String.fromCharCode(buf[p])==='#'){ while(p<buf.length&&buf[p]!==10)p++; return tok(); }
+    let s=''; while(p<buf.length&&!/\s/.test(String.fromCharCode(buf[p])))s+=String.fromCharCode(buf[p++]); return s; };
+  const magic=tok(); const w=+tok(), h=+tok(), mx=+tok(); p++; // single whitespace after maxval
+  if(magic!=='P6'){ return null; }
+  const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+  const cx=cv.getContext('2d'); const im=cx.createImageData(w,h); const d=im.data;
+  const sc=255/mx;
+  for(let i=0;i<w*h;i++){ d[i*4]=buf[p++]*sc; d[i*4+1]=buf[p++]*sc; d[i*4+2]=buf[p++]*sc; d[i*4+3]=255; }
+  cx.putImageData(im,0,0); return cv.toDataURL('image/png');
+}
+
+// ---------- display ----------
+async function show(i){
+  idx=Math.max(0,Math.min(frames.length-1,i));
+  const f=frames[idx];
+  if(!f.url && f.ppm){ f.url=await ppmToUrl(f.ppm); }
+  $('img').src=f.url||'';
+  $('scrub').value=idx;
+  const fps=Math.max(1,+$('fps').value);
+  $('fnum').textContent=(idx)+' / '+(frames.length-1);
+  $('tc').textContent=(idx/fps).toFixed(2)+'s';
+  $('badge').textContent=f.name;
+  drawGraph();
+}
+$('scrub').oninput=e=>show(+e.target.value);
+$('prev').onclick=()=>show(idx-1);
+$('next').onclick=()=>show(idx+1);
+$('fps').oninput=()=>show(idx);
+
+// ---------- playback ----------
+function tick(now){
+  if(!playing){ return; }
+  if(!lastNow) lastNow=now;
+  const fps=Math.max(1,+$('fps').value)*(+$('speed').value);
+  acc += (now-lastNow)/1000; lastNow=now;
+  const step=1/fps;
+  while(acc>=step){ acc-=step; advance(); }
+  rafPlay=requestAnimationFrame(tick);
+}
+function advance(){
+  let lo=0, hi=frames.length-1;
+  if(A>=0&&B>A){ lo=A; hi=B; }
+  let n=idx+1;
+  if(n>hi){ n = $('loop').checked ? lo : hi, playing=(n!==hi||$('loop').checked)?playing:false; if(!$('loop').checked&&idx>=hi){ stop(); return; } }
+  show(n);
+}
+function play(){ if(!frames.length||!ready) return; playing=true; lastNow=0; acc=0; $('play').textContent='❚❚ Pause';
+  rafPlay=requestAnimationFrame(tick); }
+function stop(){ playing=false; cancelAnimationFrame(rafPlay); $('play').textContent='▶ Play'; }
+$('play').onclick=()=>playing?stop():play();
+$('speed').oninput=()=>$('vspeed').textContent=(+$('speed').value).toFixed(1)+'×';
+
+// ---------- A/B loop ----------
+$('setA').onclick=()=>{ A=idx; if(B>=0&&B<A)B=-1; updateAB(); drawGraph(); };
+$('setB').onclick=()=>{ B=idx; if(A>=0&&A>B)A=-1; updateAB(); drawGraph(); };
+$('clrAB').onclick=()=>{ A=-1; B=-1; updateAB(); drawGraph(); };
+function updateAB(){ const fps=Math.max(1,+$('fps').value);
+  $('ab').textContent='A '+(A<0?'—':A+' ('+(A/fps).toFixed(2)+'s)')+' · B '+(B<0?'—':B+' ('+(B/fps).toFixed(2)+'s)'); }
+
+// ---------- prepare: decode+cache every frame and compute motion in one pass ----------
+// Playback used to stutter on the first run because each frame was only decoded the
+// first time it was displayed. Here we decode every frame up front, retain the decoded
+// Image (so paints are instant), fold the motion-graph math into the same pass (one
+// decode per frame), and only enable Play once the whole sequence is genuinely ready.
+function setStatus(cls,txt){ const s=$('status'); s.className='pill'+(cls?' '+cls:''); s.textContent=txt; }
+async function prepare(){
+  ready=false; $('play').disabled=true;
+  setStatus('load','decoding 0 / '+frames.length);
+  $('loadfill').style.width='0%';
+  motion=new Array(frames.length).fill(0);
+  const W=96,H=54; const cv=document.createElement('canvas'); cv.width=W; cv.height=H;
+  const cx=cv.getContext('2d',{willReadFrequently:true});
+  let prev=null;
+  for(let i=0;i<frames.length;i++){
+    const f=frames[i]; if(!f.url && f.ppm) f.url=await ppmToUrl(f.ppm);
+    const im=new Image(); im.src=f.url;
+    await im.decode().catch(()=>{});
+    f.img=im;   // keep a reference so the decoded bitmap stays warm for playback
+    cx.drawImage(im,0,0,W,H);
+    const d=cx.getImageData(0,0,W,H).data;
+    if(prev){ let s=0; for(let k=0;k<d.length;k+=4){ s+=Math.abs(d[k]-prev[k])+Math.abs(d[k+1]-prev[k+1])+Math.abs(d[k+2]-prev[k+2]); }
+      motion[i]=s/(W*H*3); }
+    prev=d.slice(0);
+    $('loadfill').style.width=((i+1)/frames.length*100)+'%';
+    setStatus('load','decoding '+(i+1)+' / '+frames.length);
+    if((i&7)===0) drawGraph();
+  }
+  drawGraph(); flagJerk();
+  ready=true; $('play').disabled=false;
+  setStatus('rdy','\u2713 ready \u00b7 '+frames.length+' frames');
+  setTimeout(()=>{ $('loadfill').style.width='0%'; }, 500);
+}
+function flagJerk(){ if(motion.length<3){ $('jerk').textContent=''; return; }
+  let mi=1,mv=0; for(let i=1;i<motion.length;i++) if(motion[i]>mv){ mv=motion[i]; mi=i; }
+  const fps=Math.max(1,+$('fps').value);
+  $('jerk').textContent='biggest jump: frame '+mi+' ('+(mi/fps).toFixed(2)+'s)'; }
+function drawGraph(){
+  const g=$('graph'); const dpr=Math.min(window.devicePixelRatio||1,2);
+  const w=g.clientWidth||600, h=70; g.width=w*dpr; g.height=h*dpr;
+  const cx=g.getContext('2d'); cx.scale(dpr,dpr); cx.clearRect(0,0,w,h);
+  if(!frames.length){ return; }
+  const n=frames.length; const mx=Math.max(1e-6,...motion);
+  // A/B shaded region
+  if(A>=0&&B>A){ cx.fillStyle='rgba(90,160,224,.14)';
+    cx.fillRect(A/(n-1)*w,0,(B-A)/(n-1)*w,h); }
+  // motion curve
+  cx.beginPath(); cx.strokeStyle=getCss('--spike'); cx.lineWidth=1.5;
+  for(let i=0;i<n;i++){ const x=i/(n-1)*w, y=h-4-(motion[i]/mx)*(h-8);
+    i?cx.lineTo(x,y):cx.moveTo(x,y); }
+  cx.stroke();
+  // current-frame marker
+  const cxp=idx/(n-1)*w;
+  cx.strokeStyle=getCss('--acc'); cx.lineWidth=1.5;
+  cx.beginPath(); cx.moveTo(cxp,0); cx.lineTo(cxp,h); cx.stroke();
+}
+function getCss(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+$('graph').onclick=e=>{ if(!frames.length) return; const r=e.target.getBoundingClientRect();
+  const frac=(e.clientX-r.left)/r.width; show(Math.round(frac*(frames.length-1))); };
+window.addEventListener('resize',drawGraph);
+
+// ---------- keys ----------
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'&&e.target.type==='number') return;
+  if(e.key===','){ show(idx-1); e.preventDefault(); }
+  else if(e.key==='.'){ show(idx+1); e.preventDefault(); }
+  else if(e.key===' '){ playing?stop():play(); e.preventDefault(); }
+  else if(e.key==='a'||e.key==='A'){ $('setA').click(); }
+  else if(e.key==='b'||e.key==='B'){ $('setB').click(); }
+});
+</script>
+</body>
+</html>

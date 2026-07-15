@@ -23,9 +23,12 @@
 //   light env        { file "sky.hdr"  rotate d  intensity s }  # image-based (lat-long)
 //   medium   { sigma_t v  albedo v  g v  rayleigh true }
 //   camera "name" { eye ...  look_at ...  up ...  fov_y d  aperture r  focus d  mode B
+//                   preset <archetype>  # cinema|pocket|portable|vintage|vintage-slr (fills optics)
 //                   lens <mm>  fstop <N>  zoom <x>  # photographic authoring (overrides fov_y/aperture)
 //                   projection <name> | fisheye [type]  # lens projection (rectilinear default; §8.5)
 //                   film { res W H  format <name>  size <Wmm> <Hmm>  iso .. shutter .. exposure .. } }
+//     preset picks a physically-plausible camera archetype (sensor+focal+f-stop); any
+//     knob after it overrides. Works in mode A/C (real DOF) and pinhole modes (fov only).
 //     zoom <x> multiplies the focal length (x>1 tele/narrower, x<1 wider). projection
 //     picks the lens map: rectilinear (default), equidistant/fisheye, equisolid,
 //     stereographic, orthographic — the fisheye modes allow fov_y >= 180.
@@ -165,18 +168,38 @@ struct Parser {
     // begins the next statement's key. A trailing `{` opens a nested brace block
     // (table/film/…) whose type is the preceding word, or the statement key.
     void parseValue(const std::string& key, Value& v) {
-        if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
-        while (is(Tok::Word)) {
-            const std::string& tx = cur().text;
-            bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
-            if (!cont) break;
-            v.words.push_back(tx); adv();
+        bool firstWasString = false;
+        if (is(Tok::Word) || is(Tok::String)) {
+            firstWasString = is(Tok::String);
+            v.words.push_back(cur().text); adv();
+        }
+        while (is(Tok::Word) || is(Tok::String)) {
+            // A quoted string never begins a new statement (statement keys are always
+            // barewords), so a String that follows the value's tokens is part of THIS
+            // value — e.g. a name argument: `exposure_lock camera "meter"`. (Without this
+            // the string was silently swallowed as a stray statement key.) Barewords only
+            // continue when they are numbers or `key=val` named params; a plain bareword
+            // still ends the value (it begins the next statement's key).
+            if (is(Tok::Word)) {
+                const std::string& tx = cur().text;
+                bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
+                if (!cont) break;
+            }
+            v.words.push_back(cur().text); adv();
         }
         if (is(Tok::LBrace)) {
-            std::string btype = key;
-            if (!v.words.empty()) { btype = v.words.back(); v.words.pop_back(); }
+            std::string btype = key, bname;
+            if (!v.words.empty()) {
+                // A single *quoted* word before `{` is the block's NAME (e.g. a nested
+                // `mesh "klein_a" { ... }` inside a group), so the type stays = key.
+                // A bareword before `{` is instead the block's TYPE (e.g. `table { }`,
+                // `light sphere { }`) — the historical behaviour for subtyped blocks.
+                if (v.words.size() == 1 && firstWasString) { bname = v.words.back(); v.words.pop_back(); }
+                else { btype = v.words.back(); v.words.pop_back(); }
+            }
             v.block = std::make_shared<Block>();
             v.block->type = btype;
+            v.block->name = bname;
             parseBraceBody(*v.block);
         }
     }
@@ -304,7 +327,14 @@ inline int projectionFromName(const std::string& raw) {
 // fraction. Segment `seg` blends points [seg-1, seg, seg+1, seg+2]; an open curve
 // clamps the out-of-range neighbours (so the end tangents point straight down the
 // last edge), a closed curve wraps them modulo n. Used by `camera_curve`.
-inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
+//
+// `alpha` selects the knot parameterization: 0 = UNIFORM (the classic form, tangent
+// (P2-P0)/2 -- fast but OVERSHOOTS and can cusp/loop when control points are unevenly
+// spaced), 0.5 = CENTRIPETAL (knots spaced by chord^0.5; provably no cusps or
+// self-intersections, stays tight to the points -- the fix for a jerky flight through
+// unevenly-spaced waypoints), 1 = CHORDAL (chord^1). alpha=0 is bit-identical to the
+// original so existing scenes are unchanged.
+inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g, double alpha = 0.0) {
     int n = (int)p.size();
     if (n == 1) return p[0];
     int nSeg = closed ? n : n - 1;
@@ -323,11 +353,31 @@ inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g) {
     const Vec3& P1 = idx(seg);
     const Vec3& P2 = idx(seg + 1);
     const Vec3& P3 = idx(seg + 2);
-    double t2 = t * t, t3 = t2 * t;
-    return (P1 * 2.0
-          + (P2 - P0) * t
-          + (P0 * 2.0 - P1 * 5.0 + P2 * 4.0 - P3) * t2
-          + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
+    if (alpha <= 0.0) {
+        double t2 = t * t, t3 = t2 * t;
+        return (P1 * 2.0
+              + (P2 - P0) * t
+              + (P0 * 2.0 - P1 * 5.0 + P2 * 4.0 - P3) * t2
+              + (P1 * 3.0 - P0 - P2 * 3.0 + P3) * t3) * 0.5;
+    }
+    // Non-uniform Catmull-Rom via the Barry-Goldman recursion. Knots advance by
+    // chord^alpha; a small floor keeps duplicated endpoints (open-curve clamping) and
+    // coincident control points from dividing by zero.
+    auto knot = [&](double ti, const Vec3& a, const Vec3& b) {
+        return ti + std::pow(std::max(length(b - a), 1e-9), alpha);
+    };
+    double k0 = 0.0;
+    double k1 = knot(k0, P0, P1);
+    double k2 = knot(k1, P1, P2);
+    double k3 = knot(k2, P2, P3);
+    double tt = k1 + t * (k2 - k1);                 // evaluation param within [k1,k2]
+    auto lerp = [](const Vec3& a, const Vec3& b, double u) { return a * (1.0 - u) + b * u; };
+    Vec3 A1 = lerp(P0, P1, (tt - k0) / (k1 - k0));
+    Vec3 A2 = lerp(P1, P2, (tt - k1) / (k2 - k1));
+    Vec3 A3 = lerp(P2, P3, (tt - k2) / (k3 - k2));
+    Vec3 B1 = lerp(A1, A2, (tt - k0) / (k2 - k0));
+    Vec3 B2 = lerp(A2, A3, (tt - k1) / (k3 - k1));
+    return lerp(B1, B2, (tt - k1) / (k2 - k1));
 }
 
 // Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
@@ -411,14 +461,27 @@ struct CamSpec {
     double exposureMul = 0.0;
 
     // Exposure-lock across a `camera_path` (Phase 3a intermediate win): frames of a
-    // path that authored `exposure_lock` share the auto-exposure anchor computed from
-    // the first frame, so a dolly/zoom doesn't flicker as scene brightness shifts.
-    // `pathGroup` (>=0) identifies the owning path (all its frames share the value);
-    // -1 for a standalone `camera`. `exposureLock` is set on every frame of a locked
-    // path. A CLI `-exposure-lock` can additionally force a single shared anchor
-    // across *all* rendered cameras regardless of these fields.
+    // path that authored `exposure_lock` share ONE auto-exposure anchor, so a dolly/
+    // zoom doesn't flicker as scene brightness shifts. `pathGroup` (>=0) identifies the
+    // owning path (all its frames share the value); -1 for a standalone `camera`.
+    // `exposureLock` is set on every frame of a locked path. A CLI `-exposure-lock` can
+    // additionally force a single shared anchor across *all* rendered cameras.
+    //
+    // Which frame's exposure the whole group locks to is chosen by the lock *selector*
+    // (authored as an argument to `exposure_lock`; every frame of the path carries the
+    // same resolved selector):
+    //   EXPLOCK_AVERAGE `exposure_lock`            -> mean anchor over all frames (DEFAULT)
+    //   EXPLOCK_FIRST   `exposure_lock first`      -> the path's first frame (expose for it)
+    //   EXPLOCK_INDEX   `exposure_lock index N`    -> frame N (0-based; N<0 counts from end)
+    //   EXPLOCK_NEAR    `exposure_lock near X Y Z` -> the frame whose eye is nearest (X,Y,Z)
+    //   EXPLOCK_CAMERA  `exposure_lock <name>`     -> a separately-defined camera "<name>"
+    enum { EXPLOCK_FIRST = 0, EXPLOCK_INDEX, EXPLOCK_NEAR, EXPLOCK_CAMERA, EXPLOCK_AVERAGE };
     int  pathGroup   = -1;
     bool exposureLock = false;
+    int  expLockSel   = EXPLOCK_FIRST;   // which frame the group meters from (enum above)
+    int  expLockIndex = 0;               // EXPLOCK_INDEX: frame index (may be negative)
+    Vec3 expLockPoint{0, 0, 0};          // EXPLOCK_NEAR: metering viewpoint
+    std::string expLockCam;              // EXPLOCK_CAMERA: name of the metering camera
 
     // Physical multi-element lens (the "mesh-lens" camera), built from a `lens { ... }`
     // block. When set, main renders this camera through the backward realistic-camera
@@ -1020,6 +1083,11 @@ private:
         } else {
             fail("unknown material type '" + type + "'");
         }
+        // Nested-dielectric priority (§ nested dielectrics): `priority <N>` — integer,
+        // higher wins where dielectric solids overlap. Common to every material type
+        // (only consulted for dielectric-like ones); unset => the ahead-of-time audit
+        // warns if this material overlaps another dielectric without a priority.
+        if (find(b, "priority")) m.priority = (int)std::lround(dblOf(b, "priority", 0.0));
         return m;
     }
 
@@ -1208,8 +1276,29 @@ private:
                 fail("mesh: " + gerr); return false;
             }
         } else {
+            // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
+            // smooth shading normals, merging faces across edges softer than <deg>
+            // (default 40°) and leaving sharper creases faceted. Authored `vn` wins.
+            double creaseAngleDeg = -1.0;
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
             loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                    uvProj, uvAxis);
+                    uvProj, uvAxis, creaseAngleDeg);
+        }
+        // Record the object as a named mesh group (for -check-watertight): the range of
+        // world triangles this block just appended. Unnamed blocks get a synthesized
+        // "mesh#N" label so the report can still point at them.
+        if (L.scene.tris.size() > triStart) {
+            MeshGroup g;
+            g.name = b.name.empty() ? ("mesh#" + std::to_string(L.scene.meshGroups.size())) : b.name;
+            g.triStart = triStart;
+            g.triCount = L.scene.tris.size() - triStart;
+            g.blasId   = -1;
+            g.matId    = id;
+            L.scene.meshGroups.push_back(std::move(g));
         }
         // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
         // is approximated by its box — true containment is deferred, see known-issues).
@@ -1266,7 +1355,14 @@ private:
                 fail("mesh_asset: " + gerr); return false;
             }
         } else {
-            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr);
+            double creaseAngleDeg = -1.0;
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
+            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                    UvProjection::None, 1, creaseAngleDeg);
         }
         Blas blas;
         blas.tris.assign(L.scene.tris.begin() + start, L.scene.tris.end());
@@ -1276,6 +1372,9 @@ private:
         int blasId = (int)L.scene.blasList.size();
         L.scene.blasList.push_back(std::move(blas));
         blasIndex_[b.name] = blasId;
+        // Named mesh group backed by the shared BLAS (for -check-watertight).
+        MeshGroup g; g.name = b.name; g.blasId = blasId; g.matId = id;
+        L.scene.meshGroups.push_back(std::move(g));
         return true;
     }
 
@@ -1351,9 +1450,10 @@ private:
             else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
             else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
+            else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
-            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, light, group)"); return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, light, group)"); return false; }
         }
         return true;
     }
@@ -1515,11 +1615,14 @@ private:
         return true;
     }
 
-    bool addIsosurface(const Block& b, Loaded& L) {
+    bool addIsosurface(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string mat = strOf(b, "material");
         if (mat.empty()) { fail("isosurface needs a material"); return false; }
         int id = matId(mat); if (!err.empty()) return false;
-        Affine rootXf = fieldXf(b, Affine::identity());
+        // The enclosing group's transform (identity at top level) composes OUTSIDE the
+        // isosurface's own translate/rotate/scale, so a settled `group { translate ..
+        // rotate .. <isosurface> }` rest pose bakes into the field's local->world map.
+        Affine rootXf = fieldXf(b, parentXf);
         std::vector<FieldNode> nodes;
         std::vector<PatNode> exprPool;
         int nRoot = 0;
@@ -1641,6 +1744,7 @@ private:
         }
         im.uvBounds = im.bounds;
         im.uvBoundsSet = true;
+        im.name = b.name;                         // authored name -> -export-mesh group name
         L.scene.implicits.push_back(std::move(im));
         if (!b.name.empty()) implicitByName_[b.name] = (int)L.scene.implicits.size() - 1;
         return true;
@@ -2059,12 +2163,56 @@ private:
         }
     }
 
+    // A camera archetype preset: physically-plausible optics for a real camera *type*,
+    // filled BEFORE the block's own knobs so any dial (`lens`, `fstop`, `film{size}`)
+    // still overrides it — exactly like `material { preset gold }`. One preset serves
+    // both worlds: in the finite-lens catch modes (A/C) the sensor size + focal + f-stop
+    // give real depth of field; in the pinhole/backward modes (R/B/U) the same sensor +
+    // focal still set the correct field of view and the aperture collapses to a point.
+    struct CamPreset { double filmW_mm = 0, filmH_mm = 0, lensMM = 0, fstop = 0; };
+
+    // Resolve a camera archetype name -> CamPreset. Names are normalised (lowercased,
+    // spaces/underscores/hyphens stripped) so `vintage-slr`, `vintage slr`, `vintageslr`
+    // all match. Specs are drawn from the reference archetypes in `cameras/`. Returns
+    // false for an unknown name.
+    static bool resolveCameraPreset(const std::string& raw, CamPreset& p) {
+        std::string k;
+        for (char c : raw) { if (c==' '||c=='_'||c=='-') continue; k += (char)std::tolower((unsigned char)c); }
+        // cinema: Blackmagic-style cine ("35 T2.1", "4K") — Super35, 35mm, ~T2.1.
+        if (k=="cinema"||k=="cine"||k=="cinemacamera")      { p={24.6,13.8,35.0,2.1}; return true; }
+        // pocket: Sony RX0-style rugged compact — 1" sensor, ~24mm-equiv wide, deep DOF.
+        if (k=="pocket"||k=="compact"||k=="pocketcamera")   { p={13.2, 8.8, 8.8,4.0}; return true; }
+        // portable: full-frame mirrorless with a bright ~35mm prime.
+        if (k=="portable"||k=="mirrorless"||k=="portablecamera") { p={36.0,24.0,35.0,1.8}; return true; }
+        // vintage: purple folding rangefinder (FED/Zorki) — 35mm film, ~50mm, collapsible.
+        if (k=="vintage"||k=="rangefinder"||k=="vintagecamera")  { p={36.0,24.0,50.0,3.5}; return true; }
+        // vintage-slr: classic 35mm SLR with a fast 50mm normal.
+        if (k=="vintageslr"||k=="slr"||k=="vintageslrcamera")    { p={36.0,24.0,50.0,1.4}; return true; }
+        return false;
+    }
+
     // Read the film sub-block + photographic exposure/f-stop/lens controls shared by
     // `camera` and `camera_path`, and resolve the film size (named format or explicit
     // mm), the focal length (from `lens <mm>` or `fov_y`), the f-stop -> aperture
     // radius, the physical-optics film distance, and the manual exposure multiplier.
     // `cs.fov` must already be set. Returns false only on an unknown film format.
     bool readFilmExposure(const Block& b, CamSpec& cs) {
+        // Camera archetype preset (`preset <name>`) fills default optics first, so the
+        // block's own knobs below override it. Applies to camera/path/orbit/curve alike.
+        CamPreset preset;
+        bool hasPreset = false;
+        {
+            std::string pn = strOf(b, "preset");
+            if (!pn.empty()) {
+                if (!resolveCameraPreset(pn, preset)) {
+                    fail("unknown camera preset '" + pn + "' (cinema, pocket, portable, "
+                         "vintage, vintage-slr)");
+                    return false;
+                }
+                hasPreset = true;
+                cs.filmW_mm = preset.filmW_mm; cs.filmH_mm = preset.filmH_mm;
+            }
+        }
         const Stmt* film = find(b, "film");
         if (film && film->val.block) {
             const Block& fb = *film->val.block;
@@ -2104,11 +2252,13 @@ private:
         // fov_y = 2*atan(filmH/(2f)) -> f = filmH / (2 tan(fov/2)). Fall back to a 35mm
         // full-frame 24mm height when no physical size is authored.
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
-        double lensMM = dblOf(b, "lens", 0.0);     // focal length in mm (physical, unit-independent)
+        // `lens`/`fstop` default to the archetype preset's values when one is named, so
+        // the preset supplies focal length + aperture unless the block overrides them.
+        double lensMM = dblOf(b, "lens", hasPreset ? preset.lensMM : 0.0);  // focal length in mm
         // `zoom <x>` multiplies the focal length (x>1 = tele/narrower fov; x<1 = wider).
         // It is the animatable "zoom ring" and composes on top of `lens`/`fov_y`.
         double zoom  = dblOf(b, "zoom", 1.0);
-        double fstop = dblOf(b, "fstop", 0.0);
+        double fstop = dblOf(b, "fstop", hasPreset ? preset.fstop : 0.0);
         // Resolve focal/fov/aperture/film-distance. cs.focus is already in metres (Len-scaled).
         deriveCameraOptics(cs, cs.fov, lensMM, zoom, fstop, hmm, cs.focus);
         // Manual exposure multiplier (see CamSpec). Active iff any control authored.
@@ -2255,6 +2405,51 @@ private:
     //   }
     // Frame i (0..frames-1) samples t = i/(frames-1); its output name is
     // "<path><i>" (zero-padded), so the multi-camera loop writes one file per frame.
+    // Parse an `exposure_lock [selector]` statement (shared by camera_path/orbit/curve)
+    // into the selector fields of `cs`. Returns whether the lock is enabled. The selector
+    // words are: (none)/on/true/1/first -> FIRST; off/false/0 -> disabled; average/avg/mean
+    // -> AVERAGE; `index N`/`frame N` -> INDEX; `near X Y Z` -> NEAR; anything else (a
+    // quoted or bare word) -> CAMERA metering from a separately-defined camera of that name.
+    bool parseExposureLock(const Block& b, CamSpec& cs) {
+        const Stmt* el = find(b, "exposure_lock");
+        if (!el) return false;
+        const auto& w = el->val.words;
+        // A bare `exposure_lock` (or `on`/`true`/`1`) defaults to metering the AVERAGE of
+        // the whole path — a robust choice that won't expose the entire flythrough for one
+        // possibly-atypical opening frame. `first` is the explicit "expose for frame 0".
+        if (w.empty()) { cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true; }
+        const std::string v0 = w[0];
+        if (v0 == "off" || v0 == "false" || v0 == "0") return false;
+        if (v0 == "on" || v0 == "true" || v0 == "1") {
+            cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true;
+        }
+        if (v0 == "first") { cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true; }
+        if (v0 == "average" || v0 == "avg" || v0 == "mean") {
+            cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true;
+        }
+        if (v0 == "index" || v0 == "frame") {
+            cs.expLockSel = CamSpec::EXPLOCK_INDEX;
+            cs.expLockIndex = (w.size() >= 2) ? (int)num(w[1]) : 0;
+            return true;
+        }
+        if (v0 == "near") {
+            cs.expLockSel = CamSpec::EXPLOCK_NEAR;
+            if (w.size() >= 4) cs.expLockPoint = P(Vec3{num(w[1]), num(w[2]), num(w[3])});
+            else fail("exposure_lock near needs: near X Y Z");
+            return true;
+        }
+        if (v0 == "camera" || v0 == "cam") {
+            // Explicit `exposure_lock camera "name"` — the name follows the keyword.
+            if (w.size() >= 2) { cs.expLockSel = CamSpec::EXPLOCK_CAMERA; cs.expLockCam = w[1]; return true; }
+            fail("exposure_lock camera needs a name: exposure_lock camera \"name\" "
+                 "(or just exposure_lock \"name\")");
+            return true;
+        }
+        cs.expLockSel = CamSpec::EXPLOCK_CAMERA;   // a camera name given directly (quoted or bare)
+        cs.expLockCam = v0;
+        return true;
+    }
+
     bool addCameraPath(const Block& b, Loaded& L) {
         std::string base = b.name.empty() ? ("path" + std::to_string(L.cameras.size())) : b.name;
         CamSpec shared;
@@ -2280,16 +2475,12 @@ private:
         }
         const double DEG = 3.141592653589793 / 180.0;
 
-        // Exposure-lock: a bare `exposure_lock` (or `exposure_lock on`) makes every
-        // frame of this path share the auto-exposure anchor from frame 0 (no
-        // flicker); `off`/`false`/`0` disables (the default). The group id is this
-        // path's starting index in L.cameras — unique because paths occupy disjoint
-        // contiguous ranges.
-        bool pathLock = false;
-        if (const Stmt* el = find(b, "exposure_lock")) {
-            if (el->val.words.empty()) pathLock = true;
-            else { const std::string& v = el->val.words[0]; pathLock = !(v=="off"||v=="false"||v=="0"); }
-        }
+        // Exposure-lock: a bare `exposure_lock` (or a selector — see parseExposureLock)
+        // makes every frame of this path share ONE auto-exposure anchor (no flicker);
+        // `off`/`false`/`0` disables (the default). The selector fields land on `shared`
+        // so they copy into every frame's CamSpec. The group id is this path's starting
+        // index in L.cameras — unique because paths occupy disjoint contiguous ranges.
+        bool pathLock = parseExposureLock(b, shared);
         const int pathGroup = (int)L.cameras.size();
 
         // Collect keyframes (t, eye, optional look_at, optional fov), sorted by t.
@@ -2403,11 +2594,7 @@ private:
         Vec3 U = normalize(cross(ref, A));
         Vec3 W = normalize(cross(A, U));
 
-        bool pathLock = false;
-        if (const Stmt* el = find(b, "exposure_lock")) {
-            if (el->val.words.empty()) pathLock = true;
-            else { const std::string& v = el->val.words[0]; pathLock = !(v == "off" || v == "false" || v == "0"); }
-        }
+        bool pathLock = parseExposureLock(b, shared);
         const int pathGroup = (int)L.cameras.size();
         const double DEG = 3.141592653589793 / 180.0;
 
@@ -2448,6 +2635,11 @@ private:
     // integrating rho over arc length; `frames N` (if also given) instead fixes the
     // count and only uses the density to DISTRIBUTE those N cameras. Orientation:
     //   look tangent    (default) — aim along the direction of travel
+    //       min_reach <frac>       (default 0.5) fold defence: floor the horizontal reach used
+    //                              for pitch so a hairpin/U-turn can't rake the view into the
+    //                              ceiling or floor. `0` disables (legacy behaviour).
+    //       look_smooth <n>        (default 0/off) Gaussian sigma in frames; temporally smooths
+    //                              the look direction so a fold's fast pan is spread out.
     //   look_at x y z             — a fixed target for every frame
     //   look curve + look_point.. — aim at a SECOND Catmull-Rom spline, sampled in step
     // Roll and the lens scalars can be ANIMATED per frame over the normalized timeline
@@ -2471,9 +2663,14 @@ private:
     //       roll_at 0 0   roll_at 0.5 20   roll_at 1 0        # bank into the turn and back
     //       fstop_at 0 8   fstop_at 1 1.4                     # rack the aperture open
     //       focus_at 0 5   focus_at 1 1.5                     # pull focus toward the camera
-    //       closed   exposure_lock
+    //       closed                           # seamless loop (its OWN line — see note below)
+    //       exposure_lock                    # freeze frame 0's exposure across all frames
     //       film { res 900 600 }
     //   }
+    // NOTE: each value-less flag keyword (`closed`, `exposure_lock`) must be on its OWN
+    // line. A statement's value is always the next token, so `closed exposure_lock` parses
+    // as `closed` with the *value* "exposure_lock" (the grammar can't tell that apart from
+    // `material white`), silently dropping the second flag.
     bool addCameraCurve(const Block& b, Loaded& L) {
         std::string base = b.name.empty() ? ("curve" + std::to_string(L.cameras.size())) : b.name;
         CamSpec shared;
@@ -2499,6 +2696,21 @@ private:
         if (const Stmt* c = find(b, "closed")) {
             if (c->val.words.empty()) closed = true;
             else { const std::string& v = c->val.words[0]; closed = !(v == "off" || v == "false" || v == "0"); }
+        }
+
+        // Spline knot parameterization: `spline uniform|centripetal|chordal` (or a raw
+        // alpha number). Default UNIFORM preserves every existing scene bit-for-bit;
+        // CENTRIPETAL (alpha 0.5) removes the overshoot/looping that uniform Catmull-Rom
+        // produces when waypoints are unevenly spaced -- the fix for a jerky room flight.
+        double splineAlpha = 0.0;
+        if (const Stmt* sp = find(b, "spline")) {
+            if (sp->val.words.empty()) { fail("camera_curve '" + base + "' spline needs: uniform|centripetal|chordal|<alpha>"); return false; }
+            const std::string& v = sp->val.words[0];
+            if      (v == "uniform")     splineAlpha = 0.0;
+            else if (v == "centripetal") splineAlpha = 0.5;
+            else if (v == "chordal")     splineAlpha = 1.0;
+            else                         splineAlpha = num(v);   // raw alpha
+            if (splineAlpha < 0.0) splineAlpha = 0.0;
         }
 
         // Density = cameras per unit LENGTH (1/authored-unit -> 1/metre). `density_at`
@@ -2542,15 +2754,16 @@ private:
         // yields uniform arc-length spacing.
         int nSeg = closed ? (int)pts.size() : (int)pts.size() - 1;
         int M = std::max(64, 64 * nSeg);
-        std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1);
-        Vec3 prev = catmullRomAt(pts, closed, 0.0);
-        sampG[0] = 0.0; sampC[0] = 0.0;
+        std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1), sampS((size_t)M + 1);
+        Vec3 prev = catmullRomAt(pts, closed, 0.0, splineAlpha);
+        sampG[0] = 0.0; sampC[0] = 0.0; sampS[0] = 0.0;
         for (int k = 1; k <= M; ++k) {
             double g = nSeg * (double)k / M;
-            Vec3 pcur = catmullRomAt(pts, closed, g);
+            Vec3 pcur = catmullRomAt(pts, closed, g, splineAlpha);
             double ds = length(pcur - prev);
             double rho = densityAt(g / nSeg);
             sampC[k] = sampC[k - 1] + rho * ds;
+            sampS[k] = sampS[k - 1] + ds;      // pure arc length (density-free), for look-ahead
             sampG[k] = g;
             prev = pcur;
         }
@@ -2566,6 +2779,26 @@ private:
             while (lo + 1 < hi) { int mid = (lo + hi) / 2; (sampC[(size_t)mid] <= target ? lo : hi) = mid; }
             double c0 = sampC[(size_t)lo], c1 = sampC[(size_t)lo + 1];
             double f = (c1 > c0) ? (target - c0) / (c1 - c0) : 0.0;
+            return sampG[(size_t)lo] + (sampG[(size_t)lo + 1] - sampG[(size_t)lo]) * f;
+        };
+
+        // Pure arc-length reparameterization (density-free) for the tangent look-ahead.
+        double Smax = sampS[M];
+        auto arcAtG = [&](double g) -> double {          // g -> arc length s
+            if (g <= 0.0) return 0.0;
+            if (g >= (double)nSeg) return Smax;
+            double kf = g / (double)nSeg * (double)M;     // sampG is linear in k
+            int lo = (int)kf; if (lo < 0) lo = 0; if (lo > M - 1) lo = M - 1;
+            double f = kf - lo;
+            return sampS[(size_t)lo] + (sampS[(size_t)lo + 1] - sampS[(size_t)lo]) * f;
+        };
+        auto gAtArc = [&](double s) -> double {          // arc length s -> g
+            if (s <= 0.0) return 0.0;
+            if (s >= Smax) return (double)nSeg;
+            int lo = 0, hi = M;
+            while (lo + 1 < hi) { int mid = (lo + hi) / 2; (sampS[(size_t)mid] <= s ? lo : hi) = mid; }
+            double s0 = sampS[(size_t)lo], s1 = sampS[(size_t)lo + 1];
+            double f = (s1 > s0) ? (s - s0) / (s1 - s0) : 0.0;
             return sampG[(size_t)lo] + (sampG[(size_t)lo + 1] - sampG[(size_t)lo]) * f;
         };
 
@@ -2585,6 +2818,21 @@ private:
         Vec3 fixedLook{0, 0, 0};
         if (lookFixed) { vec3Of(b, "look_at", fixedLook); fixedLook = P(fixedLook); }
         int lookSeg = lookCurve ? (closed ? (int)lookPts.size() : (int)lookPts.size() - 1) : 0;
+
+        // Tangent-mode robustness knobs (fold defence). The tangent look aims at a point a
+        // fixed arc-length ahead; where the path FOLDS (a U-turn / hairpin) the horizontal
+        // reach of that chord collapses toward zero, so even a small height difference gets
+        // amplified by asin(dy/L) into a steep pitch and the camera rakes up into the
+        // ceiling (or down into the floor). Two defences, both only touching frames that are
+        // actually near a fold — well-conditioned frames (incl. legitimately steep dives that
+        // keep their horizontal reach) are left byte-identical:
+        //   min_reach <frac>   floor the horizontal reach used for the PITCH at
+        //                      frac * (look-ahead chord length); default 0.5, `0` disables.
+        //   look_smooth <n>    Gaussian sigma (in frames) for temporal smoothing of the look
+        //                      direction (yaw+pitch, wrap-aware for closed loops), spreading a
+        //                      fold's unavoidable fast pan over more frames; default 0 (off).
+        double minReachFrac = dblOf(b, "min_reach",   0.5);
+        double lookSmooth   = dblOf(b, "look_smooth", 0.0);
 
         // ---- Animatable orientation + lens tracks ----------------------------------
         // Roll (bank about the view axis) and the lens scalars (fov_y, zoom, f-stop,
@@ -2627,12 +2875,69 @@ private:
                           fstopTrk.active() || focusTrk.active();
         const double DEG = 3.141592653589793 / 180.0;
 
-        bool pathLock = false;
-        if (const Stmt* el = find(b, "exposure_lock")) {
-            if (el->val.words.empty()) pathLock = true;
-            else { const std::string& v = el->val.words[0]; pathLock = !(v == "off" || v == "false" || v == "0"); }
-        }
+        bool pathLock = parseExposureLock(b, shared);
         const int pathGroup = (int)L.cameras.size();
+
+        // ---- Tangent look-direction pre-pass (fold-robust) -------------------------
+        // Computed ahead of the main frame loop because temporal smoothing needs the whole
+        // sequence. For look_curve / look_at modes this stays empty and the loop uses those
+        // targets directly. The min_reach floor prevents a folded chord's collapsing
+        // horizontal reach from raking the pitch into the ceiling/floor; look_smooth then
+        // spreads a fold's unavoidable fast pan over neighbouring frames.
+        std::vector<Vec3> tangentDirs;
+        if (!lookCurve && !lookFixed) {
+            const double lookAheadFrac = 0.045;                 // shared with the note above
+            const double hMin = std::max(0.0, minReachFrac) * lookAheadFrac * Smax;
+            std::vector<double> yawA((size_t)N), pitA((size_t)N);
+            for (int i = 0; i < N; ++i) {
+                double fr = closed ? ((double)i / N) : (N == 1 ? 0.5 : (double)i / (N - 1));
+                double g = invertC(fr * Cmax);
+                Vec3 eye = catmullRomAt(pts, closed, g, splineAlpha);
+                double sHere = arcAtG(g);
+                double sTgt  = sHere + lookAheadFrac * Smax;
+                double gTgt  = closed ? gAtArc(std::fmod(sTgt, Smax)) : gAtArc(std::min(sTgt, Smax));
+                Vec3 tan = catmullRomAt(pts, closed, gTgt, splineAlpha) - eye;
+                if (length(tan) <= 1e-9) {   // degenerate (end of an open curve): look forward from behind
+                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, g - (double)nSeg / (M * 4.0)), splineAlpha);
+                    tan = eye - a;
+                }
+                double h = std::sqrt(tan.x * tan.x + tan.z * tan.z);
+                yawA[(size_t)i] = std::atan2(tan.x, tan.z);          // bearing in xz
+                pitA[(size_t)i] = std::atan2(tan.y, std::max(h, hMin));   // floored-reach pitch
+            }
+            auto rebuild = [&](const std::vector<double>& yawS, const std::vector<double>& pitS) {
+                tangentDirs.resize((size_t)N);
+                for (int i = 0; i < N; ++i) {
+                    double cp = std::cos(pitS[(size_t)i]);
+                    Vec3 d{ cp * std::sin(yawS[(size_t)i]), std::sin(pitS[(size_t)i]), cp * std::cos(yawS[(size_t)i]) };
+                    tangentDirs[(size_t)i] = (length(d) > 1e-12) ? normalize(d) : Vec3{0, 0, -1};
+                }
+            };
+            if (lookSmooth > 1e-6 && N >= 3) {
+                const double PI = 3.141592653589793, TWO_PI = 6.283185307179586;
+                int r = std::max(1, (int)std::lround(3.0 * lookSmooth));
+                std::vector<double> w((size_t)(2 * r + 1));
+                for (int k = -r; k <= r; ++k)
+                    w[(size_t)(k + r)] = std::exp(-(double)(k * k) / (2.0 * lookSmooth * lookSmooth));
+                std::vector<double> yawS((size_t)N), pitS((size_t)N);
+                for (int i = 0; i < N; ++i) {
+                    double ay = 0, ap = 0, ws = 0;
+                    for (int k = -r; k <= r; ++k) {
+                        int j = i + k, jj;
+                        if (closed) jj = ((j % N) + N) % N; else jj = std::min(std::max(j, 0), N - 1);
+                        double vy = yawA[(size_t)jj];
+                        while (vy - yawA[(size_t)i] >  PI) vy -= TWO_PI;   // wrap-aware: nearest branch
+                        while (vy - yawA[(size_t)i] < -PI) vy += TWO_PI;
+                        double wk = w[(size_t)(k + r)];
+                        ay += vy * wk; ap += pitA[(size_t)jj] * wk; ws += wk;
+                    }
+                    yawS[(size_t)i] = ay / ws; pitS[(size_t)i] = ap / ws;
+                }
+                rebuild(yawS, pitS);
+            } else {
+                rebuild(yawA, pitA);
+            }
+        }
 
         int pad = 1; for (int f = N - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
         for (int i = 0; i < N; ++i) {
@@ -2642,17 +2947,18 @@ private:
                                : (N == 1 ? 0.5 : (double)i / (N - 1));
             double g = invertC(fr * Cmax);
             CamSpec cs = shared;
-            cs.eye = catmullRomAt(pts, closed, g);
+            cs.eye = catmullRomAt(pts, closed, g, splineAlpha);
             if (lookCurve) {
-                cs.look = catmullRomAt(lookPts, closed, fr * lookSeg);
+                cs.look = catmullRomAt(lookPts, closed, fr * lookSeg, splineAlpha);
             } else if (lookFixed) {
                 cs.look = fixedLook;
-            } else {   // tangent: aim one finite-difference step ahead along the curve
-                double dg = (double)nSeg / (M * 4.0);
-                Vec3 a = catmullRomAt(pts, closed, g - dg);
-                Vec3 c = catmullRomAt(pts, closed, g + dg);
-                Vec3 tan = c - a;
-                cs.look = cs.eye + ((length(tan) > 1e-12) ? normalize(tan) : Vec3{0, 0, -1});
+            } else {   // tangent: aim a fixed arc-length ahead. A differential finite-difference
+                // tangent is hypersensitive to local spline wiggle where control points cluster
+                // (e.g. the channel-threading zigzag), so aiming at an absolute point a fair
+                // arc-distance ahead averages that wiggle out into a smooth "flying down the
+                // path" motion. Direction (plus the fold-robust min_reach / look_smooth
+                // treatment) is precomputed in tangentDirs above.
+                cs.look = cs.eye + tangentDirs[(size_t)i];
             }
             // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.
             // cs starts as `shared`, so restore its aperture before re-deriving in case a

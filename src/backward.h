@@ -45,6 +45,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "render.h"   // sampleGlossy, Renderer::refractOrReflect, clamp01, PI
+#include "medium_stack.h" // nested-dielectric priority stack
 
 struct BackwardRenderer {
     int maxBounce = 32;
@@ -58,6 +59,12 @@ struct BackwardRenderer {
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                     double lambda, Pcg32& rng) const {
         double total = 0.0;
+        // Geometric normal on the shading-normal side: every light connection must lie
+        // in this hemisphere too, else a smoothed shading normal would leak light in
+        // through the geometric back face (shading-normal problem). No-op for flat
+        // tris / analytic spheres (ngo == h.n there). The shadow ray is also offset
+        // along ngo so it clears the true surface rather than the shading normal.
+        const Vec3 ngo = orientedGeoN(h);
         for (const auto& em : scene.emitters) {
             if (em.collimated) continue;                  // beams aren't area-samplable
             if (em.shape == EmitterShape::Spot) {
@@ -69,12 +76,14 @@ struct BackwardRenderer {
                 Vec3 wi = toL / dist;
                 double cosSurf = dot(h.n, wi);
                 if (cosSurf <= 0) continue;
+                double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+                if (stG <= 0.0) continue;                        // behind true geometry: hard shadow
                 double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0) continue;
-                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 double f = rho / PI;
                 double emitW = em.spdFn(lambda) * invPdfLambda;
-                double contrib = f * emitW * fall * cosSurf / dist2;  // I(w)/dist^2
+                double contrib = f * emitW * fall * cosSurf / dist2 * stG;  // I(w)/dist^2
                 if (scene.backwardMedium().enabled)
                     contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 total += contrib;
@@ -104,8 +113,10 @@ struct BackwardRenderer {
             if (coneSampled) {
                 cosSurf = dot(h.n, wi);
                 if (cosSurf <= 0) continue;
-                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
-                contrib = f * emitW * cosSurf / pdfW;     // solid-angle measure
+                double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+                if (stG <= 0.0) continue;                        // behind true geometry: hard shadow
+                if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
+                contrib = f * emitW * cosSurf / pdfW * stG;   // solid-angle measure
             } else {
                 if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
                 Vec3 toL = y - h.p;
@@ -114,11 +125,13 @@ struct BackwardRenderer {
                 wi = toL / dist;
                 cosSurf = dot(h.n, wi);
                 if (cosSurf <= 0) continue;
+                double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+                if (stG <= 0.0) continue;                        // behind true geometry: hard shadow
                 double cosLight = dot(nLight, -wi);       // light is one-sided
                 if (cosLight <= 0) continue;
-                if (scene.occluded(h.p + h.n * 1e-6, wi, dist - 2e-6)) continue;
+                if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) continue;
                 double G = cosSurf * cosLight / dist2;    // geometry term
-                contrib = f * emitW * G * effArea;        // pdf_area = 1/effArea (visible area for cylinder)
+                contrib = f * emitW * G * effArea * stG;  // pdf_area = 1/effArea (visible area for cylinder)
             }
             if (scene.backwardMedium().enabled)                     // Beer-Lambert on the shadow ray
                 contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
@@ -205,15 +218,18 @@ struct BackwardRenderer {
         Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return 0.0;
         double cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0.0) return 0.0;                 // below the horizon
+        const Vec3 ngo = orientedGeoN(h);
+        if (cosSurf <= 0.0) return 0.0;                          // below the shading horizon
+        double stG = shadowTerminatorG(wi, h.n, ngo);           // Chiang soft terminator (1 if flat)
+        if (stG <= 0.0) return 0.0;                              // behind true geometry: hard shadow
         double farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
-        if (scene.occluded(h.p + h.n * 1e-6, wi, farDist)) return 0.0;
+        if (scene.occluded(h.p + ngo * 1e-6, wi, farDist)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double f = rho / PI;                            // Lambertian BRDF
         double pdfBsdf = cosSurf / PI;                  // cosine-hemisphere pdf for wi
         double wMis = pdfW / (pdfW + pdfBsdf);          // balance heuristic
-        double contrib = f * Lenv * cosSurf * invPdfLambda / pdfW * wMis;
+        double contrib = f * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
         if (scene.backwardMedium().enabled)                       // Beer-Lambert to the scene exit
             contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
         return contrib;
@@ -252,7 +268,15 @@ struct BackwardRenderer {
         Renderer mats;                 // shared material sampling (stateless)
         mats.diffraction = diffraction; // grating order count follows the CLI toggle
 
-        const Material* interior = nullptr;   // dielectric the ray is inside (colored glass)
+        // Nested-dielectric medium stack: the solids the ray is currently inside. The
+        // current medium (for Beer-Lambert absorption + the exterior IOR at the next
+        // interface) is the highest-priority entry. Replaces the old single `interior`
+        // pointer; behaves identically for a lone dielectric.
+        MediumStack stk;
+        auto curAbsorb = [&](double lam) -> double {           // sigma_a of the current medium
+            int mi = stk.topMat();
+            return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
+        };
         for (int b = 0; b < maxBounce; ++b) {
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
@@ -268,8 +292,8 @@ struct BackwardRenderer {
                     if (tMed < dSurf) {
                         Vec3 p = ray.o + ray.d * tMed;
                         // Beer-Lambert attenuation over the in-glass free-flight leg.
-                        if (interior) {
-                            double a = interior->absorb(lambda);
+                        {
+                            double a = curAbsorb(lambda);
                             if (a > 0.0) thr *= std::exp(-a * tMed);
                         }
                         L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
@@ -296,8 +320,8 @@ struct BackwardRenderer {
             // surface emission, so forward and backward agree on env illumination.
             // Beer-Lambert attenuation over the in-glass segment up to the surface
             // (only when the ray actually reached a surface inside a dielectric).
-            if (interior && h.valid) {
-                double a = interior->absorb(lambda);
+            if (h.valid) {
+                double a = curAbsorb(lambda);
                 if (a > 0.0) thr *= std::exp(-a * dSurf);
             }
 
@@ -352,12 +376,65 @@ struct BackwardRenderer {
 
             switch (m.type) {
                 case MatType::Dielectric: {
+                    // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002).
+                    // The exterior IOR at this interface is the medium the ray is
+                    // currently travelling through (the highest-priority entry on the
+                    // stack), not a hardcoded 1.0 -- so a glass surface inside water
+                    // refracts 1.33<->1.52, not 1.0<->1.52. Where two dielectrics
+                    // overlap, the higher priority wins and the lower one's boundary is
+                    // suppressed (the ray passes straight through, unrefracted).
+                    //
+                    // SAFE FALLBACK: the priority rule is applied only when BOTH sides of
+                    // the interface carry an explicit priority. Air (an empty region of
+                    // stack) always counts as a valid side (IOR 1.0). If a competing
+                    // dielectric is present but either side lacks a priority, the
+                    // interface degrades to the old flat air<->glass model (extIor 1.0),
+                    // so priority-free scenes render bit-identically.
                     bool entering = dot(ray.d, h.ng) < 0.0;
-                    bool transmitted = false;
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
-                    if (transmitted) interior = entering ? &m : nullptr;
+                    const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
+                    const int pr = m.priority;               // INT_MIN if unset
                     specularArrival = true;
-                    break;
+
+                    if (entering) {
+                        const int outMat = stk.topMat();     // -1 == air
+                        const int outPri = stk.topPri();     // INT_MIN == air
+                        const bool ranked = m.hasPriority() &&
+                            (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                        // Suppressed: entering a lower-or-equal-priority solid while
+                        // already inside a higher-priority medium -> no visible surface.
+                        if (ranked && !stk.empty() && pr <= outPri) {
+                            stk.push(mi, pr);
+                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                            break;
+                        }
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.push(mi, pr);
+                        break;
+                    } else {
+                        // Exiting solid mi: look at the medium underneath it.
+                        MediumStack after = stk;
+                        after.popMat(mi);
+                        const int newMat = after.topMat();   // -1 == air underneath
+                        const int newPri = after.topPri();
+                        const bool ranked = m.hasPriority() &&
+                            (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                        // Suppressed: a higher-or-equal-priority medium still encloses
+                        // us, so mi's boundary was never optically visible -> pass through.
+                        if (ranked && newMat >= 0 && pr <= newPri) {
+                            stk.popMat(mi);
+                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                            break;
+                        }
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.popMat(mi);      // TIR stays inside mi
+                        break;
+                    }
                 }
                 case MatType::ThinFilm: {
                     // Iridescent coated interface: specular reflect-or-refract, same

@@ -1,31 +1,15 @@
-# Gallery Hall — the showcase room, rebuilt. A large museum hall lit by a SINGLE warm
-# bulb, every hero piece resting (pybullet-settled) on its own museum stand — the stands
-# vary in dimensions, parts (base / column / cap) and stone/wood material. The gold GYROID
-# lattice ball sits close-up on the centre line in plain view; a second, smaller DIAMOND
-# gyroid (very high IOR, dispersive) throws coloured caustics from the left. A relocated
-# glass sphere (front-right, off the gyroid's sight-line), an intricate glass KLEIN bottle,
-# a morpho-iridescent algebraic HEART, a chrome MIRROR ring, and two brass CSG studies
-# (a fused cluster and a dumbbell-ring) fill out the set. A puffy CLOUD (bounded isosurface
-# density fog, a few lobes bolted together) hangs near the ceiling in the back-left corner.
-#
-# This is BOTH the showcase still and the showcase flyby scene. The flyby (`camera_curve
-# "fly"`) is a seamless closed loop that threads the gold gyroid's empty air channels and
-# passes straight THROUGH the glass sphere.
-#
-# Pipeline: this file is the AUTHORED source (hero objects hover just above their stands).
-# Run tools/settle_scene.py to drop the physical pieces onto their stands, producing the
-# render-ready scenes/gallery_settled.ftsl:
+# Gallery Hall — RENDER-READY (pybullet-settled) build of scenes/gallery.ftsl.
+# GENERATED: the four physical hero pieces (klein, heart, brass_cluster, brass_dumbbell)
+# are wrapped in `group { translate <t> rotate <euler xyz deg> <authored block> }` rest
+# poses produced by tools/settle_scene.py. The two gyroids, chrome ring and glass sphere
+# are left at their analytic rest (see scenes/gallery.ftsl header for why). Edit the
+# AUTHORED source scenes/gallery.ftsl, never this file, then re-run the settle:
 #   python tools/settle_scene.py --scene scenes/gallery.ftsl \
 #       --settle klein,heart,brass_cluster,brass_dumbbell --out scenes/gallery_settled.ftsl
-# The two gyroids, the chrome ring and the glass sphere are placed at ANALYTIC rest (a
-# lattice ball / ring / sphere resting tangent on its stand) and left OUT of the settle:
-# the threaded gyroid must keep its exact channel alignment with the flight path, and a
-# pybullet pose on a non-watertight lattice would rotate the channels off the camera path.
 #
 # Render (still, mode D resolves the bounded cloud + dispersive caustics through glass):
 #   ftrace -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 2 -window -o png/gallery.png
-# Render (flyby, mode B = shared forward photon flight across all cameras — the multi-frame
-# speedup — which also images the bounded cloud on the camera side):
+# Render (flyby, mode B = shared forward photon flight across all cameras):
 #   ftrace -in scenes/gallery_settled.ftsl -mode B -device gpu -spp 16 -r 640 360 -window -o png/fly.png
 
 scene { units meters  spectral 360 830 1 }
@@ -172,55 +156,67 @@ isosurface "gyroid_gem" {
 sphere { center 5.6 1.40 12.0   radius 0.5   material glass }
 
 # --- KLEIN BOTTLE in glass (intricate transparent piece, right-mid; SETTLED) ----------
-mesh "klein" {
-    file "scraps/klein_staged.obj"
-    translate 5.7 1.55 7.4   rotate 8 40 0   scale 1.4
-    material glass
+group {  # settled by tools/settle_scene.py
+    translate 11.8159 7.43913 10.8717
+    rotate    -119.376 -21.2093 -165.563
+    mesh "klein" {
+        file "scraps/klein_staged.obj"
+        translate 5.7 1.55 7.4   rotate 8 40 0   scale 1.4
+        material glass
+    }
 }
 
 # --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue (left-back; SETTLED) -
-isosurface "heart" {
-    material morpho
-    translate 2.975 1.075 2.975   scale 0.85
-    function {
-        translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
-        expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
+group {  # settled by tools/settle_scene.py
+    translate 5.23572 -3.03949 7.64984
+    rotate    -95.636 44.3538 41.8667
+    isosurface "heart" {
+        material morpho
+        translate 2.975 1.075 2.975   scale 0.85
+        function {
+            translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
+            expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
+        }
+        contained_by { min 0.14 0.14 0.2   max 0.86 0.86 0.8 }
+        max_gradient 60
     }
-    contained_by { min 0.14 0.14 0.2   max 0.86 0.86 0.8 }
-    max_gradient 60
 }
 
 # --- BRASS CSG cluster (gallery pick 05): nested smooth_union of spheres+tori with two
 # spheres bored out (right-back; SETTLED). SDF leaves stay unit-Lipschitz, no max_gradient. -
-isosurface "brass_cluster" {
-    material brass
-    translate 5.4 0.95 4.0   scale 0.8
-    difference {
-    difference {
-    smooth_union { k 0.038
-        smooth_union { k 0.050
-        smooth_union { k 0.039
-        smooth_union { k 0.035
-        smooth_union { k 0.032
-        smooth_union { k 0.042
-        sphere { center 0.642 0.391 0.564  radius 0.137 }
-        sphere { center 0.602 0.392 0.536  radius 0.133 }
+group {  # settled by tools/settle_scene.py
+    translate 2.61652 -3.87206 -0.190936
+    rotate    -6.85392 -3.65997 39.9152
+    isosurface "brass_cluster" {
+        material brass
+        translate 5.4 0.95 4.0   scale 0.8
+        difference {
+        difference {
+        smooth_union { k 0.038
+            smooth_union { k 0.050
+            smooth_union { k 0.039
+            smooth_union { k 0.035
+            smooth_union { k 0.032
+            smooth_union { k 0.042
+            sphere { center 0.642 0.391 0.564  radius 0.137 }
+            sphere { center 0.602 0.392 0.536  radius 0.133 }
+        }
+            torus { translate 0.369 0.629 0.403  rotate 155 167 28  major 0.201  minor 0.041 }
+        }
+            sphere { center 0.671 0.427 0.395  radius 0.092 }
+        }
+            sphere { center 0.566 0.601 0.542  radius 0.097 }
+        }
+            sphere { center 0.365 0.665 0.501  radius 0.128 }
+        }
+            torus { translate 0.390 0.561 0.494  rotate 152 95 79  major 0.150  minor 0.060 }
+        }
+        sphere { center 0.435 0.587 0.480  radius 0.070 }
+        }
+        sphere { center 0.520 0.500 0.495  radius 0.071 }
+        }
+        contained_by { min 0.12 0.12 0.22   max 0.88 0.88 0.78 }
     }
-        torus { translate 0.369 0.629 0.403  rotate 155 167 28  major 0.201  minor 0.041 }
-    }
-        sphere { center 0.671 0.427 0.395  radius 0.092 }
-    }
-        sphere { center 0.566 0.601 0.542  radius 0.097 }
-    }
-        sphere { center 0.365 0.665 0.501  radius 0.128 }
-    }
-        torus { translate 0.390 0.561 0.494  rotate 152 95 79  major 0.150  minor 0.060 }
-    }
-    sphere { center 0.435 0.587 0.480  radius 0.070 }
-    }
-    sphere { center 0.520 0.500 0.495  radius 0.071 }
-    }
-    contained_by { min 0.12 0.12 0.22   max 0.88 0.88 0.78 }
 }
 
 # --- MIRRORED chrome ring (upright display mount, left-mid; NOT settled) ---------------
@@ -231,23 +227,27 @@ isosurface "chrome_ring" {
 
 # --- BRASS dumbbell-ring (gallery pick 09): two spheres joined by a fused bar + ring,
 # with a small bite bored out (centre-back; SETTLED). ---
-isosurface "brass_dumbbell" {
-    material brass
-    translate 4.11 0.86 2.41   scale 0.78
-    difference {
-    smooth_union { k 0.046
-        smooth_union { k 0.033
-        smooth_union { k 0.032
-        sphere { center 0.340 0.500 0.500  radius 0.150 }
-        sphere { center 0.660 0.500 0.500  radius 0.150 }
+group {  # settled by tools/settle_scene.py
+    translate -0.0570354 0.577545 -0.0973427
+    rotate    6.70729 0.108199 -5.57561
+    isosurface "brass_dumbbell" {
+        material brass
+        translate 4.11 0.86 2.41   scale 0.78
+        difference {
+        smooth_union { k 0.046
+            smooth_union { k 0.033
+            smooth_union { k 0.032
+            sphere { center 0.340 0.500 0.500  radius 0.150 }
+            sphere { center 0.660 0.500 0.500  radius 0.150 }
+        }
+            cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
+        }
+            torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.150  minor 0.045 }
+        }
+        sphere { center 0.369 0.528 0.501  radius 0.067 }
+        }
+        contained_by { min 0.08 0.08 0.12   max 0.92 0.92 0.88 }
     }
-        cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
-    }
-        torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.150  minor 0.045 }
-    }
-    sphere { center 0.369 0.528 0.501  radius 0.067 }
-    }
-    contained_by { min 0.08 0.08 0.12   max 0.92 0.92 0.88 }
 }
 
 # ==============================  LIGHTING  ====================================

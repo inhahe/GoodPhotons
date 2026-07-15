@@ -2,8 +2,10 @@
 // a fan). Per-vertex `vn` normals are loaded as smooth SHADING normals (transformed
 // by the mesh transform's inverse-transpose); a mesh without `vn` stays exactly
 // flat-shaded (Tri::finalize falls the per-vertex normals back to the geometric
-// normal). Dependency-free — enough to drop real meshes into a scene and stress the
-// BVH. A richer loader (per-face materials, full .mtl) can replace this later.
+// normal) UNLESS crease-angle auto-smoothing is requested (see `creaseAngleDeg`),
+// which synthesizes smooth per-corner normals from the face normals. Dependency-free
+// — enough to drop real meshes into a scene and stress the BVH. A richer loader
+// (per-face materials, full .mtl) can replace this later.
 #pragma once
 #include <cstdio>
 #include <fstream>
@@ -14,6 +16,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include "geometry.h"
 #include "scene.h"
 
@@ -127,7 +130,8 @@ using MtlResolver = std::function<int(const std::string&)>;
 // Returns the number of triangles added (0 on failure). Call before Scene::build().
 inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
                    bool loadUV = false, const MtlResolver* matResolver = nullptr,
-                   UvProjection uvProj = UvProjection::None, int uvAxis = 1) {
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                   double creaseAngleDeg = -1.0) {
     std::ifstream f(path);
     if (!f) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
 
@@ -138,8 +142,11 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
     int added = 0;
     std::string line;
     // For a procedural UV projection we need the whole mesh AABB, so record each
-    // added triangle's source vertex indices and fill UVs in a second pass.
+    // added triangle's source vertex indices and fill UVs in a second pass. Crease
+    // smoothing needs the same per-tri vertex indices, so record them for either.
     const bool proceduralUV = (uvProj != UvProjection::None) && !loadUV;
+    const bool wantSmooth = (creaseAngleDeg >= 0.0);
+    const bool recordVI = proceduralUV || wantSmooth;
     std::vector<std::array<int, 3>> triVI;   // vertex indices per added tri
     size_t triStart = s.tris.size();
     while (std::getline(f, line)) {
@@ -193,7 +200,7 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
                 // preserving exact flat-shading for meshes without `vn`).
                 t.n0 = nAt(nidx[0]); t.n1 = nAt(nidx[k]); t.n2 = nAt(nidx[k + 1]);
                 s.tris.push_back(t);
-                if (proceduralUV) triVI.push_back({idx[0], idx[k], idx[k + 1]});
+                if (recordVI) triVI.push_back({idx[0], idx[k], idx[k + 1]});
                 ++added;
             }
         }
@@ -214,17 +221,94 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
             t.uv2 = projectUV(verts[triVI[i][2]], lo, hi, ctr, uvProj, ax);
         }
     }
-    std::printf("loadObj: %s -> %d verts, %d tris (mat %d)%s\n",
+    // Crease-angle auto-smoothing: only when the mesh carries NO `vn` (authored
+    // normals always win). Synthesize a per-corner shading normal by averaging the
+    // FACE normals of the triangles incident to that vertex, but merge two faces only
+    // when the angle between their normals is below `creaseAngleDeg` — so soft edges
+    // smooth while genuine creases (a cube's 90° edges) stay faceted. Angle-weighted
+    // (Thürmer & Wüthrich) to avoid tessellation bias. Vertices are welded by POSITION
+    // first, so smoothing works even on exporters that split a shared position into
+    // several OBJ vertex indices. Opt-in — a mesh without `smooth` is untouched.
+    bool didSmooth = false;
+    if (wantSmooth && normals.empty() && !triVI.empty() && !verts.empty()) {
+        const size_t nt = triVI.size();
+        // Face normals (world space) per added triangle.
+        std::vector<Vec3> fn(nt);
+        for (size_t i = 0; i < nt; ++i) {
+            const Vec3& a = verts[triVI[i][0]];
+            const Vec3& b = verts[triVI[i][1]];
+            const Vec3& c = verts[triVI[i][2]];
+            Vec3 n = cross(b - a, c - a);
+            double l = std::sqrt(dot(n, n));
+            fn[i] = (l > 1e-18) ? n * (1.0 / l) : Vec3{0, 0, 0};
+        }
+        // Weld vertices by quantized position (epsilon relative to the mesh size),
+        // mapping every OBJ vertex index to a canonical welded id.
+        Vec3 lo = verts[0], hi = verts[0];
+        for (const Vec3& v : verts) {
+            lo = Vec3{std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+            hi = Vec3{std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+        }
+        Vec3 ext = hi - lo;
+        double diag = std::sqrt(dot(ext, ext));
+        double eps = (diag > 0.0 ? diag : 1.0) * 1e-6;
+        double inv = 1.0 / eps;
+        std::map<std::array<long long, 3>, int> weldMap;
+        std::vector<int> weld(verts.size());
+        int nWeld = 0;
+        for (size_t v = 0; v < verts.size(); ++v) {
+            std::array<long long, 3> key{
+                (long long)std::llround(verts[v].x * inv),
+                (long long)std::llround(verts[v].y * inv),
+                (long long)std::llround(verts[v].z * inv)};
+            auto it = weldMap.find(key);
+            if (it == weldMap.end()) { weldMap.emplace(key, nWeld); weld[v] = nWeld++; }
+            else                     { weld[v] = it->second; }
+        }
+        // Welded-vertex -> incident triangle list.
+        std::vector<std::vector<int>> vtris(nWeld);
+        for (size_t i = 0; i < nt; ++i)
+            for (int c = 0; c < 3; ++c) vtris[weld[triVI[i][c]]].push_back((int)i);
+        const double cosThresh = std::cos(creaseAngleDeg * 3.14159265358979323846 / 180.0);
+        auto cornerAngle = [&](int tri, int weldedVid) -> double {
+            const std::array<int, 3>& vi = triVI[tri];
+            int c = (weld[vi[0]] == weldedVid) ? 0 : (weld[vi[1]] == weldedVid) ? 1 : 2;
+            const Vec3& P = verts[vi[c]];
+            Vec3 e1 = verts[vi[(c + 1) % 3]] - P, e2 = verts[vi[(c + 2) % 3]] - P;
+            double l1 = std::sqrt(dot(e1, e1)), l2 = std::sqrt(dot(e2, e2));
+            if (l1 < 1e-18 || l2 < 1e-18) return 0.0;
+            double ca = dot(e1, e2) / (l1 * l2);
+            ca = ca < -1.0 ? -1.0 : (ca > 1.0 ? 1.0 : ca);
+            return std::acos(ca);
+        };
+        for (size_t i = 0; i < nt; ++i) {
+            Tri& t = s.tris[triStart + i];
+            for (int c = 0; c < 3; ++c) {
+                int wv = weld[triVI[i][c]];
+                Vec3 sum{0, 0, 0};
+                for (int j : vtris[wv])
+                    if (dot(fn[i], fn[j]) >= cosThresh) sum += fn[j] * cornerAngle(j, wv);
+                double l = std::sqrt(dot(sum, sum));
+                Vec3 sn = (l > 1e-12) ? sum * (1.0 / l) : fn[i];
+                if (c == 0) t.n0 = sn; else if (c == 1) t.n1 = sn; else t.n2 = sn;
+            }
+        }
+        didSmooth = true;
+    }
+    std::printf("loadObj: %s -> %d verts, %d tris (mat %d)%s%s\n",
                 path, (int)verts.size(), added, matId,
-                proceduralUV ? " [procedural UVs]" : "");
+                proceduralUV ? " [procedural UVs]" : "",
+                didSmooth ? " [crease-smoothed]" : "");
     return added;
 }
 
 // MeshXform overload: a single scale+Euler+translate transform (the common case).
 inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
                    bool loadUV = false, const MtlResolver* matResolver = nullptr,
-                   UvProjection uvProj = UvProjection::None, int uvAxis = 1) {
-    return loadObj(s, path, matId, xf.toAffine(), loadUV, matResolver, uvProj, uvAxis);
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                   double creaseAngleDeg = -1.0) {
+    return loadObj(s, path, matId, xf.toAffine(), loadUV, matResolver, uvProj, uvAxis,
+                   creaseAngleDeg);
 }
 
 // Backward-compatible convenience overload: translate + uniform scale only.

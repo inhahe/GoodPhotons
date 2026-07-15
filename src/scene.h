@@ -3,6 +3,7 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+#include <climits>
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
@@ -35,6 +36,15 @@ struct Material {
     Spectrum reflect = constantSpectrum(0.5);
     Spectrum emit    = constantSpectrum(0.0); // emitted radiance vs lambda
     Spectrum ior     = iorConstant(1.5);      // dielectric index vs lambda
+    // Nested-dielectric PRIORITY (Schmidt & Budge 2002). Where two dielectric solids
+    // overlap in space, the one with the HIGHER priority "wins" that region: its medium
+    // fills the overlap and the loser's surface there is a no-op (a coincident/interior
+    // face is skipped). This resolves glass-in-water, coatings, and coincident surfaces
+    // without a full per-path medium stack. INT_MIN = "unset" — used by the ahead-of-time
+    // audit to warn when two overlapping dielectrics both lack an explicit priority (the
+    // exterior IOR is then ambiguous). Only consulted for dielectric-like materials.
+    int priority = INT_MIN;
+    bool hasPriority() const { return priority != INT_MIN; }
     // Interior absorption coefficient sigma_a(lambda) in units of 1/metre, applied
     // Beer-Lambert along the path a photon travels INSIDE a dielectric (colored /
     // attenuating glass; also the `absorb` target a field_material can drive). 0 =
@@ -576,12 +586,24 @@ struct MeshInstance {
     int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
 };
 
+// A named mesh object as authored (one `mesh` or `mesh_asset` block), kept so tools
+// like `-check-watertight` can report per-object (which the flattened Scene::tris /
+// blasList otherwise lose). Either a contiguous run of world triangles in Scene::tris
+// (blasId < 0) or a shared BLAS asset (blasId >= 0).
+struct MeshGroup {
+    std::string name;
+    size_t triStart = 0, triCount = 0;   // range into Scene::tris  (blasId < 0)
+    int    blasId   = -1;                // >=0: geometry lives in Scene::blasList[blasId]
+    int    matId    = 0;                 // representative material (dielectric emphasis)
+};
+
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
+    std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)

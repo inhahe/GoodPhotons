@@ -55,6 +55,7 @@
 
 #include "render_cuda.h"
 #include "render_progress.h"
+#include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -241,6 +242,45 @@ struct DMaterial {
     int    roughnessPat;
     int    filmThicknessPat;
     int    mixWeightPat;
+    // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
+    // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
+    // twin of Material::priority.
+    int    priority;
+};
+// Sentinel for an unset dielectric priority (device twin of host INT_MIN).
+#define D_NO_PRIORITY (-2147483647 - 1)
+__device__ __host__ static inline bool dHasPriority(const DMaterial& m) { return m.priority != D_NO_PRIORITY; }
+
+// Per-path nested-dielectric medium stack (device twin of host MediumStack). The current
+// optical medium (for Beer-Lambert absorption + exterior IOR at the next interface) is the
+// highest-priority entry. A smaller CAP than the host (deep dielectric nesting is rare;
+// overflow degrades gracefully) keeps per-slot wavefront memory and megakernel local
+// footprint modest.
+struct DMediumStack {
+    static const int CAP = 8;
+    int matIdx[CAP];
+    int pri[CAP];
+    int n;
+    __device__ __host__ void clear() { n = 0; }
+    __device__ __host__ bool empty() const { return n == 0; }
+    __device__ __host__ int topPri() const {
+        int bp = D_NO_PRIORITY;
+        for (int i = 0; i < n; ++i) if (pri[i] > bp) bp = pri[i];
+        return n ? bp : D_NO_PRIORITY;
+    }
+    __device__ __host__ int topMat() const {
+        int bp = D_NO_PRIORITY, bm = -1;
+        for (int i = 0; i < n; ++i) if (pri[i] >= bp) { bp = pri[i]; bm = matIdx[i]; }
+        return bm;
+    }
+    __device__ __host__ void push(int mi, int p) { if (n < CAP) { matIdx[n] = mi; pri[n] = p; ++n; } }
+    __device__ __host__ void popMat(int mi) {
+        for (int i = n - 1; i >= 0; --i)
+            if (matIdx[i] == mi) {
+                for (int j = i; j < n - 1; ++j) { matIdx[j] = matIdx[j + 1]; pri[j] = pri[j + 1]; }
+                --n; return;
+            }
+    }
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId; };
@@ -1610,11 +1650,12 @@ __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const
 // medium it is now inside (interior absorption). Mirrors host refractOrReflect.
 __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
                                          const DVec3& d, Real lambda, DRng& rng,
-                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr) {
+                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr,
+                                         Real extIor = (Real)1) {
     Real ng = specLookup(m.ior, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
-    Real n1 = entering ? (Real)1 : ng, n2 = entering ? ng : (Real)1;
+    Real n1 = entering ? extIor : ng, n2 = entering ? ng : extIor;
     Real eta = n1 / n2;
     Real cosI = -dot(d, nl);
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
@@ -1639,6 +1680,50 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
     }
     if (transmitted) *transmitted = refracted;
     ro = h.p + outDir * RAY_EPS; rd = outDir;
+}
+
+// Nested-dielectric PRIORITY step (Schmidt & Budge 2002), shared by every device transport
+// loop. Resolves the exterior IOR at a dielectric interface from the enclosing medium (the
+// highest-priority stack entry), suppresses lower-priority overlapping boundaries (straight
+// pass-through), and maintains `stk`. `mi` is the resolved material index (Mix/Layered
+// aware). SAFE FALLBACK: the priority rule applies only when BOTH sides carry an explicit
+// priority (air always counts, IOR 1.0); otherwise this degrades to the old flat
+// air<->glass model, so priority-free scenes render bit-identically. Mirrors the host.
+__device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
+                                        const DVec3& d, Real lambda, DRng& rng,
+                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD) {
+    bool entering = dot(d, h.ng) < 0;
+    int pr = m.priority;
+    if (entering) {
+        int outMat = stk.topMat();
+        int outPri = stk.topPri();
+        bool ranked = dHasPriority(m) &&
+            (stk.empty() || (outMat >= 0 && dHasPriority(sc.mats[outMat])));
+        if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+            stk.push(mi, pr);
+            outO = h.p + d * RAY_EPS; outD = d; return;
+        }
+        Real extIor = (ranked && outMat >= 0) ? specLookup(sc.mats[outMat].ior, lambda) : (Real)1;
+        bool transmitted = false; DVec3 nro, nrd;
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor);
+        if (transmitted) stk.push(mi, pr);
+        outO = nro; outD = nrd;
+    } else {
+        DMediumStack after = stk; after.popMat(mi);
+        int newMat = after.topMat();
+        int newPri = after.topPri();
+        bool ranked = dHasPriority(m) &&
+            (after.empty() || (newMat >= 0 && dHasPriority(sc.mats[newMat])));
+        if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+            stk.popMat(mi);
+            outO = h.p + d * RAY_EPS; outD = d; return;
+        }
+        Real extIor = (ranked && newMat >= 0) ? specLookup(sc.mats[newMat].ior, lambda) : (Real)1;
+        bool transmitted = false; DVec3 nro, nrd;
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor);
+        if (transmitted) stk.popMat(mi);                // TIR stays inside mi
+        outO = nro; outD = nrd;
+    }
 }
 // Returns false if the photon is absorbed by an opaque (absorbing) substrate.
 // Forward decl: the per-hit thin-film thickness helper (definition with the other
@@ -1759,23 +1844,67 @@ __device__ static void filmAdd(double* film, double* hits, int resX, int px, int
     atomicAdd(&film[idx + 2], (double)(cieZ(lambda) * w));
     if (hits) atomicAdd(&hits[pix], 1.0);
 }
+// Device twin of geometry.h's shadingAdjointCorr (Veach §5.3 adjoint shading-normal
+// correction). Reweights a forward/particle vertex so an interpolated shading normal
+// `ns` shades smoothly instead of faceting; EXACTLY 1 when ns==ng (flat tris, analytic
+// spheres), so every flat/analytic GPU scene stays bit-identical. `wi` = toward the
+// previous (light-side) vertex, `wo` = the outgoing direction.
+__device__ static Real dShadingAdjointCorr(const DVec3& wi, const DVec3& wo,
+                                           const DVec3& ns, const DVec3& ng) {
+    Real denom = (Real)fabs((double)dot(wi, ng)) * (Real)fabs((double)dot(wo, ns));
+    if (denom <= (Real)1e-8) return (Real)1;          // degenerate grazing -> no correction
+    Real num = (Real)fabs((double)dot(wi, ns)) * (Real)fabs((double)dot(wo, ng));
+    return num / denom;
+}
+// Device twin of geometry.h's shadowTerminatorG (Chiang, Li, Burley & Hovhannisyan 2019
+// "Taming the Shadow Terminator"; Cycles' bump_shadowing_term). Returns a [0,1] factor
+// that REPLACES the old hard geometric-hemisphere cutoff (dot(ng,wi)<=0 ? reject): still
+// exactly 0 when `wi` is behind the true geometry (no back-face light leak), but ramps up
+// smoothly off the geometric horizon so a low-poly smooth-normal mesh shows a smooth
+// terminator instead of facet slivers. EXACTLY 1 when ns==ng (flat tris, analytic spheres),
+// so every flat/analytic GPU scene stays bit-identical. `wi` = direction toward the
+// light/connection, `ns` = shading normal, `ng` = geo normal oriented onto the shading side.
+__device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, const DVec3& ng) {
+    Real cosNgNs = dot(ng, ns);
+    // Exact no-op when ns==ng (flat tris, analytic spheres): the cubic would otherwise drift
+    // by ~1e-7 since a re-normalized `ns` differs from `ng` in the last bit. Short-circuit to
+    // a plain leak-free step (identical to the old hard clamp) so flat/analytic GPU scenes
+    // stay bit-identical; softening engages only once ns and ng genuinely diverge.
+    if (cosNgNs >= (Real)1 - (Real)1e-7) return (dot(ng, wi) > (Real)0) ? (Real)1 : (Real)0;
+    Real cosNgWi = dot(ng, wi);
+    if (cosNgWi <= (Real)0) return (Real)0;            // behind the true geometry -> hard shadow
+    Real denom = dot(ns, wi) * cosNgNs;
+    if (denom <= (Real)1e-8) return (Real)1;           // degenerate grazing -> no softening
+    Real g = cosNgWi / denom;
+    if (g >= (Real)1) return (Real)1;                  // fully lit -> no darkening
+    return g * g * ((Real)1 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
+}
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
-                               const DVec3& p, const DVec3& n, Real lambda, Real beta, Real rho,
-                               DRng& rng) {
+                               const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+                               Real lambda, Real beta, Real rho, DRng& rng) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
     Real cosSurf = dot(n, wdir);
+    // Reject below the shading horizon; soften across the GEOMETRIC horizon (ng = geo normal
+    // on the shading side): a smoothed shading normal must not splat a vertex whose true
+    // geometry faces away from the camera, but a hard cutoff facets the terminator, so ramp
+    // it smoothly (Chiang 2019). No-op for flat tris / analytic spheres (ng == n, stG == 1).
+    // Matches CPU render.h.
     if (cosSurf <= 0) return;
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real f = rho / (Real)DPI;
-    // Projection-general splat: contrib = beta*f*cosSurf / (dist^2 * pixelSolidAngle).
+    // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
     // classic 1/(A_pix cos^4) form; fisheye/panoramic uses the remapped solid angle.
+    // corr is the Veach adjoint shading-normal factor (1 when ns==ng).
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
-    Real contrib = beta * f * cosSurf / (Real)((double)dist2 * solidAngle);
+    Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1807,8 +1936,8 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
 // so A and C share both scale and shape. Weight beta*rho*cosSurf*cosLens*R^2/dist^2
 // (the BRDF's 1/pi cancels the pupil pdf's pi R^2).
 __device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film, double* hits,
-                                   const DVec3& p, const DVec3& n, Real lambda, Real beta,
-                                   Real rho, DRng& rng) {
+                                   const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+                                   Real lambda, Real beta, Real rho, DRng& rng) {
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -1818,13 +1947,18 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (dist < (Real)1e-9) return;
     DVec3 wdir = toA / dist;
     Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;                        // pupil behind the surface
+    // Below the shading horizon reject; soften across the geometric horizon (see connect()):
+    // no-op for flat/sphere (stG == 1).
+    if (cosSurf <= 0) return;                        // pupil behind the shading surface
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;                      // pupil behind true geometry: hard cutoff
     Real cosLens = -dot(wdir, cam.w);                // cosine at the lens (w faces scene)
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occluded(sc, p + n * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
-    Real contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
+    Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1868,11 +2002,43 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
 // standalone render in distribution only. (A HETEROGENEOUS medium adds a ratio-tracking
 // transmittance draw per connect, so multi-cam model-B also matches only in distribution
 // then — inherent to the estimator, and consistent with the CPU tracer.)
+// One deposited photon (device twin of Photon in photonmap.h): where light landed, the
+// incident direction (= -travel), the shading normal (for cross-surface leak rejection),
+// and the monochromatic power / wavelength it carried. Laid out to round-trip through the
+// host PhotonMap (float here <-> double on the host build).
+struct DPhoton {
+    DVec3 pos, wi, n;
+    float power, lambda;
+};
+
 struct DCamSet {
     const DCamera* cams;      // nCam cameras
     double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
     double* const* hits;      // nCam per-pixel hit-count buffers
     int nCam;
+    // Photon-map deposit (mode M forward pass). When depCount != nullptr the forward
+    // tracer appends a photon record at every diffuse / diffuse-transmit vertex (device
+    // twin of Renderer::depositPhoton) instead of / in addition to splatting: the pass
+    // runs with nCam == 0 (all camera splats become no-ops) so the trace is pure deposit.
+    // depCount is an atomic write cursor; depPhotons may be null (count-only sizing pass),
+    // else records with index < depCap are stored (excess is counted but dropped).
+    DPhoton*            depPhotons = nullptr;
+    unsigned long long* depCount   = nullptr;
+    unsigned long long  depCap     = 0;
+};
+
+// A view-independent photon-map query structure on the device (device twin of PhotonMap
+// in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
+// photon records, so a radius-r query touches only the 3x3x3 neighbourhood. Built on the
+// host (PhotonMap::build) from the deposited photons, then uploaded for the gather kernel.
+struct DPhotonMap {
+    const DPhoton* photons;   // reordered into cell-contiguous runs
+    const int*     cellStart; // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
+    DVec3  lo;                // grid origin (world)
+    Real   cellSize;          // == gather radius
+    Real   radius;            // gather radius (world units)
+    int    nx, ny, nz;
+    long long nEmitted;       // total photons emitted in the pass (normalization)
 };
 
 // Splat a surface vertex to every camera (model B pinhole connect, or model A finite-
@@ -1881,11 +2047,28 @@ struct DCamSet {
 // camera draws its own aperture sample, so the loop consumes RNG proportional to nCam
 // (deterministic given the camera order).
 __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int camMode,
-                                        const DVec3& p, const DVec3& n, Real lambda,
+                                        const DVec3& p, const DVec3& n, const DVec3& ng,
+                                        const DVec3& wi, Real lambda,
                                         Real beta, Real rho, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
-        else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, lambda, beta, rho, rng);
+        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+        else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+    }
+}
+// Append a photon record at a diffuse / translucent vertex (device twin of
+// Renderer::depositPhoton). No-op unless the camera set carries a deposit buffer
+// (normal renders leave cs.depCount == nullptr, so this compiles away to nothing).
+// Always increments the atomic count (so a null-buffer sizing pass measures the exact
+// deposit total); stores only when a buffer is bound and the slot is within capacity.
+__device__ static void depositPhoton(const DCamSet& cs, const DVec3& p, const DVec3& wtravel,
+                                     const DVec3& n, Real beta, Real lambda) {
+    if (!cs.depCount) return;
+    unsigned long long i = atomicAdd(cs.depCount, 1ULL);
+    if (cs.depPhotons && i < cs.depCap) {
+        DPhoton ph;
+        ph.pos = p; ph.wi = -wtravel; ph.n = n;
+        ph.power = (float)beta; ph.lambda = (float)lambda;
+        cs.depPhotons[i] = ph;
     }
 }
 // Volume (fog) analogue of splatSurfaceAll.
@@ -2719,7 +2902,9 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // C instead catches photons that physically arrive. A spot is a point light
     // with no projected area, so it has no direct term.
     if (em.shape != 2 && em.shape != 3) {
-        splatSurfaceAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
+        // Emitter vertex: ns==ng==emitN, so the adjoint correction is identically 1
+        // (wi is irrelevant here — pass emitN).
+        splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, (Real)1, rng);
         camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
     }
 
@@ -2735,7 +2920,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
-                                int& interior) {
+                                DMediumStack& stk) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
@@ -2764,8 +2949,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // Beer-Lambert attenuation over the free path just travelled inside a dielectric
     // (colored/attenuating glass), applied before the event is processed (matches the
     // host: attenuate over dEvent using the medium carried from the previous vertex).
-    if (interior >= 0) {
-        Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+    {
+        int cm = stk.topMat();
+        Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
         if (a > 0) beta *= exp(-a * dEvent);
     }
 
@@ -2796,10 +2982,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     }
     const DMaterial& m = *mptr;
     if (m.type == D_DIELECTRIC) {
-        bool entering = dot(rd, h.ng) < 0;
-        bool transmitted = false;
-        DVec3 nro, nrd; refractOrReflect(sc, m, h, rd, lambda, rng, nro, nrd, &transmitted);
-        if (transmitted) interior = entering ? matIndex : -1;   // track medium for Beer-Lambert
+        DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matIndex, stk, nro, nrd);
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_THINFILM) {
         DVec3 nro, nrd;
@@ -2853,11 +3036,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Elastic splat at the incoming lambda, then a glow splat at a Stokes-shifted
         // lambda' drawn ONCE (camera-independent) — matching the CPU camSplatAll order,
         // so a multi-camera model-B pass stays bit-identical. Skipped for model C.
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         if (camMode == CAM_A || camMode == CAM_B) {
-            splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
+            splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
             if (canGlow) {
                 Real lp = sampleFluoEmit(sc, m, rng);
-                splatSurfaceAll(sc, cs, camMode, h.p, h.n, lp, beta, (Real)(aEff * m.fluoYield), rng);
+                splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lp, beta, (Real)(aEff * m.fluoYield), rng);
             }
         }
         // Stochastic interaction (fluoroInteract): elastic / reemit / absorb. Beta is
@@ -2871,7 +3056,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         } else {
             eAbsorbed += beta; return WF_TERMINATE;
         }
-        ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
+        { DVec3 wo = cosineHemisphere(h.n, rng);
+          beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
+          ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -2883,23 +3070,33 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real sum = rhoR + rhoT;
         if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
         DVec3 nb = h.n * (Real)(-1);
-        splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
-        splatSurfaceAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 wiPrev = -rd;                                             // toward previous (light-side)
+        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
+        // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
+        // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
+        splatSurfaceAll(sc, cs, camMode, h.p, nb,  ngo * (Real)(-1), wiPrev, lambda, beta, rhoT, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
-        // unchanged on a scatter (like the diffuse case).
+        // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
-        if (u < rhoR)      { ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE; }
-        else if (u < sum)  { ro = h.p + nb  * RAY_EPS; rd = cosineHemisphere(nb,  rng); return WF_CONTINUE; }
+        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); ro = h.p + nb  * RAY_EPS; rd = wo; return WF_CONTINUE; }
         eAbsorbed += beta; return WF_TERMINATE;
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
-        splatSurfaceAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 wiPrev = -rd;                                             // toward previous (light-side)
+        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
-        ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); return WF_CONTINUE;
+        { DVec3 wo = cosineHemisphere(h.n, rng);
+          beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
+          ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
     }
 }
 
@@ -2916,11 +3113,11 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         DVec3 ro, rd; Real beta, lambda;
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
-        int interior = -1;   // dielectric the photon is currently inside (-1 = vacuum)
+        DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped, interior) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, stk) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -2958,7 +3155,12 @@ struct WFState {
     DRng*  rng;
     int*   bounce;   // bounces already shaded for the photon currently in this slot
     int*   alive;    // 1 = slot holds a live photon, 0 = drained (budget spent)
-    int*   interior; // dielectric material index the photon is inside (-1 = vacuum)
+    // Nested-dielectric medium stack per slot (SoA): stkMat/stkPri are CAP-strided
+    // (slot*CAP + i), stkN is the entry count. Empty = vacuum. Replaces the old single
+    // `interior` material index so overlapping dielectrics resolve by priority.
+    int*   stkMat;
+    int*   stkPri;
+    int*   stkN;
     DHit*  hit;      // extend-stage intersection, consumed by shade
 };
 
@@ -2978,7 +3180,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
         if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
-            st.bounce[slot] = 0; st.alive[slot] = 1; st.interior[slot] = -1;
+            st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -3016,10 +3218,15 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
     DVec3 ro = st.ro[slot], rd = st.rd[slot];
     Real beta = st.beta[slot], lambda = st.lambda[slot];
     DHit h = st.hit[slot];
-    int interior = st.interior[slot];
+    // Load the per-slot medium stack from SoA into a local (CAP-strided).
+    DMediumStack stk; stk.n = st.stkN[slot];
+    for (int i = 0; i < stk.n; ++i) {
+        stk.matIdx[i] = st.stkMat[slot * DMediumStack::CAP + i];
+        stk.pri[i]    = st.stkPri[slot * DMediumStack::CAP + i];
+    }
     double eAbs = 0, eSen = 0, eEsc = 0;
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                        eAbs, eSen, eEsc, interior);
+                        eAbs, eSen, eEsc, stk);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -3032,7 +3239,12 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
         st.bounce[slot] = bounce; st.rng[slot] = rng;
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
-        st.interior[slot] = interior;   // carry the dielectric medium to the next segment
+        // Store the medium stack back to SoA (carry to the next segment).
+        st.stkN[slot] = stk.n;
+        for (int i = 0; i < stk.n; ++i) {
+            st.stkMat[slot * DMediumStack::CAP + i] = stk.matIdx[i];
+            st.stkPri[slot * DMediumStack::CAP + i] = stk.pri[i];
+        }
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
@@ -3409,12 +3621,19 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         DVec3 wi = toL / dist;
         Real cosSurf = dot(h.n, wi);
         if (cosSurf <= 0) continue;
+        // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
+        // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
+        // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
+        // along the geometric normal so it clears the true surface.
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+        Real stG = dShadowTerminatorG(wi, h.n, ngo);
+        if (stG <= (Real)0) continue;
         Real cosLight = dot(nL, -wi);                 // light is one-sided
         if (cosLight <= 0) continue;
-        if (occluded(sc, h.p + h.n * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        if (occluded(sc, h.p + ngo * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = (double)(f * G) * emitW * (double)em.area;
+        double contrib = (double)(f * G) * emitW * (double)em.area * (double)stG;
         // Backward (mode R) treats media as a single global HOMOGENEOUS haze (first
         // medium); GPU backward is only reached when no medium is present (cudaBackwardSupported
         // rejects any), so this is defensive parity with the host backwardMedium().
@@ -3431,15 +3650,16 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                     Real lambda, double invPdfLambda, DRng& rng) {
     double L = 0.0, thr = 1.0;
     bool specularArrival = true;                       // camera ray may see a light directly
-    int interior = -1;                                 // dielectric the ray is inside (-1 = vacuum)
+    DMediumStack stk; stk.clear();                     // nested-dielectric medium stack (empty = vacuum)
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
         if (!h.valid) return L;                        // escaped (no env in v1)
         // Beer-Lambert attenuation over the in-glass segment up to this surface
-        // (colored/attenuating glass carried from the previous vertex).
-        if (interior >= 0) {
-            Real a = (Real)specLookup(sc.mats[interior].absorb, lambda);
+        // (current medium = highest-priority stack entry).
+        {
+            int cm = stk.topMat();
+            Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0) thr *= exp(-(double)a * (double)h.t);
         }
         const DMaterial* mp = &sc.mats[h.matId];
@@ -3456,10 +3676,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 
         switch (mp->type) {
             case D_DIELECTRIC: {
-                bool entering = dot(rd, h.ng) < 0;
-                bool transmitted = false;
-                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd, &transmitted);
-                if (transmitted) interior = entering ? matId : -1;
+                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_THINFILM: {
@@ -3587,11 +3804,16 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
 
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
 // until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
+// `importance` marks the LIGHT (particle) subpath: only then is the Veach adjoint
+// shading-normal correction applied at each non-specular vertex (mode==Importance in
+// bdpt.h). The eye (Radiance) subpath smooth-shades for free and passes false.
 __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int diffraction,
                                    DVec3 ro, DVec3 rd, double beta, double pdfDir, Real lambda,
-                                   int maxDepth, DRng& rng, DVertex* path, int& n) {
+                                   int maxDepth, DRng& rng, DVertex* path, int& n,
+                                   bool importance) {
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
+    DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
     for (int bounces = 0;;) {
         DHit h = closestHit(sc, ro, rd);
         if (h.valid && h.sensorId >= 0) return;
@@ -3690,7 +3912,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; refractOrReflect(sc, *mp, h, rd, lambda, rng, nro, nrd);
+                // Nested-dielectric priority: exterior IOR from the medium stack; overlapping
+                // dielectrics ranked by priority (SAFE FALLBACK to flat air<->glass otherwise).
+                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
                 wi = nrd; betaFactor = 1.0; delta = 1;
                 break;
             }
@@ -3736,6 +3960,12 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         path[cur - 1].pdfRev = dConvertDensity(pdfRevW, path[cur], path[cur - 1]);
 
         beta *= betaFactor;
+        // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
+        // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
+        if (importance && !delta) {
+            DVec3 ngo = (dot(path[cur].ng, path[cur].ns) >= 0.0) ? path[cur].ng : path[cur].ng * (Real)(-1);
+            beta *= (double)dShadingAdjointCorr(wo, normalize(wi), path[cur].ns, ngo);
+        }
         double sgn = dot(wi, path[cur].ng) >= 0.0 ? 1.0 : -1.0;
         ro = path[cur].p + path[cur].ng * (Real)(sgn * 1e-6);
         rd = normalize(wi);
@@ -3774,7 +4004,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         c.delta = 1;             // no closed-form lens inverse: not connectible (t=1 off)
         path[0] = c; int n = 1;
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
-        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, lambda, maxDepth - 1, rng, path, n);
+        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
         return n;
     }
     c.p = cam.eye;
@@ -3785,7 +4015,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     DVec3 rd = normalize(cam.w + cam.u * (sx * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
-    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n);
+    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
@@ -3815,7 +4045,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     double pdfDir = cosLight / DPI;
     double betaWalk = Le * cosLight / (pdfChoice * pdfPos * pdfDir);
     DVec3 ro = y + nOut * (Real)1e-6;
-    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, lambda, maxDepth - 1, rng, path, n);
+    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, lambda, maxDepth - 1, rng, path, n, true);
     return n;
 }
 
@@ -3927,7 +4157,17 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosSurf = ddot(qs.ns, wcam);
             if (cosSurf <= 0.0) return 0.0;
+            // Geometric-hemisphere softening (matches CPU bdpt.h): the camera must lie on the
+            // geometric front side too, else a smoothed shading normal leaks light through the
+            // back face; ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng
+            // (stG==1). GPU BDPT is reflect-only (v1), so unconditional.
+            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            double stG = (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
+            if (stG <= 0.0) return 0.0;
             f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
+            // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
+            // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
+            f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
             double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
             o = qs.p + qs.ng * (Real)(sgn * 1e-6);
         }
@@ -3963,7 +4203,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosSurf = ddot(pt.ns, wi);
             if (cosSurf <= 0.0) return 0.0;
-            f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda);
+            // Geometric-hemisphere softening on the eye/radiance vertex (matches CPU bdpt.h):
+            // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
+            DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+            double stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
+            if (stG <= 0.0) return 0.0;
+            f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda) * stG;
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
@@ -3994,7 +4239,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosE = ddot(pt.ns, w);
             if (cosE <= 0.0) return 0.0;
-            fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda);
+            // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
+            DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+            double stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
+            if (stGE <= 0.0) return 0.0;
+            fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda) * stGE;
             double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
@@ -4003,7 +4253,15 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosL = ddot(qs.ns, w * (Real)-1);
             if (cosL <= 0.0) return 0.0;
-            fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda);
+            // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
+            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            double stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
+            if (stGL <= 0.0) return 0.0;
+            fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda) * stGL;
+            // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
+            // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
+            fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
         if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
@@ -4067,6 +4325,153 @@ __global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm
     }
 }
 
+// ----------------------- photon-map camera gather (mode M) -------------------
+// Device twin of photonGather (photonmap_render.h, fgRays == 0 path). Follows a camera
+// ray through specular surfaces (monochromatic at the sampled `lambda`); at the first
+// diffuse / translucent hit it estimates reflected radiance by a radius density query
+// into the uploaded photon map, each photon reflected at ITS OWN wavelength so the
+// estimate is built directly in XYZ (returned via oX/oY/oZ). Directly-viewed emitters
+// are added as a monochromatic estimate at the sampled lambda. No final gather, no env
+// (both gated out by cudaPhotonMapSupported); Beer-Lambert interior absorption is tracked
+// exactly like bkRadiance. Keep in sync with photonGather.
+__device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
+                                     DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
+                                     double& oX, double& oY, double& oZ) {
+    oX = oY = oZ = 0.0;
+    double thr = 1.0;
+    DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
+    const double area = DPI * (double)pm.radius * (double)pm.radius;
+    const double norm = (pm.nEmitted > 0 && area > 0.0) ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
+    const double r2 = (double)pm.radius * (double)pm.radius;
+    const int maxBounce = 32;
+
+    for (int b = 0; b < maxBounce; ++b) {
+        DHit h = closestHit(sc, ro, rd);
+        if (h.valid) {                                   // Beer-Lambert in current medium
+            int cm = stk.topMat();
+            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        }
+        if (!h.valid) return;                            // escaped (env gated out of mode-M GPU)
+
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return;                       // absorbed by the mix
+            mp = &sc.mats[child]; matId = child;
+        }
+        const DMaterial& m = *mp;
+
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0) {                                   // directly-viewed / specular-seen emitter
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            oX += (double)cieX(lambda) * e;
+            oY += (double)cieY(lambda) * e;
+            oZ += (double)cieZ(lambda) * e;
+            return;
+        }
+
+        if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            // Radius density estimate at the visible point, accumulated in XYZ (each photon
+            // folded at its own wavelength): L_r = (1/N) sum_p rho(l_p)/pi * Phi_p / (pi r^2).
+            double gx = 0, gy = 0, gz = 0;
+            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
+            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
+            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
+            ix = min(max(ix, 0), pm.nx - 1);
+            iy = min(max(iy, 0), pm.ny - 1);
+            iz = min(max(iz, 0), pm.nz - 1);
+            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
+              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
+                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
+                  int c = (cz * pm.ny + cy) * pm.nx + cx;
+                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
+                      const DPhoton& ph = pm.photons[k];
+                      DVec3 d = h.p - ph.pos;
+                      if ((double)dot(d, d) > r2) continue;
+                      if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
+                      Real rho = dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                      double w = (double)rho * (1.0 / DPI) * (double)ph.power;
+                      gx += (double)cieX((Real)ph.lambda) * w;
+                      gy += (double)cieY((Real)ph.lambda) * w;
+                      gz += (double)cieZ((Real)ph.lambda) * w;
+                  }
+                }}}
+            double s = norm * thr;
+            oX += gx * s; oY += gy * s; oZ += gz * s;
+            return;
+        }
+
+        switch (m.type) {                                // specular walk (monochromatic)
+            case D_MIRROR: {
+                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+            case D_GLOSSY: {
+                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                if (dot(o, h.n) <= 0) return;
+                ro = h.p + h.n * RAY_EPS; rd = o; break;
+            }
+            case D_DIELECTRIC: {
+                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+                ro = nro; rd = nrd; break;
+            }
+            case D_HALFMIRROR: {
+                Real r = clamp01(specLookup(m.reflect, lambda));
+                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else                   { ro = h.p + rd * RAY_EPS; }
+                break;
+            }
+            case D_FILTER: {
+                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                ro = h.p + rd * RAY_EPS; break;
+            }
+            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+        }
+        if (thr <= 0.0) return;
+    }
+}
+
+// One thread per (pixel, sample); grid-strides over totalSamples. Mirrors kBackward's
+// seeding (global sample index) so a chunked gather is decorrelated across chunks. The
+// gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
+__global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, double* hits,
+                        long long totalSamples, long long chunkSpp, long long sppTotal,
+                        long long sampleBase, int resX, int diffraction,
+                        unsigned long long seedBase) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    for (long long idx = g; idx < totalSamples; idx += G) {
+        long long pix  = idx / chunkSpp;
+        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        int px = (int)(pix % resX);
+        int py = (int)(pix / resX);
+
+        double pdf = 0.0;
+        Real lambda = dSampleSceneLambda(sc, rng, pdf);
+        if (pdf <= 0.0) continue;
+        double invPdfL = dInvPdfLambda(sc, lambda);
+
+        DVec3 ro, rd;
+        Real jx = rng.uniform(), jy = rng.uniform();
+        dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
+
+        double oX, oY, oZ;
+        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, oX, oY, oZ);
+        size_t o = ((size_t)py * resX + px) * 3;
+        atomicAdd(&film[o + 0], oX);
+        atomicAdd(&film[o + 1], oY);
+        atomicAdd(&film[o + 2], oZ);
+        if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+    }
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
@@ -4089,6 +4494,43 @@ bool cudaAvailable() {
     return true;
 }
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
+
+// Append one flushed line to the teardown-trace file named by $FTRACE_TEARDOWN_LOG
+// (no-op when the env var is unset). Each call opens/appends/flushes/closes so that if
+// the machine hard-reboots mid-teardown, the LAST line on disk names the exact step that
+// was in flight when it died — the "log every step so the last log is the culprit"
+// diagnostic. Deliberately heavyweight-per-line (reopen + fflush) precisely so nothing is
+// buffered away and lost in a crash.
+static void teardownLog(const char* step) {
+    const char* path = std::getenv("FTRACE_TEARDOWN_LOG");
+    if (!path || !*path) return;
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    std::fprintf(f, "[teardown] %s\n", step);
+    std::fflush(f);
+    std::fclose(f);
+}
+
+void cudaGracefulShutdown() {
+    // Only touch the driver if a device was actually brought up; probing when none is
+    // present (or CUDA never initialised) would needlessly spin up a context just to
+    // tear it down. cudaAvailable() is cached and cheap.
+    if (!g_queried) { teardownLog("cuda: never initialised, skip"); return; }  // CUDA path never taken
+    if (!g_available) { teardownLog("cuda: no device, skip"); return; }        // no usable device
+    // Drain outstanding work first so the reset doesn't race a still-running kernel /
+    // async copy, then destroy the primary context on this thread synchronously. Ignore
+    // errors: this runs at shutdown and there's nothing left to salvage — the point is
+    // simply to reclaim the context HERE, in-process, rather than leaving it for the
+    // driver's asynchronous DPC teardown after main() returns. Bracketing each driver call
+    // with a flushed log line means a BSOD during teardown leaves the offending call as the
+    // last line in $FTRACE_TEARDOWN_LOG.
+    teardownLog("cuda: cudaDeviceSynchronize enter");
+    cudaDeviceSynchronize();
+    teardownLog("cuda: cudaDeviceSynchronize returned");
+    teardownLog("cuda: cudaDeviceReset enter");
+    cudaDeviceReset();
+    teardownLog("cuda: cudaDeviceReset returned");
+}
 
 bool cudaForwardSupported(const Scene& scene) {
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
@@ -4370,6 +4812,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(m.substrateK, d.substrateK);
         bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
         bakeSpec(m.transmit, d.transmit); // diffuse-transmission back-lobe albedo (translucent)
+        d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
@@ -4690,7 +5133,9 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng)));
     CUDA_CHECK(cudaMalloc(&st.bounce, (size_t)W * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&st.alive,  (size_t)W * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.interior, (size_t)W * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.stkMat, (size_t)W * DMediumStack::CAP * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.stkPri, (size_t)W * DMediumStack::CAP * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&st.stkN,   (size_t)W * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
@@ -4724,7 +5169,8 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     }
 
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
-    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive); cudaFree(st.interior); cudaFree(st.hit);
+    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
+    cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -5065,5 +5511,302 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
 
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits);
+    return out;
+}
+
+// --------------------- photon map (mode M) host ------------------------------
+
+bool cudaPhotonMapSupported(const Scene& scene) {
+    // The GPU mode-M path reuses the forward photon tracer (deposit) and a device gather
+    // that mirrors photonGather's DIRECT (fgRays == 0) density estimate. Scope for v1:
+    //   * same POD-bakeable materials as the forward path (cudaForwardSupported), and
+    //   * NO environment light — the device gather has no env term (CPU photonGather adds
+    //     env on escape / at diffuse hits); an env scene must stay on the CPU.
+    // Final gather (g_pmFinalGather > 0) and physical-lens cameras are gated by the caller
+    // (main.cpp) since those are render-config, not scene, properties. Fluorescence is fine:
+    // neither CPU nor GPU deposits at a fluorescent vertex, and both gather it as a query
+    // point, so the two agree. Participating media (fog) are supported — the forward deposit
+    // pass runs the same Woodcock free-flight as the CPU tracePhoton.
+    if (!cudaForwardSupported(scene)) return false;
+    if (scene.envIndex >= 0) return false;
+    return true;
+}
+
+// ---- mode-M photon-map cache file (-savemap / -loadmap) -----------------------
+// The deposited photon map is view-INDEPENDENT: it is the (expensive) result of the
+// forward photon trace, and any camera at any gather radius can be gathered from it. So
+// it is worth persisting. `-savemap <f>` writes the built map after the deposit pass;
+// `-loadmap <f>` reloads it and SKIPS the deposit entirely, re-gathering new camera
+// angles / a new radius for free without re-tracing a single photon. The file stores the
+// raw photon set + emitted count + energy tally; the grid is rebuilt on load via
+// PhotonMap::build(radius), so one file serves any gather radius. A scene-identity guard
+// (magic "FTPMP01\n") refuses to blend a stale map into a different scene.
+static uint64_t photonMapGuard(const Scene& scene, bool diffraction) {
+    uint64_t h = 14695981039346656037ULL;                 // FNV-1a offset basis
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+    mix((uint64_t)scene.tris.size());
+    mix((uint64_t)scene.spheres.size());
+    mix((uint64_t)scene.emitters.size());
+    uint64_t tp; std::memcpy(&tp, &scene.totalPower, sizeof tp); mix(tp);
+    mix(diffraction ? 0x9E37ULL : 0x1234ULL);
+    return h;
+}
+
+static bool savePhotonMap(const char* path, const PhotonMap& pm,
+                          const EnergyReport& e, uint64_t guard) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
+    const char magic[8] = {'F','T','P','M','P','0','1','\n'};
+    long long nPh = (long long)pm.photons.size();
+    double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
+    bool ok = true;
+    ok = ok && std::fwrite(magic, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&guard, sizeof guard, 1, f) == 1;
+    ok = ok && std::fwrite(&pm.nEmitted, sizeof pm.nEmitted, 1, f) == 1;
+    ok = ok && std::fwrite(en, sizeof en, 1, f) == 1;
+    ok = ok && std::fwrite(&nPh, sizeof nPh, 1, f) == 1;
+    if (ok && nPh > 0)
+        ok = std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    std::fclose(f);
+    if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
+    return ok;
+}
+
+static bool loadPhotonMap(const char* path, PhotonMap& pm,
+                          EnergyReport& e, uint64_t guard) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "[loadmap] cannot open %s\n", path); return false; }
+    char magic[8] = {0};
+    long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
+    bool ok = std::fread(magic, 1, 8, f) == 8;
+    if (!ok || std::memcmp(magic, "FTPMP01\n", 8) != 0) {
+        std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
+        std::fclose(f); return false;
+    }
+    ok = ok && std::fread(&g, sizeof g, 1, f) == 1;
+    ok = ok && std::fread(&nEmitted, sizeof nEmitted, 1, f) == 1;
+    ok = ok && std::fread(en, sizeof en, 1, f) == 1;
+    ok = ok && std::fread(&nPh, sizeof nPh, 1, f) == 1;
+    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated header; ignoring\n", path); std::fclose(f); return false; }
+    if (g != guard) {
+        std::fprintf(stderr, "[loadmap] %s was built for a different scene; ignoring\n", path);
+        std::fclose(f); return false;
+    }
+    if (nPh > 0) {
+        pm.photons.resize((size_t)nPh);
+        ok = std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    }
+    std::fclose(f);
+    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path); pm.photons.clear(); return false; }
+    pm.nEmitted = nEmitted;
+    e.emitted += en[0]; e.absorbed += en[1]; e.sensor += en[2]; e.escaped += en[3]; e.residual += en[4];
+    return true;
+}
+
+// Build the view-independent photon map on the GPU (forward deposit pass) and gather every
+// camera from it — the flythrough win, on the device. The deposit runs the megakernel
+// forward tracer TWICE: a count-only pass to size the buffer exactly, then a fill pass
+// (deterministic same-seed launch). The grid is built on the host (PhotonMap::build, the
+// tested counting sort) and re-uploaded, then each camera is gathered by kGather. Films are
+// SUMs over spp (writeFilm divides by spp), matching renderPhotonCamera / the backward path.
+std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
+                                            const std::vector<int>& resX, const std::vector<int>& resY,
+                                            long long N, double radius, EnergyReport& eOut,
+                                            bool diffraction, long long spp,
+                                            const SppProgress* prog,
+                                            const std::function<bool(int, const Film&)>* onFrame,
+                                            const char* mapLoad, const char* mapSave) {
+    using namespace gpu;
+    int nc = (int)cams.size();
+    std::vector<Film> out(nc);
+    for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
+    if (nc == 0 || !cudaAvailable() || !cudaPhotonMapSupported(scene)) return out;
+
+    DUpload up;
+    buildUploadScene(scene, up);
+
+    // Staging-chunk size for the host<->device photon copies (deposit download AND grid
+    // upload below). Streaming the deposits in blocks (instead of one giant transfer) means
+    // the host never holds a second full DPhoton mirror of the map alongside pm.photons -- at
+    // high photon counts (tens of millions emitted, each depositing at several bounces) those
+    // two full copies together would exhaust host RAM (std::bad_alloc). A 4M-photon block is
+    // ~176 MB, negligible next to the map itself.
+    const size_t PM_CHUNK = 4u << 20;
+
+    // Load a cached map (-loadmap) and skip the deposit entirely, or run the forward deposit
+    // trace and optionally persist it (-savemap). The map is view-independent, so a loaded
+    // one is re-gathered for any camera/radius without re-tracing a photon.
+    PhotonMap pm;
+    bool mapLoaded = false;
+    if (mapLoad && *mapLoad) {
+        mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction));
+        if (mapLoaded) {
+            std::printf("[loadmap] %s: %zu photons from %lld emitted -- deposit skipped\n",
+                        mapLoad, pm.photons.size(), (long long)pm.nEmitted);
+            pm.build(radius);                   // (re)build the grid at the requested radius
+        } else {
+            std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
+        }
+    }
+    if (!mapLoaded) {
+    // ---- forward deposit pass (count, then fill) ----
+    unsigned long long* d_depCount = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_depCount, sizeof(unsigned long long)));
+    double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
+
+    auto depositLaunch = [&](DPhoton* buf, unsigned long long cap) {
+        CUDA_CHECK(cudaMemset(d_depCount, 0, sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
+        DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
+        cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
+        cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
+        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B);
+    };
+
+    depositLaunch(nullptr, 0);              // count-only sizing pass
+    unsigned long long nDep = 0;
+    CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+    pm.nEmitted = N;
+    if (nDep > 0) {
+        DPhoton* d_photons = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+        depositLaunch(d_photons, nDep);     // fill pass (same seed => same nDep deposits)
+        unsigned long long nFill = 0;
+        CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        unsigned long long stored = (nFill < nDep) ? nFill : nDep;
+
+        // Download + convert to Photon in chunks (never a full host-side DPhoton copy).
+        pm.photons.resize((size_t)stored);
+        std::vector<DPhoton> stage;
+        for (size_t off = 0; off < (size_t)stored; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, (size_t)stored - off);
+            stage.resize(cnt);
+            CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton),
+                                  cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < cnt; ++i) {
+                const DPhoton& d = stage[i];
+                Photon& p = pm.photons[off + i];
+                p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
+                p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
+                p.power = d.power; p.lambda = d.lambda;
+            }
+        }
+        cudaFree(d_photons);
+    }
+    pm.build(radius);                       // host counting sort -> cell-contiguous runs
+
+    double energy[5] = {0,0,0,0,0};
+    CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
+    eOut.emitted  += energy[0]; eOut.absorbed += energy[1]; eOut.sensor += energy[2];
+    eOut.escaped  += energy[3]; eOut.residual += energy[4];
+    cudaFree(d_depCount); cudaFree(d_energy);
+    if (mapSave && *mapSave) {
+        EnergyReport passE{energy[0], energy[1], energy[2], energy[3], energy[4]};
+        if (savePhotonMap(mapSave, pm, passE, photonMapGuard(scene, diffraction)))
+            std::printf("[savemap] wrote %s: %zu photons (%lld emitted)\n",
+                        mapSave, pm.photons.size(), (long long)pm.nEmitted);
+    }
+    }   // end if (!mapLoaded): deposit + build + optional save
+
+    // ---- upload the built grid ----
+    DPhotonMap dpm{};
+    dpm.nEmitted = pm.nEmitted;
+    dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
+    dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
+    dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
+    dpm.photons = nullptr;
+    if (!pm.photons.empty()) {
+        // Upload the sorted map host->device in chunks (no full DPhoton mirror).
+        size_t n = pm.photons.size();
+        DPhoton* d_sorted = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DPhoton)));
+        std::vector<DPhoton> stage;
+        for (size_t off = 0; off < n; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, n - off);
+            stage.resize(cnt);
+            for (size_t i = 0; i < cnt; ++i) {
+                const Photon& p = pm.photons[off + i];
+                DPhoton& d = stage[i];
+                d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
+                d.wi  = DVec3(p.wi.x,  p.wi.y,  p.wi.z);
+                d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
+                d.power = p.power; d.lambda = p.lambda;
+            }
+            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DPhoton),
+                                  cudaMemcpyHostToDevice));
+        }
+        dpm.photons = (const DPhoton*)up.keep(d_sorted);
+    }
+    // cellStart always has >= 2 entries after build() (even for an empty map, where every
+    // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
+    dpm.cellStart = (const int*)up.keep(uploadVec(pm.cellStart));
+
+    // ---- gather each camera ----
+    // Pull the current device accumulation for camera c into out[c] (film + hit map).
+    auto downloadFilm = [&](int c, const double* d_film, const double* d_hits, size_t npix) {
+        std::vector<double> film(npix * 3);
+        CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)
+            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+    };
+    const bool live = (prog && prog->report);
+    auto lastReport = std::chrono::steady_clock::now();
+    bool stopped = false;
+    for (int c = 0; c < nc && !stopped; ++c) {
+        DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
+        const size_t npix = (size_t)resX[c] * resY[c];
+        double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
+        double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+        const unsigned long long seed = 0xA24BAED4963EE407ULL ^ (0x9E3779B97F4A7C15ULL * (unsigned long long)(c + 1));
+        // Chunk spp so a single launch stays well under the Windows TDR watchdog even when a
+        // caustic cell holds a dense photon cluster (heavy density query).
+        long long chunk = 200000 / (long long)(npix ? npix : 1); if (chunk < 1) chunk = 1;
+        for (long long base = 0; base < spp; base += chunk) {
+            long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
+            long long total = (long long)npix * cs2;
+            kGather<<<2048, 128>>>(up.sc, dpm, hc, d_film, d_hits, total, cs2, spp, base,
+                                   resX[c], diffraction ? 1 : 0, seed);
+            cudaCheckKernel("photon-gather");
+            // Live view: after a chunk, hand the host the frame-so-far so it can refresh the
+            // window/preview. Throttle to ~10 Hz (a high-res gather chunks one spp at a time,
+            // which is far finer than the eye needs) but always report the completed frame.
+            if (live) {
+                long long done = base + cs2;
+                bool frameDone = (done >= spp);
+                auto now = std::chrono::steady_clock::now();
+                if (frameDone || std::chrono::duration<double>(now - lastReport).count() >= 0.1) {
+                    downloadFilm(c, d_film, d_hits, npix);
+                    if (prog->report(out[c], done, frameDone)) stopped = true;
+                    lastReport = now;
+                    if (stopped) break;
+                }
+            }
+        }
+        downloadFilm(c, d_film, d_hits, npix);   // ensure out[c] holds the final accumulation
+        cudaFree(d_film); cudaFree(d_hits);
+        // Hand the finished frame to the host for IMMEDIATE crash-safe write, then release
+        // its buffers so a long flythrough runs in ~one frame of host RAM instead of holding
+        // all nc films to the end (mirrors the CPU mode-M path, which writes per frame). If
+        // the host asks to stop (window closed / Ctrl-C), quit after this frame — everything
+        // written so far is already safely on disk.
+        if (onFrame) {
+            bool stopReq = (*onFrame)(c, out[c]);
+            Film empty; empty.resX = resX[c]; empty.resY = resY[c];   // shape kept, buffers freed
+            out[c] = std::move(empty);
+            if (stopReq) stopped = true;
+        }
+        if (nc > 1) {   // watchable per-frame progress on a multi-camera (flythrough) render
+            std::printf("\r[camera] mode-M GPU gather %d/%d ...", c + 1, nc);
+            std::fflush(stdout);
+        }
+    }
+    if (nc > 1) { std::printf("\n"); std::fflush(stdout); }
+
+    freeUpload(up);
     return out;
 }

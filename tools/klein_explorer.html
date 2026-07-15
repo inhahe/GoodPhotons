@@ -8,7 +8,9 @@
   :root { --bg:#14161a; --panel:#1d2027; --ink:#e7e9ee; --dim:#9aa0ad; --acc:#e0b25a; }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
-    font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+    font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    user-select:none; -webkit-user-select:none; }
+  pre, #snippet { user-select:text; -webkit-user-select:text; }
   #wrap { display:flex; height:100vh; }
   #view { flex:1; position:relative; min-width:0; }
   canvas { display:block; width:100%; height:100%; }
@@ -24,6 +26,10 @@
   .row label b { color:var(--ink); font-variant-numeric:tabular-nums; font-weight:600; }
   .row .desc { color:#6d7482; font-size:11px; margin-top:2px; }
   input[type=range] { width:100%; accent-color:var(--acc); }
+  select { width:100%; background:#2a2f39; color:var(--ink); border:1px solid #000;
+    border-radius:6px; padding:6px 8px; font-size:12px; }
+  .mgroup[hidden] { display:none; }
+  #modelDesc { color:#6d7482; font-size:11px; margin-top:6px; }
   .chk { display:flex; gap:8px; align-items:center; margin:8px 0; color:var(--dim); }
   .btns { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
   button { background:#2a2f39; color:var(--ink); border:1px solid #000; border-radius:6px;
@@ -45,34 +51,84 @@
   </div>
   <div id="panel">
     <h1>Klein Bottle Explorer</h1>
-    <p class="sub">Live raymarch of the generalized POV klein quartic. Drag the knobs;
+    <p class="sub">Three different Klein-bottle definitions. Pick one, drag the knobs,
       copy the ftrace scene when you like a shape.</p>
 
     <div class="row">
-      <label>a — body/neck separation, re-entry height <b id="va">2.00</b></label>
-      <input id="a" type="range" min="1.2" max="3.4" step="0.01" value="2.00">
+      <label>model</label>
+      <select id="model">
+        <option value="bottle">Classic bottle (bulb + swept-tube neck)</option>
+        <option value="quartic">Algebraic quartic (POV-Ray)</option>
+      </select>
+      <div class="desc" id="modelDesc"></div>
     </div>
-    <div class="row">
-      <label>b — body size <b id="vb">1.00</b></label>
-      <input id="b" type="range" min="0.6" max="1.6" step="0.01" value="1.00">
+
+    <!-- ============ CLASSIC BOTTLE (default) ============ -->
+    <div class="mgroup" data-m="bottle">
+      <div class="row">
+        <label>body size (bulb radius) <b id="vbs">0.55</b></label>
+        <input id="bs" type="range" min="0.40" max="0.72" step="0.005" value="0.55">
+        <div class="desc">the round belly — bigger = fatter bulb; the neck's loop scales
+          and stays attached with it (thickness stays independent below)</div>
+      </div>
+      <div class="row">
+        <label>neck thickness (tube radius) <b id="vnt">0.110</b></label>
+        <input id="nt" type="range" min="0.05" max="0.20" step="0.005" value="0.110">
+        <div class="desc">the thin part of the swept tube — independent of the body</div>
+      </div>
+      <div class="row">
+        <label>base flare (shoulder radius) <b id="vfl">0.340</b></label>
+        <input id="fl" type="range" min="0.11" max="0.50" step="0.005" value="0.340">
+        <div class="desc">how fat the neck swells where it leaves the belly, then tapers to the
+          neck thickness up the arc — a bigger flare plus a higher blend k below melts the join
+          into a smooth, borderless shoulder</div>
+      </div>
+      <div class="row">
+        <label>shoulder blend (melt) <b id="vbk">0.100</b></label>
+        <input id="bk" type="range" min="0.01" max="0.22" step="0.005" value="0.100">
+        <div class="desc">how wide the body↔neck junction melts together — higher dissolves the
+          shoulder into the belly so there's no visible border (the neck's own joints stay crisp)</div>
+      </div>
     </div>
-    <div class="row">
-      <label>c — mouth opening (z²) <b id="vc">8.0</b></label>
-      <input id="c" type="range" min="3" max="16" step="0.1" value="8.0">
-      <div class="desc">too low seals the mouth into a plain egg</div>
+
+    <!-- ============ ALGEBRAIC QUARTIC (POV-Ray) ============ -->
+    <div class="mgroup" data-m="quartic" hidden>
+      <div class="row">
+        <label>a — body/neck separation, re-entry height <b id="va">2.00</b></label>
+        <input id="a" type="range" min="0.6" max="3.4" step="0.01" value="2.00">
+      </div>
+      <div class="row">
+        <label>b — body size <b id="vb">1.00</b></label>
+        <input id="b" type="range" min="0.3" max="1.6" step="0.01" value="1.00">
+      </div>
+      <div class="row">
+        <label>c — mouth opening (z²) <b id="vc">8.0</b></label>
+        <input id="c" type="range" min="1" max="16" step="0.1" value="8.0">
+        <div class="desc">too low seals the mouth into a plain egg</div>
+      </div>
+      <div class="row">
+        <label>d — neck-tube curl (x·z) <b id="vd">16.0</b></label>
+        <input id="d" type="range" min="4" max="30" step="0.1" value="16.0">
+        <div class="desc">also helps hold the mouth open</div>
+      </div>
+      <div class="row">
+        <label>level — iso-level (wall thickness) <b id="vL">0.00</b></label>
+        <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.00">
+      </div>
+      <div class="btns">
+        <button class="preset" data-p="2.0,1.0,8,16">POV classic</button>
+        <button class="preset" data-p="1.2,0.6,3,18.5,0.15,5.0">glass pick</button>
+        <button class="preset" data-p="2.0,1.0,12,16">wide mouth</button>
+        <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
+        <button class="preset" data-p="2.7,1.0,9,16">low re-entry</button>
+        <button class="preset" data-p="2.0,1.2,9,16">big body</button>
+      </div>
     </div>
+
+    <!-- ============ SHARED ============ -->
     <div class="row">
-      <label>d — neck-tube curl (x·z) <b id="vd">16.0</b></label>
-      <input id="d" type="range" min="4" max="30" step="0.1" value="16.0">
-      <div class="desc">also helps hold the mouth open</div>
-    </div>
-    <div class="row">
-      <label>level — iso-level (wall thickness) <b id="vL">0.00</b></label>
-      <input id="L" type="range" min="-1.5" max="1.5" step="0.01" value="0.00">
-    </div>
-    <div class="row">
-      <label>clip radius (object space) <b id="vR">3.20</b></label>
-      <input id="R" type="range" min="1.5" max="5.0" step="0.05" value="3.20">
+      <label>clip radius (object space) <b id="vR">1.10</b></label>
+      <input id="R" type="range" min="0.8" max="6.0" step="0.05" value="1.10">
     </div>
     <div class="row">
       <label>march quality (steps) <b id="vS">256</b></label>
@@ -81,15 +137,6 @@
 
     <label class="chk"><input id="cap" type="checkbox"> cap the cut (default = open)</label>
     <label class="chk"><input id="spin" type="checkbox" checked> auto-spin</label>
-
-    <div class="btns">
-      <button class="preset" data-p="2.0,1.0,8,16">base</button>
-      <button class="preset" data-p="2.0,1.0,12,16">wide mouth</button>
-      <button class="preset" data-p="2.0,1.0,8,26">tight curl</button>
-      <button class="preset" data-p="2.0,1.0,10,12">loose curl</button>
-      <button class="preset" data-p="2.7,1.0,9,16">low re-entry</button>
-      <button class="preset" data-p="2.0,1.2,9,16">big body</button>
-    </div>
 
     <hr>
     <div class="btns">
@@ -121,6 +168,58 @@ const cv = document.getElementById('gl');
 const gl = cv.getContext('webgl2', {antialias:false, preserveDrawingBuffer:true});
 if (!gl) { document.body.innerHTML = '<p style="padding:20px">WebGL2 not available in this browser.</p>'; }
 
+// Kill the browser's native drag (text/element) that otherwise hijacks a slider or
+// canvas drag and shows the "not-allowed" cursor mid-drag.
+window.addEventListener('dragstart', e => e.preventDefault());
+
+// The iconic "glassblower's" Klein bottle as a signed-distance field: a round bulb
+// (one sphere) plus a VARIABLE-radius swept-tube neck. The neck centreline is a
+// Catmull-Rom spline through the control points below, sampled densely so the tube
+// curves smoothly (no polyline kinks). Each control point carries a "shoulder weight"
+// w in [0..1]: the neck radius = mix(neckR, flareR, w), so the tube is fat where it
+// leaves the belly (w=1) and tapers to the thin neck (w=0) — the body flows up into
+// the neck. Object-local, +Y up, z=0. [x, y, z, w].
+const BODY_C = [0.0, -0.25, 0.0];        // bulb centre (radius = body-size slider)
+const NECK_CP = [                         // neck control points + shoulder weight
+  [ 0.00, -0.10, 0.00, 1.00],
+  [ 0.00,  0.18, 0.00, 0.90],
+  [ 0.00,  0.40, 0.00, 0.62],
+  [ 0.06,  0.58, 0.00, 0.38],
+  [ 0.16,  0.71, 0.00, 0.18],
+  [ 0.31,  0.76, 0.00, 0.06],
+  [ 0.46,  0.71, 0.00, 0.00],
+  [ 0.59,  0.57, 0.00, 0.00],
+  [ 0.66,  0.37, 0.00, 0.00],
+  [ 0.64,  0.17, 0.00, 0.00],
+  [ 0.55, -0.01, 0.00, 0.15],
+  [ 0.40, -0.14, 0.00, 0.42],
+  [ 0.22, -0.19, 0.00, 0.72],
+  [ 0.07, -0.12, 0.00, 0.95],
+];
+// Uniform Catmull-Rom through the 4-vectors (position + weight), `sub` samples/segment.
+function catmullRom(pts, sub){
+  const n = pts.length, P = i => pts[Math.max(0, Math.min(n-1, i))], out = [];
+  for (let i=0;i<n-1;i++){
+    const p0=P(i-1), p1=P(i), p2=P(i+1), p3=P(i+2);
+    for (let j=0;j<sub;j++){
+      const t=j/sub, t2=t*t, t3=t2*t, c=[];
+      for (let k=0;k<4;k++)
+        c[k] = 0.5*(2*p1[k] + (-p0[k]+p2[k])*t
+                  + (2*p0[k]-5*p1[k]+4*p2[k]-p3[k])*t2
+                  + (-p0[k]+3*p1[k]-3*p2[k]+p3[k])*t3);
+      out.push(c);
+    }
+  }
+  out.push(P(n-1).slice());
+  return out;
+}
+const NECK_SAMP = catmullRom(NECK_CP, 4);    // [x,y,z,w] per sample — the smooth centreline
+const bottleGLSL =
+  'const int NS = ' + NECK_SAMP.length + ';\n' +
+  'const vec3 BODY_C = vec3(' + BODY_C.map(v=>v.toFixed(3)).join(',') + ');\n' +
+  'const vec4 SAMP[' + NECK_SAMP.length + '] = vec4[' + NECK_SAMP.length + '](\n' +
+  NECK_SAMP.map(s => '  vec4(' + [s[0],s[1],s[2],s[3]].map(v => v.toFixed(4)).join(',') + ')').join(',\n') + ');';
+
 const VS = `#version 300 es
 in vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
 
@@ -131,18 +230,63 @@ uniform vec2  uRes;
 uniform vec3  uCam;      // camera position (object space)
 uniform mat3  uBasis;    // right, up, forward
 uniform float uA,uB,uC,uD,uL,uR;
+uniform float uBodyR,uNeckR,uFlareR,uBk;
+uniform int   uModel;    // 0 = bottle (SDF), 1 = quartic
 uniform int   uSteps;
 uniform int   uCap;
 const int MAXSTEPS = 512;
 
+${bottleGLSL}
+
+// ---- model 1: Ian Stewart quartic (POV-Ray's classic klein.pov) ----
 float fieldP(vec3 p){
   float S = dot(p,p);
   float A = S - uA*p.y - uB;
   float bd = S + uA*p.y - uB;
   return bd*(A*A - uC*p.z*p.z) + uD*p.x*p.z*A;
 }
-// solid interior where field > 0 (matches ftrace: f = clamp(-(P-L)) < 0)
-float field(vec3 p){ return fieldP(p) - uL; }
+
+// ---- model 0: rounded bulb + tapering swept-tube neck (a signed distance field) ----
+float smin(float a, float b, float k){
+  float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
+  return mix(b, a, h) - k*h*(1.0-h);
+}
+// exact round cone: sphere r1 at a smoothly tapering to sphere r2 at b (iq)
+float sdRoundCone(vec3 p, vec3 a, vec3 b, float r1, float r2){
+  vec3 ba = b - a; float l2 = dot(ba,ba);
+  float rr = r1 - r2, a2 = l2 - rr*rr, il2 = 1.0/l2;
+  vec3 pa = p - a;
+  float y = dot(pa,ba), z = y - l2;
+  vec3 xv = pa*l2 - ba*y;
+  float x2 = dot(xv,xv), y2 = y*y*l2, z2 = z*z*l2;
+  float k = sign(rr)*rr*rr*x2;
+  if (sign(z)*a2*z2 > k) return sqrt(x2+z2)*il2 - r2;
+  if (sign(y)*a2*y2 < k) return sqrt(x2+y2)*il2 - r1;
+  return (sqrt(x2*a2*il2) + y*rr)*il2 - r1;
+}
+// taper: neck thickness (w=0) swelling to the flare radius (w=1) at the base. A generous
+// flare + a generous blend k below give a tangent, crease-free shoulder with no border.
+float neckRadius(float w){ return mix(uNeckR, uFlareR, w); }
+const float BS0 = 0.55;     // reference bulb radius the neck centreline was authored at
+const float NECK_K = 0.02;  // tight blend for the neck's own joints (keeps the tube crisp)
+float field_bottle(vec3 p){
+  float sc = uBodyR / BS0;                            // neck layout scales with the bulb
+  float body = length(p - BODY_C) - uBodyR;           // the round bulb
+  float neck = 1e9;
+  for (int i=0;i<NS-1;i++){
+    vec3 a = BODY_C + (SAMP[i].xyz   - BODY_C) * sc;   // centreline tracks body size
+    vec3 b = BODY_C + (SAMP[i+1].xyz - BODY_C) * sc;
+    float seg = sdRoundCone(p, a, b, neckRadius(SAMP[i].w), neckRadius(SAMP[i+1].w));
+    neck = smin(neck, seg, NECK_K);                    // crease-free tube, no bulging
+  }
+  return -smin(body, neck, uBk);                       // WIDE shoulder blend melts the body<->neck
+}                                                      // border away; d<0 -> field>0
+
+// solid interior where field > 0 (ftrace's expr < 0 convention, negated)
+float field(vec3 p){
+  if (uModel==0) return field_bottle(p);
+  return fieldP(p) - uL;
+}
 
 vec3 gradient(vec3 p){
   float e = 0.0015;
@@ -240,38 +384,77 @@ gl.enableVertexAttribArray(ploc);
 gl.vertexAttribPointer(ploc, 2, gl.FLOAT, false, 0, 0);
 
 const U = {};
-['uRes','uCam','uBasis','uA','uB','uC','uD','uL','uR','uSteps','uCap']
+['uRes','uCam','uBasis','uA','uB','uC','uD','uL','uR','uSteps','uCap',
+ 'uBodyR','uNeckR','uFlareR','uBk','uModel']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 // ---- controls ----
 const el = id => document.getElementById(id);
-const ctl = { a:el('a'), b:el('b'), c:el('c'), d:el('d'), L:el('L'), R:el('R'), S:el('S') };
-const val = { a:el('va'), b:el('vb'), c:el('vc'), d:el('vd'), L:el('vL'), R:el('vR'), S:el('vS') };
+const ctl = { model:el('model'),
+              a:el('a'), b:el('b'), c:el('c'), d:el('d'), L:el('L'),
+              bs:el('bs'), nt:el('nt'), fl:el('fl'), bk:el('bk'),
+              R:el('R'), S:el('S') };
+const val = { a:el('va'), b:el('vb'), c:el('vc'), d:el('vd'), L:el('vL'),
+              bs:el('vbs'), nt:el('vnt'), fl:el('vfl'), bk:el('vbk'),
+              R:el('vR'), S:el('vS') };
 const cap = el('cap'), spin = el('spin');
 
+const MODEL_IDX  = { bottle:0, quartic:1 };
+const MODEL_R    = { bottle:1.05, quartic:1.10 };   // default clip radius per model
+const MODEL_DESC = {
+  bottle: "The iconic glassblower's Klein bottle: a round bulb whose neck rises from the top, "
+        + "arcs over, stands clear of the body and dives back into the side. The bulb is one "
+        + "sphere and the neck is a smooth swept tube, smooth-unioned so there are no facets; "
+        + "both ends flare into the belly. Neck thickness is an independent knob, but its loop "
+        + "scales with body size so it stays attached. Exports to a clean watertight mesh.",
+  quartic: "Ian Stewart's quartic — exactly POV-Ray's classic klein.pov isosurface (a=2, b=1, "
+        + "c=8, d=16). Mathematically a Klein bottle, but it renders as a smooth blob, never the "
+        + "familiar bottle shape, no matter how you tune it.",
+};
+
 function nums(){
-  return { a:+ctl.a.value, b:+ctl.b.value, c:+ctl.c.value, d:+ctl.d.value,
-           L:+ctl.L.value, R:+ctl.R.value, S:+ctl.S.value };
+  return { model: ctl.model.value,
+           a:+ctl.a.value, b:+ctl.b.value, c:+ctl.c.value, d:+ctl.d.value, L:+ctl.L.value,
+           bs:+ctl.bs.value, nt:+ctl.nt.value, fl:+ctl.fl.value, bk:+ctl.bk.value,
+           R:+ctl.R.value, S:+ctl.S.value };
 }
 function refreshLabels(){
   const n = nums();
   val.a.textContent = n.a.toFixed(2); val.b.textContent = n.b.toFixed(2);
   val.c.textContent = n.c.toFixed(1); val.d.textContent = n.d.toFixed(1);
-  val.L.textContent = n.L.toFixed(2); val.R.textContent = n.R.toFixed(2);
-  val.S.textContent = n.S.toFixed(0);
+  val.L.textContent = n.L.toFixed(2);
+  val.bs.textContent = n.bs.toFixed(2); val.nt.textContent = n.nt.toFixed(3);
+  val.fl.textContent = n.fl.toFixed(3); val.bk.textContent = n.bk.toFixed(3);
+  val.R.textContent = n.R.toFixed(2);  val.S.textContent = n.S.toFixed(0);
   updateSnippet(n);
 }
 Object.values(ctl).forEach(x => x.addEventListener('input', refreshLabels));
 
+function switchModel(){
+  const m = ctl.model.value;
+  document.querySelectorAll('.mgroup').forEach(g => g.hidden = (g.dataset.m !== m));
+  el('modelDesc').textContent = MODEL_DESC[m];
+  ctl.R.value = MODEL_R[m];
+  refreshLabels();
+}
+ctl.model.addEventListener('change', switchModel);
+
 document.querySelectorAll('.preset').forEach(btn=>{
   btn.addEventListener('click', ()=>{
-    const [a,b,c,d] = btn.dataset.p.split(',').map(Number);
-    ctl.a.value=a; ctl.b.value=b; ctl.c.value=c; ctl.d.value=d; ctl.L.value=0;
+    const [a,b,c,d,lvl,r] = btn.dataset.p.split(',').map(Number);
+    ctl.a.value=a; ctl.b.value=b; ctl.c.value=c; ctl.d.value=d;
+    ctl.L.value = (lvl===undefined ? 0 : lvl);
+    if (r!==undefined) ctl.R.value = r;
     refreshLabels();
   });
 });
 
 function updateSnippet(n){
+  if (n.model === 'bottle')  { el('snippet').textContent = snippetBottle(n); return; }
+  el('snippet').textContent = snippetQuartic(n);
+}
+
+function snippetQuartic(n){
   const A=n.a, B=n.b, C=n.c, D=n.d, L=n.L;
   const inner = `(r*r - ${A}*y - ${B})`;
   const body  = `(r*r + ${A}*y - ${B})`;
@@ -281,9 +464,9 @@ function updateSnippet(n){
   const scale = 0.55;
   const rWorld = (scale * n.R).toFixed(3);
   const mg = Math.max(18, Math.round(C + D));
-  el('snippet').textContent =
-`isosurface {
-    material gold
+  return `# Klein bottle — Ian Stewart quartic (POV-Ray's classic klein.pov)
+isosurface {
+    material glass
     function {
         expr "${expr}"
         scale ${scale}   translate 0 1.2 0   rotate 12 28 0
@@ -291,6 +474,43 @@ function updateSnippet(n){
     contained_by { sphere { center 0 1.2 0  radius ${rWorld} } }
     max_gradient ${mg}
     open
+}`;
+}
+
+function snippetBottle(n){
+  const sc = n.bs / 0.55;                         // neck centreline scales with the bulb
+  const scale = p => [ BODY_C[0] + (p[0]-BODY_C[0])*sc,
+                       BODY_C[1] + (p[1]-BODY_C[1])*sc,
+                       BODY_C[2] + (p[2]-BODY_C[2])*sc, p[3] ];
+  const SAMP = NECK_SAMP.map(scale);              // body-coupled samples
+  const nr = w => n.nt + (n.fl - n.nt)*w;        // taper: neck thickness -> flare radius at base
+  const neck = [];                                // neck primitives -> inner (tight) smooth_union
+  for (const p of SAMP)                           // rounded joints at every sample
+    neck.push(`            sphere { center ${p[0].toFixed(3)} ${p[1].toFixed(3)} ${p[2].toFixed(2)}  radius ${nr(p[3]).toFixed(3)} }`);
+  for (let i=0;i<SAMP.length-1;i++){              // tapering frusta between samples
+    const a=SAMP[i], b=SAMP[i+1];
+    const dx=b[0]-a[0], dy=b[1]-a[1];
+    const len=Math.hypot(dx,dy);
+    if (len < 1e-5) continue;
+    const mx=(a[0]+b[0])/2, my=(a[1]+b[1])/2;
+    const deg=Math.atan2(-dx, dy)*180/Math.PI;    // orient local +y (bottom->top) along segment
+    neck.push(`            cone { radius ${nr(a[3]).toFixed(3)}  radius2 ${nr(b[3]).toFixed(3)}  height ${len.toFixed(3)}` +
+              `  translate ${mx.toFixed(3)} ${my.toFixed(3)} 0  rotate 0 0 ${deg.toFixed(2)} }`);
+  }
+  // Nested smooth_union: a WIDE outer blend (k ${n.bk}) melts the body<->neck shoulder so
+  // there's no border; the neck's own joints use a tight inner blend so the tube stays crisp.
+  return `# Klein bottle — round bulb + tapering swept-tube neck (SDF; body, neck & flare independent)
+isosurface {
+    material glass
+    translate 0 1.05 0   scale 1.0   rotate 0 25 0
+    smooth_union { k ${n.bk.toFixed(3)}
+        # round bulb
+        sphere { center ${BODY_C[0].toFixed(2)} ${BODY_C[1].toFixed(2)} ${BODY_C[2].toFixed(2)}  radius ${n.bs.toFixed(3)} }
+        # neck: tapering swept tube (spline-sampled round-cone chain, scaled with body)
+        smooth_union { k 0.020
+${neck.join('\n')}
+        }
+    }
 }`;
 }
 el('copy').addEventListener('click', ()=>{
@@ -310,16 +530,51 @@ el('copy').addEventListener('click', ()=>{
 const kCorner = [[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,1,0],[1,1,0],[1,1,1],[0,1,1]];
 const kTet    = [[0,1,5,6],[0,1,2,6],[0,4,5,6],[0,4,7,6],[0,3,2,6],[0,3,7,6]];
 
+// signed field for meshing, matching the shader (> 0 inside the solid) for each model
+function makeSolid(n){
+  if (n.model === 'bottle'){
+    const smin = (a,b,k)=>{ const h=Math.max(0,Math.min(1,0.5+0.5*(b-a)/k)); return (b + (a-b)*h) - k*h*(1-h); };
+    const nr = w => n.nt + (n.fl - n.nt)*w;      // taper: neck thickness -> flare radius at base
+    const rcone = (px,py,pz,a,b,r1,r2)=>{        // iq round cone (matches the shader)
+      const bx=b[0]-a[0], by=b[1]-a[1], bz=b[2]-a[2], l2=bx*bx+by*by+bz*bz;
+      const rr=r1-r2, a2=l2-rr*rr, il2=1/l2;
+      const pax=px-a[0], pay=py-a[1], paz=pz-a[2];
+      const yv=pax*bx+pay*by+paz*bz, zv=yv-l2;
+      const xx=pax*l2-bx*yv, xy=pay*l2-by*yv, xz=paz*l2-bz*yv;
+      const x2=xx*xx+xy*xy+xz*xz, y2=yv*yv*l2, z2=zv*zv*l2;
+      const k=Math.sign(rr)*rr*rr*x2;
+      if (Math.sign(zv)*a2*z2 > k) return Math.sqrt(x2+z2)*il2 - r2;
+      if (Math.sign(yv)*a2*y2 < k) return Math.sqrt(x2+y2)*il2 - r1;
+      return (Math.sqrt(x2*a2*il2) + yv*rr)*il2 - r1;
+    };
+    const sc = n.bs / 0.55;                        // neck centreline scales with the bulb
+    const S = p => [ BODY_C[0] + (p[0]-BODY_C[0])*sc,
+                     BODY_C[1] + (p[1]-BODY_C[1])*sc,
+                     BODY_C[2] + (p[2]-BODY_C[2])*sc, p[3] ];
+    const SAMP = NECK_SAMP.map(S);                 // body-coupled samples
+    return (x,y,z)=>{
+      let body = Math.hypot(x-BODY_C[0], y-BODY_C[1], z-BODY_C[2]) - n.bs;
+      let neck = 1e9;
+      for (let i=0;i<SAMP.length-1;i++){
+        const a=SAMP[i], b=SAMP[i+1];
+        neck = smin(neck, rcone(x,y,z, a, b, nr(a[3]), nr(b[3])), 0.02);  // tight neck joints
+      }
+      return -smin(body, neck, n.bk);                                     // wide shoulder melt
+    };
+  }
+  return (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-n.a*y-n.b, bd=S+n.a*y-n.b;
+    return (bd*(A*A - n.c*z*z) + n.d*x*z*A) - n.L; };
+}
+
 function buildMesh(n, N){
-  const {a,b,c,d,L,R} = n;
+  const R = n.R;
   const pad = R*1.06;                      // sample a hair past the sphere so the cap closes
   const lo = -pad, h = (2*pad)/N, S1 = N+1;
   const gp = i => lo + h*i;
   const S3 = S1*S1*S1;
-  const fieldP = (x,y,z)=>{ const S=x*x+y*y+z*z, A=S-a*y-b, bd=S+a*y-b;
-                            return bd*(A*A - c*z*z) + d*x*z*A; };
-  // aug < 0  ⟺  inside solid (fieldP > L) AND inside clip sphere.  aug == 0 is the surface.
-  const aug = (x,y,z)=>{ const f = L - fieldP(x,y,z), s = Math.sqrt(x*x+y*y+z*z) - R;
+  const solid = makeSolid(n);
+  // aug < 0  ⟺  inside solid (field > 0) AND inside clip sphere.  aug == 0 is the surface.
+  const aug = (x,y,z)=>{ const f = -solid(x,y,z), s = Math.sqrt(x*x+y*y+z*z) - R;
                          return f > s ? f : s; };
 
   // sample the augmented field on the lattice
@@ -399,7 +654,9 @@ function buildMesh(n, N){
 function toOBJ(pos, nrm, tris, scale, n){
   const P=[];
   P.push('# Klein bottle isosurface — exported from klein_explorer.html');
-  P.push(`# a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L} clip_radius=${n.R}`);
+  const desc = n.model==='bottle' ? `bottle body=${n.bs} neck=${n.nt} flare=${n.fl} k=${n.bk}`
+             : `quartic a=${n.a} b=${n.b} c=${n.c} d=${n.d} level=${n.L}`;
+  P.push(`# model=${n.model}  ${desc}  clip_radius=${n.R}`);
   P.push('# watertight marching-tetrahedra mesh, +Y up, 1 unit = 1 cm (Unreal)');
   P.push('o klein_bottle');
   for (let i=0;i<pos.length;i+=3)
@@ -442,7 +699,8 @@ el('export').addEventListener('click', ()=>{
       const scale = targetCm / dim;
       const obj = toOBJ(m.pos, m.nrm, m.tris, scale, n);
       const nv = m.pos.length/3, nt = m.tris.length/3;
-      const fn = `klein_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
+      const fn = n.model==='bottle' ? `klein_bottle_b${n.bs.toFixed(2)}_n${n.nt.toFixed(2)}_f${n.fl.toFixed(2)}.obj`
+               : `klein_quartic_a${n.a.toFixed(2)}_b${n.b.toFixed(2)}_c${n.c.toFixed(1)}_d${n.d.toFixed(1)}.obj`;
       downloadText(fn, obj);
       const dt = ((performance.now()-t0)/1000).toFixed(1);
       st.textContent = `exported ${nv.toLocaleString()} verts / ${nt.toLocaleString()} tris in ${dt}s → ${fn}`;
@@ -500,6 +758,9 @@ function frame(now){
     r[0],r[1],r[2], up[0],up[1],up[2], fwd[0],fwd[1],fwd[2] ]));
   gl.uniform1f(U.uA,n.a); gl.uniform1f(U.uB,n.b); gl.uniform1f(U.uC,n.c);
   gl.uniform1f(U.uD,n.d); gl.uniform1f(U.uL,n.L); gl.uniform1f(U.uR,n.R);
+  gl.uniform1f(U.uBodyR,n.bs); gl.uniform1f(U.uNeckR,n.nt);
+  gl.uniform1f(U.uFlareR,n.fl); gl.uniform1f(U.uBk,n.bk);
+  gl.uniform1i(U.uModel, MODEL_IDX[n.model]|0);
   gl.uniform1i(U.uSteps, n.S|0); gl.uniform1i(U.uCap, cap.checked?1:0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -507,7 +768,7 @@ function frame(now){
   if (facc>500){ el('fps').textContent = (1000*frames/facc).toFixed(0)+' fps'; frames=0; facc=0; }
   requestAnimationFrame(frame);
 }
-refreshLabels();
+switchModel();          // sets the initial model group visibility + description + clip radius
 requestAnimationFrame(frame);
 </script>
 </body>

@@ -15,23 +15,45 @@ directories (already created, and git-ignored):
 When creating validation renders or scratch scripts, always target these directories
 so the working tree stays tidy and nothing stray shows up in `git status`.
 
-## Running renders — ALWAYS give the user a way to watch progress
+## Running renders — NEVER use the default (sandboxed) Bash tool
 
-Never launch a render as a fire-and-forget black box. Any render you start must
-provide periodic, checkable output so both you and the user can see it converging
-and confirm it will actually finish. Concretely, when you start a render:
+**Do NOT launch renders through the ordinary sandboxed Bash tool.** The Bash tool
+sandboxes commands, which on Windows runs them in a **non-interactive window
+station**. ftrace's `-window` GDI call then has no desktop to attach to, so the
+live-preview window is created invisibly / no-op'd — the render still runs and writes
+PNGs, but **no watchable window ever reaches the user's screen**, silently violating
+the "always show the window" rule below. (Symptom: the startup line reads
+`… (Ctrl-C to stop early) …` without the `— live window` suffix, and the process shows
+in a non-`Console` session in `tasklist`.)
 
-- **Prefer the live image window: pass `-window`.** This opens the real OS
-  live-preview (Win32 GDI) showing the actual tone-mapped image refreshed as it
-  converges — the best way to watch. It also auto-chunks a plain fixed-`-n` render
-  so periodic writes/status happen (see the gotcha below).
+To actually get a visible window, launch every render with the Bash tool's
+**`dangerouslyDisableSandbox: true`** — that runs it in the interactive **Console
+session**, where the GDI window appears on the real desktop (verify with
+`Get-Process ftrace | Select MainWindowTitle` → `ftrace 🪟 live preview`). This is
+mandatory for every render invocation, alongside `-window` itself.
+
+## Running renders — ALWAYS launch with the visual display
+
+Never launch a render as a fire-and-forget black box. **Every render you start
+MUST include the live visual display: always pass `-window`.** No exceptions —
+even quick test/validation renders get the window. It gives both you and the user
+a real, watchable view of the image converging and confirms the render will
+actually finish. On top of `-window`, add periodic crash-safe output so progress
+survives a crash. Concretely, when you start a render:
+
+- **ALWAYS pass `-window`.** This opens the real OS live-preview (Win32 GDI)
+  showing the actual tone-mapped image refreshed as it converges — the best way to
+  watch. It also auto-chunks a plain fixed-`-n` render so periodic writes/status
+  happen (see the gotcha below). This is mandatory on every render invocation.
 - **Always add periodic crash-safe output.** Use `-interval <sec>` (default 15) for
   the write/refresh cadence, and `-checkpoint` (forward modes A/B/C) so a resumable
   `.ftbuf` sidecar is written next to `-o` and progress survives a crash/Ctrl-C
   (`-resume` continues it). Without `-checkpoint` a long render that dies loses
   everything.
-- **No GUI? Use `-preview`** for a live ANSI thumbnail in the terminal, or at least
-  rely on the periodic status line (`[live] … photons, ~N% noise`).
+- **Only if a window genuinely can't open** (truly headless session): fall back to
+  `-preview` for a live ANSI thumbnail in the terminal, or at least the periodic
+  status line (`[live] … photons, ~N% noise`). On this machine there IS a desktop,
+  so this is a rare exception — default to `-window`.
 - **Prefer a bounded budget over a giant `-n`.** `-time <sec>`, `-noise <pct>`
   (stop at a target graininess), or `-forever` (Ctrl-C to stop) all render
   *progressively* with periodic writes, so you get a usable image early instead of

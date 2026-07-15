@@ -26,6 +26,18 @@ bool cudaAvailable();
 // Human-readable name of the primary CUDA device (or "none").
 const char* cudaDeviceName();
 
+// Orderly CUDA teardown: synchronize any outstanding device work, then destroy the
+// primary context (cudaDeviceReset) while the process is still in a clean, quiescent
+// state. Call this once, at the very end of a successful (or failed) run, BEFORE the
+// process exits. Rationale: leaving the context to be reclaimed implicitly at process
+// exit means the NVIDIA kernel driver tears it down asynchronously, from a DPC, after
+// main() has already returned — and buggy nvlddmkm builds can fault there and bugcheck
+// the whole machine (observed as BSOD/reboot "a couple seconds after the window closed",
+// worst with an abrupt kill). Draining + resetting synchronously here removes that
+// window: by the time we return there is no live GPU work and no context left to reap.
+// No-op (and safe to call) when CUDA is unavailable or was never initialised.
+void cudaGracefulShutdown();
+
 // True if this scene can be rendered on the GPU (no unsupported material such as
 // Fluorescent). When false, the caller must use the CPU renderer.
 bool cudaForwardSupported(const Scene& scene);
@@ -68,6 +80,52 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase = 0,
                                           bool wavefront = false);
+
+// True if this scene can be rendered by the GPU photon-map path (mode M). Requires the
+// same POD-bakeable materials as the forward path (cudaForwardSupported) and no
+// environment light (the device gather has no env term). Final gather and physical-lens
+// cameras are render-config properties gated by the caller, not here.
+bool cudaPhotonMapSupported(const Scene& scene);
+
+// GPU shared photon-map render (mode M): build ONE view-independent photon map on the
+// device (forward deposit pass over N photons) and gather every camera from it — the
+// device twin of the CPU shared runSharedPhotonMap. `radius` is the gather radius (== grid
+// cell size). Returns one film per camera (each at resX[c] x resY[c]), accumulated as a
+// SUM over `spp` (display divides by spp: writeFilm(film, spp)). Only the DIRECT density
+// estimate is implemented (final gather stays on the CPU). Requires cudaAvailable() &&
+// cudaPhotonMapSupported(scene) and pinhole cameras; otherwise returns empty films.
+// When `prog` is non-null the per-camera gather reports its converging film through
+// prog->report(sumFilm, sppDone, final) — the same hook modes R/D use — so the host can
+// drive the live window / preview as each frame builds up (final is true on the chunk that
+// completes a camera). Returning true from report() stops the render after the current
+// chunk (e.g. the live window was closed). A null `prog` renders silently as before.
+//
+// `onFrame` (when non-null) is called ONCE per camera, right after that camera's gather
+// fully completes, with its local index and finished film — so the host can write that
+// frame to disk IMMEDIATELY (crash-safe incremental output, matching the CPU mode-M path
+// which writes each frame as it finishes) instead of holding all films to the end. When
+// `onFrame` is supplied the returned vector's films are RELEASED as they are handed off
+// (each returned Film[c] is left empty after the callback), so the whole render runs in
+// roughly one-frame of host memory rather than accumulating every frame — the caller must
+// therefore consume frames via `onFrame`, not the return value. Returning true from
+// `onFrame` stops the render after the current frame. A null `onFrame` keeps every film in
+// the returned vector for the caller to write at the end (the historical behaviour).
+//
+// `mapLoad`/`mapSave` (when non-null) drive the view-independent photon-map cache file. The
+// deposited map is the expensive result of the forward photon trace and is independent of
+// camera and gather radius, so it is worth persisting: `mapSave` writes it after the deposit,
+// and `mapLoad` reloads it and SKIPS the deposit entirely — re-gathering new camera angles /
+// a new radius for free, without re-tracing a photon. The file (magic "FTPMP01\n") holds the
+// raw photon set + emitted count + energy; the grid is rebuilt on load at the requested
+// `radius`, so one file serves any radius. A scene-identity guard rejects a stale map built
+// for a different scene (it falls back to a fresh deposit). Both default null (no caching).
+std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
+                                            const std::vector<int>& resX, const std::vector<int>& resY,
+                                            long long N, double radius, EnergyReport& eOut,
+                                            bool diffraction, long long spp,
+                                            const SppProgress* prog = nullptr,
+                                            const std::function<bool(int, const Film&)>* onFrame = nullptr,
+                                            const char* mapLoad = nullptr, const char* mapSave = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

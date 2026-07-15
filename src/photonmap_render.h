@@ -101,12 +101,13 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
     Renderer mats; mats.diffraction = diffraction;
-    const Material* interior = nullptr;
+    MediumStack stk;                                     // nested-dielectric medium stack
 
     for (int b = 0; b < maxBounce; ++b) {
         Hit h = scene.closestHit(ray);
-        if (interior && h.valid) {                       // Beer-Lambert in glass
-            double a = interior->absorb(lambda);
+        if (h.valid) {                                   // Beer-Lambert in current medium
+            int cm = stk.topMat();
+            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
             if (a > 0.0) thr *= std::exp(-a * h.t);
         }
         if (!h.valid) {                                  // escaped -> environment
@@ -172,10 +173,47 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Dielectric: {
+                // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): exterior
+                // IOR = the medium the photon is currently inside (highest-priority stack
+                // entry). Overlapping dielectrics ranked by `priority` (higher wins; lower
+                // suppressed -> straight pass-through). SAFE FALLBACK to flat air<->glass
+                // unless BOTH sides carry an explicit priority (priority-free scenes stay
+                // bit-identical).
                 bool entering = dot(ray.d, h.ng) < 0.0;
-                bool transmitted = false;
-                ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
-                if (transmitted) interior = entering ? &m : nullptr;
+                const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
+                const int pr = m.priority;
+                if (entering) {
+                    const int outMat = stk.topMat();
+                    const int outPri = stk.topPri();
+                    const bool ranked = m.hasPriority() &&
+                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                        stk.push(mi, pr);
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                    } else {
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.push(mi, pr);
+                    }
+                } else {
+                    MediumStack after = stk; after.popMat(mi);
+                    const int newMat = after.topMat();
+                    const int newPri = after.topPri();
+                    const bool ranked = m.hasPriority() &&
+                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                        stk.popMat(mi);
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                    } else {
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.popMat(mi);            // TIR stays inside mi
+                    }
+                }
                 break;
             }
             case MatType::HalfMirror: {
@@ -217,15 +255,16 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double invPdfL = scene.invPdfLambda(lambda);
 
     Renderer mats; mats.diffraction = diffraction;
-    const Material* interior = nullptr;
+    MediumStack stk;                                     // nested-dielectric medium stack
     const double area = PI * pm.radius * pm.radius;
     const double norm = (pm.nEmitted > 0 && area > 0.0)
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
 
     for (int b = 0; b < maxBounce; ++b) {
         Hit h = scene.closestHit(ray);
-        if (interior && h.valid) {                       // Beer-Lambert in glass
-            double a = interior->absorb(lambda);
+        if (h.valid) {                                   // Beer-Lambert in current medium
+            int cm = stk.topMat();
+            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
             if (a > 0.0) thr *= std::exp(-a * h.t);
         }
         if (!h.valid) {                                  // escaped -> environment
@@ -311,10 +350,47 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 break;
             }
             case MatType::Dielectric: {
+                // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): exterior
+                // IOR = the medium the photon is currently inside (highest-priority stack
+                // entry). Overlapping dielectrics ranked by `priority` (higher wins; lower
+                // suppressed -> straight pass-through). SAFE FALLBACK to flat air<->glass
+                // unless BOTH sides carry an explicit priority (priority-free scenes stay
+                // bit-identical).
                 bool entering = dot(ray.d, h.ng) < 0.0;
-                bool transmitted = false;
-                ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
-                if (transmitted) interior = entering ? &m : nullptr;
+                const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
+                const int pr = m.priority;
+                if (entering) {
+                    const int outMat = stk.topMat();
+                    const int outPri = stk.topPri();
+                    const bool ranked = m.hasPriority() &&
+                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                        stk.push(mi, pr);
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                    } else {
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.push(mi, pr);
+                    }
+                } else {
+                    MediumStack after = stk; after.popMat(mi);
+                    const int newMat = after.topMat();
+                    const int newPri = after.topPri();
+                    const bool ranked = m.hasPriority() &&
+                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                        stk.popMat(mi);
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                    } else {
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.popMat(mi);            // TIR stays inside mi
+                    }
+                }
                 break;
             }
             case MatType::HalfMirror: {

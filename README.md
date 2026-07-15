@@ -31,8 +31,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **density fields** — either formula-defined blobs with soft edges *or* imported
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU).
-- **CUDA GPU backend** for the forward pinhole splat (mode `B`), megakernel or
-  wavefront, with CPU fallback.
+- **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
+  BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
+  across a whole camera flythrough), megakernel or wavefront, with CPU fallback.
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
   and checkpoint/resume.
 
@@ -106,9 +107,41 @@ paths they can capture at all**.
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
-| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU |
+| `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
+
+> **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
+> and *camera motion* before committing to a full render, `-raster` skips light
+> transport entirely: it tessellates the whole scene once (analytic spheres →
+> UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, instanced meshes baked
+> to world space) and z-buffers each camera as solid, flat diffuse+headlight
+> triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
+> reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
+> ghost and a mirror as a flat tint. Shading sums a diffuse term from **every**
+> scene light using its real position/direction (spot cones included), so multi-
+> light rooms read with their true key directions. It reuses the **same camera
+> projection** as the real renderer, so the pinhole's off-axis stretch (spheres
+> elongating toward the frame edge) and the fisheye/panoramic lenses reproduce
+> faithfully. It **emulates the same auto-exposure as the real render**: the raw
+> shaded image is anchored by a 99th-percentile tone map (lit surfaces → ~0.9,
+> emitters clip to white) exactly like `filmToRgb8`, then each camera's
+> **photographic exposure** (film `iso`/`shutter`/`exposure` compensation) is
+> applied on top as exact stops — so an ISO 200 camera previews one stop brighter
+> than ISO 100, and the composition sits at the brightness it will render at
+> instead of an arbitrary fixed level. Because that p99 anchor divides out any
+> uniform scale, **aperture** is (correctly) invisible in the default pipeline;
+> it feeds preview brightness only where the real renderer keeps it — an
+> *absolute-EV* scene (a light with `power`/`lumens`) shot in a finite-lens catch
+> mode (A/C), where a wider pupil is genuinely brighter (∝ 1/N²) and the auto-
+> exposure is bypassed. A `camera_curve`/`camera_path` with `exposure_lock` shares
+> one anchor across all its frames, so a preview flyby doesn't flicker
+> frame-to-frame just as the final render won't. It honours the `-camera`
+> selection and the `-window` live view, and a `camera_curve` flyby animates
+> through every frame in the window. Control the
+> isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
+> longest axis; `0` skips implicit surfaces). Example:
+> `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
 
 ### Speed / accuracy / ability tradeoffs
 
@@ -189,8 +222,17 @@ paths they can capture at all**.
   contact shadows and fine detail **sharp** while still smoothing indirect light, at
   roughly `K`× the per-sample cost (so pair it with fewer `-spp`). Directly-viewed
   emitters carry a little chromatic speckle at low spp. Best when many cameras share one
-  lighting solution. CPU only. (Matches the forward splat modes `A`/`B`/`C` — same
-  forward physics, just measured from a stored map.)
+  lighting solution. **GPU-accelerated** for the direct density query: the device
+  deposits the photon pass, hands the hits to the same grid builder, then gathers every
+  camera on the GPU from the one shared map — so a whole flythrough builds the map once
+  and renders each frame in device time (a `-pmfg` final gather still falls back to the
+  CPU, as do env-lit or unsupported-material scenes). The built map can also be
+  **persisted to disk** with `-savemap <f>` and reloaded with `-loadmap <f>`: because it
+  is view-independent, a reloaded map re-gathers new camera angles or a new gather radius
+  **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
+  A scene-identity guard rejects a stale map built for a different scene, falling back to
+  a fresh deposit. (Matches the forward splat modes `A`/`B`/`C` — same forward physics,
+  just measured from a stored map.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -230,10 +272,11 @@ composite (`P`) each refine an image whose brightness is fixed while only graini
 falls, so they share the same live progress and budget flags (`-time` / `-noise` /
 `-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
 and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
-the forward megakernel, **`D`** via its own GPU BDPT megakernel, and **`R` (including the
+the forward megakernel, **`D`** via its own GPU BDPT megakernel, **`R` (including the
 physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
 reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
-is within the backward-GPU scope. Outside that scope `P`'s camera-side layer, and `V`'s
+is within the backward-GPU scope — and the **`M` photon map** (direct density query),
+which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s
 backward reference (kept on the CPU as a stable ground truth), remain CPU-only. The
 composite `P` classifies its pixels once, then alternates forward and backward batches
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
@@ -248,11 +291,13 @@ stay non-resumable.
 - **`-device auto` (default, recommended).** Uses the GPU when a supported CUDA
   device is present *and* the render is one it can handle (forward modes
   `A`/`B`/`C` on a non-fluorescent scene, mode `D`'s BDPT megakernel, mode `R`'s
-  backward megakernel — including the physical-lens camera — or both layers of the
-  mode-`P` composite); otherwise the CPU. Prints its choice.
+  backward megakernel — including the physical-lens camera — both layers of the
+  mode-`P` composite, or mode `M`'s shared photon map with the direct density query
+  on a non-env, pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (env/spot/collimated lights, fluorescence; any fog for `R`), and for
+  (env/spot/collimated lights, fluorescence; any fog for `R`), for a mode-`M` render
+  that uses a `-pmfg` final gather or an env light, and for
   fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous
   `density`-field fog — directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
@@ -280,6 +325,33 @@ Defined with a `camera "name" { … }` block (or the built-in scene camera).
 block. Film size can be a preset **format** — `full-frame`, `aps-c`,
 `micro-four-thirds`, `super35`, `medium-format`, `6x6`, `6x7`, `large-format`,
 `4x5`, `8x10` — or an explicit `size W H` in millimetres.
+
+**Camera archetype presets** (`preset <name>`): one line that fills in a
+physically-plausible **sensor size + focal length + f-number** for a real camera
+*type*, exactly like `material { preset gold }`. It runs *before* the block's own
+knobs, so any dial (`lens`, `fstop`, `film { size }`, …) written afterward
+overrides it. A single preset serves both worlds — in the finite-lens catch modes
+(`A`/`C`) the sensor + focal + f-stop give real depth of field, while in the
+pinhole/backward modes (`R`/`B`/`U`) the same numbers set the correct field of view
+and the aperture simply collapses to a point (no DOF). Available archetypes:
+
+| `preset` | Sensor | Focal | f-stop | Character |
+|---|---|---|---|---|
+| `cinema` | Super35 (24.6×13.8 mm) | 35 mm | f/2.1 | Blackmagic-style cine; shallow, filmic |
+| `pocket` | 1″ (13.2×8.8 mm) | 8.8 mm | f/4 | RX0-style compact; wide, deep DOF |
+| `portable` | full-frame (36×24 mm) | 35 mm | f/1.8 | mirrorless with a bright prime |
+| `vintage` | 35 mm film (36×24 mm) | 50 mm | f/3.5 | folding rangefinder normal |
+| `vintage-slr` | 35 mm film (36×24 mm) | 50 mm | f/1.4 | classic fast fifty |
+
+```ftsl
+camera "cine" {
+    preset cinema          # Super35, 35mm, T2.1 — DOF in mode A/C, right FOV in R/B/U
+    eye 0 0.7 3   look_at 0 0.5 0   up 0 1 0
+    focus 3
+    # fstop 4              # ← would override the preset's f/2.1 if uncommented
+    film { res 512 512 }
+}
+```
 
 **Projections** (`projection …`): `rectilinear` (default perspective),
 `equidistant` and `equisolid` fisheye, `stereographic` ("little planet"), and
@@ -360,7 +432,7 @@ Declared with `material "name" { type <type> … }`.
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
 | `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). CPU only. Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
-| `dielectric` | Refractive glass with dispersion, optional **frosting** and **colored-glass tint** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption |
+| `dielectric` | Refractive glass with dispersion, optional **frosting**, **colored-glass tint** and **nested-dielectric priority** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption; `priority <N>` (integer) disambiguates overlapping dielectrics — see below |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`) |
@@ -406,6 +478,30 @@ two physically-motivated translucency controls (both compose with dispersion):
   absorption is threaded through all three CPU transport loops (forward, backward,
   BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
   frosting and colored-glass tint; mode-`D` BDPT still falls back to the CPU.)*
+
+**Nested dielectrics (`priority`).** When two glass/liquid solids overlap — a glass
+ice cube in a whisky, a lens cemented to another, a coating flush against a body — the
+exterior index at the shared boundary is ambiguous: is the ray leaving *into air* or
+*into the other medium*? Give each `dielectric` an integer `priority <N>` and the
+higher priority wins wherever they overlap (Schmidt & Budge 2002). The winning medium's
+surface refracts; the losing (lower-priority) surface inside it is *suppressed* — the
+ray passes straight through it — and the exterior IOR at each real interface is taken
+from the medium actually enclosing the ray (so glass-in-water refracts 1.33↔1.52, not
+1.0↔1.52). Every render mode honours it (CPU forward/backward/BDPT/VCM/photon/SPPM and
+the GPU forward/backward/BDPT/photon backends).
+
+Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
+exactly as before (each dielectric treated against air). Because that flat model is
+ambiguous precisely where dielectrics overlap, ftrace runs an **ahead-of-time audit** at
+load and prints `[priority] WARNING: …` for every pair of overlapping *different*
+dielectrics that don't both carry a disambiguating priority (spheres, meshes, and
+isosurfaces alike — isosurface overlap is detected conservatively by comparing their
+`contained_by` bounds). Add distinct priorities to the flagged materials to silence it.
+
+```
+material "water" { type dielectric ior 1.33  priority 1 }
+material "glass" { type dielectric ior 1.52  priority 2 }   # wins where it overlaps water
+```
 
 ---
 
@@ -500,12 +596,32 @@ supports `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UV
 OBJ **vertex normals (`vn`) are read as smooth shading normals** — a hit
 barycentric-interpolates them (CPU and GPU) for smooth-shaded curved meshes, with
 no visible faceting; a mesh with no `vn` stays exactly flat-shaded (geometric
-normal). Meshes without their own `vt` coordinates can be textured via a procedural
+normal). For low-poly OBJs that ship **no** `vn`, opt into **crease-angle
+auto-smoothing** with `mesh { smooth [<deg>] }` (default `40°`): the loader welds
+coincident positions (so split-vertex exporters still smooth), then synthesizes a
+per-corner shading normal as the **angle-weighted** average (Thürmer & Wüthrich) of
+the adjacent faces whose dihedral angle is **below** the threshold — so a sphere's
+gentle facets fuse into a smooth gradient while a cube's 90° edges stay crisp.
+Only the shading normal is affected; the silhouette stays true to the geometry.
+(Smooth shading of interpolated normals — both authored `vn` and crease-smoothing —
+is faithful in **all** render modes: the backward reference `R`, and the forward
+tracers `A/B/C/D/M/S/U` (CPU and GPU), which apply Veach's shading-normal adjoint
+correction so the light/particle transport smooth-shades to match the reference.
+Light connections are clamped to the geometric hemisphere so a smoothed normal never
+leaks light through the true back face, and the terminator where light grazes off is
+softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gradient
+instead of hard facet slivers — applied uniformly to every mode including `R`. Flat
+meshes are unaffected — both the correction and the softening are exactly a no-op when
+the shading and geometric normals coincide.)
+Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
 `group { translate … rotate … scale … <children> }` composes transform
-hierarchies (baked to world space at load).
+hierarchies (baked to world space at load). Children may be `sphere`, `quad`,
+`triangle`, `mesh`, `mesh_instance`, `isosurface`, `light`, or nested `group`s —
+so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap an
+isosurface CSG/implicit just as easily as a mesh.
 
 **Instancing.** `mesh_asset "name" { file … material … }` loads a mesh once into
 its local space; `mesh_instance { of "name"  translate … rotate … scale …
@@ -721,6 +837,104 @@ on flat areas and stay dense on detailed ones — the requested curvature-driven
 the collapses. (The mesher runs on the CPU; it reads `Implicit::eval`/`gradient` from
 `src/isomesh.h`.)
 
+##### Auditing airtightness (`-check-watertight`)
+
+Glass (`dielectric`) surfaces must be **watertight** — a closed 2-manifold where every edge
+is shared by exactly two triangles. The renderer decides *entering vs exiting* from the
+surface normal at each hit and carries the "which medium am I inside" state along the whole
+photon path, so a **hole** (boundary edge) lets a ray reach the interior without a refraction
+event and desyncs that bookkeeping, a **non-manifold** edge (3+ faces) is geometrically
+ambiguous, and a **flipped** (inconsistently-wound) facet inverts the enter/exit test — any of
+which bends light wrong for the rest of that path and can splash artifacts far from the object.
+
+```
+ftrace -in scene.ftsl -check-watertight      # or the -airtight alias
+```
+
+audits every named `mesh` and every `isosurface` (polygonised at `-mesh-res` first), prints a
+per-object `[OK]`/`[WARN]` report with the offending edge counts, then exits without rendering.
+Dielectric objects are flagged with `!` since a leak actively corrupts their refraction. The
+process exit code is non-zero if any object is not airtight, so it doubles as a CI gate. (Marching
+cubes output is watertight by construction; warnings there usually mean a `contained_by` box
+clipped the surface open. Imported OBJ meshes are the common offender — self-intersections and
+mouth openings show up as non-manifold or boundary edges.)
+
+Note the renderer intersects an isosurface by **ray-marching the analytic field directly** at
+render time — it never builds a mesh. Marching cubes runs only offline, for `-export-mesh` and
+for the `-check-watertight` audit (which polygonises the field purely to reuse the same mesh
+edge-checker). So the audit on an isosurface is a faithful *proxy* for the field's closedness,
+not the exact geometry the renderer marches.
+
+##### Auditing the *marched* field directly (`-check-airtight`)
+
+Because `-check-watertight` audits a polygonised *copy* of an isosurface, it inherits marching
+cubes' resolution blind spot: a leak, a thin wall, or a spike narrower than a grid cell can slip
+through. `-check-airtight` instead probes the **exact zero level-set the renderer sphere-traces** —
+it calls the same field marcher the camera rays use, so there is no proxy.
+
+```
+ftrace -in scene.ftsl -check-airtight              # 4000 chords/isosurface
+ftrace -in scene.ftsl -check-airtight -check-airtight-rays 20000
+```
+
+The test is a Monte-Carlo **ray-parity** audit: it fires random chords that start and end
+*outside* the container, so both endpoints are unambiguously outside the solid. A closed,
+airtight solid crosses its boundary an **even** number of times along any such chord (every entry
+is matched by an exit), so the renderer's marcher must report an even hit count. An **odd** count
+means the interior connects to the exterior — a leak:
+
+- on an **`open`** (uncapped) surface, the solid poking through a `contained_by` wall (an open
+  cap) — the audit also directly samples the container boundary and reports the interior area and
+  its worst `f`, and suggests `capped` / shrinking `contained_by`;
+- on a **`capped`** surface, a crossing the marcher *skipped* — a wrong `max_gradient`/Lipschitz
+  bound overshooting, or a feature thinner than the march step — which shows up as a real light
+  leak at render time.
+
+A dense reference sampling (finer than the march step) runs alongside; where the marcher finds
+*fewer* crossings than the reference it flags **overshoot** even when parity stays even (two
+missed crossings). Non-destructive, exits non-zero on any leak (so it too works as a CI gate).
+An analytic isosurface, unlike a mesh, cannot self-intersect — it is a level set of a continuous
+field, locally a smooth manifold at every regular point — so this audit only tests closedness,
+not self-intersection.
+
+##### Repairing a non-airtight mesh (`tools/repair_mesh.py`)
+
+There are two philosophies for getting watertight geometry, and they are complementary, not
+ranked:
+
+- **Author it airtight** with **`manifold3d`** (Emmett Lalish's Manifold library). Its guarantee
+  is a *closure property* — **manifold in ⇒ manifold out**: its boolean/offset operations, given
+  valid 2-manifold inputs, are algorithmically guaranteed to produce a valid 2-manifold, so you
+  never *introduce* a leak. It achieves that by **requiring clean input** — hand it a broken mesh
+  and it reports a non-manifold error rather than fixing it. Reach for it when you build/combine
+  geometry (CSG) and want to never produce a self-intersection or crack in the first place. It is
+  *not* a repair tool.
+- **Repair a broken mesh** after the fact with **`tools/repair_mesh.py`**, which wraps two
+  engines (both `pip install`-able):
+  - **pymeshlab** (default, `pip install pymeshlab`) — MeshLab's repair filters, run as an
+    *ordered pipeline* (order matters): merge-close-vertices (welds coincident vertices so a
+    pinch becomes a visible singularity) → remove-duplicate/null-faces → repair-non-manifold-edges
+    (`method=0` removes the offending faces) → repair-non-manifold-vertices (splits pinched
+    sheets apart) → close-holes (caps the openings that leaves). This is the **go-to engine for
+    the "pinch vertex" defect** (N surface sheets snapped to one point) that AI mesh generators
+    emit — a defect that is a valid 2-manifold in raw OBJ indexing but non-manifold once
+    coincident vertices are welded, which is exactly the class MeshFix leaves untouched. It is
+    the engine that took the Klein bottle to `[OK]`.
+  - **pymeshfix** (`--engine meshfix`) — Marco Attene's MeshFix: best for genuine self-intersections
+    and large holes; weaker on pure non-manifold pinches.
+
+```
+python tools/repair_mesh.py broken.obj fixed.obj            # MeshLab engine
+python tools/repair_mesh.py broken.obj fixed.obj --engine meshfix
+# repair a master mesh, then place the result exactly where a derived copy sat:
+python tools/repair_mesh.py master.obj staged.obj --place-like staged_original.obj
+```
+
+Re-audit the output with `-check-watertight` to confirm `[OK]`. (Example: the `klein_hunyuan`
+glass mesh had a single 3-sheet pinch vertex — invisible in raw OBJ indexing but a non-manifold
+singularity once coincident vertices are welded; `repair_mesh.py` with the MeshLab engine removes
+the pinch and closes the hole, taking it to `[OK]`.)
+
 ## Textures
 
 `texture "name" { file <path> encoding srgb|linear filter nearest|bilinear wrap
@@ -885,22 +1099,35 @@ extension), which ffmpeg concatenates into a video.
 - **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
   keyframed fly-through: the eye (and optionally look_at / fov) is linearly
   interpolated across `key` frames. Optional `dolly_zoom` holds the subject's
-  on-screen size (Vertigo effect); optional `exposure_lock` shares frame 0's exposure.
+  on-screen size (Vertigo effect); optional `exposure_lock [selector]` shares one
+  auto-exposure across all frames (metered from a selectable viewpoint, default the
+  path average — see below).
 - **`camera_orbit "name" { center <x y z> radius <m> [height <m>] [axis x|y|z] frames N
-  [start_deg <d>] [sweep_deg <d>] [look_at <x y z>] [exposure_lock] }`** — a turntable /
+  [start_deg <d>] [sweep_deg <d>] [look_at <x y z>] [exposure_lock [selector]] }`** — a turntable /
   fly-around whose eye rides a circle around `center` (the default look_at). The circle
   lies in the plane perpendicular to `axis` (default y); `height` offsets the eye along
   the axis. A full 360° sweep is sampled so frame N == frame 0 (seamless loop); a
   partial sweep spans its endpoints. See `scenes/showcase_orbit.ftsl` (an orbit tuned
   to fly straight *through* a glass sphere).
 - **`camera_curve "name" { point <x y z> … [frames N] [density <ρ> | density_at <t> <ρ> …]
-  [look tangent | look_at <x y z> | look curve + look_point <x y z> …] [closed] }`** — a
+  [spline uniform|centripetal|chordal|<alpha>] [look tangent [min_reach <f>] [look_smooth <n>] |
+  look_at <x y z> | look curve + look_point <x y z> …] [closed] }`** — a
   fly-through along a **Catmull-Rom spline** that passes through the `point` control
-  points. Camera placement is either a fixed `frames` count (uniform arc length) or a
+  points. `spline` selects the parameterization: `uniform` (α=0, the default — simple but
+  can **overshoot** and swing wide between unevenly-spaced control points), `centripetal`
+  (α=0.5 — the recommended choice; provably no cusps or self-intersections, stays tight to
+  the control polygon, so an irregularly-spaced fly path reads smooth instead of lurching),
+  or `chordal` (α=1.0); a bare number sets α directly. Camera placement is either a fixed
+  `frames` count (uniform arc length) or a
   **density** (cameras per unit length) that can vary along the curve via `density_at`
   keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
   slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
-  `look_at`, or at a second `look curve`. **Orientation and lens can also be animated**
+  `look_at`, or at a second `look curve`. The **travel tangent is fold-robust**: where the
+  path makes a sharp horizontal U-turn its look-ahead chord loses horizontal reach and would
+  otherwise rake the view steeply up into the ceiling / down at the floor, so `min_reach <f>`
+  (default `0.5`, `0` = legacy) floors that reach for the pitch calculation and `look_smooth
+  <n>` (default `0`; a Gaussian sigma in frames) temporally smooths the look direction so a
+  fold reads as a bounded near-level pan instead of a flick. **Orientation and lens can also be animated**
   per frame over the normalized timeline `t ∈ [0,1]` (`t=0` first frame, `t=1` last),
   each keyframed by `<name>_at <t> <value>` (piecewise-linear, flat-clamped at the ends,
   just like `density_at`) or held constant by the bare keyword: **`roll[_at]`** banks the
@@ -910,6 +1137,31 @@ extension), which ffmpeg concatenates into a video.
   field only in the physical catch modes `A`/`C`; in the pinhole splat `B` the aperture is
   virtual, so there `roll`/`fov`/`zoom` are the visible ones. Lens *projection*/fisheye is
   a discrete whole-flight mode, not a continuous track — set it once with `projection`.)
+
+**`exposure_lock` — one shared auto-exposure across a whole path.** On any
+`camera_path`/`camera_orbit`/`camera_curve`, `exposure_lock` freezes a single
+auto-exposure anchor and applies it to *every* frame of that path, so a fly-through
+doesn't pump brighter/darker as the framing changes (the flicker you'd get if each
+frame metered itself). A **selector** chooses which viewpoint the whole path meters
+from — before any frame renders, a quick reduced-sample **meter pre-pass** renders
+just that viewpoint, computes its exposure, and locks the path to it (the same happens
+in the `-raster` preview, so preview and final agree):
+
+  - **`exposure_lock`** (bare, or `on`) — meter the **average** across *all* frames of the path (the **default**: a robust compromise that won't expose the whole flythrough for one possibly-atypical opening frame). Aliases `average`/`avg`/`mean`.
+  - **`exposure_lock first`** — meter the **first** frame (deliberately "expose for the establishing shot").
+  - **`exposure_lock index <i>`** (alias `frame`) — meter frame **`i`** (0-based; negative counts from the end, so `-1` = last frame).
+  - **`exposure_lock near <x> <y> <z>`** — meter whichever frame's **eye is nearest** the world point `x y z`.
+  - **`exposure_lock camera "name"`** (or just **`exposure_lock "name"`**) — meter a **separately-defined `camera "name"`** — a purpose-built metering viewpoint that need not be on the path at all.
+  - **`exposure_lock off`** (alias `false`/`0`) — disable; each frame meters itself.
+
+  The selector is **always honoured** — the meter pre-pass renders the chosen viewpoint
+  in its own render mode (`A`/`B`/`C` forward, `R` backward, `D` BDPT, `M` photon map,
+  `P` composite; anything else falls back to a general forward light-trace), all of which
+  converge to the same scene brightness, so there is **no silent "just use frame 0"**
+  fallback for any mode. Absolute-EV scenes have no auto-exposure to lock, so
+  `exposure_lock` is a no-op there. The global `-exposure-lock` CLI flag instead locks
+  *all* rendered cameras to one anchor (metered from the first frame), overriding
+  per-path selectors.
 
 ### Multi-camera shared photon pass (modes `A`, `B`, and `M`)
 
@@ -940,9 +1192,19 @@ static scene.
 
 The `A`, `B`, and `M` cameras form **separate** shared passes (`A` perturbs the RNG
 stream during the trace, `B` doesn't, and `M` gathers backward instead of splatting).
-`A`/`B` sharing applies to plain `-n` renders with per-frame auto-exposure; `M` sharing
-applies to any plain `-n` render (including exposure-locked paths). The budget flags
-(`-time`/`-noise`/`-forever`/`-resume`/`-preview`) render per camera in every mode.
+`A`/`B` sharing applies to any per-frame-auto-exposed group; `M` sharing applies to any
+group (including exposure-locked paths).
+
+The `A`/`B` shared pass is **crash-safe and resumable** just like the single-camera
+forward path: it traces the group's one photon flight in accumulation chunks (each
+seeded off the cumulative photon count so successive chunks draw independent photons),
+drives the live `-window`, and every chunk writes each camera's image plus a per-camera
+`<out>.ftbuf` checkpoint. So `-checkpoint`, `-resume`, `-time`, `-noise`, and `-forever`
+all work **while still sharing** the flight — a crash or Ctrl-C loses at most one
+interval, and `-resume` reloads every camera's film and continues (the whole group
+resumes together; a half-written or mismatched sidecar set falls back to a fresh start).
+(`-resume`/budget flags still render per camera for mode `M`, whose per-camera gather is
+independent anyway.)
 
 **Shared vs. independent randomness across cameras (matters for video and for
 side-by-side cameras).** This is the key per-mode difference in how randomness is
@@ -975,6 +1237,35 @@ which falls back to per-camera passes) so each draws its own photons.
 > a multi-camera render of those modes simply renders **each camera independently**
 > (re-tracing the full sample budget per camera), so it costs the same as running them
 > one at a time. Only `A`, `B`, and `M` amortise the forward trace across cameras.
+
+### Animated geometry (OBJ sequences) → video
+
+Camera animation (above) moves the camera over **one static scene**. To animate the
+*geometry* itself — a cloth/fluid sim, a growing crystal, a Blender/Houdini point-cache
+baked to one OBJ per frame — use **`tools/obj_sequence_to_video.py`**, a self-contained
+driver that renders each OBJ frame with ftrace and encodes the frames into an MP4 with
+ffmpeg (no new renderer dependencies).
+
+You supply a **template** scene (camera, lights, materials, render mode) with a `{obj}`
+placeholder where the animated mesh goes; the driver substitutes each frame's OBJ, renders
+`frame_NNNNN.png`, then ffmpeg concatenates them:
+
+```
+# make a starter template, then edit its camera/lights/materials
+python tools/obj_sequence_to_video.py --write-template anim.ftsl
+
+# render the sequence to a 24fps clip (~4s/frame, mode B, on the GPU)
+python tools/obj_sequence_to_video.py "cache/*.obj" --template anim.ftsl \
+    -o png/growth.mp4 --mode B --device gpu -r 960 --time 4 --fps 24
+```
+
+The template's mesh block just references the placeholder: `mesh { file "{obj}" … }`
+(other tokens: `{frame}`, `{frame1}`, `{obj_stem}`). `FRAMES` is a directory of `*.obj` or
+a quoted glob, naturally sorted. Per-frame budget is `--time`/`--spp`/`--noise`; other
+useful flags: `--resume` (skip already-rendered frames), `--start/--end/--step` (sub-range),
+`--encode-only` (re-encode existing PNGs at a new `--fps` without re-rendering),
+`--no-encode`, `--keep-frames`, `--crf`/`--codec`/`--pix-fmt`, and `--dry-run`. Run with
+`--help` for the full list.
 
 ### Importing Mitsuba scenes
 
@@ -1015,6 +1306,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
+| `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
@@ -1033,6 +1325,9 @@ add-on), this doubles as a Blender → FTSL path.
 | `-export-mesh <out.obj>` | Polygonise the scene's isosurfaces into a watertight OBJ mesh (marching tetrahedra, box-capped) and exit, instead of rendering — for Unreal / Blender import (see **Exporting an isosurface to a mesh**) |
 | `-mesh-res <N>` | Mesh export fineness: grid cells along the longest bounds axis (default 128) |
 | `-mesh-adaptive` / `-mesh-decimate <f>` | Curvature-adaptive QEM decimation of the exported mesh; `<f>` = triangle fraction to keep (default 0.5) |
+| `-check-watertight` / `-airtight` | Audit every named `mesh` and every `isosurface` in the scene for a closed, consistently-oriented surface, print a per-object `[OK]`/`[WARN]` report, then exit (no render). Warns per object about **boundary edges** (holes / open border), **non-manifold edges** (3+ faces share an edge), and **flipped** (inconsistently-wound) facets; a dielectric object is flagged with `!` because a leak breaks its refraction / interior-medium tracking. Isosurfaces are polygonised at `-mesh-res` first. Exit code is non-zero if any object is not airtight. |
+| `-check-airtight` | Audit every `isosurface` by **ray-parity on the marched field** (not a polygonised proxy): fire chords from outside the container and flag any that cross the boundary an odd number of times (a leak — an open cap on an `open` surface, or a `max_gradient`/thin-feature overshoot the marcher skips), plus a dense-reference **overshoot** check. Prints `[OK]`/`[WARN]` and exits non-zero on any leak. See **Auditing the marched field directly**. |
+| `-check-airtight-rays <N>` | Chord count per isosurface for `-check-airtight` (default 4000). |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
@@ -1052,10 +1347,12 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). |
+| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
+| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window). See the preview note under **Render modes**. |
+| `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
-| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock` keyword locks just that path |
+| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,

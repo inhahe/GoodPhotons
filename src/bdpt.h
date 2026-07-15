@@ -370,10 +370,18 @@ inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, double lambda,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path) {
-    (void)cam; (void)mode;   // cam/mode reserved for future NEE-to-camera & adjoint use
+    (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;   // solid-angle density of the current ray direction
-    const Material* interior = nullptr;   // dielectric the subpath is inside (colored glass)
+    // Nested-dielectric medium stack (Schmidt & Budge 2002): the solids the subpath is
+    // currently inside. Current medium (Beer-Lambert absorption + exterior IOR at the
+    // next interface) = the highest-priority entry. Behaves like the old single-pointer
+    // `interior` for a lone dielectric.
+    MediumStack stk;
+    auto curAbsorb = [&](double lam) -> double {
+        int mi = stk.topMat();
+        return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
+    };
     for (int bounces = 0;;) {
         Hit h = scene.closestHit(ray);
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
@@ -400,8 +408,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // event (surface hit OR medium collision, whichever is nearer). NOTE: this
         // attenuates only the *subpath walk*; connection edges (connectBDPT) that cross
         // glass are NOT absorption-weighted (see known-issues.md).
-        if (interior) {
-            double a = interior->absorb(lambda);
+        {
+            double a = curAbsorb(lambda);
             if (a > 0.0) beta *= std::exp(-a * dEvent);
         }
 
@@ -511,11 +519,48 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Dielectric: {
+                // Nested-dielectric PRIORITY resolution: exterior IOR = the medium the
+                // subpath is currently inside (highest-priority stack entry). Overlapping
+                // dielectrics are ranked by `priority` (higher wins; lower is suppressed
+                // -> straight pass-through). SAFE FALLBACK to flat air<->glass (extIor 1.0)
+                // unless BOTH sides carry an explicit priority, keeping priority-free
+                // scenes bit-identical.
                 bool entering = dot(ray.d, h.ng) < 0.0;
-                bool transmitted = false;
-                Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted);
-                wi = nr.d; betaFactor = 1.0; delta = true;
-                if (transmitted) interior = entering ? mp : nullptr;
+                const int mi = (int)(mp - scene.mats.data());   // true index (Mix/Layered aware)
+                const int pr = mp->priority;
+                delta = true; betaFactor = 1.0;
+                if (entering) {
+                    const int outMat = stk.topMat();
+                    const int outPri = stk.topPri();
+                    const bool ranked = mp->hasPriority() &&
+                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                        wi = ray.d; stk.push(mi, pr);
+                    } else {
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted, extIor);
+                        wi = nr.d;
+                        if (transmitted) stk.push(mi, pr);
+                    }
+                } else {
+                    MediumStack after = stk; after.popMat(mi);
+                    const int newMat = after.topMat();
+                    const int newPri = after.topPri();
+                    const bool ranked = mp->hasPriority() &&
+                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                        wi = ray.d; stk.popMat(mi);
+                    } else {
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted, extIor);
+                        wi = nr.d;
+                        if (transmitted) stk.popMat(mi);            // TIR stays inside mi
+                    }
+                }
                 break;
             }
             case MatType::HalfMirror: {
@@ -565,6 +610,18 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         prev.pdfRev = convertDensity(pdfRevW, cur, prev);
 
         beta *= betaFactor;
+        // Veach shading-normal ADJOINT correction (§5.3) for the LIGHT (Importance)
+        // subpath only: a particle tracer deposits irradiance per GEOMETRIC area, so an
+        // interpolated shading normal must be reweighted at each non-specular vertex or
+        // the mesh facets in mode D (exactly as in modes A/B/C, render.h). `wo` points
+        // toward the previous (light-side) vertex (= Veach's wi); the sampled
+        // continuation `wi` is the outgoing direction (= Veach's wo). Exactly 1 when
+        // ns==ng, so flat triangles / analytic spheres stay bit-identical, and the eye
+        // (Radiance) subpath — which smooth-shades for free — is untouched.
+        if (mode == Mode::Importance && !delta) {
+            Vec3 ngo = (dot(cur.ng, cur.ns) >= 0.0) ? cur.ng : cur.ng * -1.0;
+            beta *= shadingAdjointCorr(wo, normalize(wi), cur.ns, ngo);
+        }
         // Spawn the continuation from the correct side of the geometric normal.
         double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
@@ -807,7 +864,18 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // Reflect-only vertices require the +ns side; a two-sided vertex may connect on
             // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
             if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
+            Vec3 ngo = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            // Geometric-hemisphere softening: a reflect-only vertex must see the camera on
+            // its GEOMETRIC front side, else a smoothed shading normal leaks light through the
+            // back face (shading-normal problem). A hard cutoff there facets the terminator,
+            // so ramp smoothly (Chiang 2019; matches backward.h/render.h). No-op when ns==ng
+            // (flat/analytic, stG==1); skipped for two-sided (transmissive) materials.
+            double stG = isTwoSidedMat(*qs.mat) ? 1.0 : shadowTerminatorG(wcam, qs.ns, ngo);
+            if (stG <= 0.0) return 0.0;
             f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
+            // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
+            // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
+            f *= shadingAdjointCorr(wo, wcam, qs.ns, ngo) * stG;
         }
         if (f <= 0.0) return 0.0;
         if (scene.occluded(connOrigin(qs, wcam), wcam, dist - 2e-6)) return 0.0;
@@ -836,13 +904,21 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
         Vec3 wo = normalize(eye[t - 2].p - pt.p);
         // Scattering value f and endpoint cosine (phase / cos=1 at a medium vertex).
-        double cosSurf, f;
+        double cosSurf, f, stG = 1.0;
         if (pt.type == VType::Medium) {
             cosSurf = 1.0;
             f = mediumScatterF(pt, wo, wi, lambda, scene);
         } else {
             cosSurf = dot(pt.ns, wi);
             if (cosSurf == 0.0 || (!isTwoSidedMat(*pt.mat) && cosSurf < 0.0)) return 0.0;
+            // Geometric-hemisphere softening (see t==1 splat above): the eye/radiance vertex
+            // must see the sampled light on its geometric front side; ramp smoothly instead of
+            // a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
+            if (!isTwoSidedMat(*pt.mat)) {
+                Vec3 ngo = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
+                stG = shadowTerminatorG(wi, pt.ns, ngo);
+                if (stG <= 0.0) return 0.0;
+            }
             f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
         }
         if (f <= 0.0) return 0.0;
@@ -854,7 +930,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (pdfA <= 0.0) return 0.0;
         double Tr = mats.mediaTransmittance(scene.media, pt.p, wi, dist, lambda, rng);
         double G = std::fabs(cosSurf) * cosLight / dist2;
-        L = pt.beta * f * Le * G / pdfA * Tr;
+        L = pt.beta * f * Le * G / pdfA * Tr * stG;
         if (L <= 0.0) return 0.0;
         sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.light = &em; sampled.matId = em.matId;
@@ -871,12 +947,19 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         Vec3 woE = normalize(eye[t - 2].p - pt.p);
         Vec3 woL = normalize(light[s - 2].p - qs.p);
         // Each endpoint is a surface (BSDF, cosine) or a medium (phase, cos=1).
-        double cosE, cosL, fE, fL;
+        double cosE, cosL, fE, fL, stGE = 1.0, stGL = 1.0;
         if (pt.type == VType::Medium) {
             cosE = 1.0; fE = mediumScatterF(pt, woE, w, lambda, scene);
         } else {
             cosE = dot(pt.ns, w);
             if (cosE == 0.0 || (!isTwoSidedMat(*pt.mat) && cosE < 0.0)) return 0.0;
+            // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
+            if (!isTwoSidedMat(*pt.mat)) {
+                Vec3 ngoE = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
+                stGE = shadowTerminatorG(w, pt.ns, ngoE);
+                if (stGE <= 0.0) return 0.0;
+            }
             fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
         }
         if (qs.type == VType::Medium) {
@@ -884,13 +967,24 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosL = dot(qs.ns, w * -1.0);
             if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
+            Vec3 ngoL = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
+            if (!isTwoSidedMat(*qs.mat)) {
+                stGL = shadowTerminatorG(w * -1.0, qs.ns, ngoL);
+                if (stGL <= 0.0) return 0.0;
+            }
             fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
+            // Adjoint shading-normal correction on the LIGHT-subpath endpoint qs (particle
+            // vertex; outgoing = w*-1 toward the eye vertex). The eye endpoint pt is a
+            // Radiance vertex and gets NO correction. 1 when ns==ng (flat/analytic).
+            fL *= shadingAdjointCorr(woL, w * -1.0, qs.ns, ngoL);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
         if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6)) return 0.0;
         double Tr = mats.mediaTransmittance(scene.media, pt.p, w, dist, lambda, rng);
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
-        L = pt.beta * fE * fL * qs.beta * G * Tr;
+        L = pt.beta * fE * fL * qs.beta * G * Tr * stGE * stGL;
     }
     if (L <= 0.0) return 0.0;
     return L * misWeight(scene, cam, light, eye, sampled, s, t, lambda);

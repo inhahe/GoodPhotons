@@ -21,6 +21,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "photonmap.h"
+#include "medium_stack.h"
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -420,20 +421,33 @@ struct Renderer {
     // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     void connect(const Scene& scene, const Camera& cam, Film& film,
-                 const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
-                 Pcg32& rng) const {
+                 const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                 double lambda, double beta, double rho, Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
         double cosSurf = dot(n, wdir);
-        if (cosSurf <= 0) return;                       // camera behind surface
+        // Reject connections below the shading horizon; soften across the GEOMETRIC
+        // horizon (`ng` is the geometric normal on the shading side). A smoothed shading
+        // normal must not splat a vertex whose true geometry faces away from the camera,
+        // but a hard cutoff there carves facet slivers at the terminator, so ramp it
+        // smoothly (Chiang 2019). No-op for flat tris / analytic spheres, where ng == n
+        // (stG == 1), so those scenes stay bit-identical.
+        if (cosSurf <= 0) return;                       // camera behind shading surface
+        double stG = shadowTerminatorG(wdir, n, ng);
+        if (stG <= 0.0) return;                         // camera behind true geometry: hard cutoff
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
 
         double f = rho / PI;
         double omega = cam.pixelSolidAngle(cosCam);
-        double contrib = beta * f * cosSurf / (dist2 * omega);
+        // Veach shading-normal adjoint correction for this particle connection
+        // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
+        // cosSurf * corr = cos(wo,Ng)*cos(wi,Ns)/cos(wi,Ng), so the grazing cosSurf
+        // cancels analytically and this stays bounded. Exactly 1 when Ns == Ng.
+        double corr = shadingAdjointCorr(wi, wdir, n, ng);
+        double contrib = beta * f * cosSurf * corr / (dist2 * omega) * stG;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
@@ -481,8 +495,8 @@ struct Renderer {
     // the depth-of-field spread automatically. Rectilinear film mapping only — a real
     // fisheye needs a wide-angle lens element, so author fisheye with model B instead.
     void connectLens(const Scene& scene, const Camera& cam, Film& film,
-                     const Vec3& p, const Vec3& n, double lambda, double beta, double rho,
-                     Pcg32& rng) const {
+                     const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                     double lambda, double beta, double rho, Pcg32& rng) const {
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -492,15 +506,21 @@ struct Renderer {
         if (dist < 1e-9) return;
         Vec3 wdir = toA / dist;
         double cosSurf = dot(n, wdir);
-        if (cosSurf <= 0) return;                        // pupil behind the surface
+        // Below the shading horizon reject; soften across the geometric horizon (see
+        // connect()): no-op for flat/sphere (stG == 1).
+        if (cosSurf <= 0) return;                        // pupil behind the shading surface
+        double stG = shadowTerminatorG(wdir, n, ng);
+        if (stG <= 0.0) return;                          // pupil behind true geometry: hard cutoff
         double cosLens = -dot(wdir, cam.w);              // cosine at the lens (w faces the scene)
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + n * 1e-6, wdir, dist - 2e-6)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
-        double contrib = beta * rho * cosSurf * cosLens * (R * R) / (dist * dist);
+        // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
+        double corr = shadingAdjointCorr(wi, wdir, n, ng);
+        double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
@@ -535,19 +555,21 @@ struct Renderer {
 
     // Route a camera connection to the pinhole (model B) or the finite lens (model A).
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
-                  const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
-        if (lensMode) connectLens(scene, cam, film, p, n, lambda, beta, rho, rng);
-        else          connect(scene, cam, film, p, n, lambda, beta, rho, rng);
+                  const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
+                  double rho, Pcg32& rng) const {
+        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
+        else          connect(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
     // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
     // exactly the old single-camera call (model A draws its aperture sample once here).
     void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
-                     const Vec3& n, double lambda, double beta, double rho, Pcg32& rng) const {
+                     const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
+                     double rho, Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
-                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, lambda, beta, rho, rng);
+                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng);
     }
 
     // ===================================================================
@@ -1064,14 +1086,20 @@ struct Renderer {
         // term (its cone illuminates surfaces, which then connect to the camera).
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
-            camSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
+            camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
         }
 
         Ray ray{origin + dir * 1e-6, dir};
-        // Dielectric the photon is currently INSIDE (for Beer-Lambert interior
-        // absorption / colored glass), or null in vacuum. Assumes non-nested glass.
-        const Material* interior = nullptr;
+        // Nested-dielectric medium stack: the solids the photon is currently inside.
+        // The current medium (for Beer-Lambert absorption and the exterior IOR at the
+        // next interface) is the highest-priority entry (Schmidt & Budge 2002). Replaces
+        // the old single `interior` pointer; behaves identically for a lone dielectric.
+        MediumStack stk;
+        auto curAbsorb = [&](double lam) -> double {           // sigma_a of the current medium
+            int mi = stk.topMat();
+            return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
+        };
 
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
             Hit h = scene.closestHit(ray);
@@ -1104,8 +1132,8 @@ struct Renderer {
             }
 
             // Beer-Lambert attenuation over the free path just travelled inside glass.
-            if (interior) {
-                double a = interior->absorb(lambda);
+            {
+                double a = curAbsorb(lambda);
                 if (a > 0.0) beta *= std::exp(-a * dEvent);
             }
 
@@ -1162,11 +1190,54 @@ struct Renderer {
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
                 case MatType::Dielectric: {
+                    // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): the
+                    // exterior IOR is the medium the photon is currently inside (the
+                    // highest-priority stack entry), not a hardcoded 1.0, so glass inside
+                    // water refracts 1.33<->1.52. Where dielectrics overlap the higher
+                    // `priority` wins and the lower one's boundary is suppressed (the
+                    // photon passes straight through). SAFE FALLBACK: the priority rule
+                    // applies only when BOTH sides carry an explicit priority (air always
+                    // counts, IOR 1.0); otherwise this degrades to the old flat
+                    // air<->glass model so priority-free scenes are bit-identical.
                     bool entering = dot(ray.d, h.ng) < 0.0;
-                    bool transmitted = false;
-                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted);
-                    if (transmitted) interior = entering ? &m : nullptr;  // track medium
-                    continue;                       // lossless (absorption applied per-segment)
+                    const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
+                    const int pr = m.priority;               // INT_MIN if unset
+
+                    if (entering) {
+                        const int outMat = stk.topMat();     // -1 == air
+                        const int outPri = stk.topPri();     // INT_MIN == air
+                        const bool ranked = m.hasPriority() &&
+                            (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                        if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                            stk.push(mi, pr);
+                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                            continue;
+                        }
+                        const double extIor = (ranked && outMat >= 0)
+                            ? scene.mats[outMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.push(mi, pr);
+                        continue;                   // lossless (absorption applied per-segment)
+                    } else {
+                        MediumStack after = stk;
+                        after.popMat(mi);
+                        const int newMat = after.topMat();   // -1 == air underneath
+                        const int newPri = after.topPri();
+                        const bool ranked = m.hasPriority() &&
+                            (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                        if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                            stk.popMat(mi);
+                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                            continue;
+                        }
+                        const double extIor = (ranked && newMat >= 0)
+                            ? scene.mats[newMat].ior(lambda) : 1.0;
+                        bool transmitted = false;
+                        ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        if (transmitted) stk.popMat(mi);      // TIR stays inside mi
+                        continue;                   // lossless (absorption applied per-segment)
+                    }
                 }
                 case MatType::ThinFilm: {
                     // Iridescent coated interface: specular reflect-or-refract with a
@@ -1242,22 +1313,26 @@ struct Renderer {
                 }
                 case MatType::Fluorescent: {
                     double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Model-B connections: the elastic channel splats at the
                     // incoming lambda; the fluorescent channel samples one
                     // lambda' ~ M and splats the glow (albedo aEff*Q) with the
                     // camera-response evaluated at lambda' (Stokes-shifted colour).
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
                             double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
-                            camSplatAll(scene, cams, nCam, h.p, h.n, lp, beta, aEff * m.fluoYield, rng);
+                            camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lp, beta, aEff * m.fluoYield, rng);
                         }
                     }
                     FluoroResult fr = fluoroInteract(m, lambda, rng);
                     if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return; }
                     lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
-                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
-                    continue;                           // beta unchanged (see above)
+                    Vec3 wo = cosineHemisphere(h.n, rng);
+                    beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                    ray = Ray{h.p + h.n * 1e-6, wo};
+                    continue;                           // beta otherwise unchanged (see above)
                 }
                 case MatType::DiffuseTransmit: {
                     // Two-lobe Lambertian: reflect albedo into the front hemisphere
@@ -1271,37 +1346,52 @@ struct Renderer {
                     double rhoT = clamp01(m.transmit(lambda));
                     double sum = rhoR + rhoT;
                     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
                     depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
-                        camSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
+                        camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
+                        camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
                     }
                     // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else
-                    // absorb — throughput unchanged on a scatter.
+                    // absorb — throughput unchanged on a scatter (bar the Veach adjoint
+                    // correction, which is 1 for a flat/analytic surface). |cos| in the
+                    // factor makes it lobe-agnostic, so (h.n, ngo) serve both lobes.
                     double u = rng.uniform();
-                    if (u < rhoR)      { ray = Ray{h.p + h.n * 1e-6, cosineHemisphere( h.n, rng)}; continue; }
-                    else if (u < sum)  { ray = Ray{h.p - h.n * 1e-6, cosineHemisphere(-h.n, rng)}; continue; }
+                    if (u < rhoR) {
+                        Vec3 wo = cosineHemisphere(h.n, rng);
+                        beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
+                        ray = Ray{h.p + h.n * 1e-6, wo}; continue;
+                    } else if (u < sum) {
+                        Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
+                        beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
+                        ray = Ray{h.p - h.n * 1e-6, wo}; continue;
+                    }
                     e.absorbed += beta; return;
                 }
                 case MatType::Diffuse:
                 default: {
                     double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
                     depositPhoton(h.p, ray.d, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
                     }
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
                     // bounces instead of running to the maxBounce cap.
                     if (rng.uniform() >= rho) { e.absorbed += beta; return; }
-                    ray = Ray{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
+                    Vec3 wo = cosineHemisphere(h.n, rng);
+                    beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                    ray = Ray{h.p + h.n * 1e-6, wo};
                     continue;
                 }
             }
@@ -1317,13 +1407,20 @@ struct Renderer {
     // (interior absorption). A non-zero `roughness` frosts the interface: BOTH the
     // reflected and refracted lobes are jittered by a power-cosine lobe (rough glass),
     // rejecting samples that would cross to the wrong side so no light leaks through.
+    // `extIor` is the refractive index of the medium on the NON-material side of this
+    // interface — i.e. what the ray is travelling through when it enters, or what it
+    // returns to when it exits. Defaults to 1.0 (vacuum/air), which reproduces the old
+    // exterior-is-air behaviour bit-for-bit. Nested-dielectric callers pass the enclosing
+    // medium's index (from the per-path priority stack) so glass-in-water refracts across
+    // 1.33<->1.52 instead of 1.0<->1.52.
     Ray refractOrReflect(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
-                         double lambda, Pcg32& rng, bool* transmitted = nullptr) const {
+                         double lambda, Pcg32& rng, bool* transmitted = nullptr,
+                         double extIor = 1.0) const {
         double ng = m.ior(lambda);
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
-        double n1 = entering ? 1.0 : ng;
-        double n2 = entering ? ng : 1.0;
+        double n1 = entering ? extIor : ng;
+        double n2 = entering ? ng : extIor;
         double eta = n1 / n2;
         double cosI = -dot(d, nl);              // > 0
         double sin2t = eta * eta * (1.0 - cosI * cosI);
