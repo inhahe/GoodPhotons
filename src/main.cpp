@@ -1508,6 +1508,12 @@ static void onInterrupt(int sig) {
 // first update at the film's resolution and torn down at process exit. Closing the
 // window sets g_stopRequested so the render stops cleanly (writing its final image).
 static bool                        g_showWindow = false;
+// -keepwindow / -hold: don't auto-close the live preview when the render finishes.
+// Normally g_liveWin is torn down at process exit (right after the render's last frame),
+// so the window vanishes the instant rendering completes. With this set, main() blocks
+// after run() returns until the user closes the window themselves, so a finished image
+// stays on screen to inspect.
+static bool                        g_keepWindow = false;
 static std::unique_ptr<LiveWindow> g_liveWin;
 // Base window title identifying WHAT is being rendered — set in main() to
 // "ftrace - <scene> -> <output>" (see makeWindowTitle). The live status (spp / noise)
@@ -2924,6 +2930,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
+        else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
@@ -4106,6 +4113,15 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;
+    }
+    // -keepwindow / -hold: keep the finished image on screen. The live window runs its
+    // own UI thread, so we just block here until the user closes it (or it's already gone)
+    // rather than letting process exit tear it down the instant the render completes.
+    if (g_keepWindow && g_liveWin && !g_liveWin->closed()) {
+        std::printf("[window] render done — close the preview window to exit.\n");
+        std::fflush(stdout);
+        while (!g_liveWin->closed())
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 #ifdef HAVE_CUDA
     cudaGracefulShutdown();
