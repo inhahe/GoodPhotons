@@ -2492,7 +2492,7 @@ correctly on **both** backends.
   smaller GPUs; energy conservation and image agreement (to within Monte-Carlo noise) hold
   across every scene tested (cornell, materials A/B/C, spotlight, envlight, thin-film,
   multilayer, mix, fog).
-- **Re: "wavefront helps divergent scenes AND small GPUs" (todo.txt question):** it's
+- **Re: "wavefront helps divergent scenes AND small GPUs" (notes/todo.txt question):** it's
   *both*, and they're related. (1) *Divergent scenes* — many materials and/or highly
   variable path lengths — benefit from the per-material sort (kills branch divergence) and
   compaction (kills path-length divergence). (2) *Small GPUs* benefit because they have

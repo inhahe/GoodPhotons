@@ -1,4 +1,0 @@
-.ppm
-.png
-.ftsl
-.ftbuf

@@ -36,7 +36,7 @@ group {
     scale 1.1
 
     # a torus lying in the group's XZ plane (the mesh has its own local spin too)
-    mesh { file "torus.obj"  material gold  rotate 90 0 0  scale 0.16 }
+    mesh { file "scenes/torus.obj"  material gold  rotate 90 0 0  scale 0.16 }
 
     # two spheres orbiting the local origin
     sphere { center  0.34 0    0     radius 0.10  material mir   }
