@@ -4099,7 +4099,7 @@ static int run(int argc, char** argv) {
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
               "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
-              "         look:   move the mouse to steer (click the window to capture; Esc frees the cursor to resize/close)\n"
+              "         look:   move the mouse over the window to steer (cursor stays visible; leave the window to stop turning)\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"

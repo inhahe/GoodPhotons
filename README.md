@@ -166,8 +166,8 @@ paths they can capture at all**.
 > **Interactive camera (raster + live window).** When a **single** camera is
 > rasterized into a `-window` (a still preview, including the double-click default —
 > a `camera_curve` flyby instead animates through its frames), the window becomes an
-> interactive **fly-camera**: click the window to capture the mouse, then fly around
-> and read off the numbers to author a `.ftsl` camera. There is a single unified view
+> interactive **fly-camera**: move the mouse over the window to look around, then fly
+> around and read off the numbers to author a `.ftsl` camera. There is a single unified view
 > — you always **travel where you look** (or the exact opposite when reversing), so
 > there is no separate "aim the target" mode and no crosshair. The world up is fixed,
 > so there is no roll. (To drop straight into this viewer **seeded at the first frame
@@ -176,7 +176,7 @@ paths they can capture at all**.
 >
 > | input | does |
 > |---|---|
-> | **move the mouse** | **steer** — horizontal motion turns (yaw), vertical motion looks up/down (pitch, clamped just shy of straight up/down). Where you look is where you fly. |
+> | **move the mouse over the window** | **steer** — horizontal motion turns (yaw), vertical motion looks up/down (pitch, clamped just shy of straight up/down). Where you look is where you fly. The pointer stays **visible**; steering happens only while the cursor is inside the window, and stops the moment it leaves. |
 > | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
 > | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
 > | **mouse wheel** | **dolly** one step forward (up) / back (down) per notch — a discrete, fully-rendered nudge for precise positioning (can't overshoot into geometry) |
@@ -184,7 +184,6 @@ paths they can capture at all**.
 > | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
-> | `Esc` | **release the captured cursor** (so you can resize or close the window); click the window again to re-capture |
 > | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
 >
 > **Motion is feedback-locked, not wall-clock-based.** Each held-key frame (and each
@@ -204,8 +203,9 @@ paths they can capture at all**.
 >
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
 > the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
-> are no letter-key bindings to relearn. While the mouse is captured the OS cursor is
-> hidden and re-centred every frame, so you can turn without limit; `Esc` frees it.
+> are no letter-key bindings to relearn. The mouse pointer stays visible the whole
+> time: moving it over the window steers, and moving it off the window (to the title
+> bar, another app, etc.) stops the view turning — nothing captures or hides the cursor.
 > The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
 > the live window's resolution — drag a corner to make the preview smaller (and
 > snappier) or larger (and sharper); the aspect ratio and the readout are

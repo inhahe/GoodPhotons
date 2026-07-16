@@ -18,10 +18,11 @@
 // you always travel where you look (or the exact opposite when reversing), so there is
 // no separate "aim the target" mode and no crosshair.
 //
-//   * mouse-look STEERS: horizontal motion yaws, vertical motion pitches. While look is
-//     captured the OS cursor is hidden and re-centred every frame, so you can turn
-//     without limit. `lookDx/lookDy` are raw client-pixel deltas (+dx = cursor right,
-//     +dy = cursor down).
+//   * mouse-look is HOVER-look: move the mouse over the window to STEER (horizontal motion
+//     yaws, vertical motion pitches). The cursor stays VISIBLE and free — it is never hidden,
+//     clipped, or warped — and steering simply stops the instant the pointer leaves the client
+//     area, so you can reach the title bar or other apps without turning the view. `lookDx/lookDy`
+//     are raw client-pixel deltas (+dx = cursor right, +dy = cursor down).
 //   * `fwd` / `back` are the CURRENT held state of the throttle keys (Space or '+' fly
 //     forward; Shift or '-' fly backward) — the render loop advances you ONE fixed step
 //     per RENDERED frame while one is held (feedback-locked: motion scales with render
@@ -31,9 +32,9 @@
 //   * `wheelSpeed` (Ctrl+wheel notches, + = up) adjusts the STEP SIZE (up = bigger steps).
 //   * `reset` / `print` / `cycleCollide` are one-shot edge flags ('0'/Home reset the
 //     camera; 'P' prints a paste-ready camera block; 'C' cycles the collision mode
-//     slide -> stop -> noclip). `looking` reports whether mouse-look is currently
-//     captured (Esc releases the cursor so the window can be resized/closed; a click
-//     re-captures).
+//     slide -> stop -> noclip). `looking` reports whether the cursor is currently inside the
+//     client area (steering live); it goes false the instant the pointer leaves the window or
+//     focus is lost, and the cursor is always free to resize/close the window.
 struct NavInput {
     double lookDx = 0.0, lookDy = 0.0;   // mouse-look motion, client pixels
     double wheel  = 0.0;                  // plain-wheel notches (+ = up = dolly forward)

@@ -60,39 +60,30 @@ struct LiveWindow::Impl {
     // render thread can race freely without the inMtx.
     std::atomic<bool>    keyFwd{false};             // Space / '+' currently held -> fly forward
     std::atomic<bool>    keyBack{false};            // Shift / '-' currently held -> fly backward
-    // Mouse-look capture: while `looking`, the OS cursor is hidden and re-centred every
-    // move so the user can turn without limit. Esc releases; a click re-captures.
-    std::atomic<bool>    looking{false};            // mouse-look currently captured
-    bool                 recentring = false;        // true while we ignore the SetCursorPos echo event
+    // Mouse-look is HOVER-look: whenever the cursor is over the client area, moving it STEERS
+    // the view by the frame-to-frame motion. The cursor stays VISIBLE and free — we never hide,
+    // clip, or capture it — and steering simply stops the moment the pointer leaves the window
+    // (so you can move to the title bar / other apps without turning the view). `looking` tracks
+    // whether the cursor is currently inside. `lastMouse`/`haveMouse` hold the previous position
+    // for the delta; `tracking` is whether we've armed WM_MOUSELEAVE for the current hover.
+    std::atomic<bool>    looking{false};            // cursor currently inside client (steering live)
+    POINT                lastMouse{0, 0};           // previous client-pixel cursor pos (for the delta)
+    bool                 haveMouse = false;         // lastMouse is valid (skip the first move after entry)
+    bool                 tracking  = false;         // WM_MOUSELEAVE requested for this hover
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
     void paint(HDC hdc, const RECT& client);
-    void setCapture(HWND h, bool on);               // enter/leave mouse-look (hide+centre cursor)
+    void endLook();                                 // cursor left / focus lost: stop steering cleanly
 };
 
-// Enter or leave mouse-look capture: hide/show the cursor, confine it (so it can't leave
-// the window while turning), and re-centre it. Called only on the UI thread.
-void LiveWindow::Impl::setCapture(HWND h, bool on) {
-    if (on == looking.load()) return;
-    looking.store(on);
-    if (on) {
-        RECT cr; GetClientRect(h, &cr);
-        POINT c{ (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
-        ClientToScreen(h, &c);
-        recentring = true;
-        SetCursorPos(c.x, c.y);
-        while (ShowCursor(FALSE) >= 0) {}            // hide (counter may start > 0)
-        RECT sr = cr; POINT tl{cr.left, cr.top}, br{cr.right, cr.bottom};
-        ClientToScreen(h, &tl); ClientToScreen(h, &br);
-        sr.left = tl.x; sr.top = tl.y; sr.right = br.x; sr.bottom = br.y;
-        ClipCursor(&sr);                            // keep the cursor inside while turning
-        ::SetCapture(h);
-    } else {
-        ClipCursor(nullptr);
-        while (ShowCursor(TRUE) < 0) {}             // show
-        if (GetCapture() == h) ReleaseCapture();
-    }
+// Stop hover-look steering: called when the cursor leaves the client area or the window loses
+// focus. Drops the stale last-position so the next entry doesn't emit a jump, and clears the
+// "inside" flag. The cursor is never hidden/clipped, so there is nothing to restore.
+void LiveWindow::Impl::endLook() {
+    looking.store(false);
+    haveMouse = false;
+    tracking  = false;
 }
 
 void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
@@ -157,30 +148,33 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         case WM_SIZE:
             InvalidateRect(h, nullptr, FALSE);
             return 0;
-        case WM_LBUTTONDOWN:
-            // A click (re)captures mouse-look: the cursor is hidden and re-centred so the
-            // user can turn freely. Esc releases it (to resize/close the window).
-            if (self) self->setCapture(h, true);
-            return 0;
         case WM_MOUSEMOVE:
-            // While mouse-look is captured, accumulate the raw motion away from the client
-            // centre as a steering delta, then warp the cursor back to the centre so the
-            // next move measures a fresh delta (unlimited turning). The SetCursorPos warp
-            // generates its own WM_MOUSEMOVE, which we skip via the `recentring` flag.
-            if (self && self->looking.load()) {
-                if (self->recentring) { self->recentring = false; return 0; }
-                RECT cr; GetClientRect(h, &cr);
-                int cx = (cr.right - cr.left) / 2, cy = (cr.bottom - cr.top) / 2;
+            // Hover-look: while the cursor is over the client area, feed its frame-to-frame
+            // motion as a steering delta. The cursor stays visible and free (no hide/clip/warp).
+            // We arm WM_MOUSELEAVE on the first move of each hover so we know when it exits, and
+            // skip the delta for that first move (haveMouse == false) so re-entering doesn't jump.
+            if (self) {
                 int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-                int dx = mx - cx, dy = my - cy;
-                if (dx || dy) {
-                    { std::lock_guard<std::mutex> lk(self->inMtx);
-                      self->lookDx += dx; self->lookDy += dy; }
-                    POINT c{cx, cy}; ClientToScreen(h, &c);
-                    self->recentring = true;
-                    SetCursorPos(c.x, c.y);
+                if (!self->tracking) {
+                    TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+                    TrackMouseEvent(&tme);
+                    self->tracking = true;
+                    self->looking.store(true);
                 }
+                if (self->haveMouse) {
+                    int dx = mx - self->lastMouse.x, dy = my - self->lastMouse.y;
+                    if (dx || dy) {
+                        std::lock_guard<std::mutex> lk(self->inMtx);
+                        self->lookDx += dx; self->lookDy += dy;
+                    }
+                }
+                self->lastMouse.x = mx; self->lastMouse.y = my;
+                self->haveMouse = true;
             }
+            return 0;
+        case WM_MOUSELEAVE:
+            // Cursor left the client area: stop steering until it comes back.
+            if (self) self->endLook();
             return 0;
         case WM_MOUSEWHEEL:
             // One detent (120 units) = one notch. Plain wheel DOLLIES the camera one fly-step
@@ -200,9 +194,8 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             // (held) fly backward — you always travel where you look (or the exact
             // opposite when reversing). Mouse-look steers. Wheel throttles the speed.
             // '0'/Home reset the camera, 'P' prints a paste-ready camera block, 'C' cycles
-            // the collision mode (slide/stop/noclip), Esc releases the captured cursor. The
-            // movement keys are layout-independent (Space/Shift and the +/- keys land in the
-            // same place on QWERTY, Dvorak, etc.).
+            // the collision mode (slide/stop/noclip). The movement keys are layout-independent
+            // (Space/Shift and the +/- keys land in the same place on QWERTY, Dvorak, etc.).
             if (self) {
                 switch (wp) {
                     case VK_SPACE: case VK_OEM_PLUS: case VK_ADD:
@@ -215,8 +208,6 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                         { std::lock_guard<std::mutex> lk(self->inMtx); self->printReq = true; } break;
                     case 'C':
                         { std::lock_guard<std::mutex> lk(self->inMtx); self->collideReq = true; } break;
-                    case VK_ESCAPE:
-                        self->setCapture(h, false); break;  // release cursor
                     default: break;
                 }
             }
@@ -234,10 +225,10 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             return 0;
         case WM_KILLFOCUS:
-            // Losing focus (Alt-Tab, click-away) must release the cursor and drop any held
+            // Losing focus (Alt-Tab, click-away) must stop steering and drop any held
             // throttle, else the keys would appear "stuck" down.
             if (self) {
-                self->setCapture(h, false);
+                self->endLook();
                 self->keyFwd.store(false);
                 self->keyBack.store(false);
             }
@@ -257,7 +248,7 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             return 0;
         case WM_CLOSE:
-            if (self) { self->setCapture(h, false); self->closedFlag.store(true); }
+            if (self) { self->endLook(); self->closedFlag.store(true); }
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
