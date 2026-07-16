@@ -12,6 +12,8 @@ NavInput LiveWindow::drainNav() { return {}; }
 bool LiveWindow::clientSize(int&, int&) const { return false; }
 void LiveWindow::enablePanel(int, double, const char*) {}
 void LiveWindow::setPanelState(int, bool, bool, const char*) {}
+void LiveWindow::setPathCount(int) {}
+void LiveWindow::setEditState(bool, int) {}
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -46,11 +48,14 @@ static std::wstring utf8ToWide(const std::string& s) {
 // range Windows reserves for standard dialog buttons.
 enum {
     ID_CLIP = 1001, ID_RESET, ID_PATH, ID_PLAY,
-    ID_TIMELINE, ID_STRIDE, ID_RATE, ID_SW_UPDATE, ID_SW_SEC
+    ID_TIMELINE, ID_STRIDE, ID_RATE, ID_SW_UPDATE, ID_SW_SEC,
+    // ---- curve-editor row ----
+    ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW
 };
-static const int kPanelH = 64;              // reserved control-strip height (px), two rows
+static const int kPanelH = 92;              // reserved control-strip height (px): buttons + timeline + editor rows
 // Marshal cross-thread panel ops onto the window's own message-pump thread.
-#define WM_MKPANEL  (WM_APP + 1)            // build the control panel (params staged in Impl)
+#define WM_MKPANEL      (WM_APP + 1)        // build the control panel (params staged in Impl)
+#define WM_SETPATHCOUNT (WM_APP + 2)        // retune the timeline range/visibility (wParam = new count)
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -91,6 +96,9 @@ struct LiveWindow::Impl {
     HWND hClip=nullptr, hReset=nullptr, hPath=nullptr, hPlay=nullptr, hTimeline=nullptr,
          hStrideLbl=nullptr, hStride=nullptr, hRateLbl=nullptr, hRate=nullptr,
          hSwUpdate=nullptr, hSwSec=nullptr;         // child controls (set on UI thread pre-hasPanel)
+    // ---- curve-editor row controls ----
+    HWND hRec=nullptr, hAddPt=nullptr, hInsPt=nullptr, hDelPt=nullptr, hSave=nullptr,
+         hPtLbl=nullptr, hRaw=nullptr, hTolLbl=nullptr, hTol=nullptr;
     HFONT panelFont = nullptr;
     // Staged enablePanel() params (set under inMtx before WM_MKPANEL is sent).
     int                  reqPathCount = 0; double reqDefFps = 0.0; std::string reqCollide;
@@ -101,6 +109,10 @@ struct LiveWindow::Impl {
     int                  strideVal = 1;             // "cameras / screen update" input (current)
     double               rateVal   = 30.0;          // "cameras / second" input (current)
     bool                 rateModeVal = true;        // switch: true = per-sec, false = per-update
+    // ---- Curve-editor outputs (guarded by inMtx): one-shot button edges + current inputs ----
+    bool                 recReq = false, addReq = false, insReq = false, delReq = false, saveReq = false;
+    double               tolVal = -1.0;             // simplify tolerance (world units; <0 = unset/unchanged)
+    bool                 rawVal = false;            // "raw" checkbox: keep every sample vs. simplify
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
@@ -108,6 +120,8 @@ struct LiveWindow::Impl {
     void endLook();                                 // cursor left / focus lost: stop steering cleanly
     void buildPanel(HWND h);                        // create child controls + grow window (UI thread)
     void layoutPanel(HWND h);                       // position child controls in the strip (UI thread)
+    void applyPathCount(int pc);                    // retune/show/hide the timeline group (UI thread)
+    void showPathGroup(bool vis);                   // toggle visibility of the path (timeline) controls
 };
 
 // Stop hover-look steering: called when the cursor leaves the client area or the window loses
@@ -143,25 +157,37 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     std::wstring clipTxt = utf8ToWide("Clip: " + collide);
     hClip  = mk(L"BUTTON", clipTxt.c_str(), BS_PUSHBUTTON, ID_CLIP);
     hReset = mk(L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_RESET);
-    if (pathCount >= 2) {
-        // Path (lock-to-path) toggle doubles as the timeline enable — same option, per spec.
-        hPath = mk(L"BUTTON", L"Path lock", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_PATH);
-        hPlay = mk(L"BUTTON", L"Play", BS_PUSHBUTTON, ID_PLAY);
-        hStrideLbl = mk(L"STATIC", L"cams/upd:", SS_RIGHT | SS_CENTERIMAGE, 0);
-        hStride    = mk(L"EDIT", L"1", ES_NUMBER | ES_RIGHT | WS_BORDER, ID_STRIDE);
-        hRateLbl   = mk(L"STATIC", L"cams/s:", SS_RIGHT | SS_CENTERIMAGE, 0);
-        wchar_t rbuf[32]; swprintf(rbuf, 32, L"%g", (defFps > 0.0 ? defFps : 30.0));
-        hRate      = mk(L"EDIT", rbuf, ES_RIGHT | WS_BORDER, ID_RATE);
-        // Speed-model switch: two radio buttons; default = per-sec (real-time playback at fps).
-        hSwUpdate  = mk(L"BUTTON", L"per upd", BS_AUTORADIOBUTTON | WS_GROUP, ID_SW_UPDATE);
-        hSwSec     = mk(L"BUTTON", L"per sec", BS_AUTORADIOBUTTON, ID_SW_SEC);
-        SendMessageW(hSwSec, BM_SETCHECK, BST_CHECKED, 0);
-        // Timeline trackbar: one tick per camera (page = ~5%).
-        hTimeline  = mk(L"msctls_trackbar32", L"", TBS_HORZ | TBS_AUTOTICKS, ID_TIMELINE);
-        SendMessageW(hTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, pathCount - 1));
-        SendMessageW(hTimeline, TBM_SETPAGESIZE, 0, (LPARAM)std::max(1, pathCount / 20));
-        SendMessageW(hTimeline, TBM_SETPOS, TRUE, 0);
-    }
+    // Path/timeline group is ALWAYS created (so authoring a curve can reveal it later via
+    // setPathCount), then hidden when there is no path yet (pathCount < 2).
+    // Path (lock-to-path) toggle doubles as the timeline enable — same option, per spec.
+    hPath = mk(L"BUTTON", L"Path lock", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_PATH);
+    hPlay = mk(L"BUTTON", L"Play", BS_PUSHBUTTON, ID_PLAY);
+    hStrideLbl = mk(L"STATIC", L"cams/upd:", SS_RIGHT | SS_CENTERIMAGE, 0);
+    hStride    = mk(L"EDIT", L"1", ES_NUMBER | ES_RIGHT | WS_BORDER, ID_STRIDE);
+    hRateLbl   = mk(L"STATIC", L"cams/s:", SS_RIGHT | SS_CENTERIMAGE, 0);
+    wchar_t rbuf[32]; swprintf(rbuf, 32, L"%g", (defFps > 0.0 ? defFps : 30.0));
+    hRate      = mk(L"EDIT", rbuf, ES_RIGHT | WS_BORDER, ID_RATE);
+    // Speed-model switch: two radio buttons; default = per-sec (real-time playback at fps).
+    hSwUpdate  = mk(L"BUTTON", L"per upd", BS_AUTORADIOBUTTON | WS_GROUP, ID_SW_UPDATE);
+    hSwSec     = mk(L"BUTTON", L"per sec", BS_AUTORADIOBUTTON, ID_SW_SEC);
+    SendMessageW(hSwSec, BM_SETCHECK, BST_CHECKED, 0);
+    // Timeline trackbar: one tick per camera (page = ~5%).
+    hTimeline  = mk(L"msctls_trackbar32", L"", TBS_HORZ | TBS_AUTOTICKS, ID_TIMELINE);
+    int rng = std::max(1, pathCount - 1);
+    SendMessageW(hTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, rng));
+    SendMessageW(hTimeline, TBM_SETPAGESIZE, 0, (LPARAM)std::max(1, pathCount / 20));
+    SendMessageW(hTimeline, TBM_SETPOS, TRUE, 0);
+    showPathGroup(pathCount >= 2);
+    // ---- Curve-editor row: author/record a camera_curve, then Save it ----
+    hRec   = mk(L"BUTTON", L"Rec",   BS_PUSHBUTTON, ID_REC);
+    hAddPt = mk(L"BUTTON", L"+Pt",   BS_PUSHBUTTON, ID_ADDPT);
+    hInsPt = mk(L"BUTTON", L"Ins",   BS_PUSHBUTTON, ID_INSPT);
+    hDelPt = mk(L"BUTTON", L"Del",   BS_PUSHBUTTON, ID_DELPT);
+    hPtLbl = mk(L"STATIC", L"pts: 0", SS_LEFT | SS_CENTERIMAGE, 0);
+    hRaw   = mk(L"BUTTON", L"raw",   BS_AUTOCHECKBOX, ID_RAW);
+    hTolLbl= mk(L"STATIC", L"tol:",  SS_RIGHT | SS_CENTERIMAGE, 0);
+    hTol   = mk(L"EDIT",   L"0",     ES_RIGHT | WS_BORDER, ID_TOL);
+    hSave  = mk(L"BUTTON", L"Save",  BS_PUSHBUTTON, ID_SAVE);
     // Grow the window by the strip height so the image keeps its size.
     RECT wr; GetWindowRect(h, &wr);
     SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + panelH,
@@ -179,25 +205,57 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     int W = cr.right - cr.left, H = cr.bottom - cr.top;
     int top = H - panelH;
     const int pad = 5, bh = 24;
-    int row1 = top + 5, row2 = top + 5 + bh + 4;
+    int row1 = top + 5, row2 = top + 5 + (bh + 4), row3 = top + 5 + 2 * (bh + 4);
     int x = pad;
     auto place = [&](HWND c, int w, int y, int height) {
         if (c) MoveWindow(c, x, y, w, height, TRUE);
         x += w + pad;
     };
+    // Row 1: collision/reset + the path (timeline) group. The group is positioned even when
+    // hidden, so revealing it later (setPathCount) needs no relayout.
     place(hClip, 84, row1, bh);
     place(hReset, 56, row1, bh);
-    if (pathCount >= 2) {
-        place(hPath, 66, row1, bh);
-        place(hPlay, 56, row1, bh);
-        place(hStrideLbl, 58, row1, bh);
-        place(hStride, 40, row1, bh);
-        place(hRateLbl, 50, row1, bh);
-        place(hRate, 48, row1, bh);
-        place(hSwUpdate, 66, row1, bh);
-        place(hSwSec, 62, row1, bh);
-        if (hTimeline) MoveWindow(hTimeline, pad, row2, std::max(1, W - 2 * pad), bh, TRUE);
+    place(hPath, 66, row1, bh);
+    place(hPlay, 56, row1, bh);
+    place(hStrideLbl, 58, row1, bh);
+    place(hStride, 40, row1, bh);
+    place(hRateLbl, 50, row1, bh);
+    place(hRate, 48, row1, bh);
+    place(hSwUpdate, 66, row1, bh);
+    place(hSwSec, 62, row1, bh);
+    // Row 2: the full-width timeline.
+    if (hTimeline) MoveWindow(hTimeline, pad, row2, std::max(1, W - 2 * pad), bh, TRUE);
+    // Row 3: the curve-editor toolset.
+    x = pad;
+    place(hRec,   56, row3, bh);
+    place(hAddPt, 48, row3, bh);
+    place(hInsPt, 48, row3, bh);
+    place(hDelPt, 48, row3, bh);
+    place(hPtLbl, 60, row3, bh);
+    place(hRaw,   52, row3, bh);
+    place(hTolLbl,34, row3, bh);
+    place(hTol,   56, row3, bh);
+    place(hSave,  56, row3, bh);
+}
+
+// Show/hide the path (timeline) controls as a group — the timeline only makes sense once a
+// curve with >= 2 cameras exists (loaded or authored). Called on build and from applyPathCount.
+void LiveWindow::Impl::showPathGroup(bool vis) {
+    int sw = vis ? SW_SHOW : SW_HIDE;
+    HWND grp[] = { hPath, hPlay, hStrideLbl, hStride, hRateLbl, hRate, hSwUpdate, hSwSec, hTimeline };
+    for (HWND c : grp) if (c) ShowWindow(c, sw);
+}
+
+// Retune the timeline to a new camera count and show/hide the path group accordingly. Runs on
+// the UI thread (via WM_SETPATHCOUNT) so the trackbar messages and ShowWindow are thread-safe.
+void LiveWindow::Impl::applyPathCount(int pc) {
+    pathCount = pc;
+    if (hTimeline) {
+        int rng = std::max(1, pc - 1);
+        SendMessageW(hTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, rng));
+        SendMessageW(hTimeline, TBM_SETPAGESIZE, 0, (LPARAM)std::max(1, pc / 20));
     }
+    showPathGroup(pc >= 2);
 }
 
 void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
@@ -274,6 +332,9 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         }
         case WM_MKPANEL:
             if (self) self->buildPanel(h);           // build controls + grow window (UI thread)
+            return 0;
+        case WM_SETPATHCOUNT:
+            if (self && self->hasPanel.load()) { self->applyPathCount((int)wp); InvalidateRect(h, nullptr, FALSE); }
             return 0;
         case WM_SIZE:
             if (self) self->layoutPanel(h);          // reflow the control strip to the new width
@@ -360,6 +421,25 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                             wchar_t b[32]; GetWindowTextW(self->hRate, b, 32);
                             double v = wcstod(b, nullptr);
                             if (v > 0.0) { std::lock_guard<std::mutex> lk(self->inMtx); self->rateVal = v; }
+                        }
+                        break;
+                    // ---- curve-editor buttons: one-shot edges the render loop acts on ----
+                    case ID_REC:   { std::lock_guard<std::mutex> lk(self->inMtx); self->recReq  = true; } break;
+                    case ID_ADDPT: { std::lock_guard<std::mutex> lk(self->inMtx); self->addReq  = true; } break;
+                    case ID_INSPT: { std::lock_guard<std::mutex> lk(self->inMtx); self->insReq  = true; } break;
+                    case ID_DELPT: { std::lock_guard<std::mutex> lk(self->inMtx); self->delReq  = true; } break;
+                    case ID_SAVE:  { std::lock_guard<std::mutex> lk(self->inMtx); self->saveReq = true; } break;
+                    case ID_RAW:
+                        if (code == BN_CLICKED && self->hRaw) {
+                            bool on = SendMessageW(self->hRaw, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            std::lock_guard<std::mutex> lk(self->inMtx); self->rawVal = on;
+                        }
+                        break;
+                    case ID_TOL:
+                        if (code == EN_CHANGE && self->hTol) {
+                            wchar_t b[32]; GetWindowTextW(self->hTol, b, 32);
+                            double v = wcstod(b, nullptr);
+                            if (v >= 0.0) { std::lock_guard<std::mutex> lk(self->inMtx); self->tolVal = v; }
                         }
                         break;
                     default: break;
@@ -563,10 +643,15 @@ NavInput LiveWindow::drainNav() {
     // Control-panel outputs: one-shot button edges (read-and-clear) + current input values.
     n.togglePath = impl_->pathReq;  n.togglePlay = impl_->playReq;  n.scrubTo = impl_->scrubReq;
     n.stride = impl_->strideVal;    n.camPerSec = impl_->rateVal;   n.rateMode = impl_->rateModeVal;
+    // Curve-editor outputs: one-shot button edges (read-and-clear) + current authoring inputs.
+    n.recToggle = impl_->recReq;    n.addPoint = impl_->addReq;     n.insPoint = impl_->insReq;
+    n.delPoint  = impl_->delReq;    n.saveCurve = impl_->saveReq;
+    n.simplifyTol = impl_->tolVal;  n.rawRecord = impl_->rawVal;
     impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = impl_->collideReq = false;
     impl_->pathReq = impl_->playReq = false;
     impl_->scrubReq = -1;
+    impl_->recReq = impl_->addReq = impl_->insReq = impl_->delReq = impl_->saveReq = false;
     return n;
 }
 
@@ -606,6 +691,19 @@ void LiveWindow::setPanelState(int idx, bool playing, bool pathMode, const char*
         std::wstring w = utf8ToWide(std::string("Clip: ") + collideLabel);
         SetWindowTextW(impl_->hClip, w.c_str());
     }
+}
+
+void LiveWindow::setPathCount(int pathCount) {
+    if (!impl_ || !impl_->hasPanel.load() || !impl_->hwnd) return;
+    // Marshal to the UI thread: retunes the trackbar range + shows/hides the path group.
+    SendMessageW(impl_->hwnd, WM_SETPATHCOUNT, (WPARAM)pathCount, 0);
+}
+
+void LiveWindow::setEditState(bool recording, int pointCount) {
+    if (!impl_ || !impl_->hasPanel.load()) return;
+    if (impl_->hRec)   SetWindowTextW(impl_->hRec, recording ? L"Stop" : L"Rec");
+    if (impl_->hPtLbl) { wchar_t b[32]; swprintf(b, 32, L"pts: %d", pointCount);
+                         SetWindowTextW(impl_->hPtLbl, b); }
 }
 
 #endif // _WIN32

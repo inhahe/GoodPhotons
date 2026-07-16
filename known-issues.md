@@ -5,6 +5,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN: camera_curve editor — remaining phases + rough edges
+
+The in-viewer `camera_curve` editor (main.cpp fly-viewer, Rec / +Pt / Ins / Del / Save)
+landed as **Phase 1** (core point authoring + recording + live spline overlay + Save a
+`camera_curve` block with a `look curve`). Planned follow-ons still to do:
+
+- **Phase 2 — speed painting.** Modulate camera density (inverse speed) while playing/
+  scrubbing via the wheel/slider as an *additive brush*, emitting a `density_at` track in
+  the saved curve. Should also retime playback live.
+- **Phase 3 — orientation painting.** Author the `look curve` by steering while scrubbing
+  (currently the look targets come only from each control point's recorded/placed fwd).
+- **Phase 4 — rendered-sequence source.** Play a real rendered flyby from a base filename
+  (`<base>NNN.<ext>`, matching ftrace's numbered output) and re-time it in the editor.
+- **Phase 5 — round-trip.** Load an existing `camera_curve` back into the editor as
+  control points for editing (currently Save is write-only; the editor starts empty).
+
+Rough edges in Phase 1 to revisit: (a) the **first** authoring action (+Pt/Ins/Rec-stop)
+on a scene that was opened with an existing multi-frame flyby **replaces** the loaded
+`explorePath` with the editor's spline — intended ("author a new curve") but can surprise;
+seeding `editPts` from the loaded frames (part of Phase 5) would make it non-destructive.
+(b) The saved `look_point`s are placed one world-unit ahead of each eye along the recorded
+fwd — fine for direction but the look *spline* can bow between sparse points; Phase 3 will
+let the user shape it. (c) No explicit point *selection* UI yet — Del targets the nearest
+control point to the current eye.
+
 ### OPEN: interactive raster fly-viewer can peg all cores / grow RAM when orphaned or on a heavy scene
 
 The interactive fly-camera viewer loop (`main.cpp`, ~line 4037) only re-rasterizes

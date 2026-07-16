@@ -68,8 +68,20 @@ struct NavInput {
     int    stride     = 0;               // "cameras / screen update" input (current value; 0 = unchanged)
     double camPerSec  = 0.0;             // "cameras / second" input (current value; 0 = unchanged)
     bool   rateMode   = false;           // speed switch: true = cam/sec (wall clock), false = stride (per update)
+    // ---- Curve-EDITOR outputs (the interactive camera_curve authoring panel) ----
+    // One-shot button edges (drainNav clears them) plus two persistent input values. The
+    // render loop owns the actual CameraTrack; the window only reports button presses and
+    // the two authoring parameters (simplify tolerance + raw/simplified choice).
+    bool   recToggle  = false;           // "Rec" button: start/stop recording a flythrough (one-shot toggle)
+    bool   addPoint   = false;           // "+Pt" button: append current pose as a control point (one-shot)
+    bool   insPoint   = false;           // "Ins" button: insert a control point at the current scrub position (one-shot)
+    bool   delPoint   = false;           // "Del" button: delete the selected/nearest control point (one-shot)
+    bool   saveCurve  = false;           // "Save" button: write the authored camera_curve block (one-shot)
+    double simplifyTol = -1.0;           // recording simplify tolerance in world units (current value; <0 = unchanged)
+    bool   rawRecord  = false;           // "raw" checkbox: keep every recorded sample (true) vs. simplify (false)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
-                                || cycleCollide || togglePath || togglePlay || scrubTo >= 0; }
+                                || cycleCollide || togglePath || togglePlay || scrubTo >= 0
+                                || recToggle || addPoint || insPoint || delPoint || saveCurve; }
 };
 
 class LiveWindow {
@@ -102,8 +114,22 @@ public:
     // unchanged. `pathCount` is the number of cameras on the timeline: >=2 shows the timeline,
     // Play/Pause, the Path (lock-to-path) toggle, the two speed inputs and their switch; <2
     // shows only the Clip and Reset buttons (no path controls). `defFps` seeds the cam/sec box
-    // and `collideLabel` the initial Clip-button text. No-op on non-Windows / stub builds.
+    // and `collideLabel` the initial Clip-button text. An EDITOR row (Rec / +Pt / Ins / Del /
+    // Save + a simplify-tolerance box and raw toggle) is always built so a camera_curve can be
+    // authored even from a lone camera. No-op on non-Windows / stub builds.
     void enablePanel(int pathCount, double defFps, const char* collideLabel);
+
+    // Reconfigure the timeline at runtime after the user authors/edits a curve (the editor
+    // regenerates the played path from its control points). `pathCount` is the new number of
+    // cameras: >=2 shows/retunes the timeline + Play/Pause + Path controls (creating them if
+    // the panel was built without a path), <2 hides them. Marshalled to the UI thread; no-op if
+    // the panel isn't enabled. Never re-emits a NavInput edge.
+    void setPathCount(int pathCount);
+
+    // Mirror the editor's state onto the panel: `recording` sets the Rec button label
+    // (Rec/Stop) and `pointCount` updates the control-point readout. Marshalled to the UI
+    // thread; no feedback edge. No-op if the panel isn't enabled.
+    void setEditState(bool recording, int pointCount);
 
     // Push live viewer state so the panel mirrors reality (call from the render loop whenever
     // it changes): `idx` moves the timeline slider (e.g. during playback), `playing` sets the

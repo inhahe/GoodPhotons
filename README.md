@@ -224,6 +224,30 @@ paths they can capture at all**.
 > **nudges one camera per notch**, and the slider tracks your position live. Toggle
 > **Path** off (or press Reset) to return to free flight.
 >
+> **Camera-curve editor (author a flyby by flying it).** An always-present editor row
+> lets you build a real [`camera_curve`](#animated-cameras--flypaths) right in the
+> viewer — fly the shot you want, then Save it. It works from a lone camera or on top of
+> an existing flyby:
+>
+> | control | does |
+> |---|---|
+> | **Rec** | start/stop **recording** your free flight; while armed it samples the pose as you move, then (on Stop) turns those samples into control points — either every sample (**raw**) or a tolerance-simplified subset |
+> | **+Pt** | append the **current pose** (eye + look direction + up + fov) as a control point |
+> | **Ins** | **insert** a control point at the current scrub position (splits that segment) |
+> | **Del** | delete the control point **nearest** the current eye |
+> | **Save** | write the authored `camera_curve { … }` block to a file next to the scene (`<scene>_curve.ftsl`, non-clobbering) **and echo it to stdout** to paste into a scene |
+> | **raw** (checkbox) | keep **every** recorded sample instead of simplifying |
+> | **tol** | recording **simplify tolerance** in world units (Ramer–Douglas–Peucker on the eye path; `0` = keep raw) |
+>
+> As you author, a **live spline overlay** is drawn on the preview: the control points as
+> markers (the one nearest you highlighted — the Del target) and the interpolated path as
+> a green polyline, sampled with the **same centripetal Catmull-Rom** math the renderer
+> uses for `camera_curve`, so the preview is WYSIWYG. The saved block records each control
+> point as a `point` plus a `look curve` (a second spline of `look_point` targets) so the
+> camera's orientation is authored too, and carries the current `up`, `fov_y`, render
+> `mode`, `frames`, and scene `fps`. Editing an existing curve in place (round-trip) is a
+> planned follow-on.
+>
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
 > the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
 > are no letter-key bindings to relearn. The mouse pointer stays visible the whole
