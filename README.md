@@ -31,6 +31,12 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **density fields** — either formula-defined blobs with soft edges *or* imported
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU).
+- **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
+  field bends rays continuously along the Eikonal ray equation (mirages, gradient
+  lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward
+  light tracer (modes `A`/`B`/`C`, CPU **and GPU**) and the backward reference
+  (mode `R`, CPU); BDPT (`D`) refuses GRIN scenes (its straight-line connection
+  geometry would be biased — use `A`/`B`/`C` or `R`).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
   BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
   across a whole camera flythrough), megakernel or wavefront, with CPU fallback.

@@ -22,6 +22,7 @@
 #include "camera.h"
 #include "photonmap.h"
 #include "medium_stack.h"
+#include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -1119,7 +1120,17 @@ struct Renderer {
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
         };
 
+        // GRADIENT-INDEX (GRIN): if any medium carries an `ior` field, photons bend
+        // through it via the shared Eikonal marcher (grin.h) — the same curved geometry
+        // the backward/BDPT tracers use, so all transport paths agree. Gated so ordinary
+        // scenes stay bit-identical (the marcher is never entered).
+        const bool grinAny = grin::sceneHasGrin(scene);
+
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
+            // GRIN curved marching pre-pass (does not consume a bounce): advance the ray
+            // through any gradient-index region before the straight-ray hit test.
+            if (grinAny) grin::march(scene, ray);
+
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
 

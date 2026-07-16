@@ -5,29 +5,44 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-07-15): gradient-index (GRIN) media only bend rays in the CPU backward tracer (mode R)
+### DONE (2026-07-15): gradient-index (GRIN) media — Phase 2 wired through forward (CPU+GPU) + backward
 
-**New feature, Phase 1 landed.** A `medium { ior "<expr over x y z r>" bounds { .. } }`
-now defines a **gradient-index region**: rays entering its bound bend continuously via a
+**Phase 1 (landed earlier):** a `medium { ior "<expr over x y z r>" bounds { .. } }`
+defines a **gradient-index region**: rays entering its bound bend continuously via a
 symplectic Eikonal march (`d/ds(n·dr/ds)=∇n`) instead of travelling straight. Data model
 (`Medium::ior`/`iorStep`, `nAt`/`gradNAt`/`insideBound` in `scene.h`), ftsl parsing
-(`ior` / `ior_step` in `ftsl.h addMedium`), and the marcher (`backward.h radiance()`,
-gated behind `grinAny` so `ior`-free scenes are bit-identical) are done and validated:
-`scenes/grin_lens.ftsl` (a radial `n=1.6→1.0` sphere over a checkerboard) shows the
-expected circular lens warp in **mode R**, while the control (medium removed) is an
-undistorted checker.
+(`ior` / `ior_step` in `ftsl.h addMedium`), and the CPU backward marcher were done.
 
-**Tech debt — the other renderers still trace GRIN regions straight** (no bending):
-the forward catch/splat modes A/B/C (`render.h`), volumetric BDPT mode D (`bdpt.h`), and
-**all GPU paths** (`render_cuda.cu`) ignore the `ior` field. So a GRIN scene only renders
-correctly in mode R today. **Proper fix:** lift the same Eikonal march into each tracer's
-main loop (the pre-`closestHit` step), and on the GPU add `ior`/`iorStep` + `nAt`/`gradNAt`
-to `DMedium` and march in the megakernels. Also: (1) at a dielectric interface *inside* a
-GRIN region the exterior IOR should be `nAt(hit)` not 1.0 (POC assumes GRIN regions sit in
-open air); (2) a GRIN medium that is *also* absorbing/scattering isn't handled (POC treats
-`ior` regions as clear — the classic use); (3) the mode-R "single global homogeneous haze"
-warning wrongly claims bounds are ignored, which is no longer true for GRIN. Fixed-step
-RK1 march (`iorStep`, default bound/64) is adequate for smooth fields; steep gradients may
+**Phase 2 (this commit):** the one canonical marcher now lives in **`grin.h`**
+(`grin::sceneHasGrin` + `grin::march`, extracted verbatim from the backward tracer) and is
+shared by **CPU backward** (`backward.h`, mode R), **CPU forward** (`render.h tracePhoton`,
+modes A/B/C) and the **GPU forward megakernel + wavefront** (`render_cuda.cu` `dGrinMarch`,
+`dMedInside`/`dMedNAt`/`dMedGradN`; `DMedium.ior`/`iorN`/`iorStep` uploaded; gated by
+`DScene::hasGrin`). All bend rays identically; `ior`-free scenes stay bit-identical (the
+march is only entered when `sceneHasGrin`). Validated: `scraps/_grin_lens.ftsl` warps a
+checker in mode R; `scraps/_grin_caustic.ftsl` (a converging GRIN sphere over a floor)
+shows the same lens redistribution in CPU mode B **and** GPU mode B, and a smooth
+unperturbed pool in mode R (backward's straight NEE shadow ray can't bend — see below).
+
+**BDPT (mode D) deliberately REFUSES GRIN.** BDPT's connection geometric term, area-measure
+pdf conversion and MIS weights all assume STRAIGHT connecting segments, so a bent path would
+bias the estimator. `main.cpp bdptUnsupportedFeature()` returns a GRIN message (mode D errors
+out with "use mode A/B/C or R"), and `cudaBdptSupported()` rejects GRIN as defense-in-depth.
+GPU backward (mode R) already falls back to the CPU for *any* medium (`cudaBackwardSupported`
+rejects `anyMedium()`), so GRIN mode R runs on the GRIN-aware CPU backward tracer — correct.
+
+**Remaining smaller tech debt (Phase-1 semantics carried forward, not regressions):**
+(1) Each tracer bends only its PRIMARY ray — the backward camera ray and the forward photon
+path. Its *connection/NEE ray* is still straight: mode R's shadow ray to a light can't bend
+through a GRIN region (so it misses GRIN caustics — that's why `_grin_caustic` is dark in R),
+and the forward camera-splat (modes A/B) is straight (so imaging a surface *through* a GRIN
+lens via splat doesn't warp — use mode R for "camera looks through a GRIN lens", forward for
+"GRIN caustic onto a surface viewed directly"). Mode C (forward-catch) is fully unbiased but
+sample-starved. Curved-path connections (bending the shadow/splat ray) are a future
+enhancement. (2) At a dielectric interface *inside* a GRIN region the exterior IOR should be
+`nAt(hit)` not 1.0 (assumes GRIN regions sit in open air). (3) A GRIN medium that is *also*
+absorbing/scattering isn't integrated along the curved path (treated as clear — the classic
+use). Fixed-step RK1 (`iorStep`, default bound/64) suits smooth fields; steep gradients may
 want RK4 / adaptive stepping.
 
 ### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode

@@ -1802,6 +1802,17 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     // simplification (PBRT-v3 convention): the balance heuristic is a partition of unity for
     // any consistent pdfs, so the estimator stays unbiased regardless (only the sampled
     // strategy's throughput must be exact, which analog + ratio tracking guarantee).
+    //
+    // GRADIENT-INDEX (GRIN) media are the one exception: they bend rays along curved
+    // Eikonal paths, which breaks BDPT's straight-edge assumptions (the geometric term G,
+    // area-measure pdf conversion and MIS all assume the connecting segment is a line). The
+    // forward (A/B/C) and backward (R) tracers march GRIN correctly; BDPT would need curved
+    // connections to stay unbiased, so we refuse GRIN scenes here rather than ship a subtly
+    // wrong image. (See known-issues.md: curved-path BDPT is a future enhancement.)
+    for (const auto& md : scene.media)
+        if (md.enabled && md.grin())
+            return "gradient-index (GRIN) media (use mode A/B/C or R)";
+
     std::vector<char> matUsed(scene.mats.size(), 0);
     // Mark a material and (one level, since Mix children can't themselves be Mix) its
     // Mix children, which a used Mix can pick at runtime.

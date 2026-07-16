@@ -46,6 +46,7 @@
 #include "camera.h"
 #include "render.h"   // sampleGlossy, Renderer::refractOrReflect, clamp01, PI
 #include "medium_stack.h" // nested-dielectric priority stack
+#include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 
 struct BackwardRenderer {
     int maxBounce = 32;
@@ -278,58 +279,19 @@ struct BackwardRenderer {
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
         };
 
-        // GRADIENT-INDEX (GRIN) support (experimental, backward tracer only).
-        // Any medium carrying an `ior` field bends rays that pass through its
-        // bound. `grinAny` gates the whole marcher off (so `ior`-free scenes are
-        // bit-identical); `grinAt` returns the GRIN region containing a point.
-        bool grinAny = false;
-        for (const auto& md : scene.media)
-            if (md.enabled && md.grin()) { grinAny = true; break; }
-        auto grinAt = [&](const Vec3& p) -> const Medium* {
-            for (const auto& md : scene.media)
-                if (md.enabled && md.grin() && md.insideBound(p)) return &md;
-            return nullptr;
-        };
-        const int GRIN_MAX_STEPS = 200000;   // safety cap on marching steps
+        // GRADIENT-INDEX (GRIN) support. Any medium carrying an `ior` field bends
+        // rays that pass through its bound. `grinAny` gates the shared marcher off so
+        // `ior`-free scenes stay bit-identical. The marcher itself now lives in grin.h
+        // and is shared verbatim by the forward and bidirectional tracers.
+        bool grinAny = grin::sceneHasGrin(scene);
 
         for (int b = 0; b < maxBounce; ++b) {
-            // GRIN curved marching pre-pass: advance the ray through any gradient-
-            // index region it enters, integrating the Eikonal equation
-            // d/ds(n·dr/ds)=∇n in small steps so the path bends. Pure marching does
-            // NOT consume a bounce; when the ray reaches a surface (within one step)
-            // or leaves all GRIN regions, we fall through to the straight-ray body.
-            if (grinAny) {
-                for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
-                    const Medium* gm = grinAt(ray.o);
-                    Hit hs = scene.closestHit(ray);
-                    double dS = hs.valid ? hs.t : 1e30;
-                    if (!gm) {
-                        // Outside any GRIN region: jump straight to the nearest GRIN
-                        // entry lying before the next surface, else stop marching.
-                        double bestTa = 1e30; const Medium* bestM = nullptr;
-                        for (const auto& md : scene.media) {
-                            if (!(md.enabled && md.grin())) continue;
-                            double ta, tb;
-                            if (md.clipToBounds(ray.o, ray.d, 1e-4, dS, ta, tb) && ta < bestTa) {
-                                bestTa = ta; bestM = &md;
-                            }
-                        }
-                        if (!bestM) break;                       // no GRIN ahead
-                        ray = Ray{ray.o + ray.d * (bestTa + 1e-4), ray.d}; // nudge inside
-                        continue;
-                    }
-                    double ds = gm->iorStep;
-                    if (hs.valid && hs.t <= ds) break;           // surface within a step
-                    // Symplectic Eikonal step with optical direction T = n·d (|T|=n):
-                    //   T += ∇n · ds ;  x += (T/n)·ds ;  d = T/|T|.
-                    double n0 = gm->nAt(ray.o);
-                    Vec3 T = ray.d * n0 + gm->gradNAt(ray.o, 0.5 * ds) * ds;
-                    Vec3 newPos = ray.o + (T / n0) * ds;
-                    double tl = std::sqrt(dot(T, T));
-                    Vec3 newDir = (tl > 1e-12) ? T * (1.0 / tl) : ray.d;
-                    ray = Ray{newPos, newDir};
-                }
-            }
+            // GRIN curved marching pre-pass: advance the ray through any gradient-index
+            // region it enters, integrating the Eikonal equation d/ds(n·dr/ds)=∇n in
+            // small steps so the path bends. Pure marching does NOT consume a bounce;
+            // when the ray reaches a surface (within one step) or leaves all GRIN regions
+            // it stops and we fall through to the straight-ray body.
+            if (grinAny) grin::march(scene, ray);
 
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;

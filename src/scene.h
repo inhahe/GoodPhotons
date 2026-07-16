@@ -238,9 +238,11 @@ struct Medium {
     // needs a `bounds{}`), using central differences of n for ∇n. This produces
     // mirages, gradient lenses, hot-air shimmer, etc. A GRIN region may also be
     // absorbing/scattering, but the classic use is a clear bending field
-    // (sigma_a = sigma_s = 0). NOTE (experimental): only the CPU backward tracer
-    // marches GRIN today; the forward (A/B/C), BDPT (D) and GPU paths still treat
-    // the region as straight-line until GRIN is wired through them.
+    // (sigma_a = sigma_s = 0). The one canonical marcher lives in grin.h and is
+    // shared by the CPU backward tracer (mode R), the CPU forward light tracer
+    // (modes A/B/C) and the GPU forward megakernel/wavefront (dGrinMarch) — all
+    // bend rays identically. BDPT (mode D) REFUSES GRIN scenes (its straight-line
+    // connection geometry / MIS would be biased); use mode A/B/C or R instead.
     std::vector<PatNode> ior;   // compiled n(x,y,z) program; empty => not GRIN
     double iorStep = 0.0;       // Eikonal march step (world units); 0 => auto from bound
 
