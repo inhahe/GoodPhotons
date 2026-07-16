@@ -3746,11 +3746,28 @@ static int run(int argc, char** argv) {
                 if (R > 0.0) ev *= (R * R) / (Rref * Rref);
             }
             const bool autoExp = !scene.absolute;   // per-frame auto-exposure while navigating
-            Vec3   eye = eye0, tgt = tgt0;
-            double step = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0) * 0.03;
-            // World-space size of the red crosshair: a fixed fraction of the scene, so it
-            // shrinks/grows with the target's distance under the camera's perspective.
-            const double crossR = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0) * 0.06;
+            // Unified fly-camera state: an eye position and a normalized look direction
+            // `fwd` (no separate orientation target — you always travel where you look).
+            // The world up is fixed (no roll), so mouse-look is a yaw about worldUp plus a
+            // clamped pitch about the camera's right axis. `lookDist` is only used to place
+            // the look_at when printing a camera block (the eye+fwd ray is what matters).
+            const Vec3 worldUp = up;
+            Vec3   eye = eye0;
+            Vec3   fwd = tgt0 - eye0;
+            { double L = std::sqrt(dot(fwd, fwd)); fwd = (L > 1e-9) ? fwd * (1.0 / L) : Vec3{0, 0, -1}; }
+            double lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+            if (lookDist < 1e-4) lookDist = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0);
+            const double sceneR = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0);
+            double       speed  = sceneR * 0.6;      // fly speed, world units / second
+            const double kSens  = 0.0035;            // mouse-look sensitivity, radians / client pixel
+            // Rodrigues rotation of v about a UNIT axis by `ang` radians.
+            auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
+                double c = std::cos(ang), s = std::sin(ang);
+                return v * c + cross(axis, v) * s + axis * (dot(axis, v) * (1.0 - c));
+            };
+            auto norml = [](const Vec3& v) -> Vec3 {
+                double L = std::sqrt(dot(v, v)); return (L > 1e-9) ? v * (1.0 / L) : v;
+            };
             // Interactive render resolution FOLLOWS THE LIVE WINDOW: fit the authored
             // W:H aspect into the current client area so the raster renders at (roughly)
             // one pixel per displayed pixel. Shrinking the window renders fewer pixels
@@ -3780,16 +3797,17 @@ static int run(int argc, char** argv) {
                 return std::string(b);
             };
             std::printf(
-              "[viewer] interactive raster camera — fly it, then copy the eye/look_at:\n"
-              "         fly:    W/S = forward/back   A/D = strafe left/right   R/F = rise/drop   (camera-relative)\n"
-              "         aim:    Left/Right = crosshair left/right   Up/Down = crosshair up/down   PgUp/PgDn = farther/nearer  (all screen-relative)\n"
-              "         mouse:  drag = slide the red crosshair L/R/U/D across the view    wheel = push it farther/nearer\n"
-              "         [ / ] finer/coarser step (now %.3f)    0 = reset    P = print camera block    (close the window to finish)\n"
+              "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
+              "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
+              "         look:   move the mouse to steer (click the window to capture; Esc frees the cursor to resize/close)\n"
+              "         speed:  mouse wheel up/down = faster/slower (now %.2f u/s)\n"
+              "         0 = reset view    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
-              step);
+              speed);
             std::fflush(stdout);
 
-            bool changed = true;   // draw a first crosshair frame immediately
+            bool changed = true;   // render one frame immediately
+            auto tPrev = std::chrono::steady_clock::now();
             while (!g_liveWin->closed() && !g_stopRequested) {
                 // Match the render resolution to the live window: a user resize re-renders
                 // at the new size (smaller = faster, larger = crisper).
@@ -3799,107 +3817,67 @@ static int run(int argc, char** argv) {
                       std::printf("[viewer] preview resolution %dx%d\n", VW, VH);
                       std::fflush(stdout);
                   } }
-                std::vector<NudgeCmd> cmds = g_liveWin->drainNudges();
-                bool doPrint = false;
-                // Camera-relative flythrough moves eye AND target together along the
-                // camera's own basis, so the view direction is preserved. forward =
-                // normalize(tgt-eye); right = forward × worldUp (screen-right); flyUp uses
-                // the WORLD up axis so "rise/drop" stays vertical regardless of pitch.
-                auto fly = [&](const Vec3& dir) {
-                    double L = std::sqrt(dot(dir, dir));
-                    if (L < 1e-12) return;
-                    Vec3 d = dir * (step / L);
-                    eye = eye + d; tgt = tgt + d; changed = true;
-                };
-                // Screen-relative crosshair basis: the arrow keys slide the look-at
-                // target across the current VIEW plane (camera right = cc.u, camera up
-                // = cc.v), exactly like the mouse-drag path, so Left/Right always move
-                // it left/right on screen and Up/Down always move it up/down — no matter
-                // how the camera is oriented. (Previously these nudged the target in
-                // WORLD X/Y/Z, which scrambled on-screen once the camera turned.)
-                Camera vc; vc.projection = proj;
-                vc.lookAt(eye, tgt, up, fovY, VW, VH);
-                const Vec3 camRight = vc.u, camUp = vc.v;
-                for (NudgeCmd c : cmds) {
-                    Vec3 fwd = tgt - eye;
-                    switch (c) {
-                        case NudgeCmd::FlyFwd:   fly(fwd);  break;
-                        case NudgeCmd::FlyBack:  fly(fwd * -1.0); break;
-                        case NudgeCmd::FlyRight: fly(cross(fwd, up));  break;
-                        case NudgeCmd::FlyLeft:  fly(cross(up, fwd));  break;
-                        case NudgeCmd::FlyUp:    fly(up);  break;
-                        case NudgeCmd::FlyDown:  fly(up * -1.0); break;
-                        case NudgeCmd::TgtXNeg: tgt = tgt - camRight * step; changed = true; break;  // screen-left
-                        case NudgeCmd::TgtXPos: tgt = tgt + camRight * step; changed = true; break;  // screen-right
-                        case NudgeCmd::TgtYNeg: tgt = tgt - camUp    * step; changed = true; break;  // screen-down
-                        case NudgeCmd::TgtYPos: tgt = tgt + camUp    * step; changed = true; break;  // screen-up
-                        case NudgeCmd::TgtZNeg: tgt = tgt - camUp    * step; changed = true; break;  // (unused key) screen-down
-                        case NudgeCmd::TgtZPos: tgt = tgt + camUp    * step; changed = true; break;  // (unused key) screen-up
-                        case NudgeCmd::TgtFar: {   // push the target away along the view axis
-                            Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
-                            if (L > 1e-9) { tgt = tgt + f * (step / L); changed = true; }
-                            break;
-                        }
-                        case NudgeCmd::TgtNear: {  // pull the target toward the eye
-                            Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
-                            if (L > 1e-9) { tgt = tgt - f * (std::min(step, L * 0.5) / L); changed = true; }
-                            break;
-                        }
-                        case NudgeCmd::StepUp:   step *= 1.5; std::printf("[viewer] step %.3f\n", step); std::fflush(stdout); break;
-                        case NudgeCmd::StepDown: step /= 1.5; std::printf("[viewer] step %.3f\n", step); std::fflush(stdout); break;
-                        case NudgeCmd::Reset:    eye = eye0; tgt = tgt0; changed = true; break;
-                        case NudgeCmd::Print:    doPrint = true; break;
-                    }
+                NavInput nav = g_liveWin->drainNav();
+                auto  tNow = std::chrono::steady_clock::now();
+                double dt  = std::chrono::duration<double>(tNow - tPrev).count();
+                tPrev = tNow;
+                if (dt > 0.1) dt = 0.1;             // clamp a long stall so motion never jumps
+
+                // Wheel throttles the fly SPEED (up = faster), clamped to a sane band.
+                if (nav.wheel != 0.0) {
+                    speed = std::clamp(speed * std::pow(1.15, nav.wheel), sceneR * 0.02, sceneR * 20.0);
+                    std::printf("[viewer] speed %.3f u/s\n", speed); std::fflush(stdout);
                 }
-                // Mouse: left-drag slides the target across the current view plane (so the
-                // crosshair tracks the cursor L/R/U/D), wheel pushes it along the view axis.
-                PointerInput pin = g_liveWin->drainPointer();
-                if (pin.any()) {
-                    Camera cc; cc.projection = proj;
-                    cc.lookAt(eye, tgt, up, fovY, VW, VH);
-                    if (pin.dragDx != 0.0 || pin.dragDy != 0.0) {
-                        // Target sits on the view axis, so its camera-forward depth is just
-                        // |tgt-eye|. Converting an image-pixel drag to a world offset in the
-                        // u/v plane at that depth makes one image pixel dragged move the
-                        // target one image pixel on screen (the crosshair follows the cursor).
-                        // Drag deltas are in the displayed image's pixel space (VW×VH).
-                        double zc = std::sqrt(dot(tgt - eye, tgt - eye));
-                        if (zc < 1e-4) zc = 1e-4;
-                        double du =  pin.dragDx * 2.0 * cc.tanHalfX * zc / std::max(1, VW);
-                        double dv = -pin.dragDy * 2.0 * cc.tanHalfY * zc / std::max(1, VH);  // screen down = -v
-                        tgt = tgt + cc.u * du + cc.v * dv;
-                        changed = true;
-                    }
-                    if (pin.wheel != 0.0) {   // +wheel = farther along the view axis
-                        Vec3 f = tgt - eye; double L = std::sqrt(dot(f, f));
-                        if (L > 1e-9) {
-                            double d = pin.wheel * step;
-                            if (d < 0.0) d = -std::min(-d, L * 0.5);   // don't cross the eye
-                            tgt = tgt + f * (d / L);
-                            changed = true;
-                        }
-                    }
+                // Reset restores the authored eye + look direction.
+                if (nav.reset) {
+                    eye = eye0; fwd = norml(tgt0 - eye0);
+                    lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+                    if (lookDist < 1e-4) lookDist = sceneR;
+                    changed = true;
                 }
+                // Mouse-look STEERS the single view direction: horizontal motion yaws about
+                // the world up, vertical motion pitches about the camera's right axis. Pitch
+                // is clamped shy of the poles so the view can't flip over (no roll).
+                if (nav.lookDx != 0.0 || nav.lookDy != 0.0) {
+                    double yaw   = -nav.lookDx * kSens;   // cursor right -> turn right
+                    double pitch = -nav.lookDy * kSens;   // cursor down  -> look down
+                    fwd = norml(rotAxis(fwd, worldUp, yaw));
+                    Vec3 right = cross(fwd, worldUp);
+                    double rl = std::sqrt(dot(right, right));
+                    if (rl > 1e-9) {
+                        right = right * (1.0 / rl);
+                        Vec3 cand = norml(rotAxis(fwd, right, pitch));
+                        if (std::fabs(dot(cand, worldUp)) < 0.9995) fwd = cand;   // clamp near poles
+                    }
+                    changed = true;
+                }
+                // Held throttle: fly forward while Space/+ is down, backward while Shift/-
+                // is down, integrated by real elapsed time so speed is frame-rate-independent.
+                if (nav.fwd)  { eye = eye + fwd * (speed * dt); changed = true; }
+                if (nav.back) { eye = eye - fwd * (speed * dt); changed = true; }
+
+                Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
                 if (changed) {
                     Camera c; c.projection = proj;
-                    c.lookAt(eye, tgt, up, fovY, VW, VH);
+                    c.lookAt(eye, tgt, worldUp, fovY, VW, VH);
                     std::vector<uint8_t> img =
                         raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr);
-                    raster::drawTargetMarker(img, VW, VH, c, tgt, crossR);
                     g_liveWin->update(VW, VH, img);
                     g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
-                                        ")  look(" + fmt3(tgt) + ")");
+                                        ")  dir(" + fmt3(fwd) + ")");
                     changed = false;
                 }
-                if (doPrint) {
+                if (nav.print) {
                     std::printf("camera \"cam\" { eye %.4g %.4g %.4g   look_at %.4g %.4g %.4g"
                                 "   up %.4g %.4g %.4g   fov_y %.4g }\n",
                                 eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z,
-                                up.x, up.y, up.z, fovY);
+                                worldUp.x, worldUp.y, worldUp.z, fovY);
                     std::fflush(stdout);
                 }
-                if (cmds.empty())
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                // Sleep only when truly idle; while a throttle key is held or the mouse is
+                // steering we loop at full raster speed for smooth continuous motion.
+                if (!nav.any())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
             }
             g_stopRequested = 1;   // window closed → done
         }

@@ -12,33 +12,33 @@
 #include <string>
 #include <cstdint>
 
-// One interactive control command queued from a key press in the live window. The
-// window only reports *which* control was pressed; the render loop (which knows the
-// scene scale) drains these and turns each into a camera nudge. Eye/target moves are
-// along the WORLD axes so the resulting numbers drop straight into a `.ftsl` camera.
-enum class NudgeCmd {
-    // Camera-relative FLYTHROUGH: translate the whole camera (eye AND target together)
-    // along the camera's own axes, so the view direction is preserved while you fly
-    // forward/back, strafe, and rise/drop — the intuitive WASD+RF flightpath. The window
-    // reports the intent; the render loop (which knows the camera basis) resolves it.
-    FlyFwd, FlyBack, FlyLeft, FlyRight, FlyUp, FlyDown,
-    TgtXNeg, TgtXPos, TgtYNeg, TgtYPos, TgtZNeg, TgtZPos,   // aim the look-at target (world axes)
-    TgtNear, TgtFar,                                         // move the target along the view axis
-    StepDown, StepUp,                                        // finer / coarser move step
-    Reset,                                                   // back to the authored camera
-    Print,                                                   // dump a paste-ready camera block
-};
-
-// Accumulated pointer (mouse) input since the last drainPointer(). The window reports
-// raw motion only — it doesn't know the scene/camera — and the render loop maps it onto
-// the look-at target. `dragDx/dragDy` are in IMAGE PIXELS (the window divides the
-// client-space drag by the current letterbox scale so one image pixel dragged = one
-// image pixel of target motion), with +dragDx = cursor right and +dragDy = cursor down.
-// `wheel` is in notches (+ = wheel forward / push the target farther).
-struct PointerInput {
-    double dragDx = 0.0, dragDy = 0.0;   // left-drag, image-pixel space
-    double wheel  = 0.0;                  // wheel notches (+ = away/farther)
-    bool   any() const { return dragDx != 0.0 || dragDy != 0.0 || wheel != 0.0; }
+// Interactive FLY-CAMERA input, accumulated since the last drainNav(). The window
+// reports raw device input only (it doesn't know the scene/camera); the render loop
+// integrates it into camera motion. The navigation model is a single unified flycam —
+// you always travel where you look (or the exact opposite when reversing), so there is
+// no separate "aim the target" mode and no crosshair.
+//
+//   * mouse-look STEERS: horizontal motion yaws, vertical motion pitches. While look is
+//     captured the OS cursor is hidden and re-centred every frame, so you can turn
+//     without limit. `lookDx/lookDy` are raw client-pixel deltas (+dx = cursor right,
+//     +dy = cursor down).
+//   * `fwd` / `back` are the CURRENT held state of the throttle keys (Space or '+' fly
+//     forward; Shift or '-' fly backward) — the render loop moves you every frame while
+//     one is held, integrating by real elapsed time.
+//   * `wheel` (notches, + = wheel up) adjusts the fly SPEED (up = faster, down = slower).
+//   * `reset` / `print` are one-shot edge flags ('0'/Home reset the camera; 'P' prints a
+//     paste-ready camera block). `looking` reports whether mouse-look is currently
+//     captured (Esc releases the cursor so the window can be resized/closed; a click
+//     re-captures).
+struct NavInput {
+    double lookDx = 0.0, lookDy = 0.0;   // mouse-look motion, client pixels
+    double wheel  = 0.0;                  // wheel notches (+ = up = faster)
+    bool   fwd    = false;               // Space / '+' held  -> fly forward
+    bool   back   = false;               // Shift / '-' held  -> fly backward
+    bool   reset  = false;               // '0' / Home pressed since last drain
+    bool   print  = false;               // 'P' pressed since last drain
+    bool   looking = false;              // mouse-look captured (cursor hidden)
+    bool   any() const { return lookDx || lookDy || wheel || fwd || back || reset || print; }
 };
 
 class LiveWindow {
@@ -61,13 +61,10 @@ public:
     // True once the user has closed the window — lets the render stop early.
     bool closed() const;
 
-    // Return (and clear) the interactive control commands queued from key presses
-    // since the last call. Empty when nothing was pressed. Thread-safe.
-    std::vector<NudgeCmd> drainNudges();
-
-    // Return (and clear) the accumulated mouse drag / wheel motion since the last call.
-    // Thread-safe. See PointerInput for units.
-    PointerInput drainPointer();
+    // Return (and clear) the accumulated fly-camera input since the last call: mouse-look
+    // deltas, wheel-throttle notches, the current held state of the forward/back throttle
+    // keys, and the one-shot reset/print edges. Thread-safe. See NavInput for units.
+    NavInput drainNav();
 
     // Current client-area size in pixels (what the image is letterboxed into). Lets the
     // interactive render loop match its raster resolution to the live window, so shrinking

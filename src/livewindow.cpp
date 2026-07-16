@@ -8,8 +8,7 @@ LiveWindow::~LiveWindow() {}
 void LiveWindow::update(int, int, const std::vector<uint8_t>&) {}
 void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
-std::vector<NudgeCmd> LiveWindow::drainNudges() { return {}; }
-PointerInput LiveWindow::drainPointer() { return {}; }
+NavInput LiveWindow::drainNav() { return {}; }
 bool LiveWindow::clientSize(int&, int&) const { return false; }
 
 #else
@@ -49,17 +48,50 @@ struct LiveWindow::Impl {
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     std::wstring         title;
     HANDLE               readyEvent = nullptr;
-    std::mutex           inMtx;                     // guards `nudges` + pointer accumulators
-    std::vector<NudgeCmd> nudges;                   // interactive control commands from key presses
-    bool                 dragging = false;          // left mouse button held (panning the target)
-    int                  lastMx = 0, lastMy = 0;    // last client-space cursor pos while dragging
-    double               dragDx = 0.0, dragDy = 0.0;// accumulated image-pixel drag since last drain
+    // ---- Fly-camera input state (guarded by inMtx unless noted) ----
+    std::mutex           inMtx;                     // guards the look/wheel accumulators + one-shots
+    double               lookDx = 0.0, lookDy = 0.0;// accumulated mouse-look deltas (client px) since drain
     double               wheelAcc = 0.0;            // accumulated wheel notches since last drain
+    bool                 resetReq = false;          // '0' / Home pressed since last drain (one-shot)
+    bool                 printReq = false;          // 'P' pressed since last drain (one-shot)
+    // Held-key throttle state — atomics so WM_KEYUP on the UI thread and drainNav on the
+    // render thread can race freely without the inMtx.
+    std::atomic<bool>    keyFwd{false};             // Space / '+' currently held -> fly forward
+    std::atomic<bool>    keyBack{false};            // Shift / '-' currently held -> fly backward
+    // Mouse-look capture: while `looking`, the OS cursor is hidden and re-centred every
+    // move so the user can turn without limit. Esc releases; a click re-captures.
+    std::atomic<bool>    looking{false};            // mouse-look currently captured
+    bool                 recentring = false;        // true while we ignore the SetCursorPos echo event
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
     void paint(HDC hdc, const RECT& client);
+    void setCapture(HWND h, bool on);               // enter/leave mouse-look (hide+centre cursor)
 };
+
+// Enter or leave mouse-look capture: hide/show the cursor, confine it (so it can't leave
+// the window while turning), and re-centre it. Called only on the UI thread.
+void LiveWindow::Impl::setCapture(HWND h, bool on) {
+    if (on == looking.load()) return;
+    looking.store(on);
+    if (on) {
+        RECT cr; GetClientRect(h, &cr);
+        POINT c{ (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+        ClientToScreen(h, &c);
+        recentring = true;
+        SetCursorPos(c.x, c.y);
+        while (ShowCursor(FALSE) >= 0) {}            // hide (counter may start > 0)
+        RECT sr = cr; POINT tl{cr.left, cr.top}, br{cr.right, cr.bottom};
+        ClientToScreen(h, &tl); ClientToScreen(h, &br);
+        sr.left = tl.x; sr.top = tl.y; sr.right = br.x; sr.bottom = br.y;
+        ClipCursor(&sr);                            // keep the cursor inside while turning
+        ::SetCapture(h);
+    } else {
+        ClipCursor(nullptr);
+        while (ShowCursor(TRUE) < 0) {}             // show
+        if (GetCapture() == h) ReleaseCapture();
+    }
+}
 
 void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
     int cw = client.right - client.left, ch = client.bottom - client.top;
@@ -124,43 +156,32 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN:
-            // Begin panning the look-at target. Capture the mouse so a drag that leaves
-            // the client area still tracks, and seed the last-position for delta math.
-            if (self) {
-                SetCapture(h);
-                self->dragging = true;
-                self->lastMx = GET_X_LPARAM(lp);
-                self->lastMy = GET_Y_LPARAM(lp);
-            }
+            // A click (re)captures mouse-look: the cursor is hidden and re-centred so the
+            // user can turn freely. Esc releases it (to resize/close the window).
+            if (self) self->setCapture(h, true);
             return 0;
         case WM_MOUSEMOVE:
-            // Accumulate the drag as IMAGE-pixel motion: convert the client-space delta
-            // through the current letterbox scale (min fit of image into client), so the
-            // render loop can move the target one image pixel per image pixel dragged.
-            if (self && self->dragging) {
+            // While mouse-look is captured, accumulate the raw motion away from the client
+            // centre as a steering delta, then warp the cursor back to the centre so the
+            // next move measures a fresh delta (unlimited turning). The SetCursorPos warp
+            // generates its own WM_MOUSEMOVE, which we skip via the `recentring` flag.
+            if (self && self->looking.load()) {
+                if (self->recentring) { self->recentring = false; return 0; }
+                RECT cr; GetClientRect(h, &cr);
+                int cx = (cr.right - cr.left) / 2, cy = (cr.bottom - cr.top) / 2;
                 int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-                int dcx = mx - self->lastMx, dcy = my - self->lastMy;
-                self->lastMx = mx; self->lastMy = my;
-                double s;
-                {
-                    std::lock_guard<std::mutex> lk(self->mtx);
-                    RECT cr; GetClientRect(h, &cr);
-                    int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
-                    s = (self->imgW > 0 && self->imgH > 0 && cw > 0 && ch > 0)
-                        ? std::min((double)cw / self->imgW, (double)ch / self->imgH)
-                        : 1.0;
+                int dx = mx - cx, dy = my - cy;
+                if (dx || dy) {
+                    { std::lock_guard<std::mutex> lk(self->inMtx);
+                      self->lookDx += dx; self->lookDy += dy; }
+                    POINT c{cx, cy}; ClientToScreen(h, &c);
+                    self->recentring = true;
+                    SetCursorPos(c.x, c.y);
                 }
-                if (s <= 1e-9) s = 1.0;
-                std::lock_guard<std::mutex> lk(self->inMtx);
-                self->dragDx += dcx / s;
-                self->dragDy += dcy / s;
             }
             return 0;
-        case WM_LBUTTONUP:
-            if (self && self->dragging) { self->dragging = false; ReleaseCapture(); }
-            return 0;
         case WM_MOUSEWHEEL:
-            // One detent (120 units) = one notch; +ve = wheel forward = push target away.
+            // One detent (120 units) = one notch of fly-SPEED: +ve (wheel up) = faster.
             if (self) {
                 double notches = (double)GET_WHEEL_DELTA_WPARAM(wp) / 120.0;
                 std::lock_guard<std::mutex> lk(self->inMtx);
@@ -168,37 +189,47 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             return 0;
         case WM_KEYDOWN:
-            // Map keys to interactive camera nudges (queued; the render loop applies
-            // them). WASD + R/F fly the whole camera in ITS OWN frame (forward/back,
-            // strafe left/right, rise/drop); the arrows slide the look-at crosshair
-            // across the SCREEN (Left/Right = screen L/R, Up/Down = screen U/D), and
-            // PgUp/PgDn push it farther / pull it nearer along the view axis.
-            // [ / ] resize the step, 0 resets, P prints a camera block.
+            // Unified fly-camera controls. Space or '+' (held) fly forward; Shift or '-'
+            // (held) fly backward — you always travel where you look (or the exact
+            // opposite when reversing). Mouse-look steers. Wheel throttles the speed.
+            // '0'/Home reset the camera, 'P' prints a paste-ready camera block, Esc
+            // releases the captured cursor. These are layout-independent (Space/Shift and
+            // the +/- keys land in the same place on QWERTY, Dvorak, etc.).
             if (self) {
-                NudgeCmd c; bool hit = true;
                 switch (wp) {
-                    case 'A':        c = NudgeCmd::FlyLeft;  break;   // strafe left
-                    case 'D':        c = NudgeCmd::FlyRight; break;   // strafe right
-                    case 'F':        c = NudgeCmd::FlyDown;  break;   // drop (world down)
-                    case 'R':        c = NudgeCmd::FlyUp;    break;   // rise (world up)
-                    case 'S':        c = NudgeCmd::FlyBack;  break;   // back off the view axis
-                    case 'W':        c = NudgeCmd::FlyFwd;   break;   // fly into the view axis
-                    case VK_LEFT:    c = NudgeCmd::TgtXNeg; break;   // crosshair screen-left
-                    case VK_RIGHT:   c = NudgeCmd::TgtXPos; break;   // crosshair screen-right
-                    case VK_DOWN:    c = NudgeCmd::TgtYNeg; break;   // crosshair screen-down
-                    case VK_UP:      c = NudgeCmd::TgtYPos; break;   // crosshair screen-up
-                    case VK_NEXT:    c = NudgeCmd::TgtNear; break;   // PageDown -> pull nearer
-                    case VK_PRIOR:   c = NudgeCmd::TgtFar;  break;   // PageUp   -> push farther
-                    case VK_OEM_4:   c = NudgeCmd::StepDown; break;  // [
-                    case VK_OEM_6:   c = NudgeCmd::StepUp;   break;  // ]
-                    case '0': case VK_HOME: c = NudgeCmd::Reset; break;
-                    case 'P':        c = NudgeCmd::Print;   break;
-                    default:         hit = false; break;
+                    case VK_SPACE: case VK_OEM_PLUS: case VK_ADD:
+                        self->keyFwd.store(true);  break;   // fly forward
+                    case VK_SHIFT: case VK_OEM_MINUS: case VK_SUBTRACT:
+                        self->keyBack.store(true); break;   // fly backward
+                    case '0': case VK_HOME:
+                        { std::lock_guard<std::mutex> lk(self->inMtx); self->resetReq = true; } break;
+                    case 'P':
+                        { std::lock_guard<std::mutex> lk(self->inMtx); self->printReq = true; } break;
+                    case VK_ESCAPE:
+                        self->setCapture(h, false); break;  // release cursor
+                    default: break;
                 }
-                if (hit) {
-                    std::lock_guard<std::mutex> lk(self->inMtx);
-                    self->nudges.push_back(c);
+            }
+            return 0;
+        case WM_KEYUP:
+            // Clear the held-throttle state when the fly keys are released.
+            if (self) {
+                switch (wp) {
+                    case VK_SPACE: case VK_OEM_PLUS: case VK_ADD:
+                        self->keyFwd.store(false);  break;
+                    case VK_SHIFT: case VK_OEM_MINUS: case VK_SUBTRACT:
+                        self->keyBack.store(false); break;
+                    default: break;
                 }
+            }
+            return 0;
+        case WM_KILLFOCUS:
+            // Losing focus (Alt-Tab, click-away) must release the cursor and drop any held
+            // throttle, else the keys would appear "stuck" down.
+            if (self) {
+                self->setCapture(h, false);
+                self->keyFwd.store(false);
+                self->keyBack.store(false);
             }
             return 0;
         case WM_GETMINMAXINFO:
@@ -216,7 +247,7 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             return 0;
         case WM_CLOSE:
-            if (self) self->closedFlag.store(true);
+            if (self) { self->setCapture(h, false); self->closedFlag.store(true); }
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
@@ -316,21 +347,20 @@ void LiveWindow::setTitle(const std::string& utf8) {
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }
 
-std::vector<NudgeCmd> LiveWindow::drainNudges() {
+NavInput LiveWindow::drainNav() {
     if (!impl_) return {};
+    NavInput n;
+    // Held-key throttle + capture state read straight from the atomics (current state).
+    n.fwd     = impl_->keyFwd.load();
+    n.back    = impl_->keyBack.load();
+    n.looking = impl_->looking.load();
+    // Accumulated look/wheel deltas + one-shot edges: read-and-clear under the lock.
     std::lock_guard<std::mutex> lk(impl_->inMtx);
-    std::vector<NudgeCmd> out;
-    out.swap(impl_->nudges);
-    return out;
-}
-
-PointerInput LiveWindow::drainPointer() {
-    if (!impl_) return {};
-    std::lock_guard<std::mutex> lk(impl_->inMtx);
-    PointerInput p;
-    p.dragDx = impl_->dragDx; p.dragDy = impl_->dragDy; p.wheel = impl_->wheelAcc;
-    impl_->dragDx = impl_->dragDy = impl_->wheelAcc = 0.0;
-    return p;
+    n.lookDx = impl_->lookDx; n.lookDy = impl_->lookDy; n.wheel = impl_->wheelAcc;
+    n.reset  = impl_->resetReq; n.print = impl_->printReq;
+    impl_->lookDx = impl_->lookDy = impl_->wheelAcc = 0.0;
+    impl_->resetReq = impl_->printReq = false;
+    return n;
 }
 
 bool LiveWindow::clientSize(int& w, int& h) const {

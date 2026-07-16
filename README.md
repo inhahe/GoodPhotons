@@ -160,31 +160,32 @@ paths they can capture at all**.
 > **Interactive camera (raster + live window).** When a **single** camera is
 > rasterized into a `-window` (a still preview, including the double-click default —
 > a `camera_curve` flyby instead animates through its frames), the window becomes an
-> interactive viewer: fly the camera around with the **mouse or keyboard** and read
-> off the numbers to author a `.ftsl` camera. The camera **eye** `(x,y,z)` and a
-> **look-at target** `(x,y,z)` that the camera always points at, drawn in the scene
-> as a **red crosshair** — one that **shrinks as the target is pushed farther and
-> grows as it's pulled nearer**, sized by the camera's own perspective so its
-> on-screen size reads the target's depth:
+> interactive **fly-camera**: click the window to capture the mouse, then fly around
+> and read off the numbers to author a `.ftsl` camera. There is a single unified view
+> — you always **travel where you look** (or the exact opposite when reversing), so
+> there is no separate "aim the target" mode and no crosshair. The world up is fixed,
+> so there is no roll:
 >
-> | input | moves |
+> | input | does |
 > |---|---|
-> | **left-drag** | slide the target across the current view plane — left/right/up/down **relative to the view direction** (the aim, hence the whole view, pans with the drag) |
-> | **mouse wheel** | push the target **farther / nearer** along the view axis (watch the crosshair shrink / grow) |
-> | `W`/`S` · `A`/`D` · `R`/`F` | **fly the camera** forward/back · strafe left/right · up/down — **camera-relative** (eye and target move together, so the view direction is kept; `R`/`F` rise/drop along world up) |
-> | `←`/`→` · `↑`/`↓` | slide the crosshair **left/right · up/down on screen** — **view-relative** (the same view-plane basis as left-drag), so the arrows always match what you see regardless of camera orientation |
-> | `PgUp` / `PgDn` | push the crosshair **farther / nearer** along the view axis (same as the mouse wheel, from the keyboard; watch the crosshair shrink / grow) |
-> | `[` / `]` | finer / coarser keyboard/wheel move step (starts at 3 % of the scene radius) |
+> | **move the mouse** | **steer** — horizontal motion turns (yaw), vertical motion looks up/down (pitch, clamped just shy of straight up/down). Where you look is where you fly. |
+> | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction, integrated by real elapsed time (frame-rate-independent) |
+> | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
+> | **mouse wheel** | throttle the **fly speed**: up = faster, down = slower (starts at 60 % of the scene radius per second, clamped to a sane band) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
+> | `Esc` | **release the captured cursor** (so you can resize or close the window); click the window again to re-capture |
 > | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
 >
-> The window title shows the live `eye(…) look(…)` as you move. Frames re-rasterize
-> at the live window's resolution — drag a corner to make the preview smaller (and
-> snappier) or larger (and sharper); the aspect ratio, the readout, and the world-
-> scaled crosshair are all resolution-independent, so this only trades preview
-> sharpness for speed while you navigate. Close the window to finish. (Click the
-> window first so it has keyboard focus.)
+> The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
+> the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
+> are no letter-key bindings to relearn. While the mouse is captured the OS cursor is
+> hidden and re-centred every frame, so you can turn without limit; `Esc` frees it.
+> The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
+> the live window's resolution — drag a corner to make the preview smaller (and
+> snappier) or larger (and sharper); the aspect ratio and the readout are
+> resolution-independent, so this only trades preview sharpness for speed while you
+> navigate. Close the window to finish.
 >
 > **Double-click / bare invocation.** Running ftrace with just a scene file and
 > nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,
