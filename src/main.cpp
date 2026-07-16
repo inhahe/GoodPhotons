@@ -3611,12 +3611,26 @@ static int run(int argc, char** argv) {
     }
 
     // -explore/-fly: seed the interactive raster viewer at the first selected frame
-    // instead of rendering the whole flyby. Keep only the first RenderCam so the raster
-    // loop draws a single frame, then the fly viewer takes over (window is held open).
+    // instead of rendering the whole flyby. We KEEP a copy of every selected frame's
+    // camera as a "path" the viewer can lock onto (its timeline / lock-to-path panel),
+    // then trim toRender to a single frame so the raster loop draws one frame before the
+    // fly viewer takes over (window is held open).
+    struct PathFrame { Vec3 eye; Vec3 fwd; Vec3 up; double fov; };
+    std::vector<PathFrame> explorePath;    // one entry per flyby frame (empty for a lone camera)
+    double explorePathFps = 0.0;           // authored playback rate hint (0 = none)
     if (exploreMode && toRender.size() > 1) {
-        std::printf("[explore] starting interactive fly viewer at '%s' (dropping %zu other frames)\n",
+        explorePath.reserve(toRender.size());
+        for (const auto& rc : toRender) {
+            Vec3 f = rc.lookAt - rc.cam.eye;
+            double L = std::sqrt(dot(f, f));
+            f = (L > 1e-9) ? f * (1.0 / L) : Vec3{0, 0, -1};
+            explorePath.push_back({rc.cam.eye, f, rc.up, rc.fovY});
+        }
+        explorePathFps = ftslScene.defaultFps;   // scene-authored fps seeds the cam/sec box
+        std::printf("[explore] starting interactive fly viewer at '%s' with a %zu-frame camera path"
+                    " (timeline + lock-to-path enabled)\n",
                     toRender.front().name.empty() ? "<camera>" : toRender.front().name.c_str(),
-                    toRender.size() - 1);
+                    explorePath.size());
         toRender.resize(1);
     }
 
@@ -4047,6 +4061,10 @@ static int run(int argc, char** argv) {
             auto collideName = [](CollideMode m) {
                 return m == COLLIDE_SLIDE ? "slide" : (m == COLLIDE_STOP ? "stop" : "off (noclip)");
             };
+            // Compact label for the panel's Clip button (fits the narrow button width).
+            auto collideShort = [](CollideMode m) {
+                return m == COLLIDE_SLIDE ? "slide" : (m == COLLIDE_STOP ? "stop" : "noclip");
+            };
             // Resolve a proposed eye move against the scene. Casts along the motion with the
             // engine's own BVH (scene.closestHit); keeps a `skin` standoff so the near plane
             // never pokes through a surface. SLIDE iterates a few times so a corner (two walls)
@@ -4099,6 +4117,28 @@ static int run(int argc, char** argv) {
                 char b[64]; std::snprintf(b, sizeof b, "%.2f, %.2f, %.2f", p.x, p.y, p.z);
                 return std::string(b);
             };
+            // ---- Control panel + camera-path (timeline) state ------------------------
+            // The window hosts a strip of controls below the image (Clip / Reset always;
+            // plus a timeline, Play/Pause, Path-lock toggle and two traversal-speed inputs
+            // when a flyby path is present). enablePanel with pathCount<2 shows just the two
+            // buttons. Path playback rides the SAME camera-index cursor the timeline scrubs.
+            const int pathCount = (int)explorePath.size();
+            g_liveWin->enablePanel(pathCount, explorePathFps, collideShort(collide));
+            bool   pathMode = false;    // locked to the camera path (orientation + travel follow it)
+            bool   playing  = false;    // auto-advancing along the path
+            double pathPos  = 0.0;      // fractional camera index (continuous; render uses the nearest)
+            int    strideN  = 1;        // stride mode: cameras advanced per RENDERED frame
+            double camPerSec = (explorePathFps > 0.0) ? explorePathFps : 30.0;  // rate mode: cameras / wall-second
+            bool   rateMode  = true;    // true = cam/sec (wall clock), false = stride (per update)
+            // Last values mirrored to the panel, so we only re-push on an actual change.
+            int    lastIdxSent = -1; bool lastPlaySent = false, lastPathSent = false;
+            CollideMode lastCollideSent = collide;
+            auto clampPos = [&](double p) { return std::clamp(p, 0.0, (double)std::max(0, pathCount - 1)); };
+            using clock = std::chrono::steady_clock;
+            auto prevT = clock::now();   // wall-clock delta for rate-mode traversal
+            if (pathCount >= 2)
+                std::printf("[viewer] camera path: %d frames on the timeline"
+                            " (Play/scrub/lock via the panel below the image)\n", pathCount);
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
@@ -4106,9 +4146,12 @@ static int run(int argc, char** argv) {
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
+              "         panel:  Clip / Reset buttons below the image%s\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
-              step, collideName(collide));
+              step, collideName(collide),
+              pathCount >= 2 ? "; timeline + Play/Pause + Path-lock + cams/upd | cams/s speed switch"
+                             : "");
             std::fflush(stdout);
 
             bool changed = true;   // render one frame immediately
@@ -4123,6 +4166,38 @@ static int run(int argc, char** argv) {
                   } }
                 NavInput nav = g_liveWin->drainNav();
 
+                // Wall-clock delta for rate-mode (cameras/second) path traversal.
+                auto nowT = clock::now();
+                double dt = std::chrono::duration<double>(nowT - prevT).count();
+                prevT = nowT;
+                if (dt > 0.25) dt = 0.25;   // clamp a hitch so playback can't leap the whole path
+
+                // Panel traversal-speed inputs (current values; 0 = leave unchanged).
+                if (nav.stride    >= 1)   strideN   = nav.stride;
+                if (nav.camPerSec > 0.0)  camPerSec = nav.camPerSec;
+                rateMode = nav.rateMode;   // radio switch: true = cam/sec, false = stride/update
+
+                // Path-lock toggle (panel "Path" button): snap the fly camera onto the path.
+                if (pathCount >= 2 && nav.togglePath) {
+                    pathMode = !pathMode;
+                    if (!pathMode) playing = false;   // leaving the path stops playback
+                    changed = true;
+                    std::printf("[viewer] path lock %s\n", pathMode ? "ON" : "OFF"); std::fflush(stdout);
+                }
+                // Play/Pause (panel button): engage path lock and toggle auto-advance.
+                if (pathCount >= 2 && nav.togglePlay) {
+                    if (!pathMode) pathMode = true;
+                    playing = !playing;
+                    if (playing && pathPos >= pathCount - 1 - 1e-9) pathPos = 0.0;   // restart from the top
+                    changed = true;
+                }
+                // Timeline scrub/jump (panel trackbar): engage path lock, pause, seek.
+                if (pathCount >= 2 && nav.scrubTo >= 0) {
+                    pathMode = true; playing = false;
+                    pathPos = clampPos((double)nav.scrubTo);
+                    changed = true;
+                }
+
                 // Ctrl+wheel adjusts the STEP SIZE (up = bigger), clamped to a sane band.
                 if (nav.wheelSpeed != 0.0) {
                     step = std::clamp(step * std::pow(1.15, nav.wheelSpeed), sceneR * 1e-3, sceneR * 2.0);
@@ -4133,54 +4208,92 @@ static int run(int argc, char** argv) {
                     collide = (CollideMode)((collide + 1) % 3);
                     std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
                 }
-                // Accumulate this frame's translation from all sources (plain-wheel dolly +
-                // held throttle), then resolve it ONCE against the scene so collision (and its
-                // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
-                // along the view ray (up = forward); held keys advance one `step`/frame.
-                Vec3 moveDelta{0, 0, 0};
-                if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * nav.wheel);
-                // Reset restores the authored eye + look direction.
+                // Reset: in free flight, restore the authored eye + look direction; while
+                // locked to the path, jump back to the start of the timeline and pause.
                 if (nav.reset) {
-                    eye = eye0; fwd = norml(tgt0 - eye0);
-                    lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
-                    if (lookDist < 1e-4) lookDist = sceneR;
-                    changed = true;
-                }
-                // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
-                // centre (joystick/hover-look): each rendered frame turns by that offset x the
-                // max rate, so the view keeps turning while you hold the pointer off-centre and
-                // holds still in the central dead zone (where you can see the scene). Horizontal
-                // offset yaws about world up, vertical offset pitches about the camera right
-                // axis, pitch clamped shy of the poles so the view can't flip over (no roll).
-                // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
-                // see rather than spinning past.
-                if (nav.lookX != 0.0 || nav.lookY != 0.0) {
-                    double yaw   = -nav.lookX * kYaw;     // pointer right -> turn right
-                    double pitch = -nav.lookY * kPitch;   // pointer down  -> look down
-                    fwd = norml(rotAxis(fwd, worldUp, yaw));
-                    Vec3 right = cross(fwd, worldUp);
-                    double rl = std::sqrt(dot(right, right));
-                    if (rl > 1e-9) {
-                        right = right * (1.0 / rl);
-                        Vec3 cand = norml(rotAxis(fwd, right, pitch));
-                        if (std::fabs(dot(cand, worldUp)) < 0.9995) fwd = cand;   // clamp near poles
+                    if (pathMode) { pathPos = 0.0; playing = false; }
+                    else {
+                        eye = eye0; fwd = norml(tgt0 - eye0);
+                        lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+                        if (lookDist < 1e-4) lookDist = sceneR;
                     }
                     changed = true;
                 }
-                // Held throttle: advance ONE `step` per RENDERED frame while Space/+ (forward)
-                // or Shift/- (backward) is down. Deliberately NOT wall-clock-integrated —
-                // tying the move to the render cadence means every position you pass through
-                // is actually drawn, so a slow scene can't fling you through a wall between two
-                // frames you never saw. Travel rate = step x render-fps (faster scene = quicker).
-                if (nav.fwd)  moveDelta = moveDelta + fwd * step;
-                if (nav.back) moveDelta = moveDelta - fwd * step;
-                // Apply the combined move through collision (no-op when collision is OFF).
-                if (dot(moveDelta, moveDelta) > 0.0) { eye = resolveMove(eye, moveDelta); changed = true; }
+
+                // The render camera's up vector and fov: fixed authored values while flying
+                // free; the current path frame's own up/fov while locked to the path.
+                Vec3   rUp  = worldUp;
+                double rFov = fovY;
+
+                if (!pathMode) {
+                    // ---- FREE FLIGHT --------------------------------------------------
+                    // Accumulate this frame's translation from all sources (plain-wheel dolly +
+                    // held throttle), then resolve it ONCE against the scene so collision (and its
+                    // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
+                    // along the view ray (up = forward); held keys advance one `step`/frame.
+                    Vec3 moveDelta{0, 0, 0};
+                    if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * nav.wheel);
+                    // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
+                    // centre (joystick/hover-look): each rendered frame turns by that offset x the
+                    // max rate, so the view keeps turning while you hold the pointer off-centre and
+                    // holds still in the central dead zone (where you can see the scene). Horizontal
+                    // offset yaws about world up, vertical offset pitches about the camera right
+                    // axis, pitch clamped shy of the poles so the view can't flip over (no roll).
+                    // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
+                    // see rather than spinning past.
+                    if (nav.lookX != 0.0 || nav.lookY != 0.0) {
+                        double yaw   = -nav.lookX * kYaw;     // pointer right -> turn right
+                        double pitch = -nav.lookY * kPitch;   // pointer down  -> look down
+                        fwd = norml(rotAxis(fwd, worldUp, yaw));
+                        Vec3 right = cross(fwd, worldUp);
+                        double rl = std::sqrt(dot(right, right));
+                        if (rl > 1e-9) {
+                            right = right * (1.0 / rl);
+                            Vec3 cand = norml(rotAxis(fwd, right, pitch));
+                            if (std::fabs(dot(cand, worldUp)) < 0.9995) fwd = cand;   // clamp near poles
+                        }
+                        changed = true;
+                    }
+                    // Held throttle: advance ONE `step` per RENDERED frame while Space/+ (forward)
+                    // or Shift/- (backward) is down. Deliberately NOT wall-clock-integrated —
+                    // tying the move to the render cadence means every position you pass through
+                    // is actually drawn, so a slow scene can't fling you through a wall between two
+                    // frames you never saw. Travel rate = step x render-fps (faster scene = quicker).
+                    if (nav.fwd)  moveDelta = moveDelta + fwd * step;
+                    if (nav.back) moveDelta = moveDelta - fwd * step;
+                    // Apply the combined move through collision (no-op when collision is OFF).
+                    if (dot(moveDelta, moveDelta) > 0.0) { eye = resolveMove(eye, moveDelta); changed = true; }
+                } else {
+                    // ---- LOCKED TO THE CAMERA PATH ------------------------------------
+                    // Travel is along the timeline (camera index), not through free space, and
+                    // the orientation/up/fov come straight from the path frames. Forward/back
+                    // (or Play auto-advance) move the cursor; the two speed modes decide how far
+                    // per frame: rate mode = cameras/second on the wall clock (may skip frames on
+                    // a slow render); stride mode = a fixed number of cameras per RENDERED frame.
+                    double dir = 0.0;
+                    if (playing)  dir += 1.0;
+                    if (nav.fwd)  dir += 1.0;
+                    if (nav.back) dir -= 1.0;
+                    double advance = 0.0;
+                    if (dir != 0.0)
+                        advance = rateMode ? (dir * camPerSec * dt) : (dir * (double)strideN);
+                    advance += nav.wheel;   // plain wheel nudges one camera per notch (precise)
+                    if (advance != 0.0) {
+                        double np = clampPos(pathPos + advance);
+                        if (np != pathPos) { pathPos = np; changed = true; }
+                        // Auto-play stops when it runs off either end of the timeline.
+                        if (playing && dir > 0.0 && pathPos >= pathCount - 1 - 1e-9) playing = false;
+                        if (playing && dir < 0.0 && pathPos <= 1e-9)                 playing = false;
+                    }
+                    int i = (int)std::lround(pathPos);
+                    eye = explorePath[i].eye; fwd = explorePath[i].fwd;
+                    rUp = explorePath[i].up;  rFov = explorePath[i].fov;
+                }
 
                 Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
                 if (changed) {
                     Camera c; c.projection = proj;
-                    c.lookAt(eye, tgt, worldUp, fovY, VW, VH);
+                    c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     std::vector<uint8_t> img =
                         raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr);
                     g_liveWin->update(VW, VH, img);
@@ -4192,12 +4305,27 @@ static int run(int argc, char** argv) {
                     std::printf("camera \"cam\" { eye %.4g %.4g %.4g   look_at %.4g %.4g %.4g"
                                 "   up %.4g %.4g %.4g   fov_y %.4g }\n",
                                 eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z,
-                                worldUp.x, worldUp.y, worldUp.z, fovY);
+                                rUp.x, rUp.y, rUp.z, rFov);
                     std::fflush(stdout);
                 }
-                // Sleep only when truly idle; while a throttle key is held or the mouse is
-                // steering we loop at full raster speed for smooth continuous motion.
-                if (!nav.any())
+                // Mirror the live viewer state back onto the panel controls (timeline slider,
+                // Play/Pause label, Path toggle, Clip label) whenever they change, so the panel
+                // always reflects reality — e.g. the slider tracks playback and the toggles
+                // follow keyboard/auto changes. setPanelState never re-emits a NavInput edge.
+                {
+                    int idxNow = pathMode ? (int)std::lround(pathPos)
+                                          : (lastIdxSent < 0 ? 0 : lastIdxSent);
+                    if (idxNow != lastIdxSent || playing != lastPlaySent ||
+                        pathMode != lastPathSent || collide != lastCollideSent) {
+                        g_liveWin->setPanelState(idxNow, playing, pathMode, collideShort(collide));
+                        lastIdxSent = idxNow; lastPlaySent = playing;
+                        lastPathSent = pathMode; lastCollideSent = collide;
+                    }
+                }
+                // Sleep only when truly idle; while a throttle key is held, the mouse is
+                // steering, or the path is auto-playing we loop at full raster speed for
+                // smooth continuous motion.
+                if (!nav.any() && !playing)
                     std::this_thread::sleep_for(std::chrono::milliseconds(15));
             }
             g_stopRequested = 1;   // window closed → done

@@ -10,6 +10,8 @@ void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
 NavInput LiveWindow::drainNav() { return {}; }
 bool LiveWindow::clientSize(int&, int&) const { return false; }
+void LiveWindow::enablePanel(int, double, const char*) {}
+void LiveWindow::setPanelState(int, bool, bool, const char*) {}
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -17,11 +19,14 @@ bool LiveWindow::clientSize(int&, int&) const { return false; }
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>          // GET_X_LPARAM / GET_Y_LPARAM
+#include <commctrl.h>          // trackbar (msctls_trackbar32) for the timeline
 #include <thread>
 #include <mutex>
 #include <atomic>
 #include <string>
+#include <cstdlib>             // strtod / atoi for the speed inputs
 #include <algorithm>
+#pragma comment(lib, "comctl32.lib")
 
 // Convert a UTF-8 byte string to UTF-16 for the Win32 *W APIs. The old code did a
 // naive `assign(begin, end)` byte-widen, which mangles any non-ASCII: an em dash
@@ -35,6 +40,17 @@ static std::wstring utf8ToWide(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
+
+// ---- Control-panel constants ----
+// Child-window command IDs (WM_COMMAND LOWORD) + the trackbar. Kept out of the low
+// range Windows reserves for standard dialog buttons.
+enum {
+    ID_CLIP = 1001, ID_RESET, ID_PATH, ID_PLAY,
+    ID_TIMELINE, ID_STRIDE, ID_RATE, ID_SW_UPDATE, ID_SW_SEC
+};
+static const int kPanelH = 64;              // reserved control-strip height (px), two rows
+// Marshal cross-thread panel ops onto the window's own message-pump thread.
+#define WM_MKPANEL  (WM_APP + 1)            // build the control panel (params staged in Impl)
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -68,10 +84,30 @@ struct LiveWindow::Impl {
     std::atomic<bool>    looking{false};            // cursor currently inside client (steering live)
     bool                 tracking  = false;         // WM_MOUSELEAVE requested for this hover
 
+    // ---- Control panel (optional strip below the image) ----
+    std::atomic<bool>    hasPanel{false};           // panel built & child HWNDs valid (release/acquire)
+    int                  panelH = 0;                // reserved strip height (0 = no panel); UI thread
+    int                  pathCount = 0;             // cameras on the timeline (0 = no path controls)
+    HWND hClip=nullptr, hReset=nullptr, hPath=nullptr, hPlay=nullptr, hTimeline=nullptr,
+         hStrideLbl=nullptr, hStride=nullptr, hRateLbl=nullptr, hRate=nullptr,
+         hSwUpdate=nullptr, hSwSec=nullptr;         // child controls (set on UI thread pre-hasPanel)
+    HFONT panelFont = nullptr;
+    // Staged enablePanel() params (set under inMtx before WM_MKPANEL is sent).
+    int                  reqPathCount = 0; double reqDefFps = 0.0; std::string reqCollide;
+    // Panel outputs (guarded by inMtx): one-shot button edges + current input values.
+    bool                 pathReq = false;           // "Path" toggle pressed (one-shot)
+    bool                 playReq = false;           // "Play/Pause" pressed (one-shot)
+    int                  scrubReq = -1;             // timeline dragged/jumped to index (>=0), else -1
+    int                  strideVal = 1;             // "cameras / screen update" input (current)
+    double               rateVal   = 30.0;          // "cameras / second" input (current)
+    bool                 rateModeVal = true;        // switch: true = per-sec, false = per-update
+
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
     void paint(HDC hdc, const RECT& client);
     void endLook();                                 // cursor left / focus lost: stop steering cleanly
+    void buildPanel(HWND h);                        // create child controls + grow window (UI thread)
+    void layoutPanel(HWND h);                       // position child controls in the strip (UI thread)
 };
 
 // Stop hover-look steering: called when the cursor leaves the client area or the window loses
@@ -84,12 +120,100 @@ void LiveWindow::Impl::endLook() {
     lookX = lookY = 0.0;
 }
 
+// Build the control-panel child windows and grow the window by kPanelH so the image area is
+// unchanged. Runs on the UI thread (via WM_MKPANEL). Reads the staged reqPathCount/reqDefFps/
+// reqCollide. Sets hasPanel=true LAST, after every HWND is valid, so the render thread's
+// setPanelState/paint see a fully-formed panel.
+void LiveWindow::Impl::buildPanel(HWND h) {
+    if (hasPanel.load()) return;
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icc);                     // register msctls_trackbar32
+    int pc; double defFps; std::string collide;
+    { std::lock_guard<std::mutex> lk(inMtx); pc = reqPathCount; defFps = reqDefFps; collide = reqCollide; }
+    pathCount = pc;
+    panelH    = kPanelH;
+    panelFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int id) -> HWND {
+        HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
+                                 0, 0, 10, 10, h, (HMENU)(INT_PTR)id, hi, nullptr);
+        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)panelFont, TRUE);
+        return c;
+    };
+    std::wstring clipTxt = utf8ToWide("Clip: " + collide);
+    hClip  = mk(L"BUTTON", clipTxt.c_str(), BS_PUSHBUTTON, ID_CLIP);
+    hReset = mk(L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_RESET);
+    if (pathCount >= 2) {
+        // Path (lock-to-path) toggle doubles as the timeline enable — same option, per spec.
+        hPath = mk(L"BUTTON", L"Path lock", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_PATH);
+        hPlay = mk(L"BUTTON", L"Play", BS_PUSHBUTTON, ID_PLAY);
+        hStrideLbl = mk(L"STATIC", L"cams/upd:", SS_RIGHT | SS_CENTERIMAGE, 0);
+        hStride    = mk(L"EDIT", L"1", ES_NUMBER | ES_RIGHT | WS_BORDER, ID_STRIDE);
+        hRateLbl   = mk(L"STATIC", L"cams/s:", SS_RIGHT | SS_CENTERIMAGE, 0);
+        wchar_t rbuf[32]; swprintf(rbuf, 32, L"%g", (defFps > 0.0 ? defFps : 30.0));
+        hRate      = mk(L"EDIT", rbuf, ES_RIGHT | WS_BORDER, ID_RATE);
+        // Speed-model switch: two radio buttons; default = per-sec (real-time playback at fps).
+        hSwUpdate  = mk(L"BUTTON", L"per upd", BS_AUTORADIOBUTTON | WS_GROUP, ID_SW_UPDATE);
+        hSwSec     = mk(L"BUTTON", L"per sec", BS_AUTORADIOBUTTON, ID_SW_SEC);
+        SendMessageW(hSwSec, BM_SETCHECK, BST_CHECKED, 0);
+        // Timeline trackbar: one tick per camera (page = ~5%).
+        hTimeline  = mk(L"msctls_trackbar32", L"", TBS_HORZ | TBS_AUTOTICKS, ID_TIMELINE);
+        SendMessageW(hTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, pathCount - 1));
+        SendMessageW(hTimeline, TBM_SETPAGESIZE, 0, (LPARAM)std::max(1, pathCount / 20));
+        SendMessageW(hTimeline, TBM_SETPOS, TRUE, 0);
+    }
+    // Grow the window by the strip height so the image keeps its size.
+    RECT wr; GetWindowRect(h, &wr);
+    SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + panelH,
+                 SWP_NOMOVE | SWP_NOZORDER);
+    layoutPanel(h);
+    hasPanel.store(true);                           // publish: children are all valid now
+    InvalidateRect(h, nullptr, TRUE);
+}
+
+// Position the panel children within the bottom strip. Row 1 = buttons + speed inputs + switch;
+// row 2 = the full-width timeline. Called on build and on every WM_SIZE. UI thread only.
+void LiveWindow::Impl::layoutPanel(HWND h) {
+    if (!panelH) return;
+    RECT cr; GetClientRect(h, &cr);
+    int W = cr.right - cr.left, H = cr.bottom - cr.top;
+    int top = H - panelH;
+    const int pad = 5, bh = 24;
+    int row1 = top + 5, row2 = top + 5 + bh + 4;
+    int x = pad;
+    auto place = [&](HWND c, int w, int y, int height) {
+        if (c) MoveWindow(c, x, y, w, height, TRUE);
+        x += w + pad;
+    };
+    place(hClip, 84, row1, bh);
+    place(hReset, 56, row1, bh);
+    if (pathCount >= 2) {
+        place(hPath, 66, row1, bh);
+        place(hPlay, 56, row1, bh);
+        place(hStrideLbl, 58, row1, bh);
+        place(hStride, 40, row1, bh);
+        place(hRateLbl, 50, row1, bh);
+        place(hRate, 48, row1, bh);
+        place(hSwUpdate, 66, row1, bh);
+        place(hSwSec, 62, row1, bh);
+        if (hTimeline) MoveWindow(hTimeline, pad, row2, std::max(1, W - 2 * pad), bh, TRUE);
+    }
+}
+
 void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
-    int cw = client.right - client.left, ch = client.bottom - client.top;
-    if (cw <= 0 || ch <= 0) return;
+    int cw = client.right - client.left;
+    int ch = (client.bottom - client.top) - panelH;   // image area = client minus the control strip
+    if (cw <= 0 || ch <= 0) {
+        // Degenerate (window dragged shorter than the panel): just fill with the toolbar face.
+        if (panelH > 0) {
+            RECT strip{0, 0, cw, client.bottom - client.top};
+            FillRect(hdc, &strip, GetSysColorBrush(COLOR_BTNFACE));
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lk(mtx);
-    // Double-buffer through a memory DC so the letterbox fill + stretch blit land in
-    // one BitBlt (no flicker; WM_ERASEBKGND is suppressed).
+    // Double-buffer the IMAGE area through a memory DC so the letterbox fill + stretch blit
+    // land in one BitBlt (no flicker; WM_ERASEBKGND is suppressed).
     HDC     mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, cw, ch);
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
@@ -115,6 +239,11 @@ void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
     SelectObject(mem, old);
     DeleteObject(bmp);
     DeleteDC(mem);
+    // Fill the control-strip background (behind/between the child controls) with the toolbar face.
+    if (panelH > 0) {
+        RECT strip{0, ch, cw, ch + panelH};
+        FillRect(hdc, &strip, GetSysColorBrush(COLOR_BTNFACE));
+    }
 }
 
 LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -143,22 +272,29 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             if (self) { RECT cr; GetClientRect(h, &cr); self->paint((HDC)wp, cr); }
             return 0;
         }
+        case WM_MKPANEL:
+            if (self) self->buildPanel(h);           // build controls + grow window (UI thread)
+            return 0;
         case WM_SIZE:
+            if (self) self->layoutPanel(h);          // reflow the control strip to the new width
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_MOUSEMOVE:
-            // Hover-look (rate / joystick): while the cursor is over the client area, its offset
-            // from the window centre sets a TURN RATE. A central dead zone reports zero (the view
-            // holds still so you can see the scene); beyond it the rate ramps to ±1 at the window
+            // Hover-look (rate / joystick): while the cursor is over the IMAGE area, its offset
+            // from the image centre sets a TURN RATE. A central dead zone reports zero (the view
+            // holds still so you can see the scene); beyond it the rate ramps to ±1 at the image
             // edge, so holding the pointer to one side keeps the view turning that way — you can
             // look a full circle without the cursor leaving the window. The cursor stays visible
-            // and free (no hide/clip/warp). We arm WM_MOUSELEAVE so we know when it exits.
+            // and free (no hide/clip/warp). We arm WM_MOUSELEAVE so we know when it exits. Over the
+            // control strip (below the image) steering is neutral, so reaching a button doesn't turn.
             if (self) {
                 RECT cr; GetClientRect(h, &cr);
-                double halfW = (cr.right - cr.left) * 0.5, halfH = (cr.bottom - cr.top) * 0.5;
+                int imgH = (cr.bottom - cr.top) - self->panelH;   // image area excludes the strip
+                double halfW = (cr.right - cr.left) * 0.5, halfH = imgH * 0.5;
                 int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-                double nx = halfW > 0.5 ? (mx - halfW) / halfW : 0.0;   // -1 (left) .. +1 (right)
-                double ny = halfH > 0.5 ? (my - halfH) / halfH : 0.0;   // -1 (top)  .. +1 (bottom)
+                bool inImage = (my < imgH);
+                double nx = (inImage && halfW > 0.5) ? (mx - halfW) / halfW : 0.0;   // -1 (left) .. +1 (right)
+                double ny = (inImage && halfH > 0.5) ? (my - halfH) / halfH : 0.0;   // -1 (top)  .. +1 (bottom)
                 const double dz = 0.15;                                 // central neutral dead zone
                 auto shape = [dz](double v) -> double {                 // dead-zone + rescale to full-edge = ±1
                     double a = v < 0 ? -v : v;
@@ -193,6 +329,51 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 std::lock_guard<std::mutex> lk(self->inMtx);
                 if (ctrl) self->wheelSpeedAcc += notches;
                 else      self->wheelAcc      += notches;
+            }
+            return 0;
+        case WM_COMMAND:
+            // Control-panel buttons / edits. Button clicks raise the same one-shot edges the
+            // keyboard uses (Clip == 'C', Reset == '0'); the radio pair sets the speed switch;
+            // the edit boxes cache their parsed value on every change so drainNav reads current.
+            if (self) {
+                int id = LOWORD(wp), code = HIWORD(wp);
+                switch (id) {
+                    case ID_CLIP:  { std::lock_guard<std::mutex> lk(self->inMtx); self->collideReq = true; } break;
+                    case ID_RESET: { std::lock_guard<std::mutex> lk(self->inMtx); self->resetReq   = true; } break;
+                    case ID_PATH:  { std::lock_guard<std::mutex> lk(self->inMtx); self->pathReq     = true; } break;
+                    case ID_PLAY:  { std::lock_guard<std::mutex> lk(self->inMtx); self->playReq     = true; } break;
+                    case ID_SW_UPDATE:
+                        if (code == BN_CLICKED) { std::lock_guard<std::mutex> lk(self->inMtx); self->rateModeVal = false; }
+                        break;
+                    case ID_SW_SEC:
+                        if (code == BN_CLICKED) { std::lock_guard<std::mutex> lk(self->inMtx); self->rateModeVal = true; }
+                        break;
+                    case ID_STRIDE:
+                        if (code == EN_CHANGE && self->hStride) {
+                            wchar_t b[32]; GetWindowTextW(self->hStride, b, 32);
+                            int v = _wtoi(b);
+                            if (v >= 1) { std::lock_guard<std::mutex> lk(self->inMtx); self->strideVal = v; }
+                        }
+                        break;
+                    case ID_RATE:
+                        if (code == EN_CHANGE && self->hRate) {
+                            wchar_t b[32]; GetWindowTextW(self->hRate, b, 32);
+                            double v = wcstod(b, nullptr);
+                            if (v > 0.0) { std::lock_guard<std::mutex> lk(self->inMtx); self->rateVal = v; }
+                        }
+                        break;
+                    default: break;
+                }
+            }
+            return 0;
+        case WM_HSCROLL:
+            // Timeline trackbar dragged / paged / arrowed: record the new camera index so the
+            // render loop jumps the view there (and engages path mode). SB_ENDSCROLL still reports
+            // the final position, so a drag ends on the exact frame the user released on.
+            if (self && self->hTimeline && (HWND)lp == self->hTimeline) {
+                int pos = (int)SendMessageW(self->hTimeline, TBM_GETPOS, 0, 0);
+                std::lock_guard<std::mutex> lk(self->inMtx);
+                self->scrubReq = pos;
             }
             return 0;
         case WM_KEYDOWN:
@@ -249,8 +430,13 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 auto mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 RECT r{0, 0, self->minW, self->minH};
                 AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-                mmi->ptMinTrackSize.x = r.right - r.left;
-                mmi->ptMinTrackSize.y = r.bottom - r.top;
+                int minWpx = r.right - r.left, minHpx = r.bottom - r.top;
+                if (self->panelH > 0) {
+                    minHpx += self->panelH;             // room for the control strip below the image
+                    if (minWpx < 700) minWpx = 700;     // wide enough for the button row not to clip
+                }
+                mmi->ptMinTrackSize.x = minWpx;
+                mmi->ptMinTrackSize.y = minHpx;
             }
             return 0;
         case WM_CLOSE:
@@ -374,8 +560,13 @@ NavInput LiveWindow::drainNav() {
     n.wheel = impl_->wheelAcc; n.wheelSpeed = impl_->wheelSpeedAcc;
     n.reset  = impl_->resetReq; n.print = impl_->printReq;
     n.cycleCollide = impl_->collideReq;
+    // Control-panel outputs: one-shot button edges (read-and-clear) + current input values.
+    n.togglePath = impl_->pathReq;  n.togglePlay = impl_->playReq;  n.scrubTo = impl_->scrubReq;
+    n.stride = impl_->strideVal;    n.camPerSec = impl_->rateVal;   n.rateMode = impl_->rateModeVal;
     impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = impl_->collideReq = false;
+    impl_->pathReq = impl_->playReq = false;
+    impl_->scrubReq = -1;
     return n;
 }
 
@@ -383,10 +574,38 @@ bool LiveWindow::clientSize(int& w, int& h) const {
     if (!impl_ || !impl_->hwnd) return false;
     RECT cr;
     if (!GetClientRect(impl_->hwnd, &cr)) return false;
-    int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+    int cw = cr.right - cr.left, ch = (cr.bottom - cr.top) - impl_->panelH;  // image area only
     if (cw <= 0 || ch <= 0) return false;
     w = cw; h = ch;
     return true;
+}
+
+void LiveWindow::enablePanel(int pathCount, double defFps, const char* collideLabel) {
+    if (!impl_ || !impl_->hwnd || impl_->hasPanel.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->inMtx);
+        impl_->reqPathCount = pathCount;
+        impl_->reqDefFps    = defFps;
+        impl_->reqCollide   = collideLabel ? collideLabel : "slide";
+        impl_->rateVal      = (defFps > 0.0) ? defFps : 30.0;   // seed the cam/sec input
+        impl_->strideVal    = 1;
+        impl_->rateModeVal  = true;                             // default switch = per-sec
+    }
+    // Build on the window's own thread (synchronous, so the child HWNDs exist on return).
+    SendMessageW(impl_->hwnd, WM_MKPANEL, 0, 0);
+}
+
+void LiveWindow::setPanelState(int idx, bool playing, bool pathMode, const char* collideLabel) {
+    if (!impl_ || !impl_->hasPanel.load()) return;
+    // These USER32 calls marshal to the window thread; setting them does not re-emit the
+    // matching NavInput edge (TBM_SETPOS/BM_SETCHECK/SetWindowText raise no WM_HSCROLL/WM_COMMAND).
+    if (impl_->hTimeline) SendMessageW(impl_->hTimeline, TBM_SETPOS, TRUE, (LPARAM)idx);
+    if (impl_->hPlay)     SetWindowTextW(impl_->hPlay, playing ? L"Pause" : L"Play");
+    if (impl_->hPath)     SendMessageW(impl_->hPath, BM_SETCHECK, pathMode ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (impl_->hClip && collideLabel) {
+        std::wstring w = utf8ToWide(std::string("Clip: ") + collideLabel);
+        SetWindowTextW(impl_->hClip, w.c_str());
+    }
 }
 
 #endif // _WIN32

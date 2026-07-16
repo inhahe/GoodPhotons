@@ -172,7 +172,8 @@ paths they can capture at all**.
 > there is no separate "aim the target" mode and no crosshair. The world up is fixed,
 > so there is no roll. (To drop straight into this viewer **seeded at the first frame
 > of a multi-frame flyby** — instead of animating through every frame — add
-> `-explore` / `-fly`; see the flags table.)
+> `-explore` / `-fly`; the flyby's frames become a **camera-path timeline** you can
+> scrub, play and lock onto from the control panel below the image. See the flags table.)
 >
 > | input | does |
 > |---|---|
@@ -200,6 +201,28 @@ paths they can capture at all**.
 > into open space; **`stop`** halts dead at the wall (no sideways drift); **`noclip`**
 > turns collision off entirely, to place a camera *outside* the room or *inside* glass.
 > Start with collision off via **`-noclip`** (`showcase_flyby.py --noclip`).
+>
+> **Control panel (below the image).** The live window reserves a strip under the
+> preview for on-screen controls, so you don't have to remember key bindings. Two
+> buttons are always present: **Clip** (cycles the same `slide` → `stop` → `noclip`
+> collision modes as `C`, showing the current mode) and **Reset** (jumps back to the
+> start — the authored camera in free flight, or frame 0 of the path when locked).
+> When you entered via `-explore` / `-fly` on a **multi-frame flyby**, the panel also
+> gains the flyby's **camera-path timeline** and its controls:
+>
+> | control | does |
+> |---|---|
+> | **timeline slider** | **scrub / jump** to any camera on the path — dragging or clicking snaps the view to that frame's exact eye, orientation, up and fov, and **locks onto the path** (pausing playback) |
+> | **Play / Pause** | auto-advance along the path (engages path-lock); it **stops at the end** of the timeline |
+> | **Path** (toggle) | **lock to / release** the path: while locked, forward/back travel along the timeline and the view uses each frame's authored orientation/up/fov (mouse-look and free translation are suspended); release to fly freely again from wherever you are |
+> | **cams/upd** | **stride** traversal speed: cameras advanced per **rendered frame** (feedback-locked, like the fly motion) |
+> | **cams/s** | **rate** traversal speed: cameras per **wall-clock second** (may skip frames on a slow render to keep real-time pace); defaults to the scene's authored fps |
+> | **per upd / per sec** switch | choose which of the two speeds above is in effect (they're mutually exclusive) |
+>
+> While locked to the path, `Space`/`+` and `Shift`/`-` move **forward/backward along
+> the timeline** (instead of through free space) at the selected speed, the mouse wheel
+> **nudges one camera per notch**, and the slider tracks your position live. Toggle
+> **Path** off (or press Reset) to return to free flight.
 >
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
 > the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
@@ -1516,9 +1539,9 @@ alone can't restore, so they are not disk-resumable.
 | `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
-| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, mouse-look to steer (click to capture, Esc frees), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
+| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
-| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`), drops the remaining frames, and hands control to you: Space/`+` fly forward, Shift/`-` back, mouse-look (click to capture, Esc frees), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. |
+| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. |
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |

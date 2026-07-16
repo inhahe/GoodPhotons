@@ -40,17 +40,36 @@
 //     slide -> stop -> noclip). `looking` reports whether the cursor is currently inside the
 //     client area (steering live); it goes false the instant the pointer leaves the window or
 //     focus is lost, and the cursor is always free to resize/close the window.
+//
+// The window can also host an optional CONTROL PANEL below the image (see enablePanel):
+// buttons for collision + reset, and — when a multi-frame camera path is present — a
+// timeline (scrub/play/pause), a "lock to path" toggle, and two traversal-speed inputs
+// with a switch between them. Those controls also feed back through NavInput:
+//   * `togglePath` / `togglePlay` are one-shot edges (the Path / Play-Pause buttons).
+//   * `scrubTo` is the camera index the user dragged/jumped the timeline to (>=0), else -1.
+//   * `stride` (cameras advanced per RENDERED frame) and `camPerSec` (cameras per WALL-CLOCK
+//     second, defaulting to the scene fps) are the two mutually-exclusive traversal speeds;
+//     `rateMode` is the switch (true = use camPerSec / wall clock, false = use stride / per
+//     update). These are current values (0 = "unchanged"), not one-shot edges.
 struct NavInput {
     double lookX  = 0.0, lookY  = 0.0;   // hover-look turn RATE from cursor offset, dead-zoned, -1..+1 per axis (persistent state)
     double wheel  = 0.0;                  // plain-wheel notches (+ = up = dolly forward)
     double wheelSpeed = 0.0;             // Ctrl+wheel notches (+ = up = bigger step size)
     bool   fwd    = false;               // Space / '+' held  -> fly forward
     bool   back   = false;               // Shift / '-' held  -> fly backward
-    bool   reset  = false;               // '0' / Home pressed since last drain
+    bool   reset  = false;               // '0' / Home / Reset button since last drain
     bool   print  = false;               // 'P' pressed since last drain
-    bool   cycleCollide = false;         // 'C' pressed since last drain (cycle collision mode)
+    bool   cycleCollide = false;         // 'C' / Clip button since last drain (cycle collision mode)
     bool   looking = false;              // cursor currently inside the client area (steering live)
-    bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print || cycleCollide; }
+    // ---- Control-panel outputs (drained alongside the fly input) ----
+    bool   togglePath = false;           // "Path" (lock-to-path) button pressed since last drain (one-shot)
+    bool   togglePlay = false;           // "Play/Pause" button pressed since last drain (one-shot)
+    int    scrubTo    = -1;              // timeline dragged/jumped to this camera index (>=0), else -1
+    int    stride     = 0;               // "cameras / screen update" input (current value; 0 = unchanged)
+    double camPerSec  = 0.0;             // "cameras / second" input (current value; 0 = unchanged)
+    bool   rateMode   = false;           // speed switch: true = cam/sec (wall clock), false = stride (per update)
+    bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
+                                || cycleCollide || togglePath || togglePlay || scrubTo >= 0; }
 };
 
 class LiveWindow {
@@ -77,6 +96,21 @@ public:
     // deltas, wheel-throttle notches, the current held state of the forward/back throttle
     // keys, and the one-shot reset/print edges. Thread-safe. See NavInput for units.
     NavInput drainNav();
+
+    // Show the control panel strip below the image (marshalled to the UI thread; safe to call
+    // once from the render thread). The window grows by the panel height so the image area is
+    // unchanged. `pathCount` is the number of cameras on the timeline: >=2 shows the timeline,
+    // Play/Pause, the Path (lock-to-path) toggle, the two speed inputs and their switch; <2
+    // shows only the Clip and Reset buttons (no path controls). `defFps` seeds the cam/sec box
+    // and `collideLabel` the initial Clip-button text. No-op on non-Windows / stub builds.
+    void enablePanel(int pathCount, double defFps, const char* collideLabel);
+
+    // Push live viewer state so the panel mirrors reality (call from the render loop whenever
+    // it changes): `idx` moves the timeline slider (e.g. during playback), `playing` sets the
+    // Play/Pause label, `pathMode` sets the Path toggle, `collideLabel` sets the Clip button
+    // text. Marshalled to the UI thread; setting these never re-emits the corresponding
+    // NavInput edge (no feedback loop). No-op if the panel isn't enabled.
+    void setPanelState(int idx, bool playing, bool pathMode, const char* collideLabel);
 
     // Current client-area size in pixels (what the image is letterboxed into). Lets the
     // interactive render loop match its raster resolution to the live window, so shrinking
