@@ -42,6 +42,15 @@ class Element:
         raise NotImplementedError
 
 
+class Pattern(Element):
+    """Marker base for procedural pattern blocks (see :mod:`loom.material`).
+
+    A pattern is emitted before materials so a material may bind it via
+    ``key pattern:<name>``.  The concrete :class:`~loom.material.FuncPattern`
+    lives in ``material.py`` to avoid an import cycle; this base is what
+    :class:`Scene` routes on."""
+
+
 # ---------------------------------------------------------------------------
 # Materials
 # ---------------------------------------------------------------------------
@@ -295,13 +304,18 @@ class Scene:
         self.camera = camera
         self.units = units
         self.spectral = spectral
+        self.patterns: List[Element] = []
         self.materials: List[Material] = []
         self.elements: List[Element] = []
         self.lights: List[Light] = []
 
     def add(self, *elems: Element) -> "Scene":
         for e in elems:
-            if isinstance(e, Material):
+            # A procedural pattern must be emitted before the materials that bind it
+            # (ftrace resolves patterns in an earlier pass, but keep the text tidy).
+            if isinstance(e, Pattern):
+                self.patterns.append(e)
+            elif isinstance(e, Material):
                 self.materials.append(e)
             elif isinstance(e, Light):
                 self.lights.append(e)
@@ -310,7 +324,8 @@ class Scene:
         return self
 
     def _all_elements(self) -> List[Element]:
-        return [*self.materials, *self.elements, *self.lights, self.camera]
+        return [*self.patterns, *self.materials, *self.elements,
+                *self.lights, self.camera]
 
     def check_cycles(self) -> None:
         """Run the loop detector over every modulator in the scene."""
@@ -324,6 +339,10 @@ class Scene:
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]
+        for p in self.patterns:
+            blocks.append(p.emit(ctx))
+        if self.patterns:
+            blocks.append("")
         for m in self.materials:
             blocks.append(m.emit(ctx))
         blocks.append("")

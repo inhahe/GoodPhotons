@@ -18,8 +18,12 @@ from .data import PointPath, Grid, Scatter
 from .interp import LoopCurve, GridField, ScatterField, eval_curve
 from .mathnd import Mat, rotation, rotations, slice3
 from .scene import (
-    Scene, Material, Sphere, Beads, Raw, Light, Camera, Element,
+    Scene, Material, Sphere, Beads, Raw, Light, Camera, Element, Pattern,
     SweptMesh, ribbon, tube, blob, fan,
+)
+from .material import (
+    FuncPattern, MixMaterial, PATTERNS,
+    waves, checker, rings, blobs,
 )
 from .sweep import (
     rmf_frames, tangents, sweep_rings, skin, circle_profile, line_profile,
@@ -45,6 +49,8 @@ __all__ = [
     "LoopCurve", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3",
     "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
+    "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
+    "waves", "checker", "rings", "blobs",
     "SweptMesh", "ribbon", "tube", "blob", "fan",
     "rmf_frames", "tangents", "sweep_rings", "skin", "circle_profile",
     "line_profile", "write_obj",
