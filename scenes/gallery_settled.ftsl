@@ -27,8 +27,11 @@
 # OUT of the settle (the threaded gyroid must keep its exact channel/path alignment; a
 # pybullet pose on a non-watertight lattice would rotate the channel off the flight path).
 #
-# Render (still, mode D resolves the bounded cloud + dispersive caustics through glass):
-#   ftrace -in scenes/gallery_settled.ftsl -camera cam -mode D -noise 2 -window -o png/room.png
+# Render (still): the scene's prefer{}/else{} picks the mode itself — mode D today
+# (resolves the bounded cloud + dispersive caustics through glass in one pass), and
+# auto-falls back to mode B if a mode-D-hostile feature (e.g. a GRIN lamp-gas field)
+# is ever added. Don't pass -mode, so the chosen branch's own mode drives:
+#   ftrace -in scenes/gallery_settled.ftsl -camera cam -noise 2 -window -keepwindow -o png/room.png
 # Render (flyby, mode M = photon-map: build one stored map, reuse it for every frame):
 #   ftrace -in scenes/gallery_settled.ftsl -mode M -spp 8 -r 960 540 -window -o png/roomfly.png
 
@@ -340,10 +343,27 @@ medium {
 # ==============================  CAMERAS  =====================================
 # Still: front-centre, moderate 50 deg lens, looking down the shallow hall so the whole
 # central spread of pieces reads at once with the gold gyroid big in the foreground.
-camera "cam" {
-    eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
-    mode D
-    film { res 1280 720 }
+#
+# The still camera is wrapped in prefer{}/else{} so the render MODE resolves itself.
+# Today the scene carries no mode-D-hostile feature, so the PREFERRED branch (mode D —
+# fast, robust MIS in one pass) is selected. The day the scene gains something mode D
+# can't render — most importantly a gradient-index (GRIN) xenon lamp-gas field for the
+# shimmering arc mirage/schlieren (see known-issues.md "GRIN in BDPT" + "Showcase
+# render-mode") — the loader's trial build rejects the mode-D branch and falls back to
+# the mode-B branch (photon tracing: slower, but renders GRIN + everything else). Both
+# branches are identical apart from `mode`.
+prefer {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
+        mode D
+        film { res 1280 720 }
+    }
+} else {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
+        mode B
+        film { res 1280 720 }
+    }
 }
 
 # --- Flyby: a SEAMLESS closed loop that (1) starts front-high, (2) descends the centre

@@ -3185,7 +3185,15 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
     // Greedy per-node resolution (nodes fixed left-to-right; the realistic case is a
     // single node). For each node pick the first branch that yields a renderable scene,
     // else keep the last branch.
+    //
+    // Single-node fast path: with exactly one `prefer`, the trial that resolves the
+    // node IS the final scene (its flattened block list == the resolved one), so we
+    // keep that trial's `Loaded` and skip a redundant final rebuild — which for a
+    // heavy scene would otherwise re-parse and RE-LOAD every mesh a second time.
+    const bool singleNode = (preferIdx.size() == 1);
     std::vector<int> choice(preferIdx.size(), 0);
+    Loaded accepted;
+    bool haveAccepted = false;
     for (size_t j = 0; j < preferIdx.size(); ++j) {
         int nb = (int)blocks[preferIdx[j]].branches.size();
         int chosen = nb - 1;
@@ -3193,7 +3201,14 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
             choice[j] = c;
             Loaded trial;
             Trial t = tryBuild(choice, trial);
-            if (t.built && t.reason == nullptr) { chosen = c; break; }   // renderable -> take it
+            const bool renderable = (t.built && t.reason == nullptr);
+            // For a single node, whichever branch we end on (first renderable, or the
+            // last as fallback) is `chosen`, and `trial` currently holds its build.
+            if (singleNode && (renderable || c == nb - 1)) {
+                accepted = std::move(trial);
+                haveAccepted = true;
+            }
+            if (renderable) { chosen = c; break; }   // renderable -> take it
             if (c < nb - 1) {
                 const char* why = t.built ? t.reason : t.buildErr.c_str();
                 std::fprintf(stderr, "[prefer] branch %d rejected (%s); trying the next\n",
@@ -3203,10 +3218,14 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
         choice[j] = chosen;
     }
 
-    // Final build with the resolved choices.
-    std::vector<Block> flat = flattenPrefer(blocks, preferIdx, choice);
-    Builder bld;
-    if (!bld.build(flat, L)) { err = bld.err; return false; }
+    if (singleNode && haveAccepted) {
+        L = std::move(accepted);
+    } else {
+        // Multi-node: rebuild once with the fully-resolved choices across all nodes.
+        std::vector<Block> flat = flattenPrefer(blocks, preferIdx, choice);
+        Builder bld;
+        if (!bld.build(flat, L)) { err = bld.err; return false; }
+    }
     for (size_t j = 0; j < preferIdx.size(); ++j)
         std::printf("[prefer] using branch %d of %d\n",
                     choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());

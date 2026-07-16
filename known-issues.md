@@ -74,7 +74,20 @@ have the whole hero render, the pragmatic route is to render the showcase in **m
 (forward) instead — B supports GRIN and captures *all* the effects — accepting that it's
 **slower to converge** than D on this mixed scene. Tracked so we remember the trade-off:
 mode D now (fast, no lamp GRIN) vs. mode B later (slow, full effects incl. lamp GRIN), unless/
-until tier-1 "GRIN in mode D" above is built.
+until tier-1 "GRIN in mode D" above is built. The showcase now encodes this trade-off directly:
+its still camera is wrapped in `prefer { mode D } else { mode B }`, so mode D wins today and the
+loader auto-falls back to mode B the day a mode-D-hostile feature (a GRIN lamp-gas field) is added.
+
+**Minor tech debt: `prefer{}/else{}` trial builds reload meshes.** Resolving a `prefer` node
+trial-builds each candidate branch to test renderability (`ftsl::load`, `tryBuild` lambda). The
+common **single-node** case is optimized — the accepted trial's `Loaded` is reused as the final
+scene, so meshes load exactly once (verified on `gallery_settled.ftsl`). But when a node has
+several branches that get *rejected* before one is accepted, each rejected trial still re-parses
+and RE-LOADS every mesh; and a **multi-node** `prefer` does one extra final rebuild on top of the
+per-node trials. For a heavy scene (600k-tri OBJs) that multiplies OBJ-load time. Proper fix if it
+ever bites: build the shared/non-`prefer` blocks (all the meshes) *once* and only re-resolve the
+small mode-sensitive delta per branch, instead of flattening + full-building the whole block list
+each trial. Negligible today (branches carry only a camera + medium), so left as-is.
 
 ### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode
 
