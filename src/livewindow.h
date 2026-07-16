@@ -18,11 +18,16 @@
 // you always travel where you look (or the exact opposite when reversing), so there is
 // no separate "aim the target" mode and no crosshair.
 //
-//   * mouse-look is HOVER-look: move the mouse over the window to STEER (horizontal motion
-//     yaws, vertical motion pitches). The cursor stays VISIBLE and free — it is never hidden,
-//     clipped, or warped — and steering simply stops the instant the pointer leaves the client
-//     area, so you can reach the title bar or other apps without turning the view. `lookDx/lookDy`
-//     are raw client-pixel deltas (+dx = cursor right, +dy = cursor down).
+//   * mouse-look is HOVER-look with RATE (joystick) steering: the cursor's offset from the
+//     window centre sets a TURN RATE. Near the centre is a neutral dead zone (the view holds
+//     still, so you can see the scene); pushing the pointer toward an edge turns the view that
+//     way and KEEPS turning while you hold it there, so you can look a full circle without the
+//     cursor ever leaving the window. The cursor stays VISIBLE and free — never hidden, clipped,
+//     or warped — and steering stops the instant the pointer leaves the client area (so you can
+//     reach the title bar or other apps without turning). `lookX/lookY` are the dead-zoned offset,
+//     each axis in [-1,+1] (+x = pointer right of centre, +y = pointer below centre); they are
+//     PERSISTENT STATE (the current offset), not per-drain accumulators — drainNav reads but does
+//     not clear them, so the view keeps turning between drains while the pointer is held off-centre.
 //   * `fwd` / `back` are the CURRENT held state of the throttle keys (Space or '+' fly
 //     forward; Shift or '-' fly backward) — the render loop advances you ONE fixed step
 //     per RENDERED frame while one is held (feedback-locked: motion scales with render
@@ -36,7 +41,7 @@
 //     client area (steering live); it goes false the instant the pointer leaves the window or
 //     focus is lost, and the cursor is always free to resize/close the window.
 struct NavInput {
-    double lookDx = 0.0, lookDy = 0.0;   // mouse-look motion, client pixels
+    double lookX  = 0.0, lookY  = 0.0;   // hover-look turn RATE from cursor offset, dead-zoned, -1..+1 per axis (persistent state)
     double wheel  = 0.0;                  // plain-wheel notches (+ = up = dolly forward)
     double wheelSpeed = 0.0;             // Ctrl+wheel notches (+ = up = bigger step size)
     bool   fwd    = false;               // Space / '+' held  -> fly forward
@@ -44,8 +49,8 @@ struct NavInput {
     bool   reset  = false;               // '0' / Home pressed since last drain
     bool   print  = false;               // 'P' pressed since last drain
     bool   cycleCollide = false;         // 'C' pressed since last drain (cycle collision mode)
-    bool   looking = false;              // mouse-look captured (cursor hidden)
-    bool   any() const { return lookDx || lookDy || wheel || wheelSpeed || fwd || back || reset || print || cycleCollide; }
+    bool   looking = false;              // cursor currently inside the client area (steering live)
+    bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print || cycleCollide; }
 };
 
 class LiveWindow {

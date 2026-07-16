@@ -4022,7 +4022,11 @@ static int run(int argc, char** argv) {
             // geometry between two frames you didn't see. `step` is the per-move distance,
             // adjustable live with Ctrl+wheel.
             double       step   = sceneR * 0.02;     // per-frame / per-notch travel, world units
-            const double kSens  = 0.0035;            // mouse-look sensitivity, radians / client pixel
+            // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
+            // (nav.lookX/lookY, -1..+1) is multiplied by these to turn the view PER RENDERED
+            // FRAME. Full deflection = kYaw/kPitch radians/frame; centre dead zone = no turn.
+            const double kYaw   = 0.040;             // max yaw   per frame at full pointer deflection
+            const double kPitch = 0.030;             // max pitch per frame at full pointer deflection
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
             auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
                 double c = std::cos(ang), s = std::sin(ang);
@@ -4099,7 +4103,7 @@ static int run(int argc, char** argv) {
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
               "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
-              "         look:   move the mouse over the window to steer (cursor stays visible; leave the window to stop turning)\n"
+              "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
@@ -4142,12 +4146,17 @@ static int run(int argc, char** argv) {
                     if (lookDist < 1e-4) lookDist = sceneR;
                     changed = true;
                 }
-                // Mouse-look STEERS the single view direction: horizontal motion yaws about
-                // the world up, vertical motion pitches about the camera's right axis. Pitch
-                // is clamped shy of the poles so the view can't flip over (no roll).
-                if (nav.lookDx != 0.0 || nav.lookDy != 0.0) {
-                    double yaw   = -nav.lookDx * kSens;   // cursor right -> turn right
-                    double pitch = -nav.lookDy * kSens;   // cursor down  -> look down
+                // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
+                // centre (joystick/hover-look): each rendered frame turns by that offset x the
+                // max rate, so the view keeps turning while you hold the pointer off-centre and
+                // holds still in the central dead zone (where you can see the scene). Horizontal
+                // offset yaws about world up, vertical offset pitches about the camera right
+                // axis, pitch clamped shy of the poles so the view can't flip over (no roll).
+                // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
+                // see rather than spinning past.
+                if (nav.lookX != 0.0 || nav.lookY != 0.0) {
+                    double yaw   = -nav.lookX * kYaw;     // pointer right -> turn right
+                    double pitch = -nav.lookY * kPitch;   // pointer down  -> look down
                     fwd = norml(rotAxis(fwd, worldUp, yaw));
                     Vec3 right = cross(fwd, worldUp);
                     double rl = std::sqrt(dot(right, right));

@@ -176,7 +176,7 @@ paths they can capture at all**.
 >
 > | input | does |
 > |---|---|
-> | **move the mouse over the window** | **steer** — horizontal motion turns (yaw), vertical motion looks up/down (pitch, clamped just shy of straight up/down). Where you look is where you fly. The pointer stays **visible**; steering happens only while the cursor is inside the window, and stops the moment it leaves. |
+> | **move the mouse over the window** | **steer** (joystick/rate look) — the cursor's offset from the window centre sets a **turn rate**: rest it near the centre (a neutral dead zone) and the view holds still so you can look at the scene; push it toward an edge and the view keeps turning that way (left/right = yaw, up/down = pitch, clamped just shy of straight up/down) for as long as you hold it there, so you can look a full circle. Where you look is where you fly. The pointer stays **visible** and free; steering only happens while the cursor is inside the window and stops the moment it leaves. |
 > | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
 > | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
 > | **mouse wheel** | **dolly** one step forward (up) / back (down) per notch — a discrete, fully-rendered nudge for precise positioning (can't overshoot into geometry) |
@@ -204,9 +204,13 @@ paths they can capture at all**.
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
 > the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
 > are no letter-key bindings to relearn. The mouse pointer stays visible the whole
-> time: moving it over the window steers, and moving it off the window (to the title
-> bar, another app, etc.) stops the view turning — nothing captures or hides the cursor.
-> The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
+> time — nothing captures or hides the cursor. Steering is **rate-based**: the cursor
+> acts like a joystick whose distance from the window centre sets how fast the view
+> turns (centre = a dead zone that holds still so you can see the scene; toward an edge
+> = keep turning that way), and moving the pointer off the window (to the title bar,
+> another app, etc.) stops the turn entirely. Because the turn is applied **per rendered
+> frame** (like the fly motion), a heavy scene turns in careful steps you actually see
+> rather than spinning past. The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
 > the live window's resolution — drag a corner to make the preview smaller (and
 > snappier) or larger (and sharper); the aspect ratio and the readout are
 > resolution-independent, so this only trades preview sharpness for speed while you

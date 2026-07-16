@@ -50,7 +50,7 @@ struct LiveWindow::Impl {
     HANDLE               readyEvent = nullptr;
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
     std::mutex           inMtx;                     // guards the look/wheel accumulators + one-shots
-    double               lookDx = 0.0, lookDy = 0.0;// accumulated mouse-look deltas (client px) since drain
+    double               lookX = 0.0, lookY = 0.0;  // hover-look turn RATE: cursor offset from centre, dead-zoned, -1..+1
     double               wheelAcc = 0.0;            // plain wheel notches since drain (dolly move)
     double               wheelSpeedAcc = 0.0;       // Ctrl+wheel notches since drain (step-size adjust)
     bool                 resetReq = false;          // '0' / Home pressed since last drain (one-shot)
@@ -60,15 +60,12 @@ struct LiveWindow::Impl {
     // render thread can race freely without the inMtx.
     std::atomic<bool>    keyFwd{false};             // Space / '+' currently held -> fly forward
     std::atomic<bool>    keyBack{false};            // Shift / '-' currently held -> fly backward
-    // Mouse-look is HOVER-look: whenever the cursor is over the client area, moving it STEERS
-    // the view by the frame-to-frame motion. The cursor stays VISIBLE and free — we never hide,
-    // clip, or capture it — and steering simply stops the moment the pointer leaves the window
-    // (so you can move to the title bar / other apps without turning the view). `looking` tracks
-    // whether the cursor is currently inside. `lastMouse`/`haveMouse` hold the previous position
-    // for the delta; `tracking` is whether we've armed WM_MOUSELEAVE for the current hover.
+    // Mouse-look is HOVER-look with RATE (joystick) steering: while the cursor is over the client
+    // area, its offset from the window centre sets a TURN RATE (dead-zoned near centre so the view
+    // can rest). The cursor stays VISIBLE and free — we never hide, clip, or capture it — and
+    // steering stops the moment the pointer leaves the window. `looking` tracks whether the cursor
+    // is inside; `tracking` is whether we've armed WM_MOUSELEAVE for the current hover.
     std::atomic<bool>    looking{false};            // cursor currently inside client (steering live)
-    POINT                lastMouse{0, 0};           // previous client-pixel cursor pos (for the delta)
-    bool                 haveMouse = false;         // lastMouse is valid (skip the first move after entry)
     bool                 tracking  = false;         // WM_MOUSELEAVE requested for this hover
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
@@ -78,12 +75,13 @@ struct LiveWindow::Impl {
 };
 
 // Stop hover-look steering: called when the cursor leaves the client area or the window loses
-// focus. Drops the stale last-position so the next entry doesn't emit a jump, and clears the
-// "inside" flag. The cursor is never hidden/clipped, so there is nothing to restore.
+// focus. Zeroes the turn rate (so the view stops) and clears the "inside"/tracking flags. The
+// cursor is never hidden/clipped, so there is nothing to restore.
 void LiveWindow::Impl::endLook() {
     looking.store(false);
-    haveMouse = false;
-    tracking  = false;
+    tracking = false;
+    std::lock_guard<std::mutex> lk(inMtx);
+    lookX = lookY = 0.0;
 }
 
 void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
@@ -149,27 +147,35 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_MOUSEMOVE:
-            // Hover-look: while the cursor is over the client area, feed its frame-to-frame
-            // motion as a steering delta. The cursor stays visible and free (no hide/clip/warp).
-            // We arm WM_MOUSELEAVE on the first move of each hover so we know when it exits, and
-            // skip the delta for that first move (haveMouse == false) so re-entering doesn't jump.
+            // Hover-look (rate / joystick): while the cursor is over the client area, its offset
+            // from the window centre sets a TURN RATE. A central dead zone reports zero (the view
+            // holds still so you can see the scene); beyond it the rate ramps to ±1 at the window
+            // edge, so holding the pointer to one side keeps the view turning that way — you can
+            // look a full circle without the cursor leaving the window. The cursor stays visible
+            // and free (no hide/clip/warp). We arm WM_MOUSELEAVE so we know when it exits.
             if (self) {
+                RECT cr; GetClientRect(h, &cr);
+                double halfW = (cr.right - cr.left) * 0.5, halfH = (cr.bottom - cr.top) * 0.5;
                 int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+                double nx = halfW > 0.5 ? (mx - halfW) / halfW : 0.0;   // -1 (left) .. +1 (right)
+                double ny = halfH > 0.5 ? (my - halfH) / halfH : 0.0;   // -1 (top)  .. +1 (bottom)
+                const double dz = 0.15;                                 // central neutral dead zone
+                auto shape = [dz](double v) -> double {                 // dead-zone + rescale to full-edge = ±1
+                    double a = v < 0 ? -v : v;
+                    if (a <= dz) return 0.0;
+                    double t = (a - dz) / (1.0 - dz);
+                    if (t > 1.0) t = 1.0;
+                    return v < 0 ? -t : t;
+                };
                 if (!self->tracking) {
                     TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
                     TrackMouseEvent(&tme);
                     self->tracking = true;
                     self->looking.store(true);
                 }
-                if (self->haveMouse) {
-                    int dx = mx - self->lastMouse.x, dy = my - self->lastMouse.y;
-                    if (dx || dy) {
-                        std::lock_guard<std::mutex> lk(self->inMtx);
-                        self->lookDx += dx; self->lookDy += dy;
-                    }
-                }
-                self->lastMouse.x = mx; self->lastMouse.y = my;
-                self->haveMouse = true;
+                std::lock_guard<std::mutex> lk(self->inMtx);
+                self->lookX = shape(nx);
+                self->lookY = shape(ny);
             }
             return 0;
         case WM_MOUSELEAVE:
@@ -360,13 +366,15 @@ NavInput LiveWindow::drainNav() {
     n.fwd     = impl_->keyFwd.load();
     n.back    = impl_->keyBack.load();
     n.looking = impl_->looking.load();
-    // Accumulated look/wheel deltas + one-shot edges: read-and-clear under the lock.
     std::lock_guard<std::mutex> lk(impl_->inMtx);
-    n.lookDx = impl_->lookDx; n.lookDy = impl_->lookDy; n.wheel = impl_->wheelAcc;
-    n.wheelSpeed = impl_->wheelSpeedAcc;
+    // Hover-look turn rate is PERSISTENT state (the current cursor offset): read but do NOT
+    // clear, so the view keeps turning between drains while the pointer is held off-centre.
+    n.lookX = impl_->lookX; n.lookY = impl_->lookY;
+    // Accumulated wheel notches + one-shot edges: read-and-clear under the lock.
+    n.wheel = impl_->wheelAcc; n.wheelSpeed = impl_->wheelSpeedAcc;
     n.reset  = impl_->resetReq; n.print = impl_->printReq;
     n.cycleCollide = impl_->collideReq;
-    impl_->lookDx = impl_->lookDy = impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
+    impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = impl_->collideReq = false;
     return n;
 }
