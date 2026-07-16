@@ -2904,6 +2904,7 @@ static int run(int argc, char** argv) {
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
     int  resYCli     = -1;        // optional height from `-r W H` (-1 = square, use res)
     bool doRaster    = false;     // -raster: fast solid-shaded preview (no light transport)
+    bool exploreMode = false;     // -explore/-fly: raster + interactive fly viewer seeded at the first selected frame (no full render)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
 
@@ -3062,6 +3063,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
+        else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
+            // Interactive fly-through: start at the first selected camera frame and let
+            // the user explore with the raster viewer instead of rendering every frame.
+            exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true;
+        }
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
@@ -3579,6 +3585,16 @@ static int run(int argc, char** argv) {
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
         toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
+    }
+
+    // -explore/-fly: seed the interactive raster viewer at the first selected frame
+    // instead of rendering the whole flyby. Keep only the first RenderCam so the raster
+    // loop draws a single frame, then the fly viewer takes over (window is held open).
+    if (exploreMode && toRender.size() > 1) {
+        std::printf("[explore] starting interactive fly viewer at '%s' (dropping %zu other frames)\n",
+                    toRender.front().name.empty() ? "<camera>" : toRender.front().name.c_str(),
+                    toRender.size() - 1);
+        toRender.resize(1);
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file

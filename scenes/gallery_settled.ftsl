@@ -403,7 +403,7 @@ camera_curve "fly" {
     point 5.55 1.95 3.95     # climb and turn forward
     point 5.25 2.08 5.05     # forward toward the start
     point 5.08 2.10 5.75     # curl back toward the start, LEVEL
-    up 0 1 0   fov_y 70   mode M   frames 144
+    up 0 1 0   fov_y 70   mode M   frames 600
     look tangent
     spline centripetal
     density_at 0.00 7   density_at 0.16 18   density_at 0.30 20   density_at 0.42 8

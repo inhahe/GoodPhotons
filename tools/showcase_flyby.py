@@ -68,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preview", dest="preview", action="store_true",
                    help="also show the live ANSI terminal thumbnail (-preview); "
                         "off by default, the OS live window (-window) is always on")
+    p.add_argument("--explore", action="store_true",
+                   help="skip rendering the flyby: open the interactive fly viewer at "
+                        "the first camera frame and let you explore it yourself "
+                        "(raster; Space/Shift to fly, mouse to look, wheel = speed, "
+                        "P prints a camera block, close the window to finish)")
     p.add_argument("--keep-frames", action="store_true",
                    help="keep the per-frame PNGs after building the video "
                         "(default: leave them in png/showcase_fly/ anyway)")
@@ -91,6 +96,7 @@ def print_run_banner(parser: argparse.ArgumentParser, args: argparse.Namespace,
     print(f"  fps (playback) : {args.fps}")
     print(f"  output         : {args.out}")
     print(f"  camera path    : {args.camera}")
+    print(f"  explore        : {'on (interactive fly viewer, no render)' if args.explore else 'off'}")
     if raster:
         time_desc = "(n/a for raster - animates all frames then exits)"
     elif args.time is not None:
@@ -118,6 +124,11 @@ def build_ftrace_cmd(args: argparse.Namespace, raster: bool) -> list[str]:
            "-o", str(frame_out)]
     if args.preview:
         cmd.append("-preview")   # live ANSI thumbnail in the terminal too
+    if args.explore:
+        # Interactive fly-through: ftrace seeds the raster viewer at the first frame
+        # of the selected camera path and hands control to the user - no full render.
+        cmd.insert(cmd.index("-camera"), "-explore")
+        return cmd
     if raster:
         # Raster flyby animates every frame in the window then exits, writing one
         # PNG per frame - exactly what we want before handing off to ffmpeg.
@@ -185,9 +196,27 @@ def main() -> int:
     if not FTRACE.exists():
         print(f"[error] ftrace.exe not found at {FTRACE} - build it first.")
         return 2
-    if shutil.which("ffmpeg") is None:
+    # ffmpeg is only needed to assemble the video - skip that check in --explore.
+    if not args.explore and shutil.which("ffmpeg") is None:
         print("[error] ffmpeg not found on PATH - install it to build the video.")
         return 2
+
+    # Interactive fly-through: hand off to ftrace's viewer, no frames, no ffmpeg.
+    if args.explore:
+        ftrace_cmd = build_ftrace_cmd(args, raster)
+        print(f"[plan] ftrace : {' '.join(ftrace_cmd)}")
+        print("[plan] explore mode: interactive fly viewer, no frames rendered, "
+              "no video assembled.")
+        if args.dry_run:
+            print("[dry-run] not executing.")
+            return 0
+        rc = run(ftrace_cmd)
+        if rc != 0:
+            print(f"[error] ftrace exited with code {rc}")
+            return rc
+        print("-" * 72)
+        print("[done] explore session ended.")
+        return 0
 
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
     # Clear any stale frames from a previous run so ffmpeg only sees this set.
