@@ -15,8 +15,14 @@ from .signals import (
     Sine, Cosine, LoopNoise,
 )
 from .data import PointPath, Grid, Scatter
-from .interp import LoopCurve, GridField, ScatterField
+from .interp import LoopCurve, GridField, ScatterField, eval_curve
 from .mathnd import Mat, rotation, rotations, slice3
+from .scene import (
+    Scene, Material, Sphere, Beads, Raw, Light, Camera, Element,
+)
+from .drive import (
+    render_range, render_still, emit_frames, assemble_gif, find_ftrace,
+)
 
 __all__ = [
     "Signal", "Clock", "Cache", "Const", "TimeFn",
@@ -27,6 +33,8 @@ __all__ = [
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
     "PointPath", "Grid", "Scatter",
-    "LoopCurve", "GridField", "ScatterField",
+    "LoopCurve", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3",
+    "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
+    "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
 ]

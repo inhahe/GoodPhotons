@@ -39,6 +39,30 @@ def _mid(p: Tuple[float, ...], q: Tuple[float, ...]) -> Tuple[float, ...]:
     return tuple(0.5 * (a + b) for a, b in zip(p, q))
 
 
+def eval_curve(pts: List[Tuple[float, ...]], u: float, closed: bool) -> Tuple[float, ...]:
+    """Point on the midpoint-quadratic-Bezier curve through control points ``pts``
+    at parameter ``u`` (wrapped to [0,1)).  ``pts`` are already-evaluated tuples."""
+    n = len(pts)
+    u -= math.floor(u)
+    if closed:
+        x = u * n
+        i = int(math.floor(x)) % n
+        f = x - math.floor(x)
+        a0, a1, a2 = pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
+    else:
+        segs = n - 2
+        if segs < 1:
+            x = u * (n - 1)
+            i = min(int(math.floor(x)), n - 2)
+            f = x - i
+            return tuple(p * (1 - f) + q * f for p, q in zip(pts[i], pts[i + 1]))
+        x = u * segs
+        i = min(int(math.floor(x)), segs - 1)
+        f = x - i
+        a0, a1, a2 = pts[i], pts[i + 1], pts[i + 2]
+    return _quad_bezier(_mid(a0, a1), a1, _mid(a1, a2), f)
+
+
 class _CurveComponent(Signal):
     """Scalar view of one axis of a :class:`LoopCurve` (for vector math)."""
 
@@ -83,38 +107,21 @@ class LoopCurve(VecSignal):
             kids.extend(p.components)
         return tuple(kids)
 
+    def _control_points(self, clock: Clock, cache: Optional[Cache]) -> List[Tuple[float, ...]]:
+        return [p.at(clock, cache) for p in self.path.points]
+
+    def sample(self, u_value: float, clock: Clock,
+               cache: Optional[Cache] = None) -> Tuple[float, ...]:
+        """Point on the curve at an explicit parameter (independent of ``self._u``)."""
+        return eval_curve(self._control_points(clock, cache), u_value, self.closed)
+
     def at(self, clock: Clock, cache: Optional[Cache] = None) -> Tuple[float, ...]:
         if cache is not None:
             hit = cache.get(self._id, clock.frame)
             if hit is not None:
                 return hit  # type: ignore[return-value]
-        pts = [p.at(clock, cache) for p in self.path.points]
-        n = len(pts)
-        u = self._u.at(clock, cache)
-        u -= math.floor(u)  # wrap into [0,1)
-
-        if self.closed:
-            x = u * n
-            i = int(math.floor(x)) % n
-            f = x - math.floor(x)
-            a0, a1, a2 = pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
-        else:
-            segs = n - 2  # arcs centered on interior anchors
-            if segs < 1:
-                # too few points for the midpoint scheme; straight lerp
-                x = u * (n - 1)
-                i = min(int(math.floor(x)), n - 2)
-                f = x - i
-                out = tuple(p * (1 - f) + q * f for p, q in zip(pts[i], pts[i + 1]))
-                if cache is not None:
-                    cache.set(self._id, clock.frame, out)
-                return out
-            x = u * segs
-            i = min(int(math.floor(x)), segs - 1)
-            f = x - i
-            a0, a1, a2 = pts[i], pts[i + 1], pts[i + 2]
-
-        out = _quad_bezier(_mid(a0, a1), a1, _mid(a1, a2), f)
+        pts = self._control_points(clock, cache)
+        out = eval_curve(pts, self._u.at(clock, cache), self.closed)
         if cache is not None:
             cache.set(self._id, clock.frame, out)
         return out
