@@ -129,6 +129,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <filesystem>          // -review: scan a directory of rendered frames
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
@@ -163,6 +164,14 @@
 extern "C" {
     int stbi_write_png(const char* filename, int w, int h, int comp, const void* data, int stride_bytes);
     int stbi_write_jpg(const char* filename, int w, int h, int comp, const void* data, int quality);
+}
+
+// stb_image decoder (implementation compiled once in stb_image_impl.cpp). Used by
+// -review to load already-rendered PNG/JPG/BMP/TGA frames; PPM P6 is read by a small
+// custom loader (stb_image doesn't decode PPM).
+extern "C" {
+    unsigned char* stbi_load(const char* filename, int* x, int* y, int* channels_in_file, int desired_channels);
+    void           stbi_image_free(void* retval_from_stbi_load);
 }
 
 // Case-insensitive test for a filename ending in `ext` (e.g. ".png").
@@ -2831,6 +2840,239 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     return writeOk ? 0 : 1;
 }
 
+// --- -review: rendered-sequence review player -------------------------------
+// Load an 8-bit RGB image (row 0 = top) from a rendered frame on disk. Handles PPM
+// P6 with a tiny custom reader (stb_image can't decode PPM — ftrace's default output)
+// and PNG/JPG/BMP/TGA via stb_image. Returns false on any failure.
+static bool loadImageRGB(const std::string& path, int& w, int& h, std::vector<uint8_t>& rgb) {
+    if (endsWithCI(path, ".ppm")) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        std::string magic; f >> magic;
+        if (magic != "P6") return false;
+        // Read three integers (width, height, maxval), skipping '#' comment lines.
+        auto readInt = [&](long& v) -> bool {
+            for (;;) {
+                int c = f.peek();
+                if (c == EOF) return false;
+                if (std::isspace((unsigned char)c)) { f.get(); continue; }
+                if (c == '#') { std::string junk; std::getline(f, junk); continue; }
+                break;
+            }
+            f >> v; return (bool)f;
+        };
+        long W = 0, H = 0, mx = 0;
+        if (!readInt(W) || !readInt(H) || !readInt(mx)) return false;
+        if (W <= 0 || H <= 0 || mx != 255) return false;
+        f.get();  // single whitespace after maxval precedes the pixel block
+        rgb.assign((size_t)W * H * 3, 0);
+        f.read(reinterpret_cast<char*>(rgb.data()), (std::streamsize)rgb.size());
+        if (!f) return false;
+        w = (int)W; h = (int)H;
+        return true;
+    }
+    int nc = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &nc, 3);
+    if (!px) return false;
+    rgb.assign(px, px + (size_t)w * h * 3);
+    stbi_image_free(px);
+    return true;
+}
+
+// `ftrace -review <base>` — play a directory of already-rendered frames on the same
+// live window + timeline used by the fly viewer, so you can watch an actual rendered
+// flyby, scrub/play it, RE-TIME it by painting local speed (wheel in Paint mode), and
+// Save a re-paced copy. `base` is a filename stem with an optional directory: frames
+// are files named `<stem><digits>.<ext>` (ftrace appends a zero-padded index), e.g.
+// `-review png/swoop/swoop` matches swoop000.png, swoop001.png, ... Numeric-sorted.
+// Self-contained utility path (no scene load).
+static int reviewMode(const std::string& base) {
+    namespace fs = std::filesystem;
+    fs::path bpath(base);
+    fs::path dir = bpath.has_parent_path() ? bpath.parent_path() : fs::path(".");
+    std::string prefix = bpath.filename().string();
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        std::fprintf(stderr, "-review: '%s' is not a directory\n", dir.string().c_str());
+        return 2;
+    }
+    auto knownExt = [](const std::string& e) {
+        static const char* exts[] = {"png","jpg","jpeg","bmp","tga","ppm"};
+        std::string lo; for (char c : e) lo += (char)std::tolower((unsigned char)c);
+        for (const char* x : exts) if (lo == x) return true;
+        return false;
+    };
+    // Collect matching frames: name = prefix + digits + '.' + ext.
+    std::vector<std::pair<long, std::string>> frames;  // (index, full path)
+    for (const auto& de : fs::directory_iterator(dir, ec)) {
+        if (!de.is_regular_file()) continue;
+        std::string name = de.path().filename().string();
+        if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) continue;
+        size_t i = prefix.size();
+        size_t d0 = i;
+        while (i < name.size() && std::isdigit((unsigned char)name[i])) ++i;
+        if (i == d0) continue;                     // need at least one digit
+        if (i >= name.size() || name[i] != '.') continue;
+        std::string ext = name.substr(i + 1);
+        if (!knownExt(ext)) continue;
+        long idx = std::strtol(name.substr(d0, i - d0).c_str(), nullptr, 10);
+        frames.emplace_back(idx, de.path().string());
+    }
+    if (frames.size() < 1) {
+        std::fprintf(stderr, "-review: no frames matching '%s<digits>.<ext>' in %s\n",
+                     prefix.c_str(), dir.string().c_str());
+        return 2;
+    }
+    std::sort(frames.begin(), frames.end(),
+              [](const auto& a, const auto& b){ return a.first < b.first; });
+    const int nFrames = (int)frames.size();
+    std::printf("[review] %d frames: %s ... %s\n", nFrames,
+                fs::path(frames.front().second).filename().string().c_str(),
+                fs::path(frames.back().second).filename().string().c_str());
+    std::fflush(stdout);
+
+    // Load the first frame to size the window.
+    int fw = 0, fh = 0; std::vector<uint8_t> cur;
+    if (!loadImageRGB(frames[0].second, fw, fh, cur)) {
+        std::fprintf(stderr, "-review: failed to load %s\n", frames[0].second.c_str());
+        return 2;
+    }
+    std::string title = "ftrace review — " + prefix;
+    LiveWindow win(fw, fh, title.c_str());
+    const double defFps = 30.0;
+    win.enablePanel(nFrames, defFps, "n/a");
+    win.setPanelState(0, /*playing*/false, /*pathMode*/true, "n/a");
+
+    // Per-frame local speed multiplier (Paint-mode wheel brush is additive, clamped).
+    std::vector<double> speed(nFrames, 1.0);
+    auto speedAt = [&](double pos) {
+        if (nFrames == 0) return 1.0;
+        int i = std::clamp((int)std::floor(pos), 0, nFrames - 1);
+        int j = std::min(i + 1, nFrames - 1);
+        double f = pos - i;
+        return speed[i] * (1.0 - f) + speed[j] * f;
+    };
+    auto paintSpeed = [&](double pos, double notches) {
+        int i = std::clamp((int)std::floor(pos), 0, nFrames - 1);
+        int j = std::min(i + 1, nFrames - 1);
+        double f = pos - i;
+        double delta = notches * 0.15;
+        speed[i] = std::clamp(speed[i] + delta * (1.0 - f), 0.1, 10.0);
+        speed[j] = std::clamp(speed[j] + delta * f,         0.1, 10.0);
+    };
+
+    using clock = std::chrono::steady_clock;
+    auto prevT = clock::now();
+    double pos = 0.0;           // fractional frame index
+    int    shown = -1;          // frame currently displayed
+    bool   playing = false;
+    double camPerSec = defFps;  // frames/second when playing (before speed scaling)
+    int    strideN = 1;
+    bool   rateMode = true;
+    double lastSpdSent = -1.0;
+    int    lastIdxSent = -1;
+    bool   lastPlaying = false;
+
+    auto display = [&](int idx) {
+        if (idx == shown) return;
+        int w2 = 0, h2 = 0; std::vector<uint8_t> rgb;
+        if (loadImageRGB(frames[idx].second, w2, h2, rgb)) {
+            win.update(w2, h2, rgb);
+            shown = idx;
+        }
+    };
+    display(0);
+
+    std::printf("[review] scrub/Play the timeline; Paint + wheel re-times (speed); "
+                "Flat resets; Save writes a re-paced copy. Close the window to finish.\n");
+    std::fflush(stdout);
+
+    while (!win.closed()) {
+        NavInput nav = win.drainNav();
+        auto nowT = clock::now();
+        double dt = std::chrono::duration<double>(nowT - prevT).count();
+        prevT = nowT;
+        if (dt > 0.25) dt = 0.25;
+
+        if (nav.stride    >= 1)  strideN   = nav.stride;
+        if (nav.camPerSec > 0.0) camPerSec = nav.camPerSec;
+        rateMode = nav.rateMode;
+
+        if (nav.togglePlay) {
+            playing = !playing;
+            if (playing && pos >= nFrames - 1 - 1e-9) pos = 0.0;
+        }
+        if (nav.scrubTo >= 0) {
+            playing = false;
+            pos = std::clamp((double)nav.scrubTo, 0.0, (double)(nFrames - 1));
+        }
+        if (nav.reset) { pos = 0.0; playing = false; }
+
+        // Paint mode: wheel paints local speed (re-timing brush); otherwise wheel dollies
+        // the timeline one frame per notch.
+        bool wheelPainted = false;
+        if (nav.paintMode && nav.wheel != 0.0) {
+            paintSpeed(pos, nav.wheel);
+            wheelPainted = true;
+        }
+        if (nav.speedReset) std::fill(speed.begin(), speed.end(), 1.0);
+
+        // Advance playback (speed-scaled) or step by a painted/plain wheel notch.
+        if (playing) {
+            double rate = rateMode ? (camPerSec * dt) : (double)strideN;
+            pos += rate * speedAt(pos);
+            if (pos >= nFrames - 1) { pos = nFrames - 1; playing = false; }
+        }
+        if (!wheelPainted && nav.wheel != 0.0)
+            pos = std::clamp(pos + nav.wheel, 0.0, (double)(nFrames - 1));
+
+        display(std::clamp((int)std::llround(pos), 0, nFrames - 1));
+
+        // Save: re-pace the sequence by the painted speed profile. Fast-painted regions
+        // yield fewer output frames (skimmed), slow regions more (dwelt on). We resample
+        // nFrames output slots uniformly in cumulative DWELL time (dwell = 1/speed), then
+        // copy the chosen source file into <dir>/retimed/.
+        if (nav.saveCurve) {
+            std::vector<double> cum(nFrames + 1, 0.0);
+            for (int i = 0; i < nFrames; ++i) cum[i + 1] = cum[i] + 1.0 / std::max(1e-3, speed[i]);
+            double total = cum[nFrames];
+            fs::path outDir = dir / "retimed";
+            std::error_code mec; fs::create_directories(outDir, mec);
+            int written = 0;
+            for (int j = 0; j < nFrames; ++j) {
+                double target = (nFrames > 1) ? (double)j / (nFrames - 1) * total : 0.0;
+                int src = 0;
+                while (src < nFrames - 1 && cum[src + 1] < target) ++src;
+                fs::path sp(frames[src].second);
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), "%s%03d%s", prefix.c_str(), j,
+                              sp.extension().string().c_str());
+                fs::path dst = outDir / nm;
+                std::error_code cec;
+                fs::copy_file(sp, dst, fs::copy_options::overwrite_existing, cec);
+                if (!cec) ++written;
+            }
+            std::printf("[review] re-timed %d frames -> %s\n", written, outDir.string().c_str());
+            std::printf("[review] assemble e.g.: ffmpeg -framerate %g -i \"%s/%s%%03d.png\" -pix_fmt yuv420p %s_retimed.mp4\n",
+                        defFps, outDir.string().c_str(), prefix.c_str(), prefix.c_str());
+            std::fflush(stdout);
+        }
+
+        // Mirror live state onto the panel (no feedback edges).
+        int idxNow = std::clamp((int)std::llround(pos), 0, nFrames - 1);
+        if (idxNow != lastIdxSent || playing != lastPlaying) {
+            win.setPanelState(idxNow, playing, /*pathMode*/true, "n/a");
+            lastIdxSent = idxNow; lastPlaying = playing;
+        }
+        double sp = speedAt(pos);
+        if (std::fabs(sp - lastSpdSent) > 5e-3) { win.setSpeedLabel(sp); lastSpdSent = sp; }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(playing ? 8 : 20));
+    }
+    std::printf("[review] window closed.\n");
+    return 0;
+}
+
 static int run(int argc, char** argv) {
     // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
     // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
@@ -2842,6 +3084,16 @@ static int run(int argc, char** argv) {
             return 2;
         }
         return convertToPng(argv[2], argv[3]);
+    }
+    // Rendered-sequence review player (no rendering): `ftrace -review <base>`.
+    // Plays a directory of `<base><digits>.<ext>` frames on the live window/timeline,
+    // with scrub/Play and speed re-timing. Pure utility path (no scene load).
+    if (argc >= 2 && !std::strcmp(argv[1], "-review")) {
+        if (argc < 3) {
+            std::fprintf(stderr, "usage: %s -review <base>   (e.g. -review png/swoop/swoop)\n", argv[0]);
+            return 2;
+        }
+        return reviewMode(argv[2]);
     }
     // Rainbow (Airy droplet phase) physics self-test: prints the primary/secondary
     // Descartes angles across the spectrum + Airy/normalisation checks, then exits.

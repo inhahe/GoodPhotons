@@ -11,13 +11,17 @@ The in-viewer `camera_curve` editor (main.cpp fly-viewer, Rec / +Pt / Ins / Del 
 landed as **Phase 1** (core point authoring + recording + live spline overlay + Save a
 `camera_curve` block with a `look curve`). Planned follow-ons still to do:
 
-- **Phase 2 — speed painting.** Modulate camera density (inverse speed) while playing/
-  scrubbing via the wheel/slider as an *additive brush*, emitting a `density_at` track in
-  the saved curve. Should also retime playback live.
-- **Phase 3 — orientation painting.** Author the `look curve` by steering while scrubbing
-  (currently the look targets come only from each control point's recorded/placed fwd).
-- **Phase 4 — rendered-sequence source.** Play a real rendered flyby from a base filename
-  (`<base>NNN.<ext>`, matching ftrace's numbered output) and re-time it in the editor.
+- **Phase 2 — speed painting. DONE (2026-07-16).** Additive wheel brush modulates
+  per-control-point speed (inverse density) in Paint mode; emitted as a `density_at`
+  track and retimes live playback. Paint/Flat panel controls + speed readout.
+- **Phase 3 — orientation painting. DONE (2026-07-16).** Mouse-look in Paint mode steers
+  the nearest control points' `fwd`, reshaping the `look curve` (WYSIWYG in the overlay
+  and saved block).
+- **Phase 4 — rendered-sequence source. DONE (2026-07-16).** `ftrace -review <base>`
+  plays a directory of rendered frames (`<base><digits>.<ext>`; reads png/jpg/bmp/tga/ppm)
+  on the live window/timeline, scrub/Play, re-times via the Paint-mode speed brush, and
+  Save writes a re-paced copy into `<dir>/retimed/` + an ffmpeg hint. `reviewMode()` in
+  main.cpp.
 - **Phase 5 — round-trip.** Load an existing `camera_curve` back into the editor as
   control points for editing (currently Save is write-only; the editor starts empty).
 

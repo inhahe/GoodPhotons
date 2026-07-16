@@ -267,6 +267,20 @@ paths they can capture at all**.
 > (the normal path-lock behaviour). Editing an existing curve in place (round-trip) is a
 > planned follow-on.
 >
+> **Reviewing a rendered flyby (`-review <base>`).** Once a flyby has actually been
+> *rendered* to a directory of images, `ftrace -review <base>` plays that sequence back
+> on the same live window + timeline — so you can watch the real rendered result (not the
+> raster preview), scrub/Play it, and **re-time** it. `<base>` is a filename stem with an
+> optional path; frames are the files named `<base><digits>.<ext>` (ftrace appends a
+> zero-padded index), so `-review png/swoop/swoop` matches `swoop000.png`, `swoop001.png`,
+> … (numeric-sorted). It reads `.png` / `.jpg` / `.bmp` / `.tga` and ftrace's own `.ppm`
+> output. No scene is loaded — it's a pure playback utility. With **Paint** on, the wheel
+> paints local speed exactly as in the editor (an additive brush, fast regions skimmed,
+> slow regions dwelt on); **Flat** resets it. **Save** writes a re-paced copy of the
+> sequence into `<dir>/retimed/` (each output frame is the source frame chosen by the
+> painted speed profile) and prints an `ffmpeg` line to assemble it into a video. Close
+> the window to finish.
+>
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
 > the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
 > are no letter-key bindings to relearn. The mouse pointer stays visible the whole
@@ -1534,6 +1548,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
+| `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-on-unsupported error\|fallback\|strip` | What to do when the selected mode can't render a scene feature (GRIN media, or a fisheye camera in mode `D`/`U`). `error` (default) prints a diagnostic and aborts; `fallback` renders that camera in mode `R` (backward reference) instead; `strip` removes the offending feature (e.g. drops the GRIN `ior`, turning the medium into a plain one) and renders in the requested mode anyway. Complements `prefer { … } else { … }` in the scene file, which resolves the mode/feature mismatch *before* this policy is consulted |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
