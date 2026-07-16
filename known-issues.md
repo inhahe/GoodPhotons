@@ -5,6 +5,26 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN: interactive raster fly-viewer can peg all cores / grow RAM when orphaned or on a heavy scene
+
+The interactive fly-camera viewer loop (`main.cpp`, ~line 4037) only re-rasterizes
+when `changed` is true and sleeps 15 ms when `!nav.any()`, so a *normal* idle viewer
+is cheap. But an **orphaned** ftrace (e.g. a `-explore` test whose parent `timeout`
+sent a signal the GUI process ignored, leaving it running with no console) was observed
+pegging **all** CPU cores and climbing from ~2 GB to ~8 GB working set on
+`scenes/gallery_settled.ftsl` — i.e. it was re-rendering flat-out (`changed` stuck true)
+with no user input. Exact trigger unconfirmed (likely a teardown-state artifact where
+`clientSize`/`drainNav` return values that keep flipping `changed`), and it wasn't
+reproduced because doing so re-pegs the machine. Two things to consider as the proper fix:
+(1) **bound the re-render rate** in the viewer loop (pace the loop to ~60 fps regardless
+of `changed`/`nav.any()`), so even a stuck-`changed` runaway or a fast light scene can't
+burn 100% of every core for no visible benefit; (2) make the loop exit on the same
+signals as a normal render (so `-explore`/interactive processes die cleanly on SIGTERM,
+not just window-close), and audit the resize-follow (`fitRes` vs `clientSize`) for any
+size oscillation that would flip `changed` every iteration. Operational note: kill
+interactive/`-window` test processes **explicitly** (PowerShell `Stop-Process -Force`) —
+`timeout`-wrapping a GDI window app does not reliably terminate it.
+
 ### OPEN: rainbow phase — `SpecVtx::term` (through-glass-sphere fog connection) is HG-only
 
 The new **rainbow droplet phase** (`rainbow.h`, tabulated Airy/Mie spectral phase) is
