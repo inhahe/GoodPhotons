@@ -2888,7 +2888,7 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
-    const char* cameraSel = nullptr; // -camera <name>|all|#N|near=X,Y,Z (FTSL multi-camera select)
+    const char* cameraSel = nullptr; // -camera <name>|<pathbase>|all|#N|near=X,Y,Z (FTSL multi-camera select)
     bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
     double viewFov = 40.0;
@@ -3394,6 +3394,8 @@ static int run(int argc, char** argv) {
         // Select which cameras to render. `-camera` accepts:
         //   all           every camera (default when several are declared)
         //   <name>        exact camera/frame name (e.g. hero, fly137)
+        //   <pathbase>    a whole camera_path/curve/orbit by its base name (e.g.
+        //                 `fly` selects fly000..fly143 but not an unrelated still)
         //   #N            the Nth declared camera, 0-based (#-1 = last)
         //   near=X,Y,Z    the camera whose eye is closest to (X,Y,Z)
         // The index and nearest selectors make it easy to aim the live window at
@@ -3434,6 +3436,24 @@ static int run(int argc, char** argv) {
             } else {
                 for (const auto& cs : ftslScene.cameras)
                     if (cs.name == cameraSel) sel.push_back(&cs);
+                // No exact hit? Treat the query as a camera_path base name and select
+                // every frame named "<q>NNN" (q followed by digits only) — so
+                // `-camera fly` grabs the whole `camera_curve "fly"` (fly000..fly143)
+                // while excluding an unrelated still like `cam`.
+                if (sel.empty()) {
+                    for (const auto& cs : ftslScene.cameras) {
+                        if (cs.name.size() > q.size() && cs.name.compare(0, q.size(), q) == 0) {
+                            bool allDigits = true;
+                            for (size_t k = q.size(); k < cs.name.size(); ++k)
+                                if (!std::isdigit((unsigned char)cs.name[k])) { allDigits = false; break; }
+                            if (allDigits) sel.push_back(&cs);
+                        }
+                    }
+                    if (!sel.empty())
+                        std::printf("[camera] path '%s' -> %zu frames (%s..%s)\n",
+                                    q.c_str(), sel.size(), sel.front()->name.c_str(),
+                                    sel.back()->name.c_str());
+                }
                 if (sel.empty()) {
                     std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
                     for (const auto& cs : ftslScene.cameras)
