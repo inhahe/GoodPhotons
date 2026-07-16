@@ -137,6 +137,7 @@
 #include "camera.h"
 #include "raster.h"             // -raster: fast solid-shaded preview rasterizer (no light transport)
 #include "render.h"
+#include "rainbow.h"            // Airy-theory droplet phase function (rainbows in droplet media)
 #include "backward.h"
 #include "bdpt.h"
 #include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
@@ -2841,6 +2842,12 @@ static int run(int argc, char** argv) {
             return 2;
         }
         return convertToPng(argv[2], argv[3]);
+    }
+    // Rainbow (Airy droplet phase) physics self-test: prints the primary/secondary
+    // Descartes angles across the spectrum + Airy/normalisation checks, then exits.
+    if (argc >= 2 && !std::strcmp(argv[1], "-rainbow-selftest")) {
+        rainbow::RainbowPhase::selfTest();
+        return 0;
     }
     long long N = 2'000'000;
     int res = 256;
