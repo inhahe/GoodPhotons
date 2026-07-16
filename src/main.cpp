@@ -2905,6 +2905,7 @@ static int run(int argc, char** argv) {
     int  resYCli     = -1;        // optional height from `-r W H` (-1 = square, use res)
     bool doRaster    = false;     // -raster: fast solid-shaded preview (no light transport)
     bool exploreMode = false;     // -explore/-fly: raster + interactive fly viewer seeded at the first selected frame (no full render)
+    bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
 
@@ -3066,8 +3067,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
             // Interactive fly-through: start at the first selected camera frame and let
             // the user explore with the raster viewer instead of rendering every frame.
-            exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true;
+            // The exposure-lock metering pre-pass is pointless here (the viewer auto-exposes
+            // per frame), and metering a whole flyby's frames just to fly one is wasteful,
+            // so explore implies -no-meter.
+            exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
         }
+        else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
@@ -3685,7 +3690,15 @@ static int run(int argc, char** argv) {
     constexpr int    kMeterMin = 8, kMeterMax = 64;
     constexpr double kMeterTolStops = 0.02;   // stop when the mean moves < 0.02 stop
 
-    if (fromFtsl && !ftslScene.cameras.empty() && !scene.absolute && !forceExposureLock) {
+    if (noMeter) {
+        bool anyLocked = false;
+        for (const auto& rc : toRender) if (rc.expGroup >= 0) { anyLocked = true; break; }
+        if (anyLocked)
+            std::printf("[meter] skipped (-no-meter%s): frames auto-expose per frame "
+                        "instead of metering the exposure-lock group.\n",
+                        exploreMode ? " via -explore" : "");
+    }
+    if (!noMeter && fromFtsl && !ftslScene.cameras.empty() && !scene.absolute && !forceExposureLock) {
         // Build a camera the same way the render loop does, minus the verbose lens logging.
         auto buildMeterCam = [&](const ftsl::CamSpec& cs) -> MeterCam {
             MeterCam m;
