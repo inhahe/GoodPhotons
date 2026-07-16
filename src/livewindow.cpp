@@ -293,16 +293,21 @@ void LiveWindow::Impl::threadMain() {
 
 LiveWindow::LiveWindow(int w, int h, const char* title) {
     impl_ = new Impl();
-    // Clamp the initial window to a sane on-screen size, preserving aspect.
+    // Open the window at the render's OWN resolution/aspect (clamped to fit on-screen),
+    // so the client area matches the image exactly — no letterbox bars on any side. The
+    // old code forced a fixed 720-wide floor, which pillarboxed anything narrower (e.g.
+    // a 640px render opened in a 720px window with 40px black bars each side).
     const int mw = 1600, mh = 900;
     double s = std::min(1.0, std::min((double)mw / std::max(1, w),
                                       (double)mh / std::max(1, h)));
-    // Open at (and never shrink below) a readable floor so the title bar text — the
-    // source scene -> destination file — is legible even for a tiny image. Extra width
-    // beyond the image's aspect is just letterboxed by paint().
-    impl_->minW = 720; impl_->minH = 320;
-    impl_->initW = std::max(impl_->minW, (int)(w * s));
-    impl_->initH = std::max(impl_->minH, (int)(h * s));
+    impl_->initW = std::max(1, (int)(w * s));
+    impl_->initH = std::max(1, (int)(h * s));
+    // Minimum drag size: a readable floor (~320px tall) scaled to KEEP the image's own
+    // aspect, so shrinking the window never re-introduces letterbox bars and never
+    // exceeds the initial image-sized window. The title bar stays legible.
+    double fs = std::min(1.0, 320.0 / std::max(1, impl_->initH));
+    impl_->minW = std::max(1, (int)(impl_->initW * fs));
+    impl_->minH = std::max(1, (int)(impl_->initH * fs));
     std::string t = title ? title : "ftrace";
     impl_->title = utf8ToWide(t);                  // proper UTF-8 -> UTF-16
     impl_->readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);

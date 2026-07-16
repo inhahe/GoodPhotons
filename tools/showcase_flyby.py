@@ -11,7 +11,7 @@ resolved parameter value before doing any work.
 
 Examples
 --------
-    # Defaults: rasterized, 640x400, 30 fps, -> .\showcase.gif
+    # Defaults: rasterized, 640x480, 30 fps, -> .\showcase.gif
     python tools/showcase_flyby.py
 
     # 1280x720 BDPT flyby at 24 fps into an mp4; 8 s budget per frame
@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--res", nargs=2, type=int, metavar=("W", "H"),
-                   default=[640, 400],
+                   default=[640, 480],
                    help="render resolution in pixels")
     p.add_argument("--fps", type=float, default=30.0,
                    help="playback speed of the output video (frames per second)")
