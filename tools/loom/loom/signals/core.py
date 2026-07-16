@@ -300,6 +300,20 @@ class MapRange(_Unary):
         return y
 
 
+class Sin(_Unary):
+    """``sin(x)`` with the argument in radians (generic, unlike periodic.Sine)."""
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        return math.sin(self.x.at(clock, cache))
+
+
+class Cos(_Unary):
+    """``cos(x)`` with the argument in radians."""
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        return math.cos(self.x.at(clock, cache))
+
+
 class Mix(Signal):
     """Linear blend ``a*(1-amount) + b*amount``."""
 
