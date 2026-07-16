@@ -5,6 +5,50 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN: rainbow phase — `SpecVtx::term` (through-glass-sphere fog connection) is HG-only
+
+The new **rainbow droplet phase** (`rainbow.h`, tabulated Airy/Mie spectral phase) is
+dispatched everywhere a medium's phase is evaluated **except one spot**: the specialised
+"trace a photon *through a glass sphere* and connect its interior fog to the sensor" path
+in `render.h` (`SpecVtx::term`, ~line 598) still calls `hgPhase(dot(wIn, wP), g)` directly
+instead of `Medium::phaseValue(...)`. That code path predates the phase abstraction and
+uses a flattened per-vertex `g` (no `mediumId`/λ), so it can't see a `RainbowPhase`. Impact
+is tiny — it only affects fog that sits *inside* a refracting glass sphere viewed on the
+special two-refraction connection — but a rainbow medium placed there would silently fall
+back to the smooth HG lobe. **Proper fix:** give `SpecVtx` the owning `mediumId` (and thread
+λ into `term`) so it can call `scene.media[mediumId].phaseValue(cosθ, λ)` like every other
+site. Left HG-only for now to avoid reworking that specialised connector in the same change.
+
+### DONE (2026-07-15): rainbow (water-droplet) phase — implemented, wired, and validated end-to-end
+
+A medium can now scatter through a physically-tabulated **Airy water-droplet phase**
+(`rainbow.h`) via FTSL `phase rainbow { .. }`, instead of the smooth Henyey-Greenstein lobe.
+- **Physics core** (`rainbow.h`): Airy theory of the rainbow tabulated on a (λ×μ) grid with
+  per-λ CDF importance sampling; normalised so `2π∫p dμ = 1` per λ. Self-test confirms exact
+  Airy values, textbook Descartes angles, and unit normalisation.
+- **Data model** (`scene.h`): `Medium::rainbowPhase` (shared_ptr, null for the common HG case
+  → HG media stay bit-identical); `phaseValue`/`phaseSample` dispatch to it when set (overrides
+  `g`). Symmetric phase → forward pdf == reverse pdf.
+- **Wiring:** phase dispatch threaded through CPU forward (`render.h`), backward (`backward.h`),
+  and BDPT (`bdpt.h` `phaseF`/`mediumScatterF`, `-dot(wo,wi)` scattering cosine). GPU volume
+  path is HG-only, so `cudaForwardSupported`/`cudaBdptSupported` now **refuse rainbow media**
+  and let the render fall back to the CPU (rather than silently dropping the bow to HG).
+- **FTSL grammar** (`ftsl.h addMedium`): `phase hg` (default) / `phase rainbow { droplet_um,
+  secondary, supernumerary, strength, forward_g, secondary_ratio }`. Features on by default.
+- **Parser bug found & fixed:** `phase rainbow { .. }` — the subtype bareword `rainbow` before
+  `{` is consumed by `parseValue` as the nested block's **`type`**, so `val.words` was empty and
+  `kind` silently defaulted to HG (no bow, no error). Fixed by reading the kind from
+  `ph->val.block->type` when `val.words` is empty. This was the reason early validation renders
+  showed only a smooth veil despite correct physics.
+- **Validated:** `scraps/rainbow_ring.ftsl` (centred-ring geometry, mode D, CPU) analysed with
+  `scraps/radial_profile.py` shows the full signature — a **primary bow at ~42°** (violet inner /
+  red outer), **Alexander's dark band** (~43–50°), and a **secondary bow at ~51–53°** with
+  **reversed colours** (red inner / blue outer). Peak/median luminance ratio ~3.5× and climbing
+  with samples.
+
+Remaining rainbow tech debt: the `SpecVtx::term` glass-sphere-interior connector is still
+HG-only (see the OPEN note above).
+
 ### DONE (2026-07-15): gradient-index (GRIN) media — Phase 2 wired through forward (CPU+GPU) + backward
 
 **Phase 1 (landed earlier):** a `medium { ior "<expr over x y z r>" bounds { .. } }`
@@ -77,6 +121,27 @@ mode D now (fast, no lamp GRIN) vs. mode B later (slow, full effects incl. lamp 
 until tier-1 "GRIN in mode D" above is built. The showcase now encodes this trade-off directly:
 its still camera is wrapped in `prefer { mode D } else { mode B }`, so mode D wins today and the
 loader auto-falls back to mode B the day a mode-D-hostile feature (a GRIN lamp-gas field) is added.
+
+**Showcase idea: a fog rainbow that MOVES with the camera (`phase rainbow`).** Now that the
+water-droplet phase is wired end-to-end (FTSL `phase rainbow { .. }`, validated: primary +
+secondary bows, Alexander's dark band, reversed secondary colours — see the DONE note below),
+we could dress the showcase (or a dedicated flyby) with a thin rain curtain that produces a
+real rainbow. The compelling part is that **the bow is centred on the antisolar point (the
+anti-sun direction), not on any object** — so as a moving camera pans/dollies, the bow slides
+across the frame and *follows the view* exactly the way a real rainbow "runs away" from you.
+That motion is the giveaway that it's genuine scattering physics, not a painted arc. Recipe
+to keep on the radar for a flyby (own subdir `png/<set>/` per the flyby rule):
+- Distant sun **behind** the camera's general travel direction (parallel rays → sharp bow);
+  keep the sun *outside* the fog slab so it isn't extincted before lighting the drops.
+- A **bounded, thin** rain curtain in front (`sigma_t`~0.001–0.002, `albedo` ~0.99, optical
+  depth ≲ 0.3) so single scattering — which carries the bow — dominates the multiply-scattered
+  veil. `phase rainbow { droplet_um 500 secondary on supernumerary on }`.
+- A `camera_curve` that pans the antisolar point across frame (e.g. yaw the look direction, or
+  translate laterally) so the ring visibly tracks the camera. Render **mode B** (forward) or
+  **mode D** (BDPT, bounded fog) on the **CPU** — the GPU volume path is HG-only and auto-falls
+  back to CPU for rainbow media, so a big flyby is CPU-bound (budget accordingly).
+- Validated seed scenes to crib geometry/params from: `scraps/rainbow_ring.ftsl` (centred
+  ring, mode D) and `scraps/rainbow_test.ftsl` (antisolar-aimed slab).
 
 **Minor tech debt: `prefer{}/else{}` trial builds reload meshes.** Resolving a `prefer` node
 trial-builds each candidate branch to test renderability (`ftsl::load`, `tryBuild` lambda). The

@@ -74,34 +74,6 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
     return {FluoroEvent::Absorb, 0.0};
 }
 
-// --- Henyey-Greenstein phase function (participating media) ------------------
-// p(cosTheta) normalized so its integral over the sphere is 1. cosTheta is the
-// cosine between the photon's propagation direction and the scattered direction;
-// g in (-1,1): g>0 forward-peaked, g<0 back-scattering, g=0 isotropic.
-inline double hgPhase(double cosTheta, double g) {
-    double d = 1.0 + g * g - 2.0 * g * cosTheta;
-    if (d < 1e-9) d = 1e-9;
-    return (1.0 - g * g) / (4.0 * PI * d * std::sqrt(d));
-}
-
-// Sample a scattered direction around the propagation direction `wi` from the HG
-// distribution. The sampled cosTheta has mean value g (forward for g>0), so the
-// returned direction is importance-sampled proportional to the phase function.
-inline Vec3 sampleHG(const Vec3& wi, double g, Pcg32& rng) {
-    double u1 = rng.uniform(), u2 = rng.uniform();
-    double cosT;
-    if (std::fabs(g) < 1e-3) {
-        cosT = 1.0 - 2.0 * u1;                          // isotropic
-    } else {
-        double sq = (1.0 - g * g) / (1.0 + g - 2.0 * g * u1);
-        cosT = (1.0 + g * g - sq * sq) / (2.0 * g);
-    }
-    double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
-    double phi = 2.0 * PI * u2;
-    Vec3 t, b; onb(wi, t, b);
-    return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + wi * cosT);
-}
-
 // --- Thin-film interference reflectance (iridescence) ------------------------
 // A thin dielectric film (index n1, thickness d nanometres) coats a substrate of
 // index n2, with incident medium n0. The beams reflected off the top (n0|n1) and
@@ -471,7 +443,7 @@ struct Renderer {
         if (!cam.project(p, px, py, cosCam, dist2)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
@@ -560,7 +532,7 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
         double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
         // Same flux->film-irradiance normaliser as connectLens (see there): divide the
@@ -1181,7 +1153,8 @@ struct Renderer {
                 }
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
                 if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
-                ray = Ray{mp, sampleHG(ray.d, sm.g, rng)};
+                double phPdf;   // sample the scatter direction from HG or the rainbow droplet phase
+                ray = Ray{mp, sm.phaseSample(ray.d, lambda, rng, phPdf)};
                 continue;
             }
 

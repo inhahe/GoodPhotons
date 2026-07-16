@@ -1069,6 +1069,18 @@ at the poles, a grid on box faces) instead of slicing through world space. See
 `-fog <sigma_t> -fogalbedo <a> -fogg <g> [-fograyleigh]`. Henyey–Greenstein phase
 function by default; Rayleigh optional.
 
+**Rainbow (water-droplet) phase.** Add `phase rainbow { .. }` to a medium and its fog
+scatters through a physically-tabulated Airy water-droplet phase instead of the smooth
+HG lobe, so rain/mist actually shows a **primary bow (~42°) + secondary bow (~51°)**,
+wavelength dispersion (red-outer/violet-inner on the primary, reversed on the
+secondary), **Alexander's dark band**, and **supernumerary arcs**. Features are on by
+default; block knobs (`droplet_um`, `secondary`, `supernumerary`, `strength`,
+`forward_g`, `secondary_ratio`) tune or disable them — small drops broaden toward a
+white **fogbow**. Point the camera at the antisolar point with a distant sun behind it
+and keep the fog thin (single-scatter regime). Evaluated by the CPU tracers (forward
+A/B/C, backward R, BDPT D); a rainbow-phase scene automatically falls back to the CPU
+on the GPU backend (the device volume path is HG-only). See FTSL.md §12.
+
 **Multiple, overlapping media.** Author as many `medium` blocks as you like — they
 coexist as independent regions (e.g. two differently-tinted fog orbs plus a faint
 global haze). The forward tracer superposes them physically: extinction adds (total

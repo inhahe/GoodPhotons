@@ -13,6 +13,7 @@
 #include "texture.h"
 #include "envmap.h"
 #include "vdbgrid.h"
+#include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
@@ -218,6 +219,32 @@ struct Medium {
     Spectrum sigma_a = constantSpectrum(0.0); // absorption coefficient vs lambda
     Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
     double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
+
+    // --- Scattering phase model ---------------------------------------------
+    // By default a medium scatters via the smooth single-parameter Henyey-Greenstein
+    // lobe above. A medium can instead opt into a physically-based WATER-DROPLET
+    // phase (Airy theory, rainbow.h) via `phase rainbow { .. }` in FTSL, which adds
+    // the wavelength-dependent rainbow fine structure (primary/secondary bows,
+    // supernumeraries, fogbow limit). When `rainbowPhase` is set it OVERRIDES `g`.
+    // The shared_ptr keeps Medium copies cheap (the table is a few MB) and is null
+    // for the common HG case, so HG media stay bit-identical.
+    std::shared_ptr<rainbow::RainbowPhase> rainbowPhase;
+    bool rainbow() const { return (bool)rainbowPhase; }
+
+    // Phase value p(cos) at wavelength lambda (nm) — equals the solid-angle pdf when
+    // the scatter direction is importance-sampled from the phase (both models below).
+    double phaseValue(double cosTheta, double lambda) const {
+        if (rainbowPhase) return rainbowPhase->eval(cosTheta, lambda);
+        return hgPhase(cosTheta, g);
+    }
+    // Importance-sample a scattered direction about propagation `wi` at wavelength
+    // lambda; sets pdfOut to the solid-angle pdf p(cos) of the chosen direction.
+    Vec3 phaseSample(const Vec3& wi, double lambda, Pcg32& rng, double& pdfOut) const {
+        if (rainbowPhase) return rainbowPhase->sample(wi, lambda, rng, pdfOut);
+        Vec3 d = sampleHG(wi, g, rng);
+        pdfOut = hgPhase(dot(wi, d), g);
+        return d;
+    }
 
     // --- Optional heterogeneous density field (fuzzy / bounded fog) ----------
     // When `density` is non-empty, the base coefficients sigma_a/sigma_s are

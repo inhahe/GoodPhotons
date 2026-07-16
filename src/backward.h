@@ -160,7 +160,7 @@ struct BackwardRenderer {
                 double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase  = hgPhase(dot(wIn, wi), scene.backwardMedium().g);
+                double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 double albedo = scene.backwardMedium().albedo(lambda);
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = em.spdFn(lambda) * invPdfLambda;
@@ -183,7 +183,7 @@ struct BackwardRenderer {
             double contrib;
             if (coneSampled) {
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase = hgPhase(dot(wIn, wi), scene.backwardMedium().g);
+                double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
             } else {
                 if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
@@ -194,7 +194,7 @@ struct BackwardRenderer {
                 double cosLight = dot(nLight, -wi);        // light is one-sided
                 if (cosLight <= 0) continue;
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
-                double phase = hgPhase(dot(wIn, wi), scene.backwardMedium().g);
+                double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 double G = cosLight / dist2;               // no surface cosine at a volume vertex
                 contrib = albedo * phase * emitW * G * effArea;
             }
@@ -249,7 +249,7 @@ struct BackwardRenderer {
         if (scene.occluded(p + wi * 1e-6, wi, farDist)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
-        double phase  = hgPhase(dot(wIn, wi), scene.backwardMedium().g);  // == BSDF pdf here
+        double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);  // == BSDF pdf here
         double albedo = scene.backwardMedium().albedo(lambda);
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
         double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * farDist);
@@ -315,8 +315,7 @@ struct BackwardRenderer {
                         if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                             L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
                         if (rng.uniform() >= scene.backwardMedium().albedo(lambda)) return L; // absorbed
-                        Vec3 wOut = sampleHG(ray.d, scene.backwardMedium().g, rng);
-                        contBsdfPdf = hgPhase(dot(ray.d, wOut), scene.backwardMedium().g);
+                        Vec3 wOut = scene.backwardMedium().phaseSample(ray.d, lambda, rng, contBsdfPdf);
                         ray = Ray{p, wOut};
                         specularArrival = false;   // phase-NEE covered the direct light
                         continue;

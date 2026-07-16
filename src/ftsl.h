@@ -2215,6 +2215,67 @@ private:
             med.iorStep = step;
         }
 
+        // ---- Optional angular phase model (HG lobe vs. spectral rainbow) ---------
+        // Default (no `phase` statement, or `phase hg`) keeps the smooth single-`g`
+        // Henyey-Greenstein lobe (`med.g` above). `phase rainbow { .. }` swaps in the
+        // physically-tabulated Airy water-droplet phase (rainbow.h) so a fog/haze
+        // actually shows a primary + secondary bow, dispersion, Alexander's dark band
+        // and supernumeraries. Its physical features are ON BY DEFAULT; the block
+        // knobs are overrides (turn a feature off, or retune it):
+        //   droplet_um <r>       droplet radius in microns (default 500 = 0.5mm rain;
+        //                        ~10 -> a broad desaturated fogbow).
+        //   secondary on|off     the p=3 secondary bow (default on).
+        //   supernumerary on|off the Airy side-maxima / supernumerary arcs (default on).
+        //   strength <s>         relative weight of the bows over the forward haze (default 1).
+        //   forward_g <g>        HG anisotropy of the smooth forward-scatter background (default 0.55).
+        //   secondary_ratio <v>  secondary brightness vs. primary (default 0.43).
+        // The droplet index n(lambda) defaults to water's Cauchy fit; if this medium
+        // also carries a scalar `ior` it does NOT feed the droplet optics (the GRIN
+        // `ior` field is a spatial bend, unrelated to per-droplet dispersion).
+        if (const Stmt* ph = find(b, "phase")) {
+            // `phase rainbow { .. }` — the subtype bareword before `{` is consumed as the
+            // nested block's TYPE (parseValue, ~line 203), NOT left in val.words. So read
+            // the kind from val.words[0] (the block-less forms `phase hg` / `phase rainbow`)
+            // and fall back to the block's type when a `{ .. }` body is present.
+            std::string kind = ph->val.words.empty() ? std::string() : ph->val.words[0];
+            if (kind.empty() && ph->val.block && ph->val.block->type != "phase")
+                kind = ph->val.block->type;
+            auto truthy = [](const std::string& s) {
+                return s == "on" || s == "true" || s == "1" || s == "yes";
+            };
+            auto falsy = [](const std::string& s) {
+                return s == "off" || s == "false" || s == "0" || s == "no";
+            };
+            if (kind == "rainbow") {
+                rainbow::Params prm;
+                const Block* pb = ph->val.block.get();
+                if (pb) {
+                    double dropUm = dblOf(*pb, "droplet_um", prm.dropletRadius_m * 1e6);
+                    if (dropUm <= 0.0) { fail("medium `phase rainbow` needs a positive `droplet_um`"); return false; }
+                    prm.dropletRadius_m = dropUm * 1e-6;
+                    prm.rainbowStrength = dblOf(*pb, "strength", prm.rainbowStrength);
+                    prm.gForward        = dblOf(*pb, "forward_g", prm.gForward);
+                    prm.secondaryRatio  = dblOf(*pb, "secondary_ratio", prm.secondaryRatio);
+                    if (const Stmt* s = find(*pb, "secondary")) {
+                        std::string v = s->val.words.empty() ? "on" : s->val.words[0];
+                        if (falsy(v)) prm.secondary = false; else if (truthy(v)) prm.secondary = true;
+                    }
+                    if (const Stmt* s = find(*pb, "supernumerary")) {
+                        std::string v = s->val.words.empty() ? "on" : s->val.words[0];
+                        if (falsy(v)) prm.supernumerary = false; else if (truthy(v)) prm.supernumerary = true;
+                    }
+                }
+                auto rp = std::make_shared<rainbow::RainbowPhase>();
+                rp->build(prm);
+                med.rainbowPhase = rp;
+            } else if (kind == "hg" || kind.empty()) {
+                // explicit HG (or `phase` with no argument): default lobe, nothing to do.
+            } else {
+                fail("medium `phase " + kind + "` is not a known phase model (use `hg` or `rainbow`)");
+                return false;
+            }
+        }
+
         L.scene.media.push_back(std::move(med));
         return true;
     }

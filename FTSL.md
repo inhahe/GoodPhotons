@@ -566,6 +566,46 @@ medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
 - `g` is the Henyey-Greenstein anisotropy; `rayleigh true` gives a λ⁻⁴ scattering
   tilt (blue-sky falloff).
 
+**Angular scattering model — `phase`.** By default a medium scatters through the
+smooth single-parameter Henyey-Greenstein lobe (`g` above). A `phase` statement swaps
+in a different angular model:
+
+```
+medium {
+    sigma_t 0.0012  albedo 0.99
+    bounds { min -260 -260 12   max 260 260 190 }
+    phase rainbow {
+        droplet_um    500      # water-drop RADIUS in microns (default 500 = 0.5 mm rain)
+        secondary     on       # p=3 secondary bow            (default on)
+        supernumerary on       # Airy side-maxima / supernumerary arcs (default on)
+        strength      1.0      # weight of the bows over the smooth forward haze (default 1)
+        forward_g     0.55     # HG anisotropy of the smooth forward-scatter background
+        secondary_ratio 0.43   # secondary brightness relative to primary
+    }
+}
+```
+
+- `phase hg` (or no `phase` statement) is the default Henyey-Greenstein lobe — nothing
+  changes; a bare `phase hg` is only for making the choice explicit.
+- **`phase rainbow { .. }`** replaces the lobe with a physically-tabulated **water-droplet
+  phase** (Airy theory of the rainbow, `rainbow.h`). A fog/rain medium then shows a real
+  **primary bow (~42°) + secondary bow (~51°)**, wavelength dispersion (red outer / violet
+  inner on the primary, *reversed* on the secondary), **Alexander's dark band** between
+  them, and **supernumerary arcs**. Its physical features are **on by default**; the block
+  knobs are overrides (turn a feature off or retune it). When set, the rainbow phase
+  **overrides `g`** for this medium.
+- Smaller drops broaden and desaturate the bow toward a white **fogbow** (try
+  `droplet_um 10`); 0.5–1 mm rain drops give the crispest bows and supernumeraries.
+- **Geometry that shows a bow:** the sun must be *behind the camera* and effectively far
+  away (parallel rays → sharp bow); aim the camera at the **antisolar point** (the shadow
+  of your head) and the bow appears as a ring at ~42° radius around it. Keep the fog
+  **thin** (optical depth ≲ 0.3) so single scattering — which carries the bow — dominates
+  over the multiply-scattered veil.
+- **Mode support:** the tabulated rainbow phase is evaluated by the **CPU** tracers
+  (forward A/B/C, backward R, BDPT D). The **GPU** volume path only knows the analytic HG
+  lobe, so a scene with a rainbow-phase medium automatically **falls back to the CPU**
+  tracer (rather than silently dropping the bow to a smooth haze).
+
 **Multiple media.** You may author several `medium` blocks; they coexist as
 independent, possibly overlapping regions (e.g. two differently-tinted fog orbs plus
 a faint global haze). The forward tracer superposes them physically: extinction adds,

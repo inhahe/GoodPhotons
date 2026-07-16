@@ -241,14 +241,19 @@ struct Vertex {
 // connection direction `wi` (both unit, both pointing AWAY from v). The propagation
 // direction INTO v is -wo; the scattered direction is wi; the phase cosine is therefore
 //   cosTheta = dot(-wo, wi) = -dot(wo, wi).
-// hgPhase is normalized over the sphere, so it is its own pdf (sampleHG draws from it):
-// phaseF == phasePdf. Two names are kept for readability at the call sites (BSDF value
-// vs BSDF pdf on the surface side map to these on the medium side).
-inline double phaseF(const Vertex& v, const Vec3& wo, const Vec3& wi) {
-    return hgPhase(-dot(wo, wi), v.mediumG);
+// The phase is normalized over the sphere, so it is its own pdf (the scatter dir is
+// importance-sampled from it): phaseF == phasePdf. Two names are kept for readability
+// (BSDF value vs BSDF pdf on the surface side map to these on the medium side). The
+// medium dispatches HG vs the wavelength-dependent rainbow droplet phase, so both take
+// lambda + scene; the phase depends only on the scattering angle, so it is symmetric in
+// (wo,wi) and the forward/reverse pdfs are equal.
+inline double phaseF(const Vertex& v, const Vec3& wo, const Vec3& wi,
+                     double lambda, const Scene& scene) {
+    return scene.media[v.mediumId].phaseValue(-dot(wo, wi), lambda);
 }
-inline double phasePdf(const Vertex& v, const Vec3& wo, const Vec3& wi) {
-    return hgPhase(-dot(wo, wi), v.mediumG);
+inline double phasePdf(const Vertex& v, const Vec3& wo, const Vec3& wi,
+                       double lambda, const Scene& scene) {
+    return scene.media[v.mediumId].phaseValue(-dot(wo, wi), lambda);
 }
 
 // In-scatter CONNECTION response at a medium vertex = single-scattering albedo (σs/σt)
@@ -261,7 +266,7 @@ inline double phasePdf(const Vertex& v, const Vec3& wo, const Vec3& wi) {
 // is a THROUGHPUT factor, not a density: MIS pdfs use the phase pdf alone (no albedo).
 inline double mediumScatterF(const Vertex& v, const Vec3& wo, const Vec3& wi,
                              double lambda, const Scene& scene) {
-    return scene.media[v.mediumId].albedo(lambda) * phaseF(v, wo, wi);
+    return scene.media[v.mediumId].albedo(lambda) * phaseF(v, wo, wi, lambda, scene);
 }
 
 // Convert a solid-angle pdf `pdfW` of leaving `from` toward `to` into an area-
@@ -340,7 +345,7 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
         Vec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.0) return 0.0;
         wp = normalize(wp);
-        pdfW = phasePdf(cur, wp, wn);
+        pdfW = phasePdf(cur, wp, wn, lambda, scene);
     } else {                                         // Surface
         if (!prev || !cur.mat) return 0.0;
         Vec3 wp = prev->p - cur.p;
@@ -435,9 +440,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             if (rng.uniform() >= sm.albedo(lambda)) return;   // absorbed (vertex retained)
             Vertex& cur = path.back();
             Vec3 wo = normalize(path[prevIdx].p - cur.p);     // toward the previous vertex
-            Vec3 wi = sampleHG(ray.d, sm.g, rng);             // scattered propagation dir
-            double pdfW    = phasePdf(cur, wo, wi);           // HG is its own pdf
-            double pdfRevW = phasePdf(cur, wi, wo);
+            double pdfW;
+            Vec3 wi = sm.phaseSample(ray.d, lambda, rng, pdfW); // scattered dir (HG or rainbow)
+            double pdfRevW = pdfW;                             // phase symmetric in (wo,wi)
             path[prevIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevIdx]);
             ray = Ray{mpos, wi};
             pdfFwd = pdfW;

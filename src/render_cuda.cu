@@ -4714,6 +4714,11 @@ bool cudaForwardSupported(const Scene& scene) {
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
+    // Spectral water-droplet (rainbow) phase is a CPU-tabulated (lambda x mu) table with
+    // per-lambda CDF importance sampling (rainbow.h); the device volume path only knows
+    // the analytic HG lobe (hgPhase). Rather than silently drop the bow to a smooth HG
+    // haze, fall back to the CPU tracer for any scene with a rainbow-phase medium.
+    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     // Environment lighting runs on-device: the kernel emits env photons from the scene
     // bounding sphere (shape==3) and the directly-viewed background is added by the
     // backend-agnostic addEnvBackground() pass. Both a constant env and an IMAGE-based
@@ -5501,6 +5506,10 @@ bool cudaBdptSupported(const Scene& scene) {
     // a GRIN region would bias the estimator. The mode-D guard (bdptUnsupportedFeature) already
     // refuses GRIN before dispatch; reject here too so GPU BDPT can never render it straight.
     if (grin::sceneHasGrin(scene)) return false;
+    // Spectral rainbow phase is CPU-tabulated (see cudaForwardSupported); the device
+    // volume connect/sample only knows the analytic HG lobe, so refuse rainbow media
+    // here too and let mode D run on the CPU BDPT (which evaluates the bow exactly).
+    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     return true;
 }
 

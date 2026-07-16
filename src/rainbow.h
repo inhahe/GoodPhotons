@@ -276,7 +276,8 @@ inline void RainbowPhase::selfTest() {
         std::printf("[rainbow selftest] lambda=%3.0fnm (%-6s) n=%.4f  primary=%.2f deg  secondary=%.2f deg\n",
                     c.lam, c.name, n, b1.thetaRb * 180.0 / PI, b2.thetaRb * 180.0 / PI);
     }
-    // Normalisation check for a mid droplet.
+    // Normalisation check for a mid droplet: each per-lambda phase slice must integrate
+    // to 1 over the sphere, i.e. 2*pi*integral p(mu) dmu == 1.
     RainbowPhase rp; rp.build(prm);
     for (double lam : {450.0, 550.0, 650.0}) {
         double integ = 0.0; int N = 4000;
