@@ -479,6 +479,11 @@ struct CamSpec {
     char   mode = 0;             // 0 = not specified -> inherit global
     int    res  = -1;            // film WIDTH  in px (-1 = inherit global/CLI res)
     int    resY = -1;            // film HEIGHT in px (-1 = square: follow res)
+    // Playback frame rate for a flyby (camera_path/orbit/curve). Purely an animation
+    // *hint* consumed by the video-assembly tooling (showcase_flyby.py -> ffmpeg): it
+    // does not affect how any still frame is rendered. 0 = not specified -> inherit the
+    // scene-level `fps` default, else the tool's own default. Meaningless for a still.
+    double fps = 0.0;
 
     // Lens projection (0 = rectilinear; see CameraProjection) and an optional zoom
     // multiplier on the focal length (1 = none; 2 = 2x tele, i.e. half the fov).
@@ -551,6 +556,11 @@ struct Loaded {
     Vec3 camEye{0, 1, 3}, camLook{0, 1, 0}, camUp{0, 1, 0};
     double camFov = 40.0, camAperture = 0.02, camFocus = 0.0;
     char mode = 'B';
+    char defaultMode = 0;        // scene { default_mode X }: fallback mode for cameras that
+                                 //   don't author their own `mode` (0 = not specified). Unlike
+                                 //   `mode` above (which trails the last camera/render block),
+                                 //   this is a stable, camera-immune default.
+    double defaultFps = 0.0;     // scene { fps N }: default flyby playback fps (0 = not specified)
     long long photons = -1;      // -1 = not specified (CLI default wins)
     int res = -1;                // -1 = not specified
     std::string device;          // empty = not specified
@@ -584,6 +594,15 @@ public:
                                  "engine range is fixed at %g..%g nm (widening is not yet supported); "
                                  "only the bin width (%g nm) is applied.\n", lo, hi, LAMBDA_MIN, LAMBDA_MAX, binWidth_);
             }
+            // Scene-level defaults. `default_mode X` gives a stable fallback render mode for
+            // any camera that doesn't author its own `mode` (see effMode in main). `fps N`
+            // is the default flyby playback rate the video tooling uses when a camera_curve/
+            // path/orbit doesn't set its own `fps`. Both are pure defaults — a per-camera
+            // `mode`/`fps` and the CLI still override them.
+            std::string dm = strOf(b, "default_mode");
+            if (!dm.empty()) L.defaultMode = dm[0];
+            double dfps = dblOf(b, "fps", 0.0);
+            if (dfps > 0.0) L.defaultFps = dfps;
         }
 
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
@@ -2613,6 +2632,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
         int frames = (int)dblOf(b, "frames", 0.0);
@@ -2722,6 +2742,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
         if (!readLens(b, shared)) return false;           // optional physical `lens { ... }` block
@@ -2833,6 +2854,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
         if (!readLens(b, shared)) return false;           // optional physical `lens { ... }` block

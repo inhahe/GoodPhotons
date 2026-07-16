@@ -36,6 +36,54 @@ DEFAULT_CAMERA = "fly"          # the camera_curve path base name in the scene
 FRAME_DIR = ROOT / "png" / "showcase_fly"   # flyby series gets its own subdir
 FRAME_STEM = "showcase"          # -> png/showcase_fly/showcase_fly000.png ...
 
+_NUM = r"[0-9]*\.?[0-9]+"        # a bare integer or decimal (no sign/exponent needed here)
+
+
+def _strip_ftsl_comments(text: str) -> str:
+    """Drop FTSL line comments (# ... to end of line) so a commented-out `fps`
+    can't be mistaken for a real one."""
+    return re.sub(r"#[^\n]*", "", text)
+
+
+def _block_body(text: str, brace_idx: int) -> str:
+    """Return the body between the `{` at brace_idx and its matching `}`."""
+    depth = 0
+    for i in range(brace_idx, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_idx + 1:i]
+    return text[brace_idx + 1:]
+
+
+def read_scene_fps(scene: str, camera: str) -> float | None:
+    """Read the playback fps the scene authors for this flyby, mirroring ftrace's
+    resolution order: the flyby camera's own `fps`, else the scene-level `fps`
+    default. Returns None if neither is present (caller falls back to 30)."""
+    p = Path(scene)
+    if not p.is_absolute() and not p.exists():
+        p = ROOT / scene                         # tolerate being run from another cwd
+    try:
+        text = _strip_ftsl_comments(p.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    # 1. The flyby camera's own `fps` (camera_curve/path/orbit "camera" { ... fps N }).
+    m = re.search(r'camera_(?:curve|path|orbit)\s+"' + re.escape(camera) + r'"\s*\{', text)
+    if m:
+        fm = re.search(r"\bfps\s+(" + _NUM + r")", _block_body(text, m.end() - 1))
+        if fm:
+            return float(fm.group(1))
+    # 2. The scene-level default (scene { ... fps N }).
+    sm = re.search(r"\bscene\s*\{", text)
+    if sm:
+        fm = re.search(r"\bfps\s+(" + _NUM + r")", _block_body(text, sm.end() - 1))
+        if fm:
+            return float(fm.group(1))
+    return None
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -46,8 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--res", nargs=2, type=int, metavar=("W", "H"),
                    default=[640, 480],
                    help="render resolution in pixels")
-    p.add_argument("--fps", type=float, default=30.0,
-                   help="playback speed of the output video (frames per second)")
+    p.add_argument("--fps", type=float, default=None,
+                   help="playback speed of the output video (frames per second). "
+                        "If omitted, read from the scene: the flyby camera's `fps`, "
+                        "else the scene's top-level `fps` default, else 30")
     p.add_argument("--out", default="showcase.gif",
                    help="output video filename; extension picks the format "
                         "(.gif, .mp4, ...) - converted with ffmpeg")
@@ -98,7 +148,7 @@ def print_run_banner(parser: argparse.ArgumentParser, args: argparse.Namespace,
     print("resolved parameters:")
     print(f"  mode           : {args.mode} ({'rasterized preview' if raster else 'transport mode'})")
     print(f"  resolution     : {args.res[0]} x {args.res[1]}")
-    print(f"  fps (playback) : {args.fps}")
+    print(f"  fps (playback) : {args.fps:g}  [{getattr(args, 'fps_source', '--fps')}]")
     print(f"  output         : {args.out}")
     print(f"  camera path    : {args.camera}")
     print(f"  explore        : {'on (interactive fly viewer, no render)' if args.explore else 'off'}")
@@ -199,6 +249,19 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     raster = args.mode.lower() in ("raster", "r-raster", "preview")
+
+    # Resolve the playback fps: --fps wins; else the scene authors it (flyby
+    # camera's `fps`, then the scene-level `fps` default); else fall back to 30.
+    if args.fps is not None:
+        args.fps_source = "--fps"
+    else:
+        scene_fps = read_scene_fps(args.scene, args.camera)
+        if scene_fps is not None:
+            args.fps = scene_fps
+            args.fps_source = f"scene ({args.scene})"
+        else:
+            args.fps = 30.0
+            args.fps_source = "default"
 
     print_run_banner(parser, args, raster)
 

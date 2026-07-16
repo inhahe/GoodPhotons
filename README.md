@@ -1182,6 +1182,20 @@ fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_cur
 `procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`,
 `gallery.ftsl` (a large room packed with varied materials around a gold gyroid), …).
 
+**Scene-header defaults (`default_mode`, `fps`).** The `scene { … }` header can set
+two project-wide defaults alongside `units`/`spectral`:
+
+- **`default_mode <letter>`** — the render mode to use when *nothing else* selects one:
+  no `-mode` on the CLI, and the camera/render blocks don't author their own `mode`.
+  It's the lowest-priority source, so the resolution order is `-mode` (CLI) → a camera's
+  own `mode` → `default_mode` → the built-in `B`. Handy when several cameras would
+  otherwise all repeat the same `mode M`.
+- **`fps <n>`** — the default playback rate for flyby animations, read by the assembly
+  tooling (e.g. `tools/showcase_flyby.py` when `--fps` is omitted). A `camera_curve`/
+  `camera_path`/`camera_orbit` block can override it with its own `fps <n>`; the tool's
+  resolution order is `--fps` → the flyby's `fps` → the scene-level `fps` → `30`. `fps`
+  is purely a playback hint — it doesn't change what ftrace renders.
+
 ### Conditional blocks (`prefer { … } else { … }`)
 
 Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
@@ -1222,7 +1236,9 @@ mode R / strip the feature).
 
 Both expand into a sequence of frames sharing look_at/up/fov/mode/film/lens; a
 multi-camera render writes one file per frame (`_<name>` inserted before the
-extension), which ffmpeg concatenates into a video.
+extension), which ffmpeg concatenates into a video. Any flyby block may carry an
+`fps <n>` playback hint (read by the assembly tooling; overrides the scene-level
+`fps` default — see *Scene-header defaults* above).
 
 - **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
   keyframed fly-through: the eye (and optionally look_at / fov) is linearly

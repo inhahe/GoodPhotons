@@ -2977,6 +2977,11 @@ static int run(int argc, char** argv) {
         if (ftslScene.photons >= 0)       N = ftslScene.photons;
         if (ftslScene.res > 0)            res = ftslScene.res;
         if (ftslScene.mode)               mode = ftslScene.mode;
+        // A scene-level `default_mode` is the authoritative fallback for cameras that don't
+        // author their own `mode`. It takes precedence over the incidental global `mode`
+        // above (which just trails the last camera/render block), but a per-camera `mode`
+        // (via effMode) and a CLI -mode still override it.
+        if (ftslScene.defaultMode)        mode = ftslScene.defaultMode;
         if (!ftslScene.device.empty())    device = ftslScene.device.c_str();
         if (!ftslScene.out.empty())       out = ftslScene.out.c_str();
     }
@@ -3460,10 +3465,21 @@ static int run(int argc, char** argv) {
                             if (allDigits) sel.push_back(&cs);
                         }
                     }
-                    if (!sel.empty())
-                        std::printf("[camera] path '%s' -> %zu frames (%s..%s)\n",
-                                    q.c_str(), sel.size(), sel.front()->name.c_str(),
-                                    sel.back()->name.c_str());
+                    if (!sel.empty()) {
+                        // Resolve the flyby's playback fps hint (per-camera, else scene
+                        // default) so a user running ftrace directly sees the authored rate
+                        // the video tooling will assemble at; 0 => none authored.
+                        double pfps = (sel.front()->fps > 0.0) ? sel.front()->fps
+                                                               : ftslScene.defaultFps;
+                        if (pfps > 0.0)
+                            std::printf("[camera] path '%s' -> %zu frames (%s..%s) @ %g fps\n",
+                                        q.c_str(), sel.size(), sel.front()->name.c_str(),
+                                        sel.back()->name.c_str(), pfps);
+                        else
+                            std::printf("[camera] path '%s' -> %zu frames (%s..%s)\n",
+                                        q.c_str(), sel.size(), sel.front()->name.c_str(),
+                                        sel.back()->name.c_str());
+                    }
                 }
                 if (sel.empty()) {
                     std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);

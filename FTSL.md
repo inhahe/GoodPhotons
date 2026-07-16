@@ -94,6 +94,8 @@ scene { units meters  spectral 360 830 1 }
 |---|---|---|---|
 | `units` | `meters`/`m`, `centimeters`/`cm`, `millimeters`/`mm`, `inches`/`in`, `feet`/`ft` | `meters` | all authored **lengths/positions** are scaled to internal metres at load time |
 | `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
+| `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B` |
+| `fps` | `<n>` | *(none)* | default playback rate for flyby animations, read by assembly tooling (e.g. `showcase_flyby.py` when `--fps` is omitted). Overridable per-flyby with `fps <n>` on the `camera_curve`/`camera_path`/`camera_orbit` block. Playback hint only — does not affect rendering |
 
 Directions (`up`, `normal`, `dir`, `axis`) are **not** unit-scaled — only points and
 lengths are. There is one `scene` block (extra ones are also scanned but the last
