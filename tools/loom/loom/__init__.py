@@ -19,6 +19,11 @@ from .interp import LoopCurve, GridField, ScatterField, eval_curve
 from .mathnd import Mat, rotation, rotations, slice3
 from .scene import (
     Scene, Material, Sphere, Beads, Raw, Light, Camera, Element,
+    SweptMesh, ribbon, tube, blob, fan,
+)
+from .sweep import (
+    rmf_frames, tangents, sweep_rings, skin, circle_profile, line_profile,
+    write_obj,
 )
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
@@ -36,5 +41,8 @@ __all__ = [
     "LoopCurve", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3",
     "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
+    "SweptMesh", "ribbon", "tube", "blob", "fan",
+    "rmf_frames", "tangents", "sweep_rings", "skin", "circle_profile",
+    "line_profile", "write_obj",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
 ]

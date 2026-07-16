@@ -11,13 +11,16 @@ text for a given :class:`~loom.signals.core.Clock`.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+import math
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from .signals.core import Signal, Clock, Cache, detect_signal_cycle
+from .signals.core import Signal, Clock, Cache, Const, detect_signal_cycle
 from .signals.vector import VecSignal
 from .interp import LoopCurve
 from .data import PointPath
-from .ftsl_emit import num, vec3, fmt, fmt3, value_token
+from .ftsl_emit import EmitCtx, num, vec3, fmt, fmt3, value_token
+from . import sweep as _sweep
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +38,7 @@ class Element:
                 out.append(v)
         return out
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
+    def emit(self, ctx: EmitCtx) -> str:
         raise NotImplementedError
 
 
@@ -52,10 +55,10 @@ class Material(Element):
     def roots(self) -> List:
         return [v for v in self.props.values() if isinstance(v, (Signal, VecSignal))]
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
+    def emit(self, ctx: EmitCtx) -> str:
         parts = [f"type {self.mtype}"]
         for k, v in self.props.items():
-            parts.append(f"{k} {value_token(v, clock, cache)}")
+            parts.append(f"{k} {value_token(v, ctx.clock, ctx.cache)}")
         return f'material "{self.name}" {{ ' + "  ".join(parts) + " }"
 
 
@@ -76,9 +79,9 @@ class Sphere(Element):
             out.append(self.radius)
         return out
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
-        c = vec3(self.center, clock, cache)
-        r = num(self.radius, clock, cache)
+    def emit(self, ctx: EmitCtx) -> str:
+        c = vec3(self.center, ctx.clock, ctx.cache)
+        r = num(self.radius, ctx.clock, ctx.cache)
         return f'sphere {{ center {fmt3(c)}  radius {fmt(r)}  material "{self.material}" }}'
 
 
@@ -103,11 +106,11 @@ class Beads(Element):
             out.append(self.radius)
         return out
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
-        r = num(self.radius, clock, cache)
+    def emit(self, ctx: EmitCtx) -> str:
+        r = num(self.radius, ctx.clock, ctx.cache)
         lines: List[str] = []
         for k in range(self.count):
-            p = self.curve.sample(k / self.count, clock, cache)
+            p = self.curve.sample(k / self.count, ctx.clock, ctx.cache)
             lines.append(
                 f'sphere {{ center {fmt3(p)}  radius {fmt(r)}  material "{self.material}" }}')
         return "\n".join(lines)
@@ -122,8 +125,109 @@ class Raw(Element):
     def roots(self) -> List:
         return []
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
+    def emit(self, ctx: EmitCtx) -> str:
         return self.text
+
+
+class SweptMesh(Element):
+    """A profile swept along a spine curve into a triangle mesh (M4 sweep engine).
+
+    The ``spine`` (a :class:`LoopCurve` or :class:`PointPath`) is sampled at
+    ``count`` points *at the current clock*, oriented with a rotation-minimizing
+    frame, scaled/twisted, and skinned into an OBJ that is written per-frame via
+    ``ctx.asset_path``; the emitted ftsl is a ``mesh { file ... }`` reference.
+
+    ``scale`` and ``twist`` may be plain numbers or :class:`Signal`\\ s (animated).
+    ``turns`` adds a full ``turns * 2pi`` twist distributed along the spine.
+    ``scale_profile`` is an optional ``f(u)->float`` multiplier (``u in [0,1)``)
+    that swells/pinches the section along the spine (used by the ``blob`` preset).
+    """
+
+    def __init__(self, spine: Union[LoopCurve, PointPath], profile: Sequence[Tuple[float, float]],
+                 *, count: int = 64, scale=1.0, twist=0.0, turns=0.0,
+                 closed_spine: bool = True, closed_profile: bool = True,
+                 material: str = "default", smooth: int = 1, name: str = "swept",
+                 scale_profile: Optional[Callable[[float], float]] = None) -> None:
+        if isinstance(spine, PointPath):
+            spine = LoopCurve(spine, Const(0.0))
+        self.spine = spine
+        self.profile = [(float(a), float(b)) for (a, b) in profile]
+        self.count = int(count)
+        self.scale = scale
+        self.twist = twist
+        self.turns = turns
+        self.closed_spine = closed_spine
+        self.closed_profile = closed_profile
+        self.material = material
+        self.smooth = int(smooth)
+        self.name = name
+        self.scale_profile = scale_profile
+
+    def roots(self) -> List:
+        out: List = [self.spine]
+        for v in (self.scale, self.twist, self.turns):
+            if isinstance(v, (Signal, VecSignal)):
+                out.append(v)
+        return out
+
+    def emit(self, ctx: EmitCtx) -> str:
+        n = self.count
+        pts = [self.spine.sample(k / n, ctx.clock, ctx.cache) for k in range(n)]
+        base_sc = num(self.scale, ctx.clock, ctx.cache)
+        base_tw = num(self.twist, ctx.clock, ctx.cache)
+        turns = num(self.turns, ctx.clock, ctx.cache)
+        scales: List[float] = []
+        twists: List[float] = []
+        for k in range(n):
+            u = k / n
+            mult = self.scale_profile(u) if self.scale_profile is not None else 1.0
+            scales.append(base_sc * mult)
+            twists.append(base_tw + turns * 2.0 * math.pi * u)
+        rings = _sweep.sweep_rings(pts, self.profile, scales, twists, self.closed_spine)
+        verts, faces = _sweep.skin(rings, self.closed_spine, self.closed_profile)
+        path = ctx.asset_path(self.name, "obj")
+        _sweep.write_obj(path, verts, faces)
+        return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
+                f'material "{self.material}" }}')
+
+
+def ribbon(spine, *, width: float = 0.3, material: str = "default", count: int = 64,
+           twist=0.0, turns=0.0, closed_spine: bool = True, smooth: int = 0,
+           name: str = "ribbon") -> SweptMesh:
+    """A flat strip (open line profile) swept along the spine."""
+    return SweptMesh(spine, _sweep.line_profile(width), count=count, scale=1.0,
+                     twist=twist, turns=turns, closed_spine=closed_spine,
+                     closed_profile=False, material=material, smooth=smooth, name=name)
+
+
+def tube(spine, *, radius: float = 0.1, sides: int = 12, material: str = "default",
+         count: int = 64, twist=0.0, turns=0.0, closed_spine: bool = True,
+         smooth: int = 1, name: str = "tube") -> SweptMesh:
+    """A closed circular tube swept along the spine."""
+    return SweptMesh(spine, _sweep.circle_profile(sides, 1.0), count=count, scale=radius,
+                     twist=twist, turns=turns, closed_spine=closed_spine,
+                     closed_profile=True, material=material, smooth=smooth, name=name)
+
+
+def blob(spine, *, radius: float = 0.15, sides: int = 16, bulge: float = 0.6,
+         lobes: int = 2, material: str = "default", count: int = 96,
+         twist=0.0, turns=0.0, closed_spine: bool = True, smooth: int = 1,
+         name: str = "blob") -> SweptMesh:
+    """A tube whose radius swells and pinches around the loop (``lobes`` bulges)."""
+    def _prof(u: float) -> float:
+        return 1.0 + bulge * math.sin(2.0 * math.pi * lobes * u)
+    return SweptMesh(spine, _sweep.circle_profile(sides, 1.0), count=count, scale=radius,
+                     twist=twist, turns=turns, closed_spine=closed_spine,
+                     closed_profile=True, material=material, smooth=smooth, name=name,
+                     scale_profile=_prof)
+
+
+def fan(spine, *, width: float = 0.4, material: str = "default", count: int = 64,
+        twist=0.0, turns=0.0, smooth: int = 0, name: str = "fan") -> SweptMesh:
+    """An open ribbon swept along an *open* spine (fans out end to end)."""
+    return SweptMesh(spine, _sweep.line_profile(width), count=count, scale=1.0,
+                     twist=twist, turns=turns, closed_spine=False,
+                     closed_profile=False, material=material, smooth=smooth, name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +245,9 @@ class Light(Element):
     def roots(self) -> List:
         return [v for v in self.props.values() if isinstance(v, (Signal, VecSignal))]
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
-        parts = [f"{k} {value_token(v, clock, cache)}" for k, v in self.props.items()]
+    def emit(self, ctx: EmitCtx) -> str:
+        parts = [f"{k} {value_token(v, ctx.clock, ctx.cache)}"
+                 for k, v in self.props.items()]
         return f"light {self.kind} {{ " + "  ".join(parts) + " }"
 
 
@@ -168,11 +273,11 @@ class Camera(Element):
             out.append(self.fov_y)
         return out
 
-    def emit(self, clock: Clock, cache: Optional[Cache]) -> str:
-        e = vec3(self.eye, clock, cache)
-        la = vec3(self.look_at, clock, cache)
-        up = vec3(self.up, clock, cache)
-        fov = num(self.fov_y, clock, cache)
+    def emit(self, ctx: EmitCtx) -> str:
+        e = vec3(self.eye, ctx.clock, ctx.cache)
+        la = vec3(self.look_at, ctx.clock, ctx.cache)
+        up = vec3(self.up, ctx.clock, ctx.cache)
+        fov = num(self.fov_y, ctx.clock, ctx.cache)
         return (f'camera "{self.name}" {{\n'
                 f'    eye {fmt3(e)}  look_at {fmt3(la)}  up {fmt3(up)}  fov_y {fmt(fov)}\n'
                 f'    mode {self.mode}\n'
@@ -213,18 +318,20 @@ class Scene:
             for r in el.roots():
                 detect_signal_cycle(r)
 
-    def emit(self, clock: Clock, cache: Optional[Cache] = None) -> str:
+    def emit(self, clock: Clock, cache: Optional[Cache] = None, *,
+             assets_dir: Optional["Path"] = None, tag: str = "") -> str:
+        ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag)
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]
         for m in self.materials:
-            blocks.append(m.emit(clock, cache))
+            blocks.append(m.emit(ctx))
         blocks.append("")
         for e in self.elements:
-            blocks.append(e.emit(clock, cache))
+            blocks.append(e.emit(ctx))
         blocks.append("")
         for lt in self.lights:
-            blocks.append(lt.emit(clock, cache))
+            blocks.append(lt.emit(ctx))
         blocks.append("")
-        blocks.append(self.camera.emit(clock, cache))
+        blocks.append(self.camera.emit(ctx))
         return "\n".join(blocks) + "\n"

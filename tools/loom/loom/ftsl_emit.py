@@ -8,12 +8,36 @@ uses these to turn a snapshot into a ``.ftsl`` string per frame.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
 from .signals.core import Signal, Clock, Cache, Number
 from .signals.vector import VecSignal
 
 Animatable = Union[Signal, VecSignal, Number, Sequence[Number], str]
+
+
+@dataclass
+class EmitCtx:
+    """Context for one frame's emission.
+
+    ``assets_dir`` is where file-backed elements (e.g. a swept mesh) write their
+    OBJ; ``tag`` disambiguates per-frame filenames.  When ``assets_dir`` is None
+    (a stdout preview), file-backed elements fall back to a temp dir.
+    """
+
+    clock: Clock
+    cache: Optional[Cache] = None
+    assets_dir: Optional[Path] = None
+    tag: str = ""
+
+    def asset_path(self, name: str, ext: str) -> Path:
+        import tempfile
+        d = self.assets_dir if self.assets_dir is not None else Path(tempfile.gettempdir())
+        d = Path(d)
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{name}{self.tag}.{ext}"
 
 
 def num(x: Union[Signal, Number], clock: Clock, cache: Optional[Cache] = None) -> float:

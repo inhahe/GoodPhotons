@@ -72,7 +72,8 @@ def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
     paths: List[Path] = []
     for k in range(frames):
         clock = Clock.at_frame(k, frames, fps)
-        text = scene.emit(clock, Cache())
+        tag = f"{k:0{width}d}"
+        text = scene.emit(clock, Cache(), assets_dir=outdir, tag=tag)
         p = outdir / f"{name}{k:0{width}d}.ftsl"
         p.write_text(text, encoding="utf-8")
         paths.append(p)
@@ -121,7 +122,8 @@ def render_still(scene: Scene, *, t: float = 0.0, name: str = "loom_still",
     ftrace = find_ftrace()
     clock = Clock(t=t, frame=0, frames=1, fps=30.0)
     fp = outdir / f"{name}.ftsl"
-    fp.write_text(scene.emit(clock, Cache()), encoding="utf-8")
+    fp.write_text(scene.emit(clock, Cache(), assets_dir=outdir, tag=""),
+                  encoding="utf-8")
     png = fp.with_suffix(".png")
     cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
            "-interval", f"{interval:g}", "-checkpoint",

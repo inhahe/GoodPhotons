@@ -82,7 +82,8 @@ def test_beads_from_pointpath():
     path = PointPath([vec(0, 0, 0), vec(1, 0, 0), vec(1, 1, 0), vec(0, 1, 0)],
                      closed=True)
     b = Beads(path, count=8, radius=0.1, material="m")
-    txt = b.emit(Clock(t=0.0), Cache())
+    from loom.ftsl_emit import EmitCtx
+    txt = b.emit(EmitCtx(clock=Clock(t=0.0), cache=Cache()))
     assert txt.count("sphere {") == 8
 
 
