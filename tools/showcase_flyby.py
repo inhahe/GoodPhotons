@@ -148,7 +148,11 @@ def print_run_banner(parser: argparse.ArgumentParser, args: argparse.Namespace,
     print("resolved parameters:")
     print(f"  mode           : {args.mode} ({'rasterized preview' if raster else 'transport mode'})")
     print(f"  resolution     : {args.res[0]} x {args.res[1]}")
-    print(f"  fps (playback) : {args.fps:g}  [{getattr(args, 'fps_source', '--fps')}]")
+    if args.explore:
+        print("  fps (playback) : (n/a in --explore; the interactive viewer renders "
+              "as fast as it can, no video is assembled)")
+    else:
+        print(f"  fps (playback) : {args.fps:g}  [{getattr(args, 'fps_source', '--fps')}]")
     print(f"  output         : {args.out}")
     print(f"  camera path    : {args.camera}")
     print(f"  explore        : {'on (interactive fly viewer, no render)' if args.explore else 'off'}")
@@ -252,7 +256,10 @@ def main() -> int:
 
     # Resolve the playback fps: --fps wins; else the scene authors it (flyby
     # camera's `fps`, then the scene-level `fps` default); else fall back to 30.
-    if args.fps is not None:
+    # Skipped entirely under --explore, which assembles no video (fps is unused).
+    if args.explore:
+        args.fps_source = "n/a"
+    elif args.fps is not None:
         args.fps_source = "--fps"
     else:
         scene_fps = read_scene_fps(args.scene, args.camera)
