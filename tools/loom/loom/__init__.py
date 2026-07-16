@@ -25,6 +25,10 @@ from .sweep import (
     rmf_frames, tangents, sweep_rings, skin, circle_profile, line_profile,
     write_obj,
 )
+from .iso import (
+    Isosurface, gyroid_surface, phase_drift, FIELDS,
+    gyroid, schwarz_p, schwarz_d, neovius,
+)
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
@@ -44,5 +48,7 @@ __all__ = [
     "SweptMesh", "ribbon", "tube", "blob", "fan",
     "rmf_frames", "tangents", "sweep_rings", "skin", "circle_profile",
     "line_profile", "write_obj",
+    "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",
+    "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
 ]
