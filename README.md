@@ -177,13 +177,21 @@ paths they can capture at all**.
 > | input | does |
 > |---|---|
 > | **move the mouse** | **steer** — horizontal motion turns (yaw), vertical motion looks up/down (pitch, clamped just shy of straight up/down). Where you look is where you fly. |
-> | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction, integrated by real elapsed time (frame-rate-independent) |
+> | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
 > | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
-> | **mouse wheel** | throttle the **fly speed**: up = faster, down = slower (starts at 60 % of the scene radius per second, clamped to a sane band) |
+> | **mouse wheel** | **dolly** one step forward (up) / back (down) per notch — a discrete, fully-rendered nudge for precise positioning (can't overshoot into geometry) |
+> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (starts at 2 % of the scene radius, clamped to a sane band) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
 > | `Esc` | **release the captured cursor** (so you can resize or close the window); click the window again to re-capture |
 > | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
+>
+> **Motion is feedback-locked, not wall-clock-based.** Each held-key frame (and each
+> wheel notch) moves the eye exactly one fixed `step`, and *one frame is rendered per
+> move* — so travel rate automatically scales with render speed: a heavy scene dollies
+> in a careful crawl, a light one moves briskly, and because every position you pass
+> through is actually drawn you can **never skip through a wall into the void between two
+> frames you didn't see**. Adjust the per-move distance live with `Ctrl`+wheel.
 >
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
 > the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there

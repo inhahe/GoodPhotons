@@ -4013,7 +4013,13 @@ static int run(int argc, char** argv) {
             double lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
             if (lookDist < 1e-4) lookDist = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0);
             const double sceneR = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0);
-            double       speed  = sceneR * 0.6;      // fly speed, world units / second
+            // Motion is FEEDBACK-LOCKED, not wall-clock-based: each held-key frame (and each
+            // wheel notch) advances the eye by this fixed `step` in world units, and exactly
+            // one frame is rendered per move. So travel rate auto-scales with render speed
+            // (heavy scene -> careful crawl, light scene -> quick) and you can never skip past
+            // geometry between two frames you didn't see. `step` is the per-move distance,
+            // adjustable live with Ctrl+wheel.
+            double       step   = sceneR * 0.02;     // per-frame / per-notch travel, world units
             const double kSens  = 0.0035;            // mouse-look sensitivity, radians / client pixel
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
             auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
@@ -4054,15 +4060,15 @@ static int run(int argc, char** argv) {
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
+              "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
               "         look:   move the mouse to steer (click the window to capture; Esc frees the cursor to resize/close)\n"
-              "         speed:  mouse wheel up/down = faster/slower (now %.2f u/s)\n"
+              "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
-              speed);
+              step);
             std::fflush(stdout);
 
             bool changed = true;   // render one frame immediately
-            auto tPrev = std::chrono::steady_clock::now();
             while (!g_liveWin->closed() && !g_stopRequested) {
                 // Match the render resolution to the live window: a user resize re-renders
                 // at the new size (smaller = faster, larger = crisper).
@@ -4073,16 +4079,16 @@ static int run(int argc, char** argv) {
                       std::fflush(stdout);
                   } }
                 NavInput nav = g_liveWin->drainNav();
-                auto  tNow = std::chrono::steady_clock::now();
-                double dt  = std::chrono::duration<double>(tNow - tPrev).count();
-                tPrev = tNow;
-                if (dt > 0.1) dt = 0.1;             // clamp a long stall so motion never jumps
 
-                // Wheel throttles the fly SPEED (up = faster), clamped to a sane band.
-                if (nav.wheel != 0.0) {
-                    speed = std::clamp(speed * std::pow(1.15, nav.wheel), sceneR * 0.02, sceneR * 20.0);
-                    std::printf("[viewer] speed %.3f u/s\n", speed); std::fflush(stdout);
+                // Ctrl+wheel adjusts the STEP SIZE (up = bigger), clamped to a sane band.
+                if (nav.wheelSpeed != 0.0) {
+                    step = std::clamp(step * std::pow(1.15, nav.wheelSpeed), sceneR * 1e-3, sceneR * 2.0);
+                    std::printf("[viewer] step %.3g u\n", step); std::fflush(stdout);
                 }
+                // Plain wheel DOLLIES: each notch moves the eye one `step` along the view ray
+                // (up = forward). Feedback-locked like the held keys — one bounded, rendered
+                // move per notch, so scrolling can't punch through geometry unseen.
+                if (nav.wheel != 0.0) { eye = eye + fwd * (step * nav.wheel); changed = true; }
                 // Reset restores the authored eye + look direction.
                 if (nav.reset) {
                     eye = eye0; fwd = norml(tgt0 - eye0);
@@ -4106,10 +4112,13 @@ static int run(int argc, char** argv) {
                     }
                     changed = true;
                 }
-                // Held throttle: fly forward while Space/+ is down, backward while Shift/-
-                // is down, integrated by real elapsed time so speed is frame-rate-independent.
-                if (nav.fwd)  { eye = eye + fwd * (speed * dt); changed = true; }
-                if (nav.back) { eye = eye - fwd * (speed * dt); changed = true; }
+                // Held throttle: advance ONE `step` per RENDERED frame while Space/+ (forward)
+                // or Shift/- (backward) is down. Deliberately NOT wall-clock-integrated —
+                // tying the move to the render cadence means every position you pass through
+                // is actually drawn, so a slow scene can't fling you through a wall between two
+                // frames you never saw. Travel rate = step x render-fps (faster scene = quicker).
+                if (nav.fwd)  { eye = eye + fwd * step; changed = true; }
+                if (nav.back) { eye = eye - fwd * step; changed = true; }
 
                 Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
                 if (changed) {

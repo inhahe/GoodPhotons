@@ -51,7 +51,8 @@ struct LiveWindow::Impl {
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
     std::mutex           inMtx;                     // guards the look/wheel accumulators + one-shots
     double               lookDx = 0.0, lookDy = 0.0;// accumulated mouse-look deltas (client px) since drain
-    double               wheelAcc = 0.0;            // accumulated wheel notches since last drain
+    double               wheelAcc = 0.0;            // plain wheel notches since drain (dolly move)
+    double               wheelSpeedAcc = 0.0;       // Ctrl+wheel notches since drain (step-size adjust)
     bool                 resetReq = false;          // '0' / Home pressed since last drain (one-shot)
     bool                 printReq = false;          // 'P' pressed since last drain (one-shot)
     // Held-key throttle state — atomics so WM_KEYUP on the UI thread and drainNav on the
@@ -181,11 +182,16 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             return 0;
         case WM_MOUSEWHEEL:
-            // One detent (120 units) = one notch of fly-SPEED: +ve (wheel up) = faster.
+            // One detent (120 units) = one notch. Plain wheel DOLLIES the camera one fly-step
+            // (+ve/wheel-up = forward, -ve = back); Ctrl+wheel adjusts the STEP SIZE instead
+            // (up = bigger steps). Both are feedback-locked — each notch is one bounded, fully
+            // rendered move, so you can never overshoot into geometry between frames.
             if (self) {
                 double notches = (double)GET_WHEEL_DELTA_WPARAM(wp) / 120.0;
+                bool   ctrl    = (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) != 0;
                 std::lock_guard<std::mutex> lk(self->inMtx);
-                self->wheelAcc += notches;
+                if (ctrl) self->wheelSpeedAcc += notches;
+                else      self->wheelAcc      += notches;
             }
             return 0;
         case WM_KEYDOWN:
@@ -362,8 +368,9 @@ NavInput LiveWindow::drainNav() {
     // Accumulated look/wheel deltas + one-shot edges: read-and-clear under the lock.
     std::lock_guard<std::mutex> lk(impl_->inMtx);
     n.lookDx = impl_->lookDx; n.lookDy = impl_->lookDy; n.wheel = impl_->wheelAcc;
+    n.wheelSpeed = impl_->wheelSpeedAcc;
     n.reset  = impl_->resetReq; n.print = impl_->printReq;
-    impl_->lookDx = impl_->lookDy = impl_->wheelAcc = 0.0;
+    impl_->lookDx = impl_->lookDy = impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = false;
     return n;
 }
