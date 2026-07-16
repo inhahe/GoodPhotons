@@ -55,6 +55,7 @@ struct LiveWindow::Impl {
     double               wheelSpeedAcc = 0.0;       // Ctrl+wheel notches since drain (step-size adjust)
     bool                 resetReq = false;          // '0' / Home pressed since last drain (one-shot)
     bool                 printReq = false;          // 'P' pressed since last drain (one-shot)
+    bool                 collideReq = false;        // 'C' pressed since last drain (one-shot)
     // Held-key throttle state — atomics so WM_KEYUP on the UI thread and drainNav on the
     // render thread can race freely without the inMtx.
     std::atomic<bool>    keyFwd{false};             // Space / '+' currently held -> fly forward
@@ -198,9 +199,10 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             // Unified fly-camera controls. Space or '+' (held) fly forward; Shift or '-'
             // (held) fly backward — you always travel where you look (or the exact
             // opposite when reversing). Mouse-look steers. Wheel throttles the speed.
-            // '0'/Home reset the camera, 'P' prints a paste-ready camera block, Esc
-            // releases the captured cursor. These are layout-independent (Space/Shift and
-            // the +/- keys land in the same place on QWERTY, Dvorak, etc.).
+            // '0'/Home reset the camera, 'P' prints a paste-ready camera block, 'C' cycles
+            // the collision mode (slide/stop/noclip), Esc releases the captured cursor. The
+            // movement keys are layout-independent (Space/Shift and the +/- keys land in the
+            // same place on QWERTY, Dvorak, etc.).
             if (self) {
                 switch (wp) {
                     case VK_SPACE: case VK_OEM_PLUS: case VK_ADD:
@@ -211,6 +213,8 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                         { std::lock_guard<std::mutex> lk(self->inMtx); self->resetReq = true; } break;
                     case 'P':
                         { std::lock_guard<std::mutex> lk(self->inMtx); self->printReq = true; } break;
+                    case 'C':
+                        { std::lock_guard<std::mutex> lk(self->inMtx); self->collideReq = true; } break;
                     case VK_ESCAPE:
                         self->setCapture(h, false); break;  // release cursor
                     default: break;
@@ -370,8 +374,9 @@ NavInput LiveWindow::drainNav() {
     n.lookDx = impl_->lookDx; n.lookDy = impl_->lookDy; n.wheel = impl_->wheelAcc;
     n.wheelSpeed = impl_->wheelSpeedAcc;
     n.reset  = impl_->resetReq; n.print = impl_->printReq;
+    n.cycleCollide = impl_->collideReq;
     impl_->lookDx = impl_->lookDy = impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
-    impl_->resetReq = impl_->printReq = false;
+    impl_->resetReq = impl_->printReq = impl_->collideReq = false;
     return n;
 }
 

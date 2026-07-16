@@ -2906,6 +2906,7 @@ static int run(int argc, char** argv) {
     bool doRaster    = false;     // -raster: fast solid-shaded preview (no light transport)
     bool exploreMode = false;     // -explore/-fly: raster + interactive fly viewer seeded at the first selected frame (no full render)
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
+    bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
 
@@ -3078,6 +3079,7 @@ static int run(int argc, char** argv) {
             exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
         }
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
+        else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
@@ -4029,6 +4031,42 @@ static int run(int argc, char** argv) {
             auto norml = [](const Vec3& v) -> Vec3 {
                 double L = std::sqrt(dot(v, v)); return (L > 1e-9) ? v * (1.0 / L) : v;
             };
+            // Collision: keep the eye out of solid geometry so you can't fly through a wall.
+            //   SLIDE  — stop at the wall but let the remaining motion slide along it, so
+            //            holding forward against a wall carries you around a corner into open
+            //            space (the default; also the least "stuck"-feeling).
+            //   STOP   — halt dead at the wall (no sideways drift).
+            //   OFF    — no collision (ghost through anything; for placing a camera outside
+            //            the room or inside glass). `-noclip` starts here.
+            enum CollideMode { COLLIDE_SLIDE, COLLIDE_STOP, COLLIDE_OFF };
+            CollideMode collide = viewerNoclip ? COLLIDE_OFF : COLLIDE_SLIDE;
+            auto collideName = [](CollideMode m) {
+                return m == COLLIDE_SLIDE ? "slide" : (m == COLLIDE_STOP ? "stop" : "off (noclip)");
+            };
+            // Resolve a proposed eye move against the scene. Casts along the motion with the
+            // engine's own BVH (scene.closestHit); keeps a `skin` standoff so the near plane
+            // never pokes through a surface. SLIDE iterates a few times so a corner (two walls)
+            // doesn't leak. Returns the collision-safe new position.
+            const double kSkin = sceneR * 0.02;       // standoff kept between eye and any wall
+            auto resolveMove = [&](Vec3 pos, Vec3 delta) -> Vec3 {
+                if (collide == COLLIDE_OFF) return pos + delta;
+                for (int iter = 0; iter < 4; ++iter) {
+                    double len = std::sqrt(dot(delta, delta));
+                    if (len < 1e-9) break;
+                    Vec3 dir = delta * (1.0 / len);
+                    Hit h = scene.closestHit(Ray{pos, dir}, 1e-6);
+                    if (!h.valid || h.t > len + kSkin) { pos = pos + delta; break; }  // clear path
+                    double advance = h.t - kSkin; if (advance < 0.0) advance = 0.0;   // stop short
+                    pos = pos + dir * advance;
+                    if (collide == COLLIDE_STOP) break;
+                    // Slide: strip the into-wall component from the leftover motion. h's
+                    // geometric normal oriented toward us (orientedGeoN) is the wall plane's.
+                    Vec3 n = orientedGeoN(h);
+                    Vec3 remain = dir * (len - advance);
+                    delta = remain - n * dot(remain, n);
+                }
+                return pos;
+            };
             // Interactive render resolution FOLLOWS THE LIVE WINDOW: fit the authored
             // W:H aspect into the current client area so the raster renders at (roughly)
             // one pixel per displayed pixel. Shrinking the window renders fewer pixels
@@ -4063,9 +4101,10 @@ static int run(int argc, char** argv) {
               "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
               "         look:   move the mouse to steer (click the window to capture; Esc frees the cursor to resize/close)\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
+              "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
-              step);
+              step, collideName(collide));
             std::fflush(stdout);
 
             bool changed = true;   // render one frame immediately
@@ -4085,10 +4124,17 @@ static int run(int argc, char** argv) {
                     step = std::clamp(step * std::pow(1.15, nav.wheelSpeed), sceneR * 1e-3, sceneR * 2.0);
                     std::printf("[viewer] step %.3g u\n", step); std::fflush(stdout);
                 }
-                // Plain wheel DOLLIES: each notch moves the eye one `step` along the view ray
-                // (up = forward). Feedback-locked like the held keys — one bounded, rendered
-                // move per notch, so scrolling can't punch through geometry unseen.
-                if (nav.wheel != 0.0) { eye = eye + fwd * (step * nav.wheel); changed = true; }
+                // C cycles the collision response: slide -> stop -> off -> slide.
+                if (nav.cycleCollide) {
+                    collide = (CollideMode)((collide + 1) % 3);
+                    std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
+                }
+                // Accumulate this frame's translation from all sources (plain-wheel dolly +
+                // held throttle), then resolve it ONCE against the scene so collision (and its
+                // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
+                // along the view ray (up = forward); held keys advance one `step`/frame.
+                Vec3 moveDelta{0, 0, 0};
+                if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * nav.wheel);
                 // Reset restores the authored eye + look direction.
                 if (nav.reset) {
                     eye = eye0; fwd = norml(tgt0 - eye0);
@@ -4117,8 +4163,10 @@ static int run(int argc, char** argv) {
                 // tying the move to the render cadence means every position you pass through
                 // is actually drawn, so a slow scene can't fling you through a wall between two
                 // frames you never saw. Travel rate = step x render-fps (faster scene = quicker).
-                if (nav.fwd)  { eye = eye + fwd * step; changed = true; }
-                if (nav.back) { eye = eye - fwd * step; changed = true; }
+                if (nav.fwd)  moveDelta = moveDelta + fwd * step;
+                if (nav.back) moveDelta = moveDelta - fwd * step;
+                // Apply the combined move through collision (no-op when collision is OFF).
+                if (dot(moveDelta, moveDelta) > 0.0) { eye = resolveMove(eye, moveDelta); changed = true; }
 
                 Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
                 if (changed) {

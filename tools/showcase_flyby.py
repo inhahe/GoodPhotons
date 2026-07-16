@@ -121,9 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--explore", action="store_true",
                    help="skip rendering the flyby: open the interactive fly viewer at "
                         "the first camera frame and let you explore it yourself "
-                        "(raster; Space/Shift to fly, mouse to look, wheel = speed, "
-                        "P prints a camera block, close the window to finish). "
-                        "Implies --no-meter.")
+                        "(raster; Space/Shift to fly, mouse to look, wheel to dolly, "
+                        "Ctrl+wheel = step size, C = wall collision, P prints a camera "
+                        "block, close the window to finish). Implies --no-meter.")
+    p.add_argument("--noclip", action="store_true",
+                   help="start the interactive fly viewer with wall collision OFF "
+                        "(-noclip), so you can fly through geometry to place a camera "
+                        "outside the room or inside glass. Collision is on by default; "
+                        "press C in the viewer to cycle slide/stop/off live")
     p.add_argument("--no-meter", action="store_true",
                    help="skip the exposure-lock metering pre-pass (-no-meter); frames "
                         "auto-expose per frame instead of metering the whole flyby. "
@@ -156,6 +161,8 @@ def print_run_banner(parser: argparse.ArgumentParser, args: argparse.Namespace,
     print(f"  output         : {args.out}")
     print(f"  camera path    : {args.camera}")
     print(f"  explore        : {'on (interactive fly viewer, no render)' if args.explore else 'off'}")
+    if args.explore:
+        print(f"  collision      : {'off (-noclip; fly through walls)' if args.noclip else 'on (slide; C cycles slide/stop/off)'}")
     print(f"  metering       : {'off (-no-meter; auto-expose per frame)' if (args.no_meter or args.explore) else 'on (exposure-lock pre-pass)'}")
     if raster:
         time_desc = "(n/a for raster - animates all frames then exits)"
@@ -189,6 +196,8 @@ def build_ftrace_cmd(args: argparse.Namespace, raster: bool) -> list[str]:
         # of the selected camera path and hands control to the user - no full render.
         # -explore already implies -no-meter inside ftrace.
         cmd.insert(cmd.index("-camera"), "-explore")
+        if args.noclip:
+            cmd.insert(cmd.index("-camera"), "-noclip")   # start with collision off
         return cmd
     if args.no_meter:
         cmd.insert(cmd.index("-camera"), "-no-meter")

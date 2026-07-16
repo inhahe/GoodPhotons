@@ -29,8 +29,9 @@
 //   * `wheel` (plain-wheel notches, + = up) DOLLIES the camera: each notch is one bounded
 //     fly-step forward (+) / back (-), fully rendered — precise, overshoot-proof nudging.
 //   * `wheelSpeed` (Ctrl+wheel notches, + = up) adjusts the STEP SIZE (up = bigger steps).
-//   * `reset` / `print` are one-shot edge flags ('0'/Home reset the camera; 'P' prints a
-//     paste-ready camera block). `looking` reports whether mouse-look is currently
+//   * `reset` / `print` / `cycleCollide` are one-shot edge flags ('0'/Home reset the
+//     camera; 'P' prints a paste-ready camera block; 'C' cycles the collision mode
+//     slide -> stop -> noclip). `looking` reports whether mouse-look is currently
 //     captured (Esc releases the cursor so the window can be resized/closed; a click
 //     re-captures).
 struct NavInput {
@@ -41,8 +42,9 @@ struct NavInput {
     bool   back   = false;               // Shift / '-' held  -> fly backward
     bool   reset  = false;               // '0' / Home pressed since last drain
     bool   print  = false;               // 'P' pressed since last drain
+    bool   cycleCollide = false;         // 'C' pressed since last drain (cycle collision mode)
     bool   looking = false;              // mouse-look captured (cursor hidden)
-    bool   any() const { return lookDx || lookDy || wheel || wheelSpeed || fwd || back || reset || print; }
+    bool   any() const { return lookDx || lookDy || wheel || wheelSpeed || fwd || back || reset || print || cycleCollide; }
 };
 
 class LiveWindow {
