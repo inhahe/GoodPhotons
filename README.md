@@ -264,8 +264,16 @@ paths they can capture at all**.
 >   live (WYSIWYG in the overlay and in the saved block).
 >
 > With Paint **off**, the wheel nudges one camera per notch and mouse-look is suspended
-> (the normal path-lock behaviour). Editing an existing curve in place (round-trip) is a
-> planned follow-on.
+> (the normal path-lock behaviour).
+>
+> **Editing an existing curve in place (round-trip).** When you open a scene that already
+> contains a `camera_curve` with `-explore` / `-fly`, the editor **seeds itself from that
+> curve's control points** — each `point` becomes an editor control point (with its look
+> direction taken from the curve's `look curve` / `look_at` / tangent, and its local speed
+> from the `density` track). The control-point markers appear in the overlay immediately,
+> so you can Del/Ins/steer/re-paint speed and Save a revised curve rather than starting
+> from an empty editor. The loaded flyby still plays at full fidelity until you make the
+> first edit.
 >
 > **Reviewing a rendered flyby (`-review <base>`).** Once a flyby has actually been
 > *rendered* to a directory of images, `ftrace -review <base>` plays that sequence back

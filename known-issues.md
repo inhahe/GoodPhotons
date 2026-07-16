@@ -5,11 +5,11 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN: camera_curve editor — remaining phases + rough edges
+### MOSTLY DONE: camera_curve editor — all five phases landed; minor rough edges remain
 
 The in-viewer `camera_curve` editor (main.cpp fly-viewer, Rec / +Pt / Ins / Del / Save)
 landed as **Phase 1** (core point authoring + recording + live spline overlay + Save a
-`camera_curve` block with a `look curve`). Planned follow-ons still to do:
+`camera_curve` block with a `look curve`). All planned follow-ons are now DONE:
 
 - **Phase 2 — speed painting. DONE (2026-07-16).** Additive wheel brush modulates
   per-control-point speed (inverse density) in Paint mode; emitted as a `density_at`
@@ -22,17 +22,19 @@ landed as **Phase 1** (core point authoring + recording + live spline overlay + 
   on the live window/timeline, scrub/Play, re-times via the Paint-mode speed brush, and
   Save writes a re-paced copy into `<dir>/retimed/` + an ffmpeg hint. `reviewMode()` in
   main.cpp.
-- **Phase 5 — round-trip.** Load an existing `camera_curve` back into the editor as
-  control points for editing (currently Save is write-only; the editor starts empty).
+- **Phase 5 — round-trip. DONE (2026-07-16).** Opening a scene with an existing
+  `camera_curve` under `-explore`/`-fly` seeds the editor's `editPts` from that curve's
+  control points (eye + look direction from look curve/look_at/tangent + per-point speed
+  from the `density` track). Captured at load in `ftsl.h` (`AuthoredCurve` on `Loaded`,
+  filled in `addCameraCurve`), consumed in `main.cpp`'s viewer. Save re-emits a revised
+  curve. The loaded flyby still plays at full fidelity until the first edit.
 
-Rough edges in Phase 1 to revisit: (a) the **first** authoring action (+Pt/Ins/Rec-stop)
-on a scene that was opened with an existing multi-frame flyby **replaces** the loaded
-`explorePath` with the editor's spline — intended ("author a new curve") but can surprise;
-seeding `editPts` from the loaded frames (part of Phase 5) would make it non-destructive.
-(b) The saved `look_point`s are placed one world-unit ahead of each eye along the recorded
-fwd — fine for direction but the look *spline* can bow between sparse points; Phase 3 will
-let the user shape it. (c) No explicit point *selection* UI yet — Del targets the nearest
-control point to the current eye.
+Rough edges to revisit: (a) The saved `look_point`s are placed one world-unit ahead of
+each eye along the point's fwd — fine for direction but the look *spline* can bow between
+sparse points; Paint-mode orientation steering (Phase 3) lets the user reshape it. (b) No
+explicit point *selection* UI yet — Del targets the nearest control point to the current
+eye. (c) Round-trip seeds only the FIRST `camera_curve` in a scene with several; multi-
+curve scenes edit whichever the viewer selected/rendered would be a follow-on.
 
 ### OPEN: interactive raster fly-viewer can peg all cores / grow RAM when orphaned or on a heavy scene
 

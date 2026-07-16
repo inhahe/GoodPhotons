@@ -545,11 +545,29 @@ struct CamSpec {
     std::shared_ptr<LensSystem> lens;
 };
 
+// Round-trip record of an authored `camera_curve`'s CONTROL POINTS (not the expanded
+// per-frame cameras), captured at load so the interactive editor (-explore / -fly) can
+// seed itself from an existing curve and edit it in place. Positions are in internal
+// units (metres), matching everything the viewer works with.
+struct AuthoredCurve {
+    std::string         name;
+    std::vector<Vec3>   eyes;      // `point` control points, in file order
+    std::vector<Vec3>   fwds;      // per-point unit look direction (from look curve / look_at / tangent)
+    std::vector<double> density;   // per-point rho (internal units); empty => uniform speed
+    Vec3   up{0, 1, 0};
+    double fov = 40.0;             // fov_y in degrees
+    char   mode = 0;               // 0 = inherit
+    bool   closed = false;
+};
+
 struct Loaded {
     Scene scene;
     // All authored cameras, in file order. Phase 3a: any number of `camera` blocks
     // accumulate; main renders the CLI-selected one, or all of them.
     std::vector<CamSpec> cameras;
+    // Control points of every authored `camera_curve` (for the in-viewer editor's
+    // round-trip load; see AuthoredCurve). Empty for scenes with no curve.
+    std::vector<AuthoredCurve> authoredCurves;
     // Mirror of the FIRST camera (kept so the pre-Phase-3a single-camera code paths
     // and defaults keep working unchanged).
     bool hasCamera = false;
@@ -3113,6 +3131,46 @@ private:
             } else {
                 rebuild(yawA, pitA);
             }
+        }
+
+        // ---- Round-trip capture: record this curve's CONTROL POINTS for the editor ----
+        // The in-viewer camera_curve editor seeds its `editPts` from this so an existing
+        // curve can be loaded and edited in place (rather than starting from an empty
+        // editor). Per control point we store the eye, a unit look direction (sampled from
+        // whichever orientation mode the curve uses), and — if a density was authored — the
+        // local rho so the editor's speed track round-trips too.
+        {
+            AuthoredCurve ac;
+            ac.name   = base;
+            ac.up     = shared.up;
+            ac.fov    = shared.fov;
+            ac.mode   = shared.mode;
+            ac.closed = closed;
+            ac.eyes   = pts;
+            const int nPts = (int)pts.size();
+            ac.fwds.reserve((size_t)nPts);
+            for (int i = 0; i < nPts; ++i) {
+                double gi = (double)i;                                  // control point i sits at g = i
+                double ui = (nSeg > 0) ? gi / (double)nSeg : 0.0;       // its normalized timeline position
+                Vec3 dir{0, 0, -1};
+                if (lookCurve && lookPts.size() >= 2) {
+                    dir = catmullRomAt(lookPts, closed, ui * (double)lookSeg, splineAlpha) - pts[(size_t)i];
+                } else if (lookFixed) {
+                    dir = fixedLook - pts[(size_t)i];
+                } else {                                                // tangent: central difference along the eye spline
+                    double eps = (nSeg > 0) ? (double)nSeg / 256.0 : 1e-3;
+                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, gi - eps), splineAlpha);
+                    Vec3 c = catmullRomAt(pts, closed, std::min((double)nSeg, gi + eps), splineAlpha);
+                    dir = c - a;
+                }
+                ac.fwds.push_back((length(dir) > 1e-9) ? normalize(dir) : Vec3{0, 0, -1});
+            }
+            if (haveDensity) {
+                ac.density.reserve((size_t)nPts);
+                for (int i = 0; i < nPts; ++i)
+                    ac.density.push_back(densityAt((nSeg > 0) ? (double)i / (double)nSeg : 0.0));
+            }
+            L.authoredCurves.push_back(std::move(ac));
         }
 
         int pad = 1; for (int f = N - 1; f >= 10; f /= 10) ++pad;   // zero-pad width

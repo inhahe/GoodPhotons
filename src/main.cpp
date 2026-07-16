@@ -4463,6 +4463,31 @@ static int run(int argc, char** argv) {
                 for (int i = 0; i < n; ++i) if (keep[(size_t)i]) out.push_back(in[(size_t)i]);
                 return out;
             };
+            // Round-trip (Phase 5): if the scene came from an existing `camera_curve`, seed the
+            // editor's control points from it so the curve can be EDITED in place rather than
+            // starting from an empty editor. We keep the loaded `explorePath` (the fully expanded
+            // flyby) for high-fidelity playback and only populate `editPts` / `ptSpeed` here — the
+            // overlay's control-point markers appear immediately, and the first authoring action
+            // refines the loaded points instead of replacing the path. Speed round-trips from the
+            // curve's `density` as a relative multiplier (mean/rho), so Save re-emits the profile.
+            if (!ftslScene.authoredCurves.empty()) {
+                const auto& ac = ftslScene.authoredCurves.front();
+                int n = (int)ac.eyes.size();
+                editPts.clear(); editPts.reserve((size_t)n);
+                for (int i = 0; i < n; ++i)
+                    editPts.push_back(PathFrame{ac.eyes[(size_t)i], ac.fwds[(size_t)i], ac.up, ac.fov});
+                ptSpeed.assign((size_t)n, 1.0);
+                if ((int)ac.density.size() == n && n > 0) {
+                    double mean = 0.0; for (double r : ac.density) mean += r; mean /= n;
+                    if (mean > 1e-12)
+                        for (int i = 0; i < n; ++i)
+                            ptSpeed[(size_t)i] = std::clamp(mean / std::max(1e-12, ac.density[(size_t)i]), 0.1, 10.0);
+                }
+                if (g_liveWin) g_liveWin->setEditState(false, n);
+                std::printf("[editor] loaded %d control points from camera_curve \"%s\" (edit in place)\n",
+                            n, ac.name.c_str());
+                std::fflush(stdout);
+            }
             // Write the authored control points as a camera_curve .ftsl block, next to the
             // scene file AND echoed to stdout so it can be pasted straight into a scene.
             auto saveCurveFn = [&]() {
