@@ -5,6 +5,32 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DONE (2026-07-16): raster see-through for clear objects (`-see-through`)
+
+Opt-in preview transparency for the `-raster` viewer, so clear materials read as
+see-through instead of the old solid pale ghost — *without* refraction. Implemented
+entirely in `raster.h` + a CLI flag in `main.cpp`:
+
+- **Model.** Each clear surface (dielectric / thin-film / filter / diffuse-transmit,
+  via `isClearPreviewType`) between the camera and the opaque background multiplies a
+  per-pixel transmittance (`clarity`, default 0.85) and accumulates a milk product, so
+  N crossed surfaces give `clarity^N` dimming + growing haze (a closed ball = 2
+  crossings). A grazing-angle Fresnel-ish term adds silhouette milk so edges read.
+  Composited in display-linear space in the tone-map pass:
+  `c = c*clearT + milkColor*(1 - milkT)`.
+- **Architecture.** `PTri`/`STri` gained a `clear` flag (set in `tessellate` from the
+  material type). Opaque pass skips clear tris; a second **order-independent**
+  band-parallel pass (`fillTriangleClear`) accumulates transmittance/milk against the
+  finished opaque z-buffer — the product is commutative so no transparent depth sort is
+  needed. Auto-exposure is still computed on the opaque-only accum (glass doesn't skew
+  exposure).
+- **CLI.** `-see-through` / `-seethrough` / `-glass` enable it; `-glass-clarity <0..1>`
+  sets the per-surface transmittance (implies the flag). Wired into the main raster
+  path and the interactive fly-viewer `renderFrame` calls (metering pass stays opaque).
+- **Possible follow-ups (not done):** per-channel coloured transmittance for tinted
+  glass/filters (currently neutral dimming); modelling thickness so a thin edge dims
+  less than a thick centre (currently every crossed triangle counts equally).
+
 ### DONE (2026-07-16): camera_curve editor — all five phases + rough edges landed
 
 The in-viewer `camera_curve` editor (main.cpp fly-viewer, Rec / +Pt / Ins / Del / Save)

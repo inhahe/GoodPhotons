@@ -124,7 +124,9 @@ paths they can capture at all**.
 > to world space) and z-buffers each camera as solid, flat diffuse+headlight
 > triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
-> ghost and a mirror as a flat tint. Shading sums a diffuse term from **every**
+> ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
+> `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
+> that still refracts nothing.) Shading sums a diffuse term from **every**
 > scene light using its real position/direction (spot cones included), so multi-
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
@@ -157,6 +159,23 @@ paths they can capture at all**.
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+>
+> **See-through clear objects — `-see-through`.** By default a clear material
+> (dielectric / thin-film / filter / diffuse-transmit) previews as a solid pale
+> ghost. Pass **`-see-through`** (aliases `-seethrough`, `-glass`) to instead render
+> those surfaces as actually transparent — *without* refraction. Each clear surface
+> between the camera and the opaque background **dims** what's behind it by a
+> per-surface transmittance and adds a little **milky haze**, and both effects
+> **accumulate with the number of clear surfaces crossed** (a closed glass ball =
+> two crossings, front + back), so thicker/stacked glass reads progressively darker
+> and hazier. A grazing-angle (Fresnel-like) term thickens the haze at silhouettes
+> so glass edges still read. It's **order-independent** (the transmittance is a
+> commutative product), so overlapping transparent objects need no depth sort and
+> the pass stays nearly free. Tune the per-surface transmittance with
+> **`-glass-clarity <0..1>`** (default `0.85`; higher = clearer/less dimming, and
+> passing it implies `-see-through`). This is a *look* preview only — there's still
+> no bending, reflection or coloured absorption. Example:
+> `ftrace -in scenes/cornell.ftsl -raster -see-through -window -o png/preview.png`.
 > Because rasterizing is nearly free, a preview whose size you haven't pinned with
 > `-r` is **upscaled so its long edge is at least 1440 px** (aspect preserved) —
 > a scene that authored a small `film { res 256 256 }` still previews big and
@@ -1612,6 +1631,8 @@ alone can't restore, so they are not disk-resumable.
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
+| `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
+| `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
 | `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. |
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |

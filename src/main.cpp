@@ -3160,6 +3160,8 @@ static int run(int argc, char** argv) {
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
+    double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
@@ -3333,6 +3335,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
         else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
+        else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
@@ -4086,6 +4090,8 @@ static int run(int argc, char** argv) {
     // -----------------------------------------------------------------------------
     if (doRaster) {
         std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
+        if (rasterSeeThrough)
+            std::printf("[raster] see-through: clear objects dim/haze what's behind them (clarity %.2f, no refraction)\n", rasterClarity);
         std::fflush(stdout);
 
         // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
@@ -4223,7 +4229,8 @@ static int run(int argc, char** argv) {
             // flicker frame-to-frame (shared anchor per group; per-frame when expGroup<0).
             const bool autoExp = !scene.absolute;
             double* lockAnchor = (autoExp && rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev, autoExp, lockAnchor);
+            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev, autoExp, lockAnchor,
+                                                           rasterSeeThrough, rasterClarity);
             std::string path = outFor(rc.name);
             if (!writeImage(path, W, H, img)) {
                 std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());
@@ -4921,7 +4928,8 @@ static int run(int argc, char** argv) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     std::vector<uint8_t> img =
-                        raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr);
+                        raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr,
+                                            rasterSeeThrough, rasterClarity);
                     drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
                     g_liveWin->update(VW, VH, img);
                     g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
