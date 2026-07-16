@@ -14,6 +14,7 @@ void LiveWindow::enablePanel(int, double, const char*) {}
 void LiveWindow::setPanelState(int, bool, bool, const char*) {}
 void LiveWindow::setPathCount(int) {}
 void LiveWindow::setEditState(bool, int) {}
+void LiveWindow::setSpeedLabel(double) {}
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -50,7 +51,9 @@ enum {
     ID_CLIP = 1001, ID_RESET, ID_PATH, ID_PLAY,
     ID_TIMELINE, ID_STRIDE, ID_RATE, ID_SW_UPDATE, ID_SW_SEC,
     // ---- curve-editor row ----
-    ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW
+    ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW,
+    // ---- paint-mode controls (speed + orientation painting) ----
+    ID_PAINT, ID_FLAT
 };
 static const int kPanelH = 92;              // reserved control-strip height (px): buttons + timeline + editor rows
 // Marshal cross-thread panel ops onto the window's own message-pump thread.
@@ -99,6 +102,8 @@ struct LiveWindow::Impl {
     // ---- curve-editor row controls ----
     HWND hRec=nullptr, hAddPt=nullptr, hInsPt=nullptr, hDelPt=nullptr, hSave=nullptr,
          hPtLbl=nullptr, hRaw=nullptr, hTolLbl=nullptr, hTol=nullptr;
+    // ---- paint-mode controls (on the timeline row, shown with the path group) ----
+    HWND hPaint=nullptr, hFlat=nullptr, hSpdLbl=nullptr;
     HFONT panelFont = nullptr;
     // Staged enablePanel() params (set under inMtx before WM_MKPANEL is sent).
     int                  reqPathCount = 0; double reqDefFps = 0.0; std::string reqCollide;
@@ -113,6 +118,8 @@ struct LiveWindow::Impl {
     bool                 recReq = false, addReq = false, insReq = false, delReq = false, saveReq = false;
     double               tolVal = -1.0;             // simplify tolerance (world units; <0 = unset/unchanged)
     bool                 rawVal = false;            // "raw" checkbox: keep every sample vs. simplify
+    bool                 paintVal = false;          // "Paint" checkbox: speed/orientation painting on (persistent)
+    bool                 flatReq = false;           // "Flat" button: reset painted speed (one-shot)
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
@@ -177,6 +184,12 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     SendMessageW(hTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, rng));
     SendMessageW(hTimeline, TBM_SETPAGESIZE, 0, (LPARAM)std::max(1, pathCount / 20));
     SendMessageW(hTimeline, TBM_SETPOS, TRUE, 0);
+    // Paint-mode controls (live on the timeline row, right of the trackbar): a Paint toggle
+    // (wheel paints speed / mouse paints orientation along the path), a Flat reset, and a
+    // local-speed readout. Shown/hidden with the rest of the path group.
+    hPaint  = mk(L"BUTTON", L"Paint", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_PAINT);
+    hFlat   = mk(L"BUTTON", L"Flat",  BS_PUSHBUTTON, ID_FLAT);
+    hSpdLbl = mk(L"STATIC", L"1.00x", SS_CENTER | SS_CENTERIMAGE, 0);
     showPathGroup(pathCount >= 2);
     // ---- Curve-editor row: author/record a camera_curve, then Save it ----
     hRec   = mk(L"BUTTON", L"Rec",   BS_PUSHBUTTON, ID_REC);
@@ -223,8 +236,15 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     place(hRate, 48, row1, bh);
     place(hSwUpdate, 66, row1, bh);
     place(hSwSec, 62, row1, bh);
-    // Row 2: the full-width timeline.
-    if (hTimeline) MoveWindow(hTimeline, pad, row2, std::max(1, W - 2 * pad), bh, TRUE);
+    // Row 2: the timeline, with the paint controls docked at the right end.
+    const int paintW = 52, flatW = 44, spdW = 52;
+    int rightBlock = paintW + flatW + spdW + 3 * pad;   // reserved on the right for paint tools
+    int tlW = std::max(1, W - 2 * pad - rightBlock);
+    if (hTimeline) MoveWindow(hTimeline, pad, row2, tlW, bh, TRUE);
+    x = pad + tlW + pad;
+    place(hPaint, paintW, row2, bh);
+    place(hFlat,  flatW,  row2, bh);
+    place(hSpdLbl, spdW,  row2, bh);
     // Row 3: the curve-editor toolset.
     x = pad;
     place(hRec,   56, row3, bh);
@@ -242,7 +262,8 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
 // curve with >= 2 cameras exists (loaded or authored). Called on build and from applyPathCount.
 void LiveWindow::Impl::showPathGroup(bool vis) {
     int sw = vis ? SW_SHOW : SW_HIDE;
-    HWND grp[] = { hPath, hPlay, hStrideLbl, hStride, hRateLbl, hRate, hSwUpdate, hSwSec, hTimeline };
+    HWND grp[] = { hPath, hPlay, hStrideLbl, hStride, hRateLbl, hRate, hSwUpdate, hSwSec, hTimeline,
+                   hPaint, hFlat, hSpdLbl };
     for (HWND c : grp) if (c) ShowWindow(c, sw);
 }
 
@@ -442,6 +463,13 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                             if (v >= 0.0) { std::lock_guard<std::mutex> lk(self->inMtx); self->tolVal = v; }
                         }
                         break;
+                    case ID_PAINT:
+                        if (code == BN_CLICKED && self->hPaint) {
+                            bool on = SendMessageW(self->hPaint, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            std::lock_guard<std::mutex> lk(self->inMtx); self->paintVal = on;
+                        }
+                        break;
+                    case ID_FLAT:  { std::lock_guard<std::mutex> lk(self->inMtx); self->flatReq = true; } break;
                     default: break;
                 }
             }
@@ -647,11 +675,14 @@ NavInput LiveWindow::drainNav() {
     n.recToggle = impl_->recReq;    n.addPoint = impl_->addReq;     n.insPoint = impl_->insReq;
     n.delPoint  = impl_->delReq;    n.saveCurve = impl_->saveReq;
     n.simplifyTol = impl_->tolVal;  n.rawRecord = impl_->rawVal;
+    // Paint-mode outputs: persistent checkbox state + one-shot Flat edge.
+    n.paintMode = impl_->paintVal;  n.speedReset = impl_->flatReq;
     impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = impl_->collideReq = false;
     impl_->pathReq = impl_->playReq = false;
     impl_->scrubReq = -1;
     impl_->recReq = impl_->addReq = impl_->insReq = impl_->delReq = impl_->saveReq = false;
+    impl_->flatReq = false;
     return n;
 }
 
@@ -704,6 +735,12 @@ void LiveWindow::setEditState(bool recording, int pointCount) {
     if (impl_->hRec)   SetWindowTextW(impl_->hRec, recording ? L"Stop" : L"Rec");
     if (impl_->hPtLbl) { wchar_t b[32]; swprintf(b, 32, L"pts: %d", pointCount);
                          SetWindowTextW(impl_->hPtLbl, b); }
+}
+
+void LiveWindow::setSpeedLabel(double speedX) {
+    if (!impl_ || !impl_->hasPanel.load() || !impl_->hSpdLbl) return;
+    wchar_t b[32]; swprintf(b, 32, L"%.2fx", speedX);
+    SetWindowTextW(impl_->hSpdLbl, b);   // marshals to the UI thread; no feedback edge
 }
 
 #endif // _WIN32

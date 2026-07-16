@@ -79,9 +79,17 @@ struct NavInput {
     bool   saveCurve  = false;           // "Save" button: write the authored camera_curve block (one-shot)
     double simplifyTol = -1.0;           // recording simplify tolerance in world units (current value; <0 = unchanged)
     bool   rawRecord  = false;           // "raw" checkbox: keep every recorded sample (true) vs. simplify (false)
+    // ---- Paint-mode outputs (speed + orientation painting along the path) ----
+    // `paintMode` is the persistent "Paint" checkbox state (not an edge): while it is on and the
+    // view is locked to the path, the plain wheel PAINTS local traversal speed (additive brush,
+    // clamped) at the current scrub position and mouse-look STEERS the nearest control points'
+    // orientation, instead of nudging/being suspended. `speedReset` is the one-shot "Flat" button
+    // (reset the painted speed track to uniform).
+    bool   paintMode  = false;           // "Paint" checkbox: wheel=speed, mouse=orientation on the path (persistent)
+    bool   speedReset = false;           // "Flat" button: reset painted speed to uniform (one-shot)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
                                 || cycleCollide || togglePath || togglePlay || scrubTo >= 0
-                                || recToggle || addPoint || insPoint || delPoint || saveCurve; }
+                                || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset; }
 };
 
 class LiveWindow {
@@ -130,6 +138,11 @@ public:
     // (Rec/Stop) and `pointCount` updates the control-point readout. Marshalled to the UI
     // thread; no feedback edge. No-op if the panel isn't enabled.
     void setEditState(bool recording, int pointCount);
+
+    // Update the panel's painted-speed readout (the "Paint" mode shows the local traversal-speed
+    // multiplier at the current scrub position, e.g. "1.35x"). Marshalled to the UI thread; no
+    // feedback edge. No-op if the panel isn't enabled / no path controls exist.
+    void setSpeedLabel(double speedX);
 
     // Push live viewer state so the panel mirrors reality (call from the render loop whenever
     // it changes): `idx` moves the timeline slider (e.g. during playback), `playing` sets the

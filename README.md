@@ -245,7 +245,26 @@ paths they can capture at all**.
 > uses for `camera_curve`, so the preview is WYSIWYG. The saved block records each control
 > point as a `point` plus a `look curve` (a second spline of `look_point` targets) so the
 > camera's orientation is authored too, and carries the current `up`, `fov_y`, render
-> `mode`, `frames`, and scene `fps`. Editing an existing curve in place (round-trip) is a
+> `mode`, `frames`, and scene `fps`.
+>
+> **Painting speed and orientation (Paint mode).** Two more controls sit at the right end
+> of the timeline row: a **Paint** toggle and a **Flat** button, with a live speed readout.
+> With **Paint** on and the view locked to the path, *fly the timeline* (Play or the
+> throttle keys) while:
+>
+> - **rolling the mouse wheel** to paint the **local traversal speed** at the current point
+>   — an *additive brush* (wheel up = faster there, down = slower), clamped, so you can
+>   play a pass, speed up the boring stretches and slow down the money shot, then play
+>   again to refine. Speed is the inverse of camera density, so it's exported as a
+>   `density_at` track and **both** the live playback pace **and** the rendered flyby's
+>   frame spacing follow it. The readout shows the multiplier (e.g. `1.35x`); **Flat**
+>   resets the whole speed track to a uniform pace.
+> - **moving the mouse** to **steer the orientation** at the current point — the nearest
+>   control points' look directions bend toward where you aim, reshaping the `look curve`
+>   live (WYSIWYG in the overlay and in the saved block).
+>
+> With Paint **off**, the wheel nudges one camera per notch and mouse-look is suspended
+> (the normal path-lock behaviour). Editing an existing curve in place (round-trip) is a
 > planned follow-on.
 >
 > The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and

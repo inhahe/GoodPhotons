@@ -4133,6 +4133,7 @@ static int run(int argc, char** argv) {
             // Last values mirrored to the panel, so we only re-push on an actual change.
             int    lastIdxSent = -1; bool lastPlaySent = false, lastPathSent = false;
             CollideMode lastCollideSent = collide;
+            double lastSpdSent = -1.0;   // last painted-speed readout pushed to the panel
             auto clampPos = [&](double p) { return std::clamp(p, 0.0, (double)std::max(0, pathCount - 1)); };
             using clock = std::chrono::steady_clock;
             auto prevT = clock::now();   // wall-clock delta for rate-mode traversal
@@ -4152,14 +4153,20 @@ static int run(int argc, char** argv) {
             bool   recRaw    = false;        // "raw" checkbox: keep every sample (ignore tol)
             std::vector<PathFrame> recRawBuf;// raw samples captured in the current recording pass
             Vec3   lastRecPos{0, 0, 0}; bool haveRecPos = false;
+            // Per-control-point traversal-SPEED multiplier (Phase 2 speed painting): 1.0 = the
+            // curve's natural pace, >1 faster / <1 slower. Kept in lockstep with editPts and
+            // exported on Save as `density_at` keyframes (camera density = inverse speed).
+            std::vector<double> ptSpeed;
             // Current free pose as a control-point frame.
             auto poseNow = [&]() -> PathFrame { return PathFrame{eye, fwd, worldUp, fovY}; };
             // Regenerate the preview path (explorePath) + timeline from the control points.
             auto rebuildPath = [&]() {
+                ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the speed track sized to the points
+                int oldCount = pathCount;
                 explorePath.clear();
                 int n = (int)editPts.size();
-                if (n == 0) { pathCount = 0; g_liveWin->setPathCount(0); return; }
-                if (n == 1) { explorePath.push_back(editPts[0]); pathCount = 1; g_liveWin->setPathCount(1); return; }
+                if (n == 0) { pathCount = 0; if (oldCount != 0) g_liveWin->setPathCount(0); return; }
+                if (n == 1) { explorePath.push_back(editPts[0]); pathCount = 1; if (oldCount != 1) g_liveWin->setPathCount(1); return; }
                 std::vector<Vec3> P, Lk; P.reserve(n); Lk.reserve(n);
                 for (const auto& e : editPts) { P.push_back(e.eye); Lk.push_back(e.eye + e.fwd); }
                 const bool closed = false; const int nSeg = n - 1;
@@ -4177,7 +4184,7 @@ static int run(int argc, char** argv) {
                     explorePath.push_back({pe, f, uu, fv});
                 }
                 pathCount = (int)explorePath.size();
-                g_liveWin->setPathCount(pathCount);
+                if (pathCount != oldCount) g_liveWin->setPathCount(pathCount);   // only notify on a real change
             };
             // Ramer-Douglas-Peucker simplify of a pose polyline by eye position (keeps ends).
             auto simplify = [&](const std::vector<PathFrame>& in, double tol) -> std::vector<PathFrame> {
@@ -4243,6 +4250,20 @@ static int run(int argc, char** argv) {
                     Vec3 lp = e.eye + e.fwd;   // a look target one unit ahead along the view ray
                     std::snprintf(hdr, sizeof hdr, "    look_point %.6g %.6g %.6g\n", lp.x, lp.y, lp.z); blk += hdr;
                 }
+                // Painted speed -> camera density (density = 1/speed). Emitted only when the
+                // pace is non-uniform; with `frames N` fixed, ftsl distributes the N cameras by
+                // this rho profile (absolute scale is irrelevant — only the relative shape).
+                bool nonUniform = false;
+                if (ptSpeed.size() == editPts.size())
+                    for (double s : ptSpeed) if (std::fabs(s - 1.0) > 1e-3) { nonUniform = true; break; }
+                if (nonUniform) {
+                    int np = (int)editPts.size();
+                    for (int i = 0; i < np; ++i) {
+                        double t = (np > 1) ? (double)i / (np - 1) : 0.0;
+                        double rho = 1.0 / std::max(ptSpeed[(size_t)i], 1e-3);
+                        std::snprintf(hdr, sizeof hdr, "    density_at %.4g %.4g\n", t, rho); blk += hdr;
+                    }
+                }
                 blk += "}\n";
                 std::ofstream of(outPath);
                 if (of.good()) { of << blk; of.close();
@@ -4286,6 +4307,55 @@ static int run(int argc, char** argv) {
                 for (size_t i = 0; i < editPts.size(); ++i)
                     marker(editPts[i].eye, 255, ((int)i == sel) ? 60 : 220, ((int)i == sel) ? 60 : 40);  // yellow / red-selected
             };
+            // ---- Speed / orientation PAINTING (Phase 2/3) -----------------------------
+            // The painted tracks are anchored to the CONTROL POINTS: speed is a per-point
+            // multiplier (ptSpeed) and orientation is each point's own look direction. The
+            // brush at a scrub position distributes its effect to the two bracketing control
+            // points, weighted by proximity — so scrubbing/playing while painting shapes a
+            // smooth track that the exported density_at / look curve reproduce.
+            auto bracket = [&](double pos, int& i, double& f) {   // scrub index -> (control seg, frac)
+                int n = (int)editPts.size();
+                int len = (int)explorePath.size();
+                double t = (len > 1) ? pos / (len - 1) : 0.0;   // normalized 0..1 along the curve
+                double g = t * std::max(0, n - 1);
+                i = (int)g; if (i < 0) i = 0; if (i > n - 2) i = std::max(0, n - 2);
+                f = (n >= 2) ? g - i : 0.0;
+            };
+            auto speedAt = [&](double pos) -> double {
+                int n = (int)ptSpeed.size();
+                if (n == 0) return 1.0;
+                if (n == 1) return ptSpeed[0];
+                int i; double f; bracket(pos, i, f);
+                return ptSpeed[(size_t)i] * (1.0 - f) + ptSpeed[(size_t)i + 1] * f;
+            };
+            auto paintSpeed = [&](double pos, double notches) {
+                int n = (int)ptSpeed.size();
+                if (n == 0) return;
+                double delta = notches * 0.15;   // additive per wheel notch
+                auto bump = [&](int k, double w) {
+                    if (k < 0 || k >= n || w <= 0.0) return;
+                    ptSpeed[(size_t)k] = std::clamp(ptSpeed[(size_t)k] + delta * w, 0.1, 10.0);
+                };
+                if (n == 1) { bump(0, 1.0); return; }
+                int i; double f; bracket(pos, i, f); bump(i, 1.0 - f); bump(i + 1, f);
+            };
+            auto paintOrient = [&](double pos, double lx, double ly) {
+                int n = (int)editPts.size();
+                if (n == 0) return;
+                double yaw = -lx * kYaw, pitch = -ly * kPitch;
+                auto steer = [&](int k, double w) {
+                    if (k < 0 || k >= n || w <= 1e-6) return;
+                    Vec3 d = norml(rotAxis(editPts[(size_t)k].fwd, worldUp, yaw * w));
+                    Vec3 right = cross(d, worldUp); double rl = std::sqrt(dot(right, right));
+                    if (rl > 1e-9) { right = right * (1.0 / rl);
+                        Vec3 cand = norml(rotAxis(d, right, pitch * w));
+                        if (std::fabs(dot(cand, worldUp)) < 0.9995) d = cand; }
+                    editPts[(size_t)k].fwd = d;
+                };
+                if (n == 1) { steer(0, 1.0); rebuildPath(); return; }
+                int i; double f; bracket(pos, i, f); steer(i, 1.0 - f); steer(i + 1, f);
+                rebuildPath();
+            };
             if (pathCount >= 2)
                 std::printf("[viewer] camera path: %d frames on the timeline"
                             " (Play/scrub/lock via the panel below the image)\n", pathCount);
@@ -4299,6 +4369,7 @@ static int run(int argc, char** argv) {
               "         panel:  Clip / Reset buttons below the image%s\n"
               "         editor: Rec records your flight into a camera_curve; +Pt appends the current pose;\n"
               "                 Ins inserts at the scrub point; Del removes the nearest point; Save writes a camera_curve block\n"
+              "         paint:  Paint (path mode) — wheel paints local speed (density) at the scrub point, mouse steers orientation; Flat resets speed\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
               "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
               step, collideName(collide),
@@ -4383,7 +4454,7 @@ static int run(int argc, char** argv) {
                         std::printf("[editor] recording flythrough (fly around; press Rec again to stop)\n");
                     } else {
                         std::vector<PathFrame> got = (!recRaw && recTol > 0.0) ? simplify(recRawBuf, recTol) : recRawBuf;
-                        for (const auto& g : got) editPts.push_back(g);
+                        for (const auto& g : got) { editPts.push_back(g); ptSpeed.push_back(1.0); }
                         rebuildPath();
                         std::printf("[editor] recorded %zu control points from %zu raw samples (tol %.4g, %s)\n",
                                     got.size(), recRawBuf.size(), recTol, recRaw ? "raw" : "simplified");
@@ -4392,17 +4463,18 @@ static int run(int argc, char** argv) {
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.addPoint) {
-                    editPts.push_back(poseNow());
+                    editPts.push_back(poseNow()); ptSpeed.push_back(1.0);
                     rebuildPath();
                     g_liveWin->setEditState(recording, (int)editPts.size());
                     std::printf("[editor] +point %zu at eye(%s)\n", editPts.size(), fmt3(eye).c_str());
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.insPoint) {
-                    if (editPts.size() < 2) editPts.push_back(poseNow());
+                    if (editPts.size() < 2) { editPts.push_back(poseNow()); ptSpeed.push_back(1.0); }
                     else {
                         int seg = std::clamp((int)(pathPos / kPreviewPerSeg), 0, (int)editPts.size() - 2);
                         editPts.insert(editPts.begin() + seg + 1, poseNow());
+                        ptSpeed.insert(ptSpeed.begin() + std::min((size_t)seg + 1, ptSpeed.size()), 1.0);
                     }
                     rebuildPath();
                     g_liveWin->setEditState(recording, (int)editPts.size());
@@ -4413,6 +4485,7 @@ static int run(int argc, char** argv) {
                     int best = 0; double bd = 1e300;
                     for (size_t i = 0; i < editPts.size(); ++i) { Vec3 d = editPts[i].eye - eye; double dd = dot(d, d); if (dd < bd) { bd = dd; best = (int)i; } }
                     editPts.erase(editPts.begin() + best);
+                    if ((size_t)best < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + best);
                     if (pathPos > std::max(0, pathCount - 1)) pathPos = std::max(0, pathCount - 1);
                     rebuildPath();
                     pathPos = clampPos(pathPos);
@@ -4421,6 +4494,12 @@ static int run(int argc, char** argv) {
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.saveCurve) saveCurveFn();
+                // "Flat" button: reset the painted speed track back to a uniform pace.
+                if (nav.speedReset) {
+                    std::fill(ptSpeed.begin(), ptSpeed.end(), 1.0);
+                    std::printf("[editor] speed reset to flat (1.00x everywhere)\n"); std::fflush(stdout);
+                    changed = true;
+                }
 
                 // The render camera's up vector and fov: fixed authored values while flying
                 // free; the current path frame's own up/fov while locked to the path.
@@ -4472,14 +4551,23 @@ static int run(int argc, char** argv) {
                     // (or Play auto-advance) move the cursor; the two speed modes decide how far
                     // per frame: rate mode = cameras/second on the wall clock (may skip frames on
                     // a slow render); stride mode = a fixed number of cameras per RENDERED frame.
+                    // PAINT mode (panel "Paint"): the plain wheel PAINTS local traversal speed
+                    // at the scrub position (additive brush) and mouse-look STEERS the nearest
+                    // control points' orientation — authoring the density_at + look curve live.
+                    // Outside paint mode the wheel nudges and mouse-look is suspended (as before).
+                    bool wheelPainted = false;
+                    if (nav.paintMode) {
+                        if (nav.wheel != 0.0 && !editPts.empty()) { paintSpeed(pathPos, nav.wheel); wheelPainted = true; changed = true; }
+                        if ((nav.lookX != 0.0 || nav.lookY != 0.0) && !editPts.empty()) { paintOrient(pathPos, nav.lookX, nav.lookY); changed = true; }
+                    }
                     double dir = 0.0;
                     if (playing)  dir += 1.0;
                     if (nav.fwd)  dir += 1.0;
                     if (nav.back) dir -= 1.0;
                     double advance = 0.0;
                     if (dir != 0.0)
-                        advance = rateMode ? (dir * camPerSec * dt) : (dir * (double)strideN);
-                    advance += nav.wheel;   // plain wheel nudges one camera per notch (precise)
+                        advance = (rateMode ? (dir * camPerSec * dt) : (dir * (double)strideN)) * speedAt(pathPos);
+                    if (!wheelPainted) advance += nav.wheel;   // plain wheel nudges one camera per notch (precise)
                     if (advance != 0.0) {
                         double np = clampPos(pathPos + advance);
                         if (np != pathPos) { pathPos = np; changed = true; }
@@ -4533,6 +4621,11 @@ static int run(int argc, char** argv) {
                         g_liveWin->setPanelState(idxNow, playing, pathMode, collideShort(collide));
                         lastIdxSent = idxNow; lastPlaySent = playing;
                         lastPathSent = pathMode; lastCollideSent = collide;
+                    }
+                    // Mirror the painted local-speed multiplier at the current scrub position.
+                    if (pathMode) {
+                        double sp = speedAt(pathPos);
+                        if (std::fabs(sp - lastSpdSent) > 5e-3) { g_liveWin->setSpeedLabel(sp); lastSpdSent = sp; }
                     }
                 }
                 // Sleep only when truly idle; while a throttle key is held, the mouse is
