@@ -31,19 +31,50 @@ out with "use mode A/B/C or R"), and `cudaBdptSupported()` rejects GRIN as defen
 GPU backward (mode R) already falls back to the CPU for *any* medium (`cudaBackwardSupported`
 rejects `anyMedium()`), so GRIN mode R runs on the GRIN-aware CPU backward tracer — correct.
 
-**Remaining smaller tech debt (Phase-1 semantics carried forward, not regressions):**
-(1) Each tracer bends only its PRIMARY ray — the backward camera ray and the forward photon
-path. Its *connection/NEE ray* is still straight: mode R's shadow ray to a light can't bend
-through a GRIN region (so it misses GRIN caustics — that's why `_grin_caustic` is dark in R),
-and the forward camera-splat (modes A/B) is straight (so imaging a surface *through* a GRIN
-lens via splat doesn't warp — use mode R for "camera looks through a GRIN lens", forward for
-"GRIN caustic onto a surface viewed directly"). Mode C (forward-catch) is fully unbiased but
-sample-starved. Curved-path connections (bending the shadow/splat ray) are a future
-enhancement. (2) At a dielectric interface *inside* a GRIN region the exterior IOR should be
-`nAt(hit)` not 1.0 (assumes GRIN regions sit in open air). (3) A GRIN medium that is *also*
-absorbing/scattering isn't integrated along the curved path (treated as clear — the classic
-use). Fixed-step RK1 (`iorStep`, default bound/64) suits smooth fields; steep gradients may
-want RK4 / adaptive stepping.
+Remaining GRIN tech debt is tracked as its own OPEN entry below.
+
+### OPEN: GRIN tech debt (Phase-1 semantics carried forward — not regressions)
+
+Follow-on work for the GRIN Phase-2 wiring above. None of these are bugs in the shipped
+behavior; they are known limits of the current bend-only model.
+
+1. **Only PRIMARY rays bend; connection/NEE rays are still straight.** Each tracer bends only
+   its primary ray — the backward camera ray and the forward photon path. Its *connection/NEE
+   ray* is straight: mode R's shadow ray to a light can't bend through a GRIN region (so it
+   misses GRIN caustics — that's why `_grin_caustic` is dark in R), and the forward
+   camera-splat (modes A/B) is straight (so imaging a surface *through* a GRIN lens via splat
+   doesn't warp — use mode R for "camera looks through a GRIN lens", forward for "GRIN caustic
+   onto a surface viewed directly"). Mode C (forward-catch) is fully unbiased but
+   sample-starved. Curved-path connections (bending the shadow/splat ray) are a future
+   enhancement.
+2. **Exterior IOR inside a GRIN region is hard-coded to 1.0.** At a dielectric interface
+   *inside* a GRIN region the exterior IOR should be `nAt(hit)` not 1.0 (the current code
+   assumes GRIN regions sit in open air). **Directly relevant to the pending xenon-lamp work:**
+   its bulb is a nested dielectric whose interior gas index differs from air, so a GRIN
+   gradient over that same region would need the correct surrounding index at each interface.
+3. **Absorbing/scattering GRIN not integrated along the curve.** A GRIN medium that is *also*
+   absorbing/scattering isn't integrated along the curved path (treated as clear — the classic
+   use). Fixed-step RK1 (`iorStep`, default bound/64) suits smooth fields; steep gradients may
+   want RK4 / adaptive stepping.
+
+**GRIN in BDPT (mode D) — deferred, may implement someday.** Mode D refuses GRIN today (see
+the DONE entry above: its connection G-term, area-measure pdf conversion and MIS weights all
+assume straight edges). Two tiers exist if we revisit it: (1) **cheap** — let the camera/light
+subpaths bend on their PRIMARY march (they already can elsewhere) and pdf-consistently *skip*
+any connection whose straight edge crosses a GRIN region; stays unbiased, only under-samples
+pure-GRIN-caustic paths (negligible for a weak gradient like the lamp gas), and would let mode
+D literally accept a GRIN scene. (2) **research-grade** — true curved connections (solve the
+two-point boundary-value problem for the connecting geodesic, generalized geometric/Jacobian
+term, consistent MIS); expensive and numerically nasty near a focus, poor ROI. Keep this on
+the radar; neither is built.
+
+**Showcase (`scenes/gallery_settled.ftsl`) render-mode note.** The hero stays in **mode D**
+for now (its documented command). If we want the xenon lamp to carry a GRIN gas gradient *and*
+have the whole hero render, the pragmatic route is to render the showcase in **mode B**
+(forward) instead — B supports GRIN and captures *all* the effects — accepting that it's
+**slower to converge** than D on this mixed scene. Tracked so we remember the trade-off:
+mode D now (fast, no lamp GRIN) vs. mode B later (slow, full effects incl. lamp GRIN), unless/
+until tier-1 "GRIN in mode D" above is built.
 
 ### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode
 

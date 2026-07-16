@@ -1168,6 +1168,42 @@ fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_cur
 `procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`,
 `gallery.ftsl` (a large room packed with varied materials around a gold gyroid), …).
 
+### Conditional blocks (`prefer { … } else { … }`)
+
+Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
+media** and **non-rectilinear (fisheye/panoramic) cameras**, which the bidirectional
+modes (`D` BDPT, `U` VCM) can't handle because their path-connection geometry assumes
+straight edges. Rather than maintaining two separate scene files, wrap the
+mode-sensitive blocks in a `prefer { … } else { … }` chain:
+
+```
+prefer {
+    camera "cam" { … mode D … }      # fast, robust — but no GRIN
+    medium  "lampgas" { … }           # (plain, non-GRIN)
+} else {
+    camera "cam" { … mode B … }      # slower, but renders everything
+    medium  "lampgas" { … ior … }     # GRIN version
+}
+```
+
+- Each **branch** is a complete set of top-level blocks (so it carries its own camera
+  mode *and* its own media — the two travel together, dissolving the "which mode
+  supports which medium" circularity).
+- `else` chains **flat** — `prefer { A } else { B } else { C }` — and you may **not**
+  nest a `prefer` inside a branch.
+- At load time the resolver **trial-builds each branch in order and picks the first one
+  that's renderable** under the active mode; if none qualify it falls back to the last
+  branch. It prints `[prefer] branch N rejected (<reason>); trying the next` and
+  `[prefer] using branch N of M` so you can see which won.
+- Only **cameras** and **media** (the features with real mode gaps) participate in the
+  support test; everything else always builds.
+
+The showcase (`scenes/gallery_settled.ftsl`) uses this to render in mode D today while
+keeping a mode-B "full-effects" branch (with the GRIN lamp gas) ready for the future.
+See also `-on-unsupported` under the command-line reference, which controls what
+happens when the *selected* mode still can't render a feature (error / fall back to
+mode R / strip the feature).
+
 ### Camera animation (`camera_path`, `camera_orbit`)
 
 Both expand into a sequence of frames sharing look_at/up/fov/mode/film/lens; a
@@ -1382,6 +1418,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
+| `-on-unsupported error\|fallback\|strip` | What to do when the selected mode can't render a scene feature (GRIN media, or a fisheye camera in mode `D`/`U`). `error` (default) prints a diagnostic and aborts; `fallback` renders that camera in mode `R` (backward reference) instead; `strip` removes the offending feature (e.g. drops the GRIN `ior`, turning the medium into a plain one) and renders in the requested mode anyway. Complements `prefer { … } else { … }` in the scene file, which resolves the mode/feature mismatch *before* this policy is consulted |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |

@@ -1848,6 +1848,93 @@ static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) 
     return nullptr;
 }
 
+// --- Unsupported-feature POLICY (`-on-unsupported`) + the `prefer{}/else{}` predicate ---
+// A scene may ask a mode to render something it can't (e.g. GRIN media in mode D). The
+// policy decides what happens: error out (default, historical), fall back to a mode that
+// CAN render it (backward reference R), or strip the offending feature and render anyway.
+enum class OnUnsupported { Error, Fallback, Strip };
+static OnUnsupported g_onUnsupported = OnUnsupported::Error;
+
+// Core capability check: return a reason string if `mode` cannot render `scene` with a
+// camera of the given `projection`, else nullptr. Only modes with real restrictions (D
+// BDPT, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything here.
+static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
+    if (mode == 'D') {
+        if (const char* r = bdptUnsupportedFeature(scene)) return r;
+        if (projection != CAM_RECTILINEAR)
+            return "a non-rectilinear (fisheye/panoramic) camera in mode D";
+    } else if (mode == 'U') {
+        if (const char* r = bdptUnsupportedFeature(scene)) return r;
+        if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
+        if (projection != CAM_RECTILINEAR)
+            return "a non-rectilinear (fisheye/panoramic) camera in mode U";
+    }
+    return nullptr;
+}
+
+// `prefer{}/else{}` predicate handed to ftsl::load: a branch is renderable iff EVERY
+// camera it declares can render the scene in its effective mode. `cliMode` (0 = none)
+// is a `-mode` override that forces the mode for all cameras.
+static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
+    auto effOf = [&](char camMode) -> char {
+        if (cliMode) return cliMode;
+        if (camMode) return camMode;
+        return L.mode ? L.mode : 'B';
+    };
+    if (!L.cameras.empty()) {
+        for (const auto& cs : L.cameras)
+            if (const char* r = modeFeatureUnsupported(L.scene, effOf(cs.mode), cs.projection))
+                return r;
+    } else {
+        if (const char* r = modeFeatureUnsupported(L.scene, effOf(0), CAM_RECTILINEAR))
+            return r;
+    }
+    return nullptr;
+}
+
+// Best-effort feature stripping for `-on-unsupported strip`. Today only GRIN is
+// strippable (clear the index field -> the medium is treated as homogeneous/clear).
+// Mutates `scene` only if that fully resolves the conflict; otherwise restores it and
+// returns false (so the caller falls back to a supported mode instead). Returns true iff
+// the scene now renders in `mode`.
+static bool stripUnsupportedFeature(Scene& scene, char mode, int projection) {
+    if (modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
+    std::vector<Medium> saved = scene.media;
+    bool anyGrin = false;
+    for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; anyGrin = true; }
+    if (anyGrin && modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
+    scene.media = saved;   // couldn't fully strip -> leave the scene intact
+    return false;
+}
+
+// Apply the `-on-unsupported` policy for one camera. Returns the (possibly changed) mode;
+// may mutate `scene` (strip). `proceed` is set false only when Error policy should abort
+// this camera's render. Prints a notice describing what happened.
+static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
+                                   const char* camName, bool& proceed) {
+    proceed = true;
+    const char* why = modeFeatureUnsupported(scene, mode, projection);
+    if (!why) return mode;
+    if (g_onUnsupported == OnUnsupported::Error) {
+        std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; "
+                             "use mode A/B/C/R, add a prefer{}/else{} fallback, or pass "
+                             "-on-unsupported fallback|strip.\n", mode, camName, why);
+        proceed = false;
+        return mode;
+    }
+    if (g_onUnsupported == OnUnsupported::Strip &&
+        stripUnsupportedFeature(scene, mode, projection)) {
+        std::printf("[on-unsupported=strip] camera '%s': stripped %s; rendering in mode %c "
+                    "anyway.\n", camName, why, mode);
+        return mode;
+    }
+    // Fallback (or strip couldn't resolve it): the backward reference (R) renders every
+    // feature BDPT/VCM refuse (GRIN, media, fisheye, fluorescence, ...).
+    std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode R "
+                "(backward reference).\n", camName, why, mode);
+    return 'R';
+}
+
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
 // in adaptive chunks so a CPU mode-R/D render gets the same live progress as the GPU.
 // `renderOne(chunkSpp, seedOffset)` renders one chunk and returns its SUM film; the
@@ -2839,11 +2926,34 @@ static int run(int argc, char** argv) {
             if (hasSceneExt(argv[i])) { inFile = argv[i]; positionalScene = true; break; }
         }
     }
+    // Pre-scan the two flags that affect `prefer{}/else{}` branch selection (which the
+    // loader resolves up-front): a `-mode` override forces the mode a branch is judged
+    // against, and `-on-unsupported` sets the global policy. Pre-scanning mirrors how
+    // -in is found above; the full CLI loop below re-parses them normally.
+    char cliModePrescan = 0;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (!std::strcmp(argv[i], "-mode")) cliModePrescan = argv[i + 1][0];
+        else if (!std::strcmp(argv[i], "-on-unsupported")) {
+            std::string v = argv[i + 1];
+            if      (v == "fallback" || v == "fall") g_onUnsupported = OnUnsupported::Fallback;
+            else if (v == "strip"    || v == "ignore") g_onUnsupported = OnUnsupported::Strip;
+            else                                     g_onUnsupported = OnUnsupported::Error;
+        }
+    }
+
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
     if (inFile) {
         std::string ferr;
-        if (!ftsl::load(inFile, ftslScene, ferr)) {
+        // The prefer/else resolver asks this predicate whether a branch renders; when the
+        // policy is fallback/strip we accept every branch (the policy handles it later at
+        // render time), so the FIRST/most-preferred branch always wins.
+        ftsl::SupportFn supportFn = (g_onUnsupported == OnUnsupported::Error)
+            ? ftsl::SupportFn([cliModePrescan](const ftsl::Loaded& L) -> const char* {
+                  return sceneModeUnsupported(L, cliModePrescan);
+              })
+            : ftsl::SupportFn{};
+        if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
             std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
         }
@@ -2872,6 +2982,7 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
@@ -3409,6 +3520,15 @@ static int run(int argc, char** argv) {
                     double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
                     cexp = (cexp > 0.0 ? cexp : 1.0) * camEq;
                 }
+            }
+            // Unsupported-feature policy (-on-unsupported): if this camera's mode still
+            // can't render the scene (e.g. GRIN media in mode D and no prefer{}/else{}
+            // branch selected one), apply the policy — error (abort), fall back to mode R,
+            // or strip the offending feature and render anyway.
+            {
+                bool proceed = true;
+                cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->name.c_str(), proceed);
+                if (!proceed) return 1;
             }
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov});
         }

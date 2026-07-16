@@ -58,6 +58,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <functional>
 #include "scene.h"
 #include "camera.h"
 #include "spectrum.h"
@@ -146,6 +147,10 @@ struct Block {
     std::string name;                  // quoted name, if any
     std::vector<Stmt> stmts;           // newline-structured statements
     std::vector<std::string> words;    // flat token dump (for table/palette lists)
+    // For type == "prefer": ordered alternative branches (`prefer { .. } else { .. }`).
+    // Each branch is a list of ordinary top-level blocks; the loader picks the first
+    // branch whose spliced scene is fully renderable in its chosen mode. Empty otherwise.
+    std::vector<std::vector<Block>> branches;
 };
 
 struct Parser {
@@ -220,26 +225,71 @@ struct Parser {
         else fail("unterminated '{'");
     }
 
+    // Parse ONE top-level block (or a `prefer { } else { }` construct) starting at
+    // cur() (which must be a Word). Fills `b`; returns false on a parse error.
+    bool parseOneTopBlock(Block& b) {
+        if (!is(Tok::Word)) { fail("expected a block type"); return false; }
+        b.type = cur().text; adv();
+        if (b.type == "prefer") return parsePrefer(b);
+        if (is(Tok::String)) { b.name = cur().text; adv(); }
+        // Optional bareword subtype (light area / light collimated), but not '='.
+        if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
+        if (b.type == "spectrum") {
+            if (is(Tok::Word) && cur().text == "=") adv();
+            else { fail("spectrum declaration needs '='"); return false; }
+            Stmt s; s.key = "="; s.line = cur().line;
+            parseValue("=", s.val);
+            b.stmts.push_back(std::move(s));
+        } else {
+            if (!is(Tok::LBrace)) { fail("expected '{' after " + b.type); return false; }
+            parseBraceBody(b);
+        }
+        return true;
+    }
+
+    // Parse a `{ <top-level blocks> }` list (cur() must be LBrace). Consumes the braces.
+    // Used for each branch of a `prefer`/`else` construct.
+    std::vector<Block> parseBlockList() {
+        std::vector<Block> list;
+        adv();   // consume '{'
+        skipNewlines();
+        while (!is(Tok::RBrace) && !is(Tok::End) && err.empty()) {
+            Block b;
+            if (!parseOneTopBlock(b)) break;
+            list.push_back(std::move(b));
+            skipNewlines();
+        }
+        if (is(Tok::RBrace)) adv();
+        else fail("unterminated 'prefer'/'else' block");
+        return list;
+    }
+
+    // Parse `prefer { .. } else { .. } else { .. }` (b.type already == "prefer").
+    // Each brace group becomes one ordered branch in b.branches; `else` chains flatly.
+    bool parsePrefer(Block& b) {
+        skipNewlines();
+        if (!is(Tok::LBrace)) { fail("'prefer' needs '{ ... }'"); return false; }
+        b.branches.push_back(parseBlockList());
+        if (!err.empty()) return false;
+        for (;;) {
+            skipNewlines();
+            if (is(Tok::Word) && cur().text == "else") {
+                adv(); skipNewlines();
+                if (!is(Tok::LBrace)) { fail("'else' needs '{ ... }'"); return false; }
+                b.branches.push_back(parseBlockList());
+                if (!err.empty()) return false;
+            } else break;
+        }
+        return true;
+    }
+
     // Parse the whole file into a list of top-level blocks.
     std::vector<Block> parseTop() {
         std::vector<Block> blocks;
         skipNewlines();
         while (!is(Tok::End) && err.empty()) {
-            if (!is(Tok::Word)) { fail("expected a block type"); break; }
-            Block b; b.type = cur().text; adv();
-            if (is(Tok::String)) { b.name = cur().text; adv(); }
-            // Optional bareword subtype (light area / light collimated), but not '='.
-            if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
-            if (b.type == "spectrum") {
-                if (is(Tok::Word) && cur().text == "=") adv();
-                else { fail("spectrum declaration needs '='"); break; }
-                Stmt s; s.key = "="; s.line = cur().line;
-                parseValue("=", s.val);
-                b.stmts.push_back(std::move(s));
-            } else {
-                if (!is(Tok::LBrace)) { fail("expected '{' after " + b.type); break; }
-                parseBraceBody(b);
-            }
+            Block b;
+            if (!parseOneTopBlock(b)) break;
             blocks.push_back(std::move(b));
             skipNewlines();
         }
@@ -3055,8 +3105,38 @@ private:
     }
 };
 
-// Load an FTSL file, populating `L`. Returns false and sets `err` on any error.
-inline bool load(const std::string& path, Loaded& L, std::string& err) {
+// A caller-supplied capability predicate for `prefer{}/else{}` resolution: given a
+// freshly-built scene it returns a reason string if the scene is NOT renderable (some
+// feature unsupported by the mode it would render in), or nullptr if it is fine. main.cpp
+// supplies this using its per-mode support gates (BDPT/VCM/fisheye). Empty => no filtering
+// (the first / most-preferred branch always wins).
+using SupportFn = std::function<const char*(const Loaded&)>;
+
+// Splice a flat block list: each top-level `prefer` node (at preferIdx[k]) is replaced by
+// the blocks of its choice[k]-th branch; all other blocks pass through unchanged.
+inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
+                                        const std::vector<size_t>& preferIdx,
+                                        const std::vector<int>& choice) {
+    std::vector<Block> flat;
+    size_t k = 0;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (k < preferIdx.size() && preferIdx[k] == i) {
+            const auto& branch = blocks[i].branches[(size_t)choice[k]];
+            for (const auto& bb : branch) flat.push_back(bb);
+            ++k;
+        } else {
+            flat.push_back(blocks[i]);
+        }
+    }
+    return flat;
+}
+
+// Load an FTSL file, populating `L`. Returns false and sets `err` on any error. When the
+// scene contains `prefer{}/else{}` blocks, `supported` chooses which branch renders (see
+// SupportFn): the first branch whose spliced scene is fully renderable wins, falling back
+// to the last branch when none are (a loud mode error then fires at render time).
+inline bool load(const std::string& path, Loaded& L, std::string& err,
+                 const SupportFn& supported = {}) {
     std::ifstream f(path);
     if (!f) { err = "cannot open scene file: " + path; return false; }
     std::stringstream ss; ss << f.rdbuf();
@@ -3066,8 +3146,70 @@ inline bool load(const std::string& path, Loaded& L, std::string& err) {
     std::vector<Block> blocks = p.parseTop();
     if (!p.err.empty()) { err = p.err; return false; }
 
+    // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
+    std::vector<size_t> preferIdx;
+    for (size_t i = 0; i < blocks.size(); ++i)
+        if (blocks[i].type == "prefer") preferIdx.push_back(i);
+
+    if (preferIdx.empty()) {
+        Builder bld;
+        if (!bld.build(blocks, L)) { err = bld.err; return false; }
+        return true;
+    }
+
+    // Validate: every prefer must have >=1 branch and must not nest another prefer inside
+    // a branch (use flat `else` chaining instead — keeps resolution non-circular).
+    for (size_t idx : preferIdx) {
+        if (blocks[idx].branches.empty()) { err = "'prefer' has no branches"; return false; }
+        for (const auto& branch : blocks[idx].branches)
+            for (const auto& bb : branch)
+                if (bb.type == "prefer") {
+                    err = "nested 'prefer' inside a branch is not supported; use "
+                          "'prefer { } else { } else { }' chaining instead";
+                    return false;
+                }
+    }
+
+    // Try-build a candidate (fresh Builder each time). Returns:
+    //   built=false           -> the branch's scene has a real authoring error (buildErr set)
+    //   built=true, reason==0  -> renderable
+    //   built=true, reason!=0  -> builds but the mode can't render some feature
+    struct Trial { bool built; std::string buildErr; const char* reason; };
+    auto tryBuild = [&](const std::vector<int>& ch, Loaded& out) -> Trial {
+        std::vector<Block> flat = flattenPrefer(blocks, preferIdx, ch);
+        Builder bld;
+        if (!bld.build(flat, out)) return {false, bld.err, nullptr};
+        return {true, {}, supported ? supported(out) : nullptr};
+    };
+
+    // Greedy per-node resolution (nodes fixed left-to-right; the realistic case is a
+    // single node). For each node pick the first branch that yields a renderable scene,
+    // else keep the last branch.
+    std::vector<int> choice(preferIdx.size(), 0);
+    for (size_t j = 0; j < preferIdx.size(); ++j) {
+        int nb = (int)blocks[preferIdx[j]].branches.size();
+        int chosen = nb - 1;
+        for (int c = 0; c < nb; ++c) {
+            choice[j] = c;
+            Loaded trial;
+            Trial t = tryBuild(choice, trial);
+            if (t.built && t.reason == nullptr) { chosen = c; break; }   // renderable -> take it
+            if (c < nb - 1) {
+                const char* why = t.built ? t.reason : t.buildErr.c_str();
+                std::fprintf(stderr, "[prefer] branch %d rejected (%s); trying the next\n",
+                             c + 1, why ? why : "unrenderable");
+            }
+        }
+        choice[j] = chosen;
+    }
+
+    // Final build with the resolved choices.
+    std::vector<Block> flat = flattenPrefer(blocks, preferIdx, choice);
     Builder bld;
-    if (!bld.build(blocks, L)) { err = bld.err; return false; }
+    if (!bld.build(flat, L)) { err = bld.err; return false; }
+    for (size_t j = 0; j < preferIdx.size(); ++j)
+        std::printf("[prefer] using branch %d of %d\n",
+                    choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());
     return true;
 }
 

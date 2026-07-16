@@ -48,6 +48,40 @@ blocktype ["name"] [subtype] { … }
 - `light` takes a **subtype** bareword: `light area { … }`, `light spot { … }`, etc.
 - All other blocks are `type ["name"] { … }`.
 
+### 1.3 Conditional blocks (`prefer { … } else { … }`)
+
+A top-level `prefer` node holds ordered **branches**, each a complete list of top-level
+blocks. The loader trial-builds them in order and keeps the first branch that is
+**renderable under the active render mode**, splicing its blocks into the scene as if
+they'd been written inline; if none qualify, the last branch is used as the fallback.
+
+```
+prefer {
+    camera "cam" { … mode D … }
+    medium  "gas" { … }            # plain (non-GRIN)
+} else {
+    camera "cam" { … mode B … }
+    medium  "gas" { … ior … }      # GRIN version
+}
+```
+
+Rules:
+
+- `else` chains **flat**: `prefer { A } else { B } else { C }`. A branch may **not**
+  contain a nested `prefer` (the parser errors).
+- Each branch must have at least one block.
+- Only **cameras** and **media** carry mode-support constraints today — GRIN media
+  (`medium … { ior … }`) and non-rectilinear cameras (`projection fisheye/…`) are the
+  features rejected by the bidirectional modes (`D` BDPT, `U` VCM). The support test
+  wraps `bdptUnsupportedFeature` / the fisheye/media checks; everything else always
+  builds.
+- Resolution logs `[prefer] branch N rejected (<reason>); trying the next` and
+  `[prefer] using branch N of M`.
+
+The CLI flag `-on-unsupported error|fallback|strip` is a separate, lower-priority
+safety net applied *after* prefer resolution, for when the finally-selected mode still
+can't render a feature (see the command-line reference).
+
 ---
 
 ## 2. Units and the `scene` block
