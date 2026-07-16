@@ -65,6 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "frames)")
     p.add_argument("--spp", type=int, default=None,
                    help="samples per pixel per frame (non-raster modes only)")
+    p.add_argument("--preview", dest="preview", action="store_true",
+                   help="also show the live ANSI terminal thumbnail (-preview); "
+                        "off by default, the OS live window (-window) is always on")
     p.add_argument("--keep-frames", action="store_true",
                    help="keep the per-frame PNGs after building the video "
                         "(default: leave them in png/showcase_fly/ anyway)")
@@ -96,6 +99,7 @@ def print_run_banner(parser: argparse.ArgumentParser, args: argparse.Namespace,
         time_desc = "(none -> hold window open until you close it)"
     print(f"  per-frame time : {time_desc}")
     print(f"  spp            : {args.spp if args.spp is not None else '(scene default)'}")
+    print(f"  preview        : {'on (-window + -preview ANSI thumbnail)' if args.preview else 'window only (-window)'}")
     print(f"  frame PNG dir  : {FRAME_DIR}")
     print(f"  frame stem     : {FRAME_STEM}")
     print(f"  ftrace exe     : {FTRACE}")
@@ -112,6 +116,8 @@ def build_ftrace_cmd(args: argparse.Namespace, raster: bool) -> list[str]:
            "-r", str(args.res[0]), str(args.res[1]),
            "-window",
            "-o", str(frame_out)]
+    if args.preview:
+        cmd.append("-preview")   # live ANSI thumbnail in the terminal too
     if raster:
         # Raster flyby animates every frame in the window then exits, writing one
         # PNG per frame - exactly what we want before handing off to ffmpeg.
