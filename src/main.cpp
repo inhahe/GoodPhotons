@@ -127,6 +127,7 @@
 #include <algorithm>
 #include <thread>
 #include <map>
+#include <set>
 #include <memory>
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
@@ -3449,6 +3450,67 @@ static int run(int argc, char** argv) {
     // no auto-exposure to lock) and when a global -exposure-lock is forcing one anchor.
     struct MeterCam { Camera cam; char mode; int res; int resY; std::string name; };
     std::map<int, std::vector<MeterCam>> meterPlan;   // group -> metering camera(s) (>1 = average)
+    std::set<int> meterAdaptive;                      // groups whose plan is metered ADAPTIVELY
+
+    // Low-discrepancy metering ORDER over a path's N frames. Instead of picking evenly
+    // spaced frames (which can ALIAS with a periodic exposure swing along the path — an
+    // orbit that passes a light once per revolution, say — biasing the averaged anchor),
+    // we walk the frames in van der Corput (base-2 radical-inverse / bit-reversal) order:
+    // 0, N/2, N/4, 3N/4, N/8, …  Every prefix of this sequence is uniformly spread over
+    // the whole path AND non-periodic, so an adaptive meter that stops after k frames has
+    // still sampled the entire flyby evenly with no periodic bias — and it is deterministic
+    // (reproducible), which a purely random jitter would not be. Rounding collisions are
+    // resolved by probing to the nearest unused index, so the result is a permutation.
+    auto meterOrder = [](int n) {
+        std::vector<int> order; order.reserve(std::max(0, n));
+        if (n <= 0) return order;
+        std::vector<char> used(n, 0);
+        for (int r = 0; (int)order.size() < n; ++r) {
+            unsigned b = (unsigned)r; double f = 0.0, base = 0.5;   // radical inverse base 2 of r
+            while (b) { f += (b & 1u) * base; b >>= 1; base *= 0.5; }
+            int i = (int)(f * n); if (i >= n) i = n - 1;
+            while (used[i]) i = (i + 1) % n;                        // nearest unused (dedupe rounding)
+            used[i] = 1; order.push_back(i);
+        }
+        return order;
+    };
+
+    // Adaptive stop for an AVERAGED exposure meter. We don't know a path's exposure
+    // variance up front, so rather than metering a fixed frame count we meter in the
+    // low-discrepancy order above and watch the running mean converge. The anchor is a
+    // brightness, so convergence is judged in STOPS (log2): at successive power-of-two
+    // checkpoints (8,16,32,…) we compare the running mean-of-log2 to the previous
+    // checkpoint and stop once it moves less than `tolStops`. Bounded to [kMin, kMax]
+    // valid samples, so a smooth path settles in ~16 frames while a wildly varying one
+    // keeps going (up to kMax) for a faithful average — the count adapts to the DATA
+    // instead of a guessed constant. The returned anchor is the ARITHMETIC mean of the
+    // metered per-frame anchors (unchanged from the non-adaptive path, so short paths
+    // that meter every frame are bit-identical to before).
+    struct MeterConverge {
+        int    kMin, kMax; double tolStops;
+        int    k = 0; double sumLin = 0.0, sumLog2 = 0.0;
+        int    nextCheck; double lastMean = 0.0; bool haveLast = false;
+        MeterConverge(int kmn, int kmx, double tol)
+            : kMin(kmn), kMax(kmx), tolStops(tol), nextCheck(std::max(kmn, 8)) {}
+        // Feed one per-frame anchor (>0 to count). Returns true once enough frames are in.
+        bool add(double a) {
+            if (a > 0.0) { sumLin += a; sumLog2 += std::log2(a); ++k; }
+            if (k >= kMax) return true;
+            if (k >= kMin && k >= nextCheck) {
+                double mean = sumLog2 / k;
+                bool conv = haveLast && std::fabs(mean - lastMean) <= tolStops;
+                lastMean = mean; haveLast = true; nextCheck *= 2;
+                if (conv) return true;
+            }
+            return false;
+        }
+        double anchor() const { return k > 0 ? sumLin / k : 0.0; }
+        int    used()   const { return k; }
+    };
+    // Adaptive-meter bounds: never fewer than kMeterMin nor more than kMeterMax frames.
+    constexpr int    kMeterMin = 8, kMeterMax = 64;
+    constexpr double kMeterTolStops = 0.02;   // stop when the mean moves < 0.02 stop
+
     if (fromFtsl && !ftslScene.cameras.empty() && !scene.absolute && !forceExposureLock) {
         // Build a camera the same way the render loop does, minus the verbose lens logging.
         auto buildMeterCam = [&](const ftsl::CamSpec& cs) -> MeterCam {
@@ -3483,23 +3545,15 @@ static int run(int argc, char** argv) {
                     // Average the per-frame anchors — but metering every frame of a long
                     // flyby is wasteful. Each meter frame projects the WHOLE scene (the
                     // dominant, resolution-independent cost), and the locked anchor is a
-                    // smooth statistic of the path, so a stratified subsample estimates the
-                    // same mean to well within a tenth of a stop. Cap at kMeterFrames evenly
-                    // spaced frames (endpoints included) instead of all N. Measured on
-                    // gallery.ftsl (144-frame camera_curve, 4.65 M tris): all-144 average
-                    // anchor 1.597 vs 32-frame subsample 1.697 — a 0.088-stop difference
-                    // (invisible), for a ~4.5x cheaper meter pre-pass.
-                    constexpr int kMeterFrames = 32;
+                    // smooth statistic of the path. Rather than a fixed subsample count, we
+                    // queue ALL frames in low-discrepancy (van der Corput) order and let the
+                    // meter loop stop ADAPTIVELY once the running average converges (see
+                    // MeterConverge). That kills the periodic-aliasing bias of even spacing
+                    // and spends frames in proportion to how variable the path actually is:
+                    // a smooth dolly settles in ~16 frames, a wild orbit meters up to kMax.
                     const int n = (int)members.size();
-                    if (n <= kMeterFrames) {
-                        for (const auto* cs : members) addFrame(*cs);
-                    } else {
-                        // Evenly spaced indices in [0, n-1], endpoints included.
-                        for (int j = 0; j < kMeterFrames; ++j) {
-                            long long idx = (long long)j * (n - 1) / (kMeterFrames - 1);
-                            addFrame(*members[(size_t)idx]);
-                        }
-                    }
+                    for (int idx : meterOrder(n)) addFrame(*members[(size_t)idx]);
+                    meterAdaptive.insert(g);
                     break;
                 }
                 case ftsl::CamSpec::EXPLOCK_INDEX: {
@@ -3612,51 +3666,49 @@ static int run(int argc, char** argv) {
         // stdout percentage + a window title, and it pushes each freshly-metered frame to
         // the live window so the preview animates through the metering instead of sitting
         // blank on the last tessellation frame.
-        size_t meterTotal = 0;
-        for (const auto& [g, cams] : meterPlan) meterTotal += cams.size();
         size_t meterDone = 0;
         auto   meterTick = std::chrono::steady_clock::now();
         for (const auto& [g, cams] : meterPlan) {
             if (cams.empty()) continue;
-            double sum = 0.0; int m = 0;
+            const bool adaptive = meterAdaptive.count(g) != 0;
+            const int  N   = (int)cams.size();
+            const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
+            const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
+            MeterConverge conv(kmn, kmx, kMeterTolStops);
             for (const auto& mc : cams) {
                 if (g_liveWin && g_liveWin->closed()) { g_stopRequested = 1; break; }
                 double a = 0.0;
                 std::vector<uint8_t> mimg =
                     raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
                                         /*exposure*/1.0, /*autoExpose*/true, &a);
-                if (a > 0.0) { sum += a; ++m; }
+                bool stop = conv.add(a);
                 ++meterDone;
-                // Show the metering pass converging + report a throttled percentage so the
+                // Show the metering pass converging + a throttled running count so the
                 // window/console isn't silent while this (often long) pre-pass runs. The
                 // shown frames are per-frame auto-exposed — a rough, NOT-yet-exposure-locked
                 // preview whose brightness varies frame to frame — so the title says as much
                 // to avoid the impression that this flickering sweep is the final look.
                 auto now = std::chrono::steady_clock::now();
-                bool last = (meterDone == meterTotal);
-                if (meterDone == 1 || last ||
+                if (meterDone == 1 || stop ||
                     std::chrono::duration<double>(now - meterTick).count() >= 1.0) {
-                    int pct = meterTotal ? (int)std::lround(100.0 * meterDone / meterTotal) : 100;
                     if (g_liveWin && !g_liveWin->closed()) {
                         g_liveWin->update(mc.res, mc.resY, mimg);
                         g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure "
                                             "(preview NOT locked yet) " +
-                                            std::to_string(meterDone) + "/" +
-                                            std::to_string(meterTotal) + " (" +
-                                            std::to_string(pct) + "%)");
+                                            std::to_string(meterDone));
                     }
-                    std::printf("[raster] metering exposure %zu/%zu (%d%%)\n",
-                                meterDone, meterTotal, pct);
+                    std::printf("[raster] metering exposure %zu\n", meterDone);
                     std::fflush(stdout);
                     meterTick = now;
                 }
+                if (stop) break;
             }
             if (g_stopRequested) break;
-            if (m > 0) {
-                expAnchors[g] = sum / m;
-                if (cams.size() > 1)
-                    std::printf("[raster] exposure lock: group %d meters the average of %zu "
-                                "frames (anchor %.4g)\n", g, cams.size(), expAnchors[g]);
+            if (conv.used() > 0) {
+                expAnchors[g] = conv.anchor();
+                if (adaptive)
+                    std::printf("[raster] exposure lock: group %d meters the average of %d/%d "
+                                "frames (anchor %.4g)\n", g, conv.used(), N, expAnchors[g]);
                 else
                     std::printf("[raster] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                                 g, cams.front().name.c_str(), expAnchors[g]);
@@ -3972,16 +4024,19 @@ static int run(int argc, char** argv) {
     };
     for (const auto& [g, cams] : meterPlan) {
         if (cams.empty() || g_stopRequested) continue;
-        double sum = 0.0; int m = 0;
+        const bool adaptive = meterAdaptive.count(g) != 0;
+        const int  N   = (int)cams.size();
+        const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
+        const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
+        MeterConverge conv(kmn, kmx, kMeterTolStops);
         for (const auto& mc : cams) {
-            double a = meterAnchor(mc);
-            if (a > 0.0) { sum += a; ++m; }
+            if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
         }
-        if (m > 0) {
-            expAnchors[g] = sum / m;
-            if (cams.size() > 1)
-                std::printf("[meter] exposure lock: group %d meters the average of %zu frame(s) "
-                            "(anchor %.4g)\n", g, cams.size(), expAnchors[g]);
+        if (conv.used() > 0) {
+            expAnchors[g] = conv.anchor();
+            if (adaptive)
+                std::printf("[meter] exposure lock: group %d meters the average of %d/%d frame(s) "
+                            "(anchor %.4g)\n", g, conv.used(), N, expAnchors[g]);
             else
                 std::printf("[meter] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                             g, cams.front().name.c_str(), expAnchors[g]);
