@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### MOSTLY DONE: camera_curve editor — all five phases landed; minor rough edges remain
+### DONE (2026-07-16): camera_curve editor — all five phases + rough edges landed
 
 The in-viewer `camera_curve` editor (main.cpp fly-viewer, Rec / +Pt / Ins / Del / Save)
 landed as **Phase 1** (core point authoring + recording + live spline overlay + Save a
@@ -29,12 +29,23 @@ landed as **Phase 1** (core point authoring + recording + live spline overlay + 
   filled in `addCameraCurve`), consumed in `main.cpp`'s viewer. Save re-emits a revised
   curve. The loaded flyby still plays at full fidelity until the first edit.
 
-Rough edges to revisit: (a) The saved `look_point`s are placed one world-unit ahead of
-each eye along the point's fwd — fine for direction but the look *spline* can bow between
-sparse points; Paint-mode orientation steering (Phase 3) lets the user reshape it. (b) No
-explicit point *selection* UI yet — Del targets the nearest control point to the current
-eye. (c) Round-trip seeds only the FIRST `camera_curve` in a scene with several; multi-
-curve scenes edit whichever the viewer selected/rendered would be a follow-on.
+Rough edges — all addressed (2026-07-16):
+- **(a) look-spline bowing. FIXED.** Saved `look_point`s are now placed one MEAN control-
+  point spacing ahead along each point's fwd (scene-relative, clamped), instead of a fixed
+  1 world-unit. A larger, consistent offset keeps `(lookSample − eyeSample)` well away from
+  the two splines' interpolation noise, so the aim spline stays smooth between sparse points.
+  Direction at each control point is preserved exactly (any positive distance along the same
+  fwd). In `saveCurveFn` (main.cpp).
+- **(b) explicit point selection. FIXED.** A `selectedPoint()` helper drives both the red
+  overlay highlight and Del. Locked to the path it follows the timeline (the control point
+  nearest the scrub position — scrub to select), and in free flight it's the point nearest
+  the eye. Also fixed a latent bug: Ins now finds its segment via `bracket()` (normalizes by
+  the ACTUAL explorePath length) instead of `pathPos / kPreviewPerSeg`, which was wrong for a
+  freshly-loaded curve whose frame count isn't a multiple of the preview sampling rate.
+- **(c) multi-curve round-trip. FIXED.** The viewer records the flyby's base name (frame
+  "beta00" → "beta") and the editor seeds from the authored curve whose name matches, so
+  `-camera <name>` selects which curve is edited — not blindly the first. In main.cpp
+  (`exploreCurveName` + the Phase-5 seeding block).
 
 ### OPEN: interactive raster fly-viewer can peg all cores / grow RAM when orphaned or on a heavy scene
 

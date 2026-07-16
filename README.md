@@ -234,18 +234,22 @@ paths they can capture at all**.
 > | **Rec** | start/stop **recording** your free flight; while armed it samples the pose as you move, then (on Stop) turns those samples into control points — either every sample (**raw**) or a tolerance-simplified subset |
 > | **+Pt** | append the **current pose** (eye + look direction + up + fov) as a control point |
 > | **Ins** | **insert** a control point at the current scrub position (splits that segment) |
-> | **Del** | delete the control point **nearest** the current eye |
+> | **Del** | delete the **selected** control point — the one highlighted red in the overlay (see below) |
 > | **Save** | write the authored `camera_curve { … }` block to a file next to the scene (`<scene>_curve.ftsl`, non-clobbering) **and echo it to stdout** to paste into a scene |
 > | **raw** (checkbox) | keep **every** recorded sample instead of simplifying |
 > | **tol** | recording **simplify tolerance** in world units (Ramer–Douglas–Peucker on the eye path; `0` = keep raw) |
 >
 > As you author, a **live spline overlay** is drawn on the preview: the control points as
-> markers (the one nearest you highlighted — the Del target) and the interpolated path as
-> a green polyline, sampled with the **same centripetal Catmull-Rom** math the renderer
-> uses for `camera_curve`, so the preview is WYSIWYG. The saved block records each control
-> point as a `point` plus a `look curve` (a second spline of `look_point` targets) so the
-> camera's orientation is authored too, and carries the current `up`, `fov_y`, render
-> `mode`, `frames`, and scene `fps`.
+> yellow markers — with the **selected** one highlighted **red** (the Del target) — and the
+> interpolated path as a green polyline, sampled with the **same centripetal Catmull-Rom**
+> math the renderer uses for `camera_curve`, so the preview is WYSIWYG. **Selecting a point:**
+> when you're locked to the path, the selection follows the timeline — the control point
+> nearest the current scrub position — so you just **scrub to a point to select it** (then
+> Del removes it); in free flight the selection is the point nearest the eye. The saved block
+> records each control point as a `point` plus a `look curve` (a second spline of `look_point`
+> targets, each placed one mean control-point spacing ahead along the view ray so the aim
+> spline stays smooth) so the camera's orientation is authored too, and carries the current
+> `up`, `fov_y`, render `mode`, `frames`, and scene `fps`.
 >
 > **Painting speed and orientation (Paint mode).** Two more controls sit at the right end
 > of the timeline row: a **Paint** toggle and a **Flat** button, with a live speed readout.
@@ -273,7 +277,8 @@ paths they can capture at all**.
 > from the `density` track). The control-point markers appear in the overlay immediately,
 > so you can Del/Ins/steer/re-paint speed and Save a revised curve rather than starting
 > from an empty editor. The loaded flyby still plays at full fidelity until you make the
-> first edit.
+> first edit. When a scene defines **several** `camera_curve`s, the editor seeds from the
+> one you're actually flying (chosen with `-camera <name>`), not blindly the first.
 >
 > **Reviewing a rendered flyby (`-review <base>`).** Once a flyby has actually been
 > *rendered* to a directory of images, `ftrace -review <base>` plays that sequence back

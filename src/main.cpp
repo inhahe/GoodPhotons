@@ -3870,6 +3870,8 @@ static int run(int argc, char** argv) {
     struct PathFrame { Vec3 eye; Vec3 fwd; Vec3 up; double fov; };
     std::vector<PathFrame> explorePath;    // one entry per flyby frame (empty for a lone camera)
     double explorePathFps = 0.0;           // authored playback rate hint (0 = none)
+    std::string exploreCurveName;          // base name of the selected flyby (frame "swoop007" -> "swoop"),
+                                           //   used to pick the matching authored camera_curve for round-trip edit
     if (exploreMode && toRender.size() > 1) {
         explorePath.reserve(toRender.size());
         for (const auto& rc : toRender) {
@@ -3878,6 +3880,12 @@ static int run(int argc, char** argv) {
             f = (L > 1e-9) ? f * (1.0 / L) : Vec3{0, 0, -1};
             explorePath.push_back({rc.cam.eye, f, rc.up, rc.fovY});
         }
+        // Recover the flyby's base name by stripping the trailing zero-padded frame index
+        // off the first frame's camera name (e.g. "swoop007" -> "swoop").
+        { const std::string& fn = toRender.front().name;
+          size_t end = fn.size();
+          while (end > 0 && std::isdigit((unsigned char)fn[end - 1])) --end;
+          if (end < fn.size()) exploreCurveName = fn.substr(0, end); }
         explorePathFps = ftslScene.defaultFps;   // scene-authored fps seeds the cam/sec box
         std::printf("[explore] starting interactive fly viewer at '%s' with a %zu-frame camera path"
                     " (timeline + lock-to-path enabled)\n",
@@ -4471,7 +4479,14 @@ static int run(int argc, char** argv) {
             // refines the loaded points instead of replacing the path. Speed round-trips from the
             // curve's `density` as a relative multiplier (mean/rho), so Save re-emits the profile.
             if (!ftslScene.authoredCurves.empty()) {
-                const auto& ac = ftslScene.authoredCurves.front();
+                // With several camera_curves in one scene, seed from the one the viewer is
+                // actually flying (matched by the recovered base name), not blindly the first.
+                const auto* acp = &ftslScene.authoredCurves.front();
+                if (!exploreCurveName.empty()) {
+                    for (const auto& c : ftslScene.authoredCurves)
+                        if (c.name == exploreCurveName) { acp = &c; break; }
+                }
+                const auto& ac = *acp;
                 int n = (int)ac.eyes.size();
                 editPts.clear(); editPts.reserve((size_t)n);
                 for (int i = 0; i < n; ++i)
@@ -4523,8 +4538,20 @@ static int run(int argc, char** argv) {
                 for (const auto& e : editPts) {
                     std::snprintf(hdr, sizeof hdr, "    point %.6g %.6g %.6g\n", e.eye.x, e.eye.y, e.eye.z); blk += hdr;
                 }
+                // The `look curve` is a SECOND Catmull-Rom spline through these look targets. Its
+                // aim direction only stays smooth between control points when the targets sit a
+                // reasonable distance ahead: too close and (lookSample - eyeSample) shrinks toward
+                // the two splines' interpolation noise, making the aim swing/bow. Placing each
+                // target one MEAN control-point spacing ahead (scene-relative, clamped) keeps the
+                // look spline a smooth parallel-ish offset of the eye path. Direction at each
+                // control point is preserved exactly (any positive distance along the same fwd).
+                double lookAhead = 0.0;
+                for (size_t i = 1; i < editPts.size(); ++i)
+                    lookAhead += std::sqrt(dot(editPts[i].eye - editPts[i - 1].eye, editPts[i].eye - editPts[i - 1].eye));
+                lookAhead = (editPts.size() > 1) ? lookAhead / (editPts.size() - 1) : 0.0;
+                if (!(lookAhead > 1e-4)) lookAhead = (sceneR > 1e-4 ? sceneR * 0.1 : 1.0);
                 for (const auto& e : editPts) {
-                    Vec3 lp = e.eye + e.fwd;   // a look target one unit ahead along the view ray
+                    Vec3 lp = e.eye + e.fwd * lookAhead;   // look target ~one segment ahead along the view ray
                     std::snprintf(hdr, sizeof hdr, "    look_point %.6g %.6g %.6g\n", lp.x, lp.y, lp.z); blk += hdr;
                 }
                 // Painted speed -> camera density (density = 1/speed). Emitted only when the
@@ -4552,6 +4579,24 @@ static int run(int argc, char** argv) {
                 std::printf("%s", blk.c_str());
                 std::fflush(stdout);
             };
+            // The currently SELECTED control point — the target Del removes and the overlay
+            // highlights red. When locked to the path (scrubbing/playing) the selection follows
+            // the timeline: it's the control point nearest the current scrub position, so you
+            // scrub to a point to select it. In free flight it's the point nearest the eye.
+            // Returns -1 when there are no points.
+            auto selectedPoint = [&]() -> int {
+                int n = (int)editPts.size();
+                if (n == 0) return -1;
+                if (n == 1) return 0;
+                if (pathMode && pathCount >= 2) {
+                    double t = pathPos / (double)(pathCount - 1);         // 0..1 along the timeline
+                    int k = (int)std::llround(t * (double)(n - 1));       // nearest control point
+                    return std::clamp(k, 0, n - 1);
+                }
+                int best = 0; double bd = 1e300;
+                for (int i = 0; i < n; ++i) { Vec3 d = editPts[(size_t)i].eye - eye; double dd = dot(d, d); if (dd < bd) { bd = dd; best = i; } }
+                return best;
+            };
             // Draw the control-point markers + the live spline polyline over the tone-mapped
             // frame. Camera::project gives py with +up = larger py; the RGB buffer is row-0-top,
             // so the screen row is (h-1-py). Segments are drawn only when both ends project.
@@ -4578,9 +4623,8 @@ static int run(int argc, char** argv) {
                 };
                 for (size_t i = 1; i < explorePath.size(); ++i)
                     line(explorePath[i - 1].eye, explorePath[i].eye, 40, 220, 90);   // green spline
-                // Nearest control point to the current eye = the Del/highlight target.
-                int sel = -1; double bd = 1e300;
-                for (size_t i = 0; i < editPts.size(); ++i) { Vec3 d = editPts[i].eye - eye; double dd = dot(d, d); if (dd < bd) { bd = dd; sel = (int)i; } }
+                // The selected control point (Del target) is highlighted red; the rest yellow.
+                int sel = selectedPoint();
                 for (size_t i = 0; i < editPts.size(); ++i)
                     marker(editPts[i].eye, 255, ((int)i == sel) ? 60 : 220, ((int)i == sel) ? 60 : 40);  // yellow / red-selected
             };
@@ -4749,7 +4793,12 @@ static int run(int argc, char** argv) {
                 if (nav.insPoint) {
                     if (editPts.size() < 2) { editPts.push_back(poseNow()); ptSpeed.push_back(1.0); }
                     else {
-                        int seg = std::clamp((int)(pathPos / kPreviewPerSeg), 0, (int)editPts.size() - 2);
+                        // Insert between the two control points bracketing the current scrub
+                        // position. bracket() normalizes by the ACTUAL explorePath length, so this
+                        // is correct for a freshly-loaded curve (whose frame count isn't a multiple
+                        // of kPreviewPerSeg) as well as an editor-rebuilt preview.
+                        int seg; double fr; bracket(pathPos, seg, fr);
+                        seg = std::clamp(seg, 0, (int)editPts.size() - 2);
                         editPts.insert(editPts.begin() + seg + 1, poseNow());
                         ptSpeed.insert(ptSpeed.begin() + std::min((size_t)seg + 1, ptSpeed.size()), 1.0);
                     }
@@ -4759,15 +4808,15 @@ static int run(int argc, char** argv) {
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.delPoint && !editPts.empty()) {
-                    int best = 0; double bd = 1e300;
-                    for (size_t i = 0; i < editPts.size(); ++i) { Vec3 d = editPts[i].eye - eye; double dd = dot(d, d); if (dd < bd) { bd = dd; best = (int)i; } }
+                    int best = selectedPoint();   // the highlighted (selected) point — scrub to choose it
+                    if (best < 0) best = 0;
                     editPts.erase(editPts.begin() + best);
                     if ((size_t)best < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + best);
                     if (pathPos > std::max(0, pathCount - 1)) pathPos = std::max(0, pathCount - 1);
                     rebuildPath();
                     pathPos = clampPos(pathPos);
                     g_liveWin->setEditState(recording, (int)editPts.size());
-                    std::printf("[editor] deleted nearest point (now %zu)\n", editPts.size());
+                    std::printf("[editor] deleted selected point %d (now %zu)\n", best, editPts.size());
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.saveCurve) saveCurveFn();
