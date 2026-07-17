@@ -427,6 +427,31 @@ def sidecar_text(v: Variant, index: int, count: int, *,
 
 
 # ---------------------------------------------------------------------------
+# in-place status line
+# ---------------------------------------------------------------------------
+
+_status_len = 0
+
+
+def _status(msg: str) -> None:
+    """Overwrite the current status line in place (carriage-return, no newline)."""
+    global _status_len
+    pad = max(0, _status_len - len(msg))
+    sys.stdout.write("\r" + msg + " " * pad)
+    sys.stdout.flush()
+    _status_len = len(msg)
+
+
+def _status_commit(msg: str) -> None:
+    """Overwrite the live line with ``msg`` and finalize it (newline)."""
+    global _status_len
+    pad = max(0, _status_len - len(msg))
+    sys.stdout.write("\r" + msg + " " * pad + "\n")
+    sys.stdout.flush()
+    _status_len = 0
+
+
+# ---------------------------------------------------------------------------
 # per-variant video pipeline
 # ---------------------------------------------------------------------------
 
@@ -437,6 +462,8 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *, res: int,
     ``raster`` uses ftrace ``-raster`` (fast solid-shaded z-buffer preview); otherwise
     a path-traced render to a per-frame noise budget.  No ``-window`` is passed so the
     process writes the PNG and exits, letting the whole frame range run unattended.
+    The renderer's own console chatter is captured (kept off the status line) and only
+    surfaced if the frame fails.
     """
     import subprocess
     if raster:
@@ -444,13 +471,19 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *, res: int,
     else:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(res),
                "-interval", "8", "-checkpoint", "-noise", f"{noise:g}"]
-    r = subprocess.run(cmd, cwd=str(root))
+    r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
     if r.returncode != 0:
+        sys.stdout.write("\n")
+        sys.stdout.write((r.stdout or "") + (r.stderr or ""))
         raise SystemExit(f"ftrace failed on {fp.name} (exit {r.returncode})")
 
 
 def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str) -> Path:
-    """Assemble frames into ``out`` — mp4 via ffmpeg, or a Pillow GIF fallback."""
+    """Assemble frames into ``out`` — mp4 via ffmpeg, or a Pillow GIF (default).
+
+    Both paths keep their tool output off the status line (ffmpeg captured; the GIF is
+    built inline with Pillow rather than via the chatty ``loom.drive.assemble_gif``).
+    """
     import shutil
     import subprocess
     if out.suffix.lower() == ".mp4":
@@ -460,12 +493,19 @@ def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str) ->
         cmd = [ffmpeg, "-y", "-framerate", f"{fps:g}", "-i", pattern,
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", out.name]
-        r = subprocess.run(cmd, cwd=str(out.parent))
+        r = subprocess.run(cmd, cwd=str(out.parent), capture_output=True, text=True)
         if r.returncode != 0:
+            sys.stdout.write("\n" + (r.stdout or "") + (r.stderr or ""))
             raise SystemExit(f"ffmpeg failed assembling {out.name} (exit {r.returncode})")
     else:
-        from loom.drive import assemble_gif
-        assemble_gif(pngs, out, fps=fps)
+        try:
+            from PIL import Image
+        except ImportError as e:  # pragma: no cover
+            raise SystemExit("gif output needs Pillow (pip install pillow)") from e
+        imgs = [Image.open(str(p)).convert("RGB") for p in pngs]
+        duration_ms = max(1, int(round(1000.0 / fps)))
+        imgs[0].save(str(out), save_all=True, append_images=imgs[1:],
+                     duration=duration_ms, loop=0, optimize=True)
     return out
 
 
@@ -479,34 +519,38 @@ def _video_ext(fmt: str) -> str:
     return "mp4" if shutil.which("ffmpeg") else "gif"   # auto
 
 
-def make_video(subdir: Path, base: str, v: Variant, *, frames: int, fps: float,
-               res: int, radius: float, raster: bool, noise: float, fmt: str) -> Path:
+def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
+               fps: float, res: int, radius: float, raster: bool, noise: float,
+               fmt: str) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
     The gyroid drifts through its higher dimensions over a seamless loop (frame
     ``frames`` == frame 0).  Frames render headless with the rasterizer by default.
+    Progress is shown on a single in-place status line built from ``label``.
     """
     from loom import Clock, Cache
     from loom.drive import find_ftrace, repo_root
     ftrace = find_ftrace()
     root = repo_root()
+    verb = "raster" if raster else "trace"
     width = max(3, len(str(frames - 1)))
     pngs: List[Path] = []
     for k in range(frames):
         t = k / frames                                  # seamless loop: t in [0,1)
+        _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
         scene = build_scene(v, t=t, res=(res, res), radius=radius)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
                           Cache(), assets_dir=subdir, tag=f"{k:0{width}d}")
         fp = subdir / f"{base}_{k:0{width}d}.ftsl"
         fp.write_text(body, encoding="utf-8")
         png = fp.with_suffix(".png")
+        _status(f"{label} | {verb} frame {k + 1}/{frames}")
         _render_frame(ftrace, root, fp, png, res=res, raster=raster, noise=noise)
         pngs.append(png)
-        print(f"[gyroid_nd]   {base}: frame {k + 1}/{frames}", flush=True)
     out = subdir / f"{base}.{_video_ext(fmt)}"
     pattern = f"{base}_%0{width}d.png"                   # ffmpeg reads from subdir cwd
+    _status(f"{label} | assembling {out.suffix.lstrip('.')}")
     _assemble_video(pngs, out, fps=fps, pattern=pattern)
-    print(f"[gyroid_nd] wrote {out}", flush=True)
     return out
 
 
@@ -647,8 +691,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     for k, vseed in enumerate(seeds):
         v = pick_variant(vseed, args, axis_locks)
         base = f"{args.name}{k:0{width}d}"
-        print(f"[gyroid_nd] {base}: D={v.dims} osc={v.oscillating} "
-              f"harmonics={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}", flush=True)
+        # Brief, in-place status: which gyroid, its values, and the live frame/phase.
+        label = (f"[gyroid_nd] gyroid {k + 1}/{count}  D={v.dims} osc={v.oscillating} "
+                 f"harm={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}")
         if args.video:
             # Each video is a self-contained multi-frame series in its own subdir
             # (frames + assembled video + a .txt of every chosen value).
@@ -660,10 +705,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                              video_name=f"{base}.{ext}",
                              frames=args.frames, fps=args.fps),
                 encoding="utf-8")
-            video = make_video(subdir, base, v, frames=args.frames, fps=args.fps,
-                               res=args.res, radius=args.radius, raster=args.raster,
-                               noise=args.render_noise, fmt=args.format)
+            video = make_video(subdir, base, v, label=label, frames=args.frames,
+                               fps=args.fps, res=args.res, radius=args.radius,
+                               raster=args.raster, noise=args.render_noise,
+                               fmt=args.format)
             made.append(video)
+            _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
             scene = build_scene(v, t=0.0, res=(args.res, args.res), radius=args.radius)
@@ -672,6 +719,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             fp = outdir / f"{base}.ftsl"
             fp.write_text(header(v, k, count) + body, encoding="utf-8")
             made.append(fp)
+            _status_commit(f"{label} | wrote {fp.name}")
 
     kind = "video(s)" if args.video else "scene file(s)"
     print(f"[gyroid_nd] wrote {len(made)} {kind} to {outdir}")
