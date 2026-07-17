@@ -6,10 +6,12 @@
 //   HOST  upload():  bake the world-space raster::PTri list + preview lights into POD
 //                    device arrays (float3), once. Reused for every camera of a flyby.
 //
-//   Pass A  kProject  (1 thread / input triangle): transform to camera space, near-plane
-//                     clip (Sutherland-Hodgman against z=zn), and project the resulting
-//                     fan into up to TWO screen sub-triangles (DSTri) written to fixed
-//                     slots [2*i], [2*i+1]. Rectilinear only (M1).
+//   Pass A  kProject  (1 thread / input triangle): transform to camera space, then either
+//                     (rectilinear) near-plane clip (Sutherland-Hodgman against z=zn) and
+//                     project the resulting fan into up to TWO screen sub-triangles, or
+//                     (fisheye/panoramic) apply the same angular projRadius() lens map the
+//                     real camera uses, reject-culling any triangle touching the rear pole
+//                     and emitting ONE sub-triangle. Written to fixed slots [2*i], [2*i+1].
 //
 //   Pass B  kRaster   (1 thread / DSTri slot): rasterize the sub-triangle's pixel bbox,
 //                     packing (1/depth, slotIdx) into a 64-bit visibility buffer with a
@@ -79,6 +81,8 @@ struct DLight {
 struct DCam {
     float3 eye, u, v, w;   // right, up, forward (orthonormal)
     float  tanHalfX, tanHalfY;
+    int    projection;     // CAM_RECTILINEAR (0) or a fisheye/panoramic lens map
+    float  rEdge;          // image radius at the vertical film edge (angular projections)
 };
 
 // A projected screen sub-triangle produced by the clip/project pass and consumed by the
@@ -130,22 +134,53 @@ __device__ inline DVtxCS lerpVtx(const DVtxCS& a, const DVtxCS& b, float s) {
     r.wpos = a.wpos + (b.wpos - a.wpos)*s; r.wn = a.wn + (b.wn - a.wn)*s; return r;
 }
 
-// Project a camera-space vertex to the raster (rectilinear pinhole; M1). Mirrors
-// raster::projectVtx's rectilinear branch: sx in [0,W], sy=0 at image top, invd=1/depth.
-__device__ inline void projectVtxRect(const DCam& cam, const DVtxCS& v, int W, int H,
-                                       float& sx, float& sy, float& invd,
-                                       float3& wp, float3& wn) {
-    float ndcx = (v.x / v.z) / cam.tanHalfX;
-    float ndcy = (v.y / v.z) / cam.tanHalfY;
-    float depth = v.z;
+// Image radius for a ray at angle `th` from the optical axis (mirrors camera.h projRadius).
+// The enum values (CAM_EQUIDISTANT..CAM_ORTHOGRAPHIC) come from camera.h, included above.
+__device__ inline float projRadiusD(int proj, float th) {
+    switch (proj) {
+        case CAM_EQUIDISTANT:   return th;
+        case CAM_EQUISOLID:     return 2.0f * sinf(0.5f * th);
+        case CAM_STEREOGRAPHIC: return 2.0f * tanf(0.5f * th);
+        case CAM_ORTHOGRAPHIC:  return sinf(th);
+        default:                return tanf(th);            // CAM_RECTILINEAR
+    }
+}
+
+// Project a camera-space vertex to the raster. Mirrors raster::projectVtx exactly: the
+// rectilinear pinhole is the inverse of Camera::genRay; a fisheye/panoramic lens applies the
+// same angular projRadius() map (so off-axis stretch matches). sx in [0,W], sy=0 at image
+// top, invd=1/depth (camera-forward distance for rectilinear, ray length for angular).
+__device__ inline void projectVtxG(const DCam& cam, const DVtxCS& v, int W, int H,
+                                    float& sx, float& sy, float& invd,
+                                    float3& wp, float3& wn) {
+    float ndcx, ndcy, depth;
+    if (cam.projection == CAM_RECTILINEAR) {
+        ndcx = (v.x / v.z) / cam.tanHalfX;
+        ndcy = (v.y / v.z) / cam.tanHalfY;
+        depth = v.z;                                        // camera-forward distance
+    } else {
+        float len = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+        float costh = (len > 1e-12f) ? v.z / len : 1.0f;
+        costh = fminf(1.0f, fmaxf(-1.0f, costh));
+        float th = acosf(costh);
+        float rho = projRadiusD(cam.projection, th) / fmaxf(cam.rEdge, 1e-12f);
+        float rhoDir = sqrtf(v.x*v.x + v.y*v.y);
+        if (rhoDir < 1e-12f) { ndcx = 0.0f; ndcy = 0.0f; }
+        else { ndcx = rho * v.x / rhoDir; ndcy = rho * v.y / rhoDir; }
+        depth = len;                                        // ray length (angular lens)
+    }
     sx = (ndcx * 0.5f + 0.5f) * W;
-    sy = (0.5f - 0.5f * ndcy) * H;
+    sy = (0.5f - 0.5f * ndcy) * H;                          // +y (up) -> top of image
     invd = 1.0f / fmaxf(depth, 1e-9f);
     wp = v.wpos; wn = v.wn;
 }
 
 // ---------------------------------------------------------------------------
-// Pass A: transform + near-plane clip + project each input triangle into up to two DSTri.
+// Pass A: transform + project each input triangle into up to two DSTri. Rectilinear does a
+// Sutherland-Hodgman near-plane clip + fan (up to 2 sub-triangles); a fisheye/panoramic lens
+// instead rejects any triangle that reaches (nearly) behind the camera and projects the
+// three vertices straight through the angular map into a single sub-triangle. This mirrors
+// raster::projectRange's two branches exactly, so the GPU and CPU rasters agree per camera.
 __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
                          DSTri* out) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -157,7 +192,24 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
     // World -> camera space.
     DVtxCS cs[3] = { toCS(cam, t.p0, t.n0), toCS(cam, t.p1, t.n1), toCS(cam, t.p2, t.n2) };
 
-    // Sutherland-Hodgman clip against the near plane z=zn (rectilinear only).
+    if (cam.projection != CAM_RECTILINEAR) {
+        // Fisheye/panoramic: no near-plane clip. Reject the triangle if any vertex points
+        // (nearly) backward (z <= -0.999*len), else project all three straight through the
+        // angular lens map into ONE sub-triangle (slot [2*i]; [2*i+1] stays invalid).
+        for (int e = 0; e < 3; ++e) {
+            float len = sqrtf(cs[e].x*cs[e].x + cs[e].y*cs[e].y + cs[e].z*cs[e].z);
+            if (cs[e].z <= -0.999f * len) return;
+        }
+        DSTri s;
+        projectVtxG(cam, cs[0], W, H, s.sx0, s.sy0, s.invd0, s.wp0, s.wn0);
+        projectVtxG(cam, cs[1], W, H, s.sx1, s.sy1, s.invd1, s.wp1, s.wn1);
+        projectVtxG(cam, cs[2], W, H, s.sx2, s.sy2, s.invd2, s.wp2, s.wn2);
+        s.color = t.color; s.emissive = t.emissive; s.valid = 1;
+        out[2*i] = s;
+        return;
+    }
+
+    // Rectilinear: Sutherland-Hodgman clip against the near plane z=zn.
     const float zn = 1e-3f;
     DVtxCS poly[8]; int np = 0;
     for (int e = 0; e < 3; ++e) {
@@ -171,7 +223,7 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
     // Fan the clipped polygon into (np-2) triangles; store up to the first two.
     float sx[8], sy[8], invd[8]; float3 wp[8], wn[8];
     for (int k = 0; k < np; ++k)
-        projectVtxRect(cam, poly[k], W, H, sx[k], sy[k], invd[k], wp[k], wn[k]);
+        projectVtxG(cam, poly[k], W, H, sx[k], sy[k], invd[k], wp[k], wn[k]);
 
     int slot = 0;
     for (int k = 1; k + 1 < np && slot < 2; ++k, ++slot) {
@@ -404,13 +456,14 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                  double exposure, bool autoExpose, double* lockAnchor) {
     std::vector<uint8_t> empty;
     if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return empty;
-    if (cam.projection != CAM_RECTILINEAR) return empty;   // M1: rectilinear only
     const size_t N = (size_t)W * H;
     if (!ensurePix(sc, N)) return empty;
 
     DCam dc;
     dc.eye = toF3(cam.eye); dc.u = toF3(cam.u); dc.v = toF3(cam.v); dc.w = toF3(cam.w);
     dc.tanHalfX = (float)cam.tanHalfX; dc.tanHalfY = (float)cam.tanHalfY;
+    dc.projection = cam.projection;
+    dc.rEdge = (float)cam.rEdge;
 
     const float3 bg = make_float3(0.06f, 0.07f, 0.09f);
     const float  EMIS_BOOST = 4.0f;

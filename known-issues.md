@@ -5,19 +5,22 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH DEBT (2026-07-17): GPU preview rasterizer covers only rectilinear + opaque (M1)
+### TECH DEBT (2026-07-17): GPU preview rasterizer covers opaque only (see-through still CPU)
 
 The GPU preview rasterizer (`src/raster_cuda.{h,cu}`, wired into `main.cpp`'s
-`-raster` block via the `rasterOne` dispatcher, gated on `-device gpu|auto`) is a
-first milestone: it accelerates **rectilinear, opaque** previews and falls back to the
-CPU rasterizer (`raster::renderFrame`) per camera for everything else. Deferred work:
+`-raster` block via the `rasterOne` dispatcher, gated on `-device gpu|auto`) now
+accelerates **all camera projections** (rectilinear + fisheye/panoramic) for **opaque**
+previews and falls back to the CPU rasterizer (`raster::renderFrame`) per camera only
+for see-through. Deferred work:
 
-- **Fisheye / panoramic projections (M2).** The device `kProject` only implements the
-  rectilinear `x/z` branch + near-plane clip. The CPU rasterizer already proves the
-  raster/shade/exposure stages are projection-agnostic, so M2 is *just* porting the
-  angular `projRadius(projection, θ)/rEdge` branch of `raster::projectVtx` and the
-  behind-camera reject-clip into `kProject` — the `kRaster`/`kShade`/`exposeAndEncode`
-  kernels stay untouched. Until then a non-rectilinear camera silently uses the CPU.
+- **Fisheye / panoramic projections (M2). — DONE (2026-07-17).** `kProject` now branches
+  rectilinear (`x/z` + near-plane Sutherland-Hodgman clip → ≤2 sub-tris) vs angular
+  (the same `projRadius(projection, θ)/rEdge` map as `raster::projectVtx`, behind-camera
+  reject-clip → 1 sub-tri) via `DCam.projection`/`DCam.rEdge`; `kRaster`/`kShade`/
+  `exposeAndEncode` were untouched (projection-agnostic as predicted). Validated GPU vs
+  CPU on `scenes/fisheye.ftsl` (fish camera: mean abs diff 0.015/255, 515/2.07 M edge
+  pixels — tighter than the rectilinear `rect` frame's 0.034/1200), and rectilinear
+  regression unchanged.
 - **See-through (`-see-through`) on GPU.** The clear-glass accumulation pass
   (`fillTriangleClear`: cumulative transmittance + milk products) has no device port,
   so `-device gpu` with `-see-through` runs entirely on the CPU. Port it as a second

@@ -4145,9 +4145,10 @@ static int run(int argc, char** argv) {
         // GPU preview rasterizer (-device gpu|auto). Bake the world triangles to the device
         // ONCE (reused for every camera / flyby frame), then each frame runs the projection +
         // raster + shade on the GPU and shares the SAME host exposure/tonemap tail as the CPU
-        // path (raster::exposeAndEncode) — so GPU and CPU frames match. M1 covers RECTILINEAR
-        // opaque previews; fisheye/panoramic cameras and see-through fall back to the CPU
-        // per-frame (rasterOne below picks per camera). Any device failure also falls back.
+        // path (raster::exposeAndEncode) — so GPU and CPU frames match. The GPU covers all
+        // camera projections (rectilinear + fisheye/panoramic) for OPAQUE previews; only
+        // see-through (clear-glass) compositing falls back to the CPU (rasterSeeThrough gates
+        // the upload below). Any device failure also falls back per-frame.
 #ifdef HAVE_CUDA
         raster_cuda::Scene* gpuRaster = nullptr;
         {
@@ -4156,8 +4157,8 @@ static int run(int argc, char** argv) {
             if ((wantGpu || wantAuto) && raster_cuda::available() && !rasterSeeThrough) {
                 gpuRaster = raster_cuda::upload(prims, plight);
                 if (gpuRaster)
-                    std::printf("[raster] GPU rasterizer: rectilinear frames on the GPU "
-                                "(fisheye/panoramic fall back to CPU)\n");
+                    std::printf("[raster] GPU rasterizer: opaque frames on the GPU "
+                                "(all projections; see-through falls back to CPU)\n");
                 else if (wantGpu)
                     std::fprintf(stderr, "[raster] GPU upload failed; using CPU\n");
             } else if (wantGpu && rasterSeeThrough) {
@@ -4168,12 +4169,12 @@ static int run(int argc, char** argv) {
             std::fflush(stdout);
         }
 #endif
-        // Render one preview frame: GPU when it's baked and the camera is rectilinear (M1),
-        // else the CPU rasterizer. A GPU device failure returns empty -> CPU fallback too.
+        // Render one preview frame: GPU when it's baked (any projection), else the CPU
+        // rasterizer. A GPU device failure returns empty -> CPU fallback too.
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
-            if (gpuRaster && cam.projection == CAM_RECTILINEAR) {
+            if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock);
                 if (!img.empty()) return img;

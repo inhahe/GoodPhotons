@@ -189,11 +189,12 @@ paths they can capture at all**.
 > anchor with no flicker. It pays off on **heavy** scenes: a 4.5 M-triangle
 > isosurface at 1600 px rasterizes in ~0.30 s/frame on the GPU vs ~1.6 s on the
 > CPU (~5×), with the one-time tessellation unchanged; tiny scenes are launch-bound
-> and roughly tie. **Scope:** the GPU path currently covers **rectilinear** opaque
-> previews — **fisheye/panoramic** cameras and `-see-through` transparently fall
-> back to the CPU rasterizer per camera (mixed camera lists just work), as does any
-> device allocation failure, so `-device gpu` never fails a preview it can't
-> accelerate. Example:
+> and roughly tie. **Scope:** the GPU path covers **all camera projections**
+> (rectilinear **and** fisheye/panoramic — the device applies the same angular lens
+> map the real camera uses) for **opaque** previews. Only `-see-through` (clear-glass
+> compositing) still falls back to the CPU rasterizer per camera (mixed camera lists
+> just work), as does any device allocation failure, so `-device gpu` never fails a
+> preview it can't accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
 > **See-through clear objects — `-see-through`.** By default a clear material
