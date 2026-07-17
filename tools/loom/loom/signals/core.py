@@ -51,24 +51,43 @@ def alloc_id() -> int:
 class Clock:
     """A moment in a (possibly looping) animation.
 
-    ``t`` is the normalized loop phase in ``[0, 1)``; everything periodic in
-    ``t`` makes the whole scene loop seamlessly.  ``frame`` is the integer frame
-    index and is the cache key.
+    ``t`` is the normalized phase.  Looping is a **choice**, not a baked-in
+    invariant (DESIGN.md §11.6): the frame→``t`` mapping depends on ``loop``.
+
+    - **closed** (``loop=True``, the default): ``t = (frame % frames) / frames``
+      wraps into ``[0, 1)``, so frame ``N`` maps to ``t=0`` — the wrap point is
+      byte-identical to frame 0.  Compose periodic leaves (:class:`Sine`,
+      :class:`LoopNoise`) and a closed :class:`~loom.LoopCurve` to loop
+      seamlessly.
+    - **open** (``loop=False``): ``t = frame / (frames - 1)`` spans ``[0, 1]``
+      *inclusive* with no modulo, so the endpoints are distinct and there is no
+      phantom duplicate frame ``N``.  A one-shot timeline: use non-periodic
+      leaves (:class:`Ramp`, :class:`Ease`) and an open path.
+
+    ``frame`` is the integer frame index and the cache key; ``loop`` is carried
+    so drivers/tests know whether the seam is meant to close.
     """
 
     t: float
     frame: int = 0
     frames: int = 1
     fps: float = 30.0
+    loop: bool = True
 
     @property
     def seconds(self) -> float:
         return self.frame / self.fps if self.fps else 0.0
 
     @classmethod
-    def at_frame(cls, frame: int, frames: int, fps: float = 30.0) -> "Clock":
+    def at_frame(cls, frame: int, frames: int, fps: float = 30.0,
+                 loop: bool = True) -> "Clock":
         frames = max(1, int(frames))
-        return cls(t=(frame % frames) / frames, frame=frame, frames=frames, fps=fps)
+        if loop:
+            t = (frame % frames) / frames
+        else:
+            # span [0, 1] inclusive; endpoints distinct, no phantom frame N
+            t = frame / (frames - 1) if frames > 1 else 0.0
+        return cls(t=t, frame=frame, frames=frames, fps=fps, loop=loop)
 
 
 class Cache:

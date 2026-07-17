@@ -9,6 +9,7 @@ from .core import (
 )
 from .vector import VecSignal, vec, lerp
 from .periodic import Sine, Cosine, LoopNoise
+from .timeline import Ramp, Ease
 
 __all__ = [
     "Signal", "Clock", "Cache", "Const", "TimeFn",
@@ -18,4 +19,5 @@ __all__ = [
     "SignalCycleError", "detect_signal_cycle", "walk",
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
+    "Ramp", "Ease",
 ]

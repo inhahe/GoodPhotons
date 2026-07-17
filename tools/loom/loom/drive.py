@@ -63,15 +63,21 @@ def _budget_args(noise: Optional[float], time_s: Optional[float],
 
 
 def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
-                *, fps: float = 30.0) -> List[Path]:
-    """Emit ``frames`` ``.ftsl`` files for one seamless loop; return their paths."""
+                *, fps: float = 30.0, loop: bool = True) -> List[Path]:
+    """Emit ``frames`` ``.ftsl`` files; return their paths.
+
+    ``loop=True`` (default) maps frames onto a closed loop (``t=(k % frames)/
+    frames``) so frame ``frames`` would equal frame 0 — a seamless cycle.
+    ``loop=False`` maps them onto an **open** timeline (``t=k/(frames-1)``,
+    endpoints distinct) — a one-shot animation (DESIGN.md §11.6).
+    """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     scene.check_cycles()
     width = max(3, len(str(frames - 1)))
     paths: List[Path] = []
     for k in range(frames):
-        clock = Clock.at_frame(k, frames, fps)
+        clock = Clock.at_frame(k, frames, fps, loop=loop)
         tag = f"{k:0{width}d}"
         text = scene.emit(clock, Cache(), assets_dir=outdir, tag=tag)
         p = outdir / f"{name}{k:0{width}d}.ftsl"
@@ -84,15 +90,17 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  outdir: Optional[os.PathLike] = None, fps: float = 30.0,
                  window: bool = True, interval: float = 5.0,
                  noise: Optional[float] = None, time_s: Optional[float] = None,
-                 n: Optional[int] = None,
+                 n: Optional[int] = None, loop: bool = True,
                  extra_args: Sequence[str] = ()) -> List[Path]:
-    """Emit and render a seamless loop; return the rendered PNG paths.
+    """Emit and render a frame range; return the rendered PNG paths.
 
+    ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
+    renders an **open** one-shot timeline with distinct endpoints (§11.6).
     ``noise``/``time_s``/``n`` pick the per-frame stop budget (default: 3% noise).
     """
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
     ftrace = find_ftrace()
-    ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps)
+    ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop)
     budget = _budget_args(noise, time_s, n)
     pngs: List[Path] = []
     for i, fp in enumerate(ftsl_paths):

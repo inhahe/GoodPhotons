@@ -13,6 +13,7 @@ from .signals import (
     SignalCycleError, detect_signal_cycle, walk,
     VecSignal, vec, lerp,
     Sine, Cosine, LoopNoise,
+    Ramp, Ease,
 )
 from .data import PointPath, Grid, Scatter
 from .interp import LoopCurve, GridField, ScatterField, eval_curve
@@ -45,6 +46,7 @@ __all__ = [
     "SignalCycleError", "detect_signal_cycle", "walk",
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
+    "Ramp", "Ease",
     "PointPath", "Grid", "Scatter",
     "LoopCurve", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3",
