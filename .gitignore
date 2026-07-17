@@ -5,6 +5,8 @@
 /build_het/
 /build_verify/
 /out/
+# ftrace.exe copied into the repo root by build.bat (build artifact)
+/ftrace.exe
 *.ppm
 *.exr
 *.png
