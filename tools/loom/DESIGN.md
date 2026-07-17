@@ -390,10 +390,21 @@ tools/loom/
   semantics vs ftrace ops, `uses_time`/`time_signals`, one expr → both backends, static
   bake, iso integration). Demo: `examples/shared_pattern.py` (a drifting gyroid as both a
   2-D loop and a 3-D isosurface loop).
-- **M11 (deferred) — "transform video" script.** Separate two-pass tool (§11.8):
-  materialize a clip into a 4-D block → apply a spacetime (time-coupled) rotation →
-  re-slice to frames. Open clip in/out by default; looped output is the torus-constrained
-  special case. Kept out of the streaming emitter entirely.
+- **M11 — "transform video" script.** ✅ done (`loom/xvideo.py`). Separate two-pass
+  offline tool (§11.8), kept out of the streaming emitter: **materialize** a clip into a
+  4-D block `(T,H,W,C)` (`Clip.from_array` / `.from_frames` / `.from_canvas`), **transform**
+  it under a spacetime map, **re-slice** to frames (`Clip.save` → PNGs + GIF). Two honest
+  cases: `spacetime_rotate(clip, angle, axis, coupling, mode)` is the **general/default open**
+  case — a metric rotation of the (axis, t) plane that synthesizes motion from time (a static
+  stripe sweeps across); it does **not** loop (open boundaries held/blanked), because rotating
+  the periodic S¹ time axis into a non-periodic spatial axis isn't periodic. `spacetime_shear(
+  clip, axis, winding)` is the **constrained seamless-loop** case — an integer-winding shear on
+  the 2-torus: over one loop, time advances one period while the coupled (tiling) spatial axis
+  scrolls `winding` whole periods, so both axes wrap and the output is **bit-seamless** (a
+  non-integer winding is rejected). Interpolation via SciPy `map_coordinates`. Tests:
+  `tests/test_xvideo.py` (materialize, rotate motion/identity/boundary modes, bit-exact shear
+  seam, winding-zero static, integer-winding + axis validation). Demo:
+  `examples/transform_video.py` (`--rotate` open sweep, `--shear` seamless torus scroll).
 - **M12 (deferred) — resident preview server.** Keep ftrace resident and push per-frame
   deltas (only changed baked constants) + static-geometry caching + preview LOD (§11.9),
   for interactive scrubbing. The real preview speedup; not a hand-rolled rasterizer.

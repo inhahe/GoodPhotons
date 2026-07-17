@@ -48,6 +48,7 @@ from .canvas import (
     Canvas2D, Marker, Stroke, curve_points,
     render_canvas, render_canvas_still,
 )
+from .xvideo import Clip, spacetime_rotate, spacetime_shear
 
 __all__ = [
     "Signal", "Clock", "Cache", "Const", "TimeFn",
@@ -78,4 +79,5 @@ __all__ = [
     "mix", "smoothstep",
     "Canvas2D", "Marker", "Stroke", "curve_points",
     "render_canvas", "render_canvas_still",
+    "Clip", "spacetime_rotate", "spacetime_shear",
 ]
