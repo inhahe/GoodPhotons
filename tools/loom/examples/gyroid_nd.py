@@ -29,11 +29,15 @@ Each dimension's argument is  ``u_d = harmonic_d * freq * (dir_d . (x,y,z)) + ph
 and the emitted field is the cyclic sum ``sum_i sin(u_{o_i}) * cos(u_{o_{i+1}})`` over
 the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating count).
 
-The rendered *look* mirrors ``scenes/showcase.ftsl``: the lattice is a **gold thickened
-gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball, sitting in a **closed Cornell box**
-beside a **clear glass sphere**, lit by two ceiling area lights, with the camera inside the
-box.  (The gold/glass/colored-wall look only develops under path tracing, ``--no-raster``;
-the fast rasterizer previews the same geometry flat-shaded.)
+The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **gold thickened
+gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball — on its own, with no Cornell box or
+glass sphere.  Gold is a mirror, so it shows whatever surrounds it; a flat uniform light
+would wash the lattice out.  Instead it is lit like a product shot by a procedural **studio
+environment** — a dark neutral base plus a few bright soft "softbox" lights, written once as
+an equirectangular ``studio_env.pfm`` beside the outputs and fed to ftrace's image-based
+``light env`` — so the gold picks up crisp highlights that trace every facet while deep
+shadows give depth, over a clean neutral background.  (The gold look only develops under path
+tracing, ``--no-raster``; the fast rasterizer previews the same geometry flat-shaded.)
 
 This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
 **renders a seamless morphing video**: every non-main oscillating dimension is given an
@@ -352,38 +356,87 @@ def field_expr(v: Variant, t: float = 0.0) -> str:
 # scene + header
 # ---------------------------------------------------------------------------
 
-# The look is scenes/showcase.ftsl: a gold *thickened* gyroid sheet (|g| - t < 0),
-# CSG-clipped to a ball, sitting in a CLOSED Cornell box next to a clear glass sphere,
-# lit by two ceiling area lights, with the camera INSIDE the box.  We reproduce that
-# exact composition but mapped so the lattice ball is centered at the origin with
-# radius ``radius`` (gyroid_nd's native frame) and swap in the morphing higher-D field.
-_SC_CENTER = (0.40, 0.37, 0.45)     # showcase ball center
-_SC_RADIUS = 0.32                   # showcase ball radius
+# Just the gyroid from scenes/showcase.ftsl — the gold *thickened* gyroid sheet
+# (|g| - t < 0), CSG-clipped to a ball — on its own, no Cornell box / glass sphere / room.
+# Lighting is what makes gold read as gold: a conductor is a mirror, so it shows whatever
+# surrounds it.  A single *uniform* environment gives it nothing but flat grey to reflect
+# and the intricate lattice washes out.  Instead we light it like a product shot with a
+# procedural *studio* environment (``studio_env_pfm`` below): a dark neutral base plus a
+# few bright soft "softbox" lights, written once as an equirectangular .pfm and fed to
+# ftrace's image-based ``light env { file ... }``.  The gold then picks up crisp highlights
+# that trace every facet while deep shadows give depth — and the env is also the clean
+# neutral background.  The lattice itself is the morphing higher-D field at loop phase ``t``.
+
+_ENV_SPD = 1.5      # fallback uniform env radiance (used only if no studio map is supplied)
+
+# Studio environment map (equirectangular, written as a Radiance-style .pfm).  Direction
+# convention matches src/envmap.h: row 0 = +y (straight up), v=row/H -> theta=v*pi from +y;
+# col -> phi=(u-0.5)*2pi, dir=(sinT cosP, cosT, sinT sinP).  The camera sits on +z looking
+# at the origin, so the subject front faces +z and the lights below are placed accordingly.
+_STUDIO_W, _STUDIO_H = 1024, 512
+_STUDIO_BASE = (0.18, 0.185, 0.20)      # dark neutral ambient floor (clean background)
 
 
-def _sc_pt(p: Tuple[float, float, float], s: float) -> Tuple[float, float, float]:
-    """Map a showcase-space *point* into the origin-centered, radius-scaled frame."""
-    c = _SC_CENTER
-    return tuple((p[i] - c[i]) * s for i in range(3))
+def _studio_lights() -> "List[Tuple[Tuple[float, float, float], float, Tuple[float, float, float]]]":
+    """Soft key/fill/rim/top lights: (unit direction, angular radius rad, peak RGB)."""
+    def n(vec: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        m = math.sqrt(sum(c * c for c in vec)) or 1.0
+        return tuple(c / m for c in vec)  # type: ignore[return-value]
+    return [
+        (n((0.55, 0.65, 0.55)), 0.55, (7.0, 6.4, 5.2)),    # key   — warm, upper-right-front
+        (n((-0.7, 0.15, 0.5)),  0.70, (2.2, 2.4, 2.8)),    # fill  — cool, left-front, soft
+        (n((-0.2, 0.5, -0.85)), 0.35, (5.0, 5.0, 5.2)),    # rim   — behind-above, tight/hot
+        (n((0.0, 1.0, 0.0)),    0.90, (0.9, 0.95, 1.1)),   # top   — gentle skylight
+    ]
 
 
-def _sc_vec(w: Tuple[float, float, float], s: float) -> Tuple[float, float, float]:
-    """Map a showcase-space *direction/extent* (scale only, no translation)."""
-    return tuple(w[i] * s for i in range(3))
+def studio_env_pfm(path: Path) -> Path:
+    """Write (once) the procedural studio-lighting environment as an equirectangular .pfm.
 
-
-def _vtok(t: Tuple[float, float, float]) -> str:
-    return " ".join(fmt(c) for c in t)
-
-
-def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3) -> Scene:
-    """A showcase-style scene (gold thickened gyroid ball in a Cornell box) whose
-    lattice is the morphing higher-D field at loop phase ``t``.
-
-    The gold/glass/colored-wall look only develops under path tracing (``mode R``,
-    i.e. ``--no-raster``); the fast rasterizer previews the same geometry flat-shaded.
+    Returns ``path``.  If the file already exists it is left as-is (the map is fixed, so a
+    whole batch shares one write).  Pure stdlib (``struct``); no image dependency.
     """
-    s = radius / _SC_RADIUS
+    if path.exists():
+        return path
+    import struct
+    lights = _studio_lights()
+    W, H = _STUDIO_W, _STUDIO_H
+    rows: List[List[Tuple[float, float, float]]] = []
+    for row in range(H):
+        theta = (row + 0.5) / H * math.pi
+        st, ct = math.sin(theta), math.cos(theta)
+        line: List[Tuple[float, float, float]] = []
+        for col in range(W):
+            phi = ((col + 0.5) / W - 0.5) * 2.0 * math.pi
+            d = (st * math.cos(phi), ct, st * math.sin(phi))
+            r, g, b = _STUDIO_BASE
+            for ldir, rad, peak in lights:
+                cosang = max(-1.0, min(1.0, sum(a * c for a, c in zip(d, ldir))))
+                w = math.exp(-(math.acos(cosang) / rad) ** 2 * 2.0)   # soft gaussian disc
+                r += peak[0] * w; g += peak[1] * w; b += peak[2] * w
+            line.append((r, g, b))
+        rows.append(line)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"PF\n")
+        f.write(f"{W} {H}\n".encode())
+        f.write(b"-1.0\n")                              # little-endian, unit scale
+        for row in range(H - 1, -1, -1):                # PFM scanlines run bottom-to-top
+            for (r, g, b) in rows[row]:
+                f.write(struct.pack("<fff", r, g, b))
+    return path
+
+
+def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
+                env_file: Optional[str] = None) -> Scene:
+    """The lone gold thickened gyroid ball whose lattice is the morphing higher-D field.
+
+    ``env_file`` is a path to an equirectangular environment map (see ``studio_env_pfm``)
+    used for image-based lighting; with it the gold picks up the studio highlights that
+    reveal the lattice.  Without it the scene falls back to a plain uniform env (flatter).
+    The gold look only develops under path tracing (``mode R``, i.e. ``--no-raster``); the
+    fast rasterizer previews the same geometry flat-shaded.
+    """
     expr = field_expr(v, t)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
@@ -397,23 +450,10 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3) -> Sc
     sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
     grad_bound = 2.2 * v.freq * max(1, sum_h)
     box = radius * 1.05                                  # contained_by half-extent
+    r = radius
 
-    scene = Scene(Camera(eye=_sc_pt((0.47, 0.55, 1.50), s), look_at=(0, 0, 0),
-                         up=(0, 1, 0), fov_y=58, mode="R", res=res))
-
-    # Cornell box (showcase quads mapped into the ball frame): floor/ceiling/back/front
-    # white, left red, right green — a closed room the camera sits inside.
-    quads = [
-        ((0, 0, 0),    (1, 0, 0),    (0, 0, 1.65), "white"),   # floor
-        ((0, 1, 0),    (0, 0, 1.65), (1, 0, 0),    "white"),   # ceiling
-        ((0, 0, 0),    (0, 1, 0),    (1, 0, 0),    "white"),   # back
-        ((0, 0, 1.65), (0, 1, 0),    (1, 0, 0),    "white"),   # front (behind camera)
-        ((0, 0, 0),    (0, 0, 1.65), (0, 1, 0),    "red"),     # left
-        ((1, 0, 0),    (0, 1, 0),    (0, 0, 1.65), "green"),   # right
-    ]
-    walls = [Raw(f'quad {{ origin {_vtok(_sc_pt(o, s))}  u {_vtok(_sc_vec(u, s))}  '
-                 f'v {_vtok(_sc_vec(w, s))}  material "{mat}" }}')
-             for (o, u, w, mat) in quads]
+    scene = Scene(Camera(eye=(0.0, 0.7 * r, 4.0 * r), look_at=(0, 0, 0),
+                         up=(0, 1, 0), fov_y=36, mode="R", res=res))
 
     iso = Raw(
         "isosurface {\n"
@@ -427,23 +467,15 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3) -> Sc
         f"    max_gradient {fmt(grad_bound)}\n"
         "}")
 
-    glass = Raw(f'sphere {{ center {_vtok(_sc_pt((0.77, 0.17, 0.70), s))}  '
-                f'radius {fmt(0.17 * s)}  material "glass" }}')
-
-    key = Raw(f'light area {{ origin {_vtok(_sc_pt((0.22, 0.999, 0.22), s))}  '
-              f'u {_vtok(_sc_vec((0.56, 0, 0), s))}  v {_vtok(_sc_vec((0, 0, 0.56), s))}  '
-              f'normal 0 -1 0  spd preset:bb6500 }}')
-    fill = Raw(f'light area {{ origin {_vtok(_sc_pt((0.25, 0.999, 1.05), s))}  '
-               f'u {_vtok(_sc_vec((0.50, 0, 0), s))}  v {_vtok(_sc_vec((0, 0, 0.45), s))}  '
-               f'normal 0 -1 0  spd preset:bb6500 }}')
-
+    if env_file is not None:
+        # Image-based studio lighting: crisp highlights that reveal the lattice + clean bg.
+        light = Raw(f'light env {{ file "{env_file}" rotate 0 intensity 1.0 }}')
+    else:
+        light = Raw(f'light env {{ spd {fmt(_ENV_SPD)} }}')   # flat fallback
     scene.add(
-        Raw('material "white" { type diffuse reflect whitewall 0.75 }'),
-        Raw('material "red"   { type diffuse reflect redwall }'),
-        Raw('material "green" { type diffuse reflect greenwall }'),
-        Raw('material "gold"  { preset gold }'),
-        Raw('material "glass" { type dielectric ior 1.5 }'),
-        *walls, iso, glass, key, fill,
+        Raw('material "gold" { preset gold }'),
+        iso,
+        light,
     )
     return scene
 
@@ -680,7 +712,7 @@ def _video_ext(fmt: str) -> str:
 
 def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label: str,
                frames: int, fps: float, size: Tuple[int, int], radius: float,
-               raster: bool, noise: float, fmt: str,
+               raster: bool, noise: float, fmt: str, env_file: Optional[str] = None,
                preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
@@ -703,7 +735,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
     for k in range(frames):
         t = k / frames                                  # seamless loop: t in [0,1)
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
-        scene = build_scene(v, t=t, res=size, radius=radius)
+        scene = build_scene(v, t=t, res=size, radius=radius, env_file=env_file)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
                           Cache(), assets_dir=frames_dir, tag=f"{k:0{fw}d}")
         fp = frames_dir / f"{base}_{k:0{fw}d}.ftsl"
@@ -867,6 +899,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     outdir = Path(args.out) if args.out else _default_outdir(args.name)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    # One procedural studio-lighting environment map shared by the whole batch (see
+    # studio_env_pfm).  Embed an absolute forward-slash path so ftrace resolves it from
+    # its working dir (the repo root) regardless of where --out points.
+    env_file = studio_env_pfm(outdir / "studio_env.pfm").resolve().as_posix()
+
     # Exact variant seeds (--variant-seed) bypass the master; otherwise derive `count`
     # of them from a concrete master seed we print, so the whole batch is reproducible.
     master_seed = args.seed if args.seed is not None else random.randrange(1, 2 ** 31 - 1)
@@ -908,12 +945,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                                frames=args.frames, fps=args.fps, size=size,
                                radius=args.radius, raster=args.raster,
                                noise=args.render_noise, fmt=args.format,
-                               preview=preview)
+                               env_file=env_file, preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
-            scene = build_scene(v, t=0.0, res=size, radius=args.radius)
+            scene = build_scene(v, t=0.0, res=size, radius=args.radius, env_file=env_file)
             body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
                               tag=f"{k:0{width}d}")
             fp = outdir / f"{base}.ftsl"
