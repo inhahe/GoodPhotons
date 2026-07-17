@@ -127,6 +127,13 @@ Examples::
     # tumble the whole 3-D slice through N-D space (the viewpoint turns, re-slicing it)
     python examples/gyroid_nd.py --dims 6 --transform tumble
 
+    # tumble in 'slide' mode: rock the slice between two extremes so the lattice
+    # breathes smaller/larger (bigger --tumble-amp = more dramatic scale swing)
+    python examples/gyroid_nd.py --dims 6 --transform tumble --tumble-mode slide --tumble-amp 0.3
+
+    # tumble but keep world X and Y pinned (only the other axes reorient the slice)
+    python examples/gyroid_nd.py --dims 6 --transform tumble --tumble-lock 0,1
+
     # render the lattice as clear glass instead of gold (path-traced for real refraction)
     python examples/gyroid_nd.py --count 1 --material glass --no-raster --render-noise 3
 
@@ -209,6 +216,17 @@ class Variant:
     #                                     appears in at most one plane, so a rotated
     #                                     direction row can grow to at most |dir| <= sqrt(2)
     #                                     (keeps the sphere-marcher's Lipschitz bound valid).
+    tumble_mode: str = "rotate"         # tumble transform only: 'rotate' spins the slice
+    #                                     basis through full turns (winding * t); 'slide' rocks
+    #                                     it back and forth between two extremes by
+    #                                     theta(t) = (2*pi*tumble_amp) * sin(2*pi*winding*t),
+    #                                     which makes the lattice appear to breathe smaller /
+    #                                     larger as the projected frequency swells and shrinks.
+    tumble_amp: float = 0.25            # tumble 'slide' mode only: peak swing in turns
+    #                                     (0.25 = a quarter-turn rock each way).
+    tumble_locked: Tuple[int, ...] = () # tumble transform only: axis indices excluded from the
+    #                                     slice-orientation rotation (they stay fixed while the
+    #                                     other axes tumble).
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -434,12 +452,18 @@ def pick_variant(seed: int, args: argparse.Namespace,
     # Drawn last (like hidden_offset) and only when needed, so the other transforms' RNG
     # streams — and thus their reproducibility — are untouched.
     tumble_planes: List[Tuple[int, int, int]] = []
+    _tl = getattr(args, "tumble_lock", ())
+    tumble_locked: Tuple[int, ...] = (_parse_tumble_lock(_tl) if isinstance(_tl, str)
+                                      else tuple(sorted(_tl or ())))
     if transform == "tumble":
         max_w = max(1, args.max_winding)
-        rest = list(range(3, D))
+        locked = set(a for a in tumble_locked if 0 <= a < D)
+        rest = [d for d in range(3, D) if d not in locked]
         rng.shuffle(rest)                               # random hidden partners per seed
         w = 1
         for i in range(min(3, D)):                      # visible axes -> hidden partners
+            if i in locked:                             # this axis is pinned; skip it
+                continue
             if not rest:
                 break
             j = rest.pop()
@@ -449,13 +473,18 @@ def pick_variant(seed: int, args: argparse.Namespace,
             i = rest.pop(); j = rest.pop()
             tumble_planes.append((i, j, w))
             w = w % max_w + 1
-        if not tumble_planes and D >= 2:                # D<=3: no hidden dims -> spin in 3-D
-            tumble_planes.append((0, min(2, D - 1), 1))
+        if not tumble_planes and D >= 2:                # nothing paired -> spin two free axes
+            free = [d for d in range(D) if d not in locked]
+            if len(free) >= 2:
+                tumble_planes.append((free[0], free[-1], 1))
 
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
-                   tumble_planes=tumble_planes, dim_list=dims)
+                   tumble_planes=tumble_planes,
+                   tumble_mode=getattr(args, "tumble_mode", "rotate"),
+                   tumble_amp=getattr(args, "tumble_amp", 0.25),
+                   tumble_locked=tumble_locked, dim_list=dims)
 
 
 # ---------------------------------------------------------------------------
@@ -488,18 +517,32 @@ def _tumbled_directions(v: "Variant", t: float) -> Dict[int, Tuple[float, float,
     i.e. it mixes the direction rows, which is exactly a rigid rotation of the 3-D slice
     within the N-D space.  Inert dims carry a direction too, so a plane may swing an
     oscillating axis toward a hidden (inert) one and back: that axis's visible frequency
-    fades and re-forms as the slice turns.  At t=0 and t=1 every angle is a multiple of
-    2*pi, so the rotation is the identity and the field returns exactly to the base gyroid
-    (a seamless loop).
+    fades and re-forms as the slice turns.
+
+    Two motions, per ``v.tumble_mode``:
+
+    * ``rotate`` — each plane's angle is ``2*pi*winding*t``: the slice spins through whole
+      turns, so at t=0 and t=1 every angle is a multiple of 2*pi (identity) and the field
+      returns exactly to the base gyroid.
+    * ``slide`` — each plane's angle is ``(2*pi*tumble_amp)*sin(2*pi*winding*t)``: the slice
+      rocks back and forth between two extremes (+/- tumble_amp turns).  Because sin is 0 at
+      t=0 and t=1 the loop is still seamless, but instead of a full spin the projected
+      lattice frequency swells and shrinks, so the gyroid appears to breathe smaller/larger.
+
+    Either way the disjoint planes keep each rotated direction row at |dir| <= sqrt(2).
     """
     dirs: Dict[int, List[float]] = {d.index: list(d.direction) for d in v.dim_list}
     two_pi = 2.0 * math.pi
+    slide = (v.tumble_mode == "slide")
     for (i, j, wind) in v.tumble_planes:
         di = dirs.get(i)
         dj = dirs.get(j)
         if di is None or dj is None:
             continue
-        a = two_pi * wind * t
+        if slide:
+            a = (two_pi * v.tumble_amp) * math.sin(two_pi * wind * t)
+        else:
+            a = two_pi * wind * t
         ca, sa = math.cos(a), math.sin(a)
         dirs[i] = [ca * di[k] - sa * dj[k] for k in range(3)]
         dirs[j] = [sa * di[k] + ca * dj[k] for k in range(3)]
@@ -552,6 +595,25 @@ def _parse_bloom_params(spec: Optional[str]) -> Tuple[str, ...]:
         if it not in out:
             out.append(it)
     return tuple(out) if out else ("dims",)
+
+
+def _parse_tumble_lock(spec: Optional[str]) -> Tuple[int, ...]:
+    """Parse a ``--tumble-lock`` spec (comma-separated axis indices) into a sorted tuple.
+    Empty -> ()."""
+    out: List[int] = []
+    for x in (spec or "").split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            a = int(x)
+        except ValueError:
+            raise SystemExit(f"error: --tumble-lock '{x}' is not an integer axis index")
+        if a < 0:
+            raise SystemExit(f"error: --tumble-lock axis index '{a}' must be >= 0")
+        if a not in out:
+            out.append(a)
+    return tuple(sorted(out))
 
 
 def _bloom_env(t: float) -> float:
@@ -974,7 +1036,10 @@ def header(v: Variant, index: int, count: int, *,
         if transform == "bloom":
             motion = f"frame 0 = classic showcase gyroid; blooms {bloom_params_desc(v)} at mid-loop"
         elif transform == "tumble":
-            motion = f"tumbling the whole slice through N-D: {tumble_planes_desc(v)}"
+            how = ("rocking between two extremes (+/-{amp} turns)".format(amp=fmt(v.tumble_amp))
+                   if v.tumble_mode == "slide" else "spinning through full turns")
+            motion = (f"tumbling the whole slice through N-D ({how}): "
+                      f"{tumble_planes_desc(v)}")
         else:
             motion = f"{verb} dims -> {moving}"
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
@@ -985,6 +1050,17 @@ def header(v: Variant, index: int, count: int, *,
     # Animation-only detail: which oscillating dims move and how fast (winding), plus role.
     # (tumble moves the whole slice, not per-dim, so it reports its rotation planes instead.)
     if frames is not None and transform == "tumble":
+        if v.tumble_mode == "slide":
+            L += ["#",
+                  f"# tumble mode           : slide  (rocks +/-{fmt(v.tumble_amp)} turns each way,",
+                  "#   theta(t) = 2*pi*tumble_amp*sin(2*pi*winding*t); the projected frequency",
+                  "#   swells and shrinks, so the lattice appears to breathe smaller/larger)"]
+        else:
+            L += ["#",
+                  "# tumble mode           : rotate  (spins through full turns; winding*t)"]
+        if v.tumble_locked:
+            L.append(f"# tumble locked axes    : {axis_list(list(v.tumble_locked))}  "
+                     f"(indices {list(v.tumble_locked)}; excluded from the slice rotation)")
         L += ["#",
               "# tumble rotation planes — each (axis_i <-> axis_j) turns 'turns' whole",
               "#   times over the loop; together they rigidly rotate the 3-D slice in N-D:",
@@ -1033,11 +1109,19 @@ def header(v: Variant, index: int, count: int, *,
               "#   a_d = 2*pi * winding_d * t   (the dim's wavevector rotates out of the",
               "#   3-D slice into its hidden axis; t runs 0->1, 'turns' column = winding_d)"]
     elif transform == "tumble":
+        if v.tumble_mode == "slide":
+            angle = "2*pi*tumble_amp*sin(2*pi*winding*t)"
+            tail = ("(angle {a} each; rocks between +/-tumble_amp turns and back).  "
+                    "The angle is 0 at t=0,1 so the loop is seamless; in between the slice "
+                    "tilts and the projected frequency swells/shrinks (breathing scale).")
+        else:
+            angle = "2*pi*winding*t"
+            tail = ("(angle {a} each).  R(0)=R(1)=I, so the loop is seamless; in "
+                    "between the whole 3-D slice turns rigidly through the N-D space.")
         L += ["#   u_d = harmonic_d * freq * (dir_d(t) . (x, y, z)) + phase_d",
               "#   dir_d(t) = row d of  R(t) @ A,  where A is the static direction matrix",
               "#   above and R(t) is the product of the tumble planes' Givens rotations",
-              "#   (angle 2*pi*winding*t each).  R(0)=R(1)=I, so the loop is seamless; in",
-              "#   between the whole 3-D slice turns rigidly through the N-D space."]
+              "#   " + tail.format(a=angle)]
     else:
         tail = "  (winding is the per-dim 'drift' rate above)" if frames is not None else ""
         L += ["#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
@@ -1486,6 +1570,20 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--bloom-amp", type=float, default=1.0,
                    help="scale the peak swing of every bloomed parameter (default 1.0; at 1.0 "
                         "'freq'/'thickness' reach 2x at mid-loop). Only used with --transform bloom.")
+    g.add_argument("--tumble-mode", choices=("rotate", "slide"), default="rotate",
+                   help="for --transform tumble: 'rotate' (default) spins the whole 3-D slice "
+                        "through full N-D turns; 'slide' rocks it back and forth between two "
+                        "extremes so the lattice appears to breathe smaller/larger (the "
+                        "projected frequency swells and shrinks). Only used with --transform tumble.")
+    g.add_argument("--tumble-amp", type=float, default=0.25,
+                   help="for --transform tumble --tumble-mode slide: peak swing in turns each "
+                        "way (default 0.25 = a quarter-turn rock). Larger = more dramatic "
+                        "size breathing. Only used with --tumble-mode slide.")
+    g.add_argument("--tumble-lock", type=str, default=None, metavar="A[,A...]",
+                   help="for --transform tumble: comma-separated axis indices to EXCLUDE from "
+                        "the slice-orientation rotation (they stay fixed while the other axes "
+                        "tumble). e.g. --tumble-lock 0,1 keeps world X and Y pinned. Only used "
+                        "with --transform tumble.")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
                         "through its higher dimensions); the videos + .txt sidecars collect "
@@ -1523,6 +1621,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.bloom is not None and args.transform != "bloom":
         raise SystemExit("error: --bloom only applies to --transform bloom")
     _parse_bloom_params(args.bloom)     # validate early (raises on a bad parameter name)
+
+    # tumble options only apply to --transform tumble.
+    if args.transform != "tumble":
+        if args.tumble_mode != "rotate":
+            raise SystemExit("error: --tumble-mode only applies to --transform tumble")
+        if args.tumble_lock is not None:
+            raise SystemExit("error: --tumble-lock only applies to --transform tumble")
+    args.tumble_lock = _parse_tumble_lock(args.tumble_lock)   # normalize to a tuple
 
     # Video/frame pixel size: explicit --size (N or WxH) wins, else square --res.
     size = args.size if args.size is not None else (args.res, args.res)
