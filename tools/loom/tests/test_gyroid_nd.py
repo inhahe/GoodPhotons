@@ -11,7 +11,10 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -96,6 +99,105 @@ def test_bloom_default_freq_matches_showcase_density():
     # and the density scales inversely with radius (same periods across the ball)
     args2 = _args("--dims", "5", "--transform", "bloom", "--radius", "1.3")
     assert abs(g.pick_variant(3, args2, {}).freq - (0.32 * 40.0 / 1.3)) < 1e-6
+
+
+def test_bloom_default_param_is_dims():
+    # With no --bloom, the bloom transform blooms 'dims' (backward-compatible behavior).
+    v = g.pick_variant(5, _args("--dims", "6", "--transform", "bloom"), {})
+    assert v.bloom_params == ("dims",)
+
+
+def test_bloom_param_parsing_and_aliases():
+    assert g._parse_bloom_params(None) == ("dims",)
+    assert g._parse_bloom_params("") == ("dims",)
+    assert g._parse_bloom_params("freq") == ("freq",)
+    assert g._parse_bloom_params("complexity") == ("freq",)   # friendly alias
+    assert g._parse_bloom_params("intricacy") == ("freq",)
+    assert g._parse_bloom_params("dims,freq") == ("dims", "freq")
+    assert g._parse_bloom_params("freq,freq") == ("freq",)     # de-duped
+    with pytest.raises(SystemExit):
+        g._parse_bloom_params("wobble")
+
+
+def test_bloom_freq_holds_classic_and_pulses_frequency():
+    # --bloom freq: the whole loop is the classic gyroid, but its frequency swells at mid-loop.
+    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq", "--freq", "5"), {})
+    assert v.bloom_params == ("freq",)
+    # frame 0 is the exact classic gyroid at the base frequency
+    assert g.field_expr(v, 0.0, "bloom") == g._classic_gyroid_expr(5.0)
+    # mid-loop is still the classic gyroid but at 2x frequency (amp 1 -> +1*swing*1)
+    assert abs(g.bloom_freq(v, 0.5) - 10.0) < 1e-9
+    assert g.field_expr(v, 0.5, "bloom") == g._classic_gyroid_expr(g.bloom_freq(v, 0.5))
+    # and it never unfolds higher-D structure (no 'dims' bloom)
+    assert g.field_expr(v, 0.5, "bloom") != g.field_expr(v, 0.5, "drift")
+
+
+def test_bloom_amp_scales_frequency_swing():
+    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq",
+                                "--freq", "4", "--bloom-amp", "0.5"), {})
+    # amp 0.5 -> mid-loop frequency is 4*(1 + 0.5*1) = 6
+    assert abs(g.bloom_freq(v, 0.5) - 6.0) < 1e-9
+    assert abs(g.bloom_freq(v, 0.0) - 4.0) < 1e-9      # ends unchanged
+
+
+def test_bloom_freq_applies_to_full_field_when_dims_also_bloom():
+    # --bloom dims,freq: the frequency pulse rides on the full N-D crossfade too.
+    v = g.pick_variant(5, _args("--dims", "6", "--transform", "bloom",
+                                "--bloom", "dims,freq", "--freq", "3"), {})
+    assert v.bloom_params == ("dims", "freq")
+    assert g.field_expr(v, 0.0, "bloom") == g._classic_gyroid_expr(3.0)   # seamless frame 0
+    # mid-loop equals the drift field evaluated at the bloomed (2x) frequency
+    assert g.field_expr(v, 0.5, "bloom") == g.field_expr(v, 0.5, "drift",
+                                                         freq=g.bloom_freq(v, 0.5))
+
+
+def test_bloom_threshold_and_thickness_are_seamless_scalars():
+    v = g.pick_variant(5, _args("--transform", "bloom",
+                                "--bloom", "threshold,thickness"), {})
+    assert v.bloom_params == ("threshold", "thickness")
+    # both scalars equal their base at the loop ends and swing at the midpoint
+    assert g.bloom_threshold(v, 0.0) == v.threshold
+    assert g.bloom_threshold(v, 1.0) == v.threshold
+    assert g.bloom_threshold(v, 0.5) != v.threshold
+    assert g.bloom_thickness_scale(v, 0.0) == 1.0
+    assert g.bloom_thickness_scale(v, 1.0) == 1.0
+    assert g.bloom_thickness_scale(v, 0.5) > 1.0
+    # the field itself is the frozen classic gyroid (no dims/freq bloom)
+    assert g.field_expr(v, 0.3, "bloom") == g._classic_gyroid_expr(v.freq)
+
+
+def test_bloom_gradient_bound_tracks_bloomed_frequency():
+    # The Lipschitz bound must grow with the frequency pulse or the marcher will miss walls.
+    from loom import Clock, Cache
+    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq", "--freq", "5"), {})
+    sh = max(3, sum(d.harmonic for d in v.dim_list if d.oscillate))
+
+    def bound(t):
+        body = g.build_scene(v, t=t, res=(32, 32), radius=1.3,
+                             transform="bloom").emit(Clock(t=t), Cache())
+        return float(re.search(r"max_gradient ([0-9.]+)", body).group(1))
+
+    assert abs(bound(0.0) - 2.2 * 5.0 * sh) < 0.01
+    assert abs(bound(0.5) - 2.2 * 10.0 * sh) < 0.01    # 2x freq -> 2x bound
+
+
+def test_bloom_requires_bloom_transform():
+    with pytest.raises(SystemExit):
+        g.main(["--transform", "drift", "--bloom", "freq", "--no-video"])
+
+
+def test_next_run_dir_increments(tmp_path):
+    base = tmp_path / "gyroid_nd"
+    d1 = g._next_run_dir(base)
+    assert d1.name == "run001"
+    d1.mkdir(parents=True)
+    d2 = g._next_run_dir(base)
+    assert d2.name == "run002"
+    d2.mkdir()
+    # a gap (deleting run001) never reuses a number: next is still one past the max
+    import shutil
+    shutil.rmtree(d1)
+    assert g._next_run_dir(base).name == "run003"
 
 
 def test_reproducible_from_seed():

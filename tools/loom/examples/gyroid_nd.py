@@ -58,13 +58,28 @@ and loop seamlessly:
     the object rather than sliding it.
   * ``bloom`` — pin frame 0 (and frame 1) to the *exact classic gyroid* from
     ``scenes/showcase.ftsl`` (``sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)``),
-    then cross-blend the full N-D gyroid in and back out with an envelope ``w = sin^2(pi t)``.
-    The clip opens as the recognizable showcase gyroid and *unfolds* into higher-D structure
-    at the midpoint before folding back.  The base frequency defaults to the showcase density
-    (freq 40 at radius 0.32) unless ``--freq`` is given.
+    then swell one or more of its scalar **parameters** out and back with an envelope
+    ``w = sin^2(pi t)`` (0 at the loop ends, 1 at the midpoint), so the clip always opens
+    and closes on the recognizable showcase gyroid.  ``--bloom`` picks *which* parameter(s)
+    bloom (comma-separated, default ``dims``):
+
+      - ``dims`` — cross-blend the full N-D gyroid in and back out; the lattice *unfolds*
+        into higher-D structure at the midpoint (the original bloom).
+      - ``freq`` (aliases ``complexity``/``intricacy``) — hold the classic gyroid but pulse
+        its spatial frequency up at mid-loop, so the pattern gets finer/more intricate and
+        relaxes back.
+      - ``threshold`` — swell the level-set value, breathing the surface off its zero set.
+      - ``thickness`` — swell the sheet's half-thickness so the walls fatten and thin.
+
+    Parameters combine (e.g. ``--bloom dims,freq``), and ``--bloom-amp`` scales every
+    chosen parameter's peak swing (default 1).  The base frequency defaults to the showcase
+    density (freq 40 at radius 0.32) unless ``--freq`` is given.
 
 The assembled animated ``.gif`` (or ``.mp4`` via ``--format mp4``) and a ``.txt`` listing
-every chosen value collect together in the output directory; each variant's per-frame
+every chosen value collect together in the output directory.  By default each run gets its
+own fresh ``runNNN/`` subdirectory (``run001``, ``run002``, ... one past the highest existing,
+never reusing a number) so successive runs never overwrite each other; pass ``--no-run-subdir``
+to write straight into the base output directory instead.  Each variant's per-frame
 ``.ftsl``/``.png`` files live in their own subdir ``<outdir>/<variant>/``.  Frames render
 with ftrace's fast headless rasterizer by default.  Use ``--no-video`` to instead emit a
 single static ``.ftsl`` per variant (with a full comment header).  Any choice can be
@@ -82,6 +97,12 @@ Examples::
 
     # start on the exact showcase gyroid, then bloom into higher-D structure and back
     python examples/gyroid_nd.py --dims 6 --transform bloom
+
+    # stay the classic gyroid but pulse its complexity (frequency) up at mid-loop
+    python examples/gyroid_nd.py --transform bloom --bloom complexity
+
+    # bloom the higher-D unfold *and* an extra-intense frequency pulse together
+    python examples/gyroid_nd.py --dims 6 --transform bloom --bloom dims,freq --bloom-amp 1.5
 
     # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as an mp4
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
@@ -109,6 +130,7 @@ import argparse
 import math
 import os
 import random
+import re
 import sys
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
@@ -154,6 +176,13 @@ class Variant:
     pinned: bool = True                 # True: dims 0/1/2 pinned to world X/Y/Z (the slice
     #                                     contains the xyz volume); False: every dim gets a
     #                                     random direction (a freely-oriented N-D slice)
+    bloom_params: Tuple[str, ...] = ()  # bloom transform only: which scalar parameters
+    #                                     oscillate over the loop (subset of BLOOM_PARAMS:
+    #                                     'dims' = crossfade in the full N-D field, 'freq' =
+    #                                     pulse the spatial frequency / complexity, 'threshold'
+    #                                     = shift the level set, 'thickness' = swell the sheet).
+    #                                     Empty for the drift/rotate transforms.
+    bloom_amp: float = 1.0              # scales every bloom parameter's peak swing
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -241,6 +270,12 @@ def pick_variant(seed: int, args: argparse.Namespace,
                  axis_locks: Dict[int, AxisLock]) -> Variant:
     rng = random.Random(seed)
 
+    transform = getattr(args, "transform", "drift")
+    bloom_params = (_parse_bloom_params(getattr(args, "bloom", None))
+                    if transform == "bloom" else ())
+    bloom_dims = "dims" in bloom_params    # crossfade the full N-D field in (vs. only pulsing
+    #                                        scalar params around the fixed classic gyroid)
+
     # 1) total dimension count -------------------------------------------------
     max_forced_axis = max(axis_locks) if axis_locks else -1
     if args.dims is not None:
@@ -277,7 +312,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
         if M < lo_m or M > hi_m:
             raise SystemExit(f"error: --oscillating {M} is out of range [{lo_m}, {hi_m}] "
                              f"given the current locks / dims")
-    elif getattr(args, "transform", "drift") == "bloom":
+    elif bloom_dims:
         # bloom starts as the 3-term classic gyroid and unfolds into the full N-D
         # field, so we want that full field to be as rich as possible: every
         # available dimension oscillates (D terms >> the 3 classic terms).
@@ -301,7 +336,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
         if H < lo_h or H > hi_h:
             raise SystemExit(f"error: --harmonics {H} is out of range [{lo_h}, {hi_h}] "
                              f"given the current locks / oscillating dims")
-    elif getattr(args, "transform", "drift") == "bloom":
+    elif bloom_dims:
         # bloom keeps every extra dim at the fundamental (h1) so it unfolds into a
         # clean pure N-D gyroid; complexity comes from the dimensions, not harmonics.
         H = lo_h
@@ -349,7 +384,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
 
     if args.freq is not None:
         freq = args.freq
-    elif getattr(args, "transform", "drift") == "bloom":
+    elif transform == "bloom":
         # Bloom's frame 0 IS the showcase gyroid; default its density to match showcase
         # (freq 40 at radius 0.32) for whatever container radius is in use.
         freq = SHOWCASE_RF / max(1e-6, args.radius)
@@ -367,6 +402,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
 
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
+                   bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
                    dim_list=dims)
 
 
@@ -409,8 +445,67 @@ SHOWCASE_RF = 0.32 * 40.0
 # Supported ways the higher dimensions animate the slice over one loop.
 TRANSFORMS = ("drift", "rotate", "bloom")
 
+# Scalar gyroid parameters the ``bloom`` transform can oscillate over the loop (each
+# starts and ends at its base value, so frame 0 is always the recognizable base gyroid).
+#   dims      — cross-blend the full N-D field in and back out (the original bloom)
+#   freq      — pulse the spatial frequency, i.e. the pattern's intricacy / complexity
+#   threshold — shift the isosurface level set (channels open and close)
+#   thickness — swell and thin the gold sheet's half-width
+BLOOM_PARAMS = ("dims", "freq", "threshold", "thickness")
 
-def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
+# Each bloomable parameter's natural peak swing at the mid-loop (scaled by --bloom-amp):
+#   freq      * (1 + swing*w)   -> at amp 1, w 1: 2x frequency (twice as many cells)
+#   threshold + swing*w         -> shift the level set (g roughly spans +/-1.5)
+#   thickness * (1 + swing*w)   -> at amp 1, w 1: 2x sheet half-width
+_BLOOM_SWING = {"freq": 1.0, "threshold": 0.6, "thickness": 1.0}
+
+
+def _parse_bloom_params(spec: Optional[str]) -> Tuple[str, ...]:
+    """Parse a ``--bloom`` spec (comma-separated) into a validated tuple of parameters.
+    Accepts the friendly aliases 'complexity'/'intricacy' for 'freq'.  Empty -> ('dims',)."""
+    items = [x.strip().lower() for x in (spec or "").split(",") if x.strip()]
+    out: List[str] = []
+    for it in items:
+        if it in ("complexity", "intricacy"):
+            it = "freq"
+        if it not in BLOOM_PARAMS:
+            raise SystemExit(f"error: --bloom '{it}' is not one of "
+                             f"{', '.join(BLOOM_PARAMS)} (alias 'complexity' -> freq)")
+        if it not in out:
+            out.append(it)
+    return tuple(out) if out else ("dims",)
+
+
+def _bloom_env(t: float) -> float:
+    """The bloom envelope w(t) = sin^2(pi t): 0 at t=0 and t=1 (so both loop ends are
+    *exactly* the base gyroid and the loop is seamless), 1 at the mid-loop peak."""
+    return 0.5 * (1.0 - math.cos(2.0 * math.pi * t))
+
+
+def bloom_freq(v: "Variant", t: float) -> float:
+    """The (possibly time-varying) base frequency at loop phase ``t``.  Equals ``v.freq``
+    unless 'freq' is a bloom target, in which case it swells to its peak at mid-loop."""
+    if "freq" in v.bloom_params:
+        return v.freq * (1.0 + v.bloom_amp * _BLOOM_SWING["freq"] * _bloom_env(t))
+    return v.freq
+
+
+def bloom_threshold(v: "Variant", t: float) -> float:
+    """The isosurface level set at ``t`` (shifted from ``v.threshold`` when 'threshold' blooms)."""
+    if "threshold" in v.bloom_params:
+        return v.threshold + v.bloom_amp * _BLOOM_SWING["threshold"] * _bloom_env(t)
+    return v.threshold
+
+
+def bloom_thickness_scale(v: "Variant", t: float) -> float:
+    """Multiplier on the sheet half-width at ``t`` (1 unless 'thickness' blooms)."""
+    if "thickness" in v.bloom_params:
+        return 1.0 + v.bloom_amp * _BLOOM_SWING["thickness"] * _bloom_env(t)
+    return 1.0
+
+
+def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
+               freq: Optional[float] = None) -> str:
     """Emit the gyroid field at loop phase ``t`` in [0,1) under the chosen ``transform``.
 
     Both transforms reproduce the exact static field at ``t=0`` (and loop seamlessly, so
@@ -434,17 +529,27 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
       a seamless "bloom".  The higher dimensions still drift while blended in.
     """
     if transform == "bloom":
-        # Cross-fade the fixed classic gyroid (frame 0) with the full N-D field.  The
-        # envelope is 0 at t=0,1 (so both ends are *exactly* the classic gyroid and the
-        # loop is seamless) and 1 at t=0.5 (the full higher-D gyroid at its peak).
-        w = 0.5 * (1.0 - math.cos(2.0 * math.pi * t))       # sin^2(pi t)
-        g_classic = _classic_gyroid_expr(v.freq)
+        # ``bloom`` pins frame 0 (and frame 1) to the base gyroid, then oscillates the
+        # selected parameters over the loop with the envelope w = sin^2(pi t).  The
+        # frequency swing (if 'freq' blooms) applies to *both* the classic base and the
+        # full field, so the whole pattern pulses in intricacy together.
+        w = _bloom_env(t)
+        fr = bloom_freq(v, t)
+        g_classic = _classic_gyroid_expr(fr)
+        if "dims" not in v.bloom_params:
+            # No dimensional bloom: the loop is the recognizable classic gyroid the whole
+            # time (frame 0 = showcase); only the scalar parameters pulse around it.
+            return g_classic
+        # Dimensional bloom: cross-fade the classic gyroid with the full N-D field.  The
+        # envelope is 0 at t=0,1 (both ends exactly the classic gyroid, seamless loop) and
+        # 1 at t=0.5 (the full higher-D gyroid at its peak).
         if w <= 1e-9:
             return g_classic
-        g_full = field_expr(v, t, "drift")                  # higher dims drift while blended
+        g_full = field_expr(v, t, "drift", freq=fr)         # higher dims drift while blended
         if w >= 1.0 - 1e-9:
             return g_full
         return f"({fmt(1.0 - w)})*({g_classic})+({fmt(w)})*({g_full})"
+    fr = v.freq if freq is None else freq
     osc = sorted(v.oscillating)
     m = len(osc)
     by_index = {d.index: d for d in v.dim_list}
@@ -456,7 +561,7 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
             # Rotate the wavevector into the hidden axis: in-slice frequency k*cos(alpha),
             # plus a k*sin(alpha)*hidden_offset phase.  alpha is a whole number of turns
             # over the loop, so t=0 and t=1 both give alpha ≡ 0 -> the exact static field.
-            k = dim.harmonic * v.freq
+            k = dim.harmonic * fr
             alpha = two_pi * dim.winding * t
             coeff = k * math.cos(alpha)
             phase = (dim.phase + k * dim.hidden_offset * math.sin(alpha)) % two_pi
@@ -465,7 +570,7 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
             # Reduce the drifted phase modulo 2*pi so t=0 and t=1 emit the *same* constant
             # (a whole-cycle advance) -> a perfectly seamless loop despite float rounding.
             phase = (dim.phase + two_pi * dim.winding * t) % two_pi
-            u[d] = _u_expr(dim, v.freq, phase)
+            u[d] = _u_expr(dim, fr, phase)
     terms = []
     for i in range(m):
         a = osc[i]
@@ -567,21 +672,29 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     # amplitude (M=3 reproduces the classic 0.5).
     m = max(1, len(v.oscillating))
     if transform == "bloom":
-        # Match the field cross-fade: at t=0,1 the sheet is exactly showcase's (half =
-        # thickness); at the bloom peak it thickens to the full-field half like the others.
-        w = 0.5 * (1.0 - math.cos(2.0 * math.pi * t))       # sin^2(pi t)
-        half = v.thickness * (1.0 + w * (math.sqrt(m / 3.0) - 1.0))
+        w = _bloom_env(t)
+        if "dims" in v.bloom_params:
+            # Match the field cross-fade: at t=0,1 the sheet is exactly showcase's (half =
+            # thickness); at the bloom peak it thickens to the full-field half.
+            half = v.thickness * (1.0 + w * (math.sqrt(m / 3.0) - 1.0))
+        else:
+            half = v.thickness                              # classic base, fixed amplitude
+        half *= bloom_thickness_scale(v, t)                 # optional 'thickness' bloom
+        thr = bloom_threshold(v, t)                         # optional 'threshold' bloom
     else:
         half = v.thickness * math.sqrt(m / 3.0)
-    thr = v.threshold
+        thr = v.threshold
     inner = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
     sheet = f"abs({inner})-({fmt(half)})"
     # Lipschitz bound for the sphere-marcher: |grad f| <= 2*freq*sum(harmonic_d).  In bloom
-    # mode the classic base always contributes its 3 unit terms, so floor the sum at 3.
+    # mode the classic base always contributes its 3 unit terms, so floor the sum at 3; and
+    # use the peak (possibly 'freq'-bloomed) frequency at this frame so the bound stays valid.
     sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
+    fr = v.freq
     if transform == "bloom":
         sum_h = max(sum_h, 3)
-    grad_bound = 2.2 * v.freq * max(1, sum_h)
+        fr = bloom_freq(v, t)
+    grad_bound = 2.2 * fr * max(1, sum_h)
     box = radius * 1.05                                  # contained_by half-extent
     r = radius
 
@@ -696,6 +809,15 @@ def variant_banner(v: Variant, index: int, count: int) -> str:
     return "\n".join(lines)
 
 
+def bloom_params_desc(v: Variant) -> str:
+    """Human-readable list of what the bloom oscillates, e.g. 'higher-D structure,
+    frequency (complexity)'."""
+    names = {"dims": "higher-D structure", "freq": "frequency (complexity)",
+             "threshold": "level set", "thickness": "sheet thickness"}
+    parts = [names.get(p, p) for p in v.bloom_params]
+    return ", ".join(parts) if parts else "higher-D structure"
+
+
 def header(v: Variant, index: int, count: int, *,
            frames: Optional[int] = None, fps: Optional[float] = None,
            transform: str = "drift") -> str:
@@ -717,7 +839,7 @@ def header(v: Variant, index: int, count: int, *,
     verb = {"rotate": "rotating", "bloom": "blooming"}.get(transform, "drifting")
     if frames is not None:
         secs = frames / fps if fps else 0.0
-        motion = ("frame 0 = classic showcase gyroid; full N-D field blooms in at mid-loop"
+        motion = (f"frame 0 = classic showcase gyroid; blooms {bloom_params_desc(v)} at mid-loop"
                   if transform == "bloom" else f"{verb} dims -> {moving}")
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
                  f"(~{fmt(secs)}s seamless loop); transform '{transform}'; {motion}")
@@ -740,12 +862,24 @@ def header(v: Variant, index: int, count: int, *,
                 L.append(f"#   {name:>4}  {'-':>5}  inert")
     if transform == "bloom":
         L += ["#",
-              "# field (bloom):  F(t) = (1-w)*G_classic + w*G_full,  w = sin^2(pi t)",
-              "#   G_classic = sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)",
-              "#               (the showcase gyroid; f = base frequency, shown at frame 0)",
-              "#   G_full    = the full N-D gyroid below (drifting), blended in 0->1->0",
-              "#   so t=0 and t=1 are exactly the classic gyroid (seamless), t=0.5 the peak.",
-              "#"]
+              f"# bloom parameters      : {', '.join(v.bloom_params)}  (amp {fmt(v.bloom_amp)})",
+              f"#   oscillated over the loop by w(t) = sin^2(pi t)  (0 at t=0,1; 1 at t=0.5),",
+              "#   so frame 0 (and frame 1) is exactly the base showcase gyroid — seamless."]
+        if "dims" in v.bloom_params:
+            L += ["#   dims:      F(t) = (1-w)*G_classic + w*G_full",
+                  "#     G_classic = sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)",
+                  "#                 (the showcase gyroid; f = base frequency, shown at frame 0)",
+                  "#     G_full    = the full N-D gyroid below (drifting), blended in 0->1->0"]
+        else:
+            L += ["#   (no 'dims' bloom: the field stays the classic showcase gyroid all loop;",
+                  "#    only the scalar parameters below pulse around it)"]
+        if "freq" in v.bloom_params:
+            L.append(f"#   freq:      f(t) = {fmt(v.freq)} * (1 + {fmt(v.bloom_amp * _BLOOM_SWING['freq'])}*w)   (intricacy/complexity pulse)")
+        if "threshold" in v.bloom_params:
+            L.append(f"#   threshold: thr(t) = {fmt(v.threshold)} + {fmt(v.bloom_amp * _BLOOM_SWING['threshold'])}*w   (channels open/close)")
+        if "thickness" in v.bloom_params:
+            L.append(f"#   thickness: half(t) *= (1 + {fmt(v.bloom_amp * _BLOOM_SWING['thickness'])}*w)   (sheet swells/thins)")
+        L.append("#")
     L += ["#",
           "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
     if transform == "rotate":
@@ -1058,6 +1192,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="output directory (default: <repo>/png/gyroid_nd)")
     g.add_argument("--name", type=str, default="gyroid_nd",
                    help="base filename for the outputs (default gyroid_nd)")
+    g.add_argument("--run-subdir", action=argparse.BooleanOptionalAction, default=True,
+                   help="put each run in a fresh numbered subdirectory (run001, run002, ...) "
+                        "under the output dir so runs never overwrite each other (default). "
+                        "--no-run-subdir writes straight into the output dir (old behavior, "
+                        "overwrites same-named files from prior runs).")
     g.add_argument("--seed", type=int, default=None,
                    help="master RNG seed for a reproducible batch (default: random; the "
                         "chosen value is printed so you can reproduce the run)")
@@ -1122,6 +1261,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "field in and back out (w=sin^2(pi t)), so the clip opens as the "
                         "showcase gyroid and unfolds into higher-D structure. All start from "
                         "a seamless frame 0 and loop.")
+    g.add_argument("--bloom", type=str, default=None, metavar="P[,P...]",
+                   help="for --transform bloom: which parameter(s) oscillate over the loop "
+                        "(comma-separated; default 'dims'). Choices: 'dims' (cross-blend the "
+                        "full N-D field in and out — the original bloom), 'freq' (pulse the "
+                        "spatial frequency = pattern intricacy/complexity; alias 'complexity'), "
+                        "'threshold' (shift the level set so channels open/close), 'thickness' "
+                        "(swell and thin the gold sheet). Frame 0 is always the base showcase "
+                        "gyroid. e.g. --bloom freq  or  --bloom dims,freq")
+    g.add_argument("--bloom-amp", type=float, default=1.0,
+                   help="scale the peak swing of every bloomed parameter (default 1.0; at 1.0 "
+                        "'freq'/'thickness' reach 2x at mid-loop). Only used with --transform bloom.")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
                         "through its higher dimensions); the videos + .txt sidecars collect "
@@ -1156,6 +1306,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("error: --oscillating must be >= 2")
     if args.count < 1:
         raise SystemExit("error: --count must be >= 1")
+    if args.bloom is not None and args.transform != "bloom":
+        raise SystemExit("error: --bloom only applies to --transform bloom")
+    _parse_bloom_params(args.bloom)     # validate early (raises on a bad parameter name)
 
     # Video/frame pixel size: explicit --size (N or WxH) wins, else square --res.
     size = args.size if args.size is not None else (args.res, args.res)
@@ -1167,7 +1320,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         except argparse.ArgumentTypeError as e:
             parser.error(str(e))
 
-    outdir = Path(args.out) if args.out else _default_outdir(args.name)
+    base_outdir = Path(args.out) if args.out else _default_outdir(args.name)
+    if args.run_subdir:
+        outdir = _next_run_dir(base_outdir)
+        print(f"[gyroid_nd] run dir: {outdir}  (--no-run-subdir to write into {base_outdir})")
+    else:
+        outdir = base_outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
     # One procedural studio-lighting environment map shared by the whole batch (see
@@ -1249,6 +1407,20 @@ def _default_outdir(name: str) -> Path:
         return repo_root() / "png" / name
     except Exception:
         return Path.cwd() / name
+
+
+def _next_run_dir(base: Path) -> Path:
+    """A fresh ``runNNN`` subdirectory under ``base`` that does not yet exist, one past
+    the highest existing ``run<number>`` (so runs never overwrite even if some were
+    deleted).  The directory is not created here — the caller mkdirs it."""
+    base.mkdir(parents=True, exist_ok=True)
+    n = 1
+    for p in base.iterdir():
+        if p.is_dir():
+            mt = re.fullmatch(r"run(\d+)", p.name)
+            if mt:
+                n = max(n, int(mt.group(1)) + 1)
+    return base / f"run{n:03d}"
 
 
 if __name__ == "__main__":
