@@ -779,6 +779,66 @@ curve and film thickness/index at once). Only the data is external; the dispersi
 evaluators, interference/BSDF math and light models stay in the renderer. See
 `data/README.md`.
 
+### Spectral representation vs. other renderers
+
+*How* a renderer carries colour along a light path decides whether it can split
+dispersion correctly. There are three representations, and ftrace sits at the
+physically-strictest end:
+
+1. **RGB triple** — three channels ride every ray/photon. Cheap, but colour is
+   already collapsed into R/G/B, so a dispersive interface (prism, lens, water)
+   cannot fan wavelengths into different directions: no true dispersion.
+2. **Co-sampled full spectrum** — one ray/photon carries *all* N spectral bins at
+   once (a whole SPD per sample). Spectrally correct in energy, but because every
+   wavelength rides the *same* photon it still physically cannot land in different
+   places per wavelength — so **dispersive caustics through a photon map don't
+   split** (they stay energy-correct but colour-averaged).
+3. **One wavelength per photon** (ftrace) — each photon carries a single λ, refracts
+   at *that* wavelength's index, and lands where *that* colour focuses. Dispersive
+   caustics split into true spectral colour for free. The modern **hero-wavelength**
+   schemes are the same idea softened: a few stratified wavelengths share one "hero"
+   λ that drives the path (which is why they, too, can disperse).
+
+Where popular physically-based renderers fall (verified against their docs/source;
+see sources below):
+
+| Renderer (engine) | Default colour | Spectral mode | Per-path/photon carrier |
+|---|---|---|---|
+| **ftrace (this — forward photon)** | spectral | always | **1 λ per photon** — true dispersive caustics |
+| PBRT-v3 (SPPM photon map) | RGB | compile-time (`SampledSpectrum`, ~30 bins @ 10 nm) | **co-sampled: all bins on one photon** — no split |
+| Mitsuba 0.x (`ptracer`/`ppm`/`sppm`) | RGB | compile-time (`SPECTRUM_SAMPLES`, e.g. 15–30) | **co-sampled: all bins per sample** — no split |
+| PBRT-v4 | spectral | always | hero wavelength, 4 λ/path (default, recompilable) |
+| Mitsuba 3 (`*_spectral` variant) | RGB build variant | build variant | hero wavelength, 4 λ/ray |
+| Maxwell Render | spectral | always | full-spectral transport¹ |
+| Indigo Renderer | spectral | always | full-spectral transport¹ |
+| LuxCoreRender | RGB (sRGB) | on-demand only (dispersion) | RGB; spectral only at a dispersive glass event |
+| Blender Cycles | RGB | fork/experimental only | RGB |
+| Arnold | RGB | — | RGB |
+
+The **two forward light tracers that carry every wavelength on a single photon** are
+the *spectral* builds of **PBRT-v3** (`SampledSpectrum`) and **Mitsuba 0.x**
+(`SPECTRUM_SAMPLES` > 3): both are RGB by default and, even compiled spectral,
+co-sample the whole SPD per photon — so neither reproduces colour-split dispersive
+caustics in its photon map. ftrace instead traces **one wavelength per photon** (the
+limit of PBRT-v4's hero-wavelength default), which is exactly what makes true
+dispersive caustics fall out of the forward pass — paid for with more photons for
+chromatic smoothness. Renderers such as **Maxwell** and **Indigo** are fully spectral
+throughout but are bidirectional/MLT path tracers, not forward photon mappers;
+**LuxCoreRender**, **Cycles** and **Arnold** are RGB pipelines (LuxCore invokes a
+single wavelength only at a dispersive glass hit).
+
+¹ Maxwell and Indigo document spectral transport end-to-end, but do not publicly
+specify whether a path samples one wavelength or co-samples many — so their
+per-path carrier is left unqualified here.
+
+*Sources:* [pbrt-v4 spectral representation](https://pbr-book.org/4ed/Radiometry,_Spectra,_and_Color/Representing_Spectral_Distributions),
+[Wilkie et al. 2014, *Hero Wavelength Spectral Sampling*](https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.12419),
+[Mitsuba 3 spectral variants](https://mitsuba.readthedocs.io/en/latest/src/key_topics/variants.html),
+[Indigo — spectral throughout](https://indigorenderer.com/features),
+[Maxwell Render features](https://maxwellrender.com/features/),
+[LuxCoreRender — spectral on demand](https://forums.luxcorerender.org/viewtopic.php?t=1728),
+[Cycles — RGB (spectral is a fork)](https://devtalk.blender.org/t/thoughts-on-making-cycles-into-a-spectral-renderer/2192).
+
 ---
 
 ## Lights
