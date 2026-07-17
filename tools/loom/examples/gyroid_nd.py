@@ -53,6 +53,9 @@ Examples::
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
         --frames 90 --format mp4
 
+    # watch each frame render live in one preview window (title tracks the variant)
+    python examples/gyroid_nd.py --count 3 --preview
+
     # just one static .ftsl scene file per variant, no video
     python examples/gyroid_nd.py --count 3 --no-video
 
@@ -452,6 +455,72 @@ def _status_commit(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# optional single-window live preview (tkinter)
+# ---------------------------------------------------------------------------
+
+class _PreviewWindow:
+    """One reusable window that displays each freshly-rendered frame in place.
+
+    The window title carries the running context (which gyroid, its values, and the
+    current frame).  It updates synchronously between frames (``update`` rather than
+    ``mainloop``); if the toolkit is unavailable or the user closes the window the
+    preview quietly disables itself and generation continues headless.
+    """
+
+    def __init__(self) -> None:
+        self._root = None
+        self._label = None
+        self._photo = None            # keep a ref so Tk doesn't GC the image
+        self._tk = None
+        self._alive = True
+
+    def _ensure(self) -> bool:
+        if self._root is not None:
+            return True
+        if not self._alive:
+            return False
+        try:
+            import tkinter as tk
+            from PIL import ImageTk  # noqa: F401  (import checked here, used in show)
+        except Exception as e:  # pragma: no cover
+            print(f"\n[gyroid_nd] preview unavailable ({e}); continuing headless",
+                  flush=True)
+            self._alive = False
+            return False
+        self._tk = tk
+        self._root = tk.Tk()
+        self._root.title("gyroid_nd preview")
+        self._root.protocol("WM_DELETE_WINDOW", self.close)
+        self._label = tk.Label(self._root)
+        self._label.pack()
+        return True
+
+    def show(self, png: Path, title: str) -> None:
+        if not self._ensure():
+            return
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(str(png)).convert("RGB")
+            self._photo = ImageTk.PhotoImage(img)
+            self._label.configure(image=self._photo)
+            self._root.title(title)
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception:
+            # Window closed or display error: disable and keep rendering headless.
+            self.close()
+
+    def close(self) -> None:
+        self._alive = False
+        if self._root is not None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+            self._root = None
+
+
+# ---------------------------------------------------------------------------
 # per-variant video pipeline
 # ---------------------------------------------------------------------------
 
@@ -521,18 +590,20 @@ def _video_ext(fmt: str) -> str:
 
 def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
                fps: float, res: int, radius: float, raster: bool, noise: float,
-               fmt: str) -> Path:
+               fmt: str, preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
     The gyroid drifts through its higher dimensions over a seamless loop (frame
     ``frames`` == frame 0).  Frames render headless with the rasterizer by default.
-    Progress is shown on a single in-place status line built from ``label``.
+    Progress is shown on a single in-place status line built from ``label``; if a
+    ``preview`` window is given, each rendered frame is shown in it in place.
     """
     from loom import Clock, Cache
     from loom.drive import find_ftrace, repo_root
     ftrace = find_ftrace()
     root = repo_root()
     verb = "raster" if raster else "trace"
+    title_base = label.replace("[gyroid_nd] ", "")
     width = max(3, len(str(frames - 1)))
     pngs: List[Path] = []
     for k in range(frames):
@@ -547,6 +618,8 @@ def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
         _render_frame(ftrace, root, fp, png, res=res, raster=raster, noise=noise)
         pngs.append(png)
+        if preview is not None:
+            preview.show(png, f"{title_base}  |  frame {k + 1}/{frames}")
     out = subdir / f"{base}.{_video_ext(fmt)}"
     pattern = f"{base}_%0{width}d.png"                   # ffmpeg reads from subdir cwd
     _status(f"{label} | assembling {out.suffix.lstrip('.')}")
@@ -642,6 +715,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--raster", action=argparse.BooleanOptionalAction, default=True,
                    help="render each frame with the fast headless rasterizer (default); "
                         "--no-raster path-traces every frame instead (far slower)")
+    g.add_argument("--preview", action="store_true",
+                   help="show each frame as it is rendered in one reusable preview window "
+                        "whose title tracks the current gyroid / values / frame")
     g.add_argument("--render-noise", type=float, default=4.0,
                    help="per-frame noise-floor budget when path-tracing frames (--no-raster; "
                         "default 4%%)")
@@ -688,6 +764,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     width = max(3, len(str(count - 1)))
     made: List[Path] = []
     from loom import Clock, Cache
+    preview = _PreviewWindow() if (args.video and args.preview) else None
     for k, vseed in enumerate(seeds):
         v = pick_variant(vseed, args, axis_locks)
         base = f"{args.name}{k:0{width}d}"
@@ -708,7 +785,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             video = make_video(subdir, base, v, label=label, frames=args.frames,
                                fps=args.fps, res=args.res, radius=args.radius,
                                raster=args.raster, noise=args.render_noise,
-                               fmt=args.format)
+                               fmt=args.format, preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
@@ -721,6 +798,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             made.append(fp)
             _status_commit(f"{label} | wrote {fp.name}")
 
+    if preview is not None:
+        preview.close()
     kind = "video(s)" if args.video else "scene file(s)"
     print(f"[gyroid_nd] wrote {len(made)} {kind} to {outdir}")
     return 0
