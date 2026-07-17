@@ -215,6 +215,44 @@ def test_video_actually_moves():
     assert diff > 1e-3
 
 
+def test_rotate_starts_from_current_gyroid():
+    # the rotate transform at t=0 is the exact static field (same as drift at t=0)
+    v = g.pick_variant(3, _args("--dims", "6"), {})
+    assert g.field_expr(v, 0.0, "rotate") == g.field_expr(v, 0.0, "drift")
+    assert g.field_expr(v, 0.0, "rotate") == g.field_expr(v)
+
+
+def test_rotate_loop_is_seamless():
+    # t=0 and t=1 evaluate identically under rotate (whole-turn wavevector rotation)
+    v = g.pick_variant(7, _args("--dims", "6"), {})
+    e0, e1 = g.field_expr(v, 0.0, "rotate"), g.field_expr(v, 1.0, "rotate")
+    for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
+        assert abs(_eval_expr(e0, x, y, z) - _eval_expr(e1, x, y, z)) < 1e-6
+
+
+def test_rotate_actually_moves_and_differs_from_drift():
+    # mid-loop rotate morphs the field, and does so differently from drift
+    v = g.pick_variant(7, _args("--dims", "6"), {})
+    e0 = g.field_expr(v, 0.0, "rotate")
+    er = g.field_expr(v, 0.31, "rotate")
+    ed = g.field_expr(v, 0.31, "drift")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    moved = max(abs(_eval_expr(e0, *p) - _eval_expr(er, *p)) for p in pts)
+    vs_drift = max(abs(_eval_expr(er, *p) - _eval_expr(ed, *p)) for p in pts)
+    assert moved > 1e-3          # it really morphs
+    assert vs_drift > 1e-3       # and it is a genuinely different motion than drift
+
+
+def test_rotate_well_formed_across_seeds():
+    args = _args("--dims", "8")
+    for s in range(20):
+        v = g.pick_variant(s, args, {})
+        for t in (0.0, 0.13, 0.5, 0.77, 1.0):
+            expr = g.field_expr(v, t, "rotate")
+            assert expr.count("(") == expr.count(")")
+            assert "+-" not in expr and "++" not in expr and "*-" not in expr
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

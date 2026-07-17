@@ -40,17 +40,26 @@ shadows give depth, over a clean neutral background.  (The gold look only develo
 tracing, ``--no-raster``; the fast rasterizer previews the same geometry flat-shaded.)
 
 This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
-**renders a seamless morphing video**: every non-main oscillating dimension is given an
-integer *drift* rate (a "winding") so its phase advances a whole number of cycles over
-the loop, translating the visible 3-D slice *through* that dimension — literally the
-transformation through the higher dimensions.  The assembled animated ``.gif`` (or ``.mp4``
-via ``--format mp4``) and a ``.txt`` listing every chosen value collect together in the
-output directory; each variant's per-frame ``.ftsl``/``.png`` files live in their own
-subdir ``<outdir>/<variant>/``.  Frames render with ftrace's fast headless rasterizer by
-default.  Use ``--no-video`` to instead emit a single static ``.ftsl`` per variant (with a
-full comment header).  Any choice can be **locked** from the CLI (see ``--help``): the
-dimension count, how many dims oscillate, how many are harmonics of the main, the base
-frequency, and — per axis — whether it oscillates and at what harmonic.
+**renders a seamless morphing video** in which the higher dimensions move the visible slice.
+Every non-main oscillating dimension gets an integer rate (a "winding"); the ``--transform``
+choice decides what that motion *is*, and both start from the exact current gyroid at frame 0
+and loop seamlessly:
+
+  * ``drift`` (default) — advance each dim's phase a whole number of cycles over the loop,
+    translating the slice *through* that dimension.  The pattern slides.
+  * ``rotate`` — rotate each dim's wavevector out of the 3-D slice into its own hidden axis
+    (a whole number of turns).  The in-slice frequency waxes and wanes as the wave turns
+    edge-on and back, so the lattice genuinely reshapes — the higher-D analogue of *turning*
+    the object rather than sliding it.
+
+The assembled animated ``.gif`` (or ``.mp4`` via ``--format mp4``) and a ``.txt`` listing
+every chosen value collect together in the output directory; each variant's per-frame
+``.ftsl``/``.png`` files live in their own subdir ``<outdir>/<variant>/``.  Frames render
+with ftrace's fast headless rasterizer by default.  Use ``--no-video`` to instead emit a
+single static ``.ftsl`` per variant (with a full comment header).  Any choice can be
+**locked** from the CLI (see ``--help``): the dimension count, how many dims oscillate, how
+many are harmonics of the main, the base frequency, and — per axis — whether it oscillates
+and at what harmonic.
 
 Examples::
 
@@ -63,6 +72,9 @@ Examples::
     # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as an mp4
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
         --frames 90 --format mp4
+
+    # start from the current gyroid and rotate it through the extra dimensions
+    python examples/gyroid_nd.py --dims 6 --transform rotate
 
     # watch each frame render live in one preview window (title tracks the variant)
     python examples/gyroid_nd.py --count 3 --preview
@@ -106,10 +118,16 @@ class Dim:
     direction: Tuple[float, float, float]
     phase: float
     role: str                           # main | harmonic | independent | inert
-    winding: int = 0                    # animation drift: integer cycles this dim's
-    #                                     phase advances over one video loop (0 = fixed;
-    #                                     the main dim anchors at 0, others drift so the
-    #                                     slice translates through their dimension)
+    winding: int = 0                    # animation rate: integer cycles/turns over one
+    #                                     video loop (0 = fixed; the main dim anchors at 0,
+    #                                     others move).  In the ``drift`` transform this is
+    #                                     the phase-advance count (slice translates through
+    #                                     the dimension); in ``rotate`` it is the number of
+    #                                     full turns the dim's wavevector rotates out of the
+    #                                     3-D slice into its hidden axis.
+    hidden_offset: float = 0.0          # rotate transform only: the slice's offset along
+    #                                     this dim's hidden axis, i.e. the phase the wave
+    #                                     picks up once it has rotated fully out of view
 
 
 @dataclass
@@ -303,6 +321,16 @@ def pick_variant(seed: int, args: argparse.Namespace,
         by_index[d].winding = (i % max_w) + 1
 
     freq = args.freq if args.freq is not None else rng.uniform(*args.freq_range)
+
+    # Per-dim hidden-axis offset for the `rotate` transform: the slice sits this far along
+    # each oscillating dim's hidden axis, so as the wavevector rotates out of the 3-D slice
+    # the term picks up a real phase (not just a frequency fade) — distinct offsets keep the
+    # dims from morphing in lockstep.  Drawn last so it never perturbs the drift-mode stream
+    # (identical seeds still reproduce the same field for the default transform).
+    for dm in dims:
+        if dm.oscillate:
+            dm.hidden_offset = rng.uniform(0.5, 2.0)
+
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, dim_list=dims)
 
@@ -311,11 +339,10 @@ def pick_variant(seed: int, args: argparse.Namespace,
 # field expression
 # ---------------------------------------------------------------------------
 
-def _u_expr(dim: Dim, freq: float, phase: float) -> str:
-    """The per-dimension argument u_d = harmonic*freq*(dir . (x,y,z)) + phase."""
-    coeff = dim.harmonic * freq
+def _arg_expr(direction: Tuple[float, float, float], coeff: float, phase: float) -> str:
+    """The per-dimension argument ``coeff*(dir . (x,y,z)) + phase`` as an ftsl expression."""
     parts = []
-    for c, var in zip(dim.direction, ("x", "y", "z")):
+    for c, var in zip(direction, ("x", "y", "z")):
         if abs(c) < 1e-9:
             continue
         parts.append(f"({fmt(c)})*{var}")
@@ -325,13 +352,31 @@ def _u_expr(dim: Dim, freq: float, phase: float) -> str:
     return f"({fmt(coeff)}*({lin})+({fmt(phase)}))"
 
 
-def field_expr(v: Variant, t: float = 0.0) -> str:
-    """Emit the gyroid field at loop phase ``t`` in [0,1).
+def _u_expr(dim: Dim, freq: float, phase: float) -> str:
+    """The per-dimension argument u_d = harmonic*freq*(dir . (x,y,z)) + phase."""
+    return _arg_expr(dim.direction, dim.harmonic * freq, phase)
 
-    Each dim's phase is advanced by ``2*pi*winding*t`` — an integer number of full
-    cycles over the loop — so ``t=0`` and ``t=1`` are identical (seamless) and the
-    pattern drifts through its dimensions in between.  ``t=0`` reproduces the static
-    field exactly.
+
+# Supported ways the higher dimensions animate the slice over one loop.
+TRANSFORMS = ("drift", "rotate")
+
+
+def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
+    """Emit the gyroid field at loop phase ``t`` in [0,1) under the chosen ``transform``.
+
+    Both transforms reproduce the exact static field at ``t=0`` (and loop seamlessly, so
+    ``t=1`` matches ``t=0``), then move the higher dimensions in between:
+
+    * ``drift`` — translate the slice *through* each dimension: each dim's phase advances
+      by ``2*pi*winding*t`` (an integer number of whole cycles over the loop).  The pattern
+      slides.
+    * ``rotate`` — rotate each dim's wavevector *out of* the 3-D slice into its own hidden
+      axis by angle ``2*pi*winding*t``.  The in-slice frequency scales by ``cos`` (the
+      stripes widen, vanish, and re-form as the wave turns edge-on and back) while the
+      out-of-slice tilt adds a ``sin``-weighted phase from the slice's ``hidden_offset``.
+      The lattice genuinely reshapes — the higher-D analogue of turning the object — rather
+      than merely sliding.  The main dim (winding 0) stays put and anchors the pattern so it
+      never fully dissolves.
     """
     osc = sorted(v.oscillating)
     m = len(osc)
@@ -340,10 +385,20 @@ def field_expr(v: Variant, t: float = 0.0) -> str:
     two_pi = 2.0 * math.pi
     for d in osc:
         dim = by_index[d]
-        # Reduce the drifted phase modulo 2*pi so t=0 and t=1 emit the *same* constant
-        # (a whole-cycle advance) -> a perfectly seamless loop despite float rounding.
-        phase = (dim.phase + two_pi * dim.winding * t) % two_pi
-        u[d] = _u_expr(dim, v.freq, phase)
+        if transform == "rotate":
+            # Rotate the wavevector into the hidden axis: in-slice frequency k*cos(alpha),
+            # plus a k*sin(alpha)*hidden_offset phase.  alpha is a whole number of turns
+            # over the loop, so t=0 and t=1 both give alpha ≡ 0 -> the exact static field.
+            k = dim.harmonic * v.freq
+            alpha = two_pi * dim.winding * t
+            coeff = k * math.cos(alpha)
+            phase = (dim.phase + k * dim.hidden_offset * math.sin(alpha)) % two_pi
+            u[d] = _arg_expr(dim.direction, coeff, phase)
+        else:
+            # Reduce the drifted phase modulo 2*pi so t=0 and t=1 emit the *same* constant
+            # (a whole-cycle advance) -> a perfectly seamless loop despite float rounding.
+            phase = (dim.phase + two_pi * dim.winding * t) % two_pi
+            u[d] = _u_expr(dim, v.freq, phase)
     terms = []
     for i in range(m):
         a = osc[i]
@@ -428,16 +483,18 @@ def studio_env_pfm(path: Path) -> Path:
 
 
 def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
-                env_file: Optional[str] = None) -> Scene:
+                env_file: Optional[str] = None, transform: str = "drift") -> Scene:
     """The lone gold thickened gyroid ball whose lattice is the morphing higher-D field.
 
-    ``env_file`` is a path to an equirectangular environment map (see ``studio_env_pfm``)
-    used for image-based lighting; with it the gold picks up the studio highlights that
-    reveal the lattice.  Without it the scene falls back to a plain uniform env (flatter).
-    The gold look only develops under path tracing (``mode R``, i.e. ``--no-raster``); the
-    fast rasterizer previews the same geometry flat-shaded.
+    ``transform`` selects how the higher dimensions animate over the loop (see
+    :func:`field_expr`): ``drift`` slides the slice through them, ``rotate`` turns their
+    wavevectors out of the 3-D slice.  ``env_file`` is a path to an equirectangular
+    environment map (see ``studio_env_pfm``) used for image-based lighting; with it the gold
+    picks up the studio highlights that reveal the lattice.  Without it the scene falls back
+    to a plain uniform env (flatter).  The gold look only develops under path tracing
+    (``mode R``, i.e. ``--no-raster``); the fast rasterizer previews it flat-shaded.
     """
-    expr = field_expr(v, t)
+    expr = field_expr(v, t, transform)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
     # amplitude (M=3 reproduces the classic 0.5).
@@ -481,9 +538,10 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
 
 
 def header(v: Variant, index: int, count: int, *,
-           frames: Optional[int] = None, fps: Optional[float] = None) -> str:
+           frames: Optional[int] = None, fps: Optional[float] = None,
+           transform: str = "drift") -> str:
     osc = v.oscillating
-    drifting = [d.index for d in v.dim_list if d.oscillate and d.winding > 0]
+    moving = [d.index for d in v.dim_list if d.oscillate and d.winding > 0]
     L = ["#" + "=" * 74,
          f"# Higher-dimensional gyroid slice — variant {index + 1}/{count}",
          f"# generated by gyroid_nd.py",
@@ -495,32 +553,42 @@ def header(v: Variant, index: int, count: int, *,
          f"# harmonics of the main : {len(v.harmonic_dims)}  -> {v.harmonic_dims}",
          f"# base spatial frequency: {fmt(v.freq)}",
          f"# level set (threshold) : {fmt(v.threshold)}"]
+    verb = "rotating" if transform == "rotate" else "drifting"
     if frames is not None:
         secs = frames / fps if fps else 0.0
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
-                 f"(~{fmt(secs)}s seamless loop); drifting dims -> {drifting}")
+                 f"(~{fmt(secs)}s seamless loop); transform '{transform}'; "
+                 f"{verb} dims -> {moving}")
+    rate_col = "turns" if transform == "rotate" else "drift"
     L += ["#",
-          "# axis  osc  harmonic  drift  direction (x y z)                 phase     role",
+          f"# axis  osc  harmonic  {rate_col:<5}  direction (x y z)                 phase     role",
           "# ----  ---  --------  -----  --------------------------------  --------  -----------"]
     for d in v.dim_list:
         dirs = "(" + " ".join(fmt(c) for c in d.direction) + ")"
         if d.oscillate:
-            drift = f"{d.winding}" if d.winding > 0 else "-"
-            L.append(f"#  {d.index:>3}  yes  {d.harmonic:>6}  {drift:>5}  {dirs:<32}  "
+            rate = f"{d.winding}" if d.winding > 0 else "-"
+            L.append(f"#  {d.index:>3}  yes  {d.harmonic:>6}  {rate:>5}  {dirs:<32}  "
                      f"{d.phase:>7.4f}   {d.role}")
         else:
             L.append(f"#  {d.index:>3}   no       -      -  {dirs:<32}  {'-':>7}   inert")
     L += ["#",
-          "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)",
-          "#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
-          "#   (t runs 0->1 over the loop; winding is the integer 'drift' column above)",
-          "#" + "=" * 74, ""]
+          "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
+    if transform == "rotate":
+        L += ["#   u_d = harmonic_d * freq * cos(a_d) * (dir_d . (x, y, z))",
+              "#         + phase_d + harmonic_d * freq * hidden_offset_d * sin(a_d)",
+              "#   a_d = 2*pi * winding_d * t   (the dim's wavevector rotates out of the",
+              "#   3-D slice into its hidden axis; t runs 0->1, 'turns' column = winding_d)"]
+    else:
+        L += ["#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
+              "#   (t runs 0->1 over the loop; winding is the integer 'drift' column above)"]
+    L += ["#" + "=" * 74, ""]
     return "\n".join(L)
 
 
 def sidecar_text(v: Variant, index: int, count: int, *,
                  ftsl_name: str = "", video_name: str = "",
-                 frames: Optional[int] = None, fps: Optional[float] = None) -> str:
+                 frames: Optional[int] = None, fps: Optional[float] = None,
+                 transform: str = "drift") -> str:
     """Plain-text (non-comment) dump of every chosen value, saved beside each video.
 
     Reuses :func:`header` verbatim (stripped of its ``#`` comment prefixes) so the
@@ -533,7 +601,8 @@ def sidecar_text(v: Variant, index: int, count: int, *,
         if ftsl_name:
             lines.append(f"frames like: {ftsl_name}")
         lines.append("")
-    for line in header(v, index, count, frames=frames, fps=fps).splitlines():
+    for line in header(v, index, count, frames=frames, fps=fps,
+                       transform=transform).splitlines():
         if line.startswith("# "):
             lines.append(line[2:])
         elif line == "#":
@@ -713,6 +782,7 @@ def _video_ext(fmt: str) -> str:
 def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label: str,
                frames: int, fps: float, size: Tuple[int, int], radius: float,
                raster: bool, noise: float, fmt: str, env_file: Optional[str] = None,
+               transform: str = "drift",
                preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
@@ -735,7 +805,8 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
     for k in range(frames):
         t = k / frames                                  # seamless loop: t in [0,1)
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
-        scene = build_scene(v, t=t, res=size, radius=radius, env_file=env_file)
+        scene = build_scene(v, t=t, res=size, radius=radius, env_file=env_file,
+                            transform=transform)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
                           Cache(), assets_dir=frames_dir, tag=f"{k:0{fw}d}")
         fp = frames_dir / f"{base}_{k:0{fw}d}.ftsl"
@@ -851,6 +922,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="square render size when --size is unset (default 480)")
 
     g = p.add_argument_group("video (per variant)")
+    g.add_argument("--transform", choices=TRANSFORMS, default="drift",
+                   help="how the higher dimensions animate the loop: 'drift' (default) "
+                        "translates the slice through them (the pattern slides); 'rotate' "
+                        "turns each dim's wavevector out of the 3-D slice into a hidden axis "
+                        "(the lattice reshapes — a higher-D 'rotation'). Both start from the "
+                        "exact current gyroid at frame 0 and loop seamlessly.")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
                         "through its higher dimensions); the videos + .txt sidecars collect "
@@ -939,22 +1016,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             (outdir / f"{base}.txt").write_text(
                 sidecar_text(v, k, count, ftsl_name=f"{base}/{base}_NNN.ftsl",
                              video_name=f"{base}.{ext}",
-                             frames=args.frames, fps=args.fps),
+                             frames=args.frames, fps=args.fps,
+                             transform=args.transform),
                 encoding="utf-8")
             video = make_video(frames_dir, outdir, base, v, label=label,
                                frames=args.frames, fps=args.fps, size=size,
                                radius=args.radius, raster=args.raster,
                                noise=args.render_noise, fmt=args.format,
-                               env_file=env_file, preview=preview)
+                               env_file=env_file, transform=args.transform,
+                               preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
-            scene = build_scene(v, t=0.0, res=size, radius=args.radius, env_file=env_file)
+            scene = build_scene(v, t=0.0, res=size, radius=args.radius, env_file=env_file,
+                                transform=args.transform)
             body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
                               tag=f"{k:0{width}d}")
             fp = outdir / f"{base}.ftsl"
-            fp.write_text(header(v, k, count) + body, encoding="utf-8")
+            fp.write_text(header(v, k, count, transform=args.transform) + body,
+                          encoding="utf-8")
             made.append(fp)
             _status_commit(f"{label} | wrote {fp.name}")
 
