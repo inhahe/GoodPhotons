@@ -14,7 +14,11 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 - **Spectral transport** — single-wavelength photons over a configurable band
   (e.g. `spectral 360 830 1`); per-wavelength refraction gives dispersion and
-  chromatic aberration with no extra code.
+  chromatic aberration with no extra code. Carrying **one wavelength per photon**
+  — rather than a bundled RGB triple or wavelength-multiplexed packet, as most
+  forward light tracers do — means dispersive **caustics** (light focused through
+  a prism, a lens, or a glass of water) split into true spectral colour instead of
+  smearing an averaged RGB, for more physically realistic focusing.
 - **Forward *and* backward** engines that validate each other (mode `V` reports
   the residual between them).
 - **Realistic cameras** — from a simple pinhole to a **physical multi-element
@@ -40,8 +44,23 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
   BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
   across a whole camera flythrough), megakernel or wavefront, with CPU fallback.
+- **Whole camera flybys in one render** — some modes amortise a *single* light
+  transport pass across an entire moving-camera shot. The **view-independent photon
+  map** (mode `M`) is built **once** from one forward photon pass, then reused to
+  gather every frame of a camera flythrough (or every camera of a multi-camera
+  render), so an *N*-frame flyby costs roughly one render's worth of photons instead
+  of *N* — far more efficient than re-tracing the scene per frame.
+- **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
+  **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
+  record / insert / delete / steer control points, paint per-point speed and look
+  direction, round-trip and revise an existing curve, then save a ready-to-render
+  `camera_curve { … }` block. See [Camera animation](#camera-animation-camera_path-camera_orbit).
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
   and checkpoint/resume.
+- **Loom animation toolkit** — a bundled Python toolkit for building scenes and
+  seamless looping animations that emit `.ftsl` per frame (procedural ribbons/tubes,
+  N-D-transformed isosurfaces, motion graphics, and more). See
+  [`tools/loom/`](tools/loom/README.md).
 
 ---
 
@@ -1667,6 +1686,23 @@ A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.p
 Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
 **`ftbuf_to_png.bat`** (both call `-topng`), and **`ftsl_to_png.bat`** (renders the
 scene). Drop a file on one, or run `ppm_to_png.bat input.ppm [output.png]`.
+
+---
+
+## Loom — procedural animation toolkit
+
+The repo bundles **Loom** (`tools/loom/`), a programmatic-first Python toolkit for
+building 3-D scenes and **seamless looping animations** that render on ftrace. Loom
+animates *continuous* things — modulator graphs, curves, fields, N-D-transformed
+isosurfaces — and discretizes **last, per frame**, emitting one `.ftsl` per frame
+which ftrace then renders (raster preview or full path trace) and assembles into a
+GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, gyroid and other
+triply-periodic minimal-surface loops, higher-dimensional gyroid slices, function-driven
+materials, 2-D motion graphics, spacetime-transform videos) and stands alone (it can
+drive any renderer).
+
+See **[`tools/loom/README.md`](tools/loom/README.md)** for the tour, and
+`tools/loom/DESIGN.md` for the architecture.
 
 ---
 
