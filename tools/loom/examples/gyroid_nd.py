@@ -29,15 +29,22 @@ Each dimension's argument is  ``u_d = harmonic_d * freq * (dir_d . (x,y,z)) + ph
 and the emitted field is the cyclic sum ``sum_i sin(u_{o_i}) * cos(u_{o_{i+1}})`` over
 the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating count).
 
-This script **randomly picks** all of the above.  For each of ``--count N`` variants it
+The rendered *look* mirrors ``scenes/showcase.ftsl``: the lattice is a **gold thickened
+gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball, sitting in a **closed Cornell box**
+beside a **clear glass sphere**, lit by two ceiling area lights, with the camera inside the
+box.  (The gold/glass/colored-wall look only develops under path tracing, ``--no-raster``;
+the fast rasterizer previews the same geometry flat-shaded.)
+
+This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
 **renders a seamless morphing video**: every non-main oscillating dimension is given an
 integer *drift* rate (a "winding") so its phase advances a whole number of cycles over
 the loop, translating the visible 3-D slice *through* that dimension — literally the
-transformation through the higher dimensions.  Each variant lands in its own subdir with
-the per-frame ``.ftsl`` files, the assembled animated ``.gif`` (or ``.mp4`` via
-``--format mp4``), and a ``.txt`` listing every chosen value.  Frames render with
-ftrace's fast headless rasterizer by default.  Use ``--no-video`` to instead emit a single static ``.ftsl`` per variant (with
-a full comment header).  Any choice can be **locked** from the CLI (see ``--help``): the
+transformation through the higher dimensions.  The assembled animated ``.gif`` (or ``.mp4``
+via ``--format mp4``) and a ``.txt`` listing every chosen value collect together in the
+output directory; each variant's per-frame ``.ftsl``/``.png`` files live in their own
+subdir ``<outdir>/<variant>/``.  Frames render with ftrace's fast headless rasterizer by
+default.  Use ``--no-video`` to instead emit a single static ``.ftsl`` per variant (with a
+full comment header).  Any choice can be **locked** from the CLI (see ``--help``): the
 dimension count, how many dims oscillate, how many are harmonics of the main, the base
 frequency, and — per axis — whether it oscillates and at what harmonic.
 
@@ -79,7 +86,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from loom import Scene, Camera, Material, Light, Raw, Isosurface  # noqa: E402
+from loom import Scene, Camera, Raw  # noqa: E402
 from loom.ftsl_emit import fmt  # noqa: E402
 
 
@@ -107,6 +114,7 @@ class Variant:
     dims: int
     freq: float
     threshold: float
+    thickness: float = 0.5              # half-width of the thickened gold sheet
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -291,7 +299,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
         by_index[d].winding = (i % max_w) + 1
 
     freq = args.freq if args.freq is not None else rng.uniform(*args.freq_range)
-    return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold, dim_list=dims)
+    return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
+                   thickness=args.thickness, dim_list=dims)
 
 
 # ---------------------------------------------------------------------------
@@ -343,26 +352,98 @@ def field_expr(v: Variant, t: float = 0.0) -> str:
 # scene + header
 # ---------------------------------------------------------------------------
 
-def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
-                material="shell") -> Scene:
+# The look is scenes/showcase.ftsl: a gold *thickened* gyroid sheet (|g| - t < 0),
+# CSG-clipped to a ball, sitting in a CLOSED Cornell box next to a clear glass sphere,
+# lit by two ceiling area lights, with the camera INSIDE the box.  We reproduce that
+# exact composition but mapped so the lattice ball is centered at the origin with
+# radius ``radius`` (gyroid_nd's native frame) and swap in the morphing higher-D field.
+_SC_CENTER = (0.40, 0.37, 0.45)     # showcase ball center
+_SC_RADIUS = 0.32                   # showcase ball radius
+
+
+def _sc_pt(p: Tuple[float, float, float], s: float) -> Tuple[float, float, float]:
+    """Map a showcase-space *point* into the origin-centered, radius-scaled frame."""
+    c = _SC_CENTER
+    return tuple((p[i] - c[i]) * s for i in range(3))
+
+
+def _sc_vec(w: Tuple[float, float, float], s: float) -> Tuple[float, float, float]:
+    """Map a showcase-space *direction/extent* (scale only, no translation)."""
+    return tuple(w[i] * s for i in range(3))
+
+
+def _vtok(t: Tuple[float, float, float]) -> str:
+    return " ".join(fmt(c) for c in t)
+
+
+def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3) -> Scene:
+    """A showcase-style scene (gold thickened gyroid ball in a Cornell box) whose
+    lattice is the morphing higher-D field at loop phase ``t``.
+
+    The gold/glass/colored-wall look only develops under path tracing (``mode R``,
+    i.e. ``--no-raster``); the fast rasterizer previews the same geometry flat-shaded.
+    """
+    s = radius / _SC_RADIUS
     expr = field_expr(v, t)
-    fn = (lambda cx, cy, cz, _e=expr: _e)   # ignore transformed coords; freq baked in
-    iso = Isosurface(fn, freq=1.0, threshold=v.threshold, container="sphere",
-                     center=(0, 0, 0), radius=radius, material=material,
-                     name="gyroid_nd")
-    scene = Scene(Camera(eye=(0.0, 0.7, 5.2), look_at=(0, 0, 0), up=(0, 1, 0),
-                         fov_y=34, mode="R", res=res))
+    # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
+    # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
+    # amplitude (M=3 reproduces the classic 0.5).
+    m = max(1, len(v.oscillating))
+    half = v.thickness * math.sqrt(m / 3.0)
+    thr = v.threshold
+    inner = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
+    sheet = f"abs({inner})-({fmt(half)})"
+    # Lipschitz bound for the sphere-marcher: |grad f| <= 2*freq*sum(harmonic_d).
+    sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
+    grad_bound = 2.2 * v.freq * max(1, sum_h)
+    box = radius * 1.05                                  # contained_by half-extent
+
+    scene = Scene(Camera(eye=_sc_pt((0.47, 0.55, 1.50), s), look_at=(0, 0, 0),
+                         up=(0, 1, 0), fov_y=58, mode="R", res=res))
+
+    # Cornell box (showcase quads mapped into the ball frame): floor/ceiling/back/front
+    # white, left red, right green — a closed room the camera sits inside.
+    quads = [
+        ((0, 0, 0),    (1, 0, 0),    (0, 0, 1.65), "white"),   # floor
+        ((0, 1, 0),    (0, 0, 1.65), (1, 0, 0),    "white"),   # ceiling
+        ((0, 0, 0),    (0, 1, 0),    (1, 0, 0),    "white"),   # back
+        ((0, 0, 1.65), (0, 1, 0),    (1, 0, 0),    "white"),   # front (behind camera)
+        ((0, 0, 0),    (0, 0, 1.65), (0, 1, 0),    "red"),     # left
+        ((1, 0, 0),    (0, 1, 0),    (0, 0, 1.65), "green"),   # right
+    ]
+    walls = [Raw(f'quad {{ origin {_vtok(_sc_pt(o, s))}  u {_vtok(_sc_vec(u, s))}  '
+                 f'v {_vtok(_sc_vec(w, s))}  material "{mat}" }}')
+             for (o, u, w, mat) in quads]
+
+    iso = Raw(
+        "isosurface {\n"
+        '    material "gold"\n'
+        "    intersect {\n"
+        f'        function {{ expr "{sheet}" }}\n'
+        f"        sphere {{ center 0 0 0  radius {fmt(radius)} }}\n"
+        "    }\n"
+        f"    contained_by {{ min {fmt(-box)} {fmt(-box)} {fmt(-box)}"
+        f"  max {fmt(box)} {fmt(box)} {fmt(box)} }}\n"
+        f"    max_gradient {fmt(grad_bound)}\n"
+        "}")
+
+    glass = Raw(f'sphere {{ center {_vtok(_sc_pt((0.77, 0.17, 0.70), s))}  '
+                f'radius {fmt(0.17 * s)}  material "glass" }}')
+
+    key = Raw(f'light area {{ origin {_vtok(_sc_pt((0.22, 0.999, 0.22), s))}  '
+              f'u {_vtok(_sc_vec((0.56, 0, 0), s))}  v {_vtok(_sc_vec((0, 0, 0.56), s))}  '
+              f'normal 0 -1 0  spd preset:bb6500 }}')
+    fill = Raw(f'light area {{ origin {_vtok(_sc_pt((0.25, 0.999, 1.05), s))}  '
+               f'u {_vtok(_sc_vec((0.50, 0, 0), s))}  v {_vtok(_sc_vec((0, 0, 0.45), s))}  '
+               f'normal 0 -1 0  spd preset:bb6500 }}')
+
     scene.add(
-        Material("shell", "diffuse", reflect=0.85),
-        Material("wall", "diffuse", reflect=0.78),
-        iso,
-        Raw('quad { origin -2 -1.7 -2  u 4 0 0  v 0 0 4  material "wall" }'),
-        Raw('quad { origin -2  1.7 -2  u 4 0 0  v 0 0 4  material "wall" }'),
-        Raw('quad { origin -2 -1.7 -2  u 4 0 0  v 0 3.4 0  material "wall" }'),
-        Raw('quad { origin -2 -1.7 -2  u 0 0 4  v 0 3.4 0  material "wall" }'),
-        Raw('quad { origin  2 -1.7 -2  u 0 0 4  v 0 3.4 0  material "wall" }'),
-        Light("area", origin="-0.9 1.68 -0.9", u="1.8 0 0", v="0 0 1.8",
-              normal="0 -1 0", spd="preset:bb6500"),
+        Raw('material "white" { type diffuse reflect whitewall 0.75 }'),
+        Raw('material "red"   { type diffuse reflect redwall }'),
+        Raw('material "green" { type diffuse reflect greenwall }'),
+        Raw('material "gold"  { preset gold }'),
+        Raw('material "glass" { type dielectric ior 1.5 }'),
+        *walls, iso, glass, key, fill,
     )
     return scene
 
@@ -553,11 +634,14 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
         raise SystemExit(f"ftrace failed on {fp.name} (exit {r.returncode})")
 
 
-def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str) -> Path:
+def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str,
+                    cwd: Path) -> Path:
     """Assemble frames into ``out`` — mp4 via ffmpeg, or a Pillow GIF (default).
 
-    Both paths keep their tool output off the status line (ffmpeg captured; the GIF is
-    built inline with Pillow rather than via the chatty ``loom.drive.assemble_gif``).
+    ``pattern`` is the ffmpeg input glob resolved relative to ``cwd`` (the frames may
+    live in a subdirectory of the video's directory).  Both paths keep their tool output
+    off the status line (ffmpeg captured; the GIF is built inline with Pillow rather than
+    via the chatty ``loom.drive.assemble_gif``).
     """
     import shutil
     import subprocess
@@ -568,7 +652,7 @@ def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str) ->
         cmd = [ffmpeg, "-y", "-framerate", f"{fps:g}", "-i", pattern,
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", out.name]
-        r = subprocess.run(cmd, cwd=str(out.parent), capture_output=True, text=True)
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
         if r.returncode != 0:
             sys.stdout.write("\n" + (r.stdout or "") + (r.stderr or ""))
             raise SystemExit(f"ffmpeg failed assembling {out.name} (exit {r.returncode})")
@@ -594,17 +678,19 @@ def _video_ext(fmt: str) -> str:
     return "mp4" if shutil.which("ffmpeg") else "gif"   # auto
 
 
-def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
-               fps: float, size: Tuple[int, int], radius: float, raster: bool,
-               noise: float, fmt: str,
+def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label: str,
+               frames: int, fps: float, size: Tuple[int, int], radius: float,
+               raster: bool, noise: float, fmt: str,
                preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
-    The gyroid drifts through its higher dimensions over a seamless loop (frame
-    ``frames`` == frame 0).  Frames render at ``size`` = ``(W, H)`` pixels, headless
-    with the rasterizer by default.  Progress is shown on a single in-place status line
-    built from ``label``; if a ``preview`` window is given, each rendered frame is shown
-    in it in place (at the same ``size``).
+    The per-frame ``.ftsl``/``.png`` files land in ``frames_dir`` (its own subdirectory),
+    while the assembled video is written to ``out_dir`` (the shared collection directory).
+    The gyroid drifts through its higher dimensions over a seamless loop (frame ``frames``
+    == frame 0).  Frames render at ``size`` = ``(W, H)`` pixels, headless with the
+    rasterizer by default.  Progress is shown on a single in-place status line built from
+    ``label``; if a ``preview`` window is given, each rendered frame is shown in it in
+    place (at the same ``size``).
     """
     from loom import Clock, Cache
     from loom.drive import find_ftrace, repo_root
@@ -619,8 +705,8 @@ def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
         scene = build_scene(v, t=t, res=size, radius=radius)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
-                          Cache(), assets_dir=subdir, tag=f"{k:0{fw}d}")
-        fp = subdir / f"{base}_{k:0{fw}d}.ftsl"
+                          Cache(), assets_dir=frames_dir, tag=f"{k:0{fw}d}")
+        fp = frames_dir / f"{base}_{k:0{fw}d}.ftsl"
         fp.write_text(body, encoding="utf-8")
         png = fp.with_suffix(".png")
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
@@ -628,10 +714,11 @@ def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
         pngs.append(png)
         if preview is not None:
             preview.show(png, f"{title_base}  |  frame {k + 1}/{frames}")
-    out = subdir / f"{base}.{_video_ext(fmt)}"
-    pattern = f"{base}_%0{fw}d.png"                     # ffmpeg reads from subdir cwd
+    out = out_dir / f"{base}.{_video_ext(fmt)}"
+    # ffmpeg reads the frames from the per-variant subdir, relative to out_dir.
+    pattern = f"{frames_dir.name}/{base}_%0{fw}d.png"
     _status(f"{label} | assembling {out.suffix.lstrip('.')}")
-    _assemble_video(pngs, out, fps=fps, pattern=pattern)
+    _assemble_video(pngs, out, fps=fps, pattern=pattern, cwd=out_dir)
     return out
 
 
@@ -721,6 +808,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="isosurface level set f = threshold (default 0; ~+/-0.7 thins the walls)")
     g.add_argument("--radius", type=float, default=1.3,
                    help="radius of the spherical container the lattice fills (default 1.3)")
+    g.add_argument("--thickness", type=float, default=0.5,
+                   help="half-width of the thickened gold sheet (showcase abs(g)-t style; "
+                        "default 0.5; auto-scaled up with the oscillating-dim count)")
     g.add_argument("--size", type=_parse_size, default=None, metavar="N|WxH",
                    help="video/frame size in pixels: a single number for square (e.g. 720) "
                         "or WIDTHxHEIGHT (e.g. 1280x720); the preview window matches it "
@@ -731,9 +821,9 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("video (per variant)")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
-                        "through its higher dimensions) into its own subdir, plus a .txt of "
-                        "its values (default on; --no-video emits just one static .ftsl per "
-                        "variant)")
+                        "through its higher dimensions); the videos + .txt sidecars collect "
+                        "in the output dir, per-frame files in a subdir each (default on; "
+                        "--no-video emits just one static .ftsl per variant)")
     g.add_argument("--frames", type=int, default=60,
                    help="frames per video (default 60)")
     g.add_argument("--fps", type=float, default=30.0,
@@ -804,20 +894,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         label = (f"[gyroid_nd] gyroid {k + 1}/{count}  D={v.dims} osc={v.oscillating} "
                  f"harm={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}")
         if args.video:
-            # Each video is a self-contained multi-frame series in its own subdir
-            # (frames + assembled video + a .txt of every chosen value).
-            subdir = outdir / base
-            subdir.mkdir(parents=True, exist_ok=True)
+            # Videos and their .txt sidecars collect in the shared outdir; each video's
+            # per-frame .ftsl/.png files live in their own subdir <outdir>/<base>/.
+            frames_dir = outdir / base
+            frames_dir.mkdir(parents=True, exist_ok=True)
             ext = _video_ext(args.format)
-            (subdir / f"{base}.txt").write_text(
-                sidecar_text(v, k, count, ftsl_name=f"{base}_NNN.ftsl",
+            (outdir / f"{base}.txt").write_text(
+                sidecar_text(v, k, count, ftsl_name=f"{base}/{base}_NNN.ftsl",
                              video_name=f"{base}.{ext}",
                              frames=args.frames, fps=args.fps),
                 encoding="utf-8")
-            video = make_video(subdir, base, v, label=label, frames=args.frames,
-                               fps=args.fps, size=size, radius=args.radius,
-                               raster=args.raster, noise=args.render_noise,
-                               fmt=args.format, preview=preview)
+            video = make_video(frames_dir, outdir, base, v, label=label,
+                               frames=args.frames, fps=args.fps, size=size,
+                               radius=args.radius, raster=args.raster,
+                               noise=args.render_noise, fmt=args.format,
+                               preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
