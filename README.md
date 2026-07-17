@@ -196,11 +196,12 @@ paths they can capture at all**.
 > CPU (~5×), with the one-time tessellation unchanged; tiny scenes are launch-bound
 > and roughly tie. **Scope:** the GPU path covers **all camera projections**
 > (rectilinear **and** fisheye/panoramic — the device applies the same angular lens
-> map the real camera uses) for **opaque** previews. `-see-through` (clear-glass
-> compositing) and **image skins** (textured `reflect texture:<name>` albedo) still
-> fall back to the CPU rasterizer per camera (mixed camera lists just work), as does
-> any device allocation failure, so `-device gpu` never fails a preview it can't
-> accelerate. Example:
+> map the real camera uses), **opaque and textured (skinned)** geometry (image skins
+> — per-vertex UV **and** world-triplanar `reflect texture:<name>` albedo — are sampled
+> on-device), **and** `-see-through` clear-glass compositing (a device clear-accumulation
+> pass mirrors the CPU one). Only a device allocation failure falls back to the CPU
+> rasterizer per camera (mixed camera lists just work), so `-device gpu` never fails a
+> preview it can't accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
 > **See-through clear objects — `-see-through`.** By default a clear material

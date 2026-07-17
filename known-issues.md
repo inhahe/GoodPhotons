@@ -5,13 +5,15 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH DEBT (2026-07-17): GPU preview rasterizer covers opaque only (see-through still CPU)
+### TECH DEBT (2026-07-17): GPU preview rasterizer — feature parity with the CPU rasterizer
 
 The GPU preview rasterizer (`src/raster_cuda.{h,cu}`, wired into `main.cpp`'s
 `-raster` block via the `rasterOne` dispatcher, gated on `-device gpu|auto`) now
-accelerates **all camera projections** (rectilinear + fisheye/panoramic) for **opaque**
-previews and falls back to the CPU rasterizer (`raster::renderFrame`) per camera only
-for see-through. Deferred work:
+accelerates **all camera projections** (rectilinear + fisheye/panoramic), **opaque +
+textured (skinned)** previews, and **see-through (clear-glass)** compositing on the GPU.
+It only falls back to the CPU rasterizer (`raster::renderFrame`) on a device failure
+(the `renderFrame` returning empty). Remaining deferred work is limited to bit-exactness
+and readback (below). History:
 
 - **Fisheye / panoramic projections (M2). — DONE (2026-07-17).** `kProject` now branches
   rectilinear (`x/z` + near-plane Sutherland-Hodgman clip → ≤2 sub-tris) vs angular
@@ -21,22 +23,25 @@ for see-through. Deferred work:
   CPU on `scenes/fisheye.ftsl` (fish camera: mean abs diff 0.015/255, 515/2.07 M edge
   pixels — tighter than the rectilinear `rect` frame's 0.034/1200), and rectilinear
   regression unchanged.
-- **See-through (`-see-through`) on GPU.** The clear-glass accumulation pass
-  (`fillTriangleClear`: cumulative transmittance + milk products) has no device port,
-  so `-device gpu` with `-see-through` runs entirely on the CPU. Port it as a second
-  device pass over the clear triangles writing `clearT`/`milkT`, then feed those to the
-  shared `exposeAndEncode` (which already accepts them).
-- **Image skins (textured `reflect texture:<name>` albedo) on GPU.** The CPU rasterizer
-  now samples an image skin per G-buffer pixel (`raster::renderFrame` shade pass:
-  `Texture::sampleRgb(u,v)` for UV'd geometry, `sampleRgbTriplanar(wpos,wn,scale)` for
-  un-UV'd implicits), but the GPU path has no device texture support, so `main.cpp` gates
-  `wantGpu && !rasterTextured` and falls back to the CPU rasterizer per camera whenever any
-  `PTri.tex >= 0`. Proper fix: upload each `Scene::textures` entry's linear-RGB buffer
-  (`Texture::rgb`, plus width/height/filter/wrap) to device memory once, carry `tex` +
-  `triplanarScale` + interpolated UV through the device G-buffer, and sample in `kShade`
-  mirroring the host `sampleRgb`/`sampleRgbTriplanar` (nearest/bilinear, v-flip, wrap
-  modes; triplanar |n|^4 axis blend). Indexed-palette textures already fall back on the CPU
-  too and can stay CPU-only.
+- **See-through (`-see-through`) on GPU. — DONE (2026-07-17).** `kProject` now propagates a
+  per-triangle `clear` flag; `kRaster` skips clear surfaces when `seeThrough` (so only opaque
+  geometry wins the visibility buffer); a new `kClear` device pass mirrors `fillTriangleClear`
+  — it rasterizes each clear sub-triangle against the opaque `zbuf` written by `kShade`, and
+  for every fragment IN FRONT multiplies that pixel's `clearT` (transmittance) and `milkT`
+  (1 − per-surface milk, incl. the grazing/rim term) via a CAS-based `atomicMulF` (the product
+  is commutative → order-independent, so races are safe). `renderFrame` resets `clearT`/`milkT`
+  to 1 with `kFillF`, runs `kClear`, downloads both, and feeds the shared `exposeAndEncode`
+  (which already composites them). Validated GPU vs CPU on `scenes/cornell.ftsl -see-through`:
+  mean abs diff 0.020/255, 0.034 % edge pixels — same float-vs-double edge gap as opaque.
+- **Image skins (textured `reflect texture:<name>` albedo) on GPU. — DONE (2026-07-17).** Each
+  `Scene::textures` entry's linear-RGB buffer is flattened into one shared device texel array
+  (`DTex` metadata: w/h/filter/wrap/offset) in `upload`; `DPTri`/`DSTri`/`DVtxCS` carry `uv`,
+  `tex` and `triplanarScale` (with UV lerped through the near-plane clip); `kShade` samples via
+  device twins `dSampleRgb`/`dSampleRgbTri` (nearest/bilinear, v-flip, wrap modes; triplanar
+  |n|^4 axis blend) exactly mirroring the host `Texture::sampleRgb`/`sampleRgbTriplanar`.
+  Indexed-palette textures sample their raw index-map RGB here, identical to the CPU preview's
+  `sampleRgb` path. Validated GPU vs CPU on `scenes/textured.ftsl` (UV skin: mean 0.019/255,
+  0.029 % edge) and `scenes/triplanar.ftsl` (world triplanar: mean 0.018/255, 0.028 % edge).
 - **Parity is visual, not bit-exact.** The device geometry/shading is single precision
   vs the CPU's double, so silhouette-edge pixels can differ by one pixel of coverage
   (measured ~0.03 % of pixels on cornell/implicit, all on color boundaries, mean abs
