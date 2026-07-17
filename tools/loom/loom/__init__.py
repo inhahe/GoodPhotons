@@ -38,6 +38,11 @@ from .pov import pov, PovFn, POV_FUNCS, POV_ND_GENERALIZABLE
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
+from .spatial import (
+    SpatialExpr, sexpr, X, Y, Z, T, SPATIAL_PATTERNS,
+    sin, cos, tan, sqrt, exp, log, floor, fract, sign, saturate, sabs,
+    smin, smax, spow, atan2, step, clamp, mix, smoothstep,
+)
 from .canvas import (
     Canvas2D, Marker, Stroke, curve_points,
     render_canvas, render_canvas_still,
@@ -65,6 +70,10 @@ __all__ = [
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
+    "SpatialExpr", "sexpr", "X", "Y", "Z", "T", "SPATIAL_PATTERNS",
+    "sin", "cos", "tan", "sqrt", "exp", "log", "floor", "fract", "sign",
+    "saturate", "sabs", "smin", "smax", "spow", "atan2", "step", "clamp",
+    "mix", "smoothstep",
     "Canvas2D", "Marker", "Stroke", "curve_points",
     "render_canvas", "render_canvas_still",
 ]

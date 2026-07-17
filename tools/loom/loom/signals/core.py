@@ -141,28 +141,47 @@ class Signal:
         return v
 
     # ---- operator overloads -------------------------------------------------
+    # Binary operators coerce numbers/Signals; for any *other* operand type they
+    # return NotImplemented so Python defers to that operand's reflected operator
+    # (e.g. a SpatialExpr on the right of ``Signal * expr``), instead of raising.
     def __add__(self, other: Union["Signal", Number]) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Add(self, as_signal(other))
 
     def __radd__(self, other: Number) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Add(as_signal(other), self)
 
     def __sub__(self, other: Union["Signal", Number]) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Sub(self, as_signal(other))
 
     def __rsub__(self, other: Number) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Sub(as_signal(other), self)
 
     def __mul__(self, other: Union["Signal", Number]) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Mul(self, as_signal(other))
 
     def __rmul__(self, other: Number) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Mul(as_signal(other), self)
 
     def __truediv__(self, other: Union["Signal", Number]) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Div(self, as_signal(other))
 
     def __rtruediv__(self, other: Number) -> "Signal":
+        if not isinstance(other, (Signal, int, float)):
+            return NotImplemented
         return Div(as_signal(other), self)
 
     def __neg__(self) -> "Signal":

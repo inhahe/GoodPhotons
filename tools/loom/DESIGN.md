@@ -291,6 +291,21 @@ tools/loom/
    Rejected "Snakecraft"/"Snakeskin" — snake puns are overdone and renaming a working,
    committed, tested codebase for a pun isn't worth the churn. ("Snakeskin" could name the
    2D backend if a pun is ever wanted.)
+11. **Coordinates do NOT belong in the time-DAG.** The Signal DAG is a function of the
+   *clock*, cached per `(node, frame)` — one value per node per frame. That invariant is
+   the whole reason the cache works, and a *spatial* input (`x`, `y`, `z`) breaks it: a
+   node would have one value per **pixel**, not per frame, so the frame-keyed cache is
+   simply wrong. So a **field** (function of space) lives in a *separate* spatial algebra,
+   not the temporal DAG. The two axes stay factored: **loom owns time, the field owns
+   space**, and a *time-varying* field is their product — a spatial expression whose
+   *coefficients* are temporal Signals baked per frame (exactly how the 3-D pattern/iso
+   emitter already animates a static x/y/z formula). Two authoring styles for a field are
+   genuinely distinct and both kept: an **opaque numpy callable** `f(x,y,clock)` (fast,
+   imperative, but loom can't introspect or re-emit it) vs a **symbolic spatial-expr tree**
+   (loom can evaluate it numerically *and* emit it as an ftsl string, and can *introspect*
+   it — e.g. auto-detect a time-independent field and bake its raster once). Time-dependence
+   is orthogonal to authoring style; don't conflate "static→numpy, animated→tree". The tree
+   is the **shared 2-D-numeric / 3-D-emitted pattern layer** (`loom/spatial.py`, M10.5).
 
 ---
 
@@ -341,6 +356,23 @@ tools/loom/
   `LoopCurve` to a stroke (sweeps→strokes). y-up world `view` box; colours RGB in [0,1].
   Honesty: SVG has no per-pixel surface, so it omits `field`. Tests: `tests/test_canvas.py`
   (mapping, per-frame animation, seamless wrap vs open endpoints, field, strokes, cycles).
+- **M10.5 — Shared spatial-expression pattern layer.** ✅ done (`loom/spatial.py`). One
+  pattern **defined once, used two ways** (§11.11): a `SpatialExpr` tree over coordinate
+  leaves `X`/`Y`/`Z` + loop phase `T`, with temporal `Signal` coefficients baked per frame.
+  `eval_np` evaluates it numerically over numpy grids (the 2-D raster `field`); `emit`
+  renders it as an ftsl string in x/y/z (the 3-D isosurface/pattern). Every emitted builtin
+  (`sin`/`sign`/`clamp`/`mix`/…) is a real `src/pattern.h` op and isosurfaces share that
+  same `patternEval` engine, so one string is valid for both; the numpy twins compute the
+  same maths (`noise` deliberately omitted — no bit-identical numpy value-noise). It plugs
+  into `Isosurface`/`FuncPattern` through their **existing** `build()`/`param_signals()`
+  duck-typed protocol — zero changes there. `Canvas2D.field` now type-dispatches (SpatialExpr
+  / 3-tuple of them / opaque callable) and **bakes a time-independent field once** (auto for
+  a tree via `uses_time`; a `static=True` flag for opaque callables). Enabling fix: `Signal`
+  arithmetic returns `NotImplemented` for un-coercible operands so `Signal * SpatialExpr`
+  defers to the reflected op. Tests: `tests/test_spatial.py` (deterministic emit, numeric
+  semantics vs ftrace ops, `uses_time`/`time_signals`, one expr → both backends, static
+  bake, iso integration). Demo: `examples/shared_pattern.py` (a drifting gyroid as both a
+  2-D loop and a 3-D isosurface loop).
 - **M11 (deferred) — "transform video" script.** Separate two-pass tool (§11.8):
   materialize a clip into a 4-D block → apply a spacetime (time-coupled) rotation →
   re-slice to frames. Open clip in/out by default; looped output is the torus-constrained

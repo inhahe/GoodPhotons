@@ -40,6 +40,7 @@ from .signals.core import (
     Signal, Clock, Cache, as_signal, Number, detect_signal_cycle,
 )
 from .signals.vector import VecSignal, Vecish, vec
+from .spatial import SpatialExpr
 
 Point = Tuple[Union[Signal, Number], Union[Signal, Number]]
 # a per-pixel field: fn(X, Y, clock, cache) -> (R, G, B).  With ``vectorized``
@@ -182,7 +183,9 @@ class Canvas2D:
         self.background = _as_rgb(background)
         self.markers: List[Marker] = []
         self.strokes: List[Stroke] = []
-        self._field: Optional[Tuple[FieldFn, bool]] = None
+        # (kind, payload, vectorized, static): kind in {"call", "expr"}
+        self._field: Optional[Tuple] = None
+        self._static_raster = None  # cached HxWx3 buffer for a time-independent field
 
     # ---- authoring --------------------------------------------------------
     def plot(self, x: Union[Signal, Number], y: Union[Signal, Number],
@@ -202,15 +205,38 @@ class Canvas2D:
                                    opacity=opacity, closed=closed))
         return self
 
-    def field(self, fn: FieldFn, *, vectorized: bool = True) -> "Canvas2D":
-        """Set a full-canvas per-pixel field ``fn(X, Y, clock, cache) -> (R, G, B)``.
+    def field(self, fn, *, vectorized: bool = True,
+              static: Optional[bool] = None) -> "Canvas2D":
+        """Set a full-canvas per-pixel field.  Two authoring styles, one entry point:
 
-        With ``vectorized=True`` (default) ``fn`` is handed numpy arrays spanning
-        the whole canvas at once (fast); otherwise it is called per pixel with
-        plain floats (simple but slow).  Raster (PNG) only — SVG has no per-pixel
-        surface, so :meth:`emit_svg` ignores the field.
+        - a :class:`~loom.spatial.SpatialExpr` (or a 3-tuple of them for R, G, B) —
+          the **shared** spatial layer, evaluated numerically here and emit-able as
+          an ftsl string on the 3-D side.  A scalar expr paints greyscale.  loom can
+          *introspect* it, so a time-independent field (no ``T`` / temporal
+          coefficient) is auto-detected and its raster is **baked once**.
+        - a plain callable ``fn(X, Y, clock, cache) -> (R, G, B)`` — an opaque numpy
+          (``vectorized=True``, whole-canvas arrays) or per-pixel (``vectorized=
+          False``, floats) function.  loom can't introspect it, so pass
+          ``static=True`` yourself to bake a time-independent one once.
+
+        Raster (PNG) only — SVG has no per-pixel surface, so :meth:`emit_svg`
+        ignores the field.
         """
-        self._field = (fn, bool(vectorized))
+        self._static_raster = None
+        if isinstance(fn, SpatialExpr) or (
+                isinstance(fn, (tuple, list))
+                and all(isinstance(e, SpatialExpr) for e in fn)):
+            exprs = (fn,) if isinstance(fn, SpatialExpr) else tuple(fn)
+            if len(exprs) not in (1, 3):
+                raise ValueError("an expr field must be 1 (greyscale) or 3 (RGB) exprs")
+            auto = not any(e.uses_time() for e in exprs)
+            self._field = ("expr", exprs, True, auto if static is None else static)
+        elif callable(fn):
+            self._field = ("call", fn, bool(vectorized),
+                           False if static is None else bool(static))
+        else:
+            raise TypeError("field expects a SpatialExpr, a 3-tuple of them, "
+                            "or a callable")
         return self
 
     # ---- graph safety -----------------------------------------------------
@@ -222,6 +248,10 @@ class Canvas2D:
         for d in self._drawables():
             for r in d.roots():
                 detect_signal_cycle(r)
+        if self._field is not None and self._field[0] == "expr":
+            for e in self._field[1]:
+                for s in e.time_signals():
+                    detect_signal_cycle(s)
 
     # ---- coordinate mapping ----------------------------------------------
     def _to_px(self, x: float, y: float) -> Tuple[float, float]:
@@ -265,24 +295,40 @@ class Canvas2D:
         return "\n".join(out)
 
     # ---- raster output (pixels: field + markers + strokes) ----------------
-    def _field_array(self, clock: Clock, cache: Cache):
-        import numpy as np
-        fn, vectorized = self._field  # type: ignore[misc]
+    def _field_grid(self, np):
         W, H = self.width, self.height
         x0, y0, x1, y1 = self.view
         # pixel-centre world coords, y-up
         xs = x0 + (np.arange(W) + 0.5) / W * (x1 - x0)
         ys = y1 - (np.arange(H) + 0.5) / H * (y1 - y0)
-        if vectorized:
-            X, Y = np.meshgrid(xs, ys)
-            r, g, b = fn(X, Y, clock, cache)
+        return np.meshgrid(xs, ys), xs, ys
+
+    def _field_array(self, clock: Clock, cache: Cache):
+        import numpy as np
+        kind, payload, vectorized, static = self._field  # type: ignore[misc]
+        if static and self._static_raster is not None:
+            return self._static_raster                     # baked once, reuse
+        W, H = self.width, self.height
+        (X, Y), xs, ys = self._field_grid(np)
+        if kind == "expr":
+            Z = np.zeros_like(X)
+            chans = [e.eval_np((X, Y, Z), clock, cache) for e in payload]
+            if len(chans) == 1:
+                chans = chans * 3
+            arr = np.stack([np.broadcast_to(c, X.shape).astype(np.float64)
+                            for c in chans], axis=-1)
+        elif vectorized:
+            r, g, b = payload(X, Y, clock, cache)
             arr = np.stack(np.broadcast_arrays(r, g, b), axis=-1)
         else:
             arr = np.empty((H, W, 3), dtype=np.float64)
             for iy in range(H):
                 for ix in range(W):
-                    arr[iy, ix] = fn(float(xs[ix]), float(ys[iy]), clock, cache)
-        return np.clip(arr, 0.0, 1.0)
+                    arr[iy, ix] = payload(float(xs[ix]), float(ys[iy]), clock, cache)
+        arr = np.clip(arr, 0.0, 1.0)
+        if static:
+            self._static_raster = arr                       # cache the baked field
+        return arr
 
     def rasterize(self, clock: Clock, cache: Optional[Cache] = None):
         """Render one frame to a Pillow ``Image`` (RGB)."""
