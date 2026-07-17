@@ -181,6 +181,22 @@ struct Texture {
         return r;
     }
 
+    // Triplanar (box) projection of the LINEAR RGB albedo at a world hit — the RGB
+    // twin of reflectanceTriplanar, used by the solid-shaded preview rasterizer (which
+    // shades from linear albedo, not per-wavelength reflectance). Same |n|^4 axis blend.
+    Vec3 sampleRgbTriplanar(const Vec3& p, const Vec3& n, double scale) const {
+        double ax = std::fabs(n.x), ay = std::fabs(n.y), az = std::fabs(n.z);
+        double wx = ax * ax * ax * ax, wy = ay * ay * ay * ay, wz = az * az * az * az;
+        double s = wx + wy + wz;
+        if (s <= 0.0) return sampleRgb(p.x * scale, p.y * scale);
+        wx /= s; wy /= s; wz /= s;
+        Vec3 c{0, 0, 0};
+        if (wx > 0.0) c = c + sampleRgb(p.z * scale, p.y * scale) * wx;
+        if (wy > 0.0) c = c + sampleRgb(p.x * scale, p.z * scale) * wy;
+        if (wz > 0.0) c = c + sampleRgb(p.x * scale, p.y * scale) * wz;
+        return c;
+    }
+
     // ---- loading ------------------------------------------------------------
     bool load(const std::string& path, std::string& err) {
         std::ifstream f(path, std::ios::binary);

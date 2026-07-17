@@ -4136,6 +4136,12 @@ static int run(int argc, char** argv) {
         };
         std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso, tessProgress);
         raster::PreviewLight plight = raster::deriveLight(scene);
+        // Any image skins in the preview? The CPU rasterizer samples them per pixel; the
+        // GPU twin has no device texture path yet, so a textured scene falls back to CPU
+        // (same gate as see-through). Cheap one-time scan of the baked triangles.
+        const bool rasterTextured =
+            std::any_of(prims.begin(), prims.end(),
+                        [](const raster::PTri& t){ return t.tex >= 0; });
         auto rt1 = std::chrono::steady_clock::now();
         std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
                     prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
@@ -4154,7 +4160,7 @@ static int run(int argc, char** argv) {
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && raster_cuda::available() && !rasterSeeThrough) {
+            if ((wantGpu || wantAuto) && raster_cuda::available() && !rasterSeeThrough && !rasterTextured) {
                 gpuRaster = raster_cuda::upload(prims, plight);
                 if (gpuRaster)
                     std::printf("[raster] GPU rasterizer: opaque frames on the GPU "
@@ -4163,6 +4169,8 @@ static int run(int argc, char** argv) {
                     std::fprintf(stderr, "[raster] GPU upload failed; using CPU\n");
             } else if (wantGpu && rasterSeeThrough) {
                 std::fprintf(stderr, "[raster] see-through preview isn't on the GPU yet; using CPU\n");
+            } else if (wantGpu && rasterTextured) {
+                std::fprintf(stderr, "[raster] textured (skinned) preview isn't on the GPU yet; using CPU\n");
             } else if (wantGpu && !raster_cuda::available()) {
                 std::fprintf(stderr, "[raster] no CUDA device found; using CPU\n");
             }
@@ -4181,7 +4189,7 @@ static int run(int argc, char** argv) {
             }
 #endif
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
-                                       rasterSeeThrough, rasterClarity);
+                                       rasterSeeThrough, rasterClarity, &scene.textures);
         };
 
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering

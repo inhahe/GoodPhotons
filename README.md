@@ -145,7 +145,12 @@ paths they can capture at all**.
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
 > ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
 > `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
-> that still refracts nothing.) Shading sums a diffuse term from **every**
+> that still refracts nothing.) **Image skins** *are* shown: a material whose
+> albedo is a bound texture (`reflect texture:<name>`) is previewed by
+> interpolating the surface's per-vertex UVs — or, for an un-UV'd mesh/isosurface,
+> the material's world **triplanar** projection — and sampling the texture's linear
+> RGB per pixel, so a skinned globe/wallpaper/torus reads with its actual image
+> rather than a flat colour. Shading sums a diffuse term from **every**
 > scene light using its real position/direction (spot cones included), so multi-
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
@@ -191,10 +196,11 @@ paths they can capture at all**.
 > CPU (~5×), with the one-time tessellation unchanged; tiny scenes are launch-bound
 > and roughly tie. **Scope:** the GPU path covers **all camera projections**
 > (rectilinear **and** fisheye/panoramic — the device applies the same angular lens
-> map the real camera uses) for **opaque** previews. Only `-see-through` (clear-glass
-> compositing) still falls back to the CPU rasterizer per camera (mixed camera lists
-> just work), as does any device allocation failure, so `-device gpu` never fails a
-> preview it can't accelerate. Example:
+> map the real camera uses) for **opaque** previews. `-see-through` (clear-glass
+> compositing) and **image skins** (textured `reflect texture:<name>` albedo) still
+> fall back to the CPU rasterizer per camera (mixed camera lists just work), as does
+> any device allocation failure, so `-device gpu` never fails a preview it can't
+> accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
 > **See-through clear objects — `-see-through`.** By default a clear material

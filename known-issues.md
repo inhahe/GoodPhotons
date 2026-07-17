@@ -26,6 +26,17 @@ for see-through. Deferred work:
   so `-device gpu` with `-see-through` runs entirely on the CPU. Port it as a second
   device pass over the clear triangles writing `clearT`/`milkT`, then feed those to the
   shared `exposeAndEncode` (which already accepts them).
+- **Image skins (textured `reflect texture:<name>` albedo) on GPU.** The CPU rasterizer
+  now samples an image skin per G-buffer pixel (`raster::renderFrame` shade pass:
+  `Texture::sampleRgb(u,v)` for UV'd geometry, `sampleRgbTriplanar(wpos,wn,scale)` for
+  un-UV'd implicits), but the GPU path has no device texture support, so `main.cpp` gates
+  `wantGpu && !rasterTextured` and falls back to the CPU rasterizer per camera whenever any
+  `PTri.tex >= 0`. Proper fix: upload each `Scene::textures` entry's linear-RGB buffer
+  (`Texture::rgb`, plus width/height/filter/wrap) to device memory once, carry `tex` +
+  `triplanarScale` + interpolated UV through the device G-buffer, and sample in `kShade`
+  mirroring the host `sampleRgb`/`sampleRgbTriplanar` (nearest/bilinear, v-flip, wrap
+  modes; triplanar |n|^4 axis blend). Indexed-palette textures already fall back on the CPU
+  too and can stay CPU-only.
 - **Parity is visual, not bit-exact.** The device geometry/shading is single precision
   vs the CPU's double, so silhouette-edge pixels can differ by one pixel of coverage
   (measured ~0.03 % of pixels on cornell/implicit, all on color boundaries, mean abs
