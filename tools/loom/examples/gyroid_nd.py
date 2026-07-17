@@ -599,6 +599,37 @@ def matrix_lines(v: Variant) -> List[str]:
     return L
 
 
+def orientation_desc(v: Variant, *, short: bool = False) -> str:
+    """How the 3-D slice sits in the N-D space.  'world-aligned' = dims X/Y/Z point
+    along the world axes (the --pin-axes default); 'tilted' = every axis direction is
+    random.  This is about slice *orientation*, NOT about which axes oscillate."""
+    if short:
+        return "world-aligned" if v.pinned else "tilted"
+    return ("world-aligned (the X/Y/Z axis directions point along the world axes)"
+            if v.pinned else "tilted (every axis direction is random)")
+
+
+def variant_banner(v: Variant, index: int, count: int) -> str:
+    """Multi-line console summary printed once (committed, scrolled) when a variant
+    begins — it carries the wide data that will not fit the in-place progress line:
+    the oscillation list, the slice orientation, and the embedding matrix + offsets."""
+    lines = [
+        f"[gyroid_nd] gyroid {index + 1}/{count}  {dims_desc(v)}  "
+        f"freq={fmt(v.freq)}  seed={v.seed}",
+        f"    oscillates in : {osc_harm_list(v)}",
+        f"    orientation   : {orientation_desc(v)}",
+        "    matrix A (each axis's direction in x,y,z) + offset (phase):",
+    ]
+    for d in v.dim_list:
+        name = axis_name(d.index)
+        row = " ".join(f"{c:>+8.4f}" for c in d.direction)
+        if d.oscillate:
+            lines.append(f"      {name:>4}  h{d.harmonic:<2}  [ {row} ]  offset {d.phase:>8.4f}")
+        else:
+            lines.append(f"      {name:>4}       [ {row} ]  (inert, no term)")
+    return "\n".join(lines)
+
+
 def header(v: Variant, index: int, count: int, *,
            frames: Optional[int] = None, fps: Optional[float] = None,
            transform: str = "drift") -> str:
@@ -614,7 +645,7 @@ def header(v: Variant, index: int, count: int, *,
          f"# oscillates in         : {osc_harm_list(v)}   (dim(harmonic), the axes that wave)",
          f"# main dimension        : {axis_name(v.main) if v.main is not None else '-'}   (fundamental, harmonic 1)",
          f"# harmonics of the main : {len(v.harmonic_dims)}  -> {axis_list(v.harmonic_dims)}",
-         f"# xyz frame             : {'pinned to world X/Y/Z (classic orientation)' if v.pinned else 'free — all dims random directions (tilted slice)'}",
+         f"# slice orientation     : {orientation_desc(v)}",
          f"# base spatial frequency: {fmt(v.freq)}",
          f"# level set (threshold) : {fmt(v.threshold)}"]
     verb = "rotating" if transform == "rotate" else "drifting"
@@ -689,6 +720,13 @@ def sidecar_text(v: Variant, index: int, count: int, *,
 # ---------------------------------------------------------------------------
 
 _status_len = 0
+
+
+def _status_reset() -> None:
+    """Forget the live-line width (call after printing committed multi-line output so
+    the next in-place status doesn't pad against a stale, longer previous line)."""
+    global _status_len
+    _status_len = 0
 
 
 def _status(msg: str) -> None:
@@ -1081,11 +1119,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     for k, vseed in enumerate(seeds):
         v = pick_variant(vseed, args, axis_locks)
         base = f"{args.name}{k:0{width}d}"
-        # Brief, in-place status: which gyroid, its values, and the live frame/phase.
-        label = (f"[gyroid_nd] gyroid {k + 1}/{count}  {dims_desc(v)}  "
-                 f"oscillates in {osc_harm_list(v)}  "
-                 f"frame={'pinned' if v.pinned else 'free'}  "
-                 f"freq={fmt(v.freq)} seed={v.seed}")
+        # Full multi-line detail (orientation + matrix + offsets) is printed once,
+        # committed/scrolled; the live per-frame line below stays short so it can
+        # update in place without wrapping past the terminal width.
+        print(variant_banner(v, k, count))
+        _status_reset()
+        label = f"[gyroid_nd] gyroid {k + 1}/{count}  {dims_desc(v)}"
         if args.video:
             # Videos and their .txt sidecars collect in the shared outdir; each video's
             # per-frame .ftsl/.png files live in their own subdir <outdir>/<base>/.
