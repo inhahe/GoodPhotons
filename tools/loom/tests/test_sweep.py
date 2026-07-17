@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loom.sweep import (  # noqa: E402
-    tangents, rmf_frames, sweep_rings, skin, circle_profile, line_profile,
+    tangents, rmf_frames, sweep_rings, skin_rings, circle_profile, line_profile,
     _dot, _cross, _norm, _sub,
 )
 
@@ -61,7 +61,7 @@ def test_tube_mesh_counts_and_radius():
     prof = circle_profile(sides, radius=1.0)
     rings = sweep_rings(pts, prof, scales=[0.2] * len(pts),
                         twists=[0.0] * len(pts), closed_spine=True)
-    verts, faces = skin(rings, closed_spine=True, closed_profile=True)
+    verts, faces = skin_rings(rings, closed_spine=True, closed_profile=True)
     assert len(verts) == len(pts) * sides
     assert len(faces) == 2 * len(pts) * sides
     # every tube vertex sits ~0.2 from its spine center
@@ -76,7 +76,7 @@ def test_ribbon_mesh_open_profile():
     prof = line_profile(0.5)             # 2-point profile
     rings = sweep_rings(pts, prof, scales=[0.3] * len(pts),
                         twists=[0.0] * len(pts), closed_spine=True)
-    verts, faces = skin(rings, closed_spine=True, closed_profile=False)
+    verts, faces = skin_rings(rings, closed_spine=True, closed_profile=False)
     assert len(verts) == len(pts) * 2
     # open profile (1 edge) x closed spine (n spans) x 2 tris
     assert len(faces) == 2 * len(pts) * 1

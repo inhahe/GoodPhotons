@@ -55,6 +55,43 @@ class Pattern(Element):
 # Materials
 # ---------------------------------------------------------------------------
 
+class Texture(Element):
+    """An image **skin**: ``texture "name" { file "path" … }``.
+
+    Bind it to a surface by pointing a material's colour at it — the whole point of
+    a skin is a spatially-varying diffuse albedo, so
+    ``Material("hide", "diffuse", reflect="texture:<name>")`` wraps the image around
+    the geometry (sampled at each hit's UV).  ``encoding`` (``srgb``/``linear``),
+    ``filter`` (``bilinear``/``nearest``) and ``wrap`` (``repeat``/``clamp``/
+    ``mirror``) pass straight through to ftrace.  A ``Texture`` holds no modulators
+    (the file is fixed), so it is emitted once, before the materials that reference
+    it.  Use :func:`skin` to make the texture *and* its material in one call.
+    """
+
+    def __init__(self, name: str, file, *, encoding: str = "srgb",
+                 filter: str = "bilinear", wrap: str = "repeat") -> None:
+        self.name = name
+        # normalise to forward slashes so the emitted path is portable
+        self.file = str(file).replace("\\", "/")
+        if encoding not in ("srgb", "linear"):
+            raise ValueError('texture encoding must be "srgb" or "linear"')
+        if filter not in ("bilinear", "nearest"):
+            raise ValueError('texture filter must be "bilinear" or "nearest"')
+        if wrap not in ("repeat", "clamp", "mirror"):
+            raise ValueError('texture wrap must be "repeat", "clamp" or "mirror"')
+        self.encoding = encoding
+        self.filter = filter
+        self.wrap = wrap
+
+    def roots(self) -> List:
+        return []
+
+    def emit(self, ctx: EmitCtx) -> str:
+        return (f'texture "{self.name}" {{ file "{self.file}"  '
+                f'encoding {self.encoding}  filter {self.filter}  '
+                f'wrap {self.wrap} }}')
+
+
 class Material(Element):
     def __init__(self, name: str, mtype: str = "diffuse", **props) -> None:
         self.name = name
@@ -69,6 +106,23 @@ class Material(Element):
         for k, v in self.props.items():
             parts.append(f"{k} {value_token(v, ctx.clock, ctx.cache)}")
         return f'material "{self.name}" {{ ' + "  ".join(parts) + " }"
+
+
+def skin(name: str, image, *, mtype: str = "diffuse", encoding: str = "srgb",
+         filter: str = "bilinear", wrap: str = "repeat",
+         **props) -> Tuple["Texture", "Material"]:
+    """Wrap an image over a surface: build the :class:`Texture` **and** a
+    :class:`Material` bound to it, ready to drop into a scene::
+
+        scene.add(*skin("hide", "textures/cow.png"), Sphere((0,0,0), 1, "hide"))
+
+    The material's ``reflect`` is the image (a spatially-varying diffuse albedo,
+    ftrace's ``reflect texture:<name>``); extra ``props`` (e.g. ``roughness=…``) pass
+    through to the material, and the texture and material share ``name``.
+    """
+    tex = Texture(name, image, encoding=encoding, filter=filter, wrap=wrap)
+    mat = Material(name, mtype, reflect=f"texture:{name}", **props)
+    return tex, mat
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +247,7 @@ class SweptMesh(Element):
             scales.append(base_sc * mult)
             twists.append(base_tw + turns * 2.0 * math.pi * u)
         rings = _sweep.sweep_rings(pts, self.profile, scales, twists, self.closed_spine)
-        verts, faces = _sweep.skin(rings, self.closed_spine, self.closed_profile)
+        verts, faces = _sweep.skin_rings(rings, self.closed_spine, self.closed_profile)
         path = ctx.asset_path(self.name, "obj")
         _sweep.write_obj(path, verts, faces)
         return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
@@ -361,6 +415,7 @@ class Scene:
         self.camera = camera
         self.units = units
         self.spectral = spectral
+        self.textures: List[Element] = []
         self.patterns: List[Element] = []
         self.materials: List[Material] = []
         self.elements: List[Element] = []
@@ -368,9 +423,11 @@ class Scene:
 
     def add(self, *elems: Element) -> "Scene":
         for e in elems:
-            # A procedural pattern must be emitted before the materials that bind it
-            # (ftrace resolves patterns in an earlier pass, but keep the text tidy).
-            if isinstance(e, Pattern):
+            # Textures/patterns are emitted before the materials that bind them
+            # (ftrace resolves them in an earlier pass, but keep the text tidy).
+            if isinstance(e, Texture):
+                self.textures.append(e)
+            elif isinstance(e, Pattern):
                 self.patterns.append(e)
             elif isinstance(e, Material):
                 self.materials.append(e)
@@ -381,7 +438,7 @@ class Scene:
         return self
 
     def _all_elements(self) -> List[Element]:
-        return [*self.patterns, *self.materials, *self.elements,
+        return [*self.textures, *self.patterns, *self.materials, *self.elements,
                 *self.lights, self.camera]
 
     def check_cycles(self) -> None:
@@ -396,6 +453,10 @@ class Scene:
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]
+        for tx in self.textures:
+            blocks.append(tx.emit(ctx))
+        if self.textures:
+            blocks.append("")
         for p in self.patterns:
             blocks.append(p.emit(ctx))
         if self.patterns:

@@ -15,6 +15,7 @@ from loom import (  # noqa: E402
     Clock, Cache, Sine, vec, RefSignal, detect_signal_cycle, SignalCycleError,
     walk, PointPath, TrackedPath, Grid, Scatter, LoopCurve, GridField, ScatterField,
     Color, rgb, hsv, hsv_to_rgb, rgb_to_hsv,
+    hsl, hsl_to_rgb, rgb_to_hsl, skin, Texture, Scene, Camera, Sphere, Material,
 )
 from loom.ftsl_emit import value_token  # noqa: E402
 
@@ -134,6 +135,85 @@ def test_color_works_in_scene_and_canvas():
            Sphere((0, 0, 0), 1.0, "m"))
     sc.check_cycles()
     assert "reflect hsv 0.55 0.7 0.9" in sc.emit(_clk(), Cache())
+
+
+# --- HSL / RGB colour model -------------------------------------------------
+
+def test_hsl_to_rgb_matches_reference():
+    clk, ca = _clk(), Cache()
+    for h, s, l in [(0.0, 1.0, 0.5), (0.33, 0.8, 0.4), (0.5, 0.5, 0.5),
+                    (0.9, 1.0, 0.5), (1.25, 0.7, 0.3), (0.6, 0.7, 0.5)]:
+        got = hsl(h, s, l).at(clk, ca)
+        exp = colorsys.hls_to_rgb(h % 1.0, l, s)   # colorsys order is h, l, s
+        assert all(abs(a - b) < 1e-9 for a, b in zip(got, exp)), (h, s, l, got, exp)
+
+
+def test_rgb_hsl_round_trip():
+    clk, ca = _clk(), Cache()
+    base = (0.2, 0.7, 0.4)
+    hsl_vals = rgb_to_hsl(*base).at(clk, ca)
+    back = hsl_to_rgb(*hsl_vals).at(clk, ca)
+    assert all(abs(a - b) < 1e-9 for a, b in zip(back, base)), (hsl_vals, back)
+
+
+def test_hsl_lightness_extremes():
+    clk, ca = _clk(), Cache()
+    white = hsl(0.3, 0.9, 1.0).at(clk, ca)         # l=1 -> white regardless of h/s
+    black = hsl(0.3, 0.9, 0.0).at(clk, ca)         # l=0 -> black
+    assert all(abs(x - 1.0) < 1e-9 for x in white), white
+    assert all(abs(x) < 1e-9 for x in black), black
+
+
+def test_hsl_emits_ftsl_token():
+    clk, ca = _clk(), Cache()
+    assert value_token(hsl(0.6, 0.7, 0.5), clk, ca) == "hsl 0.6 0.7 0.5"
+
+
+def test_hsl_color_in_scene():
+    sc = Scene(Camera(eye=(0, 0, 3), look_at=(0, 0, 0)))
+    sc.add(Material("m", "diffuse", reflect=hsl(0.6, 0.7, 0.5)),
+           Sphere((0, 0, 0), 1.0, "m"))
+    sc.check_cycles()
+    assert "reflect hsl 0.6 0.7 0.5" in sc.emit(_clk(), Cache())
+
+
+# --- image skins (textures) -------------------------------------------------
+
+def test_skin_makes_texture_and_material():
+    tex, mat = skin("hide", "textures/cow.png", roughness=0.4)
+    assert isinstance(tex, Texture)
+    assert isinstance(mat, Material)
+    assert tex.name == "hide"
+
+
+def test_skin_emits_texture_block_and_binding():
+    import tempfile
+    from pathlib import Path
+    sc = Scene(Camera(eye=(0, 0, 4), look_at=(0, 0, 0)))
+    sc.add(*skin("hide", "textures/cow.png", roughness=0.4),
+           Sphere((0, 0, 0), 1.0, "hide"))
+    sc.check_cycles()
+    with tempfile.TemporaryDirectory() as d:
+        out = sc.emit(_clk(), Cache(), assets_dir=Path(d))
+    assert 'texture "hide" {' in out
+    assert 'file "textures/cow.png"' in out
+    assert "reflect texture:hide" in out
+    # texture block comes before the material that binds it
+    assert out.index('texture "hide"') < out.index('material "hide"')
+
+
+def test_skin_texture_options_stored():
+    tex, _ = skin("t", "a.png", encoding="linear", filter="nearest", wrap="clamp")
+    assert (tex.encoding, tex.filter, tex.wrap) == ("linear", "nearest", "clamp")
+
+
+def test_texture_rejects_bad_options():
+    for bad in [dict(encoding="bogus"), dict(filter="bogus"), dict(wrap="bogus")]:
+        try:
+            Texture("x", "a.png", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad}")
 
 
 def _run_all() -> int:

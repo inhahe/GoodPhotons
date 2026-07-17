@@ -312,7 +312,7 @@ tools/loom/
    faster rasterizer (which would only lose fidelity). Reuse ftrace's raster for the 80/20
    viewer today; resident-server is the real speedup later.
 10. **Naming: keep "loom".** The weaving metaphor is earned (threading a DAG, sweeping
-   ribbons/tubes, skinning meshes — `skin`/`MixMaterial("skin")` already in code).
+   ribbons/tubes, skinning meshes — `skin_rings`/`MixMaterial("skin")` already in code).
    Rejected "Snakecraft"/"Snakeskin" — snake puns are overdone and renaming a working,
    committed, tested codebase for a pun isn't worth the churn. ("Snakeskin" could name the
    2D backend if a pun is ever wanted.)
@@ -398,14 +398,24 @@ tools/loom/
   `LoopCurve` to a stroke (sweeps→strokes). y-up world `view` box; colours RGB in [0,1].
   Honesty: SVG has no per-pixel surface, so it omits `field`. Tests: `tests/test_canvas.py`
   (mapping, per-frame animation, seamless wrap vs open endpoints, field, strokes, cycles).
-- **Colour model — RGB *and* HSV** (`loom/color.py`). ✅ done. A `Color` is a
-  3-component `VecSignal` that *is* its resolved **RGB** (an HSV colour is converted in
-  the graph via `hsv_to_rgb`), so it drops into 2-D (`Canvas2D` markers/strokes/field)
-  **and** 3-D (`Material` colours) with no special casing, and — remembering how it was
-  authored — emits the matching `.ftsl` colour token (`rgb r g b` / `hsv h s v`), which
-  ftrace's scene loader now parses natively. Hue is in `[0,1]` and **wraps**, so a hue
+- **Colour model — RGB, HSV *and* HSL** (`loom/color.py`). ✅ done. A `Color` is a
+  3-component `VecSignal` that *is* its resolved **RGB** (an HSV/HSL colour is converted
+  in the graph via `hsv_to_rgb` / `hsl_to_rgb`), so it drops into 2-D (`Canvas2D`
+  markers/strokes/field) **and** 3-D (`Material` colours) with no special casing, and —
+  remembering how it was authored — emits the matching `.ftsl` colour token
+  (`rgb r g b` / `hsv h s v` / `hsl h s l`), which ftrace's scene loader now parses
+  natively. Both cylindrical models are kept: **HSV** (value; `v=1` most vivid) matches
+  painterly pickers, **HSL** (lightness; `l=0.5` pure hue, `l→1` white, `l→0` black)
+  matches CSS — they share the same hue wheel. Hue is in `[0,1]` and **wraps**, so a hue
   driven by a 1-periodic leaf cycles the whole wheel and returns bit-for-bit at the loop
   seam (seamless colour cycling). Tests: `tests/test_dag_and_color.py`.
+- **Image skins — `Texture` + `skin()`** (`loom/scene.py`). ✅ done. An image file
+  applied to a surface as a spatially-varying diffuse albedo. `Texture("name", "img.png",
+  encoding=…, filter=…, wrap=…)` emits a `.ftsl` `texture "name" { file "…" … }` block;
+  `skin("name", "img.png", **material_props)` is the one-call convenience returning the
+  `Texture` *and* a `Material` bound via `reflect texture:name`. The Scene emits texture
+  blocks before the materials that bind them. (Sweep's mesh ring-skinning is now
+  `skin_rings` to free the `skin` name.) Tests: `tests/test_dag_and_color.py`.
 - **M10.5 — Shared spatial-expression pattern layer.** ✅ done (`loom/spatial.py`). One
   pattern **defined once, used two ways** (§11.11): a `SpatialExpr` tree over coordinate
   leaves `X`/`Y`/`Z` + loop phase `T`, with temporal `Signal` coefficients baked per frame.
