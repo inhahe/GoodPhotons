@@ -247,6 +247,50 @@ tools/loom/
    motion.
 5. **Performance**: Python is fine for authoring + preview + emitting scenes; heavy
    geometry (meshing) may later warrant calling ftrace's C++ mesher instead.
+6. **Looping is opt-in, not baked (decision, post-M6).** The impression that loom is
+   "always seamlessly periodic" came from exactly one line — `Clock.at_frame`'s
+   `t=(frame % frames)/frames` (modulo wrap + division by `frames`, so frame N == frame
+   0). The DAG engine itself is timeline-neutral. Periodicity actually lives in *what
+   you compose*: periodic leaves (`Sine`/`LoopNoise`/`phase_drift`→`sin`) + a **closed**
+   `LoopCurve`. `LoopCurve` is already the opt-in "seamless because I chose a closed
+   curve" mechanism; the clock just overrode the choice. Fix (M6.5): give `Clock` an
+   open vs. closed mode — closed keeps `(frame % frames)/frames`; open uses
+   `frame/(frames-1)` (no modulo, endpoints distinct, no phantom duplicate frame) — and
+   let seamlessness be a property of the composed leaves/curves, not an imposed
+   invariant. Closed stays the default so M1–M6 are untouched.
+7. **POV-function N-D honesty.** ftrace exposes ~78 POV-Ray isosurface functions as expr
+   builtins (`src/pov_functions.h`, `povFnLookup` name→(id, arity); `f_name(x,y,z,
+   ...params)`, 3 coords + up to 10 params; wired into both `implicit.h` and
+   `pattern.h`/`PatOp::PovFn`; 8 are explicit `_2d` variants). loom wraps them as
+   *field/pattern templates* (not DAG nodes — they're functions of space, not `t`); their
+   **params** are the DAG hook (Signal-driven, baked per frame). Only the algebraically
+   symmetric subset (`f_sphere`, `f_ellipsoid`, `f_superellipsoid`, `f_paraboloid`,
+   `f_ovals_of_cassini`, the quartics, TPMS) generalizes to a *genuine* extra dimension;
+   the bespoke named surfaces (`f_heart`, `f_klein_bottle`, `f_boy_surface`, …) are 3-D
+   artifacts — they can only be affine-sliced (tilt/shear/drift), never honestly morphed.
+   Docs must not over-promise "N-D heart."
+8. **Spacetime rotation needs a two-pass model + a torus constraint.** Rotating a plane
+   that includes the time axis breaks "each frame is a pure function of `t`" — a rotated
+   frame depends on a *range* of times. Doing it honestly means materializing the whole
+   temporal extent into a 4-D block, rotating, then re-slicing (time-caching / freezing,
+   two passes) → a **separate "transform video" script**, never the streaming emitter.
+   Seam caveat: loop-time is a *circle* (S¹); rotating a periodic axis into a
+   non-periodic spatial axis is no longer periodic, so seamless output requires *both*
+   coupled axes periodic (a rotation on a 2-torus). Natural layering: open clip →
+   transform → open clip out is the general/default case; looped output is the
+   constrained special case.
+9. **Preview bottleneck is scene *rebuild*, not the raster pass.** For a 480² preview on
+   a modern GPU the rasterizer is not the cost — re-parsing ftsl + re-tessellating
+   isosurfaces + rebuilding accel structures each frame is. So the interactivity win is a
+   **resident ftrace preview server** that takes per-frame *deltas* (only the changed
+   baked constants), plus static-geometry caching and preview LOD — not a hand-rolled
+   faster rasterizer (which would only lose fidelity). Reuse ftrace's raster for the 80/20
+   viewer today; resident-server is the real speedup later.
+10. **Naming: keep "loom".** The weaving metaphor is earned (threading a DAG, sweeping
+   ribbons/tubes, skinning meshes — `skin`/`MixMaterial("skin")` already in code).
+   Rejected "Snakecraft"/"Snakeskin" — snake puns are overdone and renaming a working,
+   committed, tested codebase for a pun isn't worth the churn. ("Snakeskin" could name the
+   2D backend if a pun is ever wanted.)
 
 ---
 
@@ -264,9 +308,39 @@ tools/loom/
 - **M4 — Sweep.** Frame field + `sweep` engine + 4 presets. Demo: a looping ribbon.
 - **M5 — Isosurface animation.** `iso.py` + slicer wired to ftsl. Demo: a gyroid
   whose N-D rotation/params modulate over a seamless loop.
-- **M6 — Function materials.** Animated reflectance/color/IOR over space+time.
+- **M6 — Function materials.** Animated reflectance/color/IOR over space+time. ✅ done.
+- **M6.5 — Opt-in looping.** Make seamless looping a *choice*, not a baked invariant
+  (§11.6). `Clock` gains open vs. closed mode: closed keeps `(frame % frames)/frames`;
+  open uses `frame/(frames-1)` (no modulo, distinct endpoints). Add an **open-curve
+  interpolator** (non-wrapping spline through a `PointPath`, symmetric with the closed
+  `LoopCurve`) and a couple of **non-periodic leaves** (linear ramp, ease-in/out
+  envelope) so the open-timeline kit exists. `render_range(..., loop=True|False)` picks
+  the sampling and whether the seam-equality assertion applies. Closed stays the default
+  so M1–M6 are untouched. Tests: open clock endpoints distinct (no phantom frame N);
+  open path is *not* seamless while a closed curve still is; a ramp leaf differs frame 0
+  vs last under open mode.
 - **M7 (deferred) — Adaptive marching cubes**, if/when a field must be baked.
+- **M8 — Affine composition.** Collapse an arbitrarily long chain of N-D Givens
+  rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
+  `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
+  sequential chain (fewer ops in ftrace's per-hit eval). Pin the order/convention (row
+  vs column, pre vs post) once; test associativity vs a reference. Small, low-risk.
+- **M9 — POV-function library.** Wrap ftrace's ~78 POV isosurface builtins as
+  parametric field/pattern templates driven off a mirrored `povFnLookup` table
+  (name→arity); validate param count in Python; params are Signal-drivable (baked per
+  frame). Golden-value tests per function against known shapes. Honesty per §11.7:
+  affine-slice all, genuine N-D only for the symmetric subset.
+- **M10 — 2D backend.** A parallel output driver (SVG / small canvas rasterizer) over
+  the *same* dimension-agnostic core — 2D is a slice, patterns are already 2D-native,
+  sweeps degenerate to strokes. Add as an emitter, **not** a fork; resist leaking
+  2D-specific cases into the core. Payoff: seamless-looping generative motion graphics.
+- **M11 (deferred) — "transform video" script.** Separate two-pass tool (§11.8):
+  materialize a clip into a 4-D block → apply a spacetime (time-coupled) rotation →
+  re-slice to frames. Open clip in/out by default; looped output is the torus-constrained
+  special case. Kept out of the streaming emitter entirely.
+- **M12 (deferred) — resident preview server.** Keep ftrace resident and push per-frame
+  deltas (only changed baked constants) + static-geometry caching + preview LOD (§11.9),
+  for interactive scrubbing. The real preview speedup; not a hand-rolled rasterizer.
 
 Each milestone: keep `known-issues.md` current, commit at green checkpoints, never
 `git push`. Update this doc if the plan changes.
-```
