@@ -5,6 +5,266 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-17): loom preview server (`-serve`) is resident-process only
+
+The M12 preview server (ftrace `-serve` in `src/main.cpp` `runServe`, loom
+`loom/preview.py` `PreviewServer`) delivers only the *resident-process* win: it
+keeps the process, live window, CUDA context, and spectral tables alive across
+frames, re-rendering each `.ftsl` path streamed on stdin. What it does **not** yet
+do (DESIGN.md §11.9 — the real interactivity speedup):
+
+- **Per-frame delta push.** Loom bakes a whole new scene per frame; only a handful
+  of constants actually change between adjacent frames. `-serve` still re-parses the
+  full ftsl and rebuilds everything each frame. Proper fix: a delta protocol
+  (loom sends only changed baked constants; ftrace patches them in place).
+- **Static-geometry / BVH caching.** Geometry that doesn't move between frames is
+  re-tessellated and its accel structure rebuilt every frame. Needs primitive
+  identity + an incremental/cached BVH so unchanged geometry is reused.
+- **Preview LOD.** No reduced-fidelity fast path (e.g. coarser isosurface fineness /
+  fewer samples) distinct from the final render budget.
+
+Also: the resident live window keeps the *first* frame's resolution for the whole
+session (`liveWindowUpdate` / raster window create are guarded by `!g_liveWin`), so a
+preview run must hold `-r` constant. Fine for a fixed-size scrub; revisit if
+per-frame resolution changes are ever needed.
+
+### DONE (2026-07-16): raster see-through for clear objects (`-see-through`)
+
+Opt-in preview transparency for the `-raster` viewer, so clear materials read as
+see-through instead of the old solid pale ghost — *without* refraction. Implemented
+entirely in `raster.h` + a CLI flag in `main.cpp`:
+
+- **Model.** Each clear surface (dielectric / thin-film / filter / diffuse-transmit,
+  via `isClearPreviewType`) between the camera and the opaque background multiplies a
+  per-pixel transmittance (`clarity`, default 0.85) and accumulates a milk product, so
+  N crossed surfaces give `clarity^N` dimming + growing haze (a closed ball = 2
+  crossings). A grazing-angle Fresnel-ish term adds silhouette milk so edges read.
+  Composited in display-linear space in the tone-map pass:
+  `c = c*clearT + milkColor*(1 - milkT)`.
+- **Architecture.** `PTri`/`STri` gained a `clear` flag (set in `tessellate` from the
+  material type). Opaque pass skips clear tris; a second **order-independent**
+  band-parallel pass (`fillTriangleClear`) accumulates transmittance/milk against the
+  finished opaque z-buffer — the product is commutative so no transparent depth sort is
+  needed. Auto-exposure is still computed on the opaque-only accum (glass doesn't skew
+  exposure).
+- **CLI.** `-see-through` / `-seethrough` / `-glass` enable it; `-glass-clarity <0..1>`
+  sets the per-surface transmittance (implies the flag). Wired into the main raster
+  path and the interactive fly-viewer `renderFrame` calls (metering pass stays opaque).
+- **Possible follow-ups (not done):** per-channel coloured transmittance for tinted
+  glass/filters (currently neutral dimming); modelling thickness so a thin edge dims
+  less than a thick centre (currently every crossed triangle counts equally).
+
+### DONE (2026-07-16): camera_curve editor — all five phases + rough edges landed
+
+The in-viewer `camera_curve` editor (main.cpp fly-viewer, Rec / +Pt / Ins / Del / Save)
+landed as **Phase 1** (core point authoring + recording + live spline overlay + Save a
+`camera_curve` block with a `look curve`). All planned follow-ons are now DONE:
+
+- **Phase 2 — speed painting. DONE (2026-07-16).** Additive wheel brush modulates
+  per-control-point speed (inverse density) in Paint mode; emitted as a `density_at`
+  track and retimes live playback. Paint/Flat panel controls + speed readout.
+- **Phase 3 — orientation painting. DONE (2026-07-16).** Mouse-look in Paint mode steers
+  the nearest control points' `fwd`, reshaping the `look curve` (WYSIWYG in the overlay
+  and saved block).
+- **Phase 4 — rendered-sequence source. DONE (2026-07-16).** `ftrace -review <base>`
+  plays a directory of rendered frames (`<base><digits>.<ext>`; reads png/jpg/bmp/tga/ppm)
+  on the live window/timeline, scrub/Play, re-times via the Paint-mode speed brush, and
+  Save writes a re-paced copy into `<dir>/retimed/` + an ffmpeg hint. `reviewMode()` in
+  main.cpp.
+- **Phase 5 — round-trip. DONE (2026-07-16).** Opening a scene with an existing
+  `camera_curve` under `-explore`/`-fly` seeds the editor's `editPts` from that curve's
+  control points (eye + look direction from look curve/look_at/tangent + per-point speed
+  from the `density` track). Captured at load in `ftsl.h` (`AuthoredCurve` on `Loaded`,
+  filled in `addCameraCurve`), consumed in `main.cpp`'s viewer. Save re-emits a revised
+  curve. The loaded flyby still plays at full fidelity until the first edit.
+
+Rough edges — all addressed (2026-07-16):
+- **(a) look-spline bowing. FIXED.** Saved `look_point`s are now placed one MEAN control-
+  point spacing ahead along each point's fwd (scene-relative, clamped), instead of a fixed
+  1 world-unit. A larger, consistent offset keeps `(lookSample − eyeSample)` well away from
+  the two splines' interpolation noise, so the aim spline stays smooth between sparse points.
+  Direction at each control point is preserved exactly (any positive distance along the same
+  fwd). In `saveCurveFn` (main.cpp).
+- **(b) explicit point selection. FIXED.** A `selectedPoint()` helper drives both the red
+  overlay highlight and Del. Locked to the path it follows the timeline (the control point
+  nearest the scrub position — scrub to select), and in free flight it's the point nearest
+  the eye. Also fixed a latent bug: Ins now finds its segment via `bracket()` (normalizes by
+  the ACTUAL explorePath length) instead of `pathPos / kPreviewPerSeg`, which was wrong for a
+  freshly-loaded curve whose frame count isn't a multiple of the preview sampling rate.
+- **(c) multi-curve round-trip. FIXED.** The viewer records the flyby's base name (frame
+  "beta00" → "beta") and the editor seeds from the authored curve whose name matches, so
+  `-camera <name>` selects which curve is edited — not blindly the first. In main.cpp
+  (`exploreCurveName` + the Phase-5 seeding block).
+
+### OPEN: interactive raster fly-viewer can peg all cores / grow RAM when orphaned or on a heavy scene
+
+The interactive fly-camera viewer loop (`main.cpp`, ~line 4037) only re-rasterizes
+when `changed` is true and sleeps 15 ms when `!nav.any()`, so a *normal* idle viewer
+is cheap. But an **orphaned** ftrace (e.g. a `-explore` test whose parent `timeout`
+sent a signal the GUI process ignored, leaving it running with no console) was observed
+pegging **all** CPU cores and climbing from ~2 GB to ~8 GB working set on
+`scenes/gallery_settled.ftsl` — i.e. it was re-rendering flat-out (`changed` stuck true)
+with no user input. Exact trigger unconfirmed (likely a teardown-state artifact where
+`clientSize`/`drainNav` return values that keep flipping `changed`), and it wasn't
+reproduced because doing so re-pegs the machine. Two things to consider as the proper fix:
+(1) **bound the re-render rate** in the viewer loop (pace the loop to ~60 fps regardless
+of `changed`/`nav.any()`), so even a stuck-`changed` runaway or a fast light scene can't
+burn 100% of every core for no visible benefit; (2) make the loop exit on the same
+signals as a normal render (so `-explore`/interactive processes die cleanly on SIGTERM,
+not just window-close), and audit the resize-follow (`fitRes` vs `clientSize`) for any
+size oscillation that would flip `changed` every iteration. Operational note: kill
+interactive/`-window` test processes **explicitly** (PowerShell `Stop-Process -Force`) —
+`timeout`-wrapping a GDI window app does not reliably terminate it.
+
+### OPEN: rainbow phase — `SpecVtx::term` (through-glass-sphere fog connection) is HG-only
+
+The new **rainbow droplet phase** (`rainbow.h`, tabulated Airy/Mie spectral phase) is
+dispatched everywhere a medium's phase is evaluated **except one spot**: the specialised
+"trace a photon *through a glass sphere* and connect its interior fog to the sensor" path
+in `render.h` (`SpecVtx::term`, ~line 598) still calls `hgPhase(dot(wIn, wP), g)` directly
+instead of `Medium::phaseValue(...)`. That code path predates the phase abstraction and
+uses a flattened per-vertex `g` (no `mediumId`/λ), so it can't see a `RainbowPhase`. Impact
+is tiny — it only affects fog that sits *inside* a refracting glass sphere viewed on the
+special two-refraction connection — but a rainbow medium placed there would silently fall
+back to the smooth HG lobe. **Proper fix:** give `SpecVtx` the owning `mediumId` (and thread
+λ into `term`) so it can call `scene.media[mediumId].phaseValue(cosθ, λ)` like every other
+site. Left HG-only for now to avoid reworking that specialised connector in the same change.
+
+### DONE (2026-07-15): rainbow (water-droplet) phase — implemented, wired, and validated end-to-end
+
+A medium can now scatter through a physically-tabulated **Airy water-droplet phase**
+(`rainbow.h`) via FTSL `phase rainbow { .. }`, instead of the smooth Henyey-Greenstein lobe.
+- **Physics core** (`rainbow.h`): Airy theory of the rainbow tabulated on a (λ×μ) grid with
+  per-λ CDF importance sampling; normalised so `2π∫p dμ = 1` per λ. Self-test confirms exact
+  Airy values, textbook Descartes angles, and unit normalisation.
+- **Data model** (`scene.h`): `Medium::rainbowPhase` (shared_ptr, null for the common HG case
+  → HG media stay bit-identical); `phaseValue`/`phaseSample` dispatch to it when set (overrides
+  `g`). Symmetric phase → forward pdf == reverse pdf.
+- **Wiring:** phase dispatch threaded through CPU forward (`render.h`), backward (`backward.h`),
+  and BDPT (`bdpt.h` `phaseF`/`mediumScatterF`, `-dot(wo,wi)` scattering cosine). GPU volume
+  path is HG-only, so `cudaForwardSupported`/`cudaBdptSupported` now **refuse rainbow media**
+  and let the render fall back to the CPU (rather than silently dropping the bow to HG).
+- **FTSL grammar** (`ftsl.h addMedium`): `phase hg` (default) / `phase rainbow { droplet_um,
+  secondary, supernumerary, strength, forward_g, secondary_ratio }`. Features on by default.
+- **Parser bug found & fixed:** `phase rainbow { .. }` — the subtype bareword `rainbow` before
+  `{` is consumed by `parseValue` as the nested block's **`type`**, so `val.words` was empty and
+  `kind` silently defaulted to HG (no bow, no error). Fixed by reading the kind from
+  `ph->val.block->type` when `val.words` is empty. This was the reason early validation renders
+  showed only a smooth veil despite correct physics.
+- **Validated:** `scraps/rainbow_ring.ftsl` (centred-ring geometry, mode D, CPU) analysed with
+  `scraps/radial_profile.py` shows the full signature — a **primary bow at ~42°** (violet inner /
+  red outer), **Alexander's dark band** (~43–50°), and a **secondary bow at ~51–53°** with
+  **reversed colours** (red inner / blue outer). Peak/median luminance ratio ~3.5× and climbing
+  with samples.
+
+Remaining rainbow tech debt: the `SpecVtx::term` glass-sphere-interior connector is still
+HG-only (see the OPEN note above).
+
+### DONE (2026-07-15): gradient-index (GRIN) media — Phase 2 wired through forward (CPU+GPU) + backward
+
+**Phase 1 (landed earlier):** a `medium { ior "<expr over x y z r>" bounds { .. } }`
+defines a **gradient-index region**: rays entering its bound bend continuously via a
+symplectic Eikonal march (`d/ds(n·dr/ds)=∇n`) instead of travelling straight. Data model
+(`Medium::ior`/`iorStep`, `nAt`/`gradNAt`/`insideBound` in `scene.h`), ftsl parsing
+(`ior` / `ior_step` in `ftsl.h addMedium`), and the CPU backward marcher were done.
+
+**Phase 2 (this commit):** the one canonical marcher now lives in **`grin.h`**
+(`grin::sceneHasGrin` + `grin::march`, extracted verbatim from the backward tracer) and is
+shared by **CPU backward** (`backward.h`, mode R), **CPU forward** (`render.h tracePhoton`,
+modes A/B/C) and the **GPU forward megakernel + wavefront** (`render_cuda.cu` `dGrinMarch`,
+`dMedInside`/`dMedNAt`/`dMedGradN`; `DMedium.ior`/`iorN`/`iorStep` uploaded; gated by
+`DScene::hasGrin`). All bend rays identically; `ior`-free scenes stay bit-identical (the
+march is only entered when `sceneHasGrin`). Validated: `scraps/_grin_lens.ftsl` warps a
+checker in mode R; `scraps/_grin_caustic.ftsl` (a converging GRIN sphere over a floor)
+shows the same lens redistribution in CPU mode B **and** GPU mode B, and a smooth
+unperturbed pool in mode R (backward's straight NEE shadow ray can't bend — see below).
+
+**BDPT (mode D) deliberately REFUSES GRIN.** BDPT's connection geometric term, area-measure
+pdf conversion and MIS weights all assume STRAIGHT connecting segments, so a bent path would
+bias the estimator. `main.cpp bdptUnsupportedFeature()` returns a GRIN message (mode D errors
+out with "use mode A/B/C or R"), and `cudaBdptSupported()` rejects GRIN as defense-in-depth.
+GPU backward (mode R) already falls back to the CPU for *any* medium (`cudaBackwardSupported`
+rejects `anyMedium()`), so GRIN mode R runs on the GRIN-aware CPU backward tracer — correct.
+
+Remaining GRIN tech debt is tracked as its own OPEN entry below.
+
+### OPEN: GRIN tech debt (Phase-1 semantics carried forward — not regressions)
+
+Follow-on work for the GRIN Phase-2 wiring above. None of these are bugs in the shipped
+behavior; they are known limits of the current bend-only model.
+
+1. **Only PRIMARY rays bend; connection/NEE rays are still straight.** Each tracer bends only
+   its primary ray — the backward camera ray and the forward photon path. Its *connection/NEE
+   ray* is straight: mode R's shadow ray to a light can't bend through a GRIN region (so it
+   misses GRIN caustics — that's why `_grin_caustic` is dark in R), and the forward
+   camera-splat (modes A/B) is straight (so imaging a surface *through* a GRIN lens via splat
+   doesn't warp — use mode R for "camera looks through a GRIN lens", forward for "GRIN caustic
+   onto a surface viewed directly"). Mode C (forward-catch) is fully unbiased but
+   sample-starved. Curved-path connections (bending the shadow/splat ray) are a future
+   enhancement.
+2. **Exterior IOR inside a GRIN region is hard-coded to 1.0.** At a dielectric interface
+   *inside* a GRIN region the exterior IOR should be `nAt(hit)` not 1.0 (the current code
+   assumes GRIN regions sit in open air). **Directly relevant to the pending xenon-lamp work:**
+   its bulb is a nested dielectric whose interior gas index differs from air, so a GRIN
+   gradient over that same region would need the correct surrounding index at each interface.
+3. **Absorbing/scattering GRIN not integrated along the curve.** A GRIN medium that is *also*
+   absorbing/scattering isn't integrated along the curved path (treated as clear — the classic
+   use). Fixed-step RK1 (`iorStep`, default bound/64) suits smooth fields; steep gradients may
+   want RK4 / adaptive stepping.
+
+**GRIN in BDPT (mode D) — deferred, may implement someday.** Mode D refuses GRIN today (see
+the DONE entry above: its connection G-term, area-measure pdf conversion and MIS weights all
+assume straight edges). Two tiers exist if we revisit it: (1) **cheap** — let the camera/light
+subpaths bend on their PRIMARY march (they already can elsewhere) and pdf-consistently *skip*
+any connection whose straight edge crosses a GRIN region; stays unbiased, only under-samples
+pure-GRIN-caustic paths (negligible for a weak gradient like the lamp gas), and would let mode
+D literally accept a GRIN scene. (2) **research-grade** — true curved connections (solve the
+two-point boundary-value problem for the connecting geodesic, generalized geometric/Jacobian
+term, consistent MIS); expensive and numerically nasty near a focus, poor ROI. Keep this on
+the radar; neither is built.
+
+**Showcase (`scenes/gallery_settled.ftsl`) render-mode note.** The hero stays in **mode D**
+for now (its documented command). If we want the xenon lamp to carry a GRIN gas gradient *and*
+have the whole hero render, the pragmatic route is to render the showcase in **mode B**
+(forward) instead — B supports GRIN and captures *all* the effects — accepting that it's
+**slower to converge** than D on this mixed scene. Tracked so we remember the trade-off:
+mode D now (fast, no lamp GRIN) vs. mode B later (slow, full effects incl. lamp GRIN), unless/
+until tier-1 "GRIN in mode D" above is built. The showcase now encodes this trade-off directly:
+its still camera is wrapped in `prefer { mode D } else { mode B }`, so mode D wins today and the
+loader auto-falls back to mode B the day a mode-D-hostile feature (a GRIN lamp-gas field) is added.
+
+**Showcase idea: a fog rainbow that MOVES with the camera (`phase rainbow`).** Now that the
+water-droplet phase is wired end-to-end (FTSL `phase rainbow { .. }`, validated: primary +
+secondary bows, Alexander's dark band, reversed secondary colours — see the DONE note below),
+we could dress the showcase (or a dedicated flyby) with a thin rain curtain that produces a
+real rainbow. The compelling part is that **the bow is centred on the antisolar point (the
+anti-sun direction), not on any object** — so as a moving camera pans/dollies, the bow slides
+across the frame and *follows the view* exactly the way a real rainbow "runs away" from you.
+That motion is the giveaway that it's genuine scattering physics, not a painted arc. Recipe
+to keep on the radar for a flyby (own subdir `png/<set>/` per the flyby rule):
+- Distant sun **behind** the camera's general travel direction (parallel rays → sharp bow);
+  keep the sun *outside* the fog slab so it isn't extincted before lighting the drops.
+- A **bounded, thin** rain curtain in front (`sigma_t`~0.001–0.002, `albedo` ~0.99, optical
+  depth ≲ 0.3) so single scattering — which carries the bow — dominates the multiply-scattered
+  veil. `phase rainbow { droplet_um 500 secondary on supernumerary on }`.
+- A `camera_curve` that pans the antisolar point across frame (e.g. yaw the look direction, or
+  translate laterally) so the ring visibly tracks the camera. Render **mode B** (forward) or
+  **mode D** (BDPT, bounded fog) on the **CPU** — the GPU volume path is HG-only and auto-falls
+  back to CPU for rainbow media, so a big flyby is CPU-bound (budget accordingly).
+- Validated seed scenes to crib geometry/params from: `scraps/rainbow_ring.ftsl` (centred
+  ring, mode D) and `scraps/rainbow_test.ftsl` (antisolar-aimed slab).
+
+**Minor tech debt: `prefer{}/else{}` trial builds reload meshes.** Resolving a `prefer` node
+trial-builds each candidate branch to test renderability (`ftsl::load`, `tryBuild` lambda). The
+common **single-node** case is optimized — the accepted trial's `Loaded` is reused as the final
+scene, so meshes load exactly once (verified on `gallery_settled.ftsl`). But when a node has
+several branches that get *rejected* before one is accepted, each rejected trial still re-parses
+and RE-LOADS every mesh; and a **multi-node** `prefer` does one extra final rebuild on top of the
+per-node trials. For a heavy scene (600k-tri OBJs) that multiplies OBJ-load time. Proper fix if it
+ever bites: build the shared/non-`prefer` blocks (all the meshes) *once* and only re-resolve the
+small mode-sensitive delta per branch, instead of flattening + full-building the whole block list
+each trial. Negligible today (branches carry only a camera + medium), so left as-is.
+
 ### DONE (2026-07-15): `exposure_lock` selector meter pre-pass now covers every render mode
 
 Previously the real-render `exposure_lock <selector>` meter pre-pass only metered the
@@ -21,57 +281,81 @@ of the radiance, not the integrator, every mode yields a consistent anchor. Ther
 **average** rather than the first frame. Validated on scraps/lock_test.ftsl in modes
 B/M/D/P with `index`/`average` selectors (all honoured, all frames flicker-free).
 
-### OPEN (2026-07-15): absolute-EV scenes render near-black in the finite-lens catch modes (A/C)
+### DONE (2026-07-15): A/B/C now agree in absolute brightness at equal `power` (finite-lens catch modes were near-black)
 
-`ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) — the fixed sensor gain that
-replaces the p99 auto-exposure in absolute mode (any light with `power`/`lumens`) —
-is calibrated **only for mode B** (the pinhole splat; the shipped `scenes/absolute.ftsl`
-uses mode B and exposes to mid-tone at gain 6). The **finite-lens catch modes A and C**
-produce a radiometric film scale that is ~10^3–10^4× dimmer at the same gain, so an
-absolute scene shot in mode A/C comes out essentially **black** unless the user cranks
-`exposure` to ~1e4 in the `film` block. Repro:
-`ftrace -in scraps/ap_abs.ftsl -time 10 -o png/x.png` (mode-A cams) → max pixel ≈ 5/255,
-vs the same scene in mode B which is fine. Root cause is the mode-A/C splat weight
-(render.h `connectLens`: `contrib *= cosSurf*cosLens*R^2/dist^2`) carrying pupil-area/
-geometry factors that mode B's pinhole weight does not, so the two modes don't share an
-absolute scale. **Proper fix:** derive a per-mode absolute calibration (or fold the
-missing `1/(π R_ref^2)`-style normalisation into the A/C splat) so gain 6 lands mid-tone
-in every mode, then re-validate B vs A vs C at equal `power`. NOTE: the aperture→
-brightness relationship itself is *correct* in absolute A/C (verified: doubling the
-aperture radius quadruples brightness, linear ratio 3.97≈4.0) — only the overall gain is
-mis-seated. This is why the `-raster` preview's aperture-brightness term is gated to
-`absolute && mode∈{A,C}` and uses a *relative* reference aperture (Rref=0.02), so it
-previews the correct *ratio* even though the real render's absolute level is currently
-off.
+Previously, `ABS_EXPOSURE_GAIN` (main.cpp ~927, value `6.0`) was calibrated **only for
+mode B** (the pinhole splat). The finite-lens catch modes **A** (`connectLens`) and **C**
+(forward pupil catch) produced a film scale ~10^3–10^4× dimmer at the same gain, so an
+absolute scene shot in mode A/C came out essentially **black**. Root cause: mode B's
+`connect()` records **radiance** (i.e. it is implicitly divided by the pixel solid angle
+Ω_pix = `pixelPlaneArea()·cosCam³`), whereas the A/C splat records **flux-per-cell**
+(`× R²/dist²`, with no cell-area normalisation) — a dimensionally different quantity.
 
-### OPEN (2026-07-15): absolute EV — mode B ignores the aperture's exposure (light-gathering)
+**Fix (the F = 1/A_cell factor).** Fold a single per-camera constant
+`F = 1/(pixelPlaneArea()·filmDist²) = 1/A_cell` into the A/C splat, converting its
+flux deposit into film irradiance on the same scale mode B uses. Derivation: the raw A/C
+splat = `B·(π R²·A_pix)`; the target (camera equation) = `B·(π R²/filmDist²)`; on-axis
+`A_pix = pixelPlaneArea()`, so the correcting ratio is exactly `1/A_cell`. Because it is a
+per-camera constant it cancels under p99 auto-exposure (auto-exposed scenes stay
+byte-identical) and only re-seats the *absolute* level. Applied at four sites, CPU + GPU:
+- `render.h` `connectLens` and `connectLensVolume` (`contrib *= 1/(pixelPlaneArea()·filmDist²)`),
+- `render.h` mode-C catch (`cCell` factor on the film `add`),
+- `render_cuda.cu` `connectLens`, `connectLensVolume`, and CAM_C catch (same factor).
 
-Aperture controls two separable things: **depth of field** (geometric) and
-**exposure/light-gathering** (radiometric, `E ∝ 1/N²` from the camera equation
-`E = (π/4)·L·T·cos⁴θ / N²`). Mode B is a **pinhole**, so it correctly has no DoF —
-but it *also* drops the 1/N² exposure term, which is NOT a lens effect, just how
-much light the pupil admits. Consequence: in **absolute mode** two mode-B renders
-of the same scene at f/2 vs f/8 come out **identically bright**, when a real sensor
-would separate them by 4 stops. The authored `fstop`/`aperture` is inert in mode B.
-Under auto-exposure this is moot (the p99 meter cancels exposure shifts anyway, and
-B has no R² to cancel); it only bites in absolute EV.
+Modes A/C use plain gain 6 (`comp = 1`); mode B keeps its aperture `camEq = (π/4)/N²` fold
+(the separate DONE issue below) — the two paths each carry the `1/N²` once, never doubled.
+
+**Validated** (`scraps/abs_calib.ftsl` / `_acalib_wide.ftsl`, Cornell box + 100 W area
+light), tone-mapped 8-bit whole-image mean, GPU **and** CPU:
+- f/4:   A `6.79` vs B `7.16` (95%).
+- f/1.4: GPU A `25.54` vs B `25.90` (**98.6%**); CPU A `25.49` vs B `25.86` (**98.6%**).
+- Mode C converges to B as its (pupil-catch) noise falls — mean `16.81 → 20.70 → 21.54`
+  as noise `82% → 35.8% → 31.6%` (residual gap is tone-map clamp bias on fireflies, not a
+  scale error). A and C now land at the same absolute brightness as B instead of black.
+
+NOTE: the `-raster` preview still uses its relative reference aperture (Rref=0.02) for the
+aperture-brightness *ratio*; that remains correct. Known wart (minor, logged for later):
+the **`-aperture` CLI override** changes A/C's physical pupil `R` but does **not** feed
+mode B's `camEq` comp (which reads the scene's `fstop`/`lens`), so cross-mode comparison
+via `-aperture` desyncs B — always set `fstop` in the scene for an apples-to-apples A/B/C
+comparison. Not a render-correctness bug (a normal single-mode render is unaffected).
+
+### DONE (2026-07-15): absolute EV — mode B now applies the aperture's exposure (light-gathering)
+
+**Fixed** in `src/main.cpp` (~3380, the ftsl per-camera render setup): when a scene
+is in absolute EV *and* a physical aperture was actually authored (`fstop`/`lens`,
+detected by `c.lensF > 0`), a mode-B render now folds the camera-equation aperture
+term `camEq = (π/4)/N²` (with `N = c.lensF/(2·c.apertureR)`) into the exposure comp.
+This adds only the **radiometric** light-gathering factor — the pinhole keeps zero
+DoF. Gated tightly so it only *darkens* a mode-B camera that opted into an f-number;
+with no aperture authored (`c.lensF == 0`, e.g. shipped `scenes/absolute.ftsl`) the
+branch is skipped and the pinhole stays the pure radiance reference (comp unchanged,
+byte-identical). Modes A/C are untouched (they must NOT double-apply `1/N²` — their
+gross-scale mis-seat is the separate issue above, now DONE via `F = 1/A_cell`).
+
+**Validated** (`scraps/abs_calib.ftsl`, Cornell box + 100 W area light, mode B, GPU):
+rendering the same scene at f/2 vs f/8 now separates by exactly 4 stops —
+patch linear-luminance mean `2.2225e-2` (f/2) vs `1.3919e-3` (f/8), ratio **15.97×**
+(≈ 16× = 4 stops); whole-image mean ratio 15.99×. The startup log shows the comp
+scaling correctly: `exposure=1.18 (absolute: gain 6 x 0.196 comp)` for f/2, where
+`0.196 = (π/4)/2²`. Author `fstop`/`lens` at the **camera-block** level (not inside
+`film{}` — the film block only reads res/size/format/iso/shutter/exposure).
+
+The other half of the "unification" (making A/B/C agree in *absolute* brightness at
+equal power) is now also DONE — see the "A/B/C now agree in absolute brightness"
+issue above (the `F = 1/A_cell` A/C re-seat). Mode B is internally correct wrt
+aperture, and A/B/C now match within noise at equal `power`.
 
 The old rationale for excluding aperture from the exposure comp ("in splat mode B
 the aperture is virtual, so an f-number term would double-count / be an artifact",
-CamSpec/main.cpp ~921) holds **only for modes A/C**, which already carry the physical
+CamSpec/main.cpp ~921) held **only for modes A/C**, which already carry the physical
 `R²` in their splat weight (render.h `connectLens`). Mode B has **no** `R²`, so a
-virtual-aperture exposure term there is clean and non-redundant — the correct place
-to "regard" the aperture.
-
-**Proper fix (unify with the A/C absolute-gain bug above):** replace the per-mode
-absolute scaling with one camera-equation-based absolute exposure model — apply the
-physical `π/4 · 1/N²` (and ideally `cos⁴θ` natural vignetting) once, seated so A, B
-and C agree at equal `power`. In A/C the `1/N²` comes from the pupil-area `R²` splat
-weight (keep it, fix the gain); in B it must be added as a pure exposure factor while
-keeping pinhole DoF. Do NOT double-apply it in A/C. Defensible alternative if we
-decline the fix: document that aperture is a *lens* property and absolute-EV exposure
-requires mode A/C (mode B stays a pure pinhole) — but then a mode-B `fstop` should
-warn/error rather than silently no-op.
+virtual-aperture exposure term there is clean and non-redundant — hence the fix above
+adds it in B only. When the A/C gross-scale gain is eventually re-seated (issue above),
+keep the two paths consistent: A/C get `1/N²` from the pupil-area `R²` splat weight
+(fix the gain, don't add `camEq`), B gets it as the pure exposure factor added here —
+do NOT double-apply. Ideal end state is one camera-equation absolute model (add
+`cos⁴θ` natural vignetting too) that makes A, B, C agree at equal `power`.
 
 ### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
 
@@ -89,13 +373,21 @@ deterministically regardless of timing) — some specific path at spp 14 indexes
 bounds or dereferences a bad pointer, likely a rare geometric/CSG/medium configuration
 hit only by that sample's random walk.
 
-**Investigation status:** a `compute-sanitizer --tool memcheck` run (build has
-`-lineinfo`, so it would report the exact `render_cuda.cu:<line>`) was launched but
-**stopped before it reached the crash sample** (memcheck ~20× slowdown ⇒ ~80 min to
-spp 14; killed to free the exe lock for the -raster preview work). **Next step:**
-re-run compute-sanitizer memcheck to completion for the fault line, then fix the OOB.
-Repro (headless — sanitizer runs instrumented):
-`compute-sanitizer.bat --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
+**Investigation status (2026-07-15 update):** a **bounded** `compute-sanitizer --tool
+memcheck` run — mode-D BDPT pinned to the single still camera (`-camera cam -spp 6`, so
+it terminates instead of rolling onto the 144-frame flyby) — completed with **ZERO
+memory errors**. So the fault does **not** reproduce on the still frame at low spp; it is
+either **flyby-camera-position specific** (a geometric configuration only some moving-cam
+viewpoint hits) or was already mitigated by unrelated fixes since the crash was first
+seen. The earlier unbounded attempt (`-noise 3`, no `-camera`) never reached spp 14
+(memcheck ~65× slowdown) and also rolled onto the flyby — avoid that; always bound it.
+**Next step:** reproduce at the *specific* crashing spp/camera (drive to spp 14 on the
+flyby camera under a bounded memcheck) to catch the exact `render_cuda.cu:<line>`, then
+fix the OOB. Earlier context: build has `-lineinfo`, so memcheck reports the exact line.
+Repro (headless — sanitizer runs instrumented). Use the real `compute-sanitizer.exe`
+(in the CUDA `compute-sanitizer/` subdir), NOT the `bin/compute-sanitizer.bat` wrapper —
+the `.bat` exits 127 (no useful output) when launched from the bash tool:
+`"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/compute-sanitizer/compute-sanitizer.exe" --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
 Mode B on the same scene is stable, and the new `-raster` preview is unaffected.
 
 ### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
@@ -2311,7 +2603,7 @@ correctly on **both** backends.
   smaller GPUs; energy conservation and image agreement (to within Monte-Carlo noise) hold
   across every scene tested (cornell, materials A/B/C, spotlight, envlight, thin-film,
   multilayer, mix, fog).
-- **Re: "wavefront helps divergent scenes AND small GPUs" (todo.txt question):** it's
+- **Re: "wavefront helps divergent scenes AND small GPUs" (notes/todo.txt question):** it's
   *both*, and they're related. (1) *Divergent scenes* — many materials and/or highly
   variable path lengths — benefit from the per-material sort (kills branch divergence) and
   compaction (kills path-length divergence). (2) *Small GPUs* benefit because they have
@@ -2412,3 +2704,38 @@ correctly on **both** backends.
 - **Proper fix (TODO):** profile the deposit/build with 2M vs 4M; find why host CPU
   scales super-linearly (likely an O(n^2) or lock-contended path, or grid cellSize
   degenerating so build buckets explode). Until fixed, cap flyby photons at ~2M.
+
+## Access-violation popup when closing the live-preview window (intermittent) — PARTIALLY ADDRESSED (2026-07-17)
+
+- **Symptom (user report, 2026-07-17):** closing two `ftrace.exe` live-preview windows
+  produced two "access violation" WER popups on exit. The renders were mode-R gyroid
+  batches launched with `-window -keepwindow` (studio-env HDR variants).
+- **Could NOT reproduce despite faithful attempts.** Tried under **cdb** (break on AV /
+  heap-corruption `0xC0000374` / fastfail `0xC0000409`) and, to defeat any debugger
+  Heisenbug, under **procdump** (`-e -ma`, full native speed) across: (a) mode-B GPU
+  render closed after finishing, (b) mode-R GPU render (`scenes/implicit.ftsl`) closed
+  **mid-render**, and an isolated `src/livewindow.cpp` harness (`scraps/livewin_repro.cpp`)
+  in three lifecycle modes — plain batch close, destructor-closes-a-still-live-window,
+  and a no-sleep `update()`/`setTitle()` "hammer" race closed externally. **Every path
+  tore down cleanly (exit 0, no dump).** So the isolated live-window lifecycle is NOT
+  the fault on the paths tested.
+- **Prime suspect: CUDA/driver async teardown.** The binary imports `nvcuda.dll`; closing
+  a `-keepwindow` window is exactly what unblocks the whole shutdown (`main()` hold loop →
+  `cudaGracefulShutdown()` → CRT static dtors incl. `g_liveWin`). `main.cpp` (~5568)
+  already documents a related async `nvlddmkm` DPC teardown fault they mitigate. A
+  userspace AV popup would be a fault inside `nvcuda.dll`/driver teardown, which our code
+  can't fully fix — but capturing a real dump would confirm the module.
+- **PARTIAL FIX applied (`src/livewindow.cpp`):** hardened a genuine latent cross-thread
+  hazard found by inspection — `impl_->hwnd` was never cleared after the window was
+  destroyed, yet it is read from the render thread (`setTitle`/`clientSize`/`enablePanel`/
+  `setPathCount`) and from `~LiveWindow` (`PostMessageW(WM_CLOSE)`). Windows **recycles
+  HWND values**, so a since-reused handle belonging to another window/thread could receive
+  our `WM_CLOSE`/`WM_SETTEXT`. Made `hwnd` `std::atomic<HWND>`, null it on `WM_DESTROY`,
+  and made every cross-thread caller (and the dtor) `load()` once + null-check so nothing
+  marshals to a stale/recycled handle after close. Verified no regression via the isolated
+  harness + a real mode-R render. This removes a real defect but is **not confirmed to be
+  THE crash** (couldn't reproduce the original AV).
+- **Next step if it recurs:** capture a full dump of the actual fault to pin the module —
+  e.g. attach `procdump -ma -e` to the live PID, or `procdump -i -ma <dir>` (admin) to
+  install a system postmortem catcher — then analyze `.dmp` (`!analyze -v`) to confirm
+  whether it is `nvcuda`/driver teardown vs. app code.

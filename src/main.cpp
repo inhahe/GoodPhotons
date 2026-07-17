@@ -127,7 +127,9 @@
 #include <algorithm>
 #include <thread>
 #include <map>
+#include <set>
 #include <memory>
+#include <filesystem>          // -review: scan a directory of rendered frames
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
@@ -136,6 +138,7 @@
 #include "camera.h"
 #include "raster.h"             // -raster: fast solid-shaded preview rasterizer (no light transport)
 #include "render.h"
+#include "rainbow.h"            // Airy-theory droplet phase function (rainbows in droplet media)
 #include "backward.h"
 #include "bdpt.h"
 #include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
@@ -161,6 +164,14 @@
 extern "C" {
     int stbi_write_png(const char* filename, int w, int h, int comp, const void* data, int stride_bytes);
     int stbi_write_jpg(const char* filename, int w, int h, int comp, const void* data, int quality);
+}
+
+// stb_image decoder (implementation compiled once in stb_image_impl.cpp). Used by
+// -review to load already-rendered PNG/JPG/BMP/TGA frames; PPM P6 is read by a small
+// custom loader (stb_image doesn't decode PPM).
+extern "C" {
+    unsigned char* stbi_load(const char* filename, int* x, int* y, int* channels_in_file, int desired_channels);
+    void           stbi_image_free(void* retval_from_stbi_load);
 }
 
 // Case-insensitive test for a filename ending in `ext` (e.g. ".png").
@@ -1508,6 +1519,12 @@ static void onInterrupt(int sig) {
 // first update at the film's resolution and torn down at process exit. Closing the
 // window sets g_stopRequested so the render stops cleanly (writing its final image).
 static bool                        g_showWindow = false;
+// -keepwindow / -hold: don't auto-close the live preview when the render finishes.
+// Normally g_liveWin is torn down at process exit (right after the render's last frame),
+// so the window vanishes the instant rendering completes. With this set, main() blocks
+// after run() returns until the user closes the window themselves, so a finished image
+// stays on screen to inspect.
+static bool                        g_keepWindow = false;
 static std::unique_ptr<LiveWindow> g_liveWin;
 // Base window title identifying WHAT is being rendered — set in main() to
 // "ftrace - <scene> -> <output>" (see makeWindowTitle). The live status (spp / noise)
@@ -1795,6 +1812,17 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     // simplification (PBRT-v3 convention): the balance heuristic is a partition of unity for
     // any consistent pdfs, so the estimator stays unbiased regardless (only the sampled
     // strategy's throughput must be exact, which analog + ratio tracking guarantee).
+    //
+    // GRADIENT-INDEX (GRIN) media are the one exception: they bend rays along curved
+    // Eikonal paths, which breaks BDPT's straight-edge assumptions (the geometric term G,
+    // area-measure pdf conversion and MIS all assume the connecting segment is a line). The
+    // forward (A/B/C) and backward (R) tracers march GRIN correctly; BDPT would need curved
+    // connections to stay unbiased, so we refuse GRIN scenes here rather than ship a subtly
+    // wrong image. (See known-issues.md: curved-path BDPT is a future enhancement.)
+    for (const auto& md : scene.media)
+        if (md.enabled && md.grin())
+            return "gradient-index (GRIN) media (use mode A/B/C or R)";
+
     std::vector<char> matUsed(scene.mats.size(), 0);
     // Mark a material and (one level, since Mix children can't themselves be Mix) its
     // Mix children, which a used Mix can pick at runtime.
@@ -1828,6 +1856,93 @@ static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) 
     if (cam.hasLens()) return "a realistic multi-element lens";
     if (cam.projection != CAM_RECTILINEAR) return "a non-rectilinear (fisheye/panoramic) camera";
     return nullptr;
+}
+
+// --- Unsupported-feature POLICY (`-on-unsupported`) + the `prefer{}/else{}` predicate ---
+// A scene may ask a mode to render something it can't (e.g. GRIN media in mode D). The
+// policy decides what happens: error out (default, historical), fall back to a mode that
+// CAN render it (backward reference R), or strip the offending feature and render anyway.
+enum class OnUnsupported { Error, Fallback, Strip };
+static OnUnsupported g_onUnsupported = OnUnsupported::Error;
+
+// Core capability check: return a reason string if `mode` cannot render `scene` with a
+// camera of the given `projection`, else nullptr. Only modes with real restrictions (D
+// BDPT, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything here.
+static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
+    if (mode == 'D') {
+        if (const char* r = bdptUnsupportedFeature(scene)) return r;
+        if (projection != CAM_RECTILINEAR)
+            return "a non-rectilinear (fisheye/panoramic) camera in mode D";
+    } else if (mode == 'U') {
+        if (const char* r = bdptUnsupportedFeature(scene)) return r;
+        if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
+        if (projection != CAM_RECTILINEAR)
+            return "a non-rectilinear (fisheye/panoramic) camera in mode U";
+    }
+    return nullptr;
+}
+
+// `prefer{}/else{}` predicate handed to ftsl::load: a branch is renderable iff EVERY
+// camera it declares can render the scene in its effective mode. `cliMode` (0 = none)
+// is a `-mode` override that forces the mode for all cameras.
+static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
+    auto effOf = [&](char camMode) -> char {
+        if (cliMode) return cliMode;
+        if (camMode) return camMode;
+        return L.mode ? L.mode : 'B';
+    };
+    if (!L.cameras.empty()) {
+        for (const auto& cs : L.cameras)
+            if (const char* r = modeFeatureUnsupported(L.scene, effOf(cs.mode), cs.projection))
+                return r;
+    } else {
+        if (const char* r = modeFeatureUnsupported(L.scene, effOf(0), CAM_RECTILINEAR))
+            return r;
+    }
+    return nullptr;
+}
+
+// Best-effort feature stripping for `-on-unsupported strip`. Today only GRIN is
+// strippable (clear the index field -> the medium is treated as homogeneous/clear).
+// Mutates `scene` only if that fully resolves the conflict; otherwise restores it and
+// returns false (so the caller falls back to a supported mode instead). Returns true iff
+// the scene now renders in `mode`.
+static bool stripUnsupportedFeature(Scene& scene, char mode, int projection) {
+    if (modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
+    std::vector<Medium> saved = scene.media;
+    bool anyGrin = false;
+    for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; anyGrin = true; }
+    if (anyGrin && modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
+    scene.media = saved;   // couldn't fully strip -> leave the scene intact
+    return false;
+}
+
+// Apply the `-on-unsupported` policy for one camera. Returns the (possibly changed) mode;
+// may mutate `scene` (strip). `proceed` is set false only when Error policy should abort
+// this camera's render. Prints a notice describing what happened.
+static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
+                                   const char* camName, bool& proceed) {
+    proceed = true;
+    const char* why = modeFeatureUnsupported(scene, mode, projection);
+    if (!why) return mode;
+    if (g_onUnsupported == OnUnsupported::Error) {
+        std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; "
+                             "use mode A/B/C/R, add a prefer{}/else{} fallback, or pass "
+                             "-on-unsupported fallback|strip.\n", mode, camName, why);
+        proceed = false;
+        return mode;
+    }
+    if (g_onUnsupported == OnUnsupported::Strip &&
+        stripUnsupportedFeature(scene, mode, projection)) {
+        std::printf("[on-unsupported=strip] camera '%s': stripped %s; rendering in mode %c "
+                    "anyway.\n", camName, why, mode);
+        return mode;
+    }
+    // Fallback (or strip couldn't resolve it): the backward reference (R) renders every
+    // feature BDPT/VCM refuse (GRIN, media, fisheye, fluorescence, ...).
+    std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode R "
+                "(backward reference).\n", camName, why, mode);
+    return 'R';
 }
 
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
@@ -2725,6 +2840,239 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     return writeOk ? 0 : 1;
 }
 
+// --- -review: rendered-sequence review player -------------------------------
+// Load an 8-bit RGB image (row 0 = top) from a rendered frame on disk. Handles PPM
+// P6 with a tiny custom reader (stb_image can't decode PPM — ftrace's default output)
+// and PNG/JPG/BMP/TGA via stb_image. Returns false on any failure.
+static bool loadImageRGB(const std::string& path, int& w, int& h, std::vector<uint8_t>& rgb) {
+    if (endsWithCI(path, ".ppm")) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        std::string magic; f >> magic;
+        if (magic != "P6") return false;
+        // Read three integers (width, height, maxval), skipping '#' comment lines.
+        auto readInt = [&](long& v) -> bool {
+            for (;;) {
+                int c = f.peek();
+                if (c == EOF) return false;
+                if (std::isspace((unsigned char)c)) { f.get(); continue; }
+                if (c == '#') { std::string junk; std::getline(f, junk); continue; }
+                break;
+            }
+            f >> v; return (bool)f;
+        };
+        long W = 0, H = 0, mx = 0;
+        if (!readInt(W) || !readInt(H) || !readInt(mx)) return false;
+        if (W <= 0 || H <= 0 || mx != 255) return false;
+        f.get();  // single whitespace after maxval precedes the pixel block
+        rgb.assign((size_t)W * H * 3, 0);
+        f.read(reinterpret_cast<char*>(rgb.data()), (std::streamsize)rgb.size());
+        if (!f) return false;
+        w = (int)W; h = (int)H;
+        return true;
+    }
+    int nc = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &nc, 3);
+    if (!px) return false;
+    rgb.assign(px, px + (size_t)w * h * 3);
+    stbi_image_free(px);
+    return true;
+}
+
+// `ftrace -review <base>` — play a directory of already-rendered frames on the same
+// live window + timeline used by the fly viewer, so you can watch an actual rendered
+// flyby, scrub/play it, RE-TIME it by painting local speed (wheel in Paint mode), and
+// Save a re-paced copy. `base` is a filename stem with an optional directory: frames
+// are files named `<stem><digits>.<ext>` (ftrace appends a zero-padded index), e.g.
+// `-review png/swoop/swoop` matches swoop000.png, swoop001.png, ... Numeric-sorted.
+// Self-contained utility path (no scene load).
+static int reviewMode(const std::string& base) {
+    namespace fs = std::filesystem;
+    fs::path bpath(base);
+    fs::path dir = bpath.has_parent_path() ? bpath.parent_path() : fs::path(".");
+    std::string prefix = bpath.filename().string();
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        std::fprintf(stderr, "-review: '%s' is not a directory\n", dir.string().c_str());
+        return 2;
+    }
+    auto knownExt = [](const std::string& e) {
+        static const char* exts[] = {"png","jpg","jpeg","bmp","tga","ppm"};
+        std::string lo; for (char c : e) lo += (char)std::tolower((unsigned char)c);
+        for (const char* x : exts) if (lo == x) return true;
+        return false;
+    };
+    // Collect matching frames: name = prefix + digits + '.' + ext.
+    std::vector<std::pair<long, std::string>> frames;  // (index, full path)
+    for (const auto& de : fs::directory_iterator(dir, ec)) {
+        if (!de.is_regular_file()) continue;
+        std::string name = de.path().filename().string();
+        if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) continue;
+        size_t i = prefix.size();
+        size_t d0 = i;
+        while (i < name.size() && std::isdigit((unsigned char)name[i])) ++i;
+        if (i == d0) continue;                     // need at least one digit
+        if (i >= name.size() || name[i] != '.') continue;
+        std::string ext = name.substr(i + 1);
+        if (!knownExt(ext)) continue;
+        long idx = std::strtol(name.substr(d0, i - d0).c_str(), nullptr, 10);
+        frames.emplace_back(idx, de.path().string());
+    }
+    if (frames.size() < 1) {
+        std::fprintf(stderr, "-review: no frames matching '%s<digits>.<ext>' in %s\n",
+                     prefix.c_str(), dir.string().c_str());
+        return 2;
+    }
+    std::sort(frames.begin(), frames.end(),
+              [](const auto& a, const auto& b){ return a.first < b.first; });
+    const int nFrames = (int)frames.size();
+    std::printf("[review] %d frames: %s ... %s\n", nFrames,
+                fs::path(frames.front().second).filename().string().c_str(),
+                fs::path(frames.back().second).filename().string().c_str());
+    std::fflush(stdout);
+
+    // Load the first frame to size the window.
+    int fw = 0, fh = 0; std::vector<uint8_t> cur;
+    if (!loadImageRGB(frames[0].second, fw, fh, cur)) {
+        std::fprintf(stderr, "-review: failed to load %s\n", frames[0].second.c_str());
+        return 2;
+    }
+    std::string title = "ftrace review — " + prefix;
+    LiveWindow win(fw, fh, title.c_str());
+    const double defFps = 30.0;
+    win.enablePanel(nFrames, defFps, "n/a");
+    win.setPanelState(0, /*playing*/false, /*pathMode*/true, "n/a");
+
+    // Per-frame local speed multiplier (Paint-mode wheel brush is additive, clamped).
+    std::vector<double> speed(nFrames, 1.0);
+    auto speedAt = [&](double pos) {
+        if (nFrames == 0) return 1.0;
+        int i = std::clamp((int)std::floor(pos), 0, nFrames - 1);
+        int j = std::min(i + 1, nFrames - 1);
+        double f = pos - i;
+        return speed[i] * (1.0 - f) + speed[j] * f;
+    };
+    auto paintSpeed = [&](double pos, double notches) {
+        int i = std::clamp((int)std::floor(pos), 0, nFrames - 1);
+        int j = std::min(i + 1, nFrames - 1);
+        double f = pos - i;
+        double delta = notches * 0.15;
+        speed[i] = std::clamp(speed[i] + delta * (1.0 - f), 0.1, 10.0);
+        speed[j] = std::clamp(speed[j] + delta * f,         0.1, 10.0);
+    };
+
+    using clock = std::chrono::steady_clock;
+    auto prevT = clock::now();
+    double pos = 0.0;           // fractional frame index
+    int    shown = -1;          // frame currently displayed
+    bool   playing = false;
+    double camPerSec = defFps;  // frames/second when playing (before speed scaling)
+    int    strideN = 1;
+    bool   rateMode = true;
+    double lastSpdSent = -1.0;
+    int    lastIdxSent = -1;
+    bool   lastPlaying = false;
+
+    auto display = [&](int idx) {
+        if (idx == shown) return;
+        int w2 = 0, h2 = 0; std::vector<uint8_t> rgb;
+        if (loadImageRGB(frames[idx].second, w2, h2, rgb)) {
+            win.update(w2, h2, rgb);
+            shown = idx;
+        }
+    };
+    display(0);
+
+    std::printf("[review] scrub/Play the timeline; Paint + wheel re-times (speed); "
+                "Flat resets; Save writes a re-paced copy. Close the window to finish.\n");
+    std::fflush(stdout);
+
+    while (!win.closed()) {
+        NavInput nav = win.drainNav();
+        auto nowT = clock::now();
+        double dt = std::chrono::duration<double>(nowT - prevT).count();
+        prevT = nowT;
+        if (dt > 0.25) dt = 0.25;
+
+        if (nav.stride    >= 1)  strideN   = nav.stride;
+        if (nav.camPerSec > 0.0) camPerSec = nav.camPerSec;
+        rateMode = nav.rateMode;
+
+        if (nav.togglePlay) {
+            playing = !playing;
+            if (playing && pos >= nFrames - 1 - 1e-9) pos = 0.0;
+        }
+        if (nav.scrubTo >= 0) {
+            playing = false;
+            pos = std::clamp((double)nav.scrubTo, 0.0, (double)(nFrames - 1));
+        }
+        if (nav.reset) { pos = 0.0; playing = false; }
+
+        // Paint mode: wheel paints local speed (re-timing brush); otherwise wheel dollies
+        // the timeline one frame per notch.
+        bool wheelPainted = false;
+        if (nav.paintMode && nav.wheel != 0.0) {
+            paintSpeed(pos, nav.wheel);
+            wheelPainted = true;
+        }
+        if (nav.speedReset) std::fill(speed.begin(), speed.end(), 1.0);
+
+        // Advance playback (speed-scaled) or step by a painted/plain wheel notch.
+        if (playing) {
+            double rate = rateMode ? (camPerSec * dt) : (double)strideN;
+            pos += rate * speedAt(pos);
+            if (pos >= nFrames - 1) { pos = nFrames - 1; playing = false; }
+        }
+        if (!wheelPainted && nav.wheel != 0.0)
+            pos = std::clamp(pos + nav.wheel, 0.0, (double)(nFrames - 1));
+
+        display(std::clamp((int)std::llround(pos), 0, nFrames - 1));
+
+        // Save: re-pace the sequence by the painted speed profile. Fast-painted regions
+        // yield fewer output frames (skimmed), slow regions more (dwelt on). We resample
+        // nFrames output slots uniformly in cumulative DWELL time (dwell = 1/speed), then
+        // copy the chosen source file into <dir>/retimed/.
+        if (nav.saveCurve) {
+            std::vector<double> cum(nFrames + 1, 0.0);
+            for (int i = 0; i < nFrames; ++i) cum[i + 1] = cum[i] + 1.0 / std::max(1e-3, speed[i]);
+            double total = cum[nFrames];
+            fs::path outDir = dir / "retimed";
+            std::error_code mec; fs::create_directories(outDir, mec);
+            int written = 0;
+            for (int j = 0; j < nFrames; ++j) {
+                double target = (nFrames > 1) ? (double)j / (nFrames - 1) * total : 0.0;
+                int src = 0;
+                while (src < nFrames - 1 && cum[src + 1] < target) ++src;
+                fs::path sp(frames[src].second);
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), "%s%03d%s", prefix.c_str(), j,
+                              sp.extension().string().c_str());
+                fs::path dst = outDir / nm;
+                std::error_code cec;
+                fs::copy_file(sp, dst, fs::copy_options::overwrite_existing, cec);
+                if (!cec) ++written;
+            }
+            std::printf("[review] re-timed %d frames -> %s\n", written, outDir.string().c_str());
+            std::printf("[review] assemble e.g.: ffmpeg -framerate %g -i \"%s/%s%%03d.png\" -pix_fmt yuv420p %s_retimed.mp4\n",
+                        defFps, outDir.string().c_str(), prefix.c_str(), prefix.c_str());
+            std::fflush(stdout);
+        }
+
+        // Mirror live state onto the panel (no feedback edges).
+        int idxNow = std::clamp((int)std::llround(pos), 0, nFrames - 1);
+        if (idxNow != lastIdxSent || playing != lastPlaying) {
+            win.setPanelState(idxNow, playing, /*pathMode*/true, "n/a");
+            lastIdxSent = idxNow; lastPlaying = playing;
+        }
+        double sp = speedAt(pos);
+        if (std::fabs(sp - lastSpdSent) > 5e-3) { win.setSpeedLabel(sp); lastSpdSent = sp; }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(playing ? 8 : 20));
+    }
+    std::printf("[review] window closed.\n");
+    return 0;
+}
+
 static int run(int argc, char** argv) {
     // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
     // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
@@ -2736,6 +3084,22 @@ static int run(int argc, char** argv) {
             return 2;
         }
         return convertToPng(argv[2], argv[3]);
+    }
+    // Rendered-sequence review player (no rendering): `ftrace -review <base>`.
+    // Plays a directory of `<base><digits>.<ext>` frames on the live window/timeline,
+    // with scrub/Play and speed re-timing. Pure utility path (no scene load).
+    if (argc >= 2 && !std::strcmp(argv[1], "-review")) {
+        if (argc < 3) {
+            std::fprintf(stderr, "usage: %s -review <base>   (e.g. -review png/swoop/swoop)\n", argv[0]);
+            return 2;
+        }
+        return reviewMode(argv[2]);
+    }
+    // Rainbow (Airy droplet phase) physics self-test: prints the primary/secondary
+    // Descartes angles across the spectrum + Airy/normalisation checks, then exits.
+    if (argc >= 2 && !std::strcmp(argv[1], "-rainbow-selftest")) {
+        rainbow::RainbowPhase::selfTest();
+        return 0;
     }
     long long N = 2'000'000;
     int res = 256;
@@ -2776,7 +3140,7 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
-    const char* cameraSel = nullptr; // -camera <name>|all|#N|near=X,Y,Z (FTSL multi-camera select)
+    const char* cameraSel = nullptr; // -camera <name>|<pathbase>|all|#N|near=X,Y,Z (FTSL multi-camera select)
     bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
     double viewFov = 40.0;
@@ -2792,7 +3156,12 @@ static int run(int argc, char** argv) {
     bool resFromCli  = false;     // did the CLI force a global -r?   (else per-camera)
     int  resYCli     = -1;        // optional height from `-r W H` (-1 = square, use res)
     bool doRaster    = false;     // -raster: fast solid-shaded preview (no light transport)
+    bool exploreMode = false;     // -explore/-fly: raster + interactive fly viewer seeded at the first selected frame (no full render)
+    bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
+    bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
+    double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
@@ -2821,11 +3190,34 @@ static int run(int argc, char** argv) {
             if (hasSceneExt(argv[i])) { inFile = argv[i]; positionalScene = true; break; }
         }
     }
+    // Pre-scan the two flags that affect `prefer{}/else{}` branch selection (which the
+    // loader resolves up-front): a `-mode` override forces the mode a branch is judged
+    // against, and `-on-unsupported` sets the global policy. Pre-scanning mirrors how
+    // -in is found above; the full CLI loop below re-parses them normally.
+    char cliModePrescan = 0;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (!std::strcmp(argv[i], "-mode")) cliModePrescan = argv[i + 1][0];
+        else if (!std::strcmp(argv[i], "-on-unsupported")) {
+            std::string v = argv[i + 1];
+            if      (v == "fallback" || v == "fall") g_onUnsupported = OnUnsupported::Fallback;
+            else if (v == "strip"    || v == "ignore") g_onUnsupported = OnUnsupported::Strip;
+            else                                     g_onUnsupported = OnUnsupported::Error;
+        }
+    }
+
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
     if (inFile) {
         std::string ferr;
-        if (!ftsl::load(inFile, ftslScene, ferr)) {
+        // The prefer/else resolver asks this predicate whether a branch renders; when the
+        // policy is fallback/strip we accept every branch (the policy handles it later at
+        // render time), so the FIRST/most-preferred branch always wins.
+        ftsl::SupportFn supportFn = (g_onUnsupported == OnUnsupported::Error)
+            ? ftsl::SupportFn([cliModePrescan](const ftsl::Loaded& L) -> const char* {
+                  return sceneModeUnsupported(L, cliModePrescan);
+              })
+            : ftsl::SupportFn{};
+        if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
             std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
         }
@@ -2840,6 +3232,11 @@ static int run(int argc, char** argv) {
         if (ftslScene.photons >= 0)       N = ftslScene.photons;
         if (ftslScene.res > 0)            res = ftslScene.res;
         if (ftslScene.mode)               mode = ftslScene.mode;
+        // A scene-level `default_mode` is the authoritative fallback for cameras that don't
+        // author their own `mode`. It takes precedence over the incidental global `mode`
+        // above (which just trails the last camera/render block), but a per-camera `mode`
+        // (via effMode) and a CLI -mode still override it.
+        if (ftslScene.defaultMode)        mode = ftslScene.defaultMode;
         if (!ftslScene.device.empty())    device = ftslScene.device.c_str();
         if (!ftslScene.out.empty())       out = ftslScene.out.c_str();
     }
@@ -2854,6 +3251,7 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
@@ -2924,13 +3322,27 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
+        else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
+        else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
+            // Interactive fly-through: start at the first selected camera frame and let
+            // the user explore with the raster viewer instead of rendering every frame.
+            // The exposure-lock metering pre-pass is pointless here (the viewer auto-exposes
+            // per frame), and metering a whole flyby's frames just to fly one is wasteful,
+            // so explore implies -no-meter.
+            exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
+        }
+        else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
+        else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
+        else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
+        else if (!std::strcmp(argv[i], "-serve")) { /* resident loop; driven by main(), ignored here */ }
     }
     if (nThreads < 1) nThreads = 1;
 
@@ -2951,6 +3363,8 @@ static int run(int argc, char** argv) {
         if (!explicitControl) {
             doRaster = true;
             g_showWindow = true;
+            g_keepWindow = true;   // double-click preview: hold the image open until the
+                                   // user closes the window (don't flash-and-vanish)
             // Don't drop a stray cornell.ppm next to the cwd: send the preview PNG to a
             // temp path derived from the scene name. (Window is the real deliverable.)
             if (!std::strcmp(out, "cornell.ppm")) {
@@ -3219,8 +3633,26 @@ static int run(int argc, char** argv) {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
-    struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup; };
+    struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
+                       Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0; };  // lookAt/up/fovY: for the interactive raster viewer
     std::vector<RenderCam> toRender;
+
+    // Raster previews are cheap to compute, so unless the user pinned a size with -r,
+    // scale each preview camera UP so its long edge is at least kRasterPreviewLong px
+    // (aspect preserved — the same scale on both axes, so the camera's tanHalfX/Y still
+    // match). A 256²-authored test camera then previews large and readable in the live
+    // window instead of tiny; already-large cameras are left untouched, and real
+    // (light-transport) renders always keep their authored resolution.
+    const int kRasterPreviewLong = 1440;
+    auto previewUpscale = [&](int& rx, int& ry) {
+        if (!doRaster || resFromCli) return;
+        int lo = std::max(rx, ry);
+        if (lo > 0 && lo < kRasterPreviewLong) {
+            double s = (double)kRasterPreviewLong / lo;
+            rx = std::max(1, (int)std::lround(rx * s));
+            ry = std::max(1, (int)std::lround(ry * s));
+        }
+    };
 
     // -view against a loaded (-in) scene: inject an ad-hoc 'view' CamSpec and
     // render only it (so the live -window/-preview shows exactly that angle).
@@ -3237,6 +3669,8 @@ static int run(int argc, char** argv) {
         // Select which cameras to render. `-camera` accepts:
         //   all           every camera (default when several are declared)
         //   <name>        exact camera/frame name (e.g. hero, fly137)
+        //   <pathbase>    a whole camera_path/curve/orbit by its base name (e.g.
+        //                 `fly` selects fly000..fly143 but not an unrelated still)
         //   #N            the Nth declared camera, 0-based (#-1 = last)
         //   near=X,Y,Z    the camera whose eye is closest to (X,Y,Z)
         // The index and nearest selectors make it easy to aim the live window at
@@ -3277,6 +3711,35 @@ static int run(int argc, char** argv) {
             } else {
                 for (const auto& cs : ftslScene.cameras)
                     if (cs.name == cameraSel) sel.push_back(&cs);
+                // No exact hit? Treat the query as a camera_path base name and select
+                // every frame named "<q>NNN" (q followed by digits only) — so
+                // `-camera fly` grabs the whole `camera_curve "fly"` (fly000..fly143)
+                // while excluding an unrelated still like `cam`.
+                if (sel.empty()) {
+                    for (const auto& cs : ftslScene.cameras) {
+                        if (cs.name.size() > q.size() && cs.name.compare(0, q.size(), q) == 0) {
+                            bool allDigits = true;
+                            for (size_t k = q.size(); k < cs.name.size(); ++k)
+                                if (!std::isdigit((unsigned char)cs.name[k])) { allDigits = false; break; }
+                            if (allDigits) sel.push_back(&cs);
+                        }
+                    }
+                    if (!sel.empty()) {
+                        // Resolve the flyby's playback fps hint (per-camera, else scene
+                        // default) so a user running ftrace directly sees the authored rate
+                        // the video tooling will assemble at; 0 => none authored.
+                        double pfps = (sel.front()->fps > 0.0) ? sel.front()->fps
+                                                               : ftslScene.defaultFps;
+                        if (pfps > 0.0)
+                            std::printf("[camera] path '%s' -> %zu frames (%s..%s) @ %g fps\n",
+                                        q.c_str(), sel.size(), sel.front()->name.c_str(),
+                                        sel.back()->name.c_str(), pfps);
+                        else
+                            std::printf("[camera] path '%s' -> %zu frames (%s..%s)\n",
+                                        q.c_str(), sel.size(), sel.front()->name.c_str(),
+                                        sel.back()->name.c_str());
+                    }
+                }
                 if (sel.empty()) {
                     std::fprintf(stderr, "[camera] no camera named '%s' (have:", cameraSel);
                     for (const auto& cs : ftslScene.cameras)
@@ -3292,6 +3755,7 @@ static int run(int argc, char** argv) {
             int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
             int cresY = resFromCli ? (resYCli > 0 ? resYCli : res)
                                    : (cs->resY > 0 ? cs->resY : cresX);
+            previewUpscale(cresX, cresY);   // big, readable raster preview (no-op for real renders)
             Camera c;
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cresX, cresY);
             c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
@@ -3350,7 +3814,36 @@ static int run(int argc, char** argv) {
             // locks only that path's frames (group = its pathGroup); -1 = per-frame.
             int eg = forceExposureLock ? 0 : (cs->exposureLock ? cs->pathGroup : -1);
             double cexp = (exposureCli > 0.0) ? exposureCli : cs->exposureMul;   // -exposure/-ev overrides the authored comp
-            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg});
+            // Absolute-EV aperture exposure (camera equation E = L·(π/4)/N²). The pinhole
+            // splat (mode B) measures scene RADIANCE and, unlike the finite-lens catch
+            // modes A/C (whose splat weight already carries the pupil area R²∝1/N²),
+            // ignores the aperture entirely — so an absolute mode-B render is identically
+            // bright at f/2 and f/8 when a real sensor separates them by 4 stops. Fold the
+            // camera-equation aperture term into the exposure comp, but ONLY when a
+            // physical aperture was actually authored (c.lensF>0 ⟺ an `fstop`/`lens` was
+            // given). With no aperture authored the pinhole stays the pure radiance
+            // reference (byte-identical to before — e.g. scenes/absolute.ftsl), so this
+            // only ever darkens a mode-B camera that opted into an f-number. Modes A/C are
+            // untouched here (they must NOT double-apply 1/N²; their gross-scale mis-seat
+            // is the separate issue #1). No effect outside absolute EV (auto-exposure's
+            // p99 anchor cancels any uniform aperture scale anyway).
+            if (scene.absolute && cmode == 'B' && c.lensF > 0.0 && c.apertureR > 0.0) {
+                double N = c.lensF / (2.0 * c.apertureR);           // f-number = focal / (2·apertureR)
+                if (N > 0.0) {
+                    double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
+                    cexp = (cexp > 0.0 ? cexp : 1.0) * camEq;
+                }
+            }
+            // Unsupported-feature policy (-on-unsupported): if this camera's mode still
+            // can't render the scene (e.g. GRIN media in mode D and no prefer{}/else{}
+            // branch selected one), apply the policy — error (abort), fall back to mode R,
+            // or strip the offending feature and render anyway.
+            {
+                bool proceed = true;
+                cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->name.c_str(), proceed);
+                if (!proceed) return 1;
+            }
+            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
@@ -3358,16 +3851,52 @@ static int run(int argc, char** argv) {
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
                                 mode == 'P' || mode == 'D' || mode == 'M' ||
                                 mode == 'S' || mode == 'U' || refMode);
-        const int resY = (resYCli > 0) ? resYCli : res;
+        int fresX = res, fresY = (resYCli > 0) ? resYCli : res;
+        previewUpscale(fresX, fresY);   // big, readable raster preview (no-op for real renders)
+        // Demo-camera eye/target/up/fov (captured for the interactive raster viewer).
+        Vec3 cEye  = haveView ? viewEye  : (prism ? Vec3{0.5, 0.5, 2.4} : Vec3{0.5, 0.5, 2.7});
+        Vec3 cLook = haveView ? viewLook : (prism ? Vec3{0.5, 0.45, 0.5} : Vec3{0.5, 0.5, 0.5});
+        Vec3 cUp   = haveView ? viewUp   : Vec3{0, 1, 0};
+        double cFov = haveView ? viewFov : (prism ? 45.0 : 40.0);
         Camera c;
         if (useCamera) {
-            if (haveView)   c.lookAt(viewEye, viewLook, viewUp, viewFov, res, resY);   // -view overrides the demo camera
-            else if (prism) c.lookAt({0.5, 0.5, 2.4}, {0.5, 0.45, 0.5}, {0, 1, 0}, 45.0, res, resY);
-            else            c.lookAt({0.5, 0.5, 2.7}, {0.5, 0.5, 0.5}, {0, 1, 0}, 40.0, res, resY);
+            c.lookAt(cEye, cLook, cUp, cFov, fresX, fresY);
             c.apertureR = apertureR;
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
-        toRender.push_back({"", c, mode, res, resY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1});
+        toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
+    }
+
+    // -explore/-fly: seed the interactive raster viewer at the first selected frame
+    // instead of rendering the whole flyby. We KEEP a copy of every selected frame's
+    // camera as a "path" the viewer can lock onto (its timeline / lock-to-path panel),
+    // then trim toRender to a single frame so the raster loop draws one frame before the
+    // fly viewer takes over (window is held open).
+    struct PathFrame { Vec3 eye; Vec3 fwd; Vec3 up; double fov; };
+    std::vector<PathFrame> explorePath;    // one entry per flyby frame (empty for a lone camera)
+    double explorePathFps = 0.0;           // authored playback rate hint (0 = none)
+    std::string exploreCurveName;          // base name of the selected flyby (frame "swoop007" -> "swoop"),
+                                           //   used to pick the matching authored camera_curve for round-trip edit
+    if (exploreMode && toRender.size() > 1) {
+        explorePath.reserve(toRender.size());
+        for (const auto& rc : toRender) {
+            Vec3 f = rc.lookAt - rc.cam.eye;
+            double L = std::sqrt(dot(f, f));
+            f = (L > 1e-9) ? f * (1.0 / L) : Vec3{0, 0, -1};
+            explorePath.push_back({rc.cam.eye, f, rc.up, rc.fovY});
+        }
+        // Recover the flyby's base name by stripping the trailing zero-padded frame index
+        // off the first frame's camera name (e.g. "swoop007" -> "swoop").
+        { const std::string& fn = toRender.front().name;
+          size_t end = fn.size();
+          while (end > 0 && std::isdigit((unsigned char)fn[end - 1])) --end;
+          if (end < fn.size()) exploreCurveName = fn.substr(0, end); }
+        explorePathFps = ftslScene.defaultFps;   // scene-authored fps seeds the cam/sec box
+        std::printf("[explore] starting interactive fly viewer at '%s' with a %zu-frame camera path"
+                    " (timeline + lock-to-path enabled)\n",
+                    toRender.front().name.empty() ? "<camera>" : toRender.front().name.c_str(),
+                    explorePath.size());
+        toRender.resize(1);
     }
 
     // Output naming: a single camera writes to `out`; several cameras write one file
@@ -3397,7 +3926,76 @@ static int run(int argc, char** argv) {
     // no auto-exposure to lock) and when a global -exposure-lock is forcing one anchor.
     struct MeterCam { Camera cam; char mode; int res; int resY; std::string name; };
     std::map<int, std::vector<MeterCam>> meterPlan;   // group -> metering camera(s) (>1 = average)
-    if (fromFtsl && !ftslScene.cameras.empty() && !scene.absolute && !forceExposureLock) {
+    std::set<int> meterAdaptive;                      // groups whose plan is metered ADAPTIVELY
+
+    // Low-discrepancy metering ORDER over a path's N frames. Instead of picking evenly
+    // spaced frames (which can ALIAS with a periodic exposure swing along the path — an
+    // orbit that passes a light once per revolution, say — biasing the averaged anchor),
+    // we walk the frames in van der Corput (base-2 radical-inverse / bit-reversal) order:
+    // 0, N/2, N/4, 3N/4, N/8, …  Every prefix of this sequence is uniformly spread over
+    // the whole path AND non-periodic, so an adaptive meter that stops after k frames has
+    // still sampled the entire flyby evenly with no periodic bias — and it is deterministic
+    // (reproducible), which a purely random jitter would not be. Rounding collisions are
+    // resolved by probing to the nearest unused index, so the result is a permutation.
+    auto meterOrder = [](int n) {
+        std::vector<int> order; order.reserve(std::max(0, n));
+        if (n <= 0) return order;
+        std::vector<char> used(n, 0);
+        for (int r = 0; (int)order.size() < n; ++r) {
+            unsigned b = (unsigned)r; double f = 0.0, base = 0.5;   // radical inverse base 2 of r
+            while (b) { f += (b & 1u) * base; b >>= 1; base *= 0.5; }
+            int i = (int)(f * n); if (i >= n) i = n - 1;
+            while (used[i]) i = (i + 1) % n;                        // nearest unused (dedupe rounding)
+            used[i] = 1; order.push_back(i);
+        }
+        return order;
+    };
+
+    // Adaptive stop for an AVERAGED exposure meter. We don't know a path's exposure
+    // variance up front, so rather than metering a fixed frame count we meter in the
+    // low-discrepancy order above and watch the running mean converge. The anchor is a
+    // brightness, so convergence is judged in STOPS (log2): at successive power-of-two
+    // checkpoints (8,16,32,…) we compare the running mean-of-log2 to the previous
+    // checkpoint and stop once it moves less than `tolStops`. Bounded to [kMin, kMax]
+    // valid samples, so a smooth path settles in ~16 frames while a wildly varying one
+    // keeps going (up to kMax) for a faithful average — the count adapts to the DATA
+    // instead of a guessed constant. The returned anchor is the ARITHMETIC mean of the
+    // metered per-frame anchors (unchanged from the non-adaptive path, so short paths
+    // that meter every frame are bit-identical to before).
+    struct MeterConverge {
+        int    kMin, kMax; double tolStops;
+        int    k = 0; double sumLin = 0.0, sumLog2 = 0.0;
+        int    nextCheck; double lastMean = 0.0; bool haveLast = false;
+        MeterConverge(int kmn, int kmx, double tol)
+            : kMin(kmn), kMax(kmx), tolStops(tol), nextCheck(std::max(kmn, 8)) {}
+        // Feed one per-frame anchor (>0 to count). Returns true once enough frames are in.
+        bool add(double a) {
+            if (a > 0.0) { sumLin += a; sumLog2 += std::log2(a); ++k; }
+            if (k >= kMax) return true;
+            if (k >= kMin && k >= nextCheck) {
+                double mean = sumLog2 / k;
+                bool conv = haveLast && std::fabs(mean - lastMean) <= tolStops;
+                lastMean = mean; haveLast = true; nextCheck *= 2;
+                if (conv) return true;
+            }
+            return false;
+        }
+        double anchor() const { return k > 0 ? sumLin / k : 0.0; }
+        int    used()   const { return k; }
+    };
+    // Adaptive-meter bounds: never fewer than kMeterMin nor more than kMeterMax frames.
+    constexpr int    kMeterMin = 8, kMeterMax = 64;
+    constexpr double kMeterTolStops = 0.02;   // stop when the mean moves < 0.02 stop
+
+    if (noMeter) {
+        bool anyLocked = false;
+        for (const auto& rc : toRender) if (rc.expGroup >= 0) { anyLocked = true; break; }
+        if (anyLocked)
+            std::printf("[meter] skipped (-no-meter%s): frames auto-expose per frame "
+                        "instead of metering the exposure-lock group.\n",
+                        exploreMode ? " via -explore" : "");
+    }
+    if (!noMeter && fromFtsl && !ftslScene.cameras.empty() && !scene.absolute && !forceExposureLock) {
         // Build a camera the same way the render loop does, minus the verbose lens logging.
         auto buildMeterCam = [&](const ftsl::CamSpec& cs) -> MeterCam {
             MeterCam m;
@@ -3427,9 +4025,21 @@ static int run(int argc, char** argv) {
             std::vector<MeterCam>& plan = meterPlan[g];
             auto addFrame = [&](const ftsl::CamSpec& cs) { plan.push_back(buildMeterCam(cs)); };
             switch (rep.expLockSel) {
-                case ftsl::CamSpec::EXPLOCK_AVERAGE:
-                    for (const auto* cs : members) addFrame(*cs);
+                case ftsl::CamSpec::EXPLOCK_AVERAGE: {
+                    // Average the per-frame anchors — but metering every frame of a long
+                    // flyby is wasteful. Each meter frame projects the WHOLE scene (the
+                    // dominant, resolution-independent cost), and the locked anchor is a
+                    // smooth statistic of the path. Rather than a fixed subsample count, we
+                    // queue ALL frames in low-discrepancy (van der Corput) order and let the
+                    // meter loop stop ADAPTIVELY once the running average converges (see
+                    // MeterConverge). That kills the periodic-aliasing bias of even spacing
+                    // and spends frames in proportion to how variable the path actually is:
+                    // a smooth dolly settles in ~16 frames, a wild orbit meters up to kMax.
+                    const int n = (int)members.size();
+                    for (int idx : meterOrder(n)) addFrame(*members[(size_t)idx]);
+                    meterAdaptive.insert(g);
                     break;
+                }
                 case ftsl::CamSpec::EXPLOCK_INDEX: {
                     int n = (int)members.size(), i = rep.expLockIndex;
                     if (i < 0) i += n;
@@ -3481,9 +4091,49 @@ static int run(int argc, char** argv) {
     // -----------------------------------------------------------------------------
     if (doRaster) {
         std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
+        if (rasterSeeThrough)
+            std::printf("[raster] see-through: clear objects dim/haze what's behind them (clarity %.2f, no refraction)\n", rasterClarity);
         std::fflush(stdout);
+
+        // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
+        // so heavy scenes don't sit with a blank screen while the isosurfaces march.
+        // Size it to the first camera we'll render; fill a dark placeholder frame and
+        // show a "tessellating…" title, then update N/M progress as each implicit is
+        // marched (see the tessellate() callback below).
+        if (g_showWindow && !toRender.empty() && !g_liveWin) {
+            int pw = toRender.front().res, ph = toRender.front().resY;
+            std::vector<uint8_t> placeholder((size_t)pw * ph * 3);
+            for (size_t i = 0; i < placeholder.size(); i += 3) {
+                placeholder[i] = 24; placeholder[i + 1] = 26; placeholder[i + 2] = 30;
+            }
+            g_liveWin = std::make_unique<LiveWindow>(pw, ph, g_windowTitle.c_str());
+            g_liveWin->update(pw, ph, placeholder);
+            const size_t nImp = scene.implicits.size();
+            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
+                                (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
+        }
+
         auto rt0 = std::chrono::steady_clock::now();
-        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso);
+        // Progress callback: update the window title (and a periodic stdout line) as the
+        // heavy isosurface/CSG implicits are marched one by one.
+        auto lastTick = std::chrono::steady_clock::now();
+        auto tessProgress = [&](int done, int total) {
+            if (total <= 0) return;
+            int pct = (int)std::lround(100.0 * done / total);
+            if (g_liveWin && !g_liveWin->closed()) {
+                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
+                                    std::to_string(done) + "/" + std::to_string(total) +
+                                    ", " + std::to_string(pct) + "%)");
+            }
+            auto now = std::chrono::steady_clock::now();
+            if (done == 0 || done == total ||
+                std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
+                std::printf("[raster] tessellating implicit %d/%d (%d%%)\n", done, total, pct);
+                std::fflush(stdout);
+                lastTick = now;
+            }
+        };
+        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso, tessProgress);
         raster::PreviewLight plight = raster::deriveLight(scene);
         auto rt1 = std::chrono::steady_clock::now();
         std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
@@ -3496,20 +4146,55 @@ static int run(int argc, char** argv) {
         // every frame of the group previews at the chosen viewpoint's exposure — mirroring
         // what the meter pre-pass does for the real render. Uses the same raster shading, so
         // the anchor matches the frames' own pipeline exactly.
+        //
+        // This pass can dwarf the tessellation for an averaged lock (e.g. a 145-frame
+        // camera_path meters ~144 frames), so it drives its own progress: a throttled
+        // stdout percentage + a window title, and it pushes each freshly-metered frame to
+        // the live window so the preview animates through the metering instead of sitting
+        // blank on the last tessellation frame.
+        size_t meterDone = 0;
+        auto   meterTick = std::chrono::steady_clock::now();
         for (const auto& [g, cams] : meterPlan) {
             if (cams.empty()) continue;
-            double sum = 0.0; int m = 0;
+            const bool adaptive = meterAdaptive.count(g) != 0;
+            const int  N   = (int)cams.size();
+            const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
+            const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
+            MeterConverge conv(kmn, kmx, kMeterTolStops);
             for (const auto& mc : cams) {
+                if (g_liveWin && g_liveWin->closed()) { g_stopRequested = 1; break; }
                 double a = 0.0;
-                raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
-                                    /*exposure*/1.0, /*autoExpose*/true, &a);
-                if (a > 0.0) { sum += a; ++m; }
+                std::vector<uint8_t> mimg =
+                    raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
+                                        /*exposure*/1.0, /*autoExpose*/true, &a);
+                bool stop = conv.add(a);
+                ++meterDone;
+                // Show the metering pass converging + a throttled running count so the
+                // window/console isn't silent while this (often long) pre-pass runs. The
+                // shown frames are per-frame auto-exposed — a rough, NOT-yet-exposure-locked
+                // preview whose brightness varies frame to frame — so the title says as much
+                // to avoid the impression that this flickering sweep is the final look.
+                auto now = std::chrono::steady_clock::now();
+                if (meterDone == 1 || stop ||
+                    std::chrono::duration<double>(now - meterTick).count() >= 1.0) {
+                    if (g_liveWin && !g_liveWin->closed()) {
+                        g_liveWin->update(mc.res, mc.resY, mimg);
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure "
+                                            "(preview NOT locked yet) " +
+                                            std::to_string(meterDone));
+                    }
+                    std::printf("[raster] metering exposure %zu\n", meterDone);
+                    std::fflush(stdout);
+                    meterTick = now;
+                }
+                if (stop) break;
             }
-            if (m > 0) {
-                expAnchors[g] = sum / m;
-                if (cams.size() > 1)
-                    std::printf("[raster] exposure lock: group %d meters the average of %zu "
-                                "frames (anchor %.4g)\n", g, cams.size(), expAnchors[g]);
+            if (g_stopRequested) break;
+            if (conv.used() > 0) {
+                expAnchors[g] = conv.anchor();
+                if (adaptive)
+                    std::printf("[raster] exposure lock: group %d meters the average of %d/%d "
+                                "frames (anchor %.4g)\n", g, conv.used(), N, expAnchors[g]);
                 else
                     std::printf("[raster] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                                 g, cams.front().name.c_str(), expAnchors[g]);
@@ -3545,7 +4230,8 @@ static int run(int argc, char** argv) {
             // flicker frame-to-frame (shared anchor per group; per-frame when expGroup<0).
             const bool autoExp = !scene.absolute;
             double* lockAnchor = (autoExp && rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev, autoExp, lockAnchor);
+            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev, autoExp, lockAnchor,
+                                                           rasterSeeThrough, rasterClarity);
             std::string path = outFor(rc.name);
             if (!writeImage(path, W, H, img)) {
                 std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());
@@ -3573,6 +4259,718 @@ static int run(int argc, char** argv) {
         double secs = std::chrono::duration<double>(ft1 - ft0).count();
         std::printf("[raster] done: %d frame(s) in %.2fs (%.1f fps).\n",
                     frame, secs, frame > 0 ? frame / std::max(secs, 1e-6) : 0.0);
+
+        // ---------------------------------------------------------------------------
+        // Interactive raster viewer. For a single still camera shown in a live window,
+        // fly the camera with the keyboard and read off the eye/look_at to author a
+        // .ftsl camera. Six controls, all along WORLD axes: the camera EYE (x,y,z) and
+        // a LOOK-AT TARGET (x,y,z) which the camera always points at and which is drawn
+        // as a red crosshair.
+        //
+        // A multi-camera flyby animates all its frames first (the loop above) and is NOT
+        // interactive during the animation. But once it finishes, if the window is being
+        // held open (-keepwindow), we hand control to the user too — seeded from the LAST
+        // frame's camera (the one still on screen) — so the flyby doesn't just freeze on
+        // its final frame with no way to look around. Without -keepwindow a flyby is a
+        // batch sequence render, so we leave it non-interactive and let the process exit.
+        if (g_showWindow && g_liveWin && !g_stopRequested &&
+            (toRender.size() == 1 || g_keepWindow)) {
+            const RenderCam& rc0 = toRender.back();   // == the only / last-shown camera
+            const int    W = rc0.res, H = rc0.resY, proj = rc0.cam.projection;
+            const Vec3   eye0 = rc0.cam.eye, tgt0 = rc0.lookAt, up = rc0.up;
+            const double fovY = rc0.fovY;
+            double ev = (rc0.exposure > 0.0) ? rc0.exposure : 1.0;
+            if (scene.absolute && (rc0.mode == 'A' || rc0.mode == 'C')) {
+                const double Rref = 0.02; double R = rc0.cam.apertureR;
+                if (R > 0.0) ev *= (R * R) / (Rref * Rref);
+            }
+            const bool autoExp = !scene.absolute;   // per-frame auto-exposure while navigating
+            // Unified fly-camera state: an eye position and a normalized look direction
+            // `fwd` (no separate orientation target — you always travel where you look).
+            // The world up is fixed (no roll), so mouse-look is a yaw about worldUp plus a
+            // clamped pitch about the camera's right axis. `lookDist` is only used to place
+            // the look_at when printing a camera block (the eye+fwd ray is what matters).
+            const Vec3 worldUp = up;
+            Vec3   eye = eye0;
+            Vec3   fwd = tgt0 - eye0;
+            { double L = std::sqrt(dot(fwd, fwd)); fwd = (L > 1e-9) ? fwd * (1.0 / L) : Vec3{0, 0, -1}; }
+            double lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+            if (lookDist < 1e-4) lookDist = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0);
+            const double sceneR = (scene.sceneRadius > 0.0 ? scene.sceneRadius : 1.0);
+            // Motion is FEEDBACK-LOCKED, not wall-clock-based: each held-key frame (and each
+            // wheel notch) advances the eye by this fixed `step` in world units, and exactly
+            // one frame is rendered per move. So travel rate auto-scales with render speed
+            // (heavy scene -> careful crawl, light scene -> quick) and you can never skip past
+            // geometry between two frames you didn't see. `step` is the per-move distance,
+            // adjustable live with Ctrl+wheel.
+            double       step   = sceneR * 0.02;     // per-frame / per-notch travel, world units
+            // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
+            // (nav.lookX/lookY, -1..+1) is multiplied by these to turn the view PER RENDERED
+            // FRAME. Full deflection = kYaw/kPitch radians/frame; centre dead zone = no turn.
+            const double kYaw   = 0.040;             // max yaw   per frame at full pointer deflection
+            const double kPitch = 0.030;             // max pitch per frame at full pointer deflection
+            // Rodrigues rotation of v about a UNIT axis by `ang` radians.
+            auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
+                double c = std::cos(ang), s = std::sin(ang);
+                return v * c + cross(axis, v) * s + axis * (dot(axis, v) * (1.0 - c));
+            };
+            auto norml = [](const Vec3& v) -> Vec3 {
+                double L = std::sqrt(dot(v, v)); return (L > 1e-9) ? v * (1.0 / L) : v;
+            };
+            // Collision: keep the eye out of solid geometry so you can't fly through a wall.
+            //   SLIDE  — stop at the wall but let the remaining motion slide along it, so
+            //            holding forward against a wall carries you around a corner into open
+            //            space (the default; also the least "stuck"-feeling).
+            //   STOP   — halt dead at the wall (no sideways drift).
+            //   OFF    — no collision (ghost through anything; for placing a camera outside
+            //            the room or inside glass). `-noclip` starts here.
+            enum CollideMode { COLLIDE_SLIDE, COLLIDE_STOP, COLLIDE_OFF };
+            CollideMode collide = viewerNoclip ? COLLIDE_OFF : COLLIDE_SLIDE;
+            auto collideName = [](CollideMode m) {
+                return m == COLLIDE_SLIDE ? "slide" : (m == COLLIDE_STOP ? "stop" : "off (noclip)");
+            };
+            // Compact label for the panel's Clip button (fits the narrow button width).
+            auto collideShort = [](CollideMode m) {
+                return m == COLLIDE_SLIDE ? "slide" : (m == COLLIDE_STOP ? "stop" : "noclip");
+            };
+            // Resolve a proposed eye move against the scene. Casts along the motion with the
+            // engine's own BVH (scene.closestHit); keeps a `skin` standoff so the near plane
+            // never pokes through a surface. SLIDE iterates a few times so a corner (two walls)
+            // doesn't leak. Returns the collision-safe new position.
+            const double kSkin = sceneR * 0.02;       // standoff kept between eye and any wall
+            auto resolveMove = [&](Vec3 pos, Vec3 delta) -> Vec3 {
+                if (collide == COLLIDE_OFF) return pos + delta;
+                for (int iter = 0; iter < 4; ++iter) {
+                    double len = std::sqrt(dot(delta, delta));
+                    if (len < 1e-9) break;
+                    Vec3 dir = delta * (1.0 / len);
+                    Hit h = scene.closestHit(Ray{pos, dir}, 1e-6);
+                    if (!h.valid || h.t > len + kSkin) { pos = pos + delta; break; }  // clear path
+                    double advance = h.t - kSkin; if (advance < 0.0) advance = 0.0;   // stop short
+                    pos = pos + dir * advance;
+                    if (collide == COLLIDE_STOP) break;
+                    // Slide: strip the into-wall component from the leftover motion. h's
+                    // geometric normal oriented toward us (orientedGeoN) is the wall plane's.
+                    Vec3 n = orientedGeoN(h);
+                    Vec3 remain = dir * (len - advance);
+                    delta = remain - n * dot(remain, n);
+                }
+                return pos;
+            };
+            // Interactive render resolution FOLLOWS THE LIVE WINDOW: fit the authored
+            // W:H aspect into the current client area so the raster renders at (roughly)
+            // one pixel per displayed pixel. Shrinking the window renders fewer pixels
+            // (faster while navigating a heavy scene); growing it renders more (crisper),
+            // up to the authored resolution. The aspect ratio is preserved, so the camera
+            // projection is unchanged, and the eye/look_at readout + world-scaled crosshair
+            // are resolution-independent. Recomputed every loop so a live resize retunes it.
+            auto fitRes = [&](int& outW, int& outH) {
+                int cw = 0, ch = 0;
+                if (!g_liveWin->clientSize(cw, ch)) { outW = W; outH = H; return; }
+                double s = std::min(std::min((double)cw / W, (double)ch / H), 1.0);  // never supersample
+                int vw = std::max(1, (int)std::lround(W * s));
+                int vh = std::max(1, (int)std::lround(H * s));
+                const int kMinLong = 160;   // guard against an absurdly tiny render
+                int lo = std::max(vw, vh);
+                if (lo < kMinLong) {
+                    double up = (double)kMinLong / lo;
+                    vw = std::max(1, (int)std::lround(vw * up));
+                    vh = std::max(1, (int)std::lround(vh * up));
+                }
+                outW = vw; outH = vh;
+            };
+            int VW = W, VH = H;
+            fitRes(VW, VH);
+            auto fmt3 = [](const Vec3& p) {
+                char b[64]; std::snprintf(b, sizeof b, "%.2f, %.2f, %.2f", p.x, p.y, p.z);
+                return std::string(b);
+            };
+            // ---- Control panel + camera-path (timeline) state ------------------------
+            // The window hosts a strip of controls below the image (Clip / Reset always;
+            // plus a timeline, Play/Pause, Path-lock toggle and two traversal-speed inputs
+            // when a flyby path is present). enablePanel with pathCount<2 shows just the two
+            // buttons. Path playback rides the SAME camera-index cursor the timeline scrubs.
+            int pathCount = (int)explorePath.size();   // mutable: the editor rebuilds the path
+            g_liveWin->enablePanel(pathCount, explorePathFps, collideShort(collide));
+            bool   pathMode = false;    // locked to the camera path (orientation + travel follow it)
+            bool   playing  = false;    // auto-advancing along the path
+            double pathPos  = 0.0;      // fractional camera index (continuous; render uses the nearest)
+            int    strideN  = 1;        // stride mode: cameras advanced per RENDERED frame
+            double camPerSec = (explorePathFps > 0.0) ? explorePathFps : 30.0;  // rate mode: cameras / wall-second
+            bool   rateMode  = true;    // true = cam/sec (wall clock), false = stride (per update)
+            // Last values mirrored to the panel, so we only re-push on an actual change.
+            int    lastIdxSent = -1; bool lastPlaySent = false, lastPathSent = false;
+            CollideMode lastCollideSent = collide;
+            double lastSpdSent = -1.0;   // last painted-speed readout pushed to the panel
+            auto clampPos = [&](double p) { return std::clamp(p, 0.0, (double)std::max(0, pathCount - 1)); };
+            using clock = std::chrono::steady_clock;
+            auto prevT = clock::now();   // wall-clock delta for rate-mode traversal
+
+            // ---- Interactive camera_curve EDITOR state --------------------------------
+            // The user flies free, records/hand-places control points (position + look
+            // direction), scrubs the spline built through them, inserts/deletes points, and
+            // Saves a real camera_curve .ftsl block. `editPts` are the authored control
+            // points; `explorePath` is REGENERATED by sampling a centripetal Catmull-Rom
+            // spline through them (the same math ftsl uses for camera_curve), so the preview
+            // is WYSIWYG with what the renderer will produce. Recording captures the free
+            // flight as raw samples that are optionally RDP-simplified into control points.
+            const int kPreviewPerSeg = 24;   // preview spline samples per control-point segment
+            std::vector<PathFrame> editPts;  // authored control points (pose per point)
+            bool   recording = false;        // "Rec": auto-sampling the free flight
+            double recTol    = 0.0;          // simplify tolerance in world units (0 = keep raw)
+            bool   recRaw    = false;        // "raw" checkbox: keep every sample (ignore tol)
+            std::vector<PathFrame> recRawBuf;// raw samples captured in the current recording pass
+            Vec3   lastRecPos{0, 0, 0}; bool haveRecPos = false;
+            // Per-control-point traversal-SPEED multiplier (Phase 2 speed painting): 1.0 = the
+            // curve's natural pace, >1 faster / <1 slower. Kept in lockstep with editPts and
+            // exported on Save as `density_at` keyframes (camera density = inverse speed).
+            std::vector<double> ptSpeed;
+            // Current free pose as a control-point frame.
+            auto poseNow = [&]() -> PathFrame { return PathFrame{eye, fwd, worldUp, fovY}; };
+            // Regenerate the preview path (explorePath) + timeline from the control points.
+            auto rebuildPath = [&]() {
+                ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the speed track sized to the points
+                int oldCount = pathCount;
+                explorePath.clear();
+                int n = (int)editPts.size();
+                if (n == 0) { pathCount = 0; if (oldCount != 0) g_liveWin->setPathCount(0); return; }
+                if (n == 1) { explorePath.push_back(editPts[0]); pathCount = 1; if (oldCount != 1) g_liveWin->setPathCount(1); return; }
+                std::vector<Vec3> P, Lk; P.reserve(n); Lk.reserve(n);
+                for (const auto& e : editPts) { P.push_back(e.eye); Lk.push_back(e.eye + e.fwd); }
+                const bool closed = false; const int nSeg = n - 1;
+                const int total = nSeg * kPreviewPerSeg;
+                explorePath.reserve((size_t)total + 1);
+                for (int k = 0; k <= total; ++k) {
+                    double g = (double)nSeg * k / total;
+                    Vec3 pe = ftsl::catmullRomAt(P,  closed, g, 0.5);
+                    Vec3 pl = ftsl::catmullRomAt(Lk, closed, g, 0.5);
+                    Vec3 f = pl - pe; { double L = std::sqrt(dot(f, f)); f = (L > 1e-9) ? f * (1.0 / L) : editPts[0].fwd; }
+                    int si = (int)g; if (si >= nSeg) si = nSeg - 1; double tt = g - si;
+                    Vec3 uu = editPts[si].up * (1.0 - tt) + editPts[si + 1].up * tt;
+                    { double lu = std::sqrt(dot(uu, uu)); if (lu > 1e-9) uu = uu * (1.0 / lu); }
+                    double fv = editPts[si].fov * (1.0 - tt) + editPts[si + 1].fov * tt;
+                    explorePath.push_back({pe, f, uu, fv});
+                }
+                pathCount = (int)explorePath.size();
+                if (pathCount != oldCount) g_liveWin->setPathCount(pathCount);   // only notify on a real change
+            };
+            // Ramer-Douglas-Peucker simplify of a pose polyline by eye position (keeps ends).
+            auto simplify = [&](const std::vector<PathFrame>& in, double tol) -> std::vector<PathFrame> {
+                int n = (int)in.size();
+                if (n < 3 || tol <= 0.0) return in;
+                std::vector<char> keep((size_t)n, 0); keep[0] = keep[(size_t)n - 1] = 1;
+                std::vector<std::pair<int,int>> stk; stk.push_back({0, n - 1});
+                while (!stk.empty()) {
+                    auto seg = stk.back(); stk.pop_back();
+                    int a = seg.first, b = seg.second;
+                    if (b <= a + 1) continue;
+                    Vec3 A = in[(size_t)a].eye, B = in[(size_t)b].eye, AB = B - A;
+                    double abl = std::sqrt(dot(AB, AB));
+                    double maxd = -1.0; int mi = -1;
+                    for (int i = a + 1; i < b; ++i) {
+                        Vec3 AP = in[(size_t)i].eye - A; double d;
+                        if (abl < 1e-12) d = std::sqrt(dot(AP, AP));
+                        else { Vec3 c = cross(AB, AP); d = std::sqrt(dot(c, c)) / abl; }
+                        if (d > maxd) { maxd = d; mi = i; }
+                    }
+                    if (maxd > tol && mi > 0) { keep[(size_t)mi] = 1; stk.push_back({a, mi}); stk.push_back({mi, b}); }
+                }
+                std::vector<PathFrame> out;
+                for (int i = 0; i < n; ++i) if (keep[(size_t)i]) out.push_back(in[(size_t)i]);
+                return out;
+            };
+            // Round-trip (Phase 5): if the scene came from an existing `camera_curve`, seed the
+            // editor's control points from it so the curve can be EDITED in place rather than
+            // starting from an empty editor. We keep the loaded `explorePath` (the fully expanded
+            // flyby) for high-fidelity playback and only populate `editPts` / `ptSpeed` here — the
+            // overlay's control-point markers appear immediately, and the first authoring action
+            // refines the loaded points instead of replacing the path. Speed round-trips from the
+            // curve's `density` as a relative multiplier (mean/rho), so Save re-emits the profile.
+            if (!ftslScene.authoredCurves.empty()) {
+                // With several camera_curves in one scene, seed from the one the viewer is
+                // actually flying (matched by the recovered base name), not blindly the first.
+                const auto* acp = &ftslScene.authoredCurves.front();
+                if (!exploreCurveName.empty()) {
+                    for (const auto& c : ftslScene.authoredCurves)
+                        if (c.name == exploreCurveName) { acp = &c; break; }
+                }
+                const auto& ac = *acp;
+                int n = (int)ac.eyes.size();
+                editPts.clear(); editPts.reserve((size_t)n);
+                for (int i = 0; i < n; ++i)
+                    editPts.push_back(PathFrame{ac.eyes[(size_t)i], ac.fwds[(size_t)i], ac.up, ac.fov});
+                ptSpeed.assign((size_t)n, 1.0);
+                if ((int)ac.density.size() == n && n > 0) {
+                    double mean = 0.0; for (double r : ac.density) mean += r; mean /= n;
+                    if (mean > 1e-12)
+                        for (int i = 0; i < n; ++i)
+                            ptSpeed[(size_t)i] = std::clamp(mean / std::max(1e-12, ac.density[(size_t)i]), 0.1, 10.0);
+                }
+                if (g_liveWin) g_liveWin->setEditState(false, n);
+                std::printf("[editor] loaded %d control points from camera_curve \"%s\" (edit in place)\n",
+                            n, ac.name.c_str());
+                std::fflush(stdout);
+            }
+            // Write the authored control points as a camera_curve .ftsl block, next to the
+            // scene file AND echoed to stdout so it can be pasted straight into a scene.
+            auto saveCurveFn = [&]() {
+                if (editPts.size() < 2) {
+                    std::printf("[editor] need >= 2 control points to save a camera_curve (have %zu)\n", editPts.size());
+                    std::fflush(stdout); return;
+                }
+                std::string scenePath = inFile ? std::string(inFile) : std::string("scene");
+                std::string dir, base = scenePath;
+                { size_t sl = scenePath.find_last_of("/\\"); if (sl != std::string::npos) { dir = scenePath.substr(0, sl + 1); base = scenePath.substr(sl + 1); } }
+                { size_t dt = base.find_last_of('.'); if (dt != std::string::npos) base = base.substr(0, dt); }
+                std::string curveName = base + "_edit";
+                // Pick a non-clobbering output filename.
+                std::string outPath;
+                for (int k = 0; k < 1000; ++k) {
+                    std::string cand = dir + base + "_curve" + (k ? std::to_string(k) : std::string()) + ".ftsl";
+                    std::ifstream test(cand);
+                    if (!test.good()) { outPath = cand; break; }
+                }
+                if (outPath.empty()) outPath = dir + base + "_curve.ftsl";
+                int frames = std::max(2, (int)explorePath.size());
+                char hdr[256];
+                std::string blk;
+                blk += "camera_curve \"" + curveName + "\" {\n";
+                blk += "    spline centripetal\n";
+                { const Vec3& u0 = editPts.front().up;
+                  std::snprintf(hdr, sizeof hdr, "    up %.6g %.6g %.6g\n", u0.x, u0.y, u0.z); blk += hdr; }
+                std::snprintf(hdr, sizeof hdr, "    fov_y %.6g\n", editPts.front().fov); blk += hdr;
+                std::snprintf(hdr, sizeof hdr, "    mode %c\n", rc0.mode); blk += hdr;
+                std::snprintf(hdr, sizeof hdr, "    frames %d\n", frames); blk += hdr;
+                if (explorePathFps > 0.0) { std::snprintf(hdr, sizeof hdr, "    fps %.6g\n", explorePathFps); blk += hdr; }
+                blk += "    look curve\n";
+                for (const auto& e : editPts) {
+                    std::snprintf(hdr, sizeof hdr, "    point %.6g %.6g %.6g\n", e.eye.x, e.eye.y, e.eye.z); blk += hdr;
+                }
+                // The `look curve` is a SECOND Catmull-Rom spline through these look targets. Its
+                // aim direction only stays smooth between control points when the targets sit a
+                // reasonable distance ahead: too close and (lookSample - eyeSample) shrinks toward
+                // the two splines' interpolation noise, making the aim swing/bow. Placing each
+                // target one MEAN control-point spacing ahead (scene-relative, clamped) keeps the
+                // look spline a smooth parallel-ish offset of the eye path. Direction at each
+                // control point is preserved exactly (any positive distance along the same fwd).
+                double lookAhead = 0.0;
+                for (size_t i = 1; i < editPts.size(); ++i)
+                    lookAhead += std::sqrt(dot(editPts[i].eye - editPts[i - 1].eye, editPts[i].eye - editPts[i - 1].eye));
+                lookAhead = (editPts.size() > 1) ? lookAhead / (editPts.size() - 1) : 0.0;
+                if (!(lookAhead > 1e-4)) lookAhead = (sceneR > 1e-4 ? sceneR * 0.1 : 1.0);
+                for (const auto& e : editPts) {
+                    Vec3 lp = e.eye + e.fwd * lookAhead;   // look target ~one segment ahead along the view ray
+                    std::snprintf(hdr, sizeof hdr, "    look_point %.6g %.6g %.6g\n", lp.x, lp.y, lp.z); blk += hdr;
+                }
+                // Painted speed -> camera density (density = 1/speed). Emitted only when the
+                // pace is non-uniform; with `frames N` fixed, ftsl distributes the N cameras by
+                // this rho profile (absolute scale is irrelevant — only the relative shape).
+                bool nonUniform = false;
+                if (ptSpeed.size() == editPts.size())
+                    for (double s : ptSpeed) if (std::fabs(s - 1.0) > 1e-3) { nonUniform = true; break; }
+                if (nonUniform) {
+                    int np = (int)editPts.size();
+                    for (int i = 0; i < np; ++i) {
+                        double t = (np > 1) ? (double)i / (np - 1) : 0.0;
+                        double rho = 1.0 / std::max(ptSpeed[(size_t)i], 1e-3);
+                        std::snprintf(hdr, sizeof hdr, "    density_at %.4g %.4g\n", t, rho); blk += hdr;
+                    }
+                }
+                blk += "}\n";
+                std::ofstream of(outPath);
+                if (of.good()) { of << blk; of.close();
+                    std::printf("[editor] saved camera_curve (%zu points, %d frames) to %s\n",
+                                editPts.size(), frames, outPath.c_str());
+                } else {
+                    std::printf("[editor] FAILED to write %s — block echoed below only\n", outPath.c_str());
+                }
+                std::printf("%s", blk.c_str());
+                std::fflush(stdout);
+            };
+            // The currently SELECTED control point — the target Del removes and the overlay
+            // highlights red. When locked to the path (scrubbing/playing) the selection follows
+            // the timeline: it's the control point nearest the current scrub position, so you
+            // scrub to a point to select it. In free flight it's the point nearest the eye.
+            // Returns -1 when there are no points.
+            auto selectedPoint = [&]() -> int {
+                int n = (int)editPts.size();
+                if (n == 0) return -1;
+                if (n == 1) return 0;
+                if (pathMode && pathCount >= 2) {
+                    double t = pathPos / (double)(pathCount - 1);         // 0..1 along the timeline
+                    int k = (int)std::llround(t * (double)(n - 1));       // nearest control point
+                    return std::clamp(k, 0, n - 1);
+                }
+                int best = 0; double bd = 1e300;
+                for (int i = 0; i < n; ++i) { Vec3 d = editPts[(size_t)i].eye - eye; double dd = dot(d, d); if (dd < bd) { bd = dd; best = i; } }
+                return best;
+            };
+            // Draw the control-point markers + the live spline polyline over the tone-mapped
+            // frame. Camera::project gives py with +up = larger py; the RGB buffer is row-0-top,
+            // so the screen row is (h-1-py). Segments are drawn only when both ends project.
+            auto drawOverlay = [&](const Camera& c, int w, int h, std::vector<uint8_t>& img) {
+                if (explorePath.size() < 2 && editPts.empty()) return;
+                auto putpx = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+                    if (x < 0 || y < 0 || x >= w || y >= h) return;
+                    size_t i = ((size_t)y * w + x) * 3; img[i] = r; img[i + 1] = g; img[i + 2] = b;
+                };
+                auto proj = [&](const Vec3& p, int& sx, int& sy) -> bool {
+                    int px, py; double cc, d2; if (!c.project(p, px, py, cc, d2)) return false;
+                    sx = px; sy = h - 1 - py; return true;
+                };
+                auto line = [&](const Vec3& a, const Vec3& b, uint8_t r, uint8_t g, uint8_t bl) {
+                    int x0, y0, x1, y1; if (!proj(a, x0, y0) || !proj(b, x1, y1)) return;
+                    int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+                    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+                    for (;;) { putpx(x0, y0, r, g, bl); if (x0 == x1 && y0 == y1) break;
+                        int e2 = 2 * err; if (e2 >= dy) { err += dy; x0 += sx; } if (e2 <= dx) { err += dx; y0 += sy; } }
+                };
+                auto marker = [&](const Vec3& p, uint8_t r, uint8_t g, uint8_t b) {
+                    int sx, sy; if (!proj(p, sx, sy)) return;
+                    for (int yy = -2; yy <= 2; ++yy) for (int xx = -2; xx <= 2; ++xx) putpx(sx + xx, sy + yy, r, g, b);
+                };
+                for (size_t i = 1; i < explorePath.size(); ++i)
+                    line(explorePath[i - 1].eye, explorePath[i].eye, 40, 220, 90);   // green spline
+                // The selected control point (Del target) is highlighted red; the rest yellow.
+                int sel = selectedPoint();
+                for (size_t i = 0; i < editPts.size(); ++i)
+                    marker(editPts[i].eye, 255, ((int)i == sel) ? 60 : 220, ((int)i == sel) ? 60 : 40);  // yellow / red-selected
+            };
+            // ---- Speed / orientation PAINTING (Phase 2/3) -----------------------------
+            // The painted tracks are anchored to the CONTROL POINTS: speed is a per-point
+            // multiplier (ptSpeed) and orientation is each point's own look direction. The
+            // brush at a scrub position distributes its effect to the two bracketing control
+            // points, weighted by proximity — so scrubbing/playing while painting shapes a
+            // smooth track that the exported density_at / look curve reproduce.
+            auto bracket = [&](double pos, int& i, double& f) {   // scrub index -> (control seg, frac)
+                int n = (int)editPts.size();
+                int len = (int)explorePath.size();
+                double t = (len > 1) ? pos / (len - 1) : 0.0;   // normalized 0..1 along the curve
+                double g = t * std::max(0, n - 1);
+                i = (int)g; if (i < 0) i = 0; if (i > n - 2) i = std::max(0, n - 2);
+                f = (n >= 2) ? g - i : 0.0;
+            };
+            auto speedAt = [&](double pos) -> double {
+                int n = (int)ptSpeed.size();
+                if (n == 0) return 1.0;
+                if (n == 1) return ptSpeed[0];
+                int i; double f; bracket(pos, i, f);
+                return ptSpeed[(size_t)i] * (1.0 - f) + ptSpeed[(size_t)i + 1] * f;
+            };
+            auto paintSpeed = [&](double pos, double notches) {
+                int n = (int)ptSpeed.size();
+                if (n == 0) return;
+                double delta = notches * 0.15;   // additive per wheel notch
+                auto bump = [&](int k, double w) {
+                    if (k < 0 || k >= n || w <= 0.0) return;
+                    ptSpeed[(size_t)k] = std::clamp(ptSpeed[(size_t)k] + delta * w, 0.1, 10.0);
+                };
+                if (n == 1) { bump(0, 1.0); return; }
+                int i; double f; bracket(pos, i, f); bump(i, 1.0 - f); bump(i + 1, f);
+            };
+            auto paintOrient = [&](double pos, double lx, double ly) {
+                int n = (int)editPts.size();
+                if (n == 0) return;
+                double yaw = -lx * kYaw, pitch = -ly * kPitch;
+                auto steer = [&](int k, double w) {
+                    if (k < 0 || k >= n || w <= 1e-6) return;
+                    Vec3 d = norml(rotAxis(editPts[(size_t)k].fwd, worldUp, yaw * w));
+                    Vec3 right = cross(d, worldUp); double rl = std::sqrt(dot(right, right));
+                    if (rl > 1e-9) { right = right * (1.0 / rl);
+                        Vec3 cand = norml(rotAxis(d, right, pitch * w));
+                        if (std::fabs(dot(cand, worldUp)) < 0.9995) d = cand; }
+                    editPts[(size_t)k].fwd = d;
+                };
+                if (n == 1) { steer(0, 1.0); rebuildPath(); return; }
+                int i; double f; bracket(pos, i, f); steer(i, 1.0 - f); steer(i + 1, f);
+                rebuildPath();
+            };
+            if (pathCount >= 2)
+                std::printf("[viewer] camera path: %d frames on the timeline"
+                            " (Play/scrub/lock via the panel below the image)\n", pathCount);
+            std::printf(
+              "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
+              "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
+              "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
+              "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
+              "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
+              "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
+              "         panel:  Clip / Reset buttons below the image%s\n"
+              "         editor: Rec records your flight into a camera_curve; +Pt appends the current pose;\n"
+              "                 Ins inserts at the scrub point; Del removes the nearest point; Save writes a camera_curve block\n"
+              "         paint:  Paint (path mode) — wheel paints local speed (density) at the scrub point, mouse steers orientation; Flat resets speed\n"
+              "         0 = reset view    P = print camera block    (close the window to finish)\n"
+              "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
+              step, collideName(collide),
+              pathCount >= 2 ? "; timeline + Play/Pause + Path-lock + cams/upd | cams/s speed switch"
+                             : "");
+            std::fflush(stdout);
+
+            bool changed = true;   // render one frame immediately
+            while (!g_liveWin->closed() && !g_stopRequested) {
+                // Match the render resolution to the live window: a user resize re-renders
+                // at the new size (smaller = faster, larger = crisper).
+                { int nvw = VW, nvh = VH; fitRes(nvw, nvh);
+                  if (nvw != VW || nvh != VH) {
+                      VW = nvw; VH = nvh; changed = true;
+                      std::printf("[viewer] preview resolution %dx%d\n", VW, VH);
+                      std::fflush(stdout);
+                  } }
+                NavInput nav = g_liveWin->drainNav();
+
+                // Wall-clock delta for rate-mode (cameras/second) path traversal.
+                auto nowT = clock::now();
+                double dt = std::chrono::duration<double>(nowT - prevT).count();
+                prevT = nowT;
+                if (dt > 0.25) dt = 0.25;   // clamp a hitch so playback can't leap the whole path
+
+                // Panel traversal-speed inputs (current values; 0 = leave unchanged).
+                if (nav.stride    >= 1)   strideN   = nav.stride;
+                if (nav.camPerSec > 0.0)  camPerSec = nav.camPerSec;
+                rateMode = nav.rateMode;   // radio switch: true = cam/sec, false = stride/update
+
+                // Path-lock toggle (panel "Path" button): snap the fly camera onto the path.
+                if (pathCount >= 2 && nav.togglePath) {
+                    pathMode = !pathMode;
+                    if (!pathMode) playing = false;   // leaving the path stops playback
+                    changed = true;
+                    std::printf("[viewer] path lock %s\n", pathMode ? "ON" : "OFF"); std::fflush(stdout);
+                }
+                // Play/Pause (panel button): engage path lock and toggle auto-advance.
+                if (pathCount >= 2 && nav.togglePlay) {
+                    if (!pathMode) pathMode = true;
+                    playing = !playing;
+                    if (playing && pathPos >= pathCount - 1 - 1e-9) pathPos = 0.0;   // restart from the top
+                    changed = true;
+                }
+                // Timeline scrub/jump (panel trackbar): engage path lock, pause, seek.
+                if (pathCount >= 2 && nav.scrubTo >= 0) {
+                    pathMode = true; playing = false;
+                    pathPos = clampPos((double)nav.scrubTo);
+                    changed = true;
+                }
+
+                // Ctrl+wheel adjusts the STEP SIZE (up = bigger), clamped to a sane band.
+                if (nav.wheelSpeed != 0.0) {
+                    step = std::clamp(step * std::pow(1.15, nav.wheelSpeed), sceneR * 1e-3, sceneR * 2.0);
+                    std::printf("[viewer] step %.3g u\n", step); std::fflush(stdout);
+                }
+                // C cycles the collision response: slide -> stop -> off -> slide.
+                if (nav.cycleCollide) {
+                    collide = (CollideMode)((collide + 1) % 3);
+                    std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
+                }
+                // Reset: in free flight, restore the authored eye + look direction; while
+                // locked to the path, jump back to the start of the timeline and pause.
+                if (nav.reset) {
+                    if (pathMode) { pathPos = 0.0; playing = false; }
+                    else {
+                        eye = eye0; fwd = norml(tgt0 - eye0);
+                        lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+                        if (lookDist < 1e-4) lookDist = sceneR;
+                    }
+                    changed = true;
+                }
+
+                // ---- Camera_curve EDITOR controls ---------------------------------
+                // Author control points by hand or by recording the free flight, then Save a
+                // camera_curve block. Every mutating action regenerates the preview path.
+                if (nav.simplifyTol >= 0.0) recTol = nav.simplifyTol;   // panel tolerance box
+                recRaw = nav.rawRecord;                                 // "raw" checkbox
+                if (nav.recToggle) {
+                    recording = !recording;
+                    if (recording) { recRawBuf.clear(); haveRecPos = false;
+                        std::printf("[editor] recording flythrough (fly around; press Rec again to stop)\n");
+                    } else {
+                        std::vector<PathFrame> got = (!recRaw && recTol > 0.0) ? simplify(recRawBuf, recTol) : recRawBuf;
+                        for (const auto& g : got) { editPts.push_back(g); ptSpeed.push_back(1.0); }
+                        rebuildPath();
+                        std::printf("[editor] recorded %zu control points from %zu raw samples (tol %.4g, %s)\n",
+                                    got.size(), recRawBuf.size(), recTol, recRaw ? "raw" : "simplified");
+                    }
+                    g_liveWin->setEditState(recording, (int)editPts.size());
+                    std::fflush(stdout); changed = true;
+                }
+                if (nav.addPoint) {
+                    editPts.push_back(poseNow()); ptSpeed.push_back(1.0);
+                    rebuildPath();
+                    g_liveWin->setEditState(recording, (int)editPts.size());
+                    std::printf("[editor] +point %zu at eye(%s)\n", editPts.size(), fmt3(eye).c_str());
+                    std::fflush(stdout); changed = true;
+                }
+                if (nav.insPoint) {
+                    if (editPts.size() < 2) { editPts.push_back(poseNow()); ptSpeed.push_back(1.0); }
+                    else {
+                        // Insert between the two control points bracketing the current scrub
+                        // position. bracket() normalizes by the ACTUAL explorePath length, so this
+                        // is correct for a freshly-loaded curve (whose frame count isn't a multiple
+                        // of kPreviewPerSeg) as well as an editor-rebuilt preview.
+                        int seg; double fr; bracket(pathPos, seg, fr);
+                        seg = std::clamp(seg, 0, (int)editPts.size() - 2);
+                        editPts.insert(editPts.begin() + seg + 1, poseNow());
+                        ptSpeed.insert(ptSpeed.begin() + std::min((size_t)seg + 1, ptSpeed.size()), 1.0);
+                    }
+                    rebuildPath();
+                    g_liveWin->setEditState(recording, (int)editPts.size());
+                    std::printf("[editor] inserted point (now %zu)\n", editPts.size());
+                    std::fflush(stdout); changed = true;
+                }
+                if (nav.delPoint && !editPts.empty()) {
+                    int best = selectedPoint();   // the highlighted (selected) point — scrub to choose it
+                    if (best < 0) best = 0;
+                    editPts.erase(editPts.begin() + best);
+                    if ((size_t)best < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + best);
+                    if (pathPos > std::max(0, pathCount - 1)) pathPos = std::max(0, pathCount - 1);
+                    rebuildPath();
+                    pathPos = clampPos(pathPos);
+                    g_liveWin->setEditState(recording, (int)editPts.size());
+                    std::printf("[editor] deleted selected point %d (now %zu)\n", best, editPts.size());
+                    std::fflush(stdout); changed = true;
+                }
+                if (nav.saveCurve) saveCurveFn();
+                // "Flat" button: reset the painted speed track back to a uniform pace.
+                if (nav.speedReset) {
+                    std::fill(ptSpeed.begin(), ptSpeed.end(), 1.0);
+                    std::printf("[editor] speed reset to flat (1.00x everywhere)\n"); std::fflush(stdout);
+                    changed = true;
+                }
+
+                // The render camera's up vector and fov: fixed authored values while flying
+                // free; the current path frame's own up/fov while locked to the path.
+                Vec3   rUp  = worldUp;
+                double rFov = fovY;
+
+                if (!pathMode) {
+                    // ---- FREE FLIGHT --------------------------------------------------
+                    // Accumulate this frame's translation from all sources (plain-wheel dolly +
+                    // held throttle), then resolve it ONCE against the scene so collision (and its
+                    // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
+                    // along the view ray (up = forward); held keys advance one `step`/frame.
+                    Vec3 moveDelta{0, 0, 0};
+                    if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * nav.wheel);
+                    // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
+                    // centre (joystick/hover-look): each rendered frame turns by that offset x the
+                    // max rate, so the view keeps turning while you hold the pointer off-centre and
+                    // holds still in the central dead zone (where you can see the scene). Horizontal
+                    // offset yaws about world up, vertical offset pitches about the camera right
+                    // axis, pitch clamped shy of the poles so the view can't flip over (no roll).
+                    // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
+                    // see rather than spinning past.
+                    if (nav.lookX != 0.0 || nav.lookY != 0.0) {
+                        double yaw   = -nav.lookX * kYaw;     // pointer right -> turn right
+                        double pitch = -nav.lookY * kPitch;   // pointer down  -> look down
+                        fwd = norml(rotAxis(fwd, worldUp, yaw));
+                        Vec3 right = cross(fwd, worldUp);
+                        double rl = std::sqrt(dot(right, right));
+                        if (rl > 1e-9) {
+                            right = right * (1.0 / rl);
+                            Vec3 cand = norml(rotAxis(fwd, right, pitch));
+                            if (std::fabs(dot(cand, worldUp)) < 0.9995) fwd = cand;   // clamp near poles
+                        }
+                        changed = true;
+                    }
+                    // Held throttle: advance ONE `step` per RENDERED frame while Space/+ (forward)
+                    // or Shift/- (backward) is down. Deliberately NOT wall-clock-integrated —
+                    // tying the move to the render cadence means every position you pass through
+                    // is actually drawn, so a slow scene can't fling you through a wall between two
+                    // frames you never saw. Travel rate = step x render-fps (faster scene = quicker).
+                    if (nav.fwd)  moveDelta = moveDelta + fwd * step;
+                    if (nav.back) moveDelta = moveDelta - fwd * step;
+                    // Apply the combined move through collision (no-op when collision is OFF).
+                    if (dot(moveDelta, moveDelta) > 0.0) { eye = resolveMove(eye, moveDelta); changed = true; }
+                } else {
+                    // ---- LOCKED TO THE CAMERA PATH ------------------------------------
+                    // Travel is along the timeline (camera index), not through free space, and
+                    // the orientation/up/fov come straight from the path frames. Forward/back
+                    // (or Play auto-advance) move the cursor; the two speed modes decide how far
+                    // per frame: rate mode = cameras/second on the wall clock (may skip frames on
+                    // a slow render); stride mode = a fixed number of cameras per RENDERED frame.
+                    // PAINT mode (panel "Paint"): the plain wheel PAINTS local traversal speed
+                    // at the scrub position (additive brush) and mouse-look STEERS the nearest
+                    // control points' orientation — authoring the density_at + look curve live.
+                    // Outside paint mode the wheel nudges and mouse-look is suspended (as before).
+                    bool wheelPainted = false;
+                    if (nav.paintMode) {
+                        if (nav.wheel != 0.0 && !editPts.empty()) { paintSpeed(pathPos, nav.wheel); wheelPainted = true; changed = true; }
+                        if ((nav.lookX != 0.0 || nav.lookY != 0.0) && !editPts.empty()) { paintOrient(pathPos, nav.lookX, nav.lookY); changed = true; }
+                    }
+                    double dir = 0.0;
+                    if (playing)  dir += 1.0;
+                    if (nav.fwd)  dir += 1.0;
+                    if (nav.back) dir -= 1.0;
+                    double advance = 0.0;
+                    if (dir != 0.0)
+                        advance = (rateMode ? (dir * camPerSec * dt) : (dir * (double)strideN)) * speedAt(pathPos);
+                    if (!wheelPainted) advance += nav.wheel;   // plain wheel nudges one camera per notch (precise)
+                    if (advance != 0.0) {
+                        double np = clampPos(pathPos + advance);
+                        if (np != pathPos) { pathPos = np; changed = true; }
+                        // Auto-play stops when it runs off either end of the timeline.
+                        if (playing && dir > 0.0 && pathPos >= pathCount - 1 - 1e-9) playing = false;
+                        if (playing && dir < 0.0 && pathPos <= 1e-9)                 playing = false;
+                    }
+                    int i = (int)std::lround(pathPos);
+                    eye = explorePath[i].eye; fwd = explorePath[i].fwd;
+                    rUp = explorePath[i].up;  rFov = explorePath[i].fov;
+                }
+
+                // Recording sampler: while Rec is armed and we're flying free, capture the
+                // pose whenever the eye has moved a small min-distance since the last sample
+                // (distance-gated so a stationary pause never spams the buffer). These raw
+                // samples become control points — optionally RDP-simplified — when Rec stops.
+                if (recording && !pathMode) {
+                    bool take = !haveRecPos;
+                    if (haveRecPos) { Vec3 d = eye - lastRecPos; take = dot(d, d) >= (sceneR * 0.008) * (sceneR * 0.008); }
+                    if (take) { recRawBuf.push_back(poseNow()); lastRecPos = eye; haveRecPos = true; }
+                }
+
+                Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
+                if (changed) {
+                    Camera c; c.projection = proj;
+                    c.lookAt(eye, tgt, rUp, rFov, VW, VH);
+                    std::vector<uint8_t> img =
+                        raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr,
+                                            rasterSeeThrough, rasterClarity);
+                    drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
+                    g_liveWin->update(VW, VH, img);
+                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                        ")  dir(" + fmt3(fwd) + ")");
+                    changed = false;
+                }
+                if (nav.print) {
+                    std::printf("camera \"cam\" { eye %.4g %.4g %.4g   look_at %.4g %.4g %.4g"
+                                "   up %.4g %.4g %.4g   fov_y %.4g }\n",
+                                eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z,
+                                rUp.x, rUp.y, rUp.z, rFov);
+                    std::fflush(stdout);
+                }
+                // Mirror the live viewer state back onto the panel controls (timeline slider,
+                // Play/Pause label, Path toggle, Clip label) whenever they change, so the panel
+                // always reflects reality — e.g. the slider tracks playback and the toggles
+                // follow keyboard/auto changes. setPanelState never re-emits a NavInput edge.
+                {
+                    int idxNow = pathMode ? (int)std::lround(pathPos)
+                                          : (lastIdxSent < 0 ? 0 : lastIdxSent);
+                    if (idxNow != lastIdxSent || playing != lastPlaySent ||
+                        pathMode != lastPathSent || collide != lastCollideSent) {
+                        g_liveWin->setPanelState(idxNow, playing, pathMode, collideShort(collide));
+                        lastIdxSent = idxNow; lastPlaySent = playing;
+                        lastPathSent = pathMode; lastCollideSent = collide;
+                    }
+                    // Mirror the painted local-speed multiplier at the current scrub position.
+                    if (pathMode) {
+                        double sp = speedAt(pathPos);
+                        if (std::fabs(sp - lastSpdSent) > 5e-3) { g_liveWin->setSpeedLabel(sp); lastSpdSent = sp; }
+                    }
+                }
+                // Sleep only when truly idle; while a throttle key is held, the mouse is
+                // steering, or the path is auto-playing we loop at full raster speed for
+                // smooth continuous motion.
+                if (!nav.any() && !playing)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            }
+            g_stopRequested = 1;   // window closed → done
+        }
         return 0;
     }
 
@@ -3664,16 +5062,19 @@ static int run(int argc, char** argv) {
     };
     for (const auto& [g, cams] : meterPlan) {
         if (cams.empty() || g_stopRequested) continue;
-        double sum = 0.0; int m = 0;
+        const bool adaptive = meterAdaptive.count(g) != 0;
+        const int  N   = (int)cams.size();
+        const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
+        const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
+        MeterConverge conv(kmn, kmx, kMeterTolStops);
         for (const auto& mc : cams) {
-            double a = meterAnchor(mc);
-            if (a > 0.0) { sum += a; ++m; }
+            if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
         }
-        if (m > 0) {
-            expAnchors[g] = sum / m;
-            if (cams.size() > 1)
-                std::printf("[meter] exposure lock: group %d meters the average of %zu frame(s) "
-                            "(anchor %.4g)\n", g, cams.size(), expAnchors[g]);
+        if (conv.used() > 0) {
+            expAnchors[g] = conv.anchor();
+            if (adaptive)
+                std::printf("[meter] exposure lock: group %d meters the average of %d/%d frame(s) "
+                            "(anchor %.4g)\n", g, conv.used(), N, expAnchors[g]);
             else
                 std::printf("[meter] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                             g, cams.front().name.c_str(), expAnchors[g]);
@@ -4090,6 +5491,75 @@ static int run(int argc, char** argv) {
     return sharedWriteFail ? 1 : 0;
 }
 
+// --- Resident preview server (-serve) -----------------------------------------
+// `ftrace -serve -in <scene.ftsl> [render flags…]` keeps the process — and with it
+// the live window, CUDA context, spectral/upsampling tables — resident, re-rendering
+// whenever a new scene path arrives on stdin (one path per line). This skips the
+// per-frame cost of spawning a fresh process and re-initialising all of that global
+// state, which is the dominant fixed overhead for cheap preview frames.
+//
+// Protocol (line-oriented, both directions):
+//   stdout  "[serve] ready"              once, before the first frame
+//   stdin   <path/to/frame.ftsl>\n       request: render this scene, reusing all flags
+//   stdout  "[serve] done <path>"        after each frame completes (or errors)
+//   stdin   "quit" / "exit" / EOF        end the loop
+//   stdout  "[serve] shutdown"           on exit
+//
+// Every rendered scene reuses the *same* CLI flags (-mode/-n/-r/-window/-o/…) given
+// on the -serve command line; only the -in path is swapped per frame. Honest scope:
+// this delivers the resident-process win only. It does NOT yet do incremental delta
+// rendering, static-geometry/BVH caching between frames, or a reduced preview LOD —
+// each frame is a full independent render. The live window is created lazily on the
+// first frame and keeps that first frame's resolution for the session.
+static int runServe(int argc, char** argv, int inValPos) {
+    std::printf("[serve] ready\n");
+    std::fflush(stdout);
+    int rc = 0;
+    // Initial render for whatever -in was on the command line (if any).
+    if (inValPos >= 0) {
+        rc = run(argc, argv);
+        std::printf("[serve] done %s\n", argv[inValPos]);
+        std::fflush(stdout);
+    }
+    // Stream subsequent scene paths from stdin, one per line. std::fgets (not iostream)
+    // keeps this dependency-free and blocks until a line or EOF.
+    std::string pathBuf;
+    char buf[4096];
+    while (true) {
+        // A closed live window means the user dismissed the preview: stop serving.
+        if (g_showWindow && g_liveWin && g_liveWin->closed()) break;
+        if (!std::fgets(buf, sizeof(buf), stdin)) break;             // EOF
+        std::string line(buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' ||
+                                 line.back() == ' '  || line.back() == '\t'))
+            line.pop_back();
+        size_t s = line.find_first_not_of(" \t");
+        if (s == std::string::npos) continue;                        // blank line
+        line = line.substr(s);
+        if (line == "quit" || line == "exit") break;
+        if (inValPos < 0) {
+            std::fprintf(stderr, "[serve] no -in slot to swap; ignoring '%s'\n", line.c_str());
+            continue;
+        }
+        // Point the -in argv slot at the new path and re-render. pathBuf owns the
+        // storage for the duration of this run() call.
+        pathBuf = line;
+        argv[inValPos] = const_cast<char*>(pathBuf.c_str());
+        g_stopRequested = 0;   // clear any prior clean-stop request before the new frame
+        try {
+            rc = run(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[serve] error: %s\n", e.what());
+            rc = 1;
+        }
+        std::printf("[serve] done %s\n", pathBuf.c_str());
+        std::fflush(stdout);
+    }
+    std::printf("[serve] shutdown\n");
+    std::fflush(stdout);
+    return rc;
+}
+
 // Thin wrapper: turn a fatal configuration error (e.g. an explicit `file:`/`glass:`/
 // `illuminant:` reference whose target is missing or malformed — thrown by the
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
@@ -4102,10 +5572,27 @@ int main(int argc, char** argv) {
     // window closed" BSOD). Draining + resetting here closes that window.
     int rc;
     try {
-        rc = run(argc, argv);
+        // Resident preview server (-serve): keep the process alive and re-render each
+        // scene path streamed on stdin. Find the -in value slot to swap per frame.
+        bool serve = false;
+        int inValPos = -1;
+        for (int i = 1; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "-serve")) serve = true;
+            else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) inValPos = i + 1;
+        }
+        rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;
+    }
+    // -keepwindow / -hold: keep the finished image on screen. The live window runs its
+    // own UI thread, so we just block here until the user closes it (or it's already gone)
+    // rather than letting process exit tear it down the instant the render completes.
+    if (g_keepWindow && g_liveWin && !g_liveWin->closed()) {
+        std::printf("[window] render done — close the preview window to exit.\n");
+        std::fflush(stdout);
+        while (!g_liveWin->closed())
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 #ifdef HAVE_CUDA
     cudaGracefulShutdown();

@@ -54,6 +54,15 @@ survives a crash. Concretely, when you start a render:
   showing the actual tone-mapped image refreshed as it converges — the best way to
   watch. It also auto-chunks a plain fixed-`-n` render so periodic writes/status
   happen (see the gotcha below). This is mandatory on every render invocation.
+- **ALWAYS pass `-keepwindow` (instead of plain `-window`) so the window does NOT
+  auto-close when the render finishes.** By default ftrace tears the live window
+  down at process exit, so a finished image only flashes on screen and vanishes —
+  the user never gets to look at the result. `-keepwindow` (alias `-hold`, implies
+  `-window`) keeps the final image up and blocks until the user closes the window
+  themselves. Use it on every render so the completed image stays watchable. (When
+  you launch a render in the background to poll its progress, remember the process
+  will now stay alive holding the window after the render completes — stop it
+  explicitly once you and the user are done inspecting.)
 - **Always add periodic crash-safe output.** Use `-interval <sec>` (default 15) for
   the write/refresh cadence, and `-checkpoint` (forward modes A/B/C) so a resumable
   `.ftbuf` sidecar is written next to `-o` and progress survives a crash/Ctrl-C
@@ -79,6 +88,21 @@ no partial image, no checkpoint, no status line, no way to see progress or estim
 completion. So a bare `-n 4000000000` can run for hours producing nothing and
 losing it all on a crash. Adding `-window` (or any budget flag) is what enables the
 periodic-output loop.
+
+## Performance
+
+- **Optimize the tight loops / CPU-heavy hot paths as much as possible, until the
+  point of diminishing returns.** This is a rendering engine — its inner loops
+  (per-photon / per-ray tracing, tessellation, the raster z-buffer + shading passes,
+  tone-mapping, spectral evaluation) run billions of times, so shaving work there
+  matters. When you touch a hot path, look for the usual wins: hoist redundant work
+  out of loops, project/compute once instead of per-thread or per-pixel, use
+  incremental stepping instead of recomputing from scratch, keep data contiguous and
+  cache-friendly, parallelize across threads/bands, and precompute lookup tables for
+  expensive functions. Keep going until further effort buys only marginal speedups —
+  then stop (don't sacrifice correctness or readability chasing a fraction of a
+  percent). Always verify an optimization is bit-for-bit (or visually) identical to
+  the baseline before committing it.
 
 ## Docs to keep current
 

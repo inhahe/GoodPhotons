@@ -27,8 +27,11 @@
 # OUT of the settle (the threaded gyroid must keep its exact channel/path alignment; a
 # pybullet pose on a non-watertight lattice would rotate the channel off the flight path).
 #
-# Render (still, mode D resolves the bounded cloud + dispersive caustics through glass):
-#   ftrace -in scenes/gallery_settled.ftsl -camera cam -mode D -noise 2 -window -o png/room.png
+# Render (still): the scene's prefer{}/else{} picks the mode itself — mode D today
+# (resolves the bounded cloud + dispersive caustics through glass in one pass), and
+# auto-falls back to mode B if a mode-D-hostile feature (e.g. a GRIN lamp-gas field)
+# is ever added. Don't pass -mode, so the chosen branch's own mode drives:
+#   ftrace -in scenes/gallery_settled.ftsl -camera cam -noise 2 -window -keepwindow -o png/room.png
 # Render (flyby, mode M = photon-map: build one stored map, reuse it for every frame):
 #   ftrace -in scenes/gallery_settled.ftsl -mode M -spp 8 -r 960 540 -window -o png/roomfly.png
 
@@ -50,6 +53,15 @@ material "sandstone" { type diffuse  reflect rgb 0.60 0.49 0.34 }   # warm sands
 material "basalt"    { type diffuse  reflect rgb 0.17 0.17 0.19 }   # dark basalt
 material "travertine"{ type diffuse  reflect rgb 0.66 0.58 0.46 }   # cream travertine
 material "socketmat" { type diffuse  reflect rgb 0.05 0.05 0.06 }   # dark lamp socket
+
+# --- Xenon short-arc lamp assembly (nested-dielectric quartz envelope) ----------
+# Outer fused-silica (quartz) shell with real wall thickness; a slightly-shrunk,
+# HIGHER-priority copy of the same bulb mesh (Schmidt-Budge nesting) carves the
+# interior to xenon gas at operating pressure/temperature (glass:xenon-lamp).
+material "lamp_quartz"   { type dielectric ior glass:fused-silica  priority 20 }
+material "lamp_xenon"    { type dielectric ior glass:xenon-lamp    priority 30 }
+material "lamp_electrode"{ type glossy reflect metal:chrome roughness 0.28 }
+material "lamp_cordmat"  { type diffuse reflect rgb 0.05 0.05 0.06 }
 
 # --- Hero-object materials -----------------------------------------------------
 material "gold"     { preset gold }
@@ -301,7 +313,17 @@ isosurface "chrome_ring" {
 # caustics through the diamond gyroid and glass sphere. Xenon short-arc spectrum via a
 # 6000 K Planckian (the validated xenon proxy; see data/README.md).
 isosurface "socket" { material socketmat  cylinder { translate 5.0 3.27 3.0  radius 0.018  height 0.26 } }
-light sphere { center 5.0 3.10 3.0   radius 0.05   spd blackbody 6000 }
+
+# The envelope: a real quartz bulb (built from a photo of a short-arc lamp) hangs
+# from the socket. Native mesh: electrode axis = X, cord = +Y (points up to socket).
+# Uniform 0.11 scale -> envelope radius ~0.046 (matches the old bare 0.05 bulb). The
+# xenon copy is 0.94x (0.1034) so the (1-0.94) gap = the glass wall thickness.
+mesh "lamp_bulb" { file "assets/lamp/bulb.obj"  translate 5.0 3.10 3.0  scale 0.11    material lamp_quartz }
+mesh "lamp_xe"   { file "assets/lamp/bulb.obj"  translate 5.0 3.10 3.0  scale 0.1034  material lamp_xenon }
+mesh "lamp_elec" { file "assets/lamp/inner.obj" translate 5.0 3.10 3.0  scale 0.11    material lamp_electrode }
+mesh "lamp_cord" { file "assets/lamp/cord.obj"  translate 5.0 3.10 3.0  scale 0.11    material lamp_cordmat }
+# The arc itself: a tiny emitter at the electrode gap (mesh centre) is the whole hall's light.
+light sphere { center 5.0 3.10 3.0   radius 0.008   spd blackbody 6000 }
 
 # ==============================  ATMOSPHERE  ==================================
 # (1) A very faint GLOBAL haze so the single bulb casts soft volumetric shafts + aerial depth.
@@ -321,10 +343,27 @@ medium {
 # ==============================  CAMERAS  =====================================
 # Still: front-centre, moderate 50 deg lens, looking down the shallow hall so the whole
 # central spread of pieces reads at once with the gold gyroid big in the foreground.
-camera "cam" {
-    eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
-    mode D
-    film { res 1280 720 }
+#
+# The still camera is wrapped in prefer{}/else{} so the render MODE resolves itself.
+# Today the scene carries no mode-D-hostile feature, so the PREFERRED branch (mode D —
+# fast, robust MIS in one pass) is selected. The day the scene gains something mode D
+# can't render — most importantly a gradient-index (GRIN) xenon lamp-gas field for the
+# shimmering arc mirage/schlieren (see known-issues.md "GRIN in BDPT" + "Showcase
+# render-mode") — the loader's trial build rejects the mode-D branch and falls back to
+# the mode-B branch (photon tracing: slower, but renders GRIN + everything else). Both
+# branches are identical apart from `mode`.
+prefer {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
+        mode D
+        film { res 1280 720 }
+    }
+} else {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
+        mode B
+        film { res 1280 720 }
+    }
 }
 
 # --- Flyby: a SEAMLESS closed loop that (1) starts front-high, (2) descends the centre
@@ -364,7 +403,8 @@ camera_curve "fly" {
     point 5.55 1.95 3.95     # climb and turn forward
     point 5.25 2.08 5.05     # forward toward the start
     point 5.08 2.10 5.75     # curl back toward the start, LEVEL
-    up 0 1 0   fov_y 70   mode M   frames 144
+    up 0 1 0   fov_y 70   mode M   frames 600
+    fps 30                         # playback rate the showcase assembles at (600 frames -> ~20 s)
     look tangent
     spline centripetal
     density_at 0.00 7   density_at 0.16 18   density_at 0.30 20   density_at 0.42 8

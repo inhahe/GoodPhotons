@@ -1,0 +1,39 @@
+# Gradient-index (GRIN) medium demo — EXPERIMENTAL (render with `-mode R -device cpu`).
+#
+# A bounded sphere of gradient-index medium floats in front of a checkerboard wall.
+# The region has NO glass surface — it is a pure participating medium whose refractive
+# index n(x,y,z) varies in space, so rays crossing it bend (Eikonal equation). With a
+# radial gradient (n = 1.6 at the core, ~1.0 at the rim) the region acts as a converging
+# gradient lens and visibly warps the checker behind it into a circular lensed pattern.
+# Remove the `medium` block (or render a non-R mode, which ignores `ior`) for the
+# undistorted straight-ray control.
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+pattern "checkerpat" { type checker  size 0.18 }
+material "cdark"   { type diffuse reflect rgb 0.04 0.04 0.30 }
+material "clight"  { type diffuse reflect rgb 0.90 0.90 0.90 }
+material "checker" { type mix  layer "clight" 0.5  layer "cdark" 0.5  weight_map pattern:checkerpat }
+
+# Back wall (checkerboard) at z=0, filling the frame.
+quad { origin -3 -3 0   u 6 0 0   v 0 6 0   material checker }
+
+# Gradient-index sphere region centred at (0,0,2), radius 0.9:
+#   n(x,y,z) = 1.6 - 0.6 * (dist-from-centre / 0.9)   ->  1.6 core, ~1.0 rim.
+medium {
+    bounds { center 0 0 2   radius 0.9 }
+    ior "1.6 - 0.6 * (sqrt(x*x + y*y + (z-2)*(z-2)) / 0.9)"
+}
+
+# Two front (camera-side) lights so the wall is brightly, evenly lit and the camera
+# sees it THROUGH the GRIN sphere. Auto-exposed (no `power`).
+light sphere { center -2.5 2.0 4.0   radius 0.5   spd blackbody 6500 }
+light sphere { center  2.5 2.0 4.0   radius 0.5   spd blackbody 6500 }
+
+camera "cam" {
+    eye 0 0 5   look_at 0 0 0   up 0 1 0   fov_y 45
+    mode R
+    film { res 512 512 }
+}

@@ -55,6 +55,7 @@
 
 #include "render_cuda.h"
 #include "render_progress.h"
+#include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
@@ -387,6 +388,12 @@ struct DMedium {
     int               boundFieldN;    // node count
     const PatNode*    boundFieldExpr; // expr pool backing DF_EXPR leaves (or null)
     int               boundInsideNeg; // 1 => inside when field < 0, else inside when > 0
+    // --- Optional gradient-index (GRIN) refractive field n(x,y,z) (mirrors host Medium) ---
+    // When `iorN > 0` this region bends rays along the Eikonal ray equation; the forward
+    // megakernel/wavefront march through it (dGrinMarch) before each bounce's closestHit.
+    const PatNode*    ior;            // compiled n(x,y,z) program (device pool) or null
+    int               iorN;           // node count of the ior program (0 => not GRIN)
+    double            iorStep;        // Eikonal march step in world units (>0 for GRIN)
 };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
@@ -526,6 +533,9 @@ struct DScene {
     double           emitG;
     const DMedium*   media;    // participating media array (superposed); null if none
     int              mediaN;   // number of media (0 => vacuum)
+    int              hasGrin;  // 1 => some enabled medium carries an `ior` (GRIN) field.
+                               // Gates the per-bounce Eikonal march (grin::sceneHasGrin twin);
+                               // 0 keeps ordinary scenes bit-identical (march never entered).
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -910,6 +920,54 @@ __device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& d
     }
     ta = lo; tb = hi; return tb > ta;
 }
+
+// ============================ GRIN (gradient-index) marching ==================
+// Device twins of scene.h's Medium GRIN helpers + grin::march. A GRIN medium carries an
+// `ior` field n(x,y,z); rays bend along the Eikonal ray equation d/ds(n·dr/ds)=∇n. The
+// forward megakernel/wavefront call dGrinMarch before each bounce's closestHit, gated by
+// sc.hasGrin so ordinary scenes never enter it (bit-identical). Kept byte-for-byte in step
+// with the CPU marcher (grin.h) so CPU and GPU bend rays identically.
+
+// Point-in-bound membership (device twin of Medium::insideBound).
+__device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
+    if (!m.bounded) return true;
+    if (m.boundShape == 1) {   // sphere
+        double dx = (double)p.x - m.bcenter.x, dy = (double)p.y - m.bcenter.y,
+               dz = (double)p.z - m.bcenter.z;
+        return dx * dx + dy * dy + dz * dz <= m.bradius * m.bradius;
+    }
+    if (m.boundShape == 2 && m.boundField) {   // implicit field
+        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
+        return m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
+    }
+    return p.x >= m.bmin.x && p.x <= m.bmax.x && p.y >= m.bmin.y &&
+           p.y <= m.bmax.y && p.z >= m.bmin.z && p.z <= m.bmax.z;
+}
+
+// Local refractive index n at a world point (device twin of Medium::nAt): the shared
+// pattern VM with x y z r live, floored at 1e-3. 1.0 when this medium is not GRIN.
+__device__ static double dMedNAt(const DMedium& m, const DVec3& p) {
+    if (m.iorN <= 0 || !m.ior) return 1.0;
+    double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
+    double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
+                            0.0, 0.0, 0.0, r, 0.0, 0.0);
+    return n > 1e-3 ? n : 1e-3;
+}
+
+// ∇n at a world point via central differences with step h (device twin of Medium::gradNAt).
+__device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h) {
+    double inv = 0.5 / h;
+    DVec3 xp = p, xm = p; xp.x = (Real)(p.x + h); xm.x = (Real)(p.x - h);
+    DVec3 yp = p, ym = p; yp.y = (Real)(p.y + h); ym.y = (Real)(p.y - h);
+    DVec3 zp = p, zm = p; zp.z = (Real)(p.z + h); zm.z = (Real)(p.z - h);
+    double gx = dMedNAt(m, xp) - dMedNAt(m, xm);
+    double gy = dMedNAt(m, yp) - dMedNAt(m, ym);
+    double gz = dMedNAt(m, zp) - dMedNAt(m, zm);
+    return DVec3{ (Real)(gx * inv), (Real)(gy * inv), (Real)(gz * inv) };
+}
+
+// (dGrinMarch — the Eikonal ray marcher — needs DHit + closestHit, so it is defined just
+// after the closestHit definition below.)
 
 // Sample the next real collision along (o,dir) within [0,dMax]. Device twin of
 // Renderer::sampleMediumCollision: exact analytic free-flight (one draw) for a
@@ -1600,6 +1658,52 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     }
     return h;
 }
+
+// Advance (ro,rd) through any GRIN region(s) via symplectic Eikonal marching, stopping when
+// a surface is within one step or the ray has left all GRIN regions. Device twin of
+// grin::march — the forward megakernel/wavefront call it before each bounce's closestHit,
+// gated by sc.hasGrin so ordinary scenes never enter it (bit-identical). Kept byte-for-byte
+// in step with the CPU marcher (grin.h) so CPU and GPU bend rays identically.
+__device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
+    const int GRIN_MAX_STEPS = 200000;
+    for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
+        // GRIN region containing ro (first enabled GRIN membership), or -1.
+        int gm = -1;
+        for (int mi = 0; mi < sc.mediaN; ++mi) {
+            const DMedium& md = sc.media[mi];
+            if (md.enabled && md.iorN > 0 && dMedInside(md, ro)) { gm = mi; break; }
+        }
+        DHit hs = closestHit(sc, ro, rd);
+        double dS = hs.valid ? (double)hs.t : 1e30;
+        if (gm < 0) {
+            // Outside any GRIN region: jump to the nearest GRIN entry before the next
+            // surface, else stop (straight-ray body takes over).
+            double bestTa = 1e30; int bestM = -1;
+            for (int mi = 0; mi < sc.mediaN; ++mi) {
+                const DMedium& md = sc.media[mi];
+                if (!(md.enabled && md.iorN > 0)) continue;
+                double ta, tb;
+                if (dMedClip(md, ro, rd, 1e-4, dS, ta, tb) && ta < bestTa) { bestTa = ta; bestM = mi; }
+            }
+            if (bestM < 0) break;
+            ro = ro + rd * (Real)(bestTa + 1e-4);   // nudge inside
+            continue;
+        }
+        const DMedium& g = sc.media[gm];
+        double ds = g.iorStep;
+        if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
+        // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
+        //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
+        double n0 = dMedNAt(g, ro);
+        DVec3 grad = dMedGradN(g, ro, 0.5 * ds);
+        DVec3 T = rd * (Real)n0 + grad * (Real)ds;
+        DVec3 newPos = ro + T * (Real)(ds / n0);
+        double tl = sqrt((double)dot(T, T));
+        DVec3 newDir = (tl > 1e-12) ? T * (Real)(1.0 / tl) : rd;
+        ro = newPos; rd = newDir;
+    }
+}
+
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
                                  Real maxDist, Real tmin = RAY_EPS) {
     if (sc.nNodes == 0) return false;
@@ -1959,6 +2063,12 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+    // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
+    // Divide the pupil FLUX deposited in the cell by the physical cell area
+    // A_cell = pixelPlaneArea()*filmDist^2 to turn it into film IRRADIANCE, matching
+    // mode B's radiance*camEq absolute scale. Per-camera constant; auto-exposed scenes
+    // stay byte-identical, only absolute-EV A/C are re-seated to mid-tone at gain 6.
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -1986,6 +2096,9 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     Real ph = hgPhase(dot(wIn, wdir), (Real)med.g);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
+    // Same flux->film-irradiance normaliser as connectLens (see there); per-camera
+    // constant, so auto-exposed scenes are unaffected.
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -2941,7 +3054,11 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         int px, py;
         // Model C never shares a trace (it consumes the photon), so nCam==1 here.
         if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
-            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta);
+            // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
+            // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
+            // scenes unaffected).
+            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
             eSensor += beta; return WF_TERMINATE;
         }
     }
@@ -3115,6 +3232,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
+            if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // bend through any GRIN region first
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk) == WF_TERMINATE) done = true;
@@ -3201,10 +3319,17 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
     else st.alive[slot] = 0;
 }
 
-// Extend: one closestHit per live slot.
+// Extend: one closestHit per live slot. For GRIN scenes, bend the slot's ray through any
+// gradient-index region first (writing the bent ro/rd back so kWfShade sees them) — exactly
+// as the megakernel marches before closestHit. Non-GRIN scenes skip it (bit-identical).
 __global__ void kWfExtend(DScene sc, WFState st, int W) {
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
+    if (sc.hasGrin) {
+        DVec3 ro = st.ro[slot], rd = st.rd[slot];
+        dGrinMarch(sc, ro, rd);
+        st.ro[slot] = ro; st.rd[slot] = rd;
+    }
     st.hit[slot] = closestHit(sc, st.ro[slot], st.rd[slot]);
 }
 
@@ -4589,6 +4714,11 @@ bool cudaForwardSupported(const Scene& scene) {
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
+    // Spectral water-droplet (rainbow) phase is a CPU-tabulated (lambda x mu) table with
+    // per-lambda CDF importance sampling (rainbow.h); the device volume path only knows
+    // the analytic HG lobe (hgPhase). Rather than silently drop the bow to a smooth HG
+    // haze, fall back to the CPU tracer for any scene with a rainbow-phase medium.
+    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     // Environment lighting runs on-device: the kernel emits env photons from the scene
     // bounding sphere (shape==3) and the directly-viewed background is added by the
     // backend-agnostic addEnvBackground() pass. Both a constant env and an IMAGE-based
@@ -5033,9 +5163,14 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.boundFieldN    = fs.n;
             dm.boundFieldExpr = d_fexpr;
             dm.boundInsideNeg = m.boundInsideNeg ? 1 : 0;
+            // Gradient-index (GRIN) field: upload the compiled n(x,y,z) program + march step.
+            dm.ior     = m.ior.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.ior));
+            dm.iorN    = (int)m.ior.size();
+            dm.iorStep = m.iorStep;
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
+        sc.hasGrin = grin::sceneHasGrin(scene) ? 1 : 0;   // gate for dGrinMarch (host twin)
     }
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
@@ -5366,6 +5501,15 @@ bool cudaBdptSupported(const Scene& scene) {
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
+    // Gradient-index (GRIN) media bend rays along curved paths; BDPT's connection geometry,
+    // area-measure pdf conversion and MIS weights all assume STRAIGHT connecting segments, so
+    // a GRIN region would bias the estimator. The mode-D guard (bdptUnsupportedFeature) already
+    // refuses GRIN before dispatch; reject here too so GPU BDPT can never render it straight.
+    if (grin::sceneHasGrin(scene)) return false;
+    // Spectral rainbow phase is CPU-tabulated (see cudaForwardSupported); the device
+    // volume connect/sample only knows the analytic HG lobe, so refuse rainbow media
+    // here too and let mode D run on the CPU BDPT (which evaluates the bow exactly).
+    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     return true;
 }
 

@@ -22,6 +22,7 @@
 #include "camera.h"
 #include "photonmap.h"
 #include "medium_stack.h"
+#include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -71,34 +72,6 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
         return {FluoroEvent::Reemit, lp};
     }
     return {FluoroEvent::Absorb, 0.0};
-}
-
-// --- Henyey-Greenstein phase function (participating media) ------------------
-// p(cosTheta) normalized so its integral over the sphere is 1. cosTheta is the
-// cosine between the photon's propagation direction and the scattered direction;
-// g in (-1,1): g>0 forward-peaked, g<0 back-scattering, g=0 isotropic.
-inline double hgPhase(double cosTheta, double g) {
-    double d = 1.0 + g * g - 2.0 * g * cosTheta;
-    if (d < 1e-9) d = 1e-9;
-    return (1.0 - g * g) / (4.0 * PI * d * std::sqrt(d));
-}
-
-// Sample a scattered direction around the propagation direction `wi` from the HG
-// distribution. The sampled cosTheta has mean value g (forward for g>0), so the
-// returned direction is importance-sampled proportional to the phase function.
-inline Vec3 sampleHG(const Vec3& wi, double g, Pcg32& rng) {
-    double u1 = rng.uniform(), u2 = rng.uniform();
-    double cosT;
-    if (std::fabs(g) < 1e-3) {
-        cosT = 1.0 - 2.0 * u1;                          // isotropic
-    } else {
-        double sq = (1.0 - g * g) / (1.0 + g - 2.0 * g * u1);
-        cosT = (1.0 + g * g - sq * sq) / (2.0 * g);
-    }
-    double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
-    double phi = 2.0 * PI * u2;
-    Vec3 t, b; onb(wi, t, b);
-    return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + wi * cosT);
 }
 
 // --- Thin-film interference reflectance (iridescence) ------------------------
@@ -470,7 +443,7 @@ struct Renderer {
         if (!cam.project(p, px, py, cosCam, dist2)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
@@ -521,6 +494,19 @@ struct Renderer {
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+        // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification). The line above deposits
+        // radiant FLUX through the pupil into the film CELL (it carries the pupil area
+        // R^2 but no 1/cell-area), whereas mode B's connect() deposits RADIANCE (it
+        // divides by the pixel solid angle). Dividing the flux by the physical cell
+        // area A_cell = pixelPlaneArea()*filmDist^2 turns it into film-plane IRRADIANCE
+        // E, so the finite lens now records exactly E = L * (pi/4)/N^2 (N = filmDist/2R)
+        // -- the same absolute scale as B*camEq. Equivalent derivation: current splat =
+        // B * (pi R^2 * A_pix); target = B * (pi R^2 / filmDist^2); ratio = 1/A_cell.
+        // A_cell depends only on the camera (fov/res/filmDist), so this is a per-camera
+        // constant: auto-exposed scenes stay byte-identical (the p99 anchor divides it
+        // out) and A stays consistent with C; only ABSOLUTE-EV A/C are corrected to
+        // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
+        contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
@@ -546,9 +532,14 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
 
-        double ph = hgPhase(dot(wIn, wdir), med.g);         // scattering medium's phase
+        double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
         double contrib = beta * Lambda * ph * cosLens * (PI * R * R) / (dist * dist);
+        // Same flux->film-irradiance normaliser as connectLens (see there): divide the
+        // pupil flux deposited in the cell by the physical cell area so a fog vertex
+        // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
+        // exposed scenes unaffected).
+        contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // all media
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
@@ -1101,7 +1092,17 @@ struct Renderer {
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
         };
 
+        // GRADIENT-INDEX (GRIN): if any medium carries an `ior` field, photons bend
+        // through it via the shared Eikonal marcher (grin.h) — the same curved geometry
+        // the backward/BDPT tracers use, so all transport paths agree. Gated so ordinary
+        // scenes stay bit-identical (the marcher is never entered).
+        const bool grinAny = grin::sceneHasGrin(scene);
+
         for (int bounce = 0; bounce < maxBounce; ++bounce) {
+            // GRIN curved marching pre-pass (does not consume a bounce): advance the ray
+            // through any gradient-index region before the straight-ray hit test.
+            if (grinAny) grin::march(scene, ray);
+
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
 
@@ -1125,7 +1126,14 @@ struct Renderer {
             if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
                 int px, py;
                 if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
-                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * beta);
+                    // Same flux->film-irradiance normaliser as connectLens (model A): a
+                    // caught photon deposits pupil FLUX into the cell; divide by the cell
+                    // area A_cell = pixelPlaneArea()*filmDist^2 so brute-force C keeps the
+                    // SAME absolute scale as the importance-sampled A (validated equal),
+                    // and both now match B's radiance*camEq in absolute EV.
+                    const Camera& cc = *cams[0].cam;
+                    double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
+                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (beta * cCell));
                     e.sensor += beta;
                     return;
                 }
@@ -1145,7 +1153,8 @@ struct Renderer {
                 }
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
                 if (rng.uniform() >= sm.albedo(lambda)) { e.absorbed += beta; return; }
-                ray = Ray{mp, sampleHG(ray.d, sm.g, rng)};
+                double phPdf;   // sample the scatter direction from HG or the rainbow droplet phase
+                ray = Ray{mp, sm.phaseSample(ray.d, lambda, rng, phPdf)};
                 continue;
             }
 

@@ -58,6 +58,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <functional>
 #include "scene.h"
 #include "camera.h"
 #include "spectrum.h"
@@ -146,6 +147,10 @@ struct Block {
     std::string name;                  // quoted name, if any
     std::vector<Stmt> stmts;           // newline-structured statements
     std::vector<std::string> words;    // flat token dump (for table/palette lists)
+    // For type == "prefer": ordered alternative branches (`prefer { .. } else { .. }`).
+    // Each branch is a list of ordinary top-level blocks; the loader picks the first
+    // branch whose spliced scene is fully renderable in its chosen mode. Empty otherwise.
+    std::vector<std::vector<Block>> branches;
 };
 
 struct Parser {
@@ -220,26 +225,71 @@ struct Parser {
         else fail("unterminated '{'");
     }
 
+    // Parse ONE top-level block (or a `prefer { } else { }` construct) starting at
+    // cur() (which must be a Word). Fills `b`; returns false on a parse error.
+    bool parseOneTopBlock(Block& b) {
+        if (!is(Tok::Word)) { fail("expected a block type"); return false; }
+        b.type = cur().text; adv();
+        if (b.type == "prefer") return parsePrefer(b);
+        if (is(Tok::String)) { b.name = cur().text; adv(); }
+        // Optional bareword subtype (light area / light collimated), but not '='.
+        if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
+        if (b.type == "spectrum") {
+            if (is(Tok::Word) && cur().text == "=") adv();
+            else { fail("spectrum declaration needs '='"); return false; }
+            Stmt s; s.key = "="; s.line = cur().line;
+            parseValue("=", s.val);
+            b.stmts.push_back(std::move(s));
+        } else {
+            if (!is(Tok::LBrace)) { fail("expected '{' after " + b.type); return false; }
+            parseBraceBody(b);
+        }
+        return true;
+    }
+
+    // Parse a `{ <top-level blocks> }` list (cur() must be LBrace). Consumes the braces.
+    // Used for each branch of a `prefer`/`else` construct.
+    std::vector<Block> parseBlockList() {
+        std::vector<Block> list;
+        adv();   // consume '{'
+        skipNewlines();
+        while (!is(Tok::RBrace) && !is(Tok::End) && err.empty()) {
+            Block b;
+            if (!parseOneTopBlock(b)) break;
+            list.push_back(std::move(b));
+            skipNewlines();
+        }
+        if (is(Tok::RBrace)) adv();
+        else fail("unterminated 'prefer'/'else' block");
+        return list;
+    }
+
+    // Parse `prefer { .. } else { .. } else { .. }` (b.type already == "prefer").
+    // Each brace group becomes one ordered branch in b.branches; `else` chains flatly.
+    bool parsePrefer(Block& b) {
+        skipNewlines();
+        if (!is(Tok::LBrace)) { fail("'prefer' needs '{ ... }'"); return false; }
+        b.branches.push_back(parseBlockList());
+        if (!err.empty()) return false;
+        for (;;) {
+            skipNewlines();
+            if (is(Tok::Word) && cur().text == "else") {
+                adv(); skipNewlines();
+                if (!is(Tok::LBrace)) { fail("'else' needs '{ ... }'"); return false; }
+                b.branches.push_back(parseBlockList());
+                if (!err.empty()) return false;
+            } else break;
+        }
+        return true;
+    }
+
     // Parse the whole file into a list of top-level blocks.
     std::vector<Block> parseTop() {
         std::vector<Block> blocks;
         skipNewlines();
         while (!is(Tok::End) && err.empty()) {
-            if (!is(Tok::Word)) { fail("expected a block type"); break; }
-            Block b; b.type = cur().text; adv();
-            if (is(Tok::String)) { b.name = cur().text; adv(); }
-            // Optional bareword subtype (light area / light collimated), but not '='.
-            if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
-            if (b.type == "spectrum") {
-                if (is(Tok::Word) && cur().text == "=") adv();
-                else { fail("spectrum declaration needs '='"); break; }
-                Stmt s; s.key = "="; s.line = cur().line;
-                parseValue("=", s.val);
-                b.stmts.push_back(std::move(s));
-            } else {
-                if (!is(Tok::LBrace)) { fail("expected '{' after " + b.type); break; }
-                parseBraceBody(b);
-            }
+            Block b;
+            if (!parseOneTopBlock(b)) break;
             blocks.push_back(std::move(b));
             skipNewlines();
         }
@@ -429,6 +479,11 @@ struct CamSpec {
     char   mode = 0;             // 0 = not specified -> inherit global
     int    res  = -1;            // film WIDTH  in px (-1 = inherit global/CLI res)
     int    resY = -1;            // film HEIGHT in px (-1 = square: follow res)
+    // Playback frame rate for a flyby (camera_path/orbit/curve). Purely an animation
+    // *hint* consumed by the video-assembly tooling (showcase_flyby.py -> ffmpeg): it
+    // does not affect how any still frame is rendered. 0 = not specified -> inherit the
+    // scene-level `fps` default, else the tool's own default. Meaningless for a still.
+    double fps = 0.0;
 
     // Lens projection (0 = rectilinear; see CameraProjection) and an optional zoom
     // multiplier on the focal length (1 = none; 2 = 2x tele, i.e. half the fov).
@@ -490,17 +545,40 @@ struct CamSpec {
     std::shared_ptr<LensSystem> lens;
 };
 
+// Round-trip record of an authored `camera_curve`'s CONTROL POINTS (not the expanded
+// per-frame cameras), captured at load so the interactive editor (-explore / -fly) can
+// seed itself from an existing curve and edit it in place. Positions are in internal
+// units (metres), matching everything the viewer works with.
+struct AuthoredCurve {
+    std::string         name;
+    std::vector<Vec3>   eyes;      // `point` control points, in file order
+    std::vector<Vec3>   fwds;      // per-point unit look direction (from look curve / look_at / tangent)
+    std::vector<double> density;   // per-point rho (internal units); empty => uniform speed
+    Vec3   up{0, 1, 0};
+    double fov = 40.0;             // fov_y in degrees
+    char   mode = 0;               // 0 = inherit
+    bool   closed = false;
+};
+
 struct Loaded {
     Scene scene;
     // All authored cameras, in file order. Phase 3a: any number of `camera` blocks
     // accumulate; main renders the CLI-selected one, or all of them.
     std::vector<CamSpec> cameras;
+    // Control points of every authored `camera_curve` (for the in-viewer editor's
+    // round-trip load; see AuthoredCurve). Empty for scenes with no curve.
+    std::vector<AuthoredCurve> authoredCurves;
     // Mirror of the FIRST camera (kept so the pre-Phase-3a single-camera code paths
     // and defaults keep working unchanged).
     bool hasCamera = false;
     Vec3 camEye{0, 1, 3}, camLook{0, 1, 0}, camUp{0, 1, 0};
     double camFov = 40.0, camAperture = 0.02, camFocus = 0.0;
     char mode = 'B';
+    char defaultMode = 0;        // scene { default_mode X }: fallback mode for cameras that
+                                 //   don't author their own `mode` (0 = not specified). Unlike
+                                 //   `mode` above (which trails the last camera/render block),
+                                 //   this is a stable, camera-immune default.
+    double defaultFps = 0.0;     // scene { fps N }: default flyby playback fps (0 = not specified)
     long long photons = -1;      // -1 = not specified (CLI default wins)
     int res = -1;                // -1 = not specified
     std::string device;          // empty = not specified
@@ -534,6 +612,15 @@ public:
                                  "engine range is fixed at %g..%g nm (widening is not yet supported); "
                                  "only the bin width (%g nm) is applied.\n", lo, hi, LAMBDA_MIN, LAMBDA_MAX, binWidth_);
             }
+            // Scene-level defaults. `default_mode X` gives a stable fallback render mode for
+            // any camera that doesn't author its own `mode` (see effMode in main). `fps N`
+            // is the default flyby playback rate the video tooling uses when a camera_curve/
+            // path/orbit doesn't set its own `fps`. Both are pure defaults — a per-camera
+            // `mode`/`fps` and the CLI still override them.
+            std::string dm = strOf(b, "default_mode");
+            if (!dm.empty()) L.defaultMode = dm[0];
+            double dfps = dblOf(b, "fps", 0.0);
+            if (dfps > 0.0) L.defaultFps = dfps;
         }
 
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
@@ -2122,6 +2209,110 @@ private:
                 med.densityMax = (dmax > 0.0) ? dmax : 1.0;
             }
         }
+
+        // ---- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
+        // `ior pattern:<name>` (a named pattern) or `ior "<expr>"` (inline infix
+        // formula over world x y z r, §6.1) — the local refractive index. When set,
+        // rays bend through the region (Eikonal march) instead of going straight.
+        // A GRIN region must be bounded (the march needs a finite region to enter),
+        // and the march step is `ior_step <v>` world units (default: 1/64 of the
+        // smallest bound extent). EXPERIMENTAL: CPU backward tracer only for now.
+        if (const Stmt* is = find(b, "ior")) {
+            if (!med.bounded) {
+                fail("a `medium` with an `ior` (gradient-index) field needs `bounds { .. }` "
+                     "so the ray-bending march has a finite region to enter");
+                return false;
+            }
+            std::vector<PatNode> prog;
+            if (!is->val.words.empty() && is->val.words[0].rfind("pattern:", 0) == 0) {
+                std::string nm = is->val.words[0].substr(8);
+                auto it = patternIndex_.find(nm);
+                if (it == patternIndex_.end()) {
+                    fail("medium ior references unknown pattern '" + nm + "'"); return false;
+                }
+                prog = L.scene.patterns[it->second].nodes;
+            } else {
+                std::string expr;
+                for (size_t k = 0; k < is->val.words.size(); ++k) { if (k) expr += " "; expr += is->val.words[k]; }
+                std::string perr;
+                if (!compilePatternExpr(expr, prog, perr)) {
+                    fail("medium ior: " + perr); return false;
+                }
+            }
+            med.ior = std::move(prog);
+            // March step: explicit `ior_step`, else 1/64 of the smallest bound extent.
+            double step = dblOf(b, "ior_step", 0.0);
+            if (step <= 0.0) {
+                double ext;
+                if (med.boundShape == MediumBound::Sphere) ext = 2.0 * med.bradius;
+                else ext = std::min(med.bmax.x - med.bmin.x,
+                             std::min(med.bmax.y - med.bmin.y, med.bmax.z - med.bmin.z));
+                step = (ext > 0.0) ? ext / 64.0 : 0.01;
+            }
+            med.iorStep = step;
+        }
+
+        // ---- Optional angular phase model (HG lobe vs. spectral rainbow) ---------
+        // Default (no `phase` statement, or `phase hg`) keeps the smooth single-`g`
+        // Henyey-Greenstein lobe (`med.g` above). `phase rainbow { .. }` swaps in the
+        // physically-tabulated Airy water-droplet phase (rainbow.h) so a fog/haze
+        // actually shows a primary + secondary bow, dispersion, Alexander's dark band
+        // and supernumeraries. Its physical features are ON BY DEFAULT; the block
+        // knobs are overrides (turn a feature off, or retune it):
+        //   droplet_um <r>       droplet radius in microns (default 500 = 0.5mm rain;
+        //                        ~10 -> a broad desaturated fogbow).
+        //   secondary on|off     the p=3 secondary bow (default on).
+        //   supernumerary on|off the Airy side-maxima / supernumerary arcs (default on).
+        //   strength <s>         relative weight of the bows over the forward haze (default 1).
+        //   forward_g <g>        HG anisotropy of the smooth forward-scatter background (default 0.55).
+        //   secondary_ratio <v>  secondary brightness vs. primary (default 0.43).
+        // The droplet index n(lambda) defaults to water's Cauchy fit; if this medium
+        // also carries a scalar `ior` it does NOT feed the droplet optics (the GRIN
+        // `ior` field is a spatial bend, unrelated to per-droplet dispersion).
+        if (const Stmt* ph = find(b, "phase")) {
+            // `phase rainbow { .. }` — the subtype bareword before `{` is consumed as the
+            // nested block's TYPE (parseValue, ~line 203), NOT left in val.words. So read
+            // the kind from val.words[0] (the block-less forms `phase hg` / `phase rainbow`)
+            // and fall back to the block's type when a `{ .. }` body is present.
+            std::string kind = ph->val.words.empty() ? std::string() : ph->val.words[0];
+            if (kind.empty() && ph->val.block && ph->val.block->type != "phase")
+                kind = ph->val.block->type;
+            auto truthy = [](const std::string& s) {
+                return s == "on" || s == "true" || s == "1" || s == "yes";
+            };
+            auto falsy = [](const std::string& s) {
+                return s == "off" || s == "false" || s == "0" || s == "no";
+            };
+            if (kind == "rainbow") {
+                rainbow::Params prm;
+                const Block* pb = ph->val.block.get();
+                if (pb) {
+                    double dropUm = dblOf(*pb, "droplet_um", prm.dropletRadius_m * 1e6);
+                    if (dropUm <= 0.0) { fail("medium `phase rainbow` needs a positive `droplet_um`"); return false; }
+                    prm.dropletRadius_m = dropUm * 1e-6;
+                    prm.rainbowStrength = dblOf(*pb, "strength", prm.rainbowStrength);
+                    prm.gForward        = dblOf(*pb, "forward_g", prm.gForward);
+                    prm.secondaryRatio  = dblOf(*pb, "secondary_ratio", prm.secondaryRatio);
+                    if (const Stmt* s = find(*pb, "secondary")) {
+                        std::string v = s->val.words.empty() ? "on" : s->val.words[0];
+                        if (falsy(v)) prm.secondary = false; else if (truthy(v)) prm.secondary = true;
+                    }
+                    if (const Stmt* s = find(*pb, "supernumerary")) {
+                        std::string v = s->val.words.empty() ? "on" : s->val.words[0];
+                        if (falsy(v)) prm.supernumerary = false; else if (truthy(v)) prm.supernumerary = true;
+                    }
+                }
+                auto rp = std::make_shared<rainbow::RainbowPhase>();
+                rp->build(prm);
+                med.rainbowPhase = rp;
+            } else if (kind == "hg" || kind.empty()) {
+                // explicit HG (or `phase` with no argument): default lobe, nothing to do.
+            } else {
+                fail("medium `phase " + kind + "` is not a known phase model (use `hg` or `rainbow`)");
+                return false;
+            }
+        }
+
         L.scene.media.push_back(std::move(med));
         return true;
     }
@@ -2459,6 +2650,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
         int frames = (int)dblOf(b, "frames", 0.0);
@@ -2568,6 +2760,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
         if (!readLens(b, shared)) return false;           // optional physical `lens { ... }` block
@@ -2679,6 +2872,7 @@ private:
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
         std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
         if (!readLens(b, shared)) return false;           // optional physical `lens { ... }` block
@@ -2939,6 +3133,46 @@ private:
             }
         }
 
+        // ---- Round-trip capture: record this curve's CONTROL POINTS for the editor ----
+        // The in-viewer camera_curve editor seeds its `editPts` from this so an existing
+        // curve can be loaded and edited in place (rather than starting from an empty
+        // editor). Per control point we store the eye, a unit look direction (sampled from
+        // whichever orientation mode the curve uses), and — if a density was authored — the
+        // local rho so the editor's speed track round-trips too.
+        {
+            AuthoredCurve ac;
+            ac.name   = base;
+            ac.up     = shared.up;
+            ac.fov    = shared.fov;
+            ac.mode   = shared.mode;
+            ac.closed = closed;
+            ac.eyes   = pts;
+            const int nPts = (int)pts.size();
+            ac.fwds.reserve((size_t)nPts);
+            for (int i = 0; i < nPts; ++i) {
+                double gi = (double)i;                                  // control point i sits at g = i
+                double ui = (nSeg > 0) ? gi / (double)nSeg : 0.0;       // its normalized timeline position
+                Vec3 dir{0, 0, -1};
+                if (lookCurve && lookPts.size() >= 2) {
+                    dir = catmullRomAt(lookPts, closed, ui * (double)lookSeg, splineAlpha) - pts[(size_t)i];
+                } else if (lookFixed) {
+                    dir = fixedLook - pts[(size_t)i];
+                } else {                                                // tangent: central difference along the eye spline
+                    double eps = (nSeg > 0) ? (double)nSeg / 256.0 : 1e-3;
+                    Vec3 a = catmullRomAt(pts, closed, std::max(0.0, gi - eps), splineAlpha);
+                    Vec3 c = catmullRomAt(pts, closed, std::min((double)nSeg, gi + eps), splineAlpha);
+                    dir = c - a;
+                }
+                ac.fwds.push_back((length(dir) > 1e-9) ? normalize(dir) : Vec3{0, 0, -1});
+            }
+            if (haveDensity) {
+                ac.density.reserve((size_t)nPts);
+                for (int i = 0; i < nPts; ++i)
+                    ac.density.push_back(densityAt((nSeg > 0) ? (double)i / (double)nSeg : 0.0));
+            }
+            L.authoredCurves.push_back(std::move(ac));
+        }
+
         int pad = 1; for (int f = N - 1; f >= 10; f /= 10) ++pad;   // zero-pad width
         for (int i = 0; i < N; ++i) {
             // A closed loop samples i/N (frame N == frame 0, not duplicated); an open
@@ -3012,8 +3246,38 @@ private:
     }
 };
 
-// Load an FTSL file, populating `L`. Returns false and sets `err` on any error.
-inline bool load(const std::string& path, Loaded& L, std::string& err) {
+// A caller-supplied capability predicate for `prefer{}/else{}` resolution: given a
+// freshly-built scene it returns a reason string if the scene is NOT renderable (some
+// feature unsupported by the mode it would render in), or nullptr if it is fine. main.cpp
+// supplies this using its per-mode support gates (BDPT/VCM/fisheye). Empty => no filtering
+// (the first / most-preferred branch always wins).
+using SupportFn = std::function<const char*(const Loaded&)>;
+
+// Splice a flat block list: each top-level `prefer` node (at preferIdx[k]) is replaced by
+// the blocks of its choice[k]-th branch; all other blocks pass through unchanged.
+inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
+                                        const std::vector<size_t>& preferIdx,
+                                        const std::vector<int>& choice) {
+    std::vector<Block> flat;
+    size_t k = 0;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (k < preferIdx.size() && preferIdx[k] == i) {
+            const auto& branch = blocks[i].branches[(size_t)choice[k]];
+            for (const auto& bb : branch) flat.push_back(bb);
+            ++k;
+        } else {
+            flat.push_back(blocks[i]);
+        }
+    }
+    return flat;
+}
+
+// Load an FTSL file, populating `L`. Returns false and sets `err` on any error. When the
+// scene contains `prefer{}/else{}` blocks, `supported` chooses which branch renders (see
+// SupportFn): the first branch whose spliced scene is fully renderable wins, falling back
+// to the last branch when none are (a loud mode error then fires at render time).
+inline bool load(const std::string& path, Loaded& L, std::string& err,
+                 const SupportFn& supported = {}) {
     std::ifstream f(path);
     if (!f) { err = "cannot open scene file: " + path; return false; }
     std::stringstream ss; ss << f.rdbuf();
@@ -3023,8 +3287,89 @@ inline bool load(const std::string& path, Loaded& L, std::string& err) {
     std::vector<Block> blocks = p.parseTop();
     if (!p.err.empty()) { err = p.err; return false; }
 
-    Builder bld;
-    if (!bld.build(blocks, L)) { err = bld.err; return false; }
+    // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
+    std::vector<size_t> preferIdx;
+    for (size_t i = 0; i < blocks.size(); ++i)
+        if (blocks[i].type == "prefer") preferIdx.push_back(i);
+
+    if (preferIdx.empty()) {
+        Builder bld;
+        if (!bld.build(blocks, L)) { err = bld.err; return false; }
+        return true;
+    }
+
+    // Validate: every prefer must have >=1 branch and must not nest another prefer inside
+    // a branch (use flat `else` chaining instead — keeps resolution non-circular).
+    for (size_t idx : preferIdx) {
+        if (blocks[idx].branches.empty()) { err = "'prefer' has no branches"; return false; }
+        for (const auto& branch : blocks[idx].branches)
+            for (const auto& bb : branch)
+                if (bb.type == "prefer") {
+                    err = "nested 'prefer' inside a branch is not supported; use "
+                          "'prefer { } else { } else { }' chaining instead";
+                    return false;
+                }
+    }
+
+    // Try-build a candidate (fresh Builder each time). Returns:
+    //   built=false           -> the branch's scene has a real authoring error (buildErr set)
+    //   built=true, reason==0  -> renderable
+    //   built=true, reason!=0  -> builds but the mode can't render some feature
+    struct Trial { bool built; std::string buildErr; const char* reason; };
+    auto tryBuild = [&](const std::vector<int>& ch, Loaded& out) -> Trial {
+        std::vector<Block> flat = flattenPrefer(blocks, preferIdx, ch);
+        Builder bld;
+        if (!bld.build(flat, out)) return {false, bld.err, nullptr};
+        return {true, {}, supported ? supported(out) : nullptr};
+    };
+
+    // Greedy per-node resolution (nodes fixed left-to-right; the realistic case is a
+    // single node). For each node pick the first branch that yields a renderable scene,
+    // else keep the last branch.
+    //
+    // Single-node fast path: with exactly one `prefer`, the trial that resolves the
+    // node IS the final scene (its flattened block list == the resolved one), so we
+    // keep that trial's `Loaded` and skip a redundant final rebuild — which for a
+    // heavy scene would otherwise re-parse and RE-LOAD every mesh a second time.
+    const bool singleNode = (preferIdx.size() == 1);
+    std::vector<int> choice(preferIdx.size(), 0);
+    Loaded accepted;
+    bool haveAccepted = false;
+    for (size_t j = 0; j < preferIdx.size(); ++j) {
+        int nb = (int)blocks[preferIdx[j]].branches.size();
+        int chosen = nb - 1;
+        for (int c = 0; c < nb; ++c) {
+            choice[j] = c;
+            Loaded trial;
+            Trial t = tryBuild(choice, trial);
+            const bool renderable = (t.built && t.reason == nullptr);
+            // For a single node, whichever branch we end on (first renderable, or the
+            // last as fallback) is `chosen`, and `trial` currently holds its build.
+            if (singleNode && (renderable || c == nb - 1)) {
+                accepted = std::move(trial);
+                haveAccepted = true;
+            }
+            if (renderable) { chosen = c; break; }   // renderable -> take it
+            if (c < nb - 1) {
+                const char* why = t.built ? t.reason : t.buildErr.c_str();
+                std::fprintf(stderr, "[prefer] branch %d rejected (%s); trying the next\n",
+                             c + 1, why ? why : "unrenderable");
+            }
+        }
+        choice[j] = chosen;
+    }
+
+    if (singleNode && haveAccepted) {
+        L = std::move(accepted);
+    } else {
+        // Multi-node: rebuild once with the fully-resolved choices across all nodes.
+        std::vector<Block> flat = flattenPrefer(blocks, preferIdx, choice);
+        Builder bld;
+        if (!bld.build(flat, L)) { err = bld.err; return false; }
+    }
+    for (size_t j = 0; j < preferIdx.size(); ++j)
+        std::printf("[prefer] using branch %d of %d\n",
+                    choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());
     return true;
 }
 

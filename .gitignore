@@ -8,6 +8,30 @@
 *.ppm
 *.exr
 *.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.webp
+
+# 3D model assets (large binaries kept on disk, never committed — cameras/, meshes/,
+# Meshy_* textures, etc. Scenes reference them locally; they don't belong in history.)
+*.glb
+*.gltf
+*.usdz
+*.usda
+*.zip
+
+# Render state / checkpoints / photon maps (crash-safe sidecars, regenerated on render)
+*.ftbuf
+*.ftpmap
+
+# Render logs
+*.log
+
+# Cached web reference dumps (POV-Wiki pages saved with "... - POV-Wiki_files/" dirs)
+*POV-Wiki.html
+*POV-Wiki_files/
 
 # Generated meshes (regenerate with tools/make_mesh.py)
 *.obj

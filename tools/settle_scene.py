@@ -30,9 +30,21 @@ Object geometry:
 Requirements: numpy, trimesh, and pybullet (for the physics). VHACD (bundled with
 pybullet) convex-decomposes concave dynamic objects for a faithful collision shape.
 
+Re-seating pieces on their stands (--seat):
+  A faithful free settle drops each piece onto NARROW pedestals, so anything wider than
+  its column (or authored slightly off-centre over it) tends to tip and roll OFF onto the
+  floor. `--seat` fixes the display without faking the physics: it keeps the ORIENTATION
+  each piece came to rest in, but returns it to the exact left-right / forward-back spot
+  the author placed it BEFORE the sim, then lowers it straight down until it touches its
+  stand (the same vertical "drop" tools/settle.py uses). Pass `--seat auto` to pair each
+  settled piece with the nearest other named object (its pedestal), or explicit
+  `piece:stand,…` pairs. A piece authored off-centre over its stand will overhang its rim
+  after seating (a warning is printed); nudge its authored position to sit it squarely.
+
 Usage:
   python tools/settle_scene.py --scene gallery.ftsl --all --out gallery_settled.ftsl
   python tools/settle_scene.py --scene s.ftsl --settle blobA,klein --floor plane:0.0 --out s2.ftsl
+  python tools/settle_scene.py --scene g.ftsl --settle klein,heart --seat auto --out g_seated.ftsl
 """
 import argparse, math, os, re, sys, tempfile, subprocess, glob
 import numpy as np
@@ -40,7 +52,7 @@ import trimesh
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
-from settle import euler_xyz_deg  # R -> (rx,ry,rz) deg such that R = Rz·Ry·Rx
+from settle import euler_xyz_deg, drop  # euler decomp; drop = vertical rest-on-surface
 
 # Cap on the triangle count of a dynamic object's VHACD collision proxy. Convex
 # decomposition time scales with tri count and only the gross shape matters for
@@ -325,6 +337,82 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction):
     return result
 
 
+# ---------------------------------------------------------------- seat-on-stand
+def seat_on_stand(piece_world, R, stand_world, gap):
+    """Re-seat a settled piece on its stand by lowering it straight down in place.
+
+    A faithful free physics settle drops each hero onto NARROW museum pedestals, so a
+    piece wider than its column top (or slightly overhanging it) tends to tip and roll
+    OFF onto the floor rather than resting on display. This takes the ORIENTATION physics
+    gave it (the natural way it came to rest) but does NOT relocate the piece laterally:
+    it keeps the piece's left-right / forward-back position exactly where the author put
+    it BEFORE the sim, then lowers it straight down until it just touches the stand —
+    exactly the "drop it directly downward until it stops" move, applied whether the piece
+    stayed on the stand or tumbled off. The result is a rigid transform `(translate, R)`
+    in the same form settle_bodies returns, so it drops straight into the group wrapper.
+
+    Note the rotation `R` is applied about the object's origin, which slides its bounding
+    centroid; we cancel that XZ drift so the piece's authored footprint centre is restored
+    (a pure spin-in-place at the original spot) before dropping.
+
+    `piece_world` / `stand_world` are the objects' authored world-space meshes; `R` is the
+    settled rotation about the piece's origin (world' = translate + R·world)."""
+    rot = piece_world.copy()
+    rot.vertices = piece_world.vertices @ R.T          # orient as it settled (about origin)
+    auth_c = piece_world.bounds.mean(axis=0)           # authored (pre-sim) footprint centre
+    rot_c  = rot.bounds.mean(axis=0)
+    tx = float(auth_c[0] - rot_c[0])                   # cancel the rotation's XZ drift only
+    tz = float(auth_c[2] - rot_c[2])                   # -> piece stays at its original XZ
+    placed = rot.copy(); placed.apply_translation([tx, 0.0, tz])   # spin in place, no move
+    dt, _ = drop(placed, ('mesh', stand_world), gap)   # vertical rest onto the stand top
+    # Overhang check: because we keep the authored XZ, a piece the author placed OFF the
+    # centre of its stand rests on the stand's edge with the rest of it hanging past the
+    # rim. drop() never lets it sink INTO the stand, but the overhanging part can dangle
+    # below the stand-top level. Flag it so the user knows to nudge the authored position.
+    final_bot = float(placed.vertices[:, 1].min() + dt[1])
+    stand_top = float(stand_world.bounds[1][1])
+    if final_bot < stand_top - 0.01:
+        print(f'[settle_scene] WARNING: seated piece overhangs its stand — {stand_top - final_bot:.3f} m '
+              f'of it hangs below the stand top (authored off-centre from the stand). '
+              f'Re-centre the piece over the stand if you want it to sit squarely.')
+    return np.array([tx, float(dt[1]), tz], float), R
+
+
+def parse_seat_pairs(spec, selected, by_name, worlds):
+    """Resolve a `--seat piece:stand,…` spec (or `auto`) to a {piece: stand} dict. Auto
+    pairs each settled piece to the nearest OTHER named object by authored XZ centre — in
+    the sample scenes that's the pedestal each hero was posed above."""
+    if spec.strip().lower() == 'auto':
+        stands = [n for n in by_name if n not in selected]
+        if not stands:
+            sys.exit('[settle_scene] --seat auto: no non-settled objects to use as stands')
+        pairs = {}
+        for pc in selected:
+            pcc = worlds[pc].bounds.mean(axis=0)
+            best, bd = None, math.inf
+            for st in stands:
+                sc = worlds[st].bounds.mean(axis=0)
+                d = (pcc[0] - sc[0]) ** 2 + (pcc[2] - sc[2]) ** 2   # XZ distance
+                if d < bd:
+                    bd, best = d, st
+            pairs[pc] = best
+        return pairs
+    pairs = {}
+    for tok in spec.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ':' not in tok:
+            sys.exit(f'[settle_scene] --seat needs piece:stand pairs (got "{tok}")')
+        pc, st = (x.strip() for x in tok.split(':', 1))
+        if pc not in selected:
+            sys.exit(f'[settle_scene] --seat piece "{pc}" is not among the settled objects')
+        if st not in by_name:
+            sys.exit(f'[settle_scene] --seat stand "{st}" is not a named object in the scene')
+        pairs[pc] = st
+    return pairs
+
+
 # ---------------------------------------------------------------- rewrite
 def fmt(v):
     return ' '.join(f'{x:.6g}' for x in v)
@@ -361,6 +449,12 @@ def main():
     ap.add_argument('--mesh-res', type=int, default=160, help='isosurface polygonisation resolution')
     ap.add_argument('--friction', type=float, default=0.8, help='lateral friction for all bodies')
     ap.add_argument('--max-steps', type=int, default=8000, help='max simulation steps')
+    ap.add_argument('--seat', help='after settling, re-seat pieces squarely on their stands: '
+                                   '"auto" (nearest non-settled object per piece) or explicit '
+                                   'piece:stand,… pairs. Keeps each piece\'s settled orientation '
+                                   'but centres it over the stand top and drops it straight down.')
+    ap.add_argument('--seat-gap', type=float, default=0.001,
+                    help='clearance left between a seated piece and its stand top (default 0.001)')
     a = ap.parse_args()
 
     if not a.floor.lower().startswith('plane:'):
@@ -415,6 +509,15 @@ def main():
     for name in selected:
         t, R = deltas[name]
         print(f'  {name}:  translate {fmt(t)}   rotate {fmt(euler_xyz_deg(R))}')
+
+    if a.seat:
+        pairs = parse_seat_pairs(a.seat, selected, by_name, worlds)
+        print(f'[settle_scene] seating: '
+              + ', '.join(f'{pc}->{st}' for pc, st in pairs.items()))
+        for pc, st in pairs.items():
+            deltas[pc] = seat_on_stand(worlds[pc], deltas[pc][1], worlds[st], a.seat_gap)
+            t, R = deltas[pc]
+            print(f'  seated {pc} on {st}:  translate {fmt(t)}   rotate {fmt(euler_xyz_deg(R))}')
 
     out_text = wrap_blocks(text, by_name, deltas)
     with open(a.out, 'w', encoding='utf-8') as f:

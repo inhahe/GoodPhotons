@@ -13,6 +13,7 @@
 #include "texture.h"
 #include "envmap.h"
 #include "vdbgrid.h"
+#include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
@@ -219,6 +220,32 @@ struct Medium {
     Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
     double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
 
+    // --- Scattering phase model ---------------------------------------------
+    // By default a medium scatters via the smooth single-parameter Henyey-Greenstein
+    // lobe above. A medium can instead opt into a physically-based WATER-DROPLET
+    // phase (Airy theory, rainbow.h) via `phase rainbow { .. }` in FTSL, which adds
+    // the wavelength-dependent rainbow fine structure (primary/secondary bows,
+    // supernumeraries, fogbow limit). When `rainbowPhase` is set it OVERRIDES `g`.
+    // The shared_ptr keeps Medium copies cheap (the table is a few MB) and is null
+    // for the common HG case, so HG media stay bit-identical.
+    std::shared_ptr<rainbow::RainbowPhase> rainbowPhase;
+    bool rainbow() const { return (bool)rainbowPhase; }
+
+    // Phase value p(cos) at wavelength lambda (nm) — equals the solid-angle pdf when
+    // the scatter direction is importance-sampled from the phase (both models below).
+    double phaseValue(double cosTheta, double lambda) const {
+        if (rainbowPhase) return rainbowPhase->eval(cosTheta, lambda);
+        return hgPhase(cosTheta, g);
+    }
+    // Importance-sample a scattered direction about propagation `wi` at wavelength
+    // lambda; sets pdfOut to the solid-angle pdf p(cos) of the chosen direction.
+    Vec3 phaseSample(const Vec3& wi, double lambda, Pcg32& rng, double& pdfOut) const {
+        if (rainbowPhase) return rainbowPhase->sample(wi, lambda, rng, pdfOut);
+        Vec3 d = sampleHG(wi, g, rng);
+        pdfOut = hgPhase(dot(wi, d), g);
+        return d;
+    }
+
     // --- Optional heterogeneous density field (fuzzy / bounded fog) ----------
     // When `density` is non-empty, the base coefficients sigma_a/sigma_s are
     // MULTIPLIED by a dimensionless scalar field density(x,y,z) >= 0 evaluated per
@@ -227,6 +254,24 @@ struct Medium {
     // is 1 everywhere (the classic homogeneous medium; unchanged behaviour).
     std::vector<PatNode> density;
     double densityMax = 1.0;   // majorant: sup of density over `bmin..bmax` (delta/ratio tracking)
+
+    // --- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
+    // When `ior` is non-empty, this region is a GRADIENT-INDEX medium: light
+    // rays do NOT travel straight through it — they bend continuously, obeying
+    // the Eikonal ray equation d/ds(n · dr/ds) = ∇n. `ior` is a compiled pattern
+    // program over world `x y z r` (same VM as `density`), giving the local
+    // refractive index n(x,y,z) (≥ ~1). The tracer integrates the ray in small
+    // steps of `iorStep` world units inside the region's bound (so a GRIN medium
+    // needs a `bounds{}`), using central differences of n for ∇n. This produces
+    // mirages, gradient lenses, hot-air shimmer, etc. A GRIN region may also be
+    // absorbing/scattering, but the classic use is a clear bending field
+    // (sigma_a = sigma_s = 0). The one canonical marcher lives in grin.h and is
+    // shared by the CPU backward tracer (mode R), the CPU forward light tracer
+    // (modes A/B/C) and the GPU forward megakernel/wavefront (dGrinMarch) — all
+    // bend rays identically. BDPT (mode D) REFUSES GRIN scenes (its straight-line
+    // connection geometry / MIS would be biased); use mode A/B/C or R instead.
+    std::vector<PatNode> ior;   // compiled n(x,y,z) program; empty => not GRIN
+    double iorStep = 0.0;       // Eikonal march step (world units); 0 => auto from bound
 
     // --- Optional imported .vdb/.nvdb sparse volume (baked to a dense grid) -----
     // When set, the density multiplier is TRILINEARLY sampled from a real NanoVDB
@@ -294,6 +339,38 @@ struct Medium {
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
         double d = patternEval(density.data(), (int)density.size(), c);
         return d > 0.0 ? d : 0.0;
+    }
+
+    // --- Gradient-index (GRIN) helpers ---------------------------------------
+    bool grin() const { return !ior.empty(); }
+
+    // Local refractive index n at a world point (>= a small floor). 1 when this
+    // is not a GRIN medium. Evaluated by the shared pattern VM (x y z r live).
+    double nAt(const Vec3& p) const {
+        if (ior.empty()) return 1.0;
+        PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        double n = patternEval(ior.data(), (int)ior.size(), c);
+        return n > 1e-3 ? n : 1e-3;
+    }
+    // ∇n at a world point via central differences with step h (world units).
+    Vec3 gradNAt(const Vec3& p, double h) const {
+        double inv = 0.5 / h;
+        double gx = nAt(p + Vec3(h, 0, 0)) - nAt(p - Vec3(h, 0, 0));
+        double gy = nAt(p + Vec3(0, h, 0)) - nAt(p - Vec3(0, h, 0));
+        double gz = nAt(p + Vec3(0, 0, h)) - nAt(p - Vec3(0, 0, h));
+        return Vec3(gx, gy, gz) * inv;
+    }
+    // Point-in-bound test (a GRIN region must be bounded). Mirrors clipToBounds'
+    // membership: sphere chord / AABB / implicit field. Unbounded => everywhere.
+    bool insideBound(const Vec3& p) const {
+        if (!bounded) return true;
+        if (boundShape == MediumBound::Sphere) {
+            Vec3 d = p - bcenter;
+            return dot(d, d) <= bradius * bradius;
+        }
+        if (boundShape == MediumBound::Implicit) return insideField(p);
+        return p.x >= bmin.x && p.x <= bmax.x && p.y >= bmin.y &&
+               p.y <= bmax.y && p.z >= bmin.z && p.z <= bmax.z;
     }
 
     // Clip a ray (o + t*d, t in [t0,t1]) to the bound, returning the sub-interval

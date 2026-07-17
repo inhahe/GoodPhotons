@@ -1,23 +1,130 @@
-can you make it so that simply running 'ftrace blah.ext' makes ftrace render a rasterization of the provided scene and show it? that way we can simply double-click on a file to get a quick preview.
+BTW, I forgot one thing in the spec to support: Good Photons' isosurface functions that import 78 of POV-Ray's 80 functions available for isusurface functions
+for "A live viewer (cheap: emit frames → your raster preview) — the 80% of GUI value you actually need to tune loops, without the interactive editor.", I guess we'll just re-use ftrace's rasterizer ability? Or can rasterizing be done significantly faster somehow?
 
-to me it looked like the lamp bulb was completely solid (due to how much it visually displaced what was inside it) while it needs to be just a shell, with a little bit of thickness.
+Idea: I wonder if this library concepts could be used interestingly to create 2D graphics, too? I'm not sure, but taking on a 2D output generator would be easy peasy.
+
+Add either/both of these to the plan .md if you like them.  
+
+Oh, and we could also tack on a sound generator. I mean, not to be more and more like Houdini, but just a cheap 2d graphics output and a cheap audio output as low-hanging fruit that all of this may enable as a novel approach to.
+
+can we make all of our pov-ray isosurface function functions available as general functions in our dag??<br>
+are some of them functions of x, y, and z? can any of those by generalizable as N-D functions?<br>
+what the heck should we call this? Snakecraft? Snakeskin?<br>
+convert any arbitrarily long string of N-D rotations to a matrix+offset&nbsp; for multiplication<br>
+rotate any 4-d spacetime object into a new spacetime object - I don't think we can modulate anything over time then&nbsp; - but we can if we isolate the 4-d object, e.g., as a transformed video node - except it requires two passes over time/time caching/time freezing<br>
+
+----
+
+Option to rasterize clear objects as clear, just with no refraction? Just dim the light of what's behind them by a little bit, and the more clear surfaces between you and it, the more it's dimmed? Or not even dimmed, but made a bit milky?
+
+^ done
+
+I find that I can't turn quickly enough while exploring in --explore. We should probably either increase the sensitivity of mouse movements, or make turning non-linear with how far the mouse pointer diverges from the center of the screen.
+
+----
+
+Three of the museum stands are empty, one object is on the floor, and another seems maybe wedged between two ojbects. I suggested making a tool that can properly lay things down using pybullet without allowing them to fall on the floor... 
+It would record the up-down/left-right position of the thing in question. 
+It would construct a vertical wall all around the perimeter of whatever mesh face the thing is over.
+Then it would call Pybullet on the scene (or maybe faster if it's called per object-and-stand?).
+Then it would pick it up from wherever it was left and place its x-y coordinates in the same x-y coordinates it was found in since before the script ran.
+Then it would remove the surrounding temporary wall.
+I  didn't see the Klein bottle in the image or the thing that was supposed to replace the gyref_gyroid_adaptive and take care of the caustics or the xenon lamp
 
 ----
 
 
-Here's the glb's i have of a xenon lamp which is sittin on a display holder, all in `d:\visual studio projects\forward raytracer`:
-One with textures and no segments showing only the insides
-One with segments and no textures showing only the insides
-One with textures and no segments showing the bulb but not the insides
-One with segments and no textures showing the bulb but not the insides
-And I have four pictures to show what they look like 
-Meshy_AI_Sphere Between Tubes_1784131000_part-segmentation.png
-Meshy_AI_Twin Spindle Assembly_1784131877_part-segmentation.png
-Meshy_AI_Two_Part_Precision_Sp_0715162301_texture.png
-Meshy_AI_Spherical_Vacuum_Cham_0715163130_texture.png
-The glb files are named the same things but with a the glb extension instead of the png extension.
-We just have to combine the bulb ones with the non-bulbs ones in order to (a) model both the inside and the outside, and (b) separate it from its display holder. And we have to change the texture on the bulb because it sucks. 
-Also, somehow, we need to wire up the xenon lamp to something so it's not just a disembodied piece in a room. Maybe we should wire up the camera curve to be able to define any parameters we want for anything. No, that would only work for wiry things like a flexible cord we might invent for this. 
+give the window an extra space below the imagery with buttons you can press. one to toggle clipping, one to reset your position back to where you started from. and one to lock forward and backward to forward and backward on the camera path (locks the user's orientation to the camera path's orientation too). and one to show a timeline of cameras that the user can slide across or jump to or press play or pause on. and two inputs: one for how many cameras to jump per screen update, and one for how many cameras per second to traverse despite the rasterizing rate (defaults to whatever fps is defined by the scene). these are opposite choices, so there also has to be a switch or a couple of buttons to choose between them. actually, the 'lock to camera timeline' button and the 'view/play/pause/jump across' camera timeline span should probably be the same option.
+
+Also have a button to define a flyby curve that simply follows where the user goes. Probably should have uniform timing rather than following the timing of the user. But, let's have another option. While playing, the user can use a slider or mouse wheel to modulatee the speed at which the camera will move at that time (i.e., the inverse of the density of cameras at that point in the camera density curve). Of course, it also modulates the speed at which the flyby is played. And the user can go back and play again and further modify it, and the mouse wheel movement adds to the speed or takes away from the speed. AND add a mode where the user can do this with a rendered video or set of pictures in a directory so they can view the flyby of an actual rendered result and perhaps change the speed. Maybe another option could be that the user can define the camera orientation curves by changing the orientation as they scrub/play through the camera curve, maybe even setting curve points via an interface. Actually, that would be a great way of allowing the user to define his own camera motion curve, too - he can move freely through the scene (in raster mode) and set a point recording the camera's current position and orientation. Or delete a point. Or scrub through the curve he's made so far and then move outside of it and insert a point. Let's work out what it'll be before you commit to anything.
+
+^ doing
+
+----
+
+verify that the scene description language now has a clause for specifying the preferred render mode.
+
+----
+
+put a fog with a rainbow in our showcase video/still?
+
+-----
+
+Would it be possible to simulate a raindow in some rain/fog with some degree of honesty and/or accuracy? I know that rainbows are caused by the photons bouncing around the interior of individual woter droplets, and i think actually simulating that many water droplets would take too long? but it could work if they're big ones? but big water droplets wouldn't just be hanging around in mid-air? but maybe they would be if it's raining? but that would still be too complicated a scene? all those drops with all those triangles.. or actually it would be sphere primitives, but still? BUT, even if we can't do that, could we just simulate the end result when we have fog in a way that's accurate in more or less all conditions?
+
+^ doing
+
+""The gradient-index medium is implemented, but only as Phase 1: CPU backward tracer (-mode R -device cpu), gated by grinAny (IOR-free 
+scenes stay bit-identical), with a demo scene scenes/grin_lens.ftsl. It is not in the xenon lamp — the lamp is still a plain fixed-IOR dielectric (ior glass:xenon-lamp), not a GRIN field. As scene.h:242-243 notes, the forward (A/B/C), BDPT (D) and GPU paths still treat GRIN regions as straight-line. Putting GRIN into the lamp for real needs Phase 2 (rolling it through those paths) — which I haven't started and 
+was waiting for your go-ahead on."
+Yeah, you can go ahead.
+
+For the PyBullet physics:
+1. put scaffolding perimeters around the tops of all the museum stands
+2. do the physics
+3. they'll fall somewhere onto the table
+4. remove the scaffolding perimeters
+5. center each piece on the stand
+or, alternatively
+1. if a piece stays on the stand, simply center it
+2. if a piece rolls on the floor, take it where it from where it was with its current rotations, place it above the center of the museum stand, and just use our function that drops it directly downward until it stops.
+i think we should make a convenience tool that does just this (not sure which of the two strategies would be better for a general convenience tool...if it uses the first strategy, it would have to figure out where to put the scaffolding perimiter, but it could just put them around the perimeter of whatever mesh face is directly under the object, and then it wouldn't have to worry about the fact that if it falls off, it won't necessarily fall onto something that's at the same angle as its original platform..
+
+for your sampling strategy for reducing the metering stage, i see two problems:
+1. the spacing between frames should probably be random in order to eliminate any bias that comes from periodic patterns in the data? idk.
+2. what about for really small numbers of frames? for example, if the user wants 40 frames, it'll only sample in two places out of those 40. a lot can happen along the length of 40 frames. maybe you should interpolate a non-linear function of the minimum number of sample frames you need to get for a given number of frames using further monte carlo simulations? 
+
+^ doing
+
+slight correction: don't center the pieces on anything after you pick them back up. place their left-right/forward-backward positions exactly where they were before pybullet ran, and then run our own lowering algorithm.
+
+^ pending
+queued, unattended prompt:
+
+did you implemented the gradient-index medium and put it into the xenon lamp for its interesting effects?
+
+i noticed the objects in gallery.ftsl aren't dropped down like they'd been pybullet'd like i want them to be.
+
+i still can't figure out how to actually move around in x/y/z space in the viewer. there's no controls, no keyboard legend..and the keyboard controls for the crosshairs are wrong. left and right make it go farther and closer. they should make it go left and right. and up and down make it go left and right. 
+
+how did you eliminate the problem of the long pause between the end of tesselating and the beginning of showing the preview where it was doing the meterin stage, but decreasing the number of samples didn't help?
+
+----
+
+when we have a light source or filter defined by N points on a curve, do our photons come out only at those N frequencies, or do we have a smooth curve between thew? because i think the latter would be better for truer caustics.
+
+i just realized that for the inside of the xenon lamp, we need it to be the refractive index of xenon, not the refractive index of air. (i think we also have to take into account if the xenon in xenon lamps is under a relative vacuum or pressure compared
+
+The A/C near-black gross-scale gain mis-seat (documented in known-issues.md with the exact plan) — the other half of a full A/B/C unification. Mode B is now internally correct wrt aperture; A/C need their gain re-seated with CPU+GPU splat parity before all three agree at equal power.
+The GPU-BDPT OOB memcheck (PID 5128) is still running under compute-sanitizer — it was launched in a prior session so I get no completion hook, and it's very slow, so I'm not idle-polling it. Tell me if you'd like me to keep watching for the fault line
+
+The current hero bulb has no envelope at all. It's a bare emissive light sphere radius 0.05 (gallery.ftsl:284) — there's no quartz shell and no interior region, so right now there's literally nothing to assign an interior IOR to. Giving it a xenon interior means adding a fused-silica envelope shell + a xenon interior region around the arc. The engine supports exactly this via its priority medium stack (Schmidt–Budge): an outer fused-silica sphere (envelope) + a higher-priority inner xenon sphere that "carves out" the gas interior, with the small emissive arc at center. That's clean to build — but wrapping the sole light source in glass does change the scene's shadows/caustics, which the hero room is art-directed around.
+
+yes, do the other half of the full a/b/c unification, and yes, keep monitoring pid 5128. 
+as for the xenon lamp, "here's no quartz shell and no interior region, so right now there's literally nothing to assign an interior IOR to", i thought we went through a lot of trouble to give it an actual glass bulb around it...if not, that's what we should have, it's what matches the original image that i made the meshes for the xenon light from. just make sure it has some thickness and that it has the ior of quartz. or do i misunderstand something? yeah, have the quartz outer or the fused-silica envelope shell or whatever and the xenon interior region. 
+"Which fill regime for the interior value — cold-fill (~1.0065) or a mid-operating approximation (~1.003)? " i'm not sure what that means, but it sounds like the second option is the more accurate? do whatever's more accurate, anyway. 
+"Do you want the envelope added to the hero scene now?" yes. but what is this? i think you said our physics doesn't support it? or was that something else. 
+" A constant xenon IOR is very likely sub-perceptible. The dominant interface is quartz↔gas (1.4585 vs ~1.006); swapping the interior from air (1.0003) to xenon (1.006) shifts that Fresnel/refraction/TIR by ~0.06%. The genuinely interesting xenon-lamp optic — the shimmering arc mirage/schlieren — comes from the density gradient, which needs a gradient-index medium we don't have (media are homogeneous). A single IOR won't reproduce it.
+so, what i want to do is support gradient-index mediums, is that possible? 
+
+^ doing
+
+"""
+So a metering frame is a fully-rendered frame whose only job is to have its brightness measured. That's why gallery does 144 silent renders before the "real" pass. Whether showing them is "useful enough": they're genuine frames, so the progress pass doubles as a real flyby preview (you see the camera path sweep through, confirming geometry/camera are right) instead of a ~56s blank window. It's purely additive and cheap. The deeper efficiency question — do we need to meter all 144, or could we subsample? — is separate; the indicator doesn't change the metering cost, it just makes the existing cost visible.
+"""
+five thoughts.
+1. yes, definitely show the metering flyby as it's happening, with some indicator that says it's not brightness-adjusted yet.
+2. i'm pretty sure the laws of statistics say that we should be able to have a much smaller sample base of pixels per frame to get statistically accurate metering, so we should do that - i don't know statistics, so i don't know how many samples we need per frame, do you have access to a scientific calculator tool? do you think it would be useful for you to have access to a tool like mathematica or wolfram alpha to help figure out sophisticated things?
+3. if we did keep rendering and showing the metering stage, it would make more sense just to store the pixels in floating point or something so that once we have our metering averages, we can simply show them again multiplied by the meter rather than recalculate them all. 
+4. i've yet to see any x/y/z controls on the ftrace previews, how does the user navigate forward, backward, up, down, right and left?
+5. yes, do the unification.
+
+
+make it so the user can drag the crosshairs exactly left/right/up/down in the scene (relative to their current view direction) with their mouse, or drag farther or nearer with alt, shift or ctrl+up/down or mouse wheel. also make the red crosshairs shrink or grow as they get  farther or nearer according to the perspective settings of the camera.
+
+----
+
+"One incidental observation worth flagging: the gallery.ftsl render frame itself (not tessellation) is very slow at the 1440px preview upscale — CPU kept climbing past 500s while the single z-buffer frame rendered. That's a pre-existing heavy-scene issue separate from this change, but if it's bothering you I can look into why the raster frame is so costly for that particular scene." Yes, try to optimize things, i mean the tight loops/cpu-heavy things, as much as possible (until the point of diminishing returns). in fact, write that in claude.md
 
 ^ doing
 
@@ -27,32 +134,7 @@ rasterize the showcase still of the room we made
 
 render the flyby scene to a .gif in the raster mode and also
 
-
-let's do this:
-"""
-Bottom line: you're correct. In absolute EV, mode B ignoring the aperture is physically incomplete — it should "virtualize" the aperture by applying its 1/N² light-gathering as an exposure factor while keeping pinhole DoF. And crucially, mode B is the one mode where that's clean rather than a double-count, since it carries no physical R² (unlike A/C).
-
-The proper fix isn't a one-line patch to B — it's unifying the absolute-exposure model across all three modes with the camera equation (π/4 · 1/N², ideally with cos⁴θ vignetting), seated so A, B, and C agree at equal power. That also subsumes the earlier bug (absolute A/C rendering near-black from the B-only gain). Doing them together avoids making B self-consistent but still mismatched against A/C.
-
-Want me to take that on — a single camera-equation-based absolute-exposure pass across A/B/C — or leave it logged for now? It touches the real render pipeline (not just the preview) and needs a careful re-validation of B-vs-A-vs-C at equal power, so it's a more involved change than the preview work.
-"""
-
-----
-
-ok, two things.
-1. the person should be able to specify a camera (just like specifying the camera used for the live preview) by nearest to x,y,z, by camera index, or by defining a new camera, for what auto-exposure to lock all the cameras to, and secondly should be able to lock it to an *average* of all the cameras. 
-2. the raster preview should regard the auto-exposure settings too, approximating them as well as it can analytically (or maybe we could throw in a bit of empiricism in this one too), otherwise it'll just be off... and also all the work we did to make brightness accurate based on the three other variables would be moot.
-
-^ doing
-------------------
-
 7. for level 0, there should be a warning if we detect any place where we need a priority definition and we don't get one - either by analyzing the scene ahead of time or while rendering.
-
-8. does the non-open-sounce one support any scene features that the open-source one doesn't, and that our renderer can use? if it does, then maybe we should support the non-open-source one as an option too, with notes for the user about installing it. 
-
-9. no, i don't want them in the scene, i just want them made as objects to be available for users. if objects currently can't specify pinhole camera locations and parameters or film specifications for mode A, then we should invent a format that does (or extend any of the already existing formats that have mechanics for custom extensions?). as for the knobs, i'm not sure what you mean. 
-
-^ doing
 
 another thing to add to the roadmap if you agree: make tools or cli options to detect if a scene has (a) dialectrics within dialectrics, and/or (b) overlapping dialectrics. (for isosurfaces, maybe we could just use their bounding spheres/boxes? or we could do marching cubes?) maybe we could also have a cli option to use those findings for automatically enabling or or disabling dialectric-within-dialectric and/or overlapping dialectric support in the rendering algorithms.
 

@@ -14,7 +14,11 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 - **Spectral transport** — single-wavelength photons over a configurable band
   (e.g. `spectral 360 830 1`); per-wavelength refraction gives dispersion and
-  chromatic aberration with no extra code.
+  chromatic aberration with no extra code. Carrying **one wavelength per photon**
+  — rather than a bundled RGB triple or wavelength-multiplexed packet, as most
+  forward light tracers do — means dispersive **caustics** (light focused through
+  a prism, a lens, or a glass of water) split into true spectral colour instead of
+  smearing an averaged RGB, for more physically realistic focusing.
 - **Forward *and* backward** engines that validate each other (mode `V` reports
   the residual between them).
 - **Realistic cameras** — from a simple pinhole to a **physical multi-element
@@ -31,11 +35,32 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **density fields** — either formula-defined blobs with soft edges *or* imported
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU).
+- **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
+  field bends rays continuously along the Eikonal ray equation (mirages, gradient
+  lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward
+  light tracer (modes `A`/`B`/`C`, CPU **and GPU**) and the backward reference
+  (mode `R`, CPU); BDPT (`D`) refuses GRIN scenes (its straight-line connection
+  geometry would be biased — use `A`/`B`/`C` or `R`).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
   BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
   across a whole camera flythrough), megakernel or wavefront, with CPU fallback.
+- **Whole camera flybys in one render** — some modes amortise a *single* light
+  transport pass across an entire moving-camera shot. The **view-independent photon
+  map** (mode `M`) is built **once** from one forward photon pass, then reused to
+  gather every frame of a camera flythrough (or every camera of a multi-camera
+  render), so an *N*-frame flyby costs roughly one render's worth of photons instead
+  of *N* — far more efficient than re-tracing the scene per frame.
+- **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
+  **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
+  record / insert / delete / steer control points, paint per-point speed and look
+  direction, round-trip and revise an existing curve, then save a ready-to-render
+  `camera_curve { … }` block. See [Camera animation](#camera-animation-camera_path-camera_orbit).
 - **Long-running renders** — time / noise / forever budgets, live ANSI preview,
   and checkpoint/resume.
+- **Loom animation toolkit** — a bundled Python toolkit for building scenes and
+  seamless looping animations that emit `.ftsl` per frame (procedural ribbons/tubes,
+  N-D-transformed isosurfaces, motion graphics, and more). See
+  [`tools/loom/`](tools/loom/README.md).
 
 ---
 
@@ -118,7 +143,9 @@ paths they can capture at all**.
 > to world space) and z-buffers each camera as solid, flat diffuse+headlight
 > triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
-> ghost and a mirror as a flat tint. Shading sums a diffuse term from **every**
+> ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
+> `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
+> that still refracts nothing.) Shading sums a diffuse term from **every**
 > scene light using its real position/direction (spot cones included), so multi-
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
@@ -132,23 +159,202 @@ paths they can capture at all**.
 > instead of an arbitrary fixed level. Because that p99 anchor divides out any
 > uniform scale, **aperture** is (correctly) invisible in the default pipeline;
 > it feeds preview brightness only where the real renderer keeps it — an
-> *absolute-EV* scene (a light with `power`/`lumens`) shot in a finite-lens catch
-> mode (A/C), where a wider pupil is genuinely brighter (∝ 1/N²) and the auto-
-> exposure is bypassed. A `camera_curve`/`camera_path` with `exposure_lock` shares
+> *absolute-EV* scene (a light with `power`/`lumens`), where a wider pupil is
+> genuinely brighter (∝ 1/N²) and the auto-exposure is bypassed. This holds in the
+> finite-lens catch modes (A/C), where the pupil area rides in the splat weight, and
+> now in the pinhole splat (**mode B**) too: when an `fstop`/`lens` is authored, an
+> absolute mode-B render applies the camera-equation light-gathering term `(π/4)/N²`
+> as a pure exposure factor (f/2 renders exactly four stops brighter than f/8) while
+> keeping the pinhole's zero depth of field. A `camera_curve`/`camera_path` with `exposure_lock` shares
 > one anchor across all its frames, so a preview flyby doesn't flicker
 > frame-to-frame just as the final render won't. It honours the `-camera`
 > selection and the `-window` live view, and a `camera_curve` flyby animates
-> through every frame in the window. Control the
+> through every frame in the window. On a heavy scene the live window **pops up
+> immediately** — before tessellation finishes — showing a dark placeholder and a
+> **`tessellating (N/M, P%)`** progress readout in the title bar (and matching
+> `[raster] tessellating implicit N/M` lines on stdout) as each isosurface/CSG
+> implicit is marched, so you're never left staring at a blank screen wondering
+> whether it hung. Control the
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
 >
+> **See-through clear objects — `-see-through`.** By default a clear material
+> (dielectric / thin-film / filter / diffuse-transmit) previews as a solid pale
+> ghost. Pass **`-see-through`** (aliases `-seethrough`, `-glass`) to instead render
+> those surfaces as actually transparent — *without* refraction. Each clear surface
+> between the camera and the opaque background **dims** what's behind it by a
+> per-surface transmittance and adds a little **milky haze**, and both effects
+> **accumulate with the number of clear surfaces crossed** (a closed glass ball =
+> two crossings, front + back), so thicker/stacked glass reads progressively darker
+> and hazier. A grazing-angle (Fresnel-like) term thickens the haze at silhouettes
+> so glass edges still read. It's **order-independent** (the transmittance is a
+> commutative product), so overlapping transparent objects need no depth sort and
+> the pass stays nearly free. Tune the per-surface transmittance with
+> **`-glass-clarity <0..1>`** (default `0.85`; higher = clearer/less dimming, and
+> passing it implies `-see-through`). This is a *look* preview only — there's still
+> no bending, reflection or coloured absorption. Example:
+> `ftrace -in scenes/cornell.ftsl -raster -see-through -window -o png/preview.png`.
+> Because rasterizing is nearly free, a preview whose size you haven't pinned with
+> `-r` is **upscaled so its long edge is at least 1440 px** (aspect preserved) —
+> a scene that authored a small `film { res 256 256 }` still previews big and
+> readable instead of a postage stamp; already-large cameras are left as-is, and a
+> real light-transport render always keeps its authored resolution.
+>
+> **Interactive camera (raster + live window).** When a **single** camera is
+> rasterized into a `-window` (a still preview, including the double-click default —
+> a `camera_curve` flyby instead animates through its frames), the window becomes an
+> interactive **fly-camera**: move the mouse over the window to look around, then fly
+> around and read off the numbers to author a `.ftsl` camera. There is a single unified view
+> — you always **travel where you look** (or the exact opposite when reversing), so
+> there is no separate "aim the target" mode and no crosshair. The world up is fixed,
+> so there is no roll. (To drop straight into this viewer **seeded at the first frame
+> of a multi-frame flyby** — instead of animating through every frame — add
+> `-explore` / `-fly`; the flyby's frames become a **camera-path timeline** you can
+> scrub, play and lock onto from the control panel below the image. See the flags table.)
+>
+> | input | does |
+> |---|---|
+> | **move the mouse over the window** | **steer** (joystick/rate look) — the cursor's offset from the window centre sets a **turn rate**: rest it near the centre (a neutral dead zone) and the view holds still so you can look at the scene; push it toward an edge and the view keeps turning that way (left/right = yaw, up/down = pitch, clamped just shy of straight up/down) for as long as you hold it there, so you can look a full circle. Where you look is where you fly. The pointer stays **visible** and free; steering only happens while the cursor is inside the window and stops the moment it leaves. |
+> | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
+> | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
+> | **mouse wheel** | **dolly** one step forward (up) / back (down) per notch — a discrete, fully-rendered nudge for precise positioning (can't overshoot into geometry) |
+> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (starts at 2 % of the scene radius, clamped to a sane band) |
+> | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
+> | `0` (or `Home`) | reset to the authored camera |
+> | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
+> | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
+>
+> **Motion is feedback-locked, not wall-clock-based.** Each held-key frame (and each
+> wheel notch) moves the eye exactly one fixed `step`, and *one frame is rendered per
+> move* — so travel rate automatically scales with render speed: a heavy scene dollies
+> in a careful crawl, a light one moves briskly, and because every position you pass
+> through is actually drawn you can **never skip through a wall into the void between two
+> frames you didn't see**. Adjust the per-move distance live with `Ctrl`+wheel.
+>
+> **Wall collision keeps the camera out of solid geometry** (on by default). Each move is
+> cast against the scene (the engine's own BVH), so you can't fly through a wall. `C`
+> cycles the response: **`slide`** (the default) stops at the wall but lets the leftover
+> motion slide along it, so holding forward against a wall carries you around a corner
+> into open space; **`stop`** halts dead at the wall (no sideways drift); **`noclip`**
+> turns collision off entirely, to place a camera *outside* the room or *inside* glass.
+> Start with collision off via **`-noclip`** (`showcase_flyby.py --noclip`).
+>
+> **Control panel (below the image).** The live window reserves a strip under the
+> preview for on-screen controls, so you don't have to remember key bindings. Two
+> buttons are always present: **Clip** (cycles the same `slide` → `stop` → `noclip`
+> collision modes as `C`, showing the current mode) and **Reset** (jumps back to the
+> start — the authored camera in free flight, or frame 0 of the path when locked).
+> When you entered via `-explore` / `-fly` on a **multi-frame flyby**, the panel also
+> gains the flyby's **camera-path timeline** and its controls:
+>
+> | control | does |
+> |---|---|
+> | **timeline slider** | **scrub / jump** to any camera on the path — dragging or clicking snaps the view to that frame's exact eye, orientation, up and fov, and **locks onto the path** (pausing playback) |
+> | **Play / Pause** | auto-advance along the path (engages path-lock); it **stops at the end** of the timeline |
+> | **Path** (toggle) | **lock to / release** the path: while locked, forward/back travel along the timeline and the view uses each frame's authored orientation/up/fov (mouse-look and free translation are suspended); release to fly freely again from wherever you are |
+> | **cams/upd** | **stride** traversal speed: cameras advanced per **rendered frame** (feedback-locked, like the fly motion) |
+> | **cams/s** | **rate** traversal speed: cameras per **wall-clock second** (may skip frames on a slow render to keep real-time pace); defaults to the scene's authored fps |
+> | **per upd / per sec** switch | choose which of the two speeds above is in effect (they're mutually exclusive) |
+>
+> While locked to the path, `Space`/`+` and `Shift`/`-` move **forward/backward along
+> the timeline** (instead of through free space) at the selected speed, the mouse wheel
+> **nudges one camera per notch**, and the slider tracks your position live. Toggle
+> **Path** off (or press Reset) to return to free flight.
+>
+> **Camera-curve editor (author a flyby by flying it).** An always-present editor row
+> lets you build a real [`camera_curve`](#animated-cameras--flypaths) right in the
+> viewer — fly the shot you want, then Save it. It works from a lone camera or on top of
+> an existing flyby:
+>
+> | control | does |
+> |---|---|
+> | **Rec** | start/stop **recording** your free flight; while armed it samples the pose as you move, then (on Stop) turns those samples into control points — either every sample (**raw**) or a tolerance-simplified subset |
+> | **+Pt** | append the **current pose** (eye + look direction + up + fov) as a control point |
+> | **Ins** | **insert** a control point at the current scrub position (splits that segment) |
+> | **Del** | delete the **selected** control point — the one highlighted red in the overlay (see below) |
+> | **Save** | write the authored `camera_curve { … }` block to a file next to the scene (`<scene>_curve.ftsl`, non-clobbering) **and echo it to stdout** to paste into a scene |
+> | **raw** (checkbox) | keep **every** recorded sample instead of simplifying |
+> | **tol** | recording **simplify tolerance** in world units (Ramer–Douglas–Peucker on the eye path; `0` = keep raw) |
+>
+> As you author, a **live spline overlay** is drawn on the preview: the control points as
+> yellow markers — with the **selected** one highlighted **red** (the Del target) — and the
+> interpolated path as a green polyline, sampled with the **same centripetal Catmull-Rom**
+> math the renderer uses for `camera_curve`, so the preview is WYSIWYG. **Selecting a point:**
+> when you're locked to the path, the selection follows the timeline — the control point
+> nearest the current scrub position — so you just **scrub to a point to select it** (then
+> Del removes it); in free flight the selection is the point nearest the eye. The saved block
+> records each control point as a `point` plus a `look curve` (a second spline of `look_point`
+> targets, each placed one mean control-point spacing ahead along the view ray so the aim
+> spline stays smooth) so the camera's orientation is authored too, and carries the current
+> `up`, `fov_y`, render `mode`, `frames`, and scene `fps`.
+>
+> **Painting speed and orientation (Paint mode).** Two more controls sit at the right end
+> of the timeline row: a **Paint** toggle and a **Flat** button, with a live speed readout.
+> With **Paint** on and the view locked to the path, *fly the timeline* (Play or the
+> throttle keys) while:
+>
+> - **rolling the mouse wheel** to paint the **local traversal speed** at the current point
+>   — an *additive brush* (wheel up = faster there, down = slower), clamped, so you can
+>   play a pass, speed up the boring stretches and slow down the money shot, then play
+>   again to refine. Speed is the inverse of camera density, so it's exported as a
+>   `density_at` track and **both** the live playback pace **and** the rendered flyby's
+>   frame spacing follow it. The readout shows the multiplier (e.g. `1.35x`); **Flat**
+>   resets the whole speed track to a uniform pace.
+> - **moving the mouse** to **steer the orientation** at the current point — the nearest
+>   control points' look directions bend toward where you aim, reshaping the `look curve`
+>   live (WYSIWYG in the overlay and in the saved block).
+>
+> With Paint **off**, the wheel nudges one camera per notch and mouse-look is suspended
+> (the normal path-lock behaviour).
+>
+> **Editing an existing curve in place (round-trip).** When you open a scene that already
+> contains a `camera_curve` with `-explore` / `-fly`, the editor **seeds itself from that
+> curve's control points** — each `point` becomes an editor control point (with its look
+> direction taken from the curve's `look curve` / `look_at` / tangent, and its local speed
+> from the `density` track). The control-point markers appear in the overlay immediately,
+> so you can Del/Ins/steer/re-paint speed and Save a revised curve rather than starting
+> from an empty editor. The loaded flyby still plays at full fidelity until you make the
+> first edit. When a scene defines **several** `camera_curve`s, the editor seeds from the
+> one you're actually flying (chosen with `-camera <name>`), not blindly the first.
+>
+> **Reviewing a rendered flyby (`-review <base>`).** Once a flyby has actually been
+> *rendered* to a directory of images, `ftrace -review <base>` plays that sequence back
+> on the same live window + timeline — so you can watch the real rendered result (not the
+> raster preview), scrub/Play it, and **re-time** it. `<base>` is a filename stem with an
+> optional path; frames are the files named `<base><digits>.<ext>` (ftrace appends a
+> zero-padded index), so `-review png/swoop/swoop` matches `swoop000.png`, `swoop001.png`,
+> … (numeric-sorted). It reads `.png` / `.jpg` / `.bmp` / `.tga` and ftrace's own `.ppm`
+> output. No scene is loaded — it's a pure playback utility. With **Paint** on, the wheel
+> paints local speed exactly as in the editor (an additive brush, fast regions skimmed,
+> slow regions dwelt on); **Flat** resets it. **Save** writes a re-paced copy of the
+> sequence into `<dir>/retimed/` (each output frame is the source frame chosen by the
+> painted speed profile) and prints an `ffmpeg` line to assemble it into a video. Close
+> the window to finish.
+>
+> The controls are deliberately **keyboard-layout-independent** (`Space`/`Shift` and
+> the `+`/`-` keys land in the same place on QWERTY, Dvorak, Colemak, etc.) — there
+> are no letter-key bindings to relearn. The mouse pointer stays visible the whole
+> time — nothing captures or hides the cursor. Steering is **rate-based**: the cursor
+> acts like a joystick whose distance from the window centre sets how fast the view
+> turns (centre = a dead zone that holds still so you can see the scene; toward an edge
+> = keep turning that way), and moving the pointer off the window (to the title bar,
+> another app, etc.) stops the turn entirely. Because the turn is applied **per rendered
+> frame** (like the fly motion), a heavy scene turns in careful steps you actually see
+> rather than spinning past. The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
+> the live window's resolution — drag a corner to make the preview smaller (and
+> snappier) or larger (and sharper); the aspect ratio and the readout are
+> resolution-independent, so this only trades preview sharpness for speed while you
+> navigate. Close the window to finish.
+>
 > **Double-click / bare invocation.** Running ftrace with just a scene file and
 > nothing else — `ftrace scene.ftsl` (a positional path ending in `.ftsl`,
 > `.scene`, or `.fts`, as produced by a file association or drag-and-drop) —
-> defaults to exactly this quick preview: it turns on `-raster` **and** `-window`
-> automatically and shows the room in a live window, writing the preview PNG to a
-> temp file (no stray output in the working directory). Passing any real-render
+> defaults to exactly this quick preview: it turns on `-raster`, `-window`, **and**
+> `-keepwindow` automatically and shows the room in a live window that **stays open
+> after the raster finishes** (so a double-click preview doesn't flash-and-vanish —
+> close the window yourself to exit), writing the preview PNG to a temp file (no
+> stray output in the working directory). Passing any real-render
 > control (`-mode`, `-n`, `-time`, `-noise`, `-forever`, `-device`, `-camera`,
 > `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
 > normally; `-in <path>` is likewise always an explicit render, never a preview.
@@ -161,7 +367,10 @@ paths they can capture at all**.
   an aperture. GPU-accelerated. *Cost:* a pinhole has no depth of field, and it
   **cannot render specular-first pixels** (a mirror/glass surface seen directly
   splats nothing and stays black — use `P`, `D`, or `R` for those). Best default
-  for diffuse and caustic-heavy scenes.
+  for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
+  `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
+  applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four
+  stops brighter than f/8, matching a real sensor (and A/C, once their gain is fixed).
 - **`A` — finite-lens camera (efficient depth of field).** A physical finite
   aperture + thin lens + film, but imaged by **next-event splatting** each photon to
   the lens pupil (like `B`'s splat, through a real aperture instead of a pinhole).
@@ -1014,6 +1223,18 @@ at the poles, a grid on box faces) instead of slicing through world space. See
 `-fog <sigma_t> -fogalbedo <a> -fogg <g> [-fograyleigh]`. Henyey–Greenstein phase
 function by default; Rayleigh optional.
 
+**Rainbow (water-droplet) phase.** Add `phase rainbow { .. }` to a medium and its fog
+scatters through a physically-tabulated Airy water-droplet phase instead of the smooth
+HG lobe, so rain/mist actually shows a **primary bow (~42°) + secondary bow (~51°)**,
+wavelength dispersion (red-outer/violet-inner on the primary, reversed on the
+secondary), **Alexander's dark band**, and **supernumerary arcs**. Features are on by
+default; block knobs (`droplet_um`, `secondary`, `supernumerary`, `strength`,
+`forward_g`, `secondary_ratio`) tune or disable them — small drops broaden toward a
+white **fogbow**. Point the camera at the antisolar point with a distant sun behind it
+and keep the fog thin (single-scatter regime). Evaluated by the CPU tracers (forward
+A/B/C, backward R, BDPT D); a rainbow-phase scene automatically falls back to the CPU
+on the GPU backend (the device volume path is HG-only). See FTSL.md §12.
+
 **Multiple, overlapping media.** Author as many `medium` blocks as you like — they
 coexist as independent regions (e.g. two differently-tinted fog orbs plus a faint
 global haze). The forward tracer superposes them physically: extinction adds (total
@@ -1080,6 +1301,19 @@ volumes are bounded by a safety cap; a native sparse device sampler is a future
 optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
 `density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
+**Gradient-index (GRIN) media — bending light *(experimental, mode `R` only)*.** Give a
+medium an `ior "<expr over x y z r>"` field (or `ior pattern:<name>`) and it becomes a
+**gradient-index region**: rays that enter its `bounds{}` no longer travel straight — they
+**bend continuously**, integrating the Eikonal ray equation `d/ds(n·dr/ds)=∇n` with a
+small symplectic march step (`ior_step <v>`, default 1/64 of the smallest bound extent).
+This makes mirages, hot-air shimmer, and **gradient lenses that focus/warp with no glass
+surface at all**. E.g. `medium { bounds { center 0 0 2 radius 0.9 } ior "1.6 - 0.6*(sqrt(x*x+y*y+(z-2)*(z-2))/0.9)" }`
+is a radial index ball (n=1.6 core → 1.0 rim) that visibly lenses a checkerboard behind it
+(`scenes/grin_lens.ftsl`). **Currently only the CPU backward tracer (mode `R`) bends GRIN
+rays** — the forward modes (A/B/C), BDPT `D`, and all GPU paths still trace these regions
+straight (they ignore `ior`), so render a GRIN scene with `-mode R -device cpu` for now.
+Wiring the Eikonal march through the other tracers/GPU is tracked in `known-issues.md`.
+
 ---
 
 ## Scene language (FTSL)
@@ -1100,11 +1334,63 @@ fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_cur
 `procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`,
 `gallery.ftsl` (a large room packed with varied materials around a gold gyroid), …).
 
+**Scene-header defaults (`default_mode`, `fps`).** The `scene { … }` header can set
+two project-wide defaults alongside `units`/`spectral`:
+
+- **`default_mode <letter>`** — the render mode to use when *nothing else* selects one:
+  no `-mode` on the CLI, and the camera/render blocks don't author their own `mode`.
+  It's the lowest-priority source, so the resolution order is `-mode` (CLI) → a camera's
+  own `mode` → `default_mode` → the built-in `B`. Handy when several cameras would
+  otherwise all repeat the same `mode M`.
+- **`fps <n>`** — the default playback rate for flyby animations, read by the assembly
+  tooling (e.g. `tools/showcase_flyby.py` when `--fps` is omitted). A `camera_curve`/
+  `camera_path`/`camera_orbit` block can override it with its own `fps <n>`; the tool's
+  resolution order is `--fps` → the flyby's `fps` → the scene-level `fps` → `30`. `fps`
+  is purely a playback hint — it doesn't change what ftrace renders.
+
+### Conditional blocks (`prefer { … } else { … }`)
+
+Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
+media** and **non-rectilinear (fisheye/panoramic) cameras**, which the bidirectional
+modes (`D` BDPT, `U` VCM) can't handle because their path-connection geometry assumes
+straight edges. Rather than maintaining two separate scene files, wrap the
+mode-sensitive blocks in a `prefer { … } else { … }` chain:
+
+```
+prefer {
+    camera "cam" { … mode D … }      # fast, robust — but no GRIN
+    medium  "lampgas" { … }           # (plain, non-GRIN)
+} else {
+    camera "cam" { … mode B … }      # slower, but renders everything
+    medium  "lampgas" { … ior … }     # GRIN version
+}
+```
+
+- Each **branch** is a complete set of top-level blocks (so it carries its own camera
+  mode *and* its own media — the two travel together, dissolving the "which mode
+  supports which medium" circularity).
+- `else` chains **flat** — `prefer { A } else { B } else { C }` — and you may **not**
+  nest a `prefer` inside a branch.
+- At load time the resolver **trial-builds each branch in order and picks the first one
+  that's renderable** under the active mode; if none qualify it falls back to the last
+  branch. It prints `[prefer] branch N rejected (<reason>); trying the next` and
+  `[prefer] using branch N of M` so you can see which won.
+- Only **cameras** and **media** (the features with real mode gaps) participate in the
+  support test; everything else always builds.
+
+The showcase (`scenes/gallery_settled.ftsl`) uses this to render in mode D today while
+keeping a mode-B "full-effects" branch (with the GRIN lamp gas) ready for the future.
+See also `-on-unsupported` under the command-line reference, which controls what
+happens when the *selected* mode still can't render a feature (error / fall back to
+mode R / strip the feature).
+
 ### Camera animation (`camera_path`, `camera_orbit`)
 
 Both expand into a sequence of frames sharing look_at/up/fov/mode/film/lens; a
 multi-camera render writes one file per frame (`_<name>` inserted before the
-extension), which ffmpeg concatenates into a video.
+extension), which ffmpeg concatenates into a video. Any flyby block may carry an
+`fps <n>` playback hint (read by the assembly tooling; overrides the scene-level
+`fps` default — see *Scene-header defaults* above).
 
 - **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
   keyframed fly-through: the eye (and optionally look_at / fov) is linearly
@@ -1313,13 +1599,16 @@ add-on), this doubles as a Blender → FTSL path.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
+| `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
+| `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
+| `-on-unsupported error\|fallback\|strip` | What to do when the selected mode can't render a scene feature (GRIN media, or a fisheye camera in mode `D`/`U`). `error` (default) prints a diagnostic and aborts; `fallback` renders that camera in mode `R` (backward reference) instead; `strip` removes the offending feature (e.g. drops the GRIN `ior`, turning the medium into a plain one) and renders in the requested mode anyway. Complements `prefer { … } else { … }` in the scene file, which resolves the mode/feature mismatch *before* this policy is consulted |
 | `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
-| `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The index / nearest forms make it easy to aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
+| `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
 | `-device auto\|cpu\|gpu` | Hardware backend |
@@ -1357,10 +1646,16 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. |
+| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
+| `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
-| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window). See the preview note under **Render modes**. |
+| `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
+| `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
+| `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
+| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. |
+| `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
+| `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
@@ -1391,6 +1686,23 @@ A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.p
 Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
 **`ftbuf_to_png.bat`** (both call `-topng`), and **`ftsl_to_png.bat`** (renders the
 scene). Drop a file on one, or run `ppm_to_png.bat input.ppm [output.png]`.
+
+---
+
+## Loom — procedural animation toolkit
+
+The repo bundles **Loom** (`tools/loom/`), a programmatic-first Python toolkit for
+building 3-D scenes and **seamless looping animations** that render on ftrace. Loom
+animates *continuous* things — modulator graphs, curves, fields, N-D-transformed
+isosurfaces — and discretizes **last, per frame**, emitting one `.ftsl` per frame
+which ftrace then renders (raster preview or full path trace) and assembles into a
+GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, gyroid and other
+triply-periodic minimal-surface loops, higher-dimensional gyroid slices, function-driven
+materials, 2-D motion graphics, spacetime-transform videos) and stands alone (it can
+drive any renderer).
+
+See **[`tools/loom/README.md`](tools/loom/README.md)** for the tour, and
+`tools/loom/DESIGN.md` for the architecture.
 
 ---
 
