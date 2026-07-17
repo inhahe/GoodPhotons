@@ -393,7 +393,7 @@ that converges to the same physical image.
 
 | Mode | Best for | Speed | Specular-first | Depth of field | Caustics | GPU | Main limitation |
 |---|---|---|---|---|---|---|---|
-| **`-raster`** *(preview)* | Composition & camera-motion preview | Instant | — *(flat ghost/tint)* | ✗ | ✗ | ✗ *(threaded CPU)* | **No light transport at all** — no shadows, reflection, refraction or GI (`-see-through` fakes clear glass) |
+| **`-raster`** *(preview)* | Composition & camera-motion preview | Instant | — *(flat ghost/tint)* | ✗ | ✗ | ✓ *(`-device gpu`; else threaded CPU)* | **No light transport at all** — no shadows, reflection, refraction or GI (`-see-through` fakes clear glass) |
 | `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ✗ *(black)* | ✗ | ✓ | ✓ | Can't shade a directly-seen mirror/glass; no depth of field |
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
