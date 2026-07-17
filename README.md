@@ -799,6 +799,18 @@ physically-strictest end:
    schemes are the same idea softened: a few stratified wavelengths share one "hero"
    λ that drives the path (which is why they, too, can disperse).
 
+**"Accurate" splits into two independent axes, and ftrace is only unique on the
+second:**
+
+- **Spectral energy accuracy** — right colour under odd illuminants, metamerism,
+  saturated lights, fluorescence: everything RGB's three channels smear. *Every*
+  full-spectrum renderer below is as accurate here as ftrace, and the hero-wavelength
+  ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
+  per path instead of our one. **We claim no edge on this axis.**
+- **Dispersion — colours actually splitting** through a prism / lens / water. Only
+  the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
+  co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.
+
 Where popular physically-based renderers fall (verified against their docs/source;
 see sources below):
 
@@ -819,13 +831,21 @@ The **two forward light tracers that carry every wavelength on a single photon**
 the *spectral* builds of **PBRT-v3** (`SampledSpectrum`) and **Mitsuba 0.x**
 (`SPECTRUM_SAMPLES` > 3): both are RGB by default and, even compiled spectral,
 co-sample the whole SPD per photon — so neither reproduces colour-split dispersive
-caustics in its photon map. ftrace instead traces **one wavelength per photon** (the
-limit of PBRT-v4's hero-wavelength default), which is exactly what makes true
-dispersive caustics fall out of the forward pass — paid for with more photons for
-chromatic smoothness. Renderers such as **Maxwell** and **Indigo** are fully spectral
-throughout but are bidirectional/MLT path tracers, not forward photon mappers;
-**LuxCoreRender**, **Cycles** and **Arnold** are RGB pipelines (LuxCore invokes a
-single wavelength only at a dispersive glass hit).
+caustics in its photon map.
+
+To be clear, **ftrace is not uniquely spectrally accurate** — Maxwell, Indigo and the
+spectral builds of PBRT/Mitsuba integrate the true spectrum just as faithfully (and
+PBRT-v4 / Mitsuba 3 do it with *less* colour noise). What is unique here is the
+**pairing**: ftrace is the only renderer in this table that couples *accurate
+single-wavelength photons* with a *forward photon map*, so true dispersive **caustics**
+— focused, colour-split light, a rainbow thrown through a glass of water onto a table —
+fall straight out of the forward pass. Pure path tracers (PBRT-v4, Mitsuba 3) disperse
+a directly-seen ray correctly but struggle with *caustics* regardless of how good their
+spectral model is; the fully-spectral bidirectional/MLT tracers (**Maxwell**, **Indigo**)
+reach caustics by a different, costlier route; **LuxCoreRender**, **Cycles** and
+**Arnold** are RGB pipelines (LuxCore invokes a single wavelength only at a dispersive
+glass hit). ftrace pays for the combination with more photons for chromatic smoothness —
+the price of one wavelength at a time.
 
 ¹ Maxwell and Indigo document spectral transport end-to-end, but do not publicly
 specify whether a path samples one wavelength or co-samples many — so their
