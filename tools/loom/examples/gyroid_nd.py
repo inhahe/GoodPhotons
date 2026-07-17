@@ -56,6 +56,9 @@ Examples::
     # watch each frame render live in one preview window (title tracks the variant)
     python examples/gyroid_nd.py --count 3 --preview
 
+    # a 1280x720 video (preview window matches the size)
+    python examples/gyroid_nd.py --count 2 --size 1280x720 --preview
+
     # just one static .ftsl scene file per variant, no video
     python examples/gyroid_nd.py --count 3 --no-video
 
@@ -524,21 +527,24 @@ class _PreviewWindow:
 # per-variant video pipeline
 # ---------------------------------------------------------------------------
 
-def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *, res: int,
-                  raster: bool, noise: float) -> None:
+def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
+                  size: Tuple[int, int], raster: bool, noise: float) -> None:
     """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
     ``raster`` uses ftrace ``-raster`` (fast solid-shaded z-buffer preview); otherwise
-    a path-traced render to a per-frame noise budget.  No ``-window`` is passed so the
-    process writes the PNG and exits, letting the whole frame range run unattended.
-    The renderer's own console chatter is captured (kept off the status line) and only
-    surfaced if the frame fails.
+    a path-traced render to a per-frame noise budget.  ``size`` is the ``(W, H)`` film
+    resolution, passed as ``-r W H``.  No ``-window`` is passed so the process writes
+    the PNG and exits, letting the whole frame range run unattended.  The renderer's
+    own console chatter is captured (kept off the status line) and only surfaced if the
+    frame fails.
     """
     import subprocess
+    w, h = size
     if raster:
-        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster", "-r", str(res)]
+        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster",
+               "-r", str(w), str(h)]
     else:
-        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(res),
+        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(w), str(h),
                "-interval", "8", "-checkpoint", "-noise", f"{noise:g}"]
     r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
     if r.returncode != 0:
@@ -589,14 +595,16 @@ def _video_ext(fmt: str) -> str:
 
 
 def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
-               fps: float, res: int, radius: float, raster: bool, noise: float,
-               fmt: str, preview: Optional["_PreviewWindow"] = None) -> Path:
+               fps: float, size: Tuple[int, int], radius: float, raster: bool,
+               noise: float, fmt: str,
+               preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
     The gyroid drifts through its higher dimensions over a seamless loop (frame
-    ``frames`` == frame 0).  Frames render headless with the rasterizer by default.
-    Progress is shown on a single in-place status line built from ``label``; if a
-    ``preview`` window is given, each rendered frame is shown in it in place.
+    ``frames`` == frame 0).  Frames render at ``size`` = ``(W, H)`` pixels, headless
+    with the rasterizer by default.  Progress is shown on a single in-place status line
+    built from ``label``; if a ``preview`` window is given, each rendered frame is shown
+    in it in place (at the same ``size``).
     """
     from loom import Clock, Cache
     from loom.drive import find_ftrace, repo_root
@@ -604,24 +612,24 @@ def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
     root = repo_root()
     verb = "raster" if raster else "trace"
     title_base = label.replace("[gyroid_nd] ", "")
-    width = max(3, len(str(frames - 1)))
+    fw = max(3, len(str(frames - 1)))                   # frame-number field width
     pngs: List[Path] = []
     for k in range(frames):
         t = k / frames                                  # seamless loop: t in [0,1)
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
-        scene = build_scene(v, t=t, res=(res, res), radius=radius)
+        scene = build_scene(v, t=t, res=size, radius=radius)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
-                          Cache(), assets_dir=subdir, tag=f"{k:0{width}d}")
-        fp = subdir / f"{base}_{k:0{width}d}.ftsl"
+                          Cache(), assets_dir=subdir, tag=f"{k:0{fw}d}")
+        fp = subdir / f"{base}_{k:0{fw}d}.ftsl"
         fp.write_text(body, encoding="utf-8")
         png = fp.with_suffix(".png")
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
-        _render_frame(ftrace, root, fp, png, res=res, raster=raster, noise=noise)
+        _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise)
         pngs.append(png)
         if preview is not None:
             preview.show(png, f"{title_base}  |  frame {k + 1}/{frames}")
     out = subdir / f"{base}.{_video_ext(fmt)}"
-    pattern = f"{base}_%0{width}d.png"                   # ffmpeg reads from subdir cwd
+    pattern = f"{base}_%0{fw}d.png"                     # ffmpeg reads from subdir cwd
     _status(f"{label} | assembling {out.suffix.lstrip('.')}")
     _assemble_video(pngs, out, fps=fps, pattern=pattern)
     return out
@@ -630,6 +638,23 @@ def make_video(subdir: Path, base: str, v: Variant, *, label: str, frames: int,
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _parse_size(spec: str) -> Tuple[int, int]:
+    """Parse a ``--size`` value: ``N`` (square NxN) or ``WxH`` -> ``(W, H)``."""
+    s = spec.strip().lower().replace(" ", "")
+    try:
+        if "x" in s:
+            w_str, h_str = s.split("x", 1)
+            w, h = int(w_str), int(h_str)
+        else:
+            w = h = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--size '{spec}': expected a number (square) or WIDTHxHEIGHT (e.g. 1280x720)")
+    if w < 1 or h < 1:
+        raise argparse.ArgumentTypeError(f"--size '{spec}': dimensions must be >= 1")
+    return (w, h)
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -696,8 +721,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="isosurface level set f = threshold (default 0; ~+/-0.7 thins the walls)")
     g.add_argument("--radius", type=float, default=1.3,
                    help="radius of the spherical container the lattice fills (default 1.3)")
+    g.add_argument("--size", type=_parse_size, default=None, metavar="N|WxH",
+                   help="video/frame size in pixels: a single number for square (e.g. 720) "
+                        "or WIDTHxHEIGHT (e.g. 1280x720); the preview window matches it "
+                        "(overrides --res)")
     g.add_argument("--res", type=int, default=480,
-                   help="render resolution written into each scene's film (default 480)")
+                   help="square render size when --size is unset (default 480)")
 
     g = p.add_argument_group("video (per variant)")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
@@ -734,6 +763,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("error: --oscillating must be >= 2")
     if args.count < 1:
         raise SystemExit("error: --count must be >= 1")
+
+    # Video/frame pixel size: explicit --size (N or WxH) wins, else square --res.
+    size = args.size if args.size is not None else (args.res, args.res)
 
     axis_locks: Dict[int, AxisLock] = {}
     for spec in args.axis:
@@ -783,14 +815,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                              frames=args.frames, fps=args.fps),
                 encoding="utf-8")
             video = make_video(subdir, base, v, label=label, frames=args.frames,
-                               fps=args.fps, res=args.res, radius=args.radius,
+                               fps=args.fps, size=size, radius=args.radius,
                                raster=args.raster, noise=args.render_noise,
                                fmt=args.format, preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
-            scene = build_scene(v, t=0.0, res=(args.res, args.res), radius=args.radius)
+            scene = build_scene(v, t=0.0, res=size, radius=args.radius)
             body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
                               tag=f"{k:0{width}d}")
             fp = outdir / f"{base}.ftsl"
