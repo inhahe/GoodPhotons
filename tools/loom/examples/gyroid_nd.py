@@ -51,7 +51,7 @@ for a clear ``--material`` renders it *see-through* — dimmed + milky-hazed via
 This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
 **renders a seamless morphing video** in which the higher dimensions move the visible slice.
 Every non-main oscillating dimension gets an integer rate (a "winding"); the ``--transform``
-choice decides what that motion *is*, and both start from the exact current gyroid at frame 0
+choice decides what that motion *is*, and all start from the exact current gyroid at frame 0
 and loop seamlessly:
 
   * ``drift`` (default) — advance each dim's phase a whole number of cycles over the loop,
@@ -59,7 +59,16 @@ and loop seamlessly:
   * ``rotate`` — rotate each dim's wavevector out of the 3-D slice into its own hidden axis
     (a whole number of turns).  The in-slice frequency waxes and wanes as the wave turns
     edge-on and back, so the lattice genuinely reshapes — the higher-D analogue of *turning*
-    the object rather than sliding it.
+    the object rather than sliding it.  (Each dim turns *independently* in its own private
+    plane — the wavevectors tilt, but the slice's orientation as a whole is unchanged.)
+  * ``tumble`` — rotate the **3-D slice itself** through the N-D space: a rigid N-D rotation
+    of the whole slice basis (built from disjoint Givens rotations that couple the visible
+    x/y/z axes with the hidden dimensions), a whole number of turns over the loop.  Unlike
+    ``rotate`` (which tilts each wavevector on its own), this reorients the *entire* slice
+    coherently — the higher-D axes swing into view and the visible ones swing out, so the
+    lattice is genuinely re-sliced from a turning viewpoint.  With >= 4 oscillating dims this
+    produces real morphing (new structure appears); with exactly 3 it reduces to spinning the
+    gyroid rigidly (a plain 3-D rotation).
   * ``bloom`` — pin frame 0 (and frame 1) to the *exact classic gyroid* from
     ``scenes/showcase.ftsl`` (``sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)``),
     then swell one or more of its scalar **parameters** out and back with an envelope
@@ -114,6 +123,9 @@ Examples::
 
     # start from the current gyroid and rotate it through the extra dimensions
     python examples/gyroid_nd.py --dims 6 --transform rotate
+
+    # tumble the whole 3-D slice through N-D space (the viewpoint turns, re-slicing it)
+    python examples/gyroid_nd.py --dims 6 --transform tumble
 
     # render the lattice as clear glass instead of gold (path-traced for real refraction)
     python examples/gyroid_nd.py --count 1 --material glass --no-raster --render-noise 3
@@ -190,6 +202,13 @@ class Variant:
     #                                     = shift the level set, 'thickness' = swell the sheet).
     #                                     Empty for the drift/rotate transforms.
     bloom_amp: float = 1.0              # scales every bloom parameter's peak swing
+    tumble_planes: List[Tuple[int, int, int]] = dc_field(default_factory=list)
+    #                                     tumble transform only: disjoint (i, j, winding)
+    #                                     Givens rotations composing the per-frame N-D
+    #                                     rotation of the whole slice basis.  Each dim index
+    #                                     appears in at most one plane, so a rotated
+    #                                     direction row can grow to at most |dir| <= sqrt(2)
+    #                                     (keeps the sphere-marcher's Lipschitz bound valid).
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -407,10 +426,36 @@ def pick_variant(seed: int, args: argparse.Namespace,
         if dm.oscillate:
             dm.hidden_offset = rng.uniform(0.5, 2.0)
 
+    # `tumble` transform: build the disjoint set of Givens planes whose product is the
+    # per-frame N-D rotation of the whole slice basis.  Couple each visible axis (0,1,2)
+    # with a distinct hidden dim so the slice tips *out of* the rendered 3-space and back;
+    # pair any leftover hidden dims among themselves.  Disjoint => each direction row is
+    # mixed with at most one other, so |rotated dir| <= sqrt(2) (the marcher bound holds).
+    # Drawn last (like hidden_offset) and only when needed, so the other transforms' RNG
+    # streams — and thus their reproducibility — are untouched.
+    tumble_planes: List[Tuple[int, int, int]] = []
+    if transform == "tumble":
+        max_w = max(1, args.max_winding)
+        rest = list(range(3, D))
+        rng.shuffle(rest)                               # random hidden partners per seed
+        w = 1
+        for i in range(min(3, D)):                      # visible axes -> hidden partners
+            if not rest:
+                break
+            j = rest.pop()
+            tumble_planes.append((i, j, w))
+            w = w % max_w + 1
+        while len(rest) >= 2:                           # pair up leftover hidden dims
+            i = rest.pop(); j = rest.pop()
+            tumble_planes.append((i, j, w))
+            w = w % max_w + 1
+        if not tumble_planes and D >= 2:                # D<=3: no hidden dims -> spin in 3-D
+            tumble_planes.append((0, min(2, D - 1), 1))
+
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
-                   dim_list=dims)
+                   tumble_planes=tumble_planes, dim_list=dims)
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +480,32 @@ def _u_expr(dim: Dim, freq: float, phase: float) -> str:
     return _arg_expr(dim.direction, dim.harmonic * freq, phase)
 
 
+def _tumbled_directions(v: "Variant", t: float) -> Dict[int, Tuple[float, float, float]]:
+    """Every dim's direction row after the ``tumble`` transform's N-D slice rotation at ``t``.
+
+    The rotation is the product of the variant's disjoint Givens planes (each an integer
+    number of whole turns over the loop), applied to the *stacked* N x 3 direction matrix —
+    i.e. it mixes the direction rows, which is exactly a rigid rotation of the 3-D slice
+    within the N-D space.  Inert dims carry a direction too, so a plane may swing an
+    oscillating axis toward a hidden (inert) one and back: that axis's visible frequency
+    fades and re-forms as the slice turns.  At t=0 and t=1 every angle is a multiple of
+    2*pi, so the rotation is the identity and the field returns exactly to the base gyroid
+    (a seamless loop).
+    """
+    dirs: Dict[int, List[float]] = {d.index: list(d.direction) for d in v.dim_list}
+    two_pi = 2.0 * math.pi
+    for (i, j, wind) in v.tumble_planes:
+        di = dirs.get(i)
+        dj = dirs.get(j)
+        if di is None or dj is None:
+            continue
+        a = two_pi * wind * t
+        ca, sa = math.cos(a), math.sin(a)
+        dirs[i] = [ca * di[k] - sa * dj[k] for k in range(3)]
+        dirs[j] = [sa * di[k] + ca * dj[k] for k in range(3)]
+    return {idx: (d[0], d[1], d[2]) for idx, d in dirs.items()}
+
+
 def _classic_gyroid_expr(freq: float) -> str:
     """The plain 3-D Schoen gyroid on the world X/Y/Z axes at ``freq`` — exactly the
     field in ``scenes/showcase.ftsl`` (``sin(f x)cos(f y) + sin(f y)cos(f z) +
@@ -450,7 +521,7 @@ def _classic_gyroid_expr(freq: float) -> str:
 SHOWCASE_RF = 0.32 * 40.0
 
 # Supported ways the higher dimensions animate the slice over one loop.
-TRANSFORMS = ("drift", "rotate", "bloom")
+TRANSFORMS = ("drift", "rotate", "tumble", "bloom")
 
 # Scalar gyroid parameters the ``bloom`` transform can oscillate over the loop (each
 # starts and ends at its base value, so frame 0 is always the recognizable base gyroid).
@@ -515,8 +586,8 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
                freq: Optional[float] = None) -> str:
     """Emit the gyroid field at loop phase ``t`` in [0,1) under the chosen ``transform``.
 
-    Both transforms reproduce the exact static field at ``t=0`` (and loop seamlessly, so
-    ``t=1`` matches ``t=0``), then move the higher dimensions in between:
+    Every transform reproduces the exact static field at ``t=0`` (and loops seamlessly, so
+    ``t=1`` matches ``t=0``), then moves the higher dimensions in between:
 
     * ``drift`` — translate the slice *through* each dimension: each dim's phase advances
       by ``2*pi*winding*t`` (an integer number of whole cycles over the loop).  The pattern
@@ -527,7 +598,12 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
       out-of-slice tilt adds a ``sin``-weighted phase from the slice's ``hidden_offset``.
       The lattice genuinely reshapes — the higher-D analogue of turning the object — rather
       than merely sliding.  The main dim (winding 0) stays put and anchors the pattern so it
-      never fully dissolves.
+      never fully dissolves.  Each dim turns *independently* in its own plane.
+    * ``tumble`` — rotate the whole **3-D slice** rigidly through the N-D space: a product of
+      disjoint Givens rotations (``v.tumble_planes``) is applied to the entire direction-row
+      matrix once per frame, coherently reorienting the slice (the visible axes swing out and
+      hidden axes swing in) instead of tilting each wavevector on its own.  With >= 4
+      oscillating dims real new structure appears; with 3 it is a rigid spin.
     * ``bloom`` — frame 0 (and frame 1) is the *exact classic 3-D gyroid* (the
       ``scenes/showcase.ftsl`` field on X/Y/Z); over the loop the full N-D gyroid is
       cross-blended in and back out by an envelope ``w(t) = sin^2(pi t)`` (0 at the ends,
@@ -560,6 +636,10 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
     osc = sorted(v.oscillating)
     m = len(osc)
     by_index = {d.index: d for d in v.dim_list}
+    # `tumble` rotates the whole slice basis in N-D: every direction row is remapped once
+    # per frame (see :func:`_tumbled_directions`); the phases stay put (the slice turns
+    # about its anchor, so each axis keeps its offset).
+    tdirs = _tumbled_directions(v, t) if transform == "tumble" else None
     u = {}
     two_pi = 2.0 * math.pi
     for d in osc:
@@ -573,6 +653,10 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
             coeff = k * math.cos(alpha)
             phase = (dim.phase + k * dim.hidden_offset * math.sin(alpha)) % two_pi
             u[d] = _arg_expr(dim.direction, coeff, phase)
+        elif transform == "tumble":
+            # The slice has turned in N-D: this dim's visible direction is its rotated row;
+            # magnitude (hence in-slice frequency) waxes/wanes as the axis swings in and out.
+            u[d] = _arg_expr(tdirs[d], dim.harmonic * fr, dim.phase)
         else:
             # Reduce the drifted phase modulo 2*pi so t=0 and t=1 emit the *same* constant
             # (a whole-cycle advance) -> a perfectly seamless loop despite float rounding.
@@ -718,10 +802,16 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     # use the peak (possibly 'freq'-bloomed) frequency at this frame so the bound stays valid.
     sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
     fr = v.freq
+    coef = 2.2
     if transform == "bloom":
         sum_h = max(sum_h, 3)
         fr = bloom_freq(v, t)
-    grad_bound = 2.2 * fr * max(1, sum_h)
+    elif transform == "tumble":
+        # The N-D slice rotation can grow a direction row's norm to sqrt(2) (disjoint planes,
+        # so at most two unit rows mix), scaling that term's gradient up by the same factor —
+        # inflate the bound so the sphere-marcher never oversteps the surface (no holes).
+        coef *= math.sqrt(2.0)
+    grad_bound = coef * fr * max(1, sum_h)
     box = radius * 1.05                                  # contained_by half-extent
     r = radius
 
@@ -845,6 +935,16 @@ def bloom_params_desc(v: Variant) -> str:
     return ", ".join(parts) if parts else "higher-D structure"
 
 
+def tumble_planes_desc(v: Variant) -> str:
+    """Human-readable list of the tumble transform's rotation planes, e.g.
+    'X<->d4 (1 turn), Y<->d5 (2 turns)' — each an (axis_i, axis_j, winding) Givens plane."""
+    parts = []
+    for (i, j, wind) in v.tumble_planes:
+        turns = "turn" if wind == 1 else "turns"
+        parts.append(f"{axis_name(i)}<->{axis_name(j)} ({wind} {turns})")
+    return ", ".join(parts) if parts else "(none)"
+
+
 def header(v: Variant, index: int, count: int, *,
            frames: Optional[int] = None, fps: Optional[float] = None,
            transform: str = "drift", material: str = "gold") -> str:
@@ -867,18 +967,32 @@ def header(v: Variant, index: int, count: int, *,
          + ("   (conductor / mirror — reflects the studio lights)" if material == "gold"
             else "   (clear BK7 dielectric — lattice reads through refraction)" if material == "glass"
             else "")]
-    verb = {"rotate": "rotating", "bloom": "blooming"}.get(transform, "drifting")
+    verb = {"rotate": "rotating", "tumble": "tumbling",
+            "bloom": "blooming"}.get(transform, "drifting")
     if frames is not None:
         secs = frames / fps if fps else 0.0
-        motion = (f"frame 0 = classic showcase gyroid; blooms {bloom_params_desc(v)} at mid-loop"
-                  if transform == "bloom" else f"{verb} dims -> {moving}")
+        if transform == "bloom":
+            motion = f"frame 0 = classic showcase gyroid; blooms {bloom_params_desc(v)} at mid-loop"
+        elif transform == "tumble":
+            motion = f"tumbling the whole slice through N-D: {tumble_planes_desc(v)}"
+        else:
+            motion = f"{verb} dims -> {moving}"
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
                  f"(~{fmt(secs)}s seamless loop); transform '{transform}'; {motion}")
     # The matrix + offsets view (directions = rows of A, phases = offsets, harmonics).
     L.append("#")
     L += matrix_lines(v)
     # Animation-only detail: which oscillating dims move and how fast (winding), plus role.
-    if frames is not None:
+    # (tumble moves the whole slice, not per-dim, so it reports its rotation planes instead.)
+    if frames is not None and transform == "tumble":
+        L += ["#",
+              "# tumble rotation planes — each (axis_i <-> axis_j) turns 'turns' whole",
+              "#   times over the loop; together they rigidly rotate the 3-D slice in N-D:",
+              "#   plane            turns",
+              "#   ---------------  -----"]
+        for (i, j, wind) in v.tumble_planes:
+            L.append(f"#   {axis_name(i)} <-> {axis_name(j):<8}  {wind:>5}")
+    elif frames is not None:
         rate_col = "turns" if transform == "rotate" else "drift"
         L += ["#",
               f"# animation per dim — {rate_col} = integer cycles/turns over one loop:",
@@ -918,6 +1032,12 @@ def header(v: Variant, index: int, count: int, *,
               "#         + phase_d + harmonic_d * freq * hidden_offset_d * sin(a_d)",
               "#   a_d = 2*pi * winding_d * t   (the dim's wavevector rotates out of the",
               "#   3-D slice into its hidden axis; t runs 0->1, 'turns' column = winding_d)"]
+    elif transform == "tumble":
+        L += ["#   u_d = harmonic_d * freq * (dir_d(t) . (x, y, z)) + phase_d",
+              "#   dir_d(t) = row d of  R(t) @ A,  where A is the static direction matrix",
+              "#   above and R(t) is the product of the tumble planes' Givens rotations",
+              "#   (angle 2*pi*winding*t each).  R(0)=R(1)=I, so the loop is seamless; in",
+              "#   between the whole 3-D slice turns rigidly through the N-D space."]
     else:
         tail = "  (winding is the per-dim 'drift' rate above)" if frames is not None else ""
         L += ["#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
@@ -1345,12 +1465,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--transform", choices=TRANSFORMS, default="drift",
                    help="how the higher dimensions animate the loop: 'drift' (default) "
                         "translates the slice through them (the pattern slides); 'rotate' "
-                        "turns each dim's wavevector out of the 3-D slice into a hidden axis "
-                        "(the lattice reshapes — a higher-D 'rotation'); 'bloom' pins frame 0 "
-                        "to the exact classic showcase gyroid and cross-blends the full N-D "
-                        "field in and back out (w=sin^2(pi t)), so the clip opens as the "
-                        "showcase gyroid and unfolds into higher-D structure. All start from "
-                        "a seamless frame 0 and loop.")
+                        "turns each dim's wavevector out of the 3-D slice into a hidden axis, "
+                        "each independently (the lattice reshapes — a higher-D 'rotation'); "
+                        "'tumble' rigidly rotates the WHOLE 3-D slice through the N-D space "
+                        "(the visible axes swing out and hidden ones swing in, re-slicing the "
+                        "lattice from a turning viewpoint; needs >=4 oscillating dims for real "
+                        "morphing, else it just spins); 'bloom' pins frame 0 to the exact "
+                        "classic showcase gyroid and cross-blends the full N-D field in and "
+                        "back out (w=sin^2(pi t)), so the clip opens as the showcase gyroid "
+                        "and unfolds into higher-D structure. All start from a seamless frame "
+                        "0 and loop.")
     g.add_argument("--bloom", type=str, default=None, metavar="P[,P...]",
                    help="for --transform bloom: which parameter(s) oscillate over the loop "
                         "(comma-separated; default 'dims'). Choices: 'dims' (cross-blend the "
@@ -1410,7 +1534,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         except argparse.ArgumentTypeError as e:
             parser.error(str(e))
 
-    base_outdir = Path(args.out) if args.out else _default_outdir(args.name)
+    # Resolve --out to an absolute path (relative to the invoking cwd): the frames are
+    # rendered by ftrace with cwd = repo_root, so a relative outdir would be written under
+    # the user's cwd but looked for under repo_root and fail to open.  (The default outdir
+    # is already absolute, repo_root/png/<name>.)
+    base_outdir = Path(args.out).resolve() if args.out else _default_outdir(args.name)
     if args.run_subdir:
         outdir = _next_run_dir(base_outdir)
         print(f"[gyroid_nd] run dir: {outdir}  (--no-run-subdir to write into {base_outdir})")
