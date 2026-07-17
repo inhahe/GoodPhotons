@@ -48,6 +48,23 @@ for see-through. Deferred work:
   onto the device and read back only RGB8 (would then need the anchor computed on-device
   or shared explicitly for the exposure-lock case).
 
+### TECH DEBT (2026-07-17): GPU BDPT (mode D) can't texture — falls back to CPU BDPT
+
+The forward (A/B/C) and backward-reference (R) GPU megakernels sample image skins per
+hit via `dDiffuseRho` (device twin of `diffuseReflectance`), so a textured
+`reflect texture:<name>` albedo renders on the GPU for those modes. The GPU BDPT kernel
+(`kBdpt` in `src/render_cuda.cu`), however, drops the surface-local `(u,v)` from its
+`DVertex` and its diffuse vertices sample only the constant `reflect` spectrum — so
+`cudaBdptSupported` (render_cuda.cu ~5443, `usesTexOrFluoro`: `m.reflectTex >= 0`) rejects
+any textured scene and `-mode D -device gpu` falls back to the (correct) CPU BDPT. Same
+for fluorescence, roughness/film-thickness/pattern-driven params and mix masks. Verified:
+`scenes/textured.ftsl -mode D -device gpu` prints "BDPT-GPU-unsupported feature … using
+CPU" and matches the CPU BDPT image. Proper fix: thread the hit `(u,v)` through `DVertex`
++ upload the textures to the device (as the forward path already does), then have the
+BDPT `dBsdfF`/`dBsdfPdf`/`dConnect` sample `dDiffuseRho` at the vertex instead of the
+constant spectrum. Non-trivial (MIS pdfs must stay consistent), low priority (CPU BDPT is
+correct; textured caustic-heavy scenes are rare).
+
 ### TECH DEBT (2026-07-17): loom preview server (`-serve`) is resident-process only
 
 The M12 preview server (ftrace `-serve` in `src/main.cpp` `runServe`, loom
