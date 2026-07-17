@@ -34,9 +34,9 @@ This script **randomly picks** all of the above.  For each of ``--count N`` vari
 integer *drift* rate (a "winding") so its phase advances a whole number of cycles over
 the loop, translating the visible 3-D slice *through* that dimension — literally the
 transformation through the higher dimensions.  Each variant lands in its own subdir with
-the per-frame ``.ftsl`` files, the assembled ``.mp4`` (or ``.gif``), and a ``.txt``
-listing every chosen value.  Frames render with ftrace's fast headless rasterizer by
-default.  Use ``--no-video`` to instead emit a single static ``.ftsl`` per variant (with
+the per-frame ``.ftsl`` files, the assembled animated ``.gif`` (or ``.mp4`` via
+``--format mp4``), and a ``.txt`` listing every chosen value.  Frames render with
+ftrace's fast headless rasterizer by default.  Use ``--no-video`` to instead emit a single static ``.ftsl`` per variant (with
 a full comment header).  Any choice can be **locked** from the CLI (see ``--help``): the
 dimension count, how many dims oscillate, how many are harmonics of the main, the base
 frequency, and — per axis — whether it oscillates and at what harmonic.
@@ -49,9 +49,9 @@ Examples::
     # reproducible; lock 6 dims, 4 oscillating, 2 of them harmonics of the main
     python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 --oscillating 4 --harmonics 2
 
-    # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as a gif
+    # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as an mp4
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
-        --frames 90 --format gif
+        --frames 90 --format mp4
 
     # just one static .ftsl scene file per variant, no video
     python examples/gyroid_nd.py --count 3 --no-video
@@ -592,8 +592,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="frames per video (default 60)")
     g.add_argument("--fps", type=float, default=30.0,
                    help="video frame rate (default 30)")
-    g.add_argument("--format", choices=("auto", "mp4", "gif"), default="auto",
-                   help="video container (auto: mp4 if ffmpeg is present, else gif)")
+    g.add_argument("--format", choices=("gif", "mp4", "auto"), default="gif",
+                   help="video format (default gif; mp4 needs ffmpeg; auto: mp4 if "
+                        "ffmpeg is present, else gif)")
     g.add_argument("--raster", action=argparse.BooleanOptionalAction, default=True,
                    help="render each frame with the fast headless rasterizer (default); "
                         "--no-raster path-traces every frame instead (far slower)")
