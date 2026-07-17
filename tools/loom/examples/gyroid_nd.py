@@ -88,6 +88,14 @@ and loop seamlessly:
     chosen parameter's peak swing (default 1).  The base frequency defaults to the showcase
     density (freq 40 at radius 0.32) unless ``--freq`` is given.
 
+These transforms **layer**: ``--transform`` accepts a comma-separated set (e.g.
+``--transform drift,tumble`` or ``--transform drift,rotate,tumble,bloom``) and the field
+composes them.  The three *motions* stack on each oscillating dim's argument — ``tumble``
+rotates the whole slice basis, ``rotate`` turns each wavevector out of the slice, ``drift``
+advances the phase — while ``bloom`` wraps the composed field in its classic->full cross-fade
+envelope (the motions then animate the full field it reveals).  Because every layer is the
+identity at ``t=0`` and ``t=1``, any combination still starts on a seamless frame 0 and loops.
+
 The assembled animated ``.gif`` (or ``.mp4`` via ``--format mp4``) and a ``.txt`` listing
 every chosen value collect together in the output directory.  By default each run gets its
 own fresh ``runNNN/`` subdirectory (``run001``, ``run002``, ... one past the highest existing,
@@ -123,6 +131,9 @@ Examples::
 
     # start from the current gyroid and rotate it through the extra dimensions
     python examples/gyroid_nd.py --dims 6 --transform rotate
+
+    # LAYER several motions at once: drift + tumble + a bloom cross-fade on top
+    python examples/gyroid_nd.py --dims 6 --transform drift,tumble,bloom
 
     # tumble the whole 3-D slice through N-D space (the viewpoint turns, re-slicing it)
     python examples/gyroid_nd.py --dims 6 --transform tumble
@@ -314,9 +325,9 @@ def pick_variant(seed: int, args: argparse.Namespace,
                  axis_locks: Dict[int, AxisLock]) -> Variant:
     rng = random.Random(seed)
 
-    transform = getattr(args, "transform", "drift")
+    transform = _parse_transforms(getattr(args, "transform", "drift"))
     bloom_params = (_parse_bloom_params(getattr(args, "bloom", None))
-                    if transform == "bloom" else ())
+                    if _has(transform, "bloom") else ())
     bloom_dims = "dims" in bloom_params    # crossfade the full N-D field in (vs. only pulsing
     #                                        scalar params around the fixed classic gyroid)
 
@@ -428,7 +439,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
 
     if args.freq is not None:
         freq = args.freq
-    elif transform == "bloom":
+    elif _has(transform, "bloom"):
         # Bloom's frame 0 IS the showcase gyroid; default its density to match showcase
         # (freq 40 at radius 0.32) for whatever container radius is in use.
         freq = SHOWCASE_RF / max(1e-6, args.radius)
@@ -455,7 +466,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
     _tl = getattr(args, "tumble_lock", ())
     tumble_locked: Tuple[int, ...] = (_parse_tumble_lock(_tl) if isinstance(_tl, str)
                                       else tuple(sorted(_tl or ())))
-    if transform == "tumble":
+    if _has(transform, "tumble"):
         max_w = max(1, args.max_winding)
         locked = set(a for a in tumble_locked if 0 <= a < D)
         rest = [d for d in range(3, D) if d not in locked]
@@ -502,11 +513,6 @@ def _arg_expr(direction: Tuple[float, float, float], coeff: float, phase: float)
     if abs(phase) < 1e-9:
         return f"({fmt(coeff)}*({lin}))"
     return f"({fmt(coeff)}*({lin})+({fmt(phase)}))"
-
-
-def _u_expr(dim: Dim, freq: float, phase: float) -> str:
-    """The per-dimension argument u_d = harmonic*freq*(dir . (x,y,z)) + phase."""
-    return _arg_expr(dim.direction, dim.harmonic * freq, phase)
 
 
 def _tumbled_directions(v: "Variant", t: float) -> Dict[int, Tuple[float, float, float]]:
@@ -563,8 +569,40 @@ def _classic_gyroid_expr(freq: float) -> str:
 # base reads as *the showcase gyroid* regardless of the ball size (freq 40 at r=0.32).
 SHOWCASE_RF = 0.32 * 40.0
 
-# Supported ways the higher dimensions animate the slice over one loop.
+# Supported ways the higher dimensions animate the slice over one loop.  They can be
+# *layered*: --transform takes one name or a comma-separated set (e.g. 'drift,tumble' or
+# 'drift,rotate,tumble,bloom'), and the field composes them — the three *motions* stack on
+# each dim's argument (tumble rotates the slice basis, rotate turns each wavevector out of
+# the slice, drift advances the phase) while 'bloom' wraps the whole thing in its classic->
+# full cross-fade envelope (the layered motions then animate the full field it reveals).
+# Every layer is the identity at t=0 and t=1, so any combination still loops seamlessly.
 TRANSFORMS = ("drift", "rotate", "tumble", "bloom")
+
+
+def _parse_transforms(spec: str) -> str:
+    """Normalize a ``--transform`` value — one name or a comma/plus-separated set — into a
+    canonical ``'+'``-joined string in :data:`TRANSFORMS` order, deduped.  e.g.
+    ``'tumble,drift'`` -> ``'drift+tumble'``.  Raises on an unknown name or an empty spec."""
+    names = [s.strip().lower() for s in str(spec).replace("+", ",").split(",") if s.strip()]
+    if not names:
+        raise SystemExit(f"error: --transform needs at least one of {', '.join(TRANSFORMS)}")
+    bad = [n for n in names if n not in TRANSFORMS]
+    if bad:
+        raise SystemExit(f"error: --transform '{', '.join(bad)}' not in "
+                         f"{{{', '.join(TRANSFORMS)}}}  (layer with commas, e.g. drift,tumble)")
+    seen = set(names)
+    return "+".join(t for t in TRANSFORMS if t in seen)
+
+
+def _has(transform: str, name: str) -> bool:
+    """True if motion/envelope layer ``name`` is active in a (possibly layered) transform."""
+    return name in transform.split("+")
+
+
+def _motions(transform: str) -> List[str]:
+    """The active per-dim *motion* layers (drift/rotate/tumble) of a transform, in canonical
+    order — i.e. everything except the 'bloom' envelope."""
+    return [t for t in ("drift", "rotate", "tumble") if _has(transform, t)]
 
 # Scalar gyroid parameters the ``bloom`` transform can oscillate over the loop (each
 # starts and ends at its base value, so frame 0 is always the recognizable base gyroid).
@@ -673,7 +711,7 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
       and *unfolds* into its higher-dimensional structure at mid-loop, then folds back —
       a seamless "bloom".  The higher dimensions still drift while blended in.
     """
-    if transform == "bloom":
+    if _has(transform, "bloom"):
         # ``bloom`` pins frame 0 (and frame 1) to the base gyroid, then oscillates the
         # selected parameters over the loop with the envelope w = sin^2(pi t).  The
         # frequency swing (if 'freq' blooms) applies to *both* the classic base and the
@@ -687,10 +725,12 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
             return g_classic
         # Dimensional bloom: cross-fade the classic gyroid with the full N-D field.  The
         # envelope is 0 at t=0,1 (both ends exactly the classic gyroid, seamless loop) and
-        # 1 at t=0.5 (the full higher-D gyroid at its peak).
+        # 1 at t=0.5 (the full higher-D gyroid at its peak).  The full field it reveals is
+        # animated by whatever motion layers are *also* selected (drift by default).
         if w <= 1e-9:
             return g_classic
-        g_full = field_expr(v, t, "drift", freq=fr)         # higher dims drift while blended
+        inner = "+".join(_motions(transform)) or "drift"
+        g_full = field_expr(v, t, inner, freq=fr)
         if w >= 1.0 - 1e-9:
             return g_full
         return f"({fmt(1.0 - w)})*({g_classic})+({fmt(w)})*({g_full})"
@@ -698,32 +738,32 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
     osc = sorted(v.oscillating)
     m = len(osc)
     by_index = {d.index: d for d in v.dim_list}
-    # `tumble` rotates the whole slice basis in N-D: every direction row is remapped once
-    # per frame (see :func:`_tumbled_directions`); the phases stay put (the slice turns
-    # about its anchor, so each axis keeps its offset).
-    tdirs = _tumbled_directions(v, t) if transform == "tumble" else None
+    # The three motion layers *compose* on each dim's argument u_d = coeff*(dir . xyz) + phase:
+    #   tumble — remap the whole slice basis in N-D (dir_d -> rotated row; the phases stay put
+    #            since the slice turns about its anchor);
+    #   rotate — turn each wavevector out of the 3-D slice: coeff *= cos(alpha), phase gets a
+    #            k*sin(alpha)*hidden_offset term;
+    #   drift  — advance the phase by a whole number of cycles over the loop.
+    # Each is the identity at t=0,1, so any layered combination still loops seamlessly.
+    do_drift, do_rotate, do_tumble = (_has(transform, n) for n in ("drift", "rotate", "tumble"))
+    tdirs = _tumbled_directions(v, t) if do_tumble else None
     u = {}
     two_pi = 2.0 * math.pi
     for d in osc:
         dim = by_index[d]
-        if transform == "rotate":
-            # Rotate the wavevector into the hidden axis: in-slice frequency k*cos(alpha),
-            # plus a k*sin(alpha)*hidden_offset phase.  alpha is a whole number of turns
-            # over the loop, so t=0 and t=1 both give alpha ≡ 0 -> the exact static field.
-            k = dim.harmonic * fr
+        k = dim.harmonic * fr                       # base in-slice frequency for this dim
+        direction = tdirs[d] if do_tumble else dim.direction
+        coeff = k
+        phase = dim.phase
+        if do_rotate:
             alpha = two_pi * dim.winding * t
-            coeff = k * math.cos(alpha)
-            phase = (dim.phase + k * dim.hidden_offset * math.sin(alpha)) % two_pi
-            u[d] = _arg_expr(dim.direction, coeff, phase)
-        elif transform == "tumble":
-            # The slice has turned in N-D: this dim's visible direction is its rotated row;
-            # magnitude (hence in-slice frequency) waxes/wanes as the axis swings in and out.
-            u[d] = _arg_expr(tdirs[d], dim.harmonic * fr, dim.phase)
-        else:
-            # Reduce the drifted phase modulo 2*pi so t=0 and t=1 emit the *same* constant
-            # (a whole-cycle advance) -> a perfectly seamless loop despite float rounding.
-            phase = (dim.phase + two_pi * dim.winding * t) % two_pi
-            u[d] = _u_expr(dim, fr, phase)
+            coeff *= math.cos(alpha)
+            phase += k * dim.hidden_offset * math.sin(alpha)
+        if do_drift:
+            phase += two_pi * dim.winding * t
+        # Reduce the phase modulo 2*pi so t=0 and t=1 emit the *same* constant (whole-cycle
+        # advances) -> a perfectly seamless loop despite float rounding.
+        u[d] = _arg_expr(direction, coeff, phase % two_pi)
     terms = []
     for i in range(m):
         a = osc[i]
@@ -844,7 +884,7 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
     # amplitude (M=3 reproduces the classic 0.5).
     m = max(1, len(v.oscillating))
-    if transform == "bloom":
+    if _has(transform, "bloom"):
         w = _bloom_env(t)
         if "dims" in v.bloom_params:
             # Match the field cross-fade: at t=0,1 the sheet is exactly showcase's (half =
@@ -865,13 +905,14 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
     fr = v.freq
     coef = 2.2
-    if transform == "bloom":
+    if _has(transform, "bloom"):
         sum_h = max(sum_h, 3)
         fr = bloom_freq(v, t)
-    elif transform == "tumble":
+    if _has(transform, "tumble"):
         # The N-D slice rotation can grow a direction row's norm to sqrt(2) (disjoint planes,
         # so at most two unit rows mix), scaling that term's gradient up by the same factor —
         # inflate the bound so the sphere-marcher never oversteps the surface (no holes).
+        # (rotate only *shrinks* a term's frequency by cos(alpha), so it needs no inflation.)
         coef *= math.sqrt(2.0)
     grad_bound = coef * fr * max(1, sum_h)
     box = radius * 1.05                                  # contained_by half-extent
@@ -1029,27 +1070,30 @@ def header(v: Variant, index: int, count: int, *,
          + ("   (conductor / mirror — reflects the studio lights)" if material == "gold"
             else "   (clear BK7 dielectric — lattice reads through refraction)" if material == "glass"
             else "")]
-    verb = {"rotate": "rotating", "tumble": "tumbling",
-            "bloom": "blooming"}.get(transform, "drifting")
     if frames is not None:
         secs = frames / fps if fps else 0.0
-        if transform == "bloom":
-            motion = f"frame 0 = classic showcase gyroid; blooms {bloom_params_desc(v)} at mid-loop"
-        elif transform == "tumble":
-            how = ("rocking between two extremes (+/-{amp} turns)".format(amp=fmt(v.tumble_amp))
+        # Layered transforms compose, so describe every active layer (in canonical order).
+        parts = []
+        if _has(transform, "drift"):
+            parts.append(f"drifting dims -> {moving}")
+        if _has(transform, "rotate"):
+            parts.append(f"rotating each wavevector out of the slice -> {moving}")
+        if _has(transform, "tumble"):
+            how = ("rocking +/-{amp} turns".format(amp=fmt(v.tumble_amp))
                    if v.tumble_mode == "slide" else "spinning through full turns")
-            motion = (f"tumbling the whole slice through N-D ({how}): "
-                      f"{tumble_planes_desc(v)}")
-        else:
-            motion = f"{verb} dims -> {moving}"
+            parts.append(f"tumbling the whole slice through N-D ({how}): {tumble_planes_desc(v)}")
+        if _has(transform, "bloom"):
+            parts.append(f"frame 0 = classic showcase gyroid; blooms {bloom_params_desc(v)} at mid-loop")
+        motion = "; ".join(parts) if parts else "static"
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
                  f"(~{fmt(secs)}s seamless loop); transform '{transform}'; {motion}")
     # The matrix + offsets view (directions = rows of A, phases = offsets, harmonics).
     L.append("#")
     L += matrix_lines(v)
     # Animation-only detail: which oscillating dims move and how fast (winding), plus role.
-    # (tumble moves the whole slice, not per-dim, so it reports its rotation planes instead.)
-    if frames is not None and transform == "tumble":
+    # (tumble moves the whole slice, not per-dim, so it also reports its rotation planes; with
+    # layered transforms both the tumble planes and the per-dim drift/rotate table can appear.)
+    if frames is not None and _has(transform, "tumble"):
         if v.tumble_mode == "slide":
             L += ["#",
                   f"# tumble mode           : slide  (rocks +/-{fmt(v.tumble_amp)} turns each way,",
@@ -1068,8 +1112,8 @@ def header(v: Variant, index: int, count: int, *,
               "#   ---------------  -----"]
         for (i, j, wind) in v.tumble_planes:
             L.append(f"#   {axis_name(i)} <-> {axis_name(j):<8}  {wind:>5}")
-    elif frames is not None:
-        rate_col = "turns" if transform == "rotate" else "drift"
+    if frames is not None and (_has(transform, "drift") or _has(transform, "rotate")):
+        rate_col = "turns" if (_has(transform, "rotate") and not _has(transform, "drift")) else "drift"
         L += ["#",
               f"# animation per dim — {rate_col} = integer cycles/turns over one loop:",
               f"#   axis  {rate_col:<5}  role",
@@ -1081,7 +1125,8 @@ def header(v: Variant, index: int, count: int, *,
                 L.append(f"#   {name:>4}  {rate:>5}  {d.role}")
             else:
                 L.append(f"#   {name:>4}  {'-':>5}  inert")
-    if transform == "bloom":
+    if _has(transform, "bloom"):
+        gf_motion = ", ".join(_motions(transform)) or "drifting"
         L += ["#",
               f"# bloom parameters      : {', '.join(v.bloom_params)}  (amp {fmt(v.bloom_amp)})",
               f"#   oscillated over the loop by w(t) = sin^2(pi t)  (0 at t=0,1; 1 at t=0.5),",
@@ -1090,7 +1135,7 @@ def header(v: Variant, index: int, count: int, *,
             L += ["#   dims:      F(t) = (1-w)*G_classic + w*G_full",
                   "#     G_classic = sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)",
                   "#                 (the showcase gyroid; f = base frequency, shown at frame 0)",
-                  "#     G_full    = the full N-D gyroid below (drifting), blended in 0->1->0"]
+                  f"#     G_full    = the full N-D gyroid below ({gf_motion}), blended in 0->1->0"]
         else:
             L += ["#   (no 'dims' bloom: the field stays the classic showcase gyroid all loop;",
                   "#    only the scalar parameters below pulse around it)"]
@@ -1103,29 +1148,33 @@ def header(v: Variant, index: int, count: int, *,
         L.append("#")
     L += ["#",
           "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
-    if transform == "rotate":
-        L += ["#   u_d = harmonic_d * freq * cos(a_d) * (dir_d . (x, y, z))",
-              "#         + phase_d + harmonic_d * freq * hidden_offset_d * sin(a_d)",
-              "#   a_d = 2*pi * winding_d * t   (the dim's wavevector rotates out of the",
-              "#   3-D slice into its hidden axis; t runs 0->1, 'turns' column = winding_d)"]
-    elif transform == "tumble":
-        if v.tumble_mode == "slide":
-            angle = "2*pi*tumble_amp*sin(2*pi*winding*t)"
-            tail = ("(angle {a} each; rocks between +/-tumble_amp turns and back).  "
-                    "The angle is 0 at t=0,1 so the loop is seamless; in between the slice "
-                    "tilts and the projected frequency swells/shrinks (breathing scale).")
-        else:
-            angle = "2*pi*winding*t"
-            tail = ("(angle {a} each).  R(0)=R(1)=I, so the loop is seamless; in "
-                    "between the whole 3-D slice turns rigidly through the N-D space.")
-        L += ["#   u_d = harmonic_d * freq * (dir_d(t) . (x, y, z)) + phase_d",
-              "#   dir_d(t) = row d of  R(t) @ A,  where A is the static direction matrix",
-              "#   above and R(t) is the product of the tumble planes' Givens rotations",
-              "#   " + tail.format(a=angle)]
+    motions = _motions(transform)
+    if motions:
+        # The active motion layers compose on each dim's argument (see field_expr): tumble
+        # rotates the direction row, rotate scales the in-slice frequency by cos + adds a sin
+        # phase, drift advances the phase.  Build the composed u_d formula from what's on.
+        freq_factor = "harmonic_d * freq" + (" * cos(a_d)" if "rotate" in motions else "")
+        dir_term = "dir_d(t)" if "tumble" in motions else "dir_d"
+        phase_bits = ["phase_d"]
+        if "rotate" in motions:
+            phase_bits.append("harmonic_d * freq * hidden_offset_d * sin(a_d)")
+        if "drift" in motions:
+            phase_bits.append("2*pi * winding_d * t")
+        L.append(f"#   u_d = {freq_factor} * ({dir_term} . (x, y, z)) + " + " + ".join(phase_bits))
+        if "rotate" in motions:
+            L += ["#   a_d = 2*pi * winding_d * t   (the dim's wavevector rotates out of the 3-D",
+                  "#         slice into its hidden axis; in-slice freq fades as cos, gains a sin phase)"]
+        if "tumble" in motions:
+            tnote = ("R(t) rocks +/-tumble_amp turns, angle 2*pi*tumble_amp*sin(2*pi*winding*t)"
+                     if v.tumble_mode == "slide"
+                     else "R(t) spins through whole turns, angle 2*pi*winding*t")
+            L += ["#   dir_d(t) = row d of  R(t) @ A   (A = the static direction matrix above;",
+                  f"#         R(t) = product of the tumble planes' Givens rotations; {tnote})"]
+        L.append("#   (t runs 0->1; every layer is the identity at t=0,1 -> seamless loop)")
     else:
-        tail = "  (winding is the per-dim 'drift' rate above)" if frames is not None else ""
+        # bloom-only (no explicit motion layer): the revealed full field drifts by default.
         L += ["#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
-              f"#   (t runs 0->1 over the loop.{tail})"]
+              "#   (t runs 0->1 over the loop; the bloom envelope above cross-fades it in)"]
     L += ["#" + "=" * 74, ""]
     return "\n".join(L)
 
@@ -1546,19 +1595,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="square render size when --size is unset (default 480)")
 
     g = p.add_argument_group("video (per variant)")
-    g.add_argument("--transform", choices=TRANSFORMS, default="drift",
-                   help="how the higher dimensions animate the loop: 'drift' (default) "
-                        "translates the slice through them (the pattern slides); 'rotate' "
-                        "turns each dim's wavevector out of the 3-D slice into a hidden axis, "
-                        "each independently (the lattice reshapes — a higher-D 'rotation'); "
-                        "'tumble' rigidly rotates the WHOLE 3-D slice through the N-D space "
-                        "(the visible axes swing out and hidden ones swing in, re-slicing the "
-                        "lattice from a turning viewpoint; needs >=4 oscillating dims for real "
-                        "morphing, else it just spins); 'bloom' pins frame 0 to the exact "
-                        "classic showcase gyroid and cross-blends the full N-D field in and "
-                        "back out (w=sin^2(pi t)), so the clip opens as the showcase gyroid "
-                        "and unfolds into higher-D structure. All start from a seamless frame "
-                        "0 and loop.")
+    g.add_argument("--transform", type=str, default="drift", metavar="T[,T...]",
+                   help="how the higher dimensions animate the loop. One name, or a "
+                        "comma-separated set to LAYER several at once (e.g. 'drift,tumble' or "
+                        "'drift,rotate,tumble,bloom'). Options: 'drift' (default) translates the "
+                        "slice through them (the pattern slides); 'rotate' turns each dim's "
+                        "wavevector out of the 3-D slice into a hidden axis, each independently "
+                        "(the lattice reshapes — a higher-D 'rotation'); 'tumble' rigidly rotates "
+                        "the WHOLE 3-D slice through the N-D space (the visible axes swing out and "
+                        "hidden ones swing in, re-slicing the lattice from a turning viewpoint; "
+                        "needs >=4 oscillating dims for real morphing, else it just spins); "
+                        "'bloom' pins frame 0 to the exact classic showcase gyroid and cross-blends "
+                        "the full N-D field in and back out (w=sin^2(pi t)), so the clip opens as "
+                        "the showcase gyroid and unfolds into higher-D structure. When layered, the "
+                        "three motions (drift/rotate/tumble) compose on the field and 'bloom' wraps "
+                        "the result in its cross-fade envelope. Every layer is the identity at t=0, "
+                        "so any combination starts from a seamless frame 0 and loops.")
     g.add_argument("--bloom", type=str, default=None, metavar="P[,P...]",
                    help="for --transform bloom: which parameter(s) oscillate over the loop "
                         "(comma-separated; default 'dims'). Choices: 'dims' (cross-blend the "
@@ -1618,12 +1670,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("error: --oscillating must be >= 2")
     if args.count < 1:
         raise SystemExit("error: --count must be >= 1")
-    if args.bloom is not None and args.transform != "bloom":
-        raise SystemExit("error: --bloom only applies to --transform bloom")
+    # Normalize --transform (one name or a comma/plus-separated layered set) to canonical form.
+    args.transform = _parse_transforms(args.transform)
+    if args.bloom is not None and not _has(args.transform, "bloom"):
+        raise SystemExit("error: --bloom only applies when 'bloom' is in --transform")
     _parse_bloom_params(args.bloom)     # validate early (raises on a bad parameter name)
 
-    # tumble options only apply to --transform tumble.
-    if args.transform != "tumble":
+    # tumble options only apply when 'tumble' is in --transform.
+    if not _has(args.transform, "tumble"):
         if args.tumble_mode != "rotate":
             raise SystemExit("error: --tumble-mode only applies to --transform tumble")
         if args.tumble_lock is not None:
