@@ -169,6 +169,52 @@ def test_axis_index_beyond_locked_dims_raises():
         raise AssertionError("expected SystemExit for axis index >= dims")
 
 
+def test_static_field_expr_unchanged_at_t0():
+    # field_expr default t=0 preserves the exact static (classic) field
+    args = _args("--dims", "3", "--axis", "0:on:1", "--axis", "1:on:1",
+                 "--axis", "2:on:1", "--phase0", "--freq", "1")
+    v = g.pick_variant(1, args, _locks("0:on:1", "1:on:1", "2:on:1"))
+    assert g.field_expr(v) == g.field_expr(v, 0.0)
+
+
+def test_winding_main_anchored_others_drift():
+    args = _args("--dims", "6")
+    for s in range(20):
+        v = g.pick_variant(s, args, {})
+        by = {d.index: d for d in v.dim_list}
+        assert by[v.main].winding == 0            # main is the still anchor
+        for d in v.oscillating:                   # every other osc dim drifts
+            if d != v.main:
+                assert by[d].winding >= 1
+        for d in v.dim_list:                      # inert dims never drift
+            if not d.oscillate:
+                assert d.winding == 0
+
+
+def test_max_winding_lock_respected():
+    args = _args("--dims", "8", "--oscillating", "6", "--max-winding", "1")
+    for s in range(20):
+        v = g.pick_variant(s, args, {})
+        assert all(d.winding <= 1 for d in v.dim_list)
+
+
+def test_video_loop_is_seamless():
+    # t=0 and t=1 give a numerically identical field (whole-cycle phase advance)
+    v = g.pick_variant(3, _args("--dims", "6"), {})
+    e0, e1 = g.field_expr(v, 0.0), g.field_expr(v, 1.0)
+    for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
+        assert abs(_eval_expr(e0, x, y, z) - _eval_expr(e1, x, y, z)) < 1e-6
+
+
+def test_video_actually_moves():
+    # mid-loop the field differs from the start (the pattern really morphs)
+    v = g.pick_variant(3, _args("--dims", "6"), {})
+    e0, eh = g.field_expr(v, 0.0), g.field_expr(v, 0.37)
+    diff = max(abs(_eval_expr(e0, x, y, z) - _eval_expr(eh, x, y, z))
+               for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)])
+    assert diff > 1e-3
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

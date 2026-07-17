@@ -29,32 +29,35 @@ Each dimension's argument is  ``u_d = harmonic_d * freq * (dir_d . (x,y,z)) + ph
 and the emitted field is the cyclic sum ``sum_i sin(u_{o_i}) * cos(u_{o_{i+1}})`` over
 the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating count).
 
-This script **randomly picks** all of the above and writes ``--count N`` complete,
-renderable ``.ftsl`` scene files, each with a full comment header recording exactly
-what was chosen (so a variant can be reproduced or hand-edited).  By default it also
-**rasterizes** each variant to a ``.png`` (ftrace ``-raster``, a fast headless z-buffer
-preview) and drops a ``.txt`` beside it listing every chosen value; use ``--no-images``
-to emit only the scene files.  Any choice can be **locked** from the CLI (see
-``--help``): the dimension count, how many dims oscillate, how many are harmonics of
-the main, the base frequency, and — per axis — whether it oscillates and at what
-harmonic.
+This script **randomly picks** all of the above.  For each of ``--count N`` variants it
+**renders a seamless morphing video**: every non-main oscillating dimension is given an
+integer *drift* rate (a "winding") so its phase advances a whole number of cycles over
+the loop, translating the visible 3-D slice *through* that dimension — literally the
+transformation through the higher dimensions.  Each variant lands in its own subdir with
+the per-frame ``.ftsl`` files, the assembled ``.mp4`` (or ``.gif``), and a ``.txt``
+listing every chosen value.  Frames render with ftrace's fast headless rasterizer by
+default.  Use ``--no-video`` to instead emit a single static ``.ftsl`` per variant (with
+a full comment header).  Any choice can be **locked** from the CLI (see ``--help``): the
+dimension count, how many dims oscillate, how many are harmonics of the main, the base
+frequency, and — per axis — whether it oscillates and at what harmonic.
 
 Examples::
 
-    # 10 fully random variants (each -> .ftsl + .png + .txt) into png/gyroid_nd/
+    # 10 fully random variants, each a morphing video, into png/gyroid_nd/<variant>/
     python examples/gyroid_nd.py --count 10
 
     # reproducible; lock 6 dims, 4 oscillating, 2 of them harmonics of the main
     python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 --oscillating 4 --harmonics 2
 
-    # force the classic gyroid: x,y,z on at harmonic 1, nothing else
-    python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1
+    # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as a gif
+    python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
+        --frames 90 --format gif
 
-    # just the .ftsl scene files, no rasterized images
-    python examples/gyroid_nd.py --count 3 --no-images
+    # just one static .ftsl scene file per variant, no video
+    python examples/gyroid_nd.py --count 3 --no-video
 
-    # generate and also full path-trace each (windowed, crash-safe checkpointing)
-    python examples/gyroid_nd.py --count 3 --render
+    # high-quality path-traced frames instead of the rasterizer (far slower)
+    python examples/gyroid_nd.py --count 1 --no-raster --render-noise 3
 """
 
 from __future__ import annotations
@@ -86,6 +89,10 @@ class Dim:
     direction: Tuple[float, float, float]
     phase: float
     role: str                           # main | harmonic | independent | inert
+    winding: int = 0                    # animation drift: integer cycles this dim's
+    #                                     phase advances over one video loop (0 = fixed;
+    #                                     the main dim anchors at 0, others drift so the
+    #                                     slice translates through their dimension)
 
 
 @dataclass
@@ -267,6 +274,16 @@ def pick_variant(seed: int, args: argparse.Namespace,
             role = "independent"
         dims.append(Dim(d, True, harmonic, direction, phase, role))
 
+    # Animation drift: the main dim anchors (winding 0); every other oscillating dim
+    # advances its phase by an integer number of cycles over one loop, so the slice
+    # translates *through* that dimension and the interference pattern morphs.  Rates
+    # are distinct-ish (1,2,..,max,1,2,..) so no two dims move in lockstep.
+    max_w = max(1, args.max_winding)
+    non_main_osc = [d for d in sorted(osc) if d != main]
+    by_index = {dm.index: dm for dm in dims}
+    for i, d in enumerate(non_main_osc):
+        by_index[d].winding = (i % max_w) + 1
+
     freq = args.freq if args.freq is not None else rng.uniform(*args.freq_range)
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold, dim_list=dims)
 
@@ -275,7 +292,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
 # field expression
 # ---------------------------------------------------------------------------
 
-def _u_expr(dim: Dim, freq: float) -> str:
+def _u_expr(dim: Dim, freq: float, phase: float) -> str:
     """The per-dimension argument u_d = harmonic*freq*(dir . (x,y,z)) + phase."""
     coeff = dim.harmonic * freq
     parts = []
@@ -284,16 +301,30 @@ def _u_expr(dim: Dim, freq: float) -> str:
             continue
         parts.append(f"({fmt(c)})*{var}")
     lin = "+".join(parts) if parts else "0"
-    if abs(dim.phase) < 1e-9:
+    if abs(phase) < 1e-9:
         return f"({fmt(coeff)}*({lin}))"
-    return f"({fmt(coeff)}*({lin})+({fmt(dim.phase)}))"
+    return f"({fmt(coeff)}*({lin})+({fmt(phase)}))"
 
 
-def field_expr(v: Variant) -> str:
+def field_expr(v: Variant, t: float = 0.0) -> str:
+    """Emit the gyroid field at loop phase ``t`` in [0,1).
+
+    Each dim's phase is advanced by ``2*pi*winding*t`` — an integer number of full
+    cycles over the loop — so ``t=0`` and ``t=1`` are identical (seamless) and the
+    pattern drifts through its dimensions in between.  ``t=0`` reproduces the static
+    field exactly.
+    """
     osc = sorted(v.oscillating)
     m = len(osc)
     by_index = {d.index: d for d in v.dim_list}
-    u = {d: _u_expr(by_index[d], v.freq) for d in osc}
+    u = {}
+    two_pi = 2.0 * math.pi
+    for d in osc:
+        dim = by_index[d]
+        # Reduce the drifted phase modulo 2*pi so t=0 and t=1 emit the *same* constant
+        # (a whole-cycle advance) -> a perfectly seamless loop despite float rounding.
+        phase = (dim.phase + two_pi * dim.winding * t) % two_pi
+        u[d] = _u_expr(dim, v.freq, phase)
     terms = []
     for i in range(m):
         a = osc[i]
@@ -306,8 +337,9 @@ def field_expr(v: Variant) -> str:
 # scene + header
 # ---------------------------------------------------------------------------
 
-def build_scene(v: Variant, *, res=(480, 480), radius=1.3, material="shell") -> Scene:
-    expr = field_expr(v)
+def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
+                material="shell") -> Scene:
+    expr = field_expr(v, t)
     fn = (lambda cx, cy, cz, _e=expr: _e)   # ignore transformed coords; freq baked in
     iso = Isosurface(fn, freq=1.0, threshold=v.threshold, container="sphere",
                      center=(0, 0, 0), radius=radius, material=material,
@@ -329,8 +361,10 @@ def build_scene(v: Variant, *, res=(480, 480), radius=1.3, material="shell") -> 
     return scene
 
 
-def header(v: Variant, index: int, count: int) -> str:
+def header(v: Variant, index: int, count: int, *,
+           frames: Optional[int] = None, fps: Optional[float] = None) -> str:
     osc = v.oscillating
+    drifting = [d.index for d in v.dim_list if d.oscillate and d.winding > 0]
     L = ["#" + "=" * 74,
          f"# Higher-dimensional gyroid slice — variant {index + 1}/{count}",
          f"# generated by gyroid_nd.py",
@@ -341,39 +375,46 @@ def header(v: Variant, index: int, count: int) -> str:
          f"# main dimension        : {v.main}   (fundamental, harmonic 1)",
          f"# harmonics of the main : {len(v.harmonic_dims)}  -> {v.harmonic_dims}",
          f"# base spatial frequency: {fmt(v.freq)}",
-         f"# level set (threshold) : {fmt(v.threshold)}",
-         "#",
-         "# axis  osc  harmonic  direction (x y z)                 phase     role",
-         "# ----  ---  --------  --------------------------------  --------  -----------"]
+         f"# level set (threshold) : {fmt(v.threshold)}"]
+    if frames is not None:
+        secs = frames / fps if fps else 0.0
+        L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
+                 f"(~{fmt(secs)}s seamless loop); drifting dims -> {drifting}")
+    L += ["#",
+          "# axis  osc  harmonic  drift  direction (x y z)                 phase     role",
+          "# ----  ---  --------  -----  --------------------------------  --------  -----------"]
     for d in v.dim_list:
         dirs = "(" + " ".join(fmt(c) for c in d.direction) + ")"
         if d.oscillate:
-            L.append(f"#  {d.index:>3}  yes  {d.harmonic:>6}    {dirs:<32}  "
+            drift = f"{d.winding}" if d.winding > 0 else "-"
+            L.append(f"#  {d.index:>3}  yes  {d.harmonic:>6}  {drift:>5}  {dirs:<32}  "
                      f"{d.phase:>7.4f}   {d.role}")
         else:
-            L.append(f"#  {d.index:>3}   no       -    {dirs:<32}  {'-':>7}   inert")
+            L.append(f"#  {d.index:>3}   no       -      -  {dirs:<32}  {'-':>7}   inert")
     L += ["#",
           "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)",
-          "#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d",
+          "#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
+          "#   (t runs 0->1 over the loop; winding is the integer 'drift' column above)",
           "#" + "=" * 74, ""]
     return "\n".join(L)
 
 
 def sidecar_text(v: Variant, index: int, count: int, *,
-                 ftsl_name: str = "", png_name: str = "") -> str:
-    """Plain-text (non-comment) dump of every chosen value, saved beside each image.
+                 ftsl_name: str = "", video_name: str = "",
+                 frames: Optional[int] = None, fps: Optional[float] = None) -> str:
+    """Plain-text (non-comment) dump of every chosen value, saved beside each video.
 
     Reuses :func:`header` verbatim (stripped of its ``#`` comment prefixes) so the
     ``.txt`` sidecar and the ``.ftsl`` header can never drift apart.
     """
     lines: List[str] = []
-    if ftsl_name or png_name:
+    if ftsl_name or video_name:
+        if video_name:
+            lines.append(f"video file : {video_name}")
         if ftsl_name:
-            lines.append(f"scene file : {ftsl_name}")
-        if png_name:
-            lines.append(f"image file : {png_name}")
+            lines.append(f"frames like: {ftsl_name}")
         lines.append("")
-    for line in header(v, index, count).splitlines():
+    for line in header(v, index, count, frames=frames, fps=fps).splitlines():
         if line.startswith("# "):
             lines.append(line[2:])
         elif line == "#":
@@ -386,46 +427,87 @@ def sidecar_text(v: Variant, index: int, count: int, *,
 
 
 # ---------------------------------------------------------------------------
-# image / render generation
+# per-variant video pipeline
 # ---------------------------------------------------------------------------
 
-def rasterize_files(paths: List[Path], *, res: int) -> List[Path]:
-    """Rasterize each ``.ftsl`` to a PNG with ftrace ``-raster`` (fast z-buffer preview).
+def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *, res: int,
+                  raster: bool, noise: float) -> None:
+    """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
-    Headless and non-blocking: no ``-window`` is passed, so ftrace writes the PNG to
-    ``-o`` and exits, letting a whole batch of N run unattended (with ``-window`` a
-    single ``-raster`` still becomes an interactive, blocking fly camera).
+    ``raster`` uses ftrace ``-raster`` (fast solid-shaded z-buffer preview); otherwise
+    a path-traced render to a per-frame noise budget.  No ``-window`` is passed so the
+    process writes the PNG and exits, letting the whole frame range run unattended.
     """
     import subprocess
-    from loom.drive import find_ftrace, repo_root
-    ftrace = find_ftrace()
-    pngs: List[Path] = []
-    for i, fp in enumerate(paths):
-        png = fp.with_suffix(".png")
+    if raster:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster", "-r", str(res)]
-        print(f"[gyroid_nd] rasterize {i + 1}/{len(paths)}: {png.name}", flush=True)
-        r = subprocess.run(cmd, cwd=str(repo_root()))
-        if r.returncode != 0:
-            raise SystemExit(f"ftrace -raster failed on {fp} (exit {r.returncode})")
-        pngs.append(png)
-    return pngs
+    else:
+        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(res),
+               "-interval", "8", "-checkpoint", "-noise", f"{noise:g}"]
+    r = subprocess.run(cmd, cwd=str(root))
+    if r.returncode != 0:
+        raise SystemExit(f"ftrace failed on {fp.name} (exit {r.returncode})")
 
 
-def render_files(paths: List[Path], *, noise: float, res: int) -> None:
-    """Full path-traced render of each ``.ftsl`` (windowed, checkpointed) — opt-in."""
+def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str) -> Path:
+    """Assemble frames into ``out`` — mp4 via ffmpeg, or a Pillow GIF fallback."""
+    import shutil
     import subprocess
+    if out.suffix.lower() == ".mp4":
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise SystemExit("ffmpeg not found for mp4 output (use --format gif)")
+        cmd = [ffmpeg, "-y", "-framerate", f"{fps:g}", "-i", pattern,
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+               "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", out.name]
+        r = subprocess.run(cmd, cwd=str(out.parent))
+        if r.returncode != 0:
+            raise SystemExit(f"ffmpeg failed assembling {out.name} (exit {r.returncode})")
+    else:
+        from loom.drive import assemble_gif
+        assemble_gif(pngs, out, fps=fps)
+    return out
+
+
+def _video_ext(fmt: str) -> str:
+    """Resolve the ``--format`` choice to a concrete extension."""
+    if fmt == "gif":
+        return "gif"
+    if fmt == "mp4":
+        return "mp4"
+    import shutil
+    return "mp4" if shutil.which("ffmpeg") else "gif"   # auto
+
+
+def make_video(subdir: Path, base: str, v: Variant, *, frames: int, fps: float,
+               res: int, radius: float, raster: bool, noise: float, fmt: str) -> Path:
+    """Emit ``frames`` morphing scene files, render them, and assemble one video.
+
+    The gyroid drifts through its higher dimensions over a seamless loop (frame
+    ``frames`` == frame 0).  Frames render headless with the rasterizer by default.
+    """
+    from loom import Clock, Cache
     from loom.drive import find_ftrace, repo_root
     ftrace = find_ftrace()
-    for i, fp in enumerate(paths):
+    root = repo_root()
+    width = max(3, len(str(frames - 1)))
+    pngs: List[Path] = []
+    for k in range(frames):
+        t = k / frames                                  # seamless loop: t in [0,1)
+        scene = build_scene(v, t=t, res=(res, res), radius=radius)
+        body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
+                          Cache(), assets_dir=subdir, tag=f"{k:0{width}d}")
+        fp = subdir / f"{base}_{k:0{width}d}.ftsl"
+        fp.write_text(body, encoding="utf-8")
         png = fp.with_suffix(".png")
-        last = (i == len(paths) - 1)
-        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(res),
-               "-interval", "8", "-checkpoint", "-noise", f"{noise:g}",
-               "-keepwindow" if last else "-window"]
-        print(f"[gyroid_nd] render {i + 1}/{len(paths)}: {' '.join(cmd)}", flush=True)
-        r = subprocess.run(cmd, cwd=str(repo_root()))
-        if r.returncode != 0:
-            raise SystemExit(f"ftrace failed on {fp} (exit {r.returncode})")
+        _render_frame(ftrace, root, fp, png, res=res, raster=raster, noise=noise)
+        pngs.append(png)
+        print(f"[gyroid_nd]   {base}: frame {k + 1}/{frames}", flush=True)
+    out = subdir / f"{base}.{_video_ext(fmt)}"
+    pattern = f"{base}_%0{width}d.png"                   # ffmpeg reads from subdir cwd
+    _assemble_video(pngs, out, fps=fps, pattern=pattern)
+    print(f"[gyroid_nd] wrote {out}", flush=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +560,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="lock how many oscillating dims are harmonics (overtones) of the main dim")
     g.add_argument("--max-harmonic", type=int, default=5,
                    help="largest integer harmonic drawn for an overtone dim (default 5)")
+    g.add_argument("--max-winding", type=int, default=2,
+                   help="fastest per-dim drift rate: integer cycles a dimension advances "
+                        "over one video loop as the slice moves through it (default 2)")
     g.add_argument("--axis", action="append", default=[], metavar="SPEC",
                    help="force one axis on/off and optionally its harmonic; repeatable "
                         "(see epilog)")
@@ -497,16 +582,24 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--res", type=int, default=480,
                    help="render resolution written into each scene's film (default 480)")
 
-    g = p.add_argument_group("images")
-    g.add_argument("--images", action=argparse.BooleanOptionalAction, default=True,
-                   help="rasterize each variant to a PNG and write a .txt of its values "
-                        "(default on; --no-images to only emit the .ftsl files)")
-
-    g = p.add_argument_group("render (optional)")
-    g.add_argument("--render", action="store_true",
-                   help="also path-trace each generated file with ftrace (windowed, checkpointed)")
+    g = p.add_argument_group("video (per variant)")
+    g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
+                   help="render a seamless morphing video per variant (the gyroid drifting "
+                        "through its higher dimensions) into its own subdir, plus a .txt of "
+                        "its values (default on; --no-video emits just one static .ftsl per "
+                        "variant)")
+    g.add_argument("--frames", type=int, default=60,
+                   help="frames per video (default 60)")
+    g.add_argument("--fps", type=float, default=30.0,
+                   help="video frame rate (default 30)")
+    g.add_argument("--format", choices=("auto", "mp4", "gif"), default="auto",
+                   help="video container (auto: mp4 if ffmpeg is present, else gif)")
+    g.add_argument("--raster", action=argparse.BooleanOptionalAction, default=True,
+                   help="render each frame with the fast headless rasterizer (default); "
+                        "--no-raster path-traces every frame instead (far slower)")
     g.add_argument("--render-noise", type=float, default=4.0,
-                   help="per-frame noise-floor budget for --render (default 4%%)")
+                   help="per-frame noise-floor budget when path-tracing frames (--no-raster; "
+                        "default 4%%)")
     return p
 
 
@@ -543,34 +636,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[gyroid_nd] master seed {master_seed} "
               f"(reproduce this batch with --seed {master_seed})")
 
+    if args.video and args.frames < 2:
+        raise SystemExit("error: --frames must be >= 2 to make a video")
+
     count = len(seeds)
     width = max(3, len(str(count - 1)))
-    written: List[Path] = []
+    made: List[Path] = []
+    from loom import Clock, Cache
     for k, vseed in enumerate(seeds):
         v = pick_variant(vseed, args, axis_locks)
-        scene = build_scene(v, res=(args.res, args.res), radius=args.radius)
-        from loom import Clock, Cache
-        body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir, tag=f"{k:0{width}d}")
-        text = header(v, k, count) + body
-        fp = outdir / f"{args.name}{k:0{width}d}.ftsl"
-        fp.write_text(text, encoding="utf-8")
-        written.append(fp)
-        if args.images:
-            # A plain-text record of every chosen value, saved beside each image.
-            txt = fp.with_suffix(".txt")
-            txt.write_text(
-                sidecar_text(v, k, count, ftsl_name=fp.name,
-                             png_name=fp.with_suffix(".png").name),
+        base = f"{args.name}{k:0{width}d}"
+        print(f"[gyroid_nd] {base}: D={v.dims} osc={v.oscillating} "
+              f"harmonics={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}", flush=True)
+        if args.video:
+            # Each video is a self-contained multi-frame series in its own subdir
+            # (frames + assembled video + a .txt of every chosen value).
+            subdir = outdir / base
+            subdir.mkdir(parents=True, exist_ok=True)
+            ext = _video_ext(args.format)
+            (subdir / f"{base}.txt").write_text(
+                sidecar_text(v, k, count, ftsl_name=f"{base}_NNN.ftsl",
+                             video_name=f"{base}.{ext}",
+                             frames=args.frames, fps=args.fps),
                 encoding="utf-8")
-        print(f"[gyroid_nd] {fp.name}: D={v.dims} osc={v.oscillating} "
-              f"harmonics={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}")
+            video = make_video(subdir, base, v, frames=args.frames, fps=args.fps,
+                               res=args.res, radius=args.radius, raster=args.raster,
+                               noise=args.render_noise, fmt=args.format)
+            made.append(video)
+        else:
+            # No video: one static scene file (t=0) with the full comment header.
+            scene = build_scene(v, t=0.0, res=(args.res, args.res), radius=args.radius)
+            body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
+                              tag=f"{k:0{width}d}")
+            fp = outdir / f"{base}.ftsl"
+            fp.write_text(header(v, k, count) + body, encoding="utf-8")
+            made.append(fp)
 
-    print(f"[gyroid_nd] wrote {len(written)} scene file(s) to {outdir}")
-    if args.images:
-        pngs = rasterize_files(written, res=args.res)
-        print(f"[gyroid_nd] rasterized {len(pngs)} image(s) (+ .txt values) to {outdir}")
-    if args.render:
-        render_files(written, noise=args.render_noise, res=args.res)
+    kind = "video(s)" if args.video else "scene file(s)"
+    print(f"[gyroid_nd] wrote {len(made)} {kind} to {outdir}")
     return 0
 
 
