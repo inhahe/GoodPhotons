@@ -5,6 +5,35 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-17): GPU preview rasterizer covers only rectilinear + opaque (M1)
+
+The GPU preview rasterizer (`src/raster_cuda.{h,cu}`, wired into `main.cpp`'s
+`-raster` block via the `rasterOne` dispatcher, gated on `-device gpu|auto`) is a
+first milestone: it accelerates **rectilinear, opaque** previews and falls back to the
+CPU rasterizer (`raster::renderFrame`) per camera for everything else. Deferred work:
+
+- **Fisheye / panoramic projections (M2).** The device `kProject` only implements the
+  rectilinear `x/z` branch + near-plane clip. The CPU rasterizer already proves the
+  raster/shade/exposure stages are projection-agnostic, so M2 is *just* porting the
+  angular `projRadius(projection, θ)/rEdge` branch of `raster::projectVtx` and the
+  behind-camera reject-clip into `kProject` — the `kRaster`/`kShade`/`exposeAndEncode`
+  kernels stay untouched. Until then a non-rectilinear camera silently uses the CPU.
+- **See-through (`-see-through`) on GPU.** The clear-glass accumulation pass
+  (`fillTriangleClear`: cumulative transmittance + milk products) has no device port,
+  so `-device gpu` with `-see-through` runs entirely on the CPU. Port it as a second
+  device pass over the clear triangles writing `clearT`/`milkT`, then feed those to the
+  shared `exposeAndEncode` (which already accepts them).
+- **Parity is visual, not bit-exact.** The device geometry/shading is single precision
+  vs the CPU's double, so silhouette-edge pixels can differ by one pixel of coverage
+  (measured ~0.03 % of pixels on cornell/implicit, all on color boundaries, mean abs
+  diff ~0.02/255). The exposure + tone-map tail IS shared host double code
+  (`raster::exposeAndEncode`), so brightness/lock never drift. Acceptable for a preview;
+  a full-FP64 device path would close the edge gap at a large speed cost (not worth it).
+- **Per-frame readback.** Each frame downloads the HDR accum + z + emis buffers and runs
+  the p99 + encode on the host. Fine today; if it ever bottlenecks, move the tone map
+  onto the device and read back only RGB8 (would then need the anchor computed on-device
+  or shared explicitly for the exposure-lock case).
+
 ### TECH DEBT (2026-07-17): loom preview server (`-serve`) is resident-process only
 
 The M12 preview server (ftrace `-serve` in `src/main.cpp` `runServe`, loom

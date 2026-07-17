@@ -152,6 +152,7 @@
                                // header also pulls it in, but CPU-only builds need it too
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
+#include "raster_cuda.h"   // GPU preview rasterizer (device twin of raster::renderFrame)
 #endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -4141,6 +4142,47 @@ static int run(int argc, char** argv) {
                     toRender.size(), nThreads, g_showWindow ? " — live window" : "");
         std::fflush(stdout);
 
+        // GPU preview rasterizer (-device gpu|auto). Bake the world triangles to the device
+        // ONCE (reused for every camera / flyby frame), then each frame runs the projection +
+        // raster + shade on the GPU and shares the SAME host exposure/tonemap tail as the CPU
+        // path (raster::exposeAndEncode) — so GPU and CPU frames match. M1 covers RECTILINEAR
+        // opaque previews; fisheye/panoramic cameras and see-through fall back to the CPU
+        // per-frame (rasterOne below picks per camera). Any device failure also falls back.
+#ifdef HAVE_CUDA
+        raster_cuda::Scene* gpuRaster = nullptr;
+        {
+            const bool wantGpu  = !std::strcmp(device, "gpu");
+            const bool wantAuto = !std::strcmp(device, "auto");
+            if ((wantGpu || wantAuto) && raster_cuda::available() && !rasterSeeThrough) {
+                gpuRaster = raster_cuda::upload(prims, plight);
+                if (gpuRaster)
+                    std::printf("[raster] GPU rasterizer: rectilinear frames on the GPU "
+                                "(fisheye/panoramic fall back to CPU)\n");
+                else if (wantGpu)
+                    std::fprintf(stderr, "[raster] GPU upload failed; using CPU\n");
+            } else if (wantGpu && rasterSeeThrough) {
+                std::fprintf(stderr, "[raster] see-through preview isn't on the GPU yet; using CPU\n");
+            } else if (wantGpu && !raster_cuda::available()) {
+                std::fprintf(stderr, "[raster] no CUDA device found; using CPU\n");
+            }
+            std::fflush(stdout);
+        }
+#endif
+        // Render one preview frame: GPU when it's baked and the camera is rectilinear (M1),
+        // else the CPU rasterizer. A GPU device failure returns empty -> CPU fallback too.
+        auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
+                             double* lock) -> std::vector<uint8_t> {
+#ifdef HAVE_CUDA
+            if (gpuRaster && cam.projection == CAM_RECTILINEAR) {
+                std::vector<uint8_t> img =
+                    raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock);
+                if (!img.empty()) return img;
+            }
+#endif
+            return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
+                                       rasterSeeThrough, rasterClarity);
+        };
+
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
         // frame(s) and pre-populate expAnchors[group] (averaging for EXPLOCK_AVERAGE), so
         // every frame of the group previews at the chosen viewpoint's exposure — mirroring
@@ -4165,8 +4207,7 @@ static int run(int argc, char** argv) {
                 if (g_liveWin && g_liveWin->closed()) { g_stopRequested = 1; break; }
                 double a = 0.0;
                 std::vector<uint8_t> mimg =
-                    raster::renderFrame(prims, mc.cam, mc.res, mc.resY, plight, nThreads,
-                                        /*exposure*/1.0, /*autoExpose*/true, &a);
+                    rasterOne(mc.cam, mc.res, mc.resY, /*exposure*/1.0, /*autoExpose*/true, &a);
                 bool stop = conv.add(a);
                 ++meterDone;
                 // Show the metering pass converging + a throttled running count so the
@@ -4230,8 +4271,7 @@ static int run(int argc, char** argv) {
             // flicker frame-to-frame (shared anchor per group; per-frame when expGroup<0).
             const bool autoExp = !scene.absolute;
             double* lockAnchor = (autoExp && rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-            std::vector<uint8_t> img = raster::renderFrame(prims, rc.cam, W, H, plight, nThreads, ev, autoExp, lockAnchor,
-                                                           rasterSeeThrough, rasterClarity);
+            std::vector<uint8_t> img = rasterOne(rc.cam, W, H, ev, autoExp, lockAnchor);
             std::string path = outFor(rc.name);
             if (!writeImage(path, W, H, img)) {
                 std::fprintf(stderr, "[raster] failed to write %s\n", path.c_str());
@@ -4929,8 +4969,7 @@ static int run(int argc, char** argv) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     std::vector<uint8_t> img =
-                        raster::renderFrame(prims, c, VW, VH, plight, nThreads, ev, autoExp, nullptr,
-                                            rasterSeeThrough, rasterClarity);
+                        rasterOne(c, VW, VH, ev, autoExp, nullptr);
                     drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
                     g_liveWin->update(VW, VH, img);
                     g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
@@ -4971,6 +5010,9 @@ static int run(int argc, char** argv) {
             }
             g_stopRequested = 1;   // window closed → done
         }
+#ifdef HAVE_CUDA
+        raster_cuda::destroy(gpuRaster);
+#endif
         return 0;
     }
 

@@ -421,6 +421,100 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
     return s;
 }
 
+// Shared exposure + tone-map tail (the back half of renderFrame). Given a per-pixel
+// HDR `accum` buffer that has already been shaded (background pixels hold the unlit bg
+// tint), a `zbuf` hit key (>0 where a surface was drawn), an `emis` mask, and the
+// optional see-through transmittance/milk products, this applies the p99 auto-exposure
+// anchor and the sRGB tone map exactly as filmToRgb8 does, returning W*H*3 RGB8 (row 0 =
+// top). Factored out so the CPU rasterizer and the CUDA rasterizer share ONE copy of the
+// exposure/tonemap logic — the GPU path shades into an identical `accum`/`zbuf` on the
+// device, downloads them, and calls this, guaranteeing byte-identical exposure (including
+// a camera_path's shared `lockAnchor`) regardless of which backend produced the geometry.
+inline std::vector<uint8_t> exposeAndEncode(
+        const std::vector<Vec3>& accum, const std::vector<float>& zbuf,
+        const std::vector<uint8_t>& emis, int W, int H, int nThreads,
+        double expComp, bool autoExpose, double* lockAnchor,
+        bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
+        const Vec3& milkColor) {
+    const size_t N = (size_t)W * H;
+    if (nThreads < 1) nThreads = 1;
+    auto parallelFor = [&](size_t n, const std::function<void(size_t, size_t)>& body) {
+        if (n == 0) return;
+        if (nThreads == 1) { body(0, n); return; }
+        std::vector<std::thread> pool;
+        size_t chunk = (n + nThreads - 1) / nThreads;
+        for (int ti = 0; ti < nThreads; ++ti) {
+            size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
+            if (a >= b) break;
+            pool.emplace_back(body, a, b);
+        }
+        for (auto& th : pool) th.join();
+    };
+
+    // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
+    // lit surfaces to ~0.9. Background (unhit) pixels are excluded so an empty frame
+    // margin can't skew the anchor; emitters are excluded too so the *subject* drives the
+    // exposure (they just clip to white, as in the real render, instead of dragging the
+    // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
+    // bypasses this so aperture/power brightness differences survive into the preview.
+    double eAuto = 1.0;
+    if (autoExpose) {
+        if (lockAnchor && *lockAnchor > 0.0) {
+            eAuto = *lockAnchor;                    // reuse the path's locked anchor
+        } else {
+            std::vector<double> lum; lum.reserve(N);
+            for (size_t i = 0; i < N; ++i) {
+                if (zbuf[i] <= 0.0f || emis[i]) continue;   // skip background + emitters
+                const Vec3& c = accum[i];
+                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
+            }
+            if (!lum.empty()) {
+                // Only the 99th-percentile order statistic matters, so partition instead
+                // of a full sort (O(n) vs O(n log n)).
+                size_t k = (size_t)(0.99 * (lum.size() - 1));
+                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
+                double p99 = lum[k];
+                eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
+            }
+            if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
+        }
+    }
+    const double finalExp = eAuto * expComp;
+
+    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
+    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
+    // [0,1] replaces three std::pow calls per pixel with a table read + round.
+    static const std::array<uint8_t, 4097> kSrgbLut = [] {
+        std::array<uint8_t, 4097> t{};
+        for (int i = 0; i <= 4096; ++i)
+            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
+        return t;
+    }();
+    auto encode = [&](double c) -> uint8_t {
+        if (c <= 0.0) return kSrgbLut[0];
+        if (c >= 1.0) return 255;
+        return kSrgbLut[(int)(c * 4096.0 + 0.5)];
+    };
+
+    // Tone map: exposed hit pixels through sRGB gamma; background tint left unexposed.
+    std::vector<uint8_t> img(N * 3);
+    parallelFor(N, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            Vec3 c = accum[i];
+            if (zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
+            if (seeThrough) {                          // composite clear glass (display-linear)
+                float T = clearT[i], mt = milkT[i];
+                if (T < 1.0f || mt < 1.0f)
+                    c = c * (double)T + milkColor * (1.0 - (double)mt);
+            }
+            img[i * 3 + 0] = encode(c.x);
+            img[i * 3 + 1] = encode(c.y);
+            img[i * 3 + 2] = encode(c.z);
+        }
+    });
+    return img;
+}
+
 // Render one camera to an 8-bit RGB image (row 0 = image top), multithreaded by
 // horizontal bands (each band owns its slice of the z-buffer, no locking).
 //
@@ -633,68 +727,11 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         }
     });
 
-    // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
-    // lit surfaces to ~0.9. Background (unhit) pixels are excluded so an empty frame
-    // margin can't skew the anchor; emitters are excluded too so the *subject* drives the
-    // exposure (they just clip to white, as in the real render, instead of dragging the
-    // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
-    // bypasses this so aperture/power brightness differences survive into the preview.
-    double eAuto = 1.0;
-    if (autoExpose) {
-        if (lockAnchor && *lockAnchor > 0.0) {
-            eAuto = *lockAnchor;                    // reuse the path's locked anchor
-        } else {
-            std::vector<double> lum; lum.reserve(N);
-            for (size_t i = 0; i < N; ++i) {
-                if (g.zbuf[i] <= 0.0f || g.emis[i]) continue;   // skip background + emitters
-                const Vec3& c = accum[i];
-                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
-            }
-            if (!lum.empty()) {
-                // Only the 99th-percentile order statistic matters, so partition instead
-                // of a full sort (O(n) vs O(n log n)).
-                size_t k = (size_t)(0.99 * (lum.size() - 1));
-                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
-                double p99 = lum[k];
-                eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
-            }
-            if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
-        }
-    }
-    const double finalExp = eAuto * expComp;
-
-    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
-    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
-    // [0,1] replaces three std::pow calls per pixel with a table read + round.
-    static const std::array<uint8_t, 4097> kSrgbLut = [] {
-        std::array<uint8_t, 4097> t{};
-        for (int i = 0; i <= 4096; ++i)
-            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
-        return t;
-    }();
-    auto encode = [&](double c) -> uint8_t {
-        if (c <= 0.0) return kSrgbLut[0];
-        if (c >= 1.0) return 255;
-        return kSrgbLut[(int)(c * 4096.0 + 0.5)];
-    };
-
-    // Tone map: exposed hit pixels through sRGB gamma; background tint left unexposed.
-    std::vector<uint8_t> img(N * 3);
-    parallelFor(N, [&](size_t a, size_t b) {
-        for (size_t i = a; i < b; ++i) {
-            Vec3 c = accum[i];
-            if (g.zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
-            if (seeThrough) {                          // composite clear glass (display-linear)
-                float T = clearT[i], mt = milkT[i];
-                if (T < 1.0f || mt < 1.0f)
-                    c = c * (double)T + kMilkColor * (1.0 - (double)mt);
-            }
-            img[i * 3 + 0] = encode(c.x);
-            img[i * 3 + 1] = encode(c.y);
-            img[i * 3 + 2] = encode(c.z);
-        }
-    });
-    return img;
+    // Auto-exposure + sRGB tone map: shared with the CUDA rasterizer (see exposeAndEncode),
+    // so both backends anchor and encode identically. The see-through buffers are empty when
+    // !seeThrough and simply ignored by the helper in that case.
+    return exposeAndEncode(accum, g.zbuf, g.emis, W, H, nThreads, expComp, autoExpose,
+                           lockAnchor, seeThrough, clearT, milkT, kMilkColor);
 }
 
 // Draw a red look-at crosshair at world point `target` onto an already-rendered RGB

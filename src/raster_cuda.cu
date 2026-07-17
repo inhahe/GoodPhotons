@@ -1,0 +1,456 @@
+// raster_cuda.cu — GPU (CUDA) backend for the solid-shaded PREVIEW rasterizer. See
+// raster_cuda.h for the scope and rationale.
+//
+// Pipeline (device twin of raster.h's deferred-visibility CPU rasterizer):
+//
+//   HOST  upload():  bake the world-space raster::PTri list + preview lights into POD
+//                    device arrays (float3), once. Reused for every camera of a flyby.
+//
+//   Pass A  kProject  (1 thread / input triangle): transform to camera space, near-plane
+//                     clip (Sutherland-Hodgman against z=zn), and project the resulting
+//                     fan into up to TWO screen sub-triangles (DSTri) written to fixed
+//                     slots [2*i], [2*i+1]. Rectilinear only (M1).
+//
+//   Pass B  kRaster   (1 thread / DSTri slot): rasterize the sub-triangle's pixel bbox,
+//                     packing (1/depth, slotIdx) into a 64-bit visibility buffer with a
+//                     single atomicMax. Nearest surface (largest 1/depth) wins per pixel.
+//
+//   Pass C  kShade    (1 thread / pixel): decode the winning slot, recompute barycentrics
+//                     at the pixel centre, interpolate world pos/normal, and shade once
+//                     (the same ambient + Σ weighted N·L + headlight model as the CPU).
+//                     Writes an HDR accum buffer + a 1/depth hit key + an emitter mask.
+//
+//   HOST  download accum/zbuf/emis, then raster::exposeAndEncode() applies the p99 auto-
+//         exposure + sRGB tone map on the HOST — the SAME code the CPU path uses, so
+//         exposure (incl. a camera_path's shared lockAnchor) and encoding are identical.
+//
+// Everything on the device runs in single precision (float): this is a solid-shaded
+// preview, float is amply accurate for the geometry/shading, and it halves the DSTri and
+// buffer memory. The exposure/tonemap tail that must match the real render frame-to-frame
+// stays in host double precision (exposeAndEncode).
+//
+// Portable CUDA/HIP host runtime surface (mirrors render_cuda.cu): only the host runtime
+// API is vendor-specific; the device language used here (grid-stride loops, atomicMax on
+// unsigned long long, __float_as_uint) is identical under nvcc and hipcc.
+#if defined(FTRACE_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+  #include <hip/hip_runtime.h>
+  #define cudaError_t             hipError_t
+  #define cudaSuccess             hipSuccess
+  #define cudaGetDeviceCount      hipGetDeviceCount
+  #define cudaMalloc              hipMalloc
+  #define cudaMemcpy              hipMemcpy
+  #define cudaMemcpyHostToDevice  hipMemcpyHostToDevice
+  #define cudaMemcpyDeviceToHost  hipMemcpyDeviceToHost
+  #define cudaMemset              hipMemset
+  #define cudaFree                hipFree
+  #define cudaGetLastError        hipGetLastError
+  #define cudaDeviceSynchronize   hipDeviceSynchronize
+  #define cudaGetErrorString      hipGetErrorString
+#else
+  #include <cuda_runtime.h>
+#endif
+
+#include <cstdio>
+#include <cstdint>
+#include <vector>
+#include <cmath>
+
+#include "raster_cuda.h"
+#include "camera.h"    // Camera, CAM_RECTILINEAR
+
+namespace raster_cuda {
+
+// ---------------------------------------------------------------------------
+// POD device structs (float). One preview triangle, one distilled light, the camera
+// frame, and a projected/clipped screen sub-triangle.
+struct DPTri {
+    float3 p0, p1, p2;
+    float3 n0, n1, n2;
+    float3 color;
+    int    emissive;
+};
+
+struct DLight {
+    float3 pos, dir;
+    int    spot;
+    float  cosInner, cosOuter, weight, falloff2;
+};
+
+struct DCam {
+    float3 eye, u, v, w;   // right, up, forward (orthonormal)
+    float  tanHalfX, tanHalfY;
+};
+
+// A projected screen sub-triangle produced by the clip/project pass and consumed by the
+// raster + shade passes. `valid`=0 marks an unused slot (a triangle that clipped away, or
+// the second slot of a triangle that produced only one sub-triangle).
+struct DSTri {
+    float  sx0, sy0, invd0; float3 wp0, wn0;
+    float  sx1, sy1, invd1; float3 wp1, wn1;
+    float  sx2, sy2, invd2; float3 wp2, wn2;
+    float3 color;
+    int    emissive;
+    int    valid;
+};
+
+// A camera-space vertex carrying the interpolated attributes (mirrors raster::VtxCS).
+struct DVtxCS { float x, y, z; float3 wpos, wn; };
+
+// ---------------------------------------------------------------------------
+// Device vector helpers (self-contained; no host header is __device__-annotated).
+__host__ __device__ inline float3 mk(float x, float y, float z) { return make_float3(x, y, z); }
+__device__ inline float3 operator+(float3 a, float3 b) { return mk(a.x+b.x, a.y+b.y, a.z+b.z); }
+__device__ inline float3 operator-(float3 a, float3 b) { return mk(a.x-b.x, a.y-b.y, a.z-b.z); }
+__device__ inline float3 operator*(float3 a, float s)  { return mk(a.x*s, a.y*s, a.z*s); }
+__device__ inline float  dot3(float3 a, float3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+__device__ inline float3 normalize3(float3 a) {
+    float L = sqrtf(dot3(a, a));
+    return (L > 1e-12f) ? a * (1.0f / L) : a;
+}
+
+// spotFalloff (smoothstep between the inner/outer cone cosines) — mirrors scene.h.
+__device__ inline float spotFalloffD(float ct, float cosInner, float cosOuter) {
+    if (ct >= cosInner) return 1.0f;
+    if (ct <= cosOuter) return 0.0f;
+    float t = (ct - cosOuter) / (cosInner - cosOuter);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// World -> camera space for one vertex (mirrors raster::projectRange's toCS).
+__device__ inline DVtxCS toCS(const DCam& cam, float3 P, float3 Nn) {
+    float3 d = P - cam.eye;
+    DVtxCS c; c.x = dot3(d, cam.u); c.y = dot3(d, cam.v); c.z = dot3(d, cam.w);
+    c.wpos = P; c.wn = Nn; return c;
+}
+
+// Linear interpolation of two camera-space vertices (near-plane clip).
+__device__ inline DVtxCS lerpVtx(const DVtxCS& a, const DVtxCS& b, float s) {
+    DVtxCS r;
+    r.x = a.x + (b.x - a.x)*s; r.y = a.y + (b.y - a.y)*s; r.z = a.z + (b.z - a.z)*s;
+    r.wpos = a.wpos + (b.wpos - a.wpos)*s; r.wn = a.wn + (b.wn - a.wn)*s; return r;
+}
+
+// Project a camera-space vertex to the raster (rectilinear pinhole; M1). Mirrors
+// raster::projectVtx's rectilinear branch: sx in [0,W], sy=0 at image top, invd=1/depth.
+__device__ inline void projectVtxRect(const DCam& cam, const DVtxCS& v, int W, int H,
+                                       float& sx, float& sy, float& invd,
+                                       float3& wp, float3& wn) {
+    float ndcx = (v.x / v.z) / cam.tanHalfX;
+    float ndcy = (v.y / v.z) / cam.tanHalfY;
+    float depth = v.z;
+    sx = (ndcx * 0.5f + 0.5f) * W;
+    sy = (0.5f - 0.5f * ndcy) * H;
+    invd = 1.0f / fmaxf(depth, 1e-9f);
+    wp = v.wpos; wn = v.wn;
+}
+
+// ---------------------------------------------------------------------------
+// Pass A: transform + near-plane clip + project each input triangle into up to two DSTri.
+__global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
+                         DSTri* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nTris) return;
+    const DPTri& t = tris[i];
+    // Invalidate both output slots up front.
+    out[2*i].valid = 0; out[2*i+1].valid = 0;
+
+    // World -> camera space.
+    DVtxCS cs[3] = { toCS(cam, t.p0, t.n0), toCS(cam, t.p1, t.n1), toCS(cam, t.p2, t.n2) };
+
+    // Sutherland-Hodgman clip against the near plane z=zn (rectilinear only).
+    const float zn = 1e-3f;
+    DVtxCS poly[8]; int np = 0;
+    for (int e = 0; e < 3; ++e) {
+        const DVtxCS& A = cs[e]; const DVtxCS& B = cs[(e+1)%3];
+        bool inA = A.z > zn, inB = B.z > zn;
+        if (inA && np < 8) poly[np++] = A;
+        if (inA != inB && np < 8) { float s = (zn - A.z) / (B.z - A.z); poly[np++] = lerpVtx(A, B, s); }
+    }
+    if (np < 3) return;
+
+    // Fan the clipped polygon into (np-2) triangles; store up to the first two.
+    float sx[8], sy[8], invd[8]; float3 wp[8], wn[8];
+    for (int k = 0; k < np; ++k)
+        projectVtxRect(cam, poly[k], W, H, sx[k], sy[k], invd[k], wp[k], wn[k]);
+
+    int slot = 0;
+    for (int k = 1; k + 1 < np && slot < 2; ++k, ++slot) {
+        DSTri s;
+        s.sx0 = sx[0];   s.sy0 = sy[0];   s.invd0 = invd[0];   s.wp0 = wp[0];   s.wn0 = wn[0];
+        s.sx1 = sx[k];   s.sy1 = sy[k];   s.invd1 = invd[k];   s.wp1 = wp[k];   s.wn1 = wn[k];
+        s.sx2 = sx[k+1]; s.sy2 = sy[k+1]; s.invd2 = invd[k+1]; s.wp2 = wp[k+1]; s.wn2 = wn[k+1];
+        s.color = t.color; s.emissive = t.emissive; s.valid = 1;
+        out[2*i + slot] = s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass B: rasterize each valid DSTri into the 64-bit visibility buffer. Each covered pixel
+// packs (1/depth as float bits) << 32 | slotIdx; atomicMax keeps the nearest (largest
+// 1/depth) surface. Mirrors fillTriangleG's barycentric coverage + perspective 1/depth.
+__global__ void kRaster(const DSTri* stris, int nSlots, int W, int H,
+                        unsigned long long* vis) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nSlots) return;
+    const DSTri& t = stris[idx];
+    if (!t.valid) return;
+
+    float minx = floorf(fminf(t.sx0, fminf(t.sx1, t.sx2)));
+    float maxx = ceilf (fmaxf(t.sx0, fmaxf(t.sx1, t.sx2)));
+    float miny = floorf(fminf(t.sy0, fminf(t.sy1, t.sy2)));
+    float maxy = ceilf (fmaxf(t.sy0, fmaxf(t.sy1, t.sy2)));
+    int xlo = max(0, (int)minx), xhi = min(W - 1, (int)maxx);
+    int ylo = max(0, (int)miny), yhi = min(H - 1, (int)maxy);
+    if (xlo > xhi || ylo > yhi) return;
+
+    float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
+    if (fabsf(area) < 1e-9f) return;
+    float inv = 1.0f / area;
+    const float dw0dx = (t.sy1 - t.sy2) * inv;
+    const float dw1dx = (t.sy2 - t.sy0) * inv;
+
+    for (int y = ylo; y <= yhi; ++y) {
+        float py = y + 0.5f, pxL = xlo + 0.5f;
+        float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * inv;
+        float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * inv;
+        unsigned long long row = (unsigned long long)y * W + xlo;
+        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
+            float w2 = 1.0f - w0 - w1;
+            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+            float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
+            if (invd <= 0.0f) continue;
+            unsigned long long packed =
+                ((unsigned long long)__float_as_uint(invd) << 32) | (unsigned int)idx;
+            atomicMax(&vis[row], packed);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass C: resolve + shade each pixel once. Decode the winning DSTri, recompute barycentrics
+// at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
+// interpolate world pos/normal, and shade with the same model as raster.h Pass 3.
+__global__ void kShade(const DSTri* stris, const unsigned long long* vis,
+                       const DLight* lights, int nLights,
+                       float ambient, float keyScale, float fill,
+                       DCam cam, int W, int H, float3 bg, float emisBoost,
+                       float3* accum, float* zbuf, unsigned char* emis) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (unsigned long long)W * H) return;
+    unsigned long long v = vis[i];
+    if (v == 0ULL) { accum[i] = bg; zbuf[i] = 0.0f; emis[i] = 0; return; }
+    int slot = (int)(unsigned int)(v & 0xffffffffULL);
+    const DSTri& t = stris[slot];
+
+    // Recompute barycentrics at this pixel's centre.
+    int px = (int)(i % (unsigned long long)W);
+    int py = (int)(i / (unsigned long long)W);
+    float fx = px + 0.5f, fy = py + 0.5f;
+    float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
+    float inv = (fabsf(area) > 1e-12f) ? 1.0f / area : 0.0f;
+    float w0 = ((t.sx1 - fx) * (t.sy2 - fy) - (t.sy1 - fy) * (t.sx2 - fx)) * inv;
+    float w1 = ((t.sx2 - fx) * (t.sy0 - fy) - (t.sy2 - fy) * (t.sx0 - fx)) * inv;
+    float w2 = 1.0f - w0 - w1;
+    float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;
+    zbuf[i] = invd;
+    emis[i] = t.emissive ? 1 : 0;
+    if (t.emissive) { accum[i] = t.color * emisBoost; return; }   // raw emitter radiance
+
+    // Perspective-correct world pos / normal.
+    float d = 1.0f / fmaxf(invd, 1e-12f);
+    float3 wpos = (t.wp0 * (w0 * t.invd0) + t.wp1 * (w1 * t.invd1) + t.wp2 * (w2 * t.invd2)) * d;
+    float3 wn   = (t.wn0 * (w0 * t.invd0) + t.wn1 * (w1 * t.invd1) + t.wn2 * (w2 * t.invd2)) * d;
+    float3 N3 = normalize3(wn);
+    float3 V  = normalize3(cam.eye - wpos);
+    if (dot3(N3, V) < 0.0f) N3 = N3 * -1.0f;             // two-sided
+    float lit = 0.0f;
+    for (int li = 0; li < nLights; ++li) {
+        const DLight& lp = lights[li];
+        float3 dd = lp.pos - wpos;
+        float dist2 = dot3(dd, dd);
+        float3 Ld = (dist2 > 1e-12f) ? dd * (1.0f / sqrtf(dist2)) : V;
+        float ndl = fmaxf(0.0f, dot3(N3, Ld));
+        if (ndl <= 0.0f) continue;
+        float atten = 1.0f;
+        if (lp.falloff2 > 0.0f) atten = lp.falloff2 / (lp.falloff2 + dist2);
+        float cone = 1.0f;
+        if (lp.spot) cone = spotFalloffD(dot3(lp.dir, Ld * -1.0f), lp.cosInner, lp.cosOuter);
+        lit += lp.weight * ndl * atten * cone;
+    }
+    float head = fmaxf(0.0f, dot3(N3, V));
+    float k = ambient + keyScale * lit + fill * head;
+    accum[i] = t.color * k;
+}
+
+// ---------------------------------------------------------------------------
+// Host side.
+
+// True if a usable CUDA device is present (cached).
+bool available() {
+    static int cached = -1;
+    if (cached < 0) {
+        int n = 0;
+        cudaError_t e = cudaGetDeviceCount(&n);
+        cached = (e == cudaSuccess && n > 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Opaque uploaded scene: persistent device triangle + light arrays, plus cached per-pixel
+// scratch (grown as needed) so a camera_path re-renders without re-uploading geometry.
+struct Scene {
+    DPTri*   dtris   = nullptr;
+    int      nTris   = 0;
+    DSTri*   dstris  = nullptr;   // 2*nTris slots
+    DLight*  dlights = nullptr;
+    int      nLights = 0;
+    float    ambient = 0.12f, keyScale = 1.15f, fill = 0.08f;
+    // Per-pixel scratch (sized to the largest W*H seen).
+    unsigned long long* vis   = nullptr;
+    float3*             accum = nullptr;
+    float*              zbuf  = nullptr;
+    unsigned char*      emis  = nullptr;
+    size_t              pixCap = 0;
+};
+
+static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
+
+// Non-aborting device alloc: returns false on failure (the rasterizer falls back to CPU
+// rather than killing the process, unlike the transport CUDA path's CUDA_CHECK).
+static bool tryMalloc(void** p, size_t bytes) {
+    cudaError_t e = cudaMalloc(p, bytes);
+    if (e != cudaSuccess) { *p = nullptr; return false; }
+    return true;
+}
+
+void destroy(Scene* sc) {
+    if (!sc) return;
+    if (sc->dtris)   cudaFree(sc->dtris);
+    if (sc->dstris)  cudaFree(sc->dstris);
+    if (sc->dlights) cudaFree(sc->dlights);
+    if (sc->vis)     cudaFree(sc->vis);
+    if (sc->accum)   cudaFree(sc->accum);
+    if (sc->zbuf)    cudaFree(sc->zbuf);
+    if (sc->emis)    cudaFree(sc->emis);
+    delete sc;
+}
+
+Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight& light) {
+    if (!available() || tris.empty()) return nullptr;
+    Scene* sc = new Scene();
+    sc->nTris = (int)tris.size();
+
+    // Bake triangles.
+    std::vector<DPTri> h(tris.size());
+    for (size_t i = 0; i < tris.size(); ++i) {
+        const raster::PTri& t = tris[i];
+        DPTri& d = h[i];
+        d.p0 = toF3(t.p0); d.p1 = toF3(t.p1); d.p2 = toF3(t.p2);
+        d.n0 = toF3(t.n0); d.n1 = toF3(t.n1); d.n2 = toF3(t.n2);
+        d.color = toF3(t.color); d.emissive = t.emissive ? 1 : 0;
+    }
+    // Bake lights.
+    std::vector<DLight> hl(light.lights.size());
+    for (size_t i = 0; i < light.lights.size(); ++i) {
+        const raster::PLight& p = light.lights[i];
+        DLight& d = hl[i];
+        d.pos = toF3(p.pos); d.dir = toF3(p.dir); d.spot = p.spot ? 1 : 0;
+        d.cosInner = (float)p.cosInner; d.cosOuter = (float)p.cosOuter;
+        d.weight = (float)p.weight; d.falloff2 = (float)p.falloff2;
+    }
+    sc->nLights  = (int)hl.size();
+    sc->ambient  = (float)light.ambient;
+    sc->keyScale = (float)light.keyScale;
+    sc->fill     = (float)light.fill;
+
+    bool ok = tryMalloc((void**)&sc->dtris,  sizeof(DPTri) * tris.size())
+           && tryMalloc((void**)&sc->dstris, sizeof(DSTri) * 2 * tris.size());
+    if (ok && !hl.empty())
+        ok = tryMalloc((void**)&sc->dlights, sizeof(DLight) * hl.size());
+    if (!ok) { destroy(sc); return nullptr; }
+
+    if (cudaMemcpy(sc->dtris, h.data(), sizeof(DPTri) * tris.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    if (!hl.empty() &&
+        cudaMemcpy(sc->dlights, hl.data(), sizeof(DLight) * hl.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    return sc;
+}
+
+// Grow the cached per-pixel scratch to hold N pixels (freeing + reallocating on growth).
+static bool ensurePix(Scene* sc, size_t N) {
+    if (N <= sc->pixCap && sc->vis) return true;
+    if (sc->vis)   { cudaFree(sc->vis);   sc->vis = nullptr; }
+    if (sc->accum) { cudaFree(sc->accum); sc->accum = nullptr; }
+    if (sc->zbuf)  { cudaFree(sc->zbuf);  sc->zbuf = nullptr; }
+    if (sc->emis)  { cudaFree(sc->emis);  sc->emis = nullptr; }
+    sc->pixCap = 0;
+    bool ok = tryMalloc((void**)&sc->vis,   sizeof(unsigned long long) * N)
+           && tryMalloc((void**)&sc->accum, sizeof(float3) * N)
+           && tryMalloc((void**)&sc->zbuf,  sizeof(float) * N)
+           && tryMalloc((void**)&sc->emis,  sizeof(unsigned char) * N);
+    if (!ok) return false;
+    sc->pixCap = N;
+    return true;
+}
+
+static bool sync() {
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    return e == cudaSuccess;
+}
+
+std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
+                                 double exposure, bool autoExpose, double* lockAnchor) {
+    std::vector<uint8_t> empty;
+    if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return empty;
+    if (cam.projection != CAM_RECTILINEAR) return empty;   // M1: rectilinear only
+    const size_t N = (size_t)W * H;
+    if (!ensurePix(sc, N)) return empty;
+
+    DCam dc;
+    dc.eye = toF3(cam.eye); dc.u = toF3(cam.u); dc.v = toF3(cam.v); dc.w = toF3(cam.w);
+    dc.tanHalfX = (float)cam.tanHalfX; dc.tanHalfY = (float)cam.tanHalfY;
+
+    const float3 bg = make_float3(0.06f, 0.07f, 0.09f);
+    const float  EMIS_BOOST = 4.0f;
+
+    if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return empty;
+
+    int TPB = 256;
+    int gTris  = (sc->nTris + TPB - 1) / TPB;
+    int gSlots = (2 * sc->nTris + TPB - 1) / TPB;
+    int gPix   = (int)((N + TPB - 1) / TPB);
+
+    kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dstris);
+    if (!sync()) return empty;
+    kRaster<<<gSlots, TPB>>>(sc->dstris, 2 * sc->nTris, W, H, sc->vis);
+    if (!sync()) return empty;
+    kShade<<<gPix, TPB>>>(sc->dstris, sc->vis, sc->dlights, sc->nLights,
+                          sc->ambient, sc->keyScale, sc->fill, dc, W, H, bg, EMIS_BOOST,
+                          sc->accum, sc->zbuf, sc->emis);
+    if (!sync()) return empty;
+
+    // Download the HDR accum + hit key + emitter mask; run the SHARED host exposure/tonemap
+    // tail so exposure (incl. lockAnchor) and encoding match the CPU path exactly.
+    std::vector<float3>  haccum(N);
+    std::vector<float>   hzbuf(N);
+    std::vector<uint8_t> hemis(N);
+    if (cudaMemcpy(haccum.data(), sc->accum, sizeof(float3) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+    if (cudaMemcpy(hzbuf.data(),  sc->zbuf,  sizeof(float)  * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+    if (cudaMemcpy(hemis.data(),  sc->emis,  sizeof(unsigned char) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+
+    std::vector<Vec3> accum(N);
+    for (size_t i = 0; i < N; ++i)
+        accum[i] = Vec3{ (double)haccum[i].x, (double)haccum[i].y, (double)haccum[i].z };
+
+    const double expComp = (exposure > 0.0) ? exposure : 1.0;
+    static const std::vector<float> emptyClear;   // unused (opaque path only, M1)
+    if (nThreads < 1) nThreads = 1;
+    return raster::exposeAndEncode(accum, hzbuf, hemis, W, H, nThreads,
+                                   expComp, autoExpose, lockAnchor,
+                                   /*seeThrough*/false, emptyClear, emptyClear,
+                                   Vec3{0, 0, 0});
+}
+
+}  // namespace raster_cuda

@@ -61,7 +61,7 @@ if(CMAKE_CUDA_COMPILER)
     # always double and remains the ground-truth regardless of this switch.
     option(FTRACE_GPU_FP32 "Compute GPU transport in float (mixed precision)" ON)
 
-    target_sources(ftrace PRIVATE src/render_cuda.cu)
+    target_sources(ftrace PRIVATE src/render_cuda.cu src/raster_cuda.cu)
     target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
     # Emit source line-number info in device code (nvcc -lineinfo). This is
     # essentially free at runtime (unlike -G, which disables optimisation) and
