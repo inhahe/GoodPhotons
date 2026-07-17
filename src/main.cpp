@@ -3342,6 +3342,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
+        else if (!std::strcmp(argv[i], "-serve")) { /* resident loop; driven by main(), ignored here */ }
     }
     if (nThreads < 1) nThreads = 1;
 
@@ -5490,6 +5491,75 @@ static int run(int argc, char** argv) {
     return sharedWriteFail ? 1 : 0;
 }
 
+// --- Resident preview server (-serve) -----------------------------------------
+// `ftrace -serve -in <scene.ftsl> [render flags…]` keeps the process — and with it
+// the live window, CUDA context, spectral/upsampling tables — resident, re-rendering
+// whenever a new scene path arrives on stdin (one path per line). This skips the
+// per-frame cost of spawning a fresh process and re-initialising all of that global
+// state, which is the dominant fixed overhead for cheap preview frames.
+//
+// Protocol (line-oriented, both directions):
+//   stdout  "[serve] ready"              once, before the first frame
+//   stdin   <path/to/frame.ftsl>\n       request: render this scene, reusing all flags
+//   stdout  "[serve] done <path>"        after each frame completes (or errors)
+//   stdin   "quit" / "exit" / EOF        end the loop
+//   stdout  "[serve] shutdown"           on exit
+//
+// Every rendered scene reuses the *same* CLI flags (-mode/-n/-r/-window/-o/…) given
+// on the -serve command line; only the -in path is swapped per frame. Honest scope:
+// this delivers the resident-process win only. It does NOT yet do incremental delta
+// rendering, static-geometry/BVH caching between frames, or a reduced preview LOD —
+// each frame is a full independent render. The live window is created lazily on the
+// first frame and keeps that first frame's resolution for the session.
+static int runServe(int argc, char** argv, int inValPos) {
+    std::printf("[serve] ready\n");
+    std::fflush(stdout);
+    int rc = 0;
+    // Initial render for whatever -in was on the command line (if any).
+    if (inValPos >= 0) {
+        rc = run(argc, argv);
+        std::printf("[serve] done %s\n", argv[inValPos]);
+        std::fflush(stdout);
+    }
+    // Stream subsequent scene paths from stdin, one per line. std::fgets (not iostream)
+    // keeps this dependency-free and blocks until a line or EOF.
+    std::string pathBuf;
+    char buf[4096];
+    while (true) {
+        // A closed live window means the user dismissed the preview: stop serving.
+        if (g_showWindow && g_liveWin && g_liveWin->closed()) break;
+        if (!std::fgets(buf, sizeof(buf), stdin)) break;             // EOF
+        std::string line(buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' ||
+                                 line.back() == ' '  || line.back() == '\t'))
+            line.pop_back();
+        size_t s = line.find_first_not_of(" \t");
+        if (s == std::string::npos) continue;                        // blank line
+        line = line.substr(s);
+        if (line == "quit" || line == "exit") break;
+        if (inValPos < 0) {
+            std::fprintf(stderr, "[serve] no -in slot to swap; ignoring '%s'\n", line.c_str());
+            continue;
+        }
+        // Point the -in argv slot at the new path and re-render. pathBuf owns the
+        // storage for the duration of this run() call.
+        pathBuf = line;
+        argv[inValPos] = const_cast<char*>(pathBuf.c_str());
+        g_stopRequested = 0;   // clear any prior clean-stop request before the new frame
+        try {
+            rc = run(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[serve] error: %s\n", e.what());
+            rc = 1;
+        }
+        std::printf("[serve] done %s\n", pathBuf.c_str());
+        std::fflush(stdout);
+    }
+    std::printf("[serve] shutdown\n");
+    std::fflush(stdout);
+    return rc;
+}
+
 // Thin wrapper: turn a fatal configuration error (e.g. an explicit `file:`/`glass:`/
 // `illuminant:` reference whose target is missing or malformed — thrown by the
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
@@ -5502,7 +5572,15 @@ int main(int argc, char** argv) {
     // window closed" BSOD). Draining + resetting here closes that window.
     int rc;
     try {
-        rc = run(argc, argv);
+        // Resident preview server (-serve): keep the process alive and re-render each
+        // scene path streamed on stdin. Find the -in value slot to swap per frame.
+        bool serve = false;
+        int inValPos = -1;
+        for (int i = 1; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "-serve")) serve = true;
+            else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) inValPos = i + 1;
+        }
+        rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         rc = 1;

@@ -228,6 +228,8 @@ tools/loom/
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
+    xvideo.py               two-pass spacetime transform video (M11)
+    preview.py              resident ftrace -serve preview client (M12)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
   tests/                    unit tests (cycle detection, closed-curve seamlessness, slicer)
 ```
@@ -405,9 +407,23 @@ tools/loom/
   `tests/test_xvideo.py` (materialize, rotate motion/identity/boundary modes, bit-exact shear
   seam, winding-zero static, integer-winding + axis validation). Demo:
   `examples/transform_video.py` (`--rotate` open sweep, `--shear` seamless torus scroll).
-- **M12 (deferred) — resident preview server.** Keep ftrace resident and push per-frame
-  deltas (only changed baked constants) + static-geometry caching + preview LOD (§11.9),
-  for interactive scrubbing. The real preview speedup; not a hand-rolled rasterizer.
+- **M12 — resident preview server.** ✅ done (first increment). ftrace gained a
+  `-serve` mode (`src/main.cpp`, `runServe`): instead of exiting after one render it keeps
+  the process — and with it the live window, CUDA context, and spectral / spectral-upsampling
+  tables — resident, re-rendering whenever a new scene path arrives on stdin (one path per
+  line; `[serve] ready` / `[serve] done <path>` / `quit` protocol). The loom side is
+  `loom/preview.py`: `PreviewServer` (a context-managed resident process) and `preview_range`
+  (animate a `Scene` through it), which stream one `.ftsl` per frame so the live window
+  updates *in place* with no per-frame process churn. Tests: `tests/test_preview.py`
+  (command assembly, budget precedence, protocol handshake, frame naming, clean shutdown —
+  driven by a fake in-memory server so they run headless); end-to-end smoke via
+  `scraps/preview_smoke.py`. Demo: `examples/preview_server.py --preview`.
+  **Honest scope:** this delivers the *resident-process* win only — skipping per-frame
+  process spawn + window/CUDA/table init. It does **not** yet do the per-frame *delta*
+  push (only changed baked constants), static-geometry / BVH caching between frames, or a
+  reduced preview LOD (§11.9). Each frame is still a full independent render, and the live
+  window keeps the first frame's resolution for the session. Those remain the real future
+  speedup; `-serve` is the bounded, correct increment they build on.
 
 Each milestone: keep `known-issues.md` current, commit at green checkpoints, never
 `git push`. Update this doc if the plan changes.
