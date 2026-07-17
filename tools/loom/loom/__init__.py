@@ -20,8 +20,9 @@ from .interp import LoopCurve, GridField, ScatterField, eval_curve
 from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
     Scene, Material, Sphere, Beads, Raw, Light, Camera, Element, Pattern,
-    SweptMesh, ribbon, tube, blob, fan,
+    SweptMesh, IsoMesh, ribbon, tube, blob, fan,
 )
+from .mcubes import mesh_field
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
     waves, checker, rings, blobs,
@@ -63,7 +64,8 @@ __all__ = [
     "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
     "waves", "checker", "rings", "blobs",
-    "SweptMesh", "ribbon", "tube", "blob", "fan",
+    "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan",
+    "mesh_field",
     "rmf_frames", "tangents", "sweep_rings", "skin", "circle_profile",
     "line_profile", "write_obj",
     "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",

@@ -227,7 +227,7 @@ tools/loom/
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
-    mesh.py                 (deferred) adaptive marching cubes
+    mcubes.py               marching cubes: bake a field to a mesh (M7)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
   tests/                    unit tests (cycle detection, closed-curve seamlessness, slicer)
 ```
@@ -334,7 +334,24 @@ tools/loom/
   so M1–M6 are untouched. Tests: open clock endpoints distinct (no phantom frame N);
   open path is *not* seamless while a closed curve still is; a ramp leaf differs frame 0
   vs last under open mode.
-- **M7 (deferred) — Adaptive marching cubes**, if/when a field must be baked.
+- **M7 — Marching cubes (bake a field to a mesh).** ✅ done (`loom/mcubes.py`,
+  `loom.IsoMesh`). ftrace root-finds isosurfaces directly, so most fields stay an
+  `Isosurface` (emitted `function { expr }`); `IsoMesh` is for the minority case where
+  a field must become geometry (a numpy-only field with no ftsl twin, a sampled volume,
+  a mesh for another tool). `mesh_field(field, bounds, res, iso, adaptive)` turns a
+  `SpatialExpr` (baked at the clock) or a vectorised `f(X,Y,Z)` into `(verts, faces)` via
+  scikit-image's crack-free Lewiner marching cubes (lazy/optional import). `IsoMesh` bakes
+  one OBJ per frame via `ctx.asset_path` and emits `mesh { file ... }`; a time-independent
+  field is baked once and cached. **Adaptive = honest narrow-band *sampling*** (not variable
+  triangle density): a coarse pass finds blocks straddling the iso and the fine grid is
+  evaluated only there (+ a one-block skirt), far blocks filled with a same-sign sentinel,
+  then **one** global MC runs — crack-free and identical to a dense fine mesh near the
+  surface while skipping ~O(res³) far cells (measured 5.6% of dense evals on a thin
+  surface). True variable-density DC/QEF output stays future work; MC emits uniform density
+  by construction and we don't pretend otherwise. Tests: `tests/test_mcubes.py` (sphere-radius
+  accuracy, 2-manifold edges, adaptive==dense, fewer evals, empty-box, callable+SpatialExpr,
+  morphing field, IsoMesh emit/static-cache/roots). Demo: `examples/mesh_bake.py` (a breathing
+  smooth-min metaball union baked per frame; still validated in ftrace).
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

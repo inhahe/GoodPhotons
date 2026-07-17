@@ -200,6 +200,63 @@ class SweptMesh(Element):
                 f'material "{self.material}" }}')
 
 
+class IsoMesh(Element):
+    """A scalar field **baked to a triangle mesh** per frame via marching cubes
+    (M7), then referenced as ``mesh { file ... }``.
+
+    ftrace root-finds isosurfaces directly, so most fields should be an
+    :class:`~loom.iso.Isosurface` (emitted as a ``function { expr }`` string) —
+    that is sharper and needs no baking.  Use ``IsoMesh`` only when a field must
+    become geometry: a numpy-only field with no ftsl twin, a sampled volume, or a
+    mesh destined for another tool.
+
+    ``field`` is a :class:`~loom.spatial.SpatialExpr` (baked at the clock) or a
+    vectorised ``f(X, Y, Z) -> ndarray``.  ``bounds``/``res``/``iso``/``adaptive``
+    /``coarse`` pass straight through to :func:`loom.mcubes.mesh_field`.  The mesh
+    is written per-frame via ``ctx.asset_path`` and re-baked every frame (so an
+    animated field morphs); a **time-independent** field is baked once and cached.
+    """
+
+    def __init__(self, field, *, bounds=1.0, res=48, iso: float = 0.0,
+                 adaptive: bool = False, coarse: int = 8,
+                 material: str = "default", smooth: int = 1, name: str = "isomesh") -> None:
+        self.field = field
+        self.bounds = bounds
+        self.res = res
+        self.iso = float(iso)
+        self.adaptive = bool(adaptive)
+        self.coarse = int(coarse)
+        self.material = material
+        self.smooth = int(smooth)
+        self.name = name
+        self._cache_static: Optional[Tuple[list, list]] = None
+
+    def roots(self) -> List:
+        # A SpatialExpr exposes its temporal coefficients for cycle checking.
+        if hasattr(self.field, "param_signals"):
+            return list(self.field.param_signals())
+        return []
+
+    def _static(self) -> bool:
+        return hasattr(self.field, "uses_time") and not self.field.uses_time()
+
+    def emit(self, ctx: EmitCtx) -> str:
+        from . import mcubes as _mc
+        if self._static() and self._cache_static is not None:
+            verts, faces = self._cache_static
+        else:
+            verts, faces = _mc.mesh_field(
+                self.field, bounds=self.bounds, res=self.res, iso=self.iso,
+                clock=ctx.clock, cache=ctx.cache,
+                adaptive=self.adaptive, coarse=self.coarse)
+            if self._static():
+                self._cache_static = (verts, faces)
+        path = ctx.asset_path(self.name, "obj")
+        _sweep.write_obj(path, verts, faces)
+        return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
+                f'material "{self.material}" }}')
+
+
 def ribbon(spine, *, width: float = 0.3, material: str = "default", count: int = 64,
            twist=0.0, turns=0.0, closed_spine: bool = True, smooth: int = 0,
            name: str = "ribbon") -> SweptMesh:
