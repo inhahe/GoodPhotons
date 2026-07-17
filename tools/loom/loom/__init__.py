@@ -15,8 +15,10 @@ from .signals import (
     Sine, Cosine, LoopNoise,
     Ramp, Ease,
 )
-from .data import PointPath, Grid, Scatter
-from .interp import LoopCurve, GridField, ScatterField, eval_curve
+from .data import PointPath, TrackedPath, Grid, Scatter
+from .interp import (
+    LoopCurve, TrackedCurve, Reparam, GridField, ScatterField, eval_curve,
+)
 from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
     Scene, Material, Sphere, Beads, Raw, Light, Camera, Element, Pattern,
@@ -60,8 +62,8 @@ __all__ = [
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
     "Ramp", "Ease",
-    "PointPath", "Grid", "Scatter",
-    "LoopCurve", "GridField", "ScatterField", "eval_curve",
+    "PointPath", "TrackedPath", "Grid", "Scatter",
+    "LoopCurve", "TrackedCurve", "Reparam", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
     "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",

@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple, Union
 
 from .signals.core import Signal, Clock, Cache, Number, as_signal, alloc_id
 from .signals.vector import VecSignal, Vecish
-from .data import PointPath, Grid, Scatter
+from .data import PointPath, TrackedPath, Grid, Scatter
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +125,129 @@ class LoopCurve(VecSignal):
         if cache is not None:
             cache.set(self._id, clock.frame, out)
         return out
+
+
+# ---------------------------------------------------------------------------
+# 1b. Reparam — retime a curve by a per-waypoint speed / density track
+# ---------------------------------------------------------------------------
+
+class Reparam(Signal):
+    """Map a uniform **travel** parameter ``s`` to a **curve** parameter ``u`` so a
+    point dwells longer where a per-waypoint ``weights`` (speed / density) track is
+    large — the toolkit analog of a `camera_curve`'s *density* track retiming a
+    flyby (spend more frames where density is high).
+
+    The curve parameter ``u ∈ [0, 1)`` is split into ``len(weights)`` equal bins.
+    Bin ``i`` is given a dwell proportional to ``weights[i]``: as ``s`` sweeps
+    ``[0, 1)`` uniformly it spends fraction ``weights[i]/Σweights`` of its travel in
+    bin ``i`` (an inverse-CDF), so large weight ⇒ slow ``u`` ⇒ the point lingers.
+    For a **closed** curve the bins line up with the control points (bin ``i`` is the
+    arc around waypoint ``i+1``, matching :func:`eval_curve`'s closed mapping); an
+    **open** curve reuses the same normalized bins.
+
+    ``weights`` are animatable Signals, so the speed profile can itself modulate over
+    the loop.  Non-positive weights are floored to ``eps`` to keep the map strictly
+    monotonic (no zero-width dwell / division by zero).  Feed the resulting ``u`` to a
+    :class:`LoopCurve` / :class:`TrackedCurve` (see :meth:`TrackedCurve.traveling`).
+    """
+
+    def __init__(self, weights: List[Union[Signal, Number]], s: Union[Signal, Number],
+                 *, closed: bool = True, eps: float = 1e-9) -> None:
+        super().__init__()
+        self.weights: List[Signal] = [as_signal(w) for w in weights]
+        if not self.weights:
+            raise ValueError("Reparam needs at least one weight")
+        self.s = as_signal(s)
+        self.closed = bool(closed)
+        self.eps = float(eps)
+
+    def children(self):
+        return tuple(self.weights) + (self.s,)
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        w = [max(self.eps, wi.at(clock, cache)) for wi in self.weights]
+        n = len(w)
+        total = math.fsum(w)
+        s = self.s.at(clock, cache)
+        if self.closed:
+            s -= math.floor(s)                     # wrap into [0, 1)
+        else:
+            s = 0.0 if s < 0.0 else (1.0 if s > 1.0 else s)
+        target = s * total
+        acc = 0.0
+        for i in range(n):
+            if i == n - 1 or target < acc + w[i]:
+                frac = (target - acc) / w[i]
+                frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
+                return (i + frac) / n
+            acc += w[i]
+        return 0.0  # unreachable (loop always returns)
+
+
+# ---------------------------------------------------------------------------
+# 1c. TrackedCurve — sample a sequence + all its side-tracks at one parameter
+# ---------------------------------------------------------------------------
+
+class TrackedCurve:
+    """Sample a :class:`~loom.data.TrackedPath` at a shared curve parameter ``u``.
+
+    The main **point** and **every** named track ride the *same* seamless
+    midpoint-quadratic-Bézier over the *same* waypoints and the *same* ``u`` — this
+    is the "Y curves onto one sequence" model of a `camera_curve` carrying a position
+    curve **plus** a speed curve **plus** an orientation curve.  Internally each
+    track is just another :class:`LoopCurve` sharing ``u``, so it composes with the
+    rest of the DAG (cycle-checked, cached) exactly like any field.
+
+    Attributes / methods:
+
+    - :attr:`position` — the main point as a :class:`LoopCurve` (a ``VecSignal``);
+    - :meth:`track` (or ``curve[name]``) — a named track, returned as a scalar
+      :class:`Signal` if it was authored scalar, else a :class:`VecSignal`;
+    - :meth:`traveling` — build one whose ``u`` is **retimed** by a scalar track via
+      :class:`Reparam` (the camera-curve *speed* semantics, where the track doesn't
+      just get sampled but changes how fast the sequence is traversed).
+    """
+
+    def __init__(self, tracked: TrackedPath, u: Union[Signal, Number],
+                 *, closed: Optional[bool] = None) -> None:
+        self.tracked = tracked
+        self._u = as_signal(u)
+        self.closed = tracked.closed if closed is None else bool(closed)
+        self.position = LoopCurve(tracked.path, self._u, closed=self.closed)
+        self._curves: dict = {}
+        for name, pts in tracked.tracks.items():
+            pp = PointPath(pts, closed=self.closed)
+            self._curves[name] = LoopCurve(pp, self._u, closed=self.closed)
+
+    @property
+    def u(self) -> Signal:
+        return self._u
+
+    def track(self, name: str) -> Union[Signal, VecSignal]:
+        if name not in self._curves:
+            raise KeyError(f"no track named {name!r}")
+        curve = self._curves[name]
+        if self.tracked.is_scalar(name):
+            return curve.components[0]          # scalar view of the 1-D track curve
+        return curve
+
+    def __getitem__(self, name: str) -> Union[Signal, VecSignal]:
+        return self.track(name)
+
+    def names(self) -> Tuple[str, ...]:
+        return tuple(self._curves.keys())
+
+    @classmethod
+    def traveling(cls, tracked: TrackedPath, s: Union[Signal, Number],
+                  density: str, *, closed: Optional[bool] = None) -> "TrackedCurve":
+        """Build a :class:`TrackedCurve` whose parameter is **retimed** by a scalar
+        ``density`` track: as the travel parameter ``s`` advances uniformly, the point
+        (and every track sampled off the same ``u``) dwells where ``density`` is high —
+        a camera-flyby speed curve.  ``density`` names a scalar track on ``tracked``.
+        """
+        closed_ = tracked.closed if closed is None else bool(closed)
+        u = Reparam(tracked.weights_of(density), s, closed=closed_)
+        return cls(tracked, u, closed=closed_)
 
 
 # ---------------------------------------------------------------------------

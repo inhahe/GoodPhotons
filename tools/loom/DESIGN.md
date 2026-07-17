@@ -130,6 +130,14 @@ Three **datasets**, each N-D, each with **every value feedable by a modulator**
 2. **Grid** — N-D values on a regular lattice of *arbitrary rarity* (resolution).
 3. **Scatter** — N-D values at arbitrary positions (no lattice).
 
+Plus one composite dataset built on the point-path:
+
+- **`TrackedPath`** — a point-path that carries **Y extra per-waypoint tracks**
+  keyed at the *same* control points (the toolkit analog of a `camera_curve`: one
+  sequence bundling position + a speed/density track + an orientation track + any
+  other scalar/vector track you key). Each track is one value per control point,
+  scalar or N-D vector, animatable like everything else.
+
 Three **interpolators**, each exposed **as a `Signal`/field** (so an interpolator's
 output can feed another modulator — "it's just another function"):
 
@@ -142,6 +150,16 @@ output can feed another modulator — "it's just another function"):
    volume.
 3. **`ScatterField`** — smooth interpolation of scatter values (inverse-distance /
    RBF; **quality/speed tradeoff is an open tuning item**, see §11).
+
+And, over a `TrackedPath`, one multi-curve sampler:
+
+4. **`TrackedCurve`** — samples a `TrackedPath`'s position **and every track** on
+   one shared seamless parameter `u` (each track is just another `LoopCurve` riding
+   the same `u`), exactly the way a camera flyby's speed and look-direction curves
+   ride along its position curve. `TrackedCurve.traveling(tracked, s, density=...)`
+   retimes traversal through **`Reparam`** — an inverse-CDF over equal `u`-bins that
+   maps a uniform travel param `s` to a `u` that *dwells* where the density track is
+   large (the distinguishing behavior of a camera-curve speed curve).
 
 Because interpolators are `Signal`s, you can: feed a modulator into a control point;
 *or* feed an N-D value into an interpolator to read a value out and pass it onward;
