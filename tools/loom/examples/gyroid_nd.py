@@ -15,8 +15,13 @@ an extra **plane-wave direction** — a generic unit direction in the rendered 3
 all three axes at harmonic 1 this reproduces the ordinary gyroid *exactly*.
 
 Each **dimension** has:
-  * a **direction** in (x,y,z):  dims 0/1/2 are the x/y/z axes; dims >= 3 get a
-    generic random unit direction (a higher-D axis seen edge-on in the slice);
+  * a **direction** in (x,y,z) — the corresponding row of the N x 3 slice-embedding
+    matrix.  By default (``--pin-axes``) dims 0/1/2 are pinned to the x/y/z axes so the
+    slice always contains the ordinary xyz volume, and dims >= 3 get a generic random
+    unit direction (a higher-D axis seen edge-on in the slice).  With ``--no-pin-axes``
+    *every* dimension gets a random direction — a freely-oriented N-D slice, so even the
+    base gyroid is rendered tilted.  (Each dim's random **phase** is that axis's offset,
+    i.e. where the slice sits along it.)
   * an **oscillate** flag — an inert dimension contributes no term (the surface is
     invariant along it);
   * a **harmonic** — a positive-integer spatial-frequency multiplier.  The **main**
@@ -137,6 +142,9 @@ class Variant:
     freq: float
     threshold: float
     thickness: float = 0.5              # half-width of the thickened gold sheet
+    pinned: bool = True                 # True: dims 0/1/2 pinned to world X/Y/Z (the slice
+    #                                     contains the xyz volume); False: every dim gets a
+    #                                     random direction (a freely-oriented N-D slice)
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -287,8 +295,9 @@ def pick_variant(seed: int, args: argparse.Namespace,
     # 5) assemble every dimension ---------------------------------------------
     dims: List[Dim] = []
     for d in range(D):
+        pin = getattr(args, "pin_axes", True)
         direction = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))[d] \
-            if d < 3 else _rand_unit(rng)
+            if (pin and d < 3) else _rand_unit(rng)
         oscillate = d in osc
         if not oscillate:
             dims.append(Dim(d, False, 0, direction, 0.0, "inert"))
@@ -332,7 +341,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
             dm.hidden_offset = rng.uniform(0.5, 2.0)
 
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
-                   thickness=args.thickness, dim_list=dims)
+                   thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
+                   dim_list=dims)
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +569,36 @@ def dims_desc(v: Variant) -> str:
     return base + (")" if extra <= 0 else f" + {extra} hidden)")
 
 
+def osc_harm_list(v: Variant) -> str:
+    """The dimensions the gyroid actually oscillates (rotates) in, each tagged with
+    its harmonic: e.g. 'X(h1), Y(h1), Z(h1), W(h2), d4(h3)'.  This is the compact
+    'list of dimensions + harmonics' view of the same data the matrix carries."""
+    parts = [f"{axis_name(d.index)}(h{d.harmonic})" for d in v.dim_list if d.oscillate]
+    return ", ".join(parts) if parts else "none"
+
+
+def matrix_lines(v: Variant) -> List[str]:
+    """Comment-header block: the N×3 slice-embedding matrix A and its offsets — each
+    N-D gyroid axis written as a unit *direction* in the rendered (x,y,z) volume (a
+    row of A), next to its *offset* (the phase = where the slice sits along that axis)
+    and its harmonic.  This is the 'matrix + offsets' view; osc_harm_list is the same
+    data as a flat list.  Inert dimensions carry no term and are marked."""
+    L = ["# slice-embedding matrix A (rows) + offsets — each N-D axis as a direction in",
+         "#   the rendered (x,y,z) volume; 'offset' is the phase (slice position along that",
+         "#   axis); 'harm' multiplies its spatial frequency:",
+         "#",
+         "#   axis  harm  |        A row: direction (x  y  z)        |  offset",
+         "#   ----  ----  |  -------------------------------------  |  ---------"]
+    for d in v.dim_list:
+        name = axis_name(d.index)
+        row = " ".join(f"{c:>+9.4f}" for c in d.direction)
+        if d.oscillate:
+            L.append(f"#   {name:>4}  h{d.harmonic:<3}  |  {row}  |  {d.phase:>8.4f}")
+        else:
+            L.append(f"#   {name:>4}  {'-':>4}  |  {row}  |  {'(inert)':>8}")
+    return L
+
+
 def header(v: Variant, index: int, count: int, *,
            frames: Optional[int] = None, fps: Optional[float] = None,
            transform: str = "drift") -> str:
@@ -571,8 +611,10 @@ def header(v: Variant, index: int, count: int, *,
          f"# variant seed          : {v.seed}   (regenerate: --variant-seed {v.seed} + the same locks)",
          f"# dimensions (D)        : {v.dims}   (higher/extra dims beyond x,y,z: {max(0, v.dims - 3)})",
          f"# oscillating dims      : {len(osc)}  -> {axis_list(osc)}  (indices {osc})",
+         f"# oscillates in         : {osc_harm_list(v)}   (dim(harmonic), the axes that wave)",
          f"# main dimension        : {axis_name(v.main) if v.main is not None else '-'}   (fundamental, harmonic 1)",
          f"# harmonics of the main : {len(v.harmonic_dims)}  -> {axis_list(v.harmonic_dims)}",
+         f"# xyz frame             : {'pinned to world X/Y/Z (classic orientation)' if v.pinned else 'free — all dims random directions (tilted slice)'}",
          f"# base spatial frequency: {fmt(v.freq)}",
          f"# level set (threshold) : {fmt(v.threshold)}"]
     verb = "rotating" if transform == "rotate" else "drifting"
@@ -581,19 +623,23 @@ def header(v: Variant, index: int, count: int, *,
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
                  f"(~{fmt(secs)}s seamless loop); transform '{transform}'; "
                  f"{verb} dims -> {moving}")
-    rate_col = "turns" if transform == "rotate" else "drift"
-    L += ["#",
-          f"# axis  name  osc  harmonic  {rate_col:<5}  direction (x y z)                 phase     role",
-          "# ----  ----  ---  --------  -----  --------------------------------  --------  -----------"]
-    for d in v.dim_list:
-        dirs = "(" + " ".join(fmt(c) for c in d.direction) + ")"
-        name = axis_name(d.index)
-        if d.oscillate:
-            rate = f"{d.winding}" if d.winding > 0 else "-"
-            L.append(f"#  {d.index:>3}  {name:>4}  yes  {d.harmonic:>6}  {rate:>5}  {dirs:<32}  "
-                     f"{d.phase:>7.4f}   {d.role}")
-        else:
-            L.append(f"#  {d.index:>3}  {name:>4}   no       -      -  {dirs:<32}  {'-':>7}   inert")
+    # The matrix + offsets view (directions = rows of A, phases = offsets, harmonics).
+    L.append("#")
+    L += matrix_lines(v)
+    # Animation-only detail: which oscillating dims move and how fast (winding), plus role.
+    if frames is not None:
+        rate_col = "turns" if transform == "rotate" else "drift"
+        L += ["#",
+              f"# animation per dim — {rate_col} = integer cycles/turns over one loop:",
+              f"#   axis  {rate_col:<5}  role",
+              "#   ----  -----  -----------"]
+        for d in v.dim_list:
+            name = axis_name(d.index)
+            if d.oscillate:
+                rate = f"{d.winding}" if d.winding > 0 else "-"
+                L.append(f"#   {name:>4}  {rate:>5}  {d.role}")
+            else:
+                L.append(f"#   {name:>4}  {'-':>5}  inert")
     L += ["#",
           "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
     if transform == "rotate":
@@ -602,8 +648,9 @@ def header(v: Variant, index: int, count: int, *,
               "#   a_d = 2*pi * winding_d * t   (the dim's wavevector rotates out of the",
               "#   3-D slice into its hidden axis; t runs 0->1, 'turns' column = winding_d)"]
     else:
+        tail = "  (winding is the per-dim 'drift' rate above)" if frames is not None else ""
         L += ["#   u_d = harmonic_d * freq * (dir_d . (x, y, z)) + phase_d + 2*pi*winding_d*t",
-              "#   (t runs 0->1 over the loop; winding is the integer 'drift' column above)"]
+              f"#   (t runs 0->1 over the loop.{tail})"]
     L += ["#" + "=" * 74, ""]
     return "\n".join(L)
 
@@ -887,7 +934,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "--oscillating 4 --harmonics 2\n"
                 "  python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 "
                 "--axis 2:on:1   # classic gyroid\n"
-                "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off"))
+                "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
+                "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice"))
 
     g = p.add_argument_group("output")
     g.add_argument("-n", "--count", type=int, default=1,
@@ -928,6 +976,12 @@ def build_parser() -> argparse.ArgumentParser:
                                             "(default 3 7)")
     g.add_argument("--phase0", action="store_true",
                    help="set every phase to 0 (deterministic pattern position) instead of random")
+    g.add_argument("--pin-axes", action=argparse.BooleanOptionalAction, default=True,
+                   help="pin the first three dimensions to the world X/Y/Z axes so the slice "
+                        "always contains the ordinary xyz volume (default; this is what lets "
+                        "D=3 all-on reproduce the exact classic gyroid). --no-pin-axes instead "
+                        "gives every dimension a random direction — a freely-oriented N-D slice, "
+                        "so even the base gyroid comes out tilted.")
 
     g = p.add_argument_group("scene")
     g.add_argument("--threshold", type=float, default=0.0,
@@ -1029,8 +1083,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         base = f"{args.name}{k:0{width}d}"
         # Brief, in-place status: which gyroid, its values, and the live frame/phase.
         label = (f"[gyroid_nd] gyroid {k + 1}/{count}  {dims_desc(v)}  "
-                 f"oscillating={axis_list(v.oscillating)}  "
-                 f"harmonics={axis_list(v.harmonic_dims)}  "
+                 f"oscillates in {osc_harm_list(v)}  "
+                 f"frame={'pinned' if v.pinned else 'free'}  "
                  f"freq={fmt(v.freq)} seed={v.seed}")
         if args.video:
             # Videos and their .txt sidecars collect in the shared outdir; each video's
