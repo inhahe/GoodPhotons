@@ -67,7 +67,12 @@ struct LiveWindow::Impl {
     int                  imgW = 0, imgH = 0;
     std::atomic<bool>    dirty{false};
     std::atomic<bool>    closedFlag{false};
-    HWND                 hwnd = nullptr;
+    // Window handle: created on the UI thread, nulled on WM_DESTROY. Atomic + null-on-destroy
+    // so cross-thread callers (setTitle/clientSize/enablePanel/setPathCount and the dtor) never
+    // marshal to a STALE handle after the window closes — Windows recycles HWND values, so a
+    // since-reused handle belonging to another window/thread must never receive our WM_CLOSE/
+    // WM_SETTEXT. Readers load() once and null-check before use.
+    std::atomic<HWND>    hwnd{nullptr};
     int                  initW = 0, initH = 0;
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     std::wstring         title;
@@ -552,6 +557,9 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
+            // The handle is now invalid: publish null so no cross-thread caller (or the dtor)
+            // marshals to this — or a recycled — HWND after we return.
+            if (self) self->hwnd.store(nullptr);
             PostQuitMessage(0);
             return 0;
     }
@@ -573,16 +581,17 @@ void LiveWindow::Impl::threadMain() {
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
 
-    hwnd = CreateWindowExW(0, wc.lpszClassName, title.c_str(), style,
-                           CW_USEDEFAULT, CW_USEDEFAULT, ww, wh,
-                           nullptr, nullptr, wc.hInstance, this);
-    if (hwnd) {
-        ShowWindow(hwnd, SW_SHOWNORMAL);
-        UpdateWindow(hwnd);
-        SetTimer(hwnd, 1, 33, nullptr);            // ~30 fps repaint poll
+    HWND hw = CreateWindowExW(0, wc.lpszClassName, title.c_str(), style,
+                              CW_USEDEFAULT, CW_USEDEFAULT, ww, wh,
+                              nullptr, nullptr, wc.hInstance, this);
+    hwnd.store(hw);
+    if (hw) {
+        ShowWindow(hw, SW_SHOWNORMAL);
+        UpdateWindow(hw);
+        SetTimer(hw, 1, 33, nullptr);              // ~30 fps repaint poll
     }
     if (readyEvent) SetEvent(readyEvent);          // unblock the ctor
-    if (!hwnd) { closedFlag.store(true); return; }
+    if (!hw) { closedFlag.store(true); return; }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -618,7 +627,11 @@ LiveWindow::LiveWindow(int w, int h, const char* title) {
 
 LiveWindow::~LiveWindow() {
     if (!impl_) return;
-    if (impl_->hwnd) PostMessageW(impl_->hwnd, WM_CLOSE, 0, 0);
+    // Ask the window to close only if it is still alive (user hasn't already closed it, which
+    // would have nulled hwnd on WM_DESTROY). Posting to a stale/recycled handle at exit is
+    // exactly the kind of cross-thread hazard that can fault on shutdown.
+    HWND hw = impl_->hwnd.load();
+    if (hw) PostMessageW(hw, WM_CLOSE, 0, 0);
     if (impl_->ui.joinable()) impl_->ui.join();
     if (impl_->readyEvent) CloseHandle(impl_->readyEvent);
     delete impl_;
@@ -642,13 +655,14 @@ void LiveWindow::update(int w, int h, const std::vector<uint8_t>& rgb) {
 }
 
 void LiveWindow::setTitle(const std::string& utf8) {
-    if (!impl_ || !impl_->hwnd) return;
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw) return;
     // SetWindowTextW marshals a WM_SETTEXT to the window's own thread, so this is safe
     // to call from the render thread. Skip the OS call when the text is unchanged.
     std::wstring w = utf8ToWide(utf8);
     if (w == impl_->title) return;
     impl_->title = w;
-    SetWindowTextW(impl_->hwnd, impl_->title.c_str());
+    SetWindowTextW(hw, impl_->title.c_str());
 }
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }
@@ -687,9 +701,10 @@ NavInput LiveWindow::drainNav() {
 }
 
 bool LiveWindow::clientSize(int& w, int& h) const {
-    if (!impl_ || !impl_->hwnd) return false;
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw) return false;
     RECT cr;
-    if (!GetClientRect(impl_->hwnd, &cr)) return false;
+    if (!GetClientRect(hw, &cr)) return false;
     int cw = cr.right - cr.left, ch = (cr.bottom - cr.top) - impl_->panelH;  // image area only
     if (cw <= 0 || ch <= 0) return false;
     w = cw; h = ch;
@@ -697,7 +712,8 @@ bool LiveWindow::clientSize(int& w, int& h) const {
 }
 
 void LiveWindow::enablePanel(int pathCount, double defFps, const char* collideLabel) {
-    if (!impl_ || !impl_->hwnd || impl_->hasPanel.load()) return;
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || impl_->hasPanel.load()) return;
     {
         std::lock_guard<std::mutex> lk(impl_->inMtx);
         impl_->reqPathCount = pathCount;
@@ -708,7 +724,7 @@ void LiveWindow::enablePanel(int pathCount, double defFps, const char* collideLa
         impl_->rateModeVal  = true;                             // default switch = per-sec
     }
     // Build on the window's own thread (synchronous, so the child HWNDs exist on return).
-    SendMessageW(impl_->hwnd, WM_MKPANEL, 0, 0);
+    SendMessageW(hw, WM_MKPANEL, 0, 0);
 }
 
 void LiveWindow::setPanelState(int idx, bool playing, bool pathMode, const char* collideLabel) {
@@ -725,9 +741,10 @@ void LiveWindow::setPanelState(int idx, bool playing, bool pathMode, const char*
 }
 
 void LiveWindow::setPathCount(int pathCount) {
-    if (!impl_ || !impl_->hasPanel.load() || !impl_->hwnd) return;
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || !impl_->hasPanel.load()) return;
     // Marshal to the UI thread: retunes the trackbar range + shows/hides the path group.
-    SendMessageW(impl_->hwnd, WM_SETPATHCOUNT, (WPARAM)pathCount, 0);
+    SendMessageW(hw, WM_SETPATHCOUNT, (WPARAM)pathCount, 0);
 }
 
 void LiveWindow::setEditState(bool recording, int pointCount) {

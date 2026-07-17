@@ -2704,3 +2704,38 @@ correctly on **both** backends.
 - **Proper fix (TODO):** profile the deposit/build with 2M vs 4M; find why host CPU
   scales super-linearly (likely an O(n^2) or lock-contended path, or grid cellSize
   degenerating so build buckets explode). Until fixed, cap flyby photons at ~2M.
+
+## Access-violation popup when closing the live-preview window (intermittent) — PARTIALLY ADDRESSED (2026-07-17)
+
+- **Symptom (user report, 2026-07-17):** closing two `ftrace.exe` live-preview windows
+  produced two "access violation" WER popups on exit. The renders were mode-R gyroid
+  batches launched with `-window -keepwindow` (studio-env HDR variants).
+- **Could NOT reproduce despite faithful attempts.** Tried under **cdb** (break on AV /
+  heap-corruption `0xC0000374` / fastfail `0xC0000409`) and, to defeat any debugger
+  Heisenbug, under **procdump** (`-e -ma`, full native speed) across: (a) mode-B GPU
+  render closed after finishing, (b) mode-R GPU render (`scenes/implicit.ftsl`) closed
+  **mid-render**, and an isolated `src/livewindow.cpp` harness (`scraps/livewin_repro.cpp`)
+  in three lifecycle modes — plain batch close, destructor-closes-a-still-live-window,
+  and a no-sleep `update()`/`setTitle()` "hammer" race closed externally. **Every path
+  tore down cleanly (exit 0, no dump).** So the isolated live-window lifecycle is NOT
+  the fault on the paths tested.
+- **Prime suspect: CUDA/driver async teardown.** The binary imports `nvcuda.dll`; closing
+  a `-keepwindow` window is exactly what unblocks the whole shutdown (`main()` hold loop →
+  `cudaGracefulShutdown()` → CRT static dtors incl. `g_liveWin`). `main.cpp` (~5568)
+  already documents a related async `nvlddmkm` DPC teardown fault they mitigate. A
+  userspace AV popup would be a fault inside `nvcuda.dll`/driver teardown, which our code
+  can't fully fix — but capturing a real dump would confirm the module.
+- **PARTIAL FIX applied (`src/livewindow.cpp`):** hardened a genuine latent cross-thread
+  hazard found by inspection — `impl_->hwnd` was never cleared after the window was
+  destroyed, yet it is read from the render thread (`setTitle`/`clientSize`/`enablePanel`/
+  `setPathCount`) and from `~LiveWindow` (`PostMessageW(WM_CLOSE)`). Windows **recycles
+  HWND values**, so a since-reused handle belonging to another window/thread could receive
+  our `WM_CLOSE`/`WM_SETTEXT`. Made `hwnd` `std::atomic<HWND>`, null it on `WM_DESTROY`,
+  and made every cross-thread caller (and the dtor) `load()` once + null-check so nothing
+  marshals to a stale/recycled handle after close. Verified no regression via the isolated
+  harness + a real mode-R render. This removes a real defect but is **not confirmed to be
+  THE crash** (couldn't reproduce the original AV).
+- **Next step if it recurs:** capture a full dump of the actual fault to pin the module —
+  e.g. attach `procdump -ma -e` to the live PID, or `procdump -i -ma <dir>` (admin) to
+  install a system postmortem catcher — then analyze `.dmp` (`!analyze -v`) to confirm
+  whether it is `nvcuda`/driver teardown vs. app code.
