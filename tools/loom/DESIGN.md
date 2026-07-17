@@ -309,7 +309,7 @@ tools/loom/
 - **M5 — Isosurface animation.** `iso.py` + slicer wired to ftsl. Demo: a gyroid
   whose N-D rotation/params modulate over a seamless loop.
 - **M6 — Function materials.** Animated reflectance/color/IOR over space+time. ✅ done.
-- **M6.5 — Opt-in looping.** Make seamless looping a *choice*, not a baked invariant
+- **M6.5 — Opt-in looping.** ✅ done. Make seamless looping a *choice*, not a baked invariant
   (§11.6). `Clock` gains open vs. closed mode: closed keeps `(frame % frames)/frames`;
   open uses `frame/(frames-1)` (no modulo, distinct endpoints). Add an **open-curve
   interpolator** (non-wrapping spline through a `PointPath`, symmetric with the closed
@@ -320,7 +320,7 @@ tools/loom/
   open path is *not* seamless while a closed curve still is; a ramp leaf differs frame 0
   vs last under open mode.
 - **M7 (deferred) — Adaptive marching cubes**, if/when a field must be baked.
-- **M8 — Affine composition.** Collapse an arbitrarily long chain of N-D Givens
+- **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
   sequential chain (fewer ops in ftrace's per-hit eval). Pin the order/convention (row

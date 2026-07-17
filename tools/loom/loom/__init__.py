@@ -17,7 +17,7 @@ from .signals import (
 )
 from .data import PointPath, Grid, Scatter
 from .interp import LoopCurve, GridField, ScatterField, eval_curve
-from .mathnd import Mat, rotation, rotations, slice3
+from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
     Scene, Material, Sphere, Beads, Raw, Light, Camera, Element, Pattern,
     SweptMesh, ribbon, tube, blob, fan,
@@ -49,7 +49,7 @@ __all__ = [
     "Ramp", "Ease",
     "PointPath", "Grid", "Scatter",
     "LoopCurve", "GridField", "ScatterField", "eval_curve",
-    "Mat", "rotation", "rotations", "slice3",
+    "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
     "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
     "waves", "checker", "rings", "blobs",
