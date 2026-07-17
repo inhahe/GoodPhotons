@@ -57,3 +57,26 @@ inline double srgbToLinear(double c) {
     c = std::clamp(c, 0.0, 1.0);
     return (c <= 0.04045) ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
 }
+
+// HSV -> RGB. Hue is in [0, 1] (turns), and *wraps*, so a hue swept over a loop
+// cycles the whole wheel seamlessly (matches loom's colour convention); s and v
+// are clamped to [0, 1]. Returns RGB in [0, 1].
+inline Vec3 hsvToRgb(double h, double s, double v) {
+    s = std::clamp(s, 0.0, 1.0);
+    v = std::clamp(v, 0.0, 1.0);
+    h -= std::floor(h);                 // wrap hue into [0, 1)
+    double x = h * 6.0;
+    int    i = static_cast<int>(std::floor(x)) % 6;
+    double f = x - std::floor(x);
+    double p = v * (1.0 - s);
+    double q = v * (1.0 - s * f);
+    double t = v * (1.0 - s * (1.0 - f));
+    switch (i) {
+        case 0:  return {v, t, p};
+        case 1:  return {q, v, p};
+        case 2:  return {p, v, t};
+        case 3:  return {p, q, v};
+        case 4:  return {t, p, v};
+        default: return {v, p, q};
+    }
+}

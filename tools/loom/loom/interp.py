@@ -102,10 +102,9 @@ class LoopCurve(VecSignal):
         self.components: List[Signal] = [_CurveComponent(self, a) for a in range(path.dim)]
 
     def children(self):
-        kids: List = [self._u]
-        for p in self.path.points:
-            kids.extend(p.components)
-        return tuple(kids)
+        # thread through the PointPath *node* so the dataset is part of the DAG
+        # (cycle detection walks it → a control point that loops back is caught).
+        return (self._u, self.path)
 
     def _control_points(self, clock: Clock, cache: Optional[Cache]) -> List[Tuple[float, ...]]:
         return [p.at(clock, cache) for p in self.path.points]
@@ -272,7 +271,7 @@ class GridField(Signal):
                 raise TypeError("GridField requires scalar (Signal) grid values")
 
     def children(self):
-        return tuple(self.q.components) + tuple(self.grid.values)
+        return tuple(self.q.components) + (self.grid,)
 
     def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
         g = self.grid
@@ -336,9 +335,7 @@ class ScatterField(Signal):
         self.eps = float(eps)
 
     def children(self):
-        return (tuple(self.q.components)
-                + tuple(c for p in self.scatter.positions for c in p.components)
-                + tuple(self.scatter.values))
+        return tuple(self.q.components) + (self.scatter,)
 
     def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
         q = self.q.at(clock, cache)

@@ -783,6 +783,9 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
     chromaticity.
 - **`rgb r g b`** — Jakob–Hanika sigmoid upsampling to a reflectance spectrum
   (round-trips under D65).
+- **`hsv h s v`** — an HSV colour (hue `h` in `[0,1]` turns and *wraps*, so a hue
+  swept over a loop cycles the whole wheel seamlessly; `s`/`v` in `[0,1]`),
+  converted to RGB and then upsampled exactly like `rgb`.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an

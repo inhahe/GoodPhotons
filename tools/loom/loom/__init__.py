@@ -16,6 +16,7 @@ from .signals import (
     Ramp, Ease,
 )
 from .data import PointPath, TrackedPath, Grid, Scatter
+from .color import Color, rgb, hsv, hsv_to_rgb, rgb_to_hsv
 from .interp import (
     LoopCurve, TrackedCurve, Reparam, GridField, ScatterField, eval_curve,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "Sine", "Cosine", "LoopNoise",
     "Ramp", "Ease",
     "PointPath", "TrackedPath", "Grid", "Scatter",
+    "Color", "rgb", "hsv", "hsv_to_rgb", "rgb_to_hsv",
     "LoopCurve", "TrackedCurve", "Reparam", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
     "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",

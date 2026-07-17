@@ -124,7 +124,12 @@ the pure DAG. Deferred.
 ## 6. Layer 3 — Data structures + interpolation
 
 Three **datasets**, each N-D, each with **every value feedable by a modulator**
-(a stored value may be a `Signal`, so control points animate):
+(a stored value may be a `Signal`, so control points animate).  Each dataset is
+itself a **node in the modulation DAG** (it carries an `id` + `children()`), so it
+is both *modulable* (its stored values are driven by modulators) **and** a
+*modulator* (an interpolator over it is a `Signal`), and `detect_signal_cycle`
+walks *through* the dataset — a control point / grid value / scatter value that
+loops back is caught:
 
 1. **Point-path** — an ordered sequence of N-D points (a curve's control points).
 2. **Grid** — N-D values on a regular lattice of *arbitrary rarity* (resolution).
@@ -393,6 +398,14 @@ tools/loom/
   `LoopCurve` to a stroke (sweeps→strokes). y-up world `view` box; colours RGB in [0,1].
   Honesty: SVG has no per-pixel surface, so it omits `field`. Tests: `tests/test_canvas.py`
   (mapping, per-frame animation, seamless wrap vs open endpoints, field, strokes, cycles).
+- **Colour model — RGB *and* HSV** (`loom/color.py`). ✅ done. A `Color` is a
+  3-component `VecSignal` that *is* its resolved **RGB** (an HSV colour is converted in
+  the graph via `hsv_to_rgb`), so it drops into 2-D (`Canvas2D` markers/strokes/field)
+  **and** 3-D (`Material` colours) with no special casing, and — remembering how it was
+  authored — emits the matching `.ftsl` colour token (`rgb r g b` / `hsv h s v`), which
+  ftrace's scene loader now parses natively. Hue is in `[0,1]` and **wraps**, so a hue
+  driven by a 1-periodic leaf cycles the whole wheel and returns bit-for-bit at the loop
+  seam (seamless colour cycling). Tests: `tests/test_dag_and_color.py`.
 - **M10.5 — Shared spatial-expression pattern layer.** ✅ done (`loom/spatial.py`). One
   pattern **defined once, used two ways** (§11.11): a `SpatialExpr` tree over coordinate
   leaves `X`/`Y`/`Z` + loop phase `T`, with temporal `Signal` coefficients baked per frame.

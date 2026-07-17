@@ -14,6 +14,7 @@ from typing import Optional, Sequence, Tuple, Union
 
 from .signals.core import Signal, Clock, Cache, Number
 from .signals.vector import VecSignal
+from .color import Color
 
 Animatable = Union[Signal, VecSignal, Number, Sequence[Number], str]
 
@@ -69,6 +70,8 @@ def value_token(v, clock: Clock, cache: Optional[Cache] = None) -> str:
     """Format an arbitrary animatable/scalar/vector/string property value."""
     if isinstance(v, str):
         return v
+    if isinstance(v, Color):
+        return v.token(clock, cache)            # "rgb r g b" or "hsv h s v"
     if isinstance(v, VecSignal):
         return fmt3(v.at(clock, cache))
     if isinstance(v, Signal):

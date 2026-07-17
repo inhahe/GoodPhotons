@@ -15,12 +15,20 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
-from .signals.core import Signal, Number, as_signal
+from .signals.core import Signal, Number, as_signal, alloc_id
 from .signals.vector import VecSignal, Vecish
 
 
 class PointPath:
-    """An ordered sequence of N-D points (each an animatable ``VecSignal``)."""
+    """An ordered sequence of N-D points (each an animatable ``VecSignal``).
+
+    A dataset is a **node in the modulation DAG** (it carries an ``id`` and
+    ``children()``), so it can be both *modulable* (its stored control points are
+    Signals/VecSignals driven by modulators) **and** a *modulator* (an interpolator
+    over it is a Signal that can feed other nodes).  Because it is a real node,
+    :func:`~loom.signals.core.detect_signal_cycle` walks through the dataset and
+    catches any loop that passes through a control point.
+    """
 
     def __init__(self, points: Iterable[Vecish], *, closed: bool = True) -> None:
         self.points: List[VecSignal] = [VecSignal.of(p) for p in points]
@@ -31,6 +39,11 @@ class PointPath:
             if p.dim != self.dim:
                 raise ValueError("all PointPath points must share a dimension")
         self.closed = bool(closed)
+        self._id = alloc_id()
+
+    @property
+    def id(self) -> int:
+        return self._id
 
     def __len__(self) -> int:
         return len(self.points)
@@ -76,6 +89,11 @@ class TrackedPath:
         self._scalar: dict = {}         # name -> bool (was authored as a scalar track)
         for name, values in (tracks or {}).items():
             self.add_track(name, values)
+        self._id = alloc_id()
+
+    @property
+    def id(self) -> int:
+        return self._id
 
     def __len__(self) -> int:
         return len(self.path)
@@ -121,7 +139,7 @@ class TrackedPath:
         return [p.components[0] for p in self.tracks[name]]
 
     def children(self):
-        kids: List = list(self.path.children())
+        kids: List = [self.path]
         for pts in self.tracks.values():
             kids.extend(pts)
         return tuple(kids)
@@ -158,6 +176,11 @@ class Grid:
         self._strides: List[int] = [1] * self.ndim
         for a in range(self.ndim - 2, -1, -1):
             self._strides[a] = self._strides[a + 1] * self.shape[a + 1]
+        self._id = alloc_id()
+
+    @property
+    def id(self) -> int:
+        return self._id
 
     def flat_index(self, idx: Sequence[int]) -> int:
         if len(idx) != self.ndim:
@@ -191,6 +214,11 @@ class Scatter:
         for p in self.positions:
             if p.dim != self.dim:
                 raise ValueError("all Scatter positions must share a dimension")
+        self._id = alloc_id()
+
+    @property
+    def id(self) -> int:
+        return self._id
 
     def __len__(self) -> int:
         return len(self.positions)
