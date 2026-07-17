@@ -241,6 +241,64 @@ def test_material_cli_choice_validated():
     assert _args("--material", "glass").material == "glass"
 
 
+def _capture_render_cmd(monkeypatch, tmp_path, **kw):
+    """Run _render_frame with subprocess stubbed out; return the ftrace argv it built."""
+    import subprocess
+    captured = {}
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, **_):
+        captured["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    fp = tmp_path / "f.ftsl"
+    fp.write_text("x")
+    g._render_frame("ftrace", tmp_path, fp, tmp_path / "f.png",
+                    size=(16, 16), raster=True, noise=3.0, **kw)
+    return captured["cmd"]
+
+
+def test_raster_see_through_flag(monkeypatch, tmp_path):
+    # clear material -> -see-through; gold -> not.
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, see_through=True)
+    assert "-see-through" in cmd
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, see_through=False)
+    assert "-see-through" not in cmd and "-glass-clarity" not in cmd
+
+
+def test_raster_glass_clarity_flag(monkeypatch, tmp_path):
+    # explicit clarity -> -glass-clarity <val> (which itself implies see-through in ftrace).
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, see_through=True, clarity=0.6)
+    assert "-glass-clarity" in cmd
+    assert "0.6" in cmd[cmd.index("-glass-clarity") + 1]
+
+
+def test_path_traced_ignores_see_through(monkeypatch, tmp_path):
+    # -see-through is a raster-only preview flag; it must never reach the path tracer.
+    import subprocess
+    captured = {}
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+
+    monkeypatch.setattr(subprocess, "run",
+                        lambda cmd, **_: (captured.__setitem__("cmd", cmd), _R())[1])
+    fp = tmp_path / "f.ftsl"
+    fp.write_text("x")
+    g._render_frame("ftrace", tmp_path, fp, tmp_path / "f.png",
+                    size=(16, 16), raster=False, noise=3.0, see_through=True, clarity=0.5)
+    assert "-see-through" not in captured["cmd"]
+    assert "-glass-clarity" not in captured["cmd"]
+
+
+def test_glass_clarity_cli_parsed():
+    assert _args("--glass-clarity", "0.7").glass_clarity == 0.7
+    assert _args().glass_clarity is None
+
+
 def test_reproducible_from_seed():
     args = _args()
     a = g.pick_variant(555, args, {})

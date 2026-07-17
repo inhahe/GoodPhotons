@@ -43,9 +43,10 @@ wash the lattice out, so the subject is lit like a product shot by a procedural 
 environment** — a dark neutral base plus a few bright soft "softbox" lights, written once as
 an equirectangular ``studio_env.pfm`` beside the outputs and fed to ftrace's image-based
 ``light env`` — so the surface picks up crisp highlights that trace every facet while deep
-shadows give depth, over a clean neutral background.  (The gold/glass look only develops under
-path tracing, ``--no-raster``; the fast rasterizer previews the same geometry flat-shaded,
-now including clear dielectrics.)
+shadows give depth, over a clean neutral background.  (The full gold/glass look only develops
+under path tracing, ``--no-raster``; the fast rasterizer previews the geometry flat-shaded, and
+for a clear ``--material`` renders it *see-through* — dimmed + milky-hazed via ftrace's
+``-see-through`` pass, no refraction — so glass reads as glass in the preview too.)
 
 This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
 **renders a seamless morphing video** in which the higher dimensions move the visible slice.
@@ -611,6 +612,9 @@ MATERIALS = {
     "gold":  'material "surf" { preset gold }',
     "glass": 'material "surf" { type dielectric ior glass:BK7 }',
 }
+# Materials that read as clear/transparent — the rasterizer previews these with ftrace's
+# ``-see-through`` pass (dim + milky haze) instead of a solid pale ghost.
+CLEAR_MATERIALS = {"glass"}
 
 # Studio environment map (equirectangular, written as a Radiance-style .pfm).  Direction
 # convention matches src/envmap.h: row 0 = +y (straight up), v=row/H -> theta=v*pi from +y;
@@ -1069,6 +1073,7 @@ class _PreviewWindow:
 
 def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
                   size: Tuple[int, int], raster: bool, noise: float,
+                  see_through: bool = False, clarity: Optional[float] = None,
                   pump: Optional["Callable[[], None]"] = None) -> None:
     """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
@@ -1078,6 +1083,11 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     the PNG and exits, letting the whole frame range run unattended.  The renderer's
     own console chatter is captured (kept off the status line) and only surfaced if the
     frame fails.
+
+    ``see_through`` (raster only) passes ftrace ``-see-through`` so clear dielectrics
+    (glass) render as dimmed + milky-hazed rather than a solid pale ghost (no refraction —
+    that needs path tracing); ``clarity`` (0..1) sets the per-surface transmittance via
+    ``-glass-clarity`` (higher = clearer; ftrace's default is 0.85).
 
     ``pump`` is an optional callback invoked repeatedly *while* ftrace runs (used to
     keep the preview window's event loop serviced — otherwise it would freeze for the
@@ -1089,6 +1099,10 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     if raster:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster",
                "-r", str(w), str(h)]
+        if clarity is not None:
+            cmd += ["-glass-clarity", f"{clarity:g}"]   # implies -see-through
+        elif see_through:
+            cmd.append("-see-through")
     else:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(w), str(h),
                "-interval", "8", "-checkpoint", "-noise", f"{noise:g}"]
@@ -1160,6 +1174,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
                frames: int, fps: float, size: Tuple[int, int], radius: float,
                raster: bool, noise: float, fmt: str, env_file: Optional[str] = None,
                transform: str = "drift", material: str = "gold",
+               clarity: Optional[float] = None,
                preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
@@ -1178,6 +1193,8 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
     verb = "raster" if raster else "trace"
     title_base = label.replace("[gyroid_nd] ", "")
     fw = max(3, len(str(frames - 1)))                   # frame-number field width
+    clear = material in CLEAR_MATERIALS                 # raster see-through only for clear mats
+    frame_clarity = clarity if clear else None
     pngs: List[Path] = []
     for k in range(frames):
         t = k / frames                                  # seamless loop: t in [0,1)
@@ -1191,6 +1208,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         png = fp.with_suffix(".png")
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
         _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise,
+                      see_through=clear, clarity=frame_clarity,
                       pump=(preview.pump if preview is not None else None))
         pngs.append(png)
         if preview is not None:
@@ -1309,8 +1327,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="surface of the gyroid sheet: 'gold' (default; a conductor/mirror "
                         "that reveals the lattice by reflecting the studio lights) or 'glass' "
                         "(a clear BK7 dielectric — the lattice reads through refraction). Both "
-                        "develop fully under path tracing (--no-raster); the rasterizer now "
-                        "previews clear dielectrics too.")
+                        "develop fully under path tracing (--no-raster); with a clear material "
+                        "the rasterizer previews it see-through (dim + milky haze) too.")
+    g.add_argument("--glass-clarity", type=float, default=None, metavar="0..1",
+                   help="for a clear --material under the rasterizer: per-surface see-through "
+                        "transmittance passed to ftrace -glass-clarity (higher = clearer; "
+                        "ftrace default 0.85). Ignored for gold or path-traced (--no-raster) "
+                        "renders.")
     g.add_argument("--size", type=_parse_size, default=None, metavar="N|WxH",
                    help="video/frame size in pixels: a single number for square (e.g. 720) "
                         "or WIDTHxHEIGHT (e.g. 1280x720); the preview window matches it "
@@ -1446,7 +1469,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                radius=args.radius, raster=args.raster,
                                noise=args.render_noise, fmt=args.format,
                                env_file=env_file, transform=args.transform,
-                               material=args.material, preview=preview)
+                               material=args.material, clarity=args.glass_clarity,
+                               preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
