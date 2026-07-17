@@ -31,14 +31,17 @@ the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating coun
 
 This script **randomly picks** all of the above and writes ``--count N`` complete,
 renderable ``.ftsl`` scene files, each with a full comment header recording exactly
-what was chosen (so a variant can be reproduced or hand-edited).  Any choice can be
-**locked** from the CLI (see ``--help``): the dimension count, how many dims
-oscillate, how many are harmonics of the main, the base frequency, and — per axis —
-whether it oscillates and at what harmonic.
+what was chosen (so a variant can be reproduced or hand-edited).  By default it also
+**rasterizes** each variant to a ``.png`` (ftrace ``-raster``, a fast headless z-buffer
+preview) and drops a ``.txt`` beside it listing every chosen value; use ``--no-images``
+to emit only the scene files.  Any choice can be **locked** from the CLI (see
+``--help``): the dimension count, how many dims oscillate, how many are harmonics of
+the main, the base frequency, and — per axis — whether it oscillates and at what
+harmonic.
 
 Examples::
 
-    # 10 fully random variants into png/gyroid_nd/
+    # 10 fully random variants (each -> .ftsl + .png + .txt) into png/gyroid_nd/
     python examples/gyroid_nd.py --count 10
 
     # reproducible; lock 6 dims, 4 oscillating, 2 of them harmonics of the main
@@ -47,10 +50,10 @@ Examples::
     # force the classic gyroid: x,y,z on at harmonic 1, nothing else
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1
 
-    # force axis 4 to be a 3rd-harmonic overtone, and axis 1 off
-    python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off
+    # just the .ftsl scene files, no rasterized images
+    python examples/gyroid_nd.py --count 3 --no-images
 
-    # generate and also render each (windowed, crash-safe checkpointing)
+    # generate and also full path-trace each (windowed, crash-safe checkpointing)
     python examples/gyroid_nd.py --count 3 --render
 """
 
@@ -356,11 +359,60 @@ def header(v: Variant, index: int, count: int) -> str:
     return "\n".join(L)
 
 
+def sidecar_text(v: Variant, index: int, count: int, *,
+                 ftsl_name: str = "", png_name: str = "") -> str:
+    """Plain-text (non-comment) dump of every chosen value, saved beside each image.
+
+    Reuses :func:`header` verbatim (stripped of its ``#`` comment prefixes) so the
+    ``.txt`` sidecar and the ``.ftsl`` header can never drift apart.
+    """
+    lines: List[str] = []
+    if ftsl_name or png_name:
+        if ftsl_name:
+            lines.append(f"scene file : {ftsl_name}")
+        if png_name:
+            lines.append(f"image file : {png_name}")
+        lines.append("")
+    for line in header(v, index, count).splitlines():
+        if line.startswith("# "):
+            lines.append(line[2:])
+        elif line == "#":
+            lines.append("")
+        elif line.startswith("#"):
+            lines.append(line[1:])
+        else:
+            lines.append(line)
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # ---------------------------------------------------------------------------
-# rendering (optional)
+# image / render generation
 # ---------------------------------------------------------------------------
 
+def rasterize_files(paths: List[Path], *, res: int) -> List[Path]:
+    """Rasterize each ``.ftsl`` to a PNG with ftrace ``-raster`` (fast z-buffer preview).
+
+    Headless and non-blocking: no ``-window`` is passed, so ftrace writes the PNG to
+    ``-o`` and exits, letting a whole batch of N run unattended (with ``-window`` a
+    single ``-raster`` still becomes an interactive, blocking fly camera).
+    """
+    import subprocess
+    from loom.drive import find_ftrace, repo_root
+    ftrace = find_ftrace()
+    pngs: List[Path] = []
+    for i, fp in enumerate(paths):
+        png = fp.with_suffix(".png")
+        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster", "-r", str(res)]
+        print(f"[gyroid_nd] rasterize {i + 1}/{len(paths)}: {png.name}", flush=True)
+        r = subprocess.run(cmd, cwd=str(repo_root()))
+        if r.returncode != 0:
+            raise SystemExit(f"ftrace -raster failed on {fp} (exit {r.returncode})")
+        pngs.append(png)
+    return pngs
+
+
 def render_files(paths: List[Path], *, noise: float, res: int) -> None:
+    """Full path-traced render of each ``.ftsl`` (windowed, checkpointed) — opt-in."""
     import subprocess
     from loom.drive import find_ftrace, repo_root
     ftrace = find_ftrace()
@@ -445,9 +497,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--res", type=int, default=480,
                    help="render resolution written into each scene's film (default 480)")
 
+    g = p.add_argument_group("images")
+    g.add_argument("--images", action=argparse.BooleanOptionalAction, default=True,
+                   help="rasterize each variant to a PNG and write a .txt of its values "
+                        "(default on; --no-images to only emit the .ftsl files)")
+
     g = p.add_argument_group("render (optional)")
     g.add_argument("--render", action="store_true",
-                   help="also render each generated file with ftrace (windowed, checkpointed)")
+                   help="also path-trace each generated file with ftrace (windowed, checkpointed)")
     g.add_argument("--render-noise", type=float, default=4.0,
                    help="per-frame noise-floor budget for --render (default 4%%)")
     return p
@@ -498,10 +555,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         fp = outdir / f"{args.name}{k:0{width}d}.ftsl"
         fp.write_text(text, encoding="utf-8")
         written.append(fp)
+        if args.images:
+            # A plain-text record of every chosen value, saved beside each image.
+            txt = fp.with_suffix(".txt")
+            txt.write_text(
+                sidecar_text(v, k, count, ftsl_name=fp.name,
+                             png_name=fp.with_suffix(".png").name),
+                encoding="utf-8")
         print(f"[gyroid_nd] {fp.name}: D={v.dims} osc={v.oscillating} "
               f"harmonics={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}")
 
     print(f"[gyroid_nd] wrote {len(written)} scene file(s) to {outdir}")
+    if args.images:
+        pngs = rasterize_files(written, res=args.res)
+        print(f"[gyroid_nd] rasterized {len(pngs)} image(s) (+ .txt values) to {outdir}")
     if args.render:
         render_files(written, noise=args.render_noise, res=args.res)
     return 0
