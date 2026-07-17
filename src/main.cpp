@@ -1528,9 +1528,30 @@ static bool                        g_showWindow = false;
 static bool                        g_keepWindow = false;
 static std::unique_ptr<LiveWindow> g_liveWin;
 // Base window title identifying WHAT is being rendered — set in main() to
-// "ftrace - <scene> -> <output>" (see makeWindowTitle). The live status (spp / noise)
-// is appended per frame so the title bar shows both the subject and its progress.
+// "ftrace - <scene> -> <output>" (see makeWindowTitle). The current render mode
+// (g_windowMode, below) and the live status (spp / noise) are appended per frame so
+// the title bar shows the subject, the transport mode, and its progress.
 static std::string                 g_windowTitle = "ftrace live preview";
+// Short label for the mode currently driving the live window, e.g. "mode B (pinhole)".
+// Each render dispatch (runRender / runSharedGroup / runSharedPhotonMap) stamps it so a
+// multi-camera flight with per-camera modes always shows the mode of the frame on screen.
+static std::string                 g_windowMode;
+// Human-readable name for a transport mode char (title bar + diagnostics).
+static const char* modeLabel(char m) {
+    switch (m) {
+        case 'A': return "mode A (finite-lens)";
+        case 'B': return "mode B (pinhole)";
+        case 'C': return "mode C (aperture-catch)";
+        case 'R': return "mode R (backward ref)";
+        case 'V': return "mode V (validate)";
+        case 'P': return "mode P (composite)";
+        case 'D': return "mode D (BDPT)";
+        case 'M': return "mode M (photon map)";
+        case 'S': return "mode S (SPPM)";
+        case 'U': return "mode U (VCM)";
+        default:  return "";
+    }
+}
 static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
                              const char* status = nullptr) {
     if (!g_showWindow || N <= 0.0) return;
@@ -1540,9 +1561,11 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // image the same way the ANSI preview does.
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
-    // Reflect the render subject + live progress in the title bar.
-    if (status && *status) g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  " + status);
-    else                   g_liveWin->setTitle(g_windowTitle);
+    // Reflect the render subject + mode + live progress in the title bar.
+    std::string t = g_windowTitle;
+    if (!g_windowMode.empty())     t += "  \xE2\x80\x94  " + g_windowMode;
+    if (status && *status)         t += "  \xE2\x80\x94  " + std::string(status);
+    g_liveWin->setTitle(t);
     if (g_liveWin->closed()) g_stopRequested = 1;
 }
 
@@ -2281,6 +2304,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
                      double* exposureAnchor = nullptr) {
+    g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -5207,6 +5231,7 @@ static int run(int argc, char** argv) {
     // A/B/C loop in runRender, generalised to N cameras riding one shared flight.
     auto runSharedGroup = [&](const std::vector<int>& idx, char groupMode) {
         if (idx.empty() || g_stopRequested) return;
+        g_windowMode = modeLabel(groupMode);   // title bar shows this shared group's mode
         const int nc = (int)idx.size();
         std::vector<Camera> cams; std::vector<int> rxs, rys;
         for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
@@ -5410,6 +5435,7 @@ static int run(int argc, char** argv) {
     // tracing — the (expensive) forward photon flight amortizes across all frames.
     auto runSharedPhotonMap = [&](const std::vector<int>& idx) {
         if (idx.empty() || g_stopRequested) return;
+        g_windowMode = modeLabel('M');   // title bar shows the shared photon-map mode
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
         // Trap Ctrl-C for the whole mode-M gather. Without this the default SIGINT action
