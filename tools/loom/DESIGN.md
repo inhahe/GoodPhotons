@@ -325,7 +325,7 @@ tools/loom/
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
   sequential chain (fewer ops in ftrace's per-hit eval). Pin the order/convention (row
   vs column, pre vs post) once; test associativity vs a reference. Small, low-risk.
-- **M9 — POV-function library.** Wrap ftrace's ~78 POV isosurface builtins as
+- **M9 — POV-function library.** ✅ done. Wrap ftrace's ~78 POV isosurface builtins as
   parametric field/pattern templates driven off a mirrored `povFnLookup` table
   (name→arity); validate param count in Python; params are Signal-drivable (baked per
   frame). Golden-value tests per function against known shapes. Honesty per §11.7:

@@ -92,6 +92,9 @@ class FuncPattern(Pattern):
         if self.rotation is not None:
             for r in self.rotation.rows:
                 out.extend(r)
+        # a param-animatable template (e.g. a PovFn) contributes its params
+        if hasattr(self.template, "param_signals"):
+            out.extend(self.template.param_signals())
         return out
 
     def _body(self, ctx: EmitCtx) -> str:
@@ -103,6 +106,9 @@ class FuncPattern(Pattern):
         cx = _coord_expr(f, M[0], d[0])
         cy = _coord_expr(f, M[1], d[1])
         cz = _coord_expr(f, M[2], d[2])
+        # context-aware templates (PovFn) bake their params; plain PatternFns don't
+        if hasattr(self.template, "build"):
+            return self.template.build(cx, cy, cz, ctx)
         return self.template(cx, cy, cz)
 
     def emit(self, ctx: EmitCtx) -> str:

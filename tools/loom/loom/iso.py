@@ -153,6 +153,9 @@ class Isosurface(Element):
         if self.rotation is not None:
             for r in self.rotation.rows:
                 out.extend(r)
+        # a param-animatable field template (e.g. a PovFn) contributes its params
+        if hasattr(self.field, "param_signals"):
+            out.extend(self.field.param_signals())
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
@@ -164,7 +167,11 @@ class Isosurface(Element):
         cx = _coord_expr(f, M[0], d[0])
         cy = _coord_expr(f, M[1], d[1])
         cz = _coord_expr(f, M[2], d[2])
-        expr = f"{self.field(cx, cy, cz)}-({fmt(thr)})"
+        # context-aware templates (PovFn) bake their params; plain FieldFns don't
+        field_expr = (self.field.build(cx, cy, cz, ctx)
+                      if hasattr(self.field, "build")
+                      else self.field(cx, cy, cz))
+        expr = f"{field_expr}-({fmt(thr)})"
 
         lines = [f'isosurface "{self.name}" {{']
         lines.append(f'    material "{self.material}"')

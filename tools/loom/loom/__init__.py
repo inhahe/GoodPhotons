@@ -34,6 +34,7 @@ from .iso import (
     Isosurface, gyroid_surface, phase_drift, FIELDS,
     gyroid, schwarz_p, schwarz_d, neovius,
 )
+from .pov import pov, PovFn, POV_FUNCS, POV_ND_GENERALIZABLE
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
@@ -58,5 +59,6 @@ __all__ = [
     "line_profile", "write_obj",
     "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
+    "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
 ]
