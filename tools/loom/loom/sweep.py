@@ -172,8 +172,8 @@ def sweep_rings(points: Sequence[Vec3], profile: Sequence[Vec2],
     return rings
 
 
-def skin(rings: Sequence[Sequence[Vec3]], closed_spine: bool, closed_profile: bool
-         ) -> Tuple[List[Vec3], List[Tuple[int, int, int]]]:
+def skin_rings(rings: Sequence[Sequence[Vec3]], closed_spine: bool, closed_profile: bool
+               ) -> Tuple[List[Vec3], List[Tuple[int, int, int]]]:
     """Skin consecutive rings into a triangle mesh.  Returns (vertices, faces),
     faces as 0-based index triples."""
     n = len(rings)

@@ -15,12 +15,17 @@ from .signals import (
     Sine, Cosine, LoopNoise,
     Ramp, Ease,
 )
-from .data import PointPath, Grid, Scatter
-from .interp import LoopCurve, GridField, ScatterField, eval_curve
+from .data import PointPath, TrackedPath, Grid, Scatter
+from .color import (
+    Color, rgb, hsv, hsl, hsv_to_rgb, rgb_to_hsv, hsl_to_rgb, rgb_to_hsl,
+)
+from .interp import (
+    LoopCurve, TrackedCurve, Reparam, GridField, ScatterField, eval_curve,
+)
 from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
-    Scene, Material, Sphere, Beads, Raw, Light, Camera, Element, Pattern,
-    SweptMesh, IsoMesh, ribbon, tube, blob, fan,
+    Scene, Material, Texture, skin, Sphere, Beads, Raw, Light, Camera, Element,
+    Pattern, SweptMesh, IsoMesh, ribbon, tube, blob, fan,
 )
 from .mcubes import mesh_field
 from .material import (
@@ -28,7 +33,7 @@ from .material import (
     waves, checker, rings, blobs,
 )
 from .sweep import (
-    rmf_frames, tangents, sweep_rings, skin, circle_profile, line_profile,
+    rmf_frames, tangents, sweep_rings, skin_rings, circle_profile, line_profile,
     write_obj,
 )
 from .iso import (
@@ -60,15 +65,18 @@ __all__ = [
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
     "Ramp", "Ease",
-    "PointPath", "Grid", "Scatter",
-    "LoopCurve", "GridField", "ScatterField", "eval_curve",
+    "PointPath", "TrackedPath", "Grid", "Scatter",
+    "Color", "rgb", "hsv", "hsl",
+    "hsv_to_rgb", "rgb_to_hsv", "hsl_to_rgb", "rgb_to_hsl",
+    "LoopCurve", "TrackedCurve", "Reparam", "GridField", "ScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
-    "Scene", "Material", "Sphere", "Beads", "Raw", "Light", "Camera", "Element",
+    "Scene", "Material", "Texture", "skin", "Sphere", "Beads", "Raw", "Light",
+    "Camera", "Element",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
     "waves", "checker", "rings", "blobs",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan",
     "mesh_field",
-    "rmf_frames", "tangents", "sweep_rings", "skin", "circle_profile",
+    "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
     "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",

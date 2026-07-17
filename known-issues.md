@@ -5,6 +5,71 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-17): GPU preview rasterizer — feature parity with the CPU rasterizer
+
+The GPU preview rasterizer (`src/raster_cuda.{h,cu}`, wired into `main.cpp`'s
+`-raster` block via the `rasterOne` dispatcher, gated on `-device gpu|auto`) now
+accelerates **all camera projections** (rectilinear + fisheye/panoramic), **opaque +
+textured (skinned)** previews, and **see-through (clear-glass)** compositing on the GPU.
+It only falls back to the CPU rasterizer (`raster::renderFrame`) on a device failure
+(the `renderFrame` returning empty). Remaining deferred work is limited to bit-exactness
+and readback (below). History:
+
+- **Fisheye / panoramic projections (M2). — DONE (2026-07-17).** `kProject` now branches
+  rectilinear (`x/z` + near-plane Sutherland-Hodgman clip → ≤2 sub-tris) vs angular
+  (the same `projRadius(projection, θ)/rEdge` map as `raster::projectVtx`, behind-camera
+  reject-clip → 1 sub-tri) via `DCam.projection`/`DCam.rEdge`; `kRaster`/`kShade`/
+  `exposeAndEncode` were untouched (projection-agnostic as predicted). Validated GPU vs
+  CPU on `scenes/fisheye.ftsl` (fish camera: mean abs diff 0.015/255, 515/2.07 M edge
+  pixels — tighter than the rectilinear `rect` frame's 0.034/1200), and rectilinear
+  regression unchanged.
+- **See-through (`-see-through`) on GPU. — DONE (2026-07-17).** `kProject` now propagates a
+  per-triangle `clear` flag; `kRaster` skips clear surfaces when `seeThrough` (so only opaque
+  geometry wins the visibility buffer); a new `kClear` device pass mirrors `fillTriangleClear`
+  — it rasterizes each clear sub-triangle against the opaque `zbuf` written by `kShade`, and
+  for every fragment IN FRONT multiplies that pixel's `clearT` (transmittance) and `milkT`
+  (1 − per-surface milk, incl. the grazing/rim term) via a CAS-based `atomicMulF` (the product
+  is commutative → order-independent, so races are safe). `renderFrame` resets `clearT`/`milkT`
+  to 1 with `kFillF`, runs `kClear`, downloads both, and feeds the shared `exposeAndEncode`
+  (which already composites them). Validated GPU vs CPU on `scenes/cornell.ftsl -see-through`:
+  mean abs diff 0.020/255, 0.034 % edge pixels — same float-vs-double edge gap as opaque.
+- **Image skins (textured `reflect texture:<name>` albedo) on GPU. — DONE (2026-07-17).** Each
+  `Scene::textures` entry's linear-RGB buffer is flattened into one shared device texel array
+  (`DTex` metadata: w/h/filter/wrap/offset) in `upload`; `DPTri`/`DSTri`/`DVtxCS` carry `uv`,
+  `tex` and `triplanarScale` (with UV lerped through the near-plane clip); `kShade` samples via
+  device twins `dSampleRgb`/`dSampleRgbTri` (nearest/bilinear, v-flip, wrap modes; triplanar
+  |n|^4 axis blend) exactly mirroring the host `Texture::sampleRgb`/`sampleRgbTriplanar`.
+  Indexed-palette textures sample their raw index-map RGB here, identical to the CPU preview's
+  `sampleRgb` path. Validated GPU vs CPU on `scenes/textured.ftsl` (UV skin: mean 0.019/255,
+  0.029 % edge) and `scenes/triplanar.ftsl` (world triplanar: mean 0.018/255, 0.028 % edge).
+- **Parity is visual, not bit-exact.** The device geometry/shading is single precision
+  vs the CPU's double, so silhouette-edge pixels can differ by one pixel of coverage
+  (measured ~0.03 % of pixels on cornell/implicit, all on color boundaries, mean abs
+  diff ~0.02/255). The exposure + tone-map tail IS shared host double code
+  (`raster::exposeAndEncode`), so brightness/lock never drift. Acceptable for a preview;
+  a full-FP64 device path would close the edge gap at a large speed cost (not worth it).
+- **Per-frame readback.** Each frame downloads the HDR accum + z + emis buffers and runs
+  the p99 + encode on the host. Fine today; if it ever bottlenecks, move the tone map
+  onto the device and read back only RGB8 (would then need the anchor computed on-device
+  or shared explicitly for the exposure-lock case).
+
+### TECH DEBT (2026-07-17): GPU BDPT (mode D) can't texture — falls back to CPU BDPT
+
+The forward (A/B/C) and backward-reference (R) GPU megakernels sample image skins per
+hit via `dDiffuseRho` (device twin of `diffuseReflectance`), so a textured
+`reflect texture:<name>` albedo renders on the GPU for those modes. The GPU BDPT kernel
+(`kBdpt` in `src/render_cuda.cu`), however, drops the surface-local `(u,v)` from its
+`DVertex` and its diffuse vertices sample only the constant `reflect` spectrum — so
+`cudaBdptSupported` (render_cuda.cu ~5443, `usesTexOrFluoro`: `m.reflectTex >= 0`) rejects
+any textured scene and `-mode D -device gpu` falls back to the (correct) CPU BDPT. Same
+for fluorescence, roughness/film-thickness/pattern-driven params and mix masks. Verified:
+`scenes/textured.ftsl -mode D -device gpu` prints "BDPT-GPU-unsupported feature … using
+CPU" and matches the CPU BDPT image. Proper fix: thread the hit `(u,v)` through `DVertex`
++ upload the textures to the device (as the forward path already does), then have the
+BDPT `dBsdfF`/`dBsdfPdf`/`dConnect` sample `dDiffuseRho` at the vertex instead of the
+constant spectrum. Non-trivial (MIS pdfs must stay consistent), low priority (CPU BDPT is
+correct; textured caustic-heavy scenes are rare).
+
 ### TECH DEBT (2026-07-17): loom preview server (`-serve`) is resident-process only
 
 The M12 preview server (ftrace `-serve` in `src/main.cpp` `runServe`, loom

@@ -490,6 +490,143 @@ def test_rotate_well_formed_across_seeds():
             assert "+-" not in expr and "++" not in expr and "*-" not in expr
 
 
+def test_tumble_starts_from_current_gyroid():
+    # the tumble transform at t=0 is the identity rotation -> the exact static field
+    v = g.pick_variant(3, _args("--dims", "6", "--transform", "tumble"), {})
+    assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v, 0.0, "drift")
+    assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v)
+
+
+def test_tumble_loop_is_seamless():
+    # t=0 and t=1 evaluate identically (whole-turn N-D rotation -> R(0)=R(1)=I)
+    v = g.pick_variant(7, _args("--dims", "6", "--transform", "tumble"), {})
+    e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
+    for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
+        assert abs(_eval_expr(e0, x, y, z) - _eval_expr(e1, x, y, z)) < 1e-6
+
+
+def test_tumble_actually_moves_and_differs_from_rotate():
+    # mid-loop tumble morphs the field, differently from both drift and rotate (it is a
+    # coherent whole-slice rotation, not per-dim wavevector tilts or a slide)
+    v = g.pick_variant(7, _args("--dims", "6", "--transform", "tumble"), {})
+    e0 = g.field_expr(v, 0.0, "tumble")
+    et = g.field_expr(v, 0.31, "tumble")
+    ed = g.field_expr(v, 0.31, "drift")
+    er = g.field_expr(v, 0.31, "rotate")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    assert max(abs(_eval_expr(e0, *p) - _eval_expr(et, *p)) for p in pts) > 1e-3  # morphs
+    assert max(abs(_eval_expr(et, *p) - _eval_expr(ed, *p)) for p in pts) > 1e-3  # != drift
+    assert max(abs(_eval_expr(et, *p) - _eval_expr(er, *p)) for p in pts) > 1e-3  # != rotate
+
+
+def test_tumble_planes_are_disjoint():
+    # each dim index appears in at most one Givens plane, so a rotated direction row mixes
+    # at most two unit rows (|dir| <= sqrt(2)) — the marcher's Lipschitz inflation relies on it
+    for s in range(20):
+        v = g.pick_variant(s, _args("--dims", "8", "--transform", "tumble"), {})
+        seen = []
+        for (i, j, _w) in v.tumble_planes:
+            assert i != j
+            seen += [i, j]
+        assert len(seen) == len(set(seen))          # no index reused across planes
+
+
+def test_tumble_well_formed_across_seeds():
+    args = _args("--dims", "8", "--transform", "tumble")
+    for s in range(20):
+        v = g.pick_variant(s, args, {})
+        assert v.tumble_planes                       # planes were built for tumble
+        for t in (0.0, 0.13, 0.5, 0.77, 1.0):
+            expr = g.field_expr(v, t, "tumble")
+            assert expr.count("(") == expr.count(")")
+            assert "+-" not in expr and "++" not in expr and "*-" not in expr
+
+
+def test_tumble_3d_falls_back_to_rigid_spin():
+    # with no hidden dims (D=3) tumble degenerates to a plane rotation of the visible axes;
+    # it must still build a plane, stay seamless, and morph (a rigid spin of the gyroid)
+    v = g.pick_variant(5, _args("--dims", "3", "--transform", "tumble"), {})
+    assert v.tumble_planes                            # a fallback (0,2) plane exists
+    e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
+    eh = g.field_expr(v, 0.29, "tumble")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    assert max(abs(_eval_expr(e0, *p) - _eval_expr(e1, *p)) for p in pts) < 1e-6   # seamless
+    assert max(abs(_eval_expr(e0, *p) - _eval_expr(eh, *p)) for p in pts) > 1e-3   # spins
+
+
+def test_tumble_not_built_for_other_transforms():
+    # tumble planes are only drawn when needed, so drift/rotate/bloom variants keep an empty
+    # list — and their RNG stream (hence reproducibility) is untouched by the feature
+    for tr in ("drift", "rotate", "bloom"):
+        v = g.pick_variant(4, _args("--dims", "6", "--transform", tr), {})
+        assert v.tumble_planes == []
+
+
+def test_tumble_slide_is_seamless():
+    # slide mode rocks the slice via sin(2*pi*winding*t); sin is 0 at t=0 and t=1, so both
+    # loop ends are exactly the base gyroid — still a seamless loop
+    v = g.pick_variant(7, _args("--dims", "6", "--transform", "tumble",
+                                "--tumble-mode", "slide"), {})
+    assert v.tumble_mode == "slide"
+    e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
+    assert e0 == g.field_expr(v)                          # frame 0 = base gyroid
+    for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
+        assert abs(_eval_expr(e0, x, y, z) - _eval_expr(e1, x, y, z)) < 1e-6
+
+
+def test_tumble_slide_differs_from_rotate_midloop():
+    # slide and rotate share the same planes but different angle schedules, so mid-loop they
+    # produce different fields (slide rocks +/-tumble_amp; rotate spins a full turn)
+    base = ["--dims", "6", "--transform", "tumble"]
+    vr = g.pick_variant(11, _args(*base, "--tumble-mode", "rotate"), {})
+    vs = g.pick_variant(11, _args(*base, "--tumble-mode", "slide"), {})
+    assert vr.tumble_planes == vs.tumble_planes          # same planes (RNG untouched by mode)
+    er = g.field_expr(vr, 0.31, "tumble")
+    es = g.field_expr(vs, 0.31, "tumble")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    assert max(abs(_eval_expr(er, *p) - _eval_expr(es, *p)) for p in pts) > 1e-3
+
+
+def test_tumble_slide_extreme_at_midloop_changes_projected_scale():
+    # slide's angle peaks at t=0.25 (sin(2*pi*winding*t) max); with a large amp the slice is
+    # tilted well away from identity, so the field must differ substantially from frame 0
+    v = g.pick_variant(3, _args("--dims", "6", "--transform", "tumble",
+                                "--tumble-mode", "slide", "--tumble-amp", "0.25"), {})
+    e0 = g.field_expr(v, 0.0, "tumble")
+    # peak tilt occurs where winding*t = 0.25 for a winding-1 plane, i.e. t=0.25
+    epk = g.field_expr(v, 0.25, "tumble")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    assert max(abs(_eval_expr(e0, *p) - _eval_expr(epk, *p)) for p in pts) > 1e-3
+
+
+def test_tumble_lock_excludes_axes_from_planes():
+    # locked axes must never appear in any tumble plane (they stay fixed while others tumble)
+    for s in range(20):
+        v = g.pick_variant(s, _args("--dims", "8", "--transform", "tumble",
+                                    "--tumble-lock", "0,1"), {})
+        assert v.tumble_locked == (0, 1)
+        for (i, j, _w) in v.tumble_planes:
+            assert i not in (0, 1) and j not in (0, 1)
+
+
+def test_tumble_lock_keeps_locked_axis_direction_static():
+    # a locked axis's direction row is identical at every t (it is excluded from the rotation)
+    v = g.pick_variant(4, _args("--dims", "7", "--transform", "tumble",
+                                "--tumble-lock", "0"), {})
+    d0 = g._tumbled_directions(v, 0.0)
+    for t in (0.13, 0.5, 0.87):
+        dt = g._tumbled_directions(v, t)
+        assert d0[0] == dt[0]                            # axis 0 never moves
+
+
+def test_tumble_mode_rejected_without_tumble_transform():
+    # --tumble-mode / --tumble-lock only make sense for --transform tumble
+    with pytest.raises(SystemExit):
+        g.main(["--transform", "rotate", "--tumble-mode", "slide", "--no-video", "--count", "1"])
+    with pytest.raises(SystemExit):
+        g.main(["--transform", "drift", "--tumble-lock", "0", "--no-video", "--count", "1"])
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

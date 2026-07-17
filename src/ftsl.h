@@ -44,7 +44,8 @@
 // Statements are newline-terminated; brace values (table {…}, film {…}) nest. A
 // spectrum expression is any of: a number (constant), `blackbody K`, `gaussian
 // center=.. sigma=.. amp=..`, `shortpass edge=.. slope=.. amp=..`, `ior n`,
-// `rgb r g b`, `whitewall [r]`, `redwall`, `greenwall`, `glass:BK7|SF10`,
+// `rgb r g b`, `hsv h s v` / `hsl h s l` (hue in [0,1], wraps), `whitewall [r]`,
+// `redwall`, `greenwall`, `glass:BK7|SF10`,
 // `preset:<illuminant>`, `spectrum:<name>`, `file:<path>` (a measured CSV curve),
 // or `table { λ:v λ:v … }`.
 #pragma once
@@ -67,6 +68,7 @@
 #include "mesh.h"
 #include "gltf.h"
 #include "upsample.h"
+#include "color.h"
 
 namespace ftsl {
 
@@ -778,6 +780,20 @@ private:
         if (h == "rgb") {
             if (w.size() < 4) { fail("rgb needs 3 components"); return constantSpectrum(0); }
             return rgbToReflectanceJH(num(w[1]), num(w[2]), num(w[3]));
+        }
+        if (h == "hsv") {
+            // `hsv h s v` — hue in [0,1] (turns, wraps), s/v in [0,1]. Converted to
+            // RGB then to a smooth reflectance via the same Jakob-Hanika fit as `rgb`.
+            if (w.size() < 4) { fail("hsv needs 3 components (h s v)"); return constantSpectrum(0); }
+            Vec3 c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
+            return rgbToReflectanceJH(c.x, c.y, c.z);
+        }
+        if (h == "hsl") {
+            // `hsl h s l` — hue in [0,1] (turns, wraps), s/l in [0,1] (l = lightness).
+            // Converted to RGB then upsampled to reflectance like `rgb`/`hsv`.
+            if (w.size() < 4) { fail("hsl needs 3 components (h s l)"); return constantSpectrum(0); }
+            Vec3 c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
+            return rgbToReflectanceJH(c.x, c.y, c.z);
         }
         if (h.rfind("glass:", 0) == 0) {
             std::string g = h.substr(6);

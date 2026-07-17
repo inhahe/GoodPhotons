@@ -145,7 +145,12 @@ paths they can capture at all**.
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
 > ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
 > `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
-> that still refracts nothing.) Shading sums a diffuse term from **every**
+> that still refracts nothing.) **Image skins** *are* shown: a material whose
+> albedo is a bound texture (`reflect texture:<name>`) is previewed by
+> interpolating the surface's per-vertex UVs — or, for an un-UV'd mesh/isosurface,
+> the material's world **triplanar** projection — and sampling the texture's linear
+> RGB per pixel, so a skinned globe/wallpaper/torus reads with its actual image
+> rather than a flat colour. Shading sums a diffuse term from **every**
 > scene light using its real position/direction (spot cones included), so multi-
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
@@ -178,6 +183,26 @@ paths they can capture at all**.
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+>
+> **GPU-accelerated preview — `-device gpu` (or `auto`).** When ftrace is built
+> with CUDA, the preview rasterizer runs on the GPU: the tessellated world
+> triangles are uploaded **once** and every camera is projected, depth-resolved
+> (a 64-bit `atomicMax` visibility buffer) and shaded on the device, then the
+> **same** 99th-percentile auto-exposure + sRGB tone map as the CPU path runs on
+> the host — so a GPU frame matches a CPU frame (only sub-pixel float-vs-double
+> differences at silhouette edges) and an exposure-locked flyby still shares one
+> anchor with no flicker. It pays off on **heavy** scenes: a 4.5 M-triangle
+> isosurface at 1600 px rasterizes in ~0.30 s/frame on the GPU vs ~1.6 s on the
+> CPU (~5×), with the one-time tessellation unchanged; tiny scenes are launch-bound
+> and roughly tie. **Scope:** the GPU path covers **all camera projections**
+> (rectilinear **and** fisheye/panoramic — the device applies the same angular lens
+> map the real camera uses), **opaque and textured (skinned)** geometry (image skins
+> — per-vertex UV **and** world-triplanar `reflect texture:<name>` albedo — are sampled
+> on-device), **and** `-see-through` clear-glass compositing (a device clear-accumulation
+> pass mirrors the CPU one). Only a device allocation failure falls back to the CPU
+> rasterizer per camera (mixed camera lists just work), so `-device gpu` never fails a
+> preview it can't accelerate. Example:
+> `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
 > **See-through clear objects — `-see-through`.** By default a clear material
 > (dielectric / thin-film / filter / diffuse-transmit) previews as a solid pale
@@ -360,6 +385,25 @@ paths they can capture at all**.
 > normally; `-in <path>` is likewise always an explicit render, never a preview.
 
 ### Speed / accuracy / ability tradeoffs
+
+At a glance (the prose bullets below expand every row). The first row is the
+`-raster` **preview** — not a light-transport mode, but included so you can weigh
+"quick look" against a real render; everything below it is an unbiased estimator
+that converges to the same physical image.
+
+| Mode | Best for | Speed | Specular-first | Depth of field | Caustics | GPU | Main limitation |
+|---|---|---|---|---|---|---|---|
+| **`-raster`** *(preview)* | Composition & camera-motion preview | Instant | — *(flat ghost/tint)* | ✗ | ✗ | ✓ *(`-device gpu`; else threaded CPU)* | **No light transport at all** — no shadows, reflection, refraction or GI (`-see-through` fakes clear glass) |
+| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ✗ *(black)* | ✗ | ✓ | ✓ | Can't shade a directly-seen mirror/glass; no depth of field |
+| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
+| `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
+| `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
+| `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
+| `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
+| `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
+| `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`) |
+| `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✗ | Many passes to converge; CPU only |
+| `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✗ | Heaviest per-pass cost; CPU only |
 
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
@@ -746,6 +790,12 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
     chromaticity.
 - **`rgb r g b`** — Jakob–Hanika sigmoid upsampling to a reflectance spectrum
   (round-trips under D65).
+- **`hsv h s v`** — an HSV colour (hue `h` in `[0,1]` turns and *wraps*, so a hue
+  swept over a loop cycles the whole wheel seamlessly; `s`/`v` in `[0,1]`),
+  converted to RGB and then upsampled exactly like `rgb`.
+- **`hsl h s l`** — an HSL colour on the same wrapping hue wheel, but `l` is
+  *lightness* (`l=0.5` is the pure hue, `l→1` white, `l→0` black; matches CSS);
+  `s`/`l` in `[0,1]`. Converted to RGB and upsampled exactly like `rgb`.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
@@ -778,6 +828,86 @@ into one named asset (a thin-film material owns an index curve, a substrate-exti
 curve and film thickness/index at once). Only the data is external; the dispersion
 evaluators, interference/BSDF math and light models stay in the renderer. See
 `data/README.md`.
+
+### Spectral representation vs. other renderers
+
+*How* a renderer carries colour along a light path decides whether it can split
+dispersion correctly. There are three representations, and ftrace sits at the
+physically-strictest end:
+
+1. **RGB triple** — three channels ride every ray/photon. Cheap, but colour is
+   already collapsed into R/G/B, so a dispersive interface (prism, lens, water)
+   cannot fan wavelengths into different directions: no true dispersion.
+2. **Co-sampled full spectrum** — one ray/photon carries *all* N spectral bins at
+   once (a whole SPD per sample). Spectrally correct in energy, but because every
+   wavelength rides the *same* photon it still physically cannot land in different
+   places per wavelength — so **dispersive caustics through a photon map don't
+   split** (they stay energy-correct but colour-averaged).
+3. **One wavelength per photon** (ftrace) — each photon carries a single λ, refracts
+   at *that* wavelength's index, and lands where *that* colour focuses. Dispersive
+   caustics split into true spectral colour for free. The modern **hero-wavelength**
+   schemes are the same idea softened: a few stratified wavelengths share one "hero"
+   λ that drives the path (which is why they, too, can disperse).
+
+**"Accurate" splits into two independent axes, and ftrace is only unique on the
+second:**
+
+- **Spectral energy accuracy** — right colour under odd illuminants, metamerism,
+  saturated lights, fluorescence: everything RGB's three channels smear. *Every*
+  full-spectrum renderer below is as accurate here as ftrace, and the hero-wavelength
+  ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
+  per path instead of our one. **We claim no edge on this axis.**
+- **Dispersion — colours actually splitting** through a prism / lens / water. Only
+  the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
+  co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.
+
+Where popular physically-based renderers fall (verified against their docs/source;
+see sources below):
+
+| Renderer (engine) | Default colour | Spectral mode | Per-path/photon carrier |
+|---|---|---|---|
+| **ftrace (this — forward photon)** | spectral | always | **1 λ per photon** — true dispersive caustics |
+| PBRT-v3 (SPPM photon map) | RGB | compile-time (`SampledSpectrum`, ~30 bins @ 10 nm) | **co-sampled: all bins on one photon** — no split |
+| Mitsuba 0.x (`ptracer`/`ppm`/`sppm`) | RGB | compile-time (`SPECTRUM_SAMPLES`, e.g. 15–30) | **co-sampled: all bins per sample** — no split |
+| PBRT-v4 | spectral | always | hero wavelength, 4 λ/path (default, recompilable) |
+| Mitsuba 3 (`*_spectral` variant) | RGB build variant | build variant | hero wavelength, 4 λ/ray |
+| Maxwell Render | spectral | always | full-spectral transport¹ |
+| Indigo Renderer | spectral | always | full-spectral transport¹ |
+| LuxCoreRender | RGB (sRGB) | on-demand only (dispersion) | RGB; spectral only at a dispersive glass event |
+| Blender Cycles | RGB | fork/experimental only | RGB |
+| Arnold | RGB | — | RGB |
+
+The **two forward light tracers that carry every wavelength on a single photon** are
+the *spectral* builds of **PBRT-v3** (`SampledSpectrum`) and **Mitsuba 0.x**
+(`SPECTRUM_SAMPLES` > 3): both are RGB by default and, even compiled spectral,
+co-sample the whole SPD per photon — so neither reproduces colour-split dispersive
+caustics in its photon map.
+
+To be clear, **ftrace is not uniquely spectrally accurate** — Maxwell, Indigo and the
+spectral builds of PBRT/Mitsuba integrate the true spectrum just as faithfully (and
+PBRT-v4 / Mitsuba 3 do it with *less* colour noise). What is unique here is the
+**pairing**: ftrace is the only renderer in this table that couples *accurate
+single-wavelength photons* with a *forward photon map*, so true dispersive **caustics**
+— focused, colour-split light, a rainbow thrown through a glass of water onto a table —
+fall straight out of the forward pass. Pure path tracers (PBRT-v4, Mitsuba 3) disperse
+a directly-seen ray correctly but struggle with *caustics* regardless of how good their
+spectral model is; the fully-spectral bidirectional/MLT tracers (**Maxwell**, **Indigo**)
+reach caustics by a different, costlier route; **LuxCoreRender**, **Cycles** and
+**Arnold** are RGB pipelines (LuxCore invokes a single wavelength only at a dispersive
+glass hit). ftrace pays for the combination with more photons for chromatic smoothness —
+the price of one wavelength at a time.
+
+¹ Maxwell and Indigo document spectral transport end-to-end, but do not publicly
+specify whether a path samples one wavelength or co-samples many — so their
+per-path carrier is left unqualified here.
+
+*Sources:* [pbrt-v4 spectral representation](https://pbr-book.org/4ed/Radiometry,_Spectra,_and_Color/Representing_Spectral_Distributions),
+[Wilkie et al. 2014, *Hero Wavelength Spectral Sampling*](https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.12419),
+[Mitsuba 3 spectral variants](https://mitsuba.readthedocs.io/en/latest/src/key_topics/variants.html),
+[Indigo — spectral throughout](https://indigorenderer.com/features),
+[Maxwell Render features](https://maxwellrender.com/features/),
+[LuxCoreRender — spectral on demand](https://forums.luxcorerender.org/viewtopic.php?t=1728),
+[Cycles — RGB (spectral is a fork)](https://devtalk.blender.org/t/thoughts-on-making-cycles-into-a-spectral-renderer/2192).
 
 ---
 
@@ -1646,7 +1776,7 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>` and appends the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
+| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing, how it's being rendered, and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |

@@ -40,15 +40,16 @@ tools/loom/
 ├── loom/            the package
 │   ├── signals/     modulation DAG (Signal graph): leaves, math ops, N-D vector signals
 │   ├── mathnd.py    N-D vectors / matrices, Givens-rotation builder, the 3-D slicer
-│   ├── data.py      datasets: PointPath | Grid | Scatter (N-D)
-│   ├── interp.py    interpolators (closed loop curve | grid field | scatter field)
+│   ├── data.py      datasets: PointPath | TrackedPath | Grid | Scatter (N-D, DAG nodes)
+│   ├── color.py     colour model: RGB + HSV + HSL (animatable, seamless hue loops)
+│   ├── interp.py    interpolators (loop curve | tracked multi-curve | grid field | scatter field)
 │   ├── iso.py       isosurfaces: gyroid / Schwarz-P / Schwarz-D / Neovius + N-D slicing
 │   ├── pov.py       POV-Ray function library, with which are N-D-generalizable
 │   ├── spatial.py   spatial expression DSL (X, Y, Z, T + math) → ftsl `expr` strings
-│   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin, OBJ out)
+│   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
-│   ├── scene.py     Scene / Camera / Material / geometry instances (all animatable)
+│   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry (all animatable)
 │   ├── canvas.py    2-D canvas (motion graphics: markers, strokes)
 │   ├── xvideo.py    two-pass spacetime transforms (rotate/shear a 4-D block)
 │   ├── ftsl_emit.py .ftsl emission

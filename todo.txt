@@ -1,5 +1,24 @@
+did we ever make the rasterizer show glass as clear on the gpu? and there was one other thing it wouldn't do on the gpu, i don't remember what.
+
+^ pending
+
+test skin support
+
+^ doing
+
+--
+
+would it be possible to make our rasterizer support textures?
+
+^ pending
+
+make loom support using a skin, i guess pass an image file path? that's the only thing that defines skins, right?
+
+^ not done yet
+
 BTW, I forgot one thing in the spec to support: Good Photons' isosurface functions that import 78 of POV-Ray's 80 functions available for isusurface functions
 for "A live viewer (cheap: emit frames → your raster preview) — the 80% of GUI value you actually need to tune loops, without the interactive editor.", I guess we'll just re-use ftrace's rasterizer ability? Or can rasterizing be done significantly faster somehow?
+
 
 Idea: I wonder if this library concepts could be used interestingly to create 2D graphics, too? I'm not sure, but taking on a 2D output generator would be easy peasy.
 

@@ -3,7 +3,11 @@
 // This is the "quick taste" viewer: it turns the whole scene into triangles once
 // (analytic spheres tessellated, isosurfaces marched to a mesh, instanced meshes
 // baked to world space) and rasterizes each authored camera with a plain z-buffer
-// and simple diffuse+headlight shading. There is NO transparency, refraction,
+// and simple diffuse+headlight shading. Image skins (a `reflect texture:<name>`
+// albedo) ARE previewed: the per-vertex UVs (or a world triplanar projection) are
+// interpolated in the deferred G-buffer and the texture's linear RGB is sampled per
+// pixel in the shade pass, so a skinned surface shows its image. There is NO
+// transparency, refraction,
 // reflection, shadows, caustics or global illumination — a dielectric shows as a
 // solid ghost, a mirror as a flat tint. The point is to see the *composition* and
 // (for a camera_curve) the *flyby motion* in a fraction of a second per frame,
@@ -34,6 +38,10 @@ struct PTri {
     Vec3 p0, p1, p2;
     Vec3 n0, n1, n2;
     Vec3 color;
+    // Per-vertex texture coordinates (u in .x, v in .y). Only meaningful when tex >= 0.
+    Vec3 uv0{0, 0, 0}, uv1{0, 0, 0}, uv2{0, 0, 0};
+    int  tex = -1;           // index into the scene texture table, or -1 (flat `color`)
+    double triplanarScale = 0.0;  // >0: sample the texture by world triplanar, not UV
     bool emissive = false;
     bool clear    = false;   // dielectric/thin-film/filter surface (see-through mode dims/hazes it)
 };
@@ -171,11 +179,22 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
     std::vector<Vec3> matCol(sc.mats.size());
     std::vector<char>  matEmit(sc.mats.size(), 0);
     std::vector<char>  matClear(sc.mats.size(), 0);
+    std::vector<int>   matTex(sc.mats.size(), -1);   // bound reflectTex (image skin) or -1
+    std::vector<double> matTri(sc.mats.size(), 0.0); // triplanar scale (0 = per-vertex UV)
     for (size_t i = 0; i < sc.mats.size(); ++i) {
         bool em = false;
         matCol[i] = materialColor(sc.mats[i], em);
         matEmit[i] = em ? 1 : 0;
         matClear[i] = (!sc.mats[i].isLight && isClearPreviewType(sc.mats[i].type)) ? 1 : 0;
+        // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
+        // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
+        // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
+        int rt = sc.mats[i].reflectTex;
+        if (!sc.mats[i].isLight && rt >= 0 && rt < (int)sc.textures.size() &&
+            sc.textures[rt].valid() && !sc.textures[rt].hasPalette()) {
+            matTex[i] = rt;
+            matTri[i] = sc.mats[i].triplanarScale;
+        }
     }
     auto colOf = [&](int matId) -> Vec3 {
         return (matId >= 0 && matId < (int)matCol.size()) ? matCol[matId] : Vec3{0.6, 0.6, 0.6};
@@ -186,6 +205,12 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
     auto clearOf = [&](int matId) -> bool {
         return (matId >= 0 && matId < (int)matClear.size()) && matClear[matId];
     };
+    auto texOf = [&](int matId) -> int {
+        return (matId >= 0 && matId < (int)matTex.size()) ? matTex[matId] : -1;
+    };
+    auto triOf = [&](int matId) -> double {
+        return (matId >= 0 && matId < (int)matTri.size()) ? matTri[matId] : 0.0;
+    };
 
     // (1) World triangles.
     out.reserve(sc.tris.size() + 4096);
@@ -194,6 +219,8 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
         p.p0 = t.v0; p.p1 = t.v1; p.p2 = t.v2;
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
         p.color = colOf(t.matId); p.emissive = emOf(t.matId); p.clear = clearOf(t.matId);
+        p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
+        p.tex = texOf(t.matId); p.triplanarScale = triOf(t.matId);
         out.push_back(p);
     }
 
@@ -208,14 +235,30 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
                         std::sin(theta) * std::sin(phi)};
         };
         Vec3 col = colOf(s.matId); bool em = emOf(s.matId); bool cl = clearOf(s.matId);
+        int  tex = texOf(s.matId); double tri = triOf(s.matId);
+        // Equirectangular (lat/long) UV per vertex, matching the analytic sphere hit in
+        // geometry.h (u = 0.5 + atan2(z,x)/2pi, v = 0.5 - asin(y)/pi) so a skin lines up
+        // with the real render. Computed from the unit direction d (== the vertex normal).
+        auto uvOf = [](const Vec3& d) -> Vec3 {
+            return Vec3{0.5 + std::atan2(d.z, d.x) / (2.0 * PI),
+                        0.5 - std::asin(std::clamp(d.y, -1.0, 1.0)) / PI, 0.0};
+        };
         for (int iv = 0; iv < SV; ++iv)
             for (int iu = 0; iu < SU; ++iu) {
                 Vec3 d00 = sp(iu, iv),   d10 = sp(iu + 1, iv);
                 Vec3 d01 = sp(iu, iv+1), d11 = sp(iu + 1, iv + 1);
                 Vec3 v00 = s.c + d00 * s.r, v10 = s.c + d10 * s.r;
                 Vec3 v01 = s.c + d01 * s.r, v11 = s.c + d11 * s.r;
-                PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = d00; a.n1 = d01; a.n2 = d11; a.color = col; a.emissive = em; a.clear = cl;
-                PTri b; b.p0 = v00; b.p1 = v11; b.p2 = v10; b.n0 = d00; b.n1 = d11; b.n2 = d10; b.color = col; b.emissive = em; b.clear = cl;
+                // Seam fix: atan2 wraps at u=1->0 across the last column; add 1 turn to the
+                // higher-index column's u so the interpolated span stays monotonic.
+                Vec3 uv00 = uvOf(d00), uv01 = uvOf(d01), uv10 = uvOf(d10), uv11 = uvOf(d11);
+                if (iu == SU - 1) { uv10.x += 1.0; uv11.x += 1.0; }
+                PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = d00; a.n1 = d01; a.n2 = d11;
+                a.color = col; a.emissive = em; a.clear = cl; a.tex = tex; a.triplanarScale = tri;
+                a.uv0 = uv00; a.uv1 = uv01; a.uv2 = uv11;
+                PTri b; b.p0 = v00; b.p1 = v11; b.p2 = v10; b.n0 = d00; b.n1 = d11; b.n2 = d10;
+                b.color = col; b.emissive = em; b.clear = cl; b.tex = tex; b.triplanarScale = tri;
+                b.uv0 = uv00; b.uv1 = uv11; b.uv2 = uv10;
                 out.push_back(a); out.push_back(b);
             }
     }
@@ -230,12 +273,17 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
             ++impIdx;
             isomesh::Mesh m = isomesh::marchImplicit(im, opt);
             Vec3 col = colOf(im.matId); bool em = emOf(im.matId); bool cl = clearOf(im.matId);
+            // Marched implicits carry no per-vertex UVs, so a skin only shows via world
+            // triplanar projection (triplanarScale > 0); a plain UV-bound texture stays flat.
+            double tri = triOf(im.matId);
+            int    tex = (tri > 0.0) ? texOf(im.matId) : -1;
             for (size_t f = 0; f + 2 < m.tri.size(); f += 3) {
                 int i0 = m.tri[f], i1 = m.tri[f + 1], i2 = m.tri[f + 2];
                 PTri p;
                 p.p0 = m.pos[i0]; p.p1 = m.pos[i1]; p.p2 = m.pos[i2];
                 p.n0 = m.nrm[i0]; p.n1 = m.nrm[i1]; p.n2 = m.nrm[i2];
                 p.color = col; p.emissive = em; p.clear = cl;
+                p.tex = tex; p.triplanarScale = tri;
                 out.push_back(p);
             }
         }
@@ -256,6 +304,8 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
             p.n1 = normalize(inst.toWorld.applyNormal(t.n1));
             p.n2 = normalize(inst.toWorld.applyNormal(t.n2));
             p.color = colOf(matId); p.emissive = emOf(matId); p.clear = clearOf(matId);
+            p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;   // UVs are instance-invariant
+            p.tex = texOf(matId); p.triplanarScale = triOf(matId);
             out.push_back(p);
         }
     }
@@ -267,6 +317,7 @@ struct VtxCS {
     double x, y, z;   // camera-space coords (x=right, y=up, z=forward)
     Vec3   wpos;      // world position (for per-pixel light direction)
     Vec3   wn;        // world normal
+    Vec3   uv;        // texture coords (u,v in .x,.y); interpolated for skins
 };
 
 // A vertex projected to the raster, with 1/depth for perspective-correct interp.
@@ -274,6 +325,7 @@ struct VtxScreen {
     double sx, sy;    // pixel coords (sx in [0,W], sy in [0,H]; sy=0 is image top)
     double invd;      // 1/depth used as the z-buffer key and interp weight
     Vec3   wpos, wn;
+    Vec3   uv;        // texture coords (interpolated perspective-correctly for skins)
 };
 
 // A screen-space triangle: three projected vertices plus the shared per-triangle
@@ -283,6 +335,8 @@ struct VtxScreen {
 struct STri {
     VtxScreen v0, v1, v2;
     Vec3   color;
+    int    tex;        // bound skin texture index, or -1 (use flat `color`)
+    double triplanarScale;  // >0: sample the skin by world triplanar instead of UV
     bool   emissive;
     bool   clear;      // see-through transmissive surface (handled by the clear-accumulation pass)
     int    iy0, iy1;   // inclusive pixel-row span the triangle can touch
@@ -296,6 +350,9 @@ struct GBuffer {
     std::vector<Vec3>    wn;      // world normal of the winning surface
     std::vector<Vec3>    color;   // base albedo of the winning triangle
     std::vector<uint8_t> emis;    // 1 where the winning triangle is an emitter
+    std::vector<Vec3>    uv;      // interpolated texture coords of the winning surface
+    std::vector<int>     tex;     // winning triangle's skin texture index, or -1
+    std::vector<float>   tpScale; // winning triangle's triplanar scale (0 = UV)
 };
 
 // Rasterize one screen-space triangle into the deferred G-buffer over rows [y0,y1).
@@ -338,6 +395,10 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
             g.wpos[row]  = (A.wpos * (w0 * A.invd) + B.wpos * (w1 * B.invd) + C.wpos * (w2 * C.invd)) * d;
             g.wn[row]    = (A.wn   * (w0 * A.invd) + B.wn   * (w1 * B.invd) + C.wn   * (w2 * C.invd)) * d;
             g.color[row] = t.color;
+            g.tex[row]   = t.tex;
+            g.tpScale[row] = (float)t.triplanarScale;
+            if (t.tex >= 0)
+                g.uv[row] = (A.uv * (w0 * A.invd) + B.uv * (w1 * B.invd) + C.uv * (w2 * C.invd)) * d;
         }
     }
 }
@@ -398,7 +459,7 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
 // so off-axis stretch matches. sy=0 is image top (+y/up), matching filmToRgb8's flip.
 inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
     VtxScreen s;
-    s.wpos = v.wpos; s.wn = v.wn;
+    s.wpos = v.wpos; s.wn = v.wn; s.uv = v.uv;
     double ndcx, ndcy, depth;
     if (cam.projection == CAM_RECTILINEAR) {
         ndcx = (v.x / v.z) / cam.tanHalfX;
@@ -419,6 +480,100 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
     s.sy = (0.5 - 0.5 * ndcy) * H;           // +y (up) -> top of image
     s.invd = 1.0 / std::max(depth, 1e-9);
     return s;
+}
+
+// Shared exposure + tone-map tail (the back half of renderFrame). Given a per-pixel
+// HDR `accum` buffer that has already been shaded (background pixels hold the unlit bg
+// tint), a `zbuf` hit key (>0 where a surface was drawn), an `emis` mask, and the
+// optional see-through transmittance/milk products, this applies the p99 auto-exposure
+// anchor and the sRGB tone map exactly as filmToRgb8 does, returning W*H*3 RGB8 (row 0 =
+// top). Factored out so the CPU rasterizer and the CUDA rasterizer share ONE copy of the
+// exposure/tonemap logic — the GPU path shades into an identical `accum`/`zbuf` on the
+// device, downloads them, and calls this, guaranteeing byte-identical exposure (including
+// a camera_path's shared `lockAnchor`) regardless of which backend produced the geometry.
+inline std::vector<uint8_t> exposeAndEncode(
+        const std::vector<Vec3>& accum, const std::vector<float>& zbuf,
+        const std::vector<uint8_t>& emis, int W, int H, int nThreads,
+        double expComp, bool autoExpose, double* lockAnchor,
+        bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
+        const Vec3& milkColor) {
+    const size_t N = (size_t)W * H;
+    if (nThreads < 1) nThreads = 1;
+    auto parallelFor = [&](size_t n, const std::function<void(size_t, size_t)>& body) {
+        if (n == 0) return;
+        if (nThreads == 1) { body(0, n); return; }
+        std::vector<std::thread> pool;
+        size_t chunk = (n + nThreads - 1) / nThreads;
+        for (int ti = 0; ti < nThreads; ++ti) {
+            size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
+            if (a >= b) break;
+            pool.emplace_back(body, a, b);
+        }
+        for (auto& th : pool) th.join();
+    };
+
+    // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
+    // lit surfaces to ~0.9. Background (unhit) pixels are excluded so an empty frame
+    // margin can't skew the anchor; emitters are excluded too so the *subject* drives the
+    // exposure (they just clip to white, as in the real render, instead of dragging the
+    // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
+    // bypasses this so aperture/power brightness differences survive into the preview.
+    double eAuto = 1.0;
+    if (autoExpose) {
+        if (lockAnchor && *lockAnchor > 0.0) {
+            eAuto = *lockAnchor;                    // reuse the path's locked anchor
+        } else {
+            std::vector<double> lum; lum.reserve(N);
+            for (size_t i = 0; i < N; ++i) {
+                if (zbuf[i] <= 0.0f || emis[i]) continue;   // skip background + emitters
+                const Vec3& c = accum[i];
+                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
+            }
+            if (!lum.empty()) {
+                // Only the 99th-percentile order statistic matters, so partition instead
+                // of a full sort (O(n) vs O(n log n)).
+                size_t k = (size_t)(0.99 * (lum.size() - 1));
+                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
+                double p99 = lum[k];
+                eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
+            }
+            if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
+        }
+    }
+    const double finalExp = eAuto * expComp;
+
+    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
+    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
+    // [0,1] replaces three std::pow calls per pixel with a table read + round.
+    static const std::array<uint8_t, 4097> kSrgbLut = [] {
+        std::array<uint8_t, 4097> t{};
+        for (int i = 0; i <= 4096; ++i)
+            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
+        return t;
+    }();
+    auto encode = [&](double c) -> uint8_t {
+        if (c <= 0.0) return kSrgbLut[0];
+        if (c >= 1.0) return 255;
+        return kSrgbLut[(int)(c * 4096.0 + 0.5)];
+    };
+
+    // Tone map: exposed hit pixels through sRGB gamma; background tint left unexposed.
+    std::vector<uint8_t> img(N * 3);
+    parallelFor(N, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            Vec3 c = accum[i];
+            if (zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
+            if (seeThrough) {                          // composite clear glass (display-linear)
+                float T = clearT[i], mt = milkT[i];
+                if (T < 1.0f || mt < 1.0f)
+                    c = c * (double)T + milkColor * (1.0 - (double)mt);
+            }
+            img[i * 3 + 0] = encode(c.x);
+            img[i * 3 + 1] = encode(c.y);
+            img[i * 3 + 2] = encode(c.z);
+        }
+    });
+    return img;
 }
 
 // Render one camera to an 8-bit RGB image (row 0 = image top), multithreaded by
@@ -443,7 +598,8 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                                         int W, int H, const PreviewLight& light,
                                         int nThreads, double exposure = 1.0,
                                         bool autoExpose = true, double* lockAnchor = nullptr,
-                                        bool seeThrough = false, double glassClarity = 0.85) {
+                                        bool seeThrough = false, double glassClarity = 0.85,
+                                        const std::vector<Texture>* textures = nullptr) {
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
     const double EMIS_BOOST = 4.0;    // emitters read as bright light sources (clip to white)
     const Vec3 bg{0.06, 0.07, 0.09};                    // background tint (unlit, unexposed)
@@ -474,29 +630,31 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     // concatenated. This removes the old per-thread redundancy where every rasterizer
     // band re-projected the entire scene (an nThreads-fold projection cost).
     auto projectRange = [&](size_t a, size_t b, std::vector<STri>& out) {
-        auto toCS = [&](const Vec3& P, const Vec3& Nn) -> VtxCS {
+        auto toCS = [&](const Vec3& P, const Vec3& Nn, const Vec3& UV) -> VtxCS {
             Vec3 d = P - cam.eye; VtxCS c;
             c.x = dot(d, cam.u); c.y = dot(d, cam.v); c.z = dot(d, cam.w);
-            c.wpos = P; c.wn = Nn; return c;
+            c.wpos = P; c.wn = Nn; c.uv = UV; return c;
         };
         auto push = [&](const VtxScreen& s0, const VtxScreen& s1, const VtxScreen& s2,
-                        const Vec3& col, bool emis, bool clr) {
+                        const Vec3& col, int tex, double tps, bool emis, bool clr) {
             double lo = std::min({s0.sy, s1.sy, s2.sy});
             double hi = std::max({s0.sy, s1.sy, s2.sy});
             int iy0 = std::max(0, (int)std::floor(lo));
             int iy1 = std::min(H - 1, (int)std::ceil(hi));
             if (iy0 > iy1) return;
-            out.push_back(STri{s0, s1, s2, col, emis, clr, iy0, iy1});
+            out.push_back(STri{s0, s1, s2, col, tex, tps, emis, clr, iy0, iy1});
         };
         for (size_t ti = a; ti < b; ++ti) {
             const PTri& t = tris[ti];
-            VtxCS cs[3] = { toCS(t.p0, t.n0), toCS(t.p1, t.n1), toCS(t.p2, t.n2) };
+            VtxCS cs[3] = { toCS(t.p0, t.n0, t.uv0), toCS(t.p1, t.n1, t.uv1),
+                            toCS(t.p2, t.n2, t.uv2) };
             if (rect) {
                 VtxCS poly[8]; int np = 0;
                 auto emit = [&](const VtxCS& a2){ if (np < 8) poly[np++] = a2; };
                 auto lerpV = [&](const VtxCS& a2, const VtxCS& b2, double s) -> VtxCS {
                     VtxCS r; r.x=a2.x+(b2.x-a2.x)*s; r.y=a2.y+(b2.y-a2.y)*s; r.z=a2.z+(b2.z-a2.z)*s;
-                    r.wpos=a2.wpos+(b2.wpos-a2.wpos)*s; r.wn=a2.wn+(b2.wn-a2.wn)*s; return r;
+                    r.wpos=a2.wpos+(b2.wpos-a2.wpos)*s; r.wn=a2.wn+(b2.wn-a2.wn)*s;
+                    r.uv=a2.uv+(b2.uv-a2.uv)*s; return r;
                 };
                 for (int i = 0; i < 3; ++i) {
                     const VtxCS& A = cs[i]; const VtxCS& B = cs[(i+1)%3];
@@ -509,7 +667,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 for (int i = 1; i + 1 < np; ++i) {
                     VtxScreen sc1 = projectVtx(cam, poly[i], W, H);
                     VtxScreen sc2 = projectVtx(cam, poly[i+1], W, H);
-                    push(sc0, sc1, sc2, t.color, t.emissive, t.clear);
+                    push(sc0, sc1, sc2, t.color, t.tex, t.triplanarScale, t.emissive, t.clear);
                 }
             } else {
                 bool bad = false;
@@ -521,7 +679,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 VtxScreen sc0 = projectVtx(cam, cs[0], W, H);
                 VtxScreen sc1 = projectVtx(cam, cs[1], W, H);
                 VtxScreen sc2 = projectVtx(cam, cs[2], W, H);
-                push(sc0, sc1, sc2, t.color, t.emissive, t.clear);
+                push(sc0, sc1, sc2, t.color, t.tex, t.triplanarScale, t.emissive, t.clear);
             }
         }
     };
@@ -578,6 +736,9 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     g.wn.assign(N, Vec3{0,0,0});
     g.color.assign(N, bg);
     g.emis.assign(N, 0);
+    g.uv.assign(N, Vec3{0,0,0});
+    g.tex.assign(N, -1);
+    g.tpScale.assign(N, 0.0f);
     dispatchBands([&](int y0, int y1) {
         for (const STri& s : stris) {
             if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
@@ -609,8 +770,16 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     parallelFor(N, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
             if (g.zbuf[i] <= 0.0f) continue;         // background stays bg tint
-            const Vec3& col = g.color[i];
+            Vec3 col = g.color[i];
             if (g.emis[i]) { accum[i] = col * EMIS_BOOST; continue; }  // raw emitter radiance
+            // Image skin: replace the flat albedo with the texture's linear RGB, sampled
+            // either at the interpolated per-vertex UV or by world triplanar projection.
+            if (textures && g.tex[i] >= 0 && g.tex[i] < (int)textures->size()) {
+                const Texture& tx = (*textures)[g.tex[i]];
+                col = (g.tpScale[i] > 0.0f)
+                    ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], (double)g.tpScale[i])
+                    : tx.sampleRgb(g.uv[i].x, g.uv[i].y);
+            }
             Vec3 N3 = normalize(g.wn[i]);
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
             if (dot(N3, V) < 0.0) N3 = -N3;              // two-sided
@@ -633,68 +802,11 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         }
     });
 
-    // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
-    // lit surfaces to ~0.9. Background (unhit) pixels are excluded so an empty frame
-    // margin can't skew the anchor; emitters are excluded too so the *subject* drives the
-    // exposure (they just clip to white, as in the real render, instead of dragging the
-    // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
-    // bypasses this so aperture/power brightness differences survive into the preview.
-    double eAuto = 1.0;
-    if (autoExpose) {
-        if (lockAnchor && *lockAnchor > 0.0) {
-            eAuto = *lockAnchor;                    // reuse the path's locked anchor
-        } else {
-            std::vector<double> lum; lum.reserve(N);
-            for (size_t i = 0; i < N; ++i) {
-                if (g.zbuf[i] <= 0.0f || g.emis[i]) continue;   // skip background + emitters
-                const Vec3& c = accum[i];
-                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
-            }
-            if (!lum.empty()) {
-                // Only the 99th-percentile order statistic matters, so partition instead
-                // of a full sort (O(n) vs O(n log n)).
-                size_t k = (size_t)(0.99 * (lum.size() - 1));
-                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
-                double p99 = lum[k];
-                eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
-            }
-            if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
-        }
-    }
-    const double finalExp = eAuto * expComp;
-
-    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
-    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
-    // [0,1] replaces three std::pow calls per pixel with a table read + round.
-    static const std::array<uint8_t, 4097> kSrgbLut = [] {
-        std::array<uint8_t, 4097> t{};
-        for (int i = 0; i <= 4096; ++i)
-            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
-        return t;
-    }();
-    auto encode = [&](double c) -> uint8_t {
-        if (c <= 0.0) return kSrgbLut[0];
-        if (c >= 1.0) return 255;
-        return kSrgbLut[(int)(c * 4096.0 + 0.5)];
-    };
-
-    // Tone map: exposed hit pixels through sRGB gamma; background tint left unexposed.
-    std::vector<uint8_t> img(N * 3);
-    parallelFor(N, [&](size_t a, size_t b) {
-        for (size_t i = a; i < b; ++i) {
-            Vec3 c = accum[i];
-            if (g.zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
-            if (seeThrough) {                          // composite clear glass (display-linear)
-                float T = clearT[i], mt = milkT[i];
-                if (T < 1.0f || mt < 1.0f)
-                    c = c * (double)T + kMilkColor * (1.0 - (double)mt);
-            }
-            img[i * 3 + 0] = encode(c.x);
-            img[i * 3 + 1] = encode(c.y);
-            img[i * 3 + 2] = encode(c.z);
-        }
-    });
-    return img;
+    // Auto-exposure + sRGB tone map: shared with the CUDA rasterizer (see exposeAndEncode),
+    // so both backends anchor and encode identically. The see-through buffers are empty when
+    // !seeThrough and simply ignored by the helper in that case.
+    return exposeAndEncode(accum, g.zbuf, g.emis, W, H, nThreads, expComp, autoExpose,
+                           lockAnchor, seeThrough, clearT, milkT, kMilkColor);
 }
 
 // Draw a red look-at crosshair at world point `target` onto an already-rendered RGB

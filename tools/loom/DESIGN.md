@@ -124,11 +124,24 @@ the pure DAG. Deferred.
 ## 6. Layer 3 — Data structures + interpolation
 
 Three **datasets**, each N-D, each with **every value feedable by a modulator**
-(a stored value may be a `Signal`, so control points animate):
+(a stored value may be a `Signal`, so control points animate).  Each dataset is
+itself a **node in the modulation DAG** (it carries an `id` + `children()`), so it
+is both *modulable* (its stored values are driven by modulators) **and** a
+*modulator* (an interpolator over it is a `Signal`), and `detect_signal_cycle`
+walks *through* the dataset — a control point / grid value / scatter value that
+loops back is caught:
 
 1. **Point-path** — an ordered sequence of N-D points (a curve's control points).
 2. **Grid** — N-D values on a regular lattice of *arbitrary rarity* (resolution).
 3. **Scatter** — N-D values at arbitrary positions (no lattice).
+
+Plus one composite dataset built on the point-path:
+
+- **`TrackedPath`** — a point-path that carries **Y extra per-waypoint tracks**
+  keyed at the *same* control points (the toolkit analog of a `camera_curve`: one
+  sequence bundling position + a speed/density track + an orientation track + any
+  other scalar/vector track you key). Each track is one value per control point,
+  scalar or N-D vector, animatable like everything else.
 
 Three **interpolators**, each exposed **as a `Signal`/field** (so an interpolator's
 output can feed another modulator — "it's just another function"):
@@ -142,6 +155,16 @@ output can feed another modulator — "it's just another function"):
    volume.
 3. **`ScatterField`** — smooth interpolation of scatter values (inverse-distance /
    RBF; **quality/speed tradeoff is an open tuning item**, see §11).
+
+And, over a `TrackedPath`, one multi-curve sampler:
+
+4. **`TrackedCurve`** — samples a `TrackedPath`'s position **and every track** on
+   one shared seamless parameter `u` (each track is just another `LoopCurve` riding
+   the same `u`), exactly the way a camera flyby's speed and look-direction curves
+   ride along its position curve. `TrackedCurve.traveling(tracked, s, density=...)`
+   retimes traversal through **`Reparam`** — an inverse-CDF over equal `u`-bins that
+   maps a uniform travel param `s` to a `u` that *dwells* where the density track is
+   large (the distinguishing behavior of a camera-curve speed curve).
 
 Because interpolators are `Signal`s, you can: feed a modulator into a control point;
 *or* feed an N-D value into an interpolator to read a value out and pass it onward;
@@ -289,7 +312,7 @@ tools/loom/
    faster rasterizer (which would only lose fidelity). Reuse ftrace's raster for the 80/20
    viewer today; resident-server is the real speedup later.
 10. **Naming: keep "loom".** The weaving metaphor is earned (threading a DAG, sweeping
-   ribbons/tubes, skinning meshes — `skin`/`MixMaterial("skin")` already in code).
+   ribbons/tubes, skinning meshes — `skin_rings`/`MixMaterial("skin")` already in code).
    Rejected "Snakecraft"/"Snakeskin" — snake puns are overdone and renaming a working,
    committed, tested codebase for a pun isn't worth the churn. ("Snakeskin" could name the
    2D backend if a pun is ever wanted.)
@@ -375,6 +398,24 @@ tools/loom/
   `LoopCurve` to a stroke (sweeps→strokes). y-up world `view` box; colours RGB in [0,1].
   Honesty: SVG has no per-pixel surface, so it omits `field`. Tests: `tests/test_canvas.py`
   (mapping, per-frame animation, seamless wrap vs open endpoints, field, strokes, cycles).
+- **Colour model — RGB, HSV *and* HSL** (`loom/color.py`). ✅ done. A `Color` is a
+  3-component `VecSignal` that *is* its resolved **RGB** (an HSV/HSL colour is converted
+  in the graph via `hsv_to_rgb` / `hsl_to_rgb`), so it drops into 2-D (`Canvas2D`
+  markers/strokes/field) **and** 3-D (`Material` colours) with no special casing, and —
+  remembering how it was authored — emits the matching `.ftsl` colour token
+  (`rgb r g b` / `hsv h s v` / `hsl h s l`), which ftrace's scene loader now parses
+  natively. Both cylindrical models are kept: **HSV** (value; `v=1` most vivid) matches
+  painterly pickers, **HSL** (lightness; `l=0.5` pure hue, `l→1` white, `l→0` black)
+  matches CSS — they share the same hue wheel. Hue is in `[0,1]` and **wraps**, so a hue
+  driven by a 1-periodic leaf cycles the whole wheel and returns bit-for-bit at the loop
+  seam (seamless colour cycling). Tests: `tests/test_dag_and_color.py`.
+- **Image skins — `Texture` + `skin()`** (`loom/scene.py`). ✅ done. An image file
+  applied to a surface as a spatially-varying diffuse albedo. `Texture("name", "img.png",
+  encoding=…, filter=…, wrap=…)` emits a `.ftsl` `texture "name" { file "…" … }` block;
+  `skin("name", "img.png", **material_props)` is the one-call convenience returning the
+  `Texture` *and* a `Material` bound via `reflect texture:name`. The Scene emits texture
+  blocks before the materials that bind them. (Sweep's mesh ring-skinning is now
+  `skin_rings` to free the `skin` name.) Tests: `tests/test_dag_and_color.py`.
 - **M10.5 — Shared spatial-expression pattern layer.** ✅ done (`loom/spatial.py`). One
   pattern **defined once, used two ways** (§11.11): a `SpatialExpr` tree over coordinate
   leaves `X`/`Y`/`Z` + loop phase `T`, with temporal `Signal` coefficients baked per frame.
