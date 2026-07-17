@@ -62,6 +62,42 @@ def test_freq_scales_gyroid():
         assert abs(_eval_expr(expr, x, y, z) - _true_gyroid(x, y, z, 6.0)) < 1e-8
 
 
+def test_bloom_frame0_is_exact_classic_gyroid():
+    # In bloom mode, frame 0 must be *exactly* the classic showcase gyroid regardless of
+    # how many higher dimensions the variant has.
+    args = _args("--dims", "6", "--transform", "bloom", "--freq", "1")
+    v = g.pick_variant(99, args, {})
+    expr = g.field_expr(v, 0.0, "bloom")
+    for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
+        assert abs(_eval_expr(expr, x, y, z) - _true_gyroid(x, y, z)) < 1e-9
+
+
+def test_bloom_is_seamless():
+    # t=0 and t=1 both collapse to the classic gyroid -> identical expression (seamless loop).
+    args = _args("--dims", "7", "--transform", "bloom", "--freq", "2")
+    v = g.pick_variant(7, args, {})
+    assert g.field_expr(v, 0.0, "bloom") == g.field_expr(v, 1.0, "bloom")
+    assert g.field_expr(v, 0.0, "bloom") == g._classic_gyroid_expr(v.freq)
+
+
+def test_bloom_midpoint_is_full_field():
+    # At t=0.5 the envelope is 1, so the field is the full N-D gyroid (drifting), not classic.
+    args = _args("--dims", "6", "--transform", "bloom", "--freq", "3")
+    v = g.pick_variant(11, args, {})
+    assert g.field_expr(v, 0.5, "bloom") == g.field_expr(v, 0.5, "drift")
+    assert g.field_expr(v, 0.5, "bloom") != g._classic_gyroid_expr(v.freq)
+
+
+def test_bloom_default_freq_matches_showcase_density():
+    # With no --freq, bloom defaults the density to showcase's (freq 40 at radius 0.32).
+    args = _args("--dims", "5", "--transform", "bloom", "--radius", "0.32")
+    v = g.pick_variant(3, args, {})
+    assert abs(v.freq - 40.0) < 1e-6
+    # and the density scales inversely with radius (same periods across the ball)
+    args2 = _args("--dims", "5", "--transform", "bloom", "--radius", "1.3")
+    assert abs(g.pick_variant(3, args2, {}).freq - (0.32 * 40.0 / 1.3)) < 1e-6
+
+
 def test_reproducible_from_seed():
     args = _args()
     a = g.pick_variant(555, args, {})

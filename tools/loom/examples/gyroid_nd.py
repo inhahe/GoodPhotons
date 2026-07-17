@@ -56,6 +56,12 @@ and loop seamlessly:
     (a whole number of turns).  The in-slice frequency waxes and wanes as the wave turns
     edge-on and back, so the lattice genuinely reshapes — the higher-D analogue of *turning*
     the object rather than sliding it.
+  * ``bloom`` — pin frame 0 (and frame 1) to the *exact classic gyroid* from
+    ``scenes/showcase.ftsl`` (``sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)``),
+    then cross-blend the full N-D gyroid in and back out with an envelope ``w = sin^2(pi t)``.
+    The clip opens as the recognizable showcase gyroid and *unfolds* into higher-D structure
+    at the midpoint before folding back.  The base frequency defaults to the showcase density
+    (freq 40 at radius 0.32) unless ``--freq`` is given.
 
 The assembled animated ``.gif`` (or ``.mp4`` via ``--format mp4``) and a ``.txt`` listing
 every chosen value collect together in the output directory; each variant's per-frame
@@ -73,6 +79,9 @@ Examples::
 
     # reproducible; lock 6 dims, 4 oscillating, 2 of them harmonics of the main
     python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 --oscillating 4 --harmonics 2
+
+    # start on the exact showcase gyroid, then bloom into higher-D structure and back
+    python examples/gyroid_nd.py --dims 6 --transform bloom
 
     # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as an mp4
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
@@ -268,6 +277,11 @@ def pick_variant(seed: int, args: argparse.Namespace,
         if M < lo_m or M > hi_m:
             raise SystemExit(f"error: --oscillating {M} is out of range [{lo_m}, {hi_m}] "
                              f"given the current locks / dims")
+    elif getattr(args, "transform", "drift") == "bloom":
+        # bloom starts as the 3-term classic gyroid and unfolds into the full N-D
+        # field, so we want that full field to be as rich as possible: every
+        # available dimension oscillates (D terms >> the 3 classic terms).
+        M = hi_m
     else:
         M = rng.randint(lo_m, hi_m)
     candidates = [d for d in range(D) if d not in forced_on and d not in forced_off]
@@ -287,6 +301,10 @@ def pick_variant(seed: int, args: argparse.Namespace,
         if H < lo_h or H > hi_h:
             raise SystemExit(f"error: --harmonics {H} is out of range [{lo_h}, {hi_h}] "
                              f"given the current locks / oscillating dims")
+    elif getattr(args, "transform", "drift") == "bloom":
+        # bloom keeps every extra dim at the fundamental (h1) so it unfolds into a
+        # clean pure N-D gyroid; complexity comes from the dimensions, not harmonics.
+        H = lo_h
     else:
         H = rng.randint(lo_h, hi_h) if hi_h >= lo_h else lo_h
     rng.shuffle(free)
@@ -329,7 +347,14 @@ def pick_variant(seed: int, args: argparse.Namespace,
     for i, d in enumerate(non_main_osc):
         by_index[d].winding = (i % max_w) + 1
 
-    freq = args.freq if args.freq is not None else rng.uniform(*args.freq_range)
+    if args.freq is not None:
+        freq = args.freq
+    elif getattr(args, "transform", "drift") == "bloom":
+        # Bloom's frame 0 IS the showcase gyroid; default its density to match showcase
+        # (freq 40 at radius 0.32) for whatever container radius is in use.
+        freq = SHOWCASE_RF / max(1e-6, args.radius)
+    else:
+        freq = rng.uniform(*args.freq_range)
 
     # Per-dim hidden-axis offset for the `rotate` transform: the slice sits this far along
     # each oscillating dim's hidden axis, so as the wavevector rotates out of the 3-D slice
@@ -367,8 +392,22 @@ def _u_expr(dim: Dim, freq: float, phase: float) -> str:
     return _arg_expr(dim.direction, dim.harmonic * freq, phase)
 
 
+def _classic_gyroid_expr(freq: float) -> str:
+    """The plain 3-D Schoen gyroid on the world X/Y/Z axes at ``freq`` — exactly the
+    field in ``scenes/showcase.ftsl`` (``sin(f x)cos(f y) + sin(f y)cos(f z) +
+    sin(f z)cos(f x)``).  This is the fixed frame-0 subject for the ``bloom`` transform."""
+    f = fmt(freq)
+    ux, uy, uz = f"({f}*x)", f"({f}*y)", f"({f}*z)"
+    return f"sin({ux})*cos({uy})+sin({uy})*cos({uz})+sin({uz})*cos({ux})"
+
+
+# The showcase gyroid's density as a radius*frequency product (radius 0.32, freq 40):
+# matching it at any container radius needs freq = SHOWCASE_RF / radius, so the bloom
+# base reads as *the showcase gyroid* regardless of the ball size (freq 40 at r=0.32).
+SHOWCASE_RF = 0.32 * 40.0
+
 # Supported ways the higher dimensions animate the slice over one loop.
-TRANSFORMS = ("drift", "rotate")
+TRANSFORMS = ("drift", "rotate", "bloom")
 
 
 def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
@@ -387,7 +426,25 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift") -> str:
       The lattice genuinely reshapes — the higher-D analogue of turning the object — rather
       than merely sliding.  The main dim (winding 0) stays put and anchors the pattern so it
       never fully dissolves.
+    * ``bloom`` — frame 0 (and frame 1) is the *exact classic 3-D gyroid* (the
+      ``scenes/showcase.ftsl`` field on X/Y/Z); over the loop the full N-D gyroid is
+      cross-blended in and back out by an envelope ``w(t) = sin^2(pi t)`` (0 at the ends,
+      1 at the midpoint).  The video therefore begins as the recognizable showcase gyroid
+      and *unfolds* into its higher-dimensional structure at mid-loop, then folds back —
+      a seamless "bloom".  The higher dimensions still drift while blended in.
     """
+    if transform == "bloom":
+        # Cross-fade the fixed classic gyroid (frame 0) with the full N-D field.  The
+        # envelope is 0 at t=0,1 (so both ends are *exactly* the classic gyroid and the
+        # loop is seamless) and 1 at t=0.5 (the full higher-D gyroid at its peak).
+        w = 0.5 * (1.0 - math.cos(2.0 * math.pi * t))       # sin^2(pi t)
+        g_classic = _classic_gyroid_expr(v.freq)
+        if w <= 1e-9:
+            return g_classic
+        g_full = field_expr(v, t, "drift")                  # higher dims drift while blended
+        if w >= 1.0 - 1e-9:
+            return g_full
+        return f"({fmt(1.0 - w)})*({g_classic})+({fmt(w)})*({g_full})"
     osc = sorted(v.oscillating)
     m = len(osc)
     by_index = {d.index: d for d in v.dim_list}
@@ -509,12 +566,21 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
     # amplitude (M=3 reproduces the classic 0.5).
     m = max(1, len(v.oscillating))
-    half = v.thickness * math.sqrt(m / 3.0)
+    if transform == "bloom":
+        # Match the field cross-fade: at t=0,1 the sheet is exactly showcase's (half =
+        # thickness); at the bloom peak it thickens to the full-field half like the others.
+        w = 0.5 * (1.0 - math.cos(2.0 * math.pi * t))       # sin^2(pi t)
+        half = v.thickness * (1.0 + w * (math.sqrt(m / 3.0) - 1.0))
+    else:
+        half = v.thickness * math.sqrt(m / 3.0)
     thr = v.threshold
     inner = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
     sheet = f"abs({inner})-({fmt(half)})"
-    # Lipschitz bound for the sphere-marcher: |grad f| <= 2*freq*sum(harmonic_d).
+    # Lipschitz bound for the sphere-marcher: |grad f| <= 2*freq*sum(harmonic_d).  In bloom
+    # mode the classic base always contributes its 3 unit terms, so floor the sum at 3.
     sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
+    if transform == "bloom":
+        sum_h = max(sum_h, 3)
     grad_bound = 2.2 * v.freq * max(1, sum_h)
     box = radius * 1.05                                  # contained_by half-extent
     r = radius
@@ -648,12 +714,13 @@ def header(v: Variant, index: int, count: int, *,
          f"# slice orientation     : {orientation_desc(v)}",
          f"# base spatial frequency: {fmt(v.freq)}",
          f"# level set (threshold) : {fmt(v.threshold)}"]
-    verb = "rotating" if transform == "rotate" else "drifting"
+    verb = {"rotate": "rotating", "bloom": "blooming"}.get(transform, "drifting")
     if frames is not None:
         secs = frames / fps if fps else 0.0
+        motion = ("frame 0 = classic showcase gyroid; full N-D field blooms in at mid-loop"
+                  if transform == "bloom" else f"{verb} dims -> {moving}")
         L.append(f"# animation             : {frames} frames @ {fmt(fps or 30.0)} fps "
-                 f"(~{fmt(secs)}s seamless loop); transform '{transform}'; "
-                 f"{verb} dims -> {moving}")
+                 f"(~{fmt(secs)}s seamless loop); transform '{transform}'; {motion}")
     # The matrix + offsets view (directions = rows of A, phases = offsets, harmonics).
     L.append("#")
     L += matrix_lines(v)
@@ -671,6 +738,14 @@ def header(v: Variant, index: int, count: int, *,
                 L.append(f"#   {name:>4}  {rate:>5}  {d.role}")
             else:
                 L.append(f"#   {name:>4}  {'-':>5}  inert")
+    if transform == "bloom":
+        L += ["#",
+              "# field (bloom):  F(t) = (1-w)*G_classic + w*G_full,  w = sin^2(pi t)",
+              "#   G_classic = sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)",
+              "#               (the showcase gyroid; f = base frequency, shown at frame 0)",
+              "#   G_full    = the full N-D gyroid below (drifting), blended in 0->1->0",
+              "#   so t=0 and t=1 are exactly the classic gyroid (seamless), t=0.5 the peak.",
+              "#"]
     L += ["#",
           "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
     if transform == "rotate":
@@ -973,7 +1048,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "  python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 "
                 "--axis 2:on:1   # classic gyroid\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
-                "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice"))
+                "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
+                "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid"))
 
     g = p.add_argument_group("output")
     g.add_argument("-n", "--count", type=int, default=1,
@@ -1041,8 +1117,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how the higher dimensions animate the loop: 'drift' (default) "
                         "translates the slice through them (the pattern slides); 'rotate' "
                         "turns each dim's wavevector out of the 3-D slice into a hidden axis "
-                        "(the lattice reshapes — a higher-D 'rotation'). Both start from the "
-                        "exact current gyroid at frame 0 and loop seamlessly.")
+                        "(the lattice reshapes — a higher-D 'rotation'); 'bloom' pins frame 0 "
+                        "to the exact classic showcase gyroid and cross-blends the full N-D "
+                        "field in and back out (w=sin^2(pi t)), so the clip opens as the "
+                        "showcase gyroid and unfolds into higher-D structure. All start from "
+                        "a seamless frame 0 and loop.")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
                         "through its higher dimensions); the videos + .txt sidecars collect "
