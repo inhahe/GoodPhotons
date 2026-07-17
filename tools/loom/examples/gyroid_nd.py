@@ -34,15 +34,18 @@ Each dimension's argument is  ``u_d = harmonic_d * freq * (dir_d . (x,y,z)) + ph
 and the emitted field is the cyclic sum ``sum_i sin(u_{o_i}) * cos(u_{o_{i+1}})`` over
 the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating count).
 
-The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **gold thickened
+The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **thickened
 gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball — on its own, with no Cornell box or
-glass sphere.  Gold is a mirror, so it shows whatever surrounds it; a flat uniform light
-would wash the lattice out.  Instead it is lit like a product shot by a procedural **studio
+glass sphere.  ``--material`` picks its surface: **gold** (default) — a conductor/mirror, so
+it shows whatever surrounds it; or **glass** — a clear BK7 dielectric, where the lattice reads
+through refraction and internal reflection instead.  Either way a flat uniform light would
+wash the lattice out, so the subject is lit like a product shot by a procedural **studio
 environment** — a dark neutral base plus a few bright soft "softbox" lights, written once as
 an equirectangular ``studio_env.pfm`` beside the outputs and fed to ftrace's image-based
-``light env`` — so the gold picks up crisp highlights that trace every facet while deep
-shadows give depth, over a clean neutral background.  (The gold look only develops under path
-tracing, ``--no-raster``; the fast rasterizer previews the same geometry flat-shaded.)
+``light env`` — so the surface picks up crisp highlights that trace every facet while deep
+shadows give depth, over a clean neutral background.  (The gold/glass look only develops under
+path tracing, ``--no-raster``; the fast rasterizer previews the same geometry flat-shaded,
+now including clear dielectrics.)
 
 This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
 **renders a seamless morphing video** in which the higher dimensions move the visible slice.
@@ -111,6 +114,9 @@ Examples::
     # start from the current gyroid and rotate it through the extra dimensions
     python examples/gyroid_nd.py --dims 6 --transform rotate
 
+    # render the lattice as clear glass instead of gold (path-traced for real refraction)
+    python examples/gyroid_nd.py --count 1 --material glass --no-raster --render-noise 3
+
     # watch each frame render live in one preview window (title tracks the variant)
     python examples/gyroid_nd.py --count 3 --preview
 
@@ -134,7 +140,7 @@ import re
 import sys
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -596,6 +602,16 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
 
 _ENV_SPD = 1.5      # fallback uniform env radiance (used only if no studio map is supplied)
 
+# Subject material presets (the isosurface's surface).  ``gold`` is the showcase
+# conductor (a mirror that reveals the lattice by reflecting the studio lights);
+# ``glass`` renders the same thickened sheet as a clear dielectric (BK7 crown glass)
+# — the lattice reads through refraction/reflection instead of reflection alone.
+# The rasterizer now shades clear dielectrics too, so glass previews meaningfully.
+MATERIALS = {
+    "gold":  'material "surf" { preset gold }',
+    "glass": 'material "surf" { type dielectric ior glass:BK7 }',
+}
+
 # Studio environment map (equirectangular, written as a Radiance-style .pfm).  Direction
 # convention matches src/envmap.h: row 0 = +y (straight up), v=row/H -> theta=v*pi from +y;
 # col -> phi=(u-0.5)*2pi, dir=(sinT cosP, cosT, sinT sinP).  The camera sits on +z looking
@@ -655,17 +671,24 @@ def studio_env_pfm(path: Path) -> Path:
 
 
 def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
-                env_file: Optional[str] = None, transform: str = "drift") -> Scene:
-    """The lone gold thickened gyroid ball whose lattice is the morphing higher-D field.
+                env_file: Optional[str] = None, transform: str = "drift",
+                material: str = "gold") -> Scene:
+    """The lone thickened gyroid ball whose lattice is the morphing higher-D field.
 
     ``transform`` selects how the higher dimensions animate over the loop (see
     :func:`field_expr`): ``drift`` slides the slice through them, ``rotate`` turns their
     wavevectors out of the 3-D slice.  ``env_file`` is a path to an equirectangular
-    environment map (see ``studio_env_pfm``) used for image-based lighting; with it the gold
-    picks up the studio highlights that reveal the lattice.  Without it the scene falls back
-    to a plain uniform env (flatter).  The gold look only develops under path tracing
-    (``mode R``, i.e. ``--no-raster``); the fast rasterizer previews it flat-shaded.
+    environment map (see ``studio_env_pfm``) used for image-based lighting; with it the
+    subject picks up the studio highlights that reveal the lattice.  Without it the scene
+    falls back to a plain uniform env (flatter).  ``material`` picks the surface (see
+    :data:`MATERIALS`): ``gold`` (a conductor/mirror) or ``glass`` (a clear BK7 dielectric).
+    The gold/glass look develops under path tracing (``mode R``, i.e. ``--no-raster``); the
+    fast rasterizer previews the geometry (now clear dielectrics too) flat-shaded.
     """
+    mat_def = MATERIALS.get(material)
+    if mat_def is None:
+        raise SystemExit(f"error: --material '{material}' is not one of "
+                         f"{', '.join(sorted(MATERIALS))}")
     expr = field_expr(v, t, transform)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
@@ -703,7 +726,7 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
 
     iso = Raw(
         "isosurface {\n"
-        '    material "gold"\n'
+        '    material "surf"\n'
         "    intersect {\n"
         f'        function {{ expr "{sheet}" }}\n'
         f"        sphere {{ center 0 0 0  radius {fmt(radius)} }}\n"
@@ -719,7 +742,7 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     else:
         light = Raw(f'light env {{ spd {fmt(_ENV_SPD)} }}')   # flat fallback
     scene.add(
-        Raw('material "gold" { preset gold }'),
+        Raw(mat_def),
         iso,
         light,
     )
@@ -820,7 +843,7 @@ def bloom_params_desc(v: Variant) -> str:
 
 def header(v: Variant, index: int, count: int, *,
            frames: Optional[int] = None, fps: Optional[float] = None,
-           transform: str = "drift") -> str:
+           transform: str = "drift", material: str = "gold") -> str:
     osc = v.oscillating
     moving = [d.index for d in v.dim_list if d.oscillate and d.winding > 0]
     L = ["#" + "=" * 74,
@@ -835,7 +858,11 @@ def header(v: Variant, index: int, count: int, *,
          f"# harmonics of the main : {len(v.harmonic_dims)}  -> {axis_list(v.harmonic_dims)}",
          f"# slice orientation     : {orientation_desc(v)}",
          f"# base spatial frequency: {fmt(v.freq)}",
-         f"# level set (threshold) : {fmt(v.threshold)}"]
+         f"# level set (threshold) : {fmt(v.threshold)}",
+         f"# surface material      : {material}"
+         + ("   (conductor / mirror — reflects the studio lights)" if material == "gold"
+            else "   (clear BK7 dielectric — lattice reads through refraction)" if material == "glass"
+            else "")]
     verb = {"rotate": "rotating", "bloom": "blooming"}.get(transform, "drifting")
     if frames is not None:
         secs = frames / fps if fps else 0.0
@@ -898,7 +925,7 @@ def header(v: Variant, index: int, count: int, *,
 def sidecar_text(v: Variant, index: int, count: int, *,
                  ftsl_name: str = "", video_name: str = "",
                  frames: Optional[int] = None, fps: Optional[float] = None,
-                 transform: str = "drift") -> str:
+                 transform: str = "drift", material: str = "gold") -> str:
     """Plain-text (non-comment) dump of every chosen value, saved beside each video.
 
     Reuses :func:`header` verbatim (stripped of its ``#`` comment prefixes) so the
@@ -912,7 +939,7 @@ def sidecar_text(v: Variant, index: int, count: int, *,
             lines.append(f"frames like: {ftsl_name}")
         lines.append("")
     for line in header(v, index, count, frames=frames, fps=fps,
-                       transform=transform).splitlines():
+                       transform=transform, material=material).splitlines():
         if line.startswith("# "):
             lines.append(line[2:])
         elif line == "#":
@@ -1012,6 +1039,20 @@ class _PreviewWindow:
             # Window closed or display error: disable and keep rendering headless.
             self.close()
 
+    def pump(self) -> None:
+        """Service the window's event loop once (repaint, taskbar, drag).
+
+        Called repeatedly while a frame renders so the window stays responsive
+        instead of freezing for the whole (possibly multi-second) render.  A no-op
+        if the preview never opened or was closed; errors disable it quietly.
+        """
+        if self._root is None:
+            return
+        try:
+            self._root.update()
+        except Exception:
+            self.close()
+
     def close(self) -> None:
         self._alive = False
         if self._root is not None:
@@ -1027,7 +1068,8 @@ class _PreviewWindow:
 # ---------------------------------------------------------------------------
 
 def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
-                  size: Tuple[int, int], raster: bool, noise: float) -> None:
+                  size: Tuple[int, int], raster: bool, noise: float,
+                  pump: Optional["Callable[[], None]"] = None) -> None:
     """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
     ``raster`` uses ftrace ``-raster`` (fast solid-shaded z-buffer preview); otherwise
@@ -1036,6 +1078,11 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     the PNG and exits, letting the whole frame range run unattended.  The renderer's
     own console chatter is captured (kept off the status line) and only surfaced if the
     frame fails.
+
+    ``pump`` is an optional callback invoked repeatedly *while* ftrace runs (used to
+    keep the preview window's event loop serviced — otherwise it would freeze for the
+    whole render, since a path-traced frame can take seconds).  With it the child is
+    launched via ``Popen`` and polled instead of blocking in ``subprocess.run``.
     """
     import subprocess
     w, h = size
@@ -1045,11 +1092,24 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     else:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(w), str(h),
                "-interval", "8", "-checkpoint", "-noise", f"{noise:g}"]
-    r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
-    if r.returncode != 0:
+    if pump is None:
+        r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+        rc, out, err = r.returncode, r.stdout, r.stderr
+    else:
+        # Poll so the caller can pump its GUI event loop (~30 Hz) while ftrace works,
+        # keeping the preview window responsive instead of frozen for the whole frame.
+        import time
+        proc = subprocess.Popen(cmd, cwd=str(root), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        while proc.poll() is None:
+            pump()
+            time.sleep(0.03)
+        out, err = proc.communicate()
+        rc = proc.returncode
+    if rc != 0:
         sys.stdout.write("\n")
-        sys.stdout.write((r.stdout or "") + (r.stderr or ""))
-        raise SystemExit(f"ftrace failed on {fp.name} (exit {r.returncode})")
+        sys.stdout.write((out or "") + (err or ""))
+        raise SystemExit(f"ftrace failed on {fp.name} (exit {rc})")
 
 
 def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str,
@@ -1099,7 +1159,7 @@ def _video_ext(fmt: str) -> str:
 def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label: str,
                frames: int, fps: float, size: Tuple[int, int], radius: float,
                raster: bool, noise: float, fmt: str, env_file: Optional[str] = None,
-               transform: str = "drift",
+               transform: str = "drift", material: str = "gold",
                preview: Optional["_PreviewWindow"] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
@@ -1123,14 +1183,15 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         t = k / frames                                  # seamless loop: t in [0,1)
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
         scene = build_scene(v, t=t, res=size, radius=radius, env_file=env_file,
-                            transform=transform)
+                            transform=transform, material=material)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
                           Cache(), assets_dir=frames_dir, tag=f"{k:0{fw}d}")
         fp = frames_dir / f"{base}_{k:0{fw}d}.ftsl"
         fp.write_text(body, encoding="utf-8")
         png = fp.with_suffix(".png")
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
-        _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise)
+        _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise,
+                      pump=(preview.pump if preview is not None else None))
         pngs.append(png)
         if preview is not None:
             preview.show(png, f"{title_base}  |  frame {k + 1}/{frames}")
@@ -1242,8 +1303,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--radius", type=float, default=1.3,
                    help="radius of the spherical container the lattice fills (default 1.3)")
     g.add_argument("--thickness", type=float, default=0.5,
-                   help="half-width of the thickened gold sheet (showcase abs(g)-t style; "
+                   help="half-width of the thickened sheet (showcase abs(g)-t style; "
                         "default 0.5; auto-scaled up with the oscillating-dim count)")
+    g.add_argument("--material", choices=sorted(MATERIALS), default="gold",
+                   help="surface of the gyroid sheet: 'gold' (default; a conductor/mirror "
+                        "that reveals the lattice by reflecting the studio lights) or 'glass' "
+                        "(a clear BK7 dielectric — the lattice reads through refraction). Both "
+                        "develop fully under path tracing (--no-raster); the rasterizer now "
+                        "previews clear dielectrics too.")
     g.add_argument("--size", type=_parse_size, default=None, metavar="N|WxH",
                    help="video/frame size in pixels: a single number for square (e.g. 720) "
                         "or WIDTHxHEIGHT (e.g. 1280x720); the preview window matches it "
@@ -1372,24 +1439,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sidecar_text(v, k, count, ftsl_name=f"{base}/{base}_NNN.ftsl",
                              video_name=f"{base}.{ext}",
                              frames=args.frames, fps=args.fps,
-                             transform=args.transform),
+                             transform=args.transform, material=args.material),
                 encoding="utf-8")
             video = make_video(frames_dir, outdir, base, v, label=label,
                                frames=args.frames, fps=args.fps, size=size,
                                radius=args.radius, raster=args.raster,
                                noise=args.render_noise, fmt=args.format,
                                env_file=env_file, transform=args.transform,
-                               preview=preview)
+                               material=args.material, preview=preview)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
             scene = build_scene(v, t=0.0, res=size, radius=args.radius, env_file=env_file,
-                                transform=args.transform)
+                                transform=args.transform, material=args.material)
             body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
                               tag=f"{k:0{width}d}")
             fp = outdir / f"{base}.ftsl"
-            fp.write_text(header(v, k, count, transform=args.transform) + body,
+            fp.write_text(header(v, k, count, transform=args.transform,
+                                 material=args.material) + body,
                           encoding="utf-8")
             made.append(fp)
             _status_commit(f"{label} | wrote {fp.name}")

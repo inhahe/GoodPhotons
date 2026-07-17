@@ -200,6 +200,47 @@ def test_next_run_dir_increments(tmp_path):
     assert g._next_run_dir(base).name == "run003"
 
 
+def _scene_body(v, **kw):
+    from loom import Clock, Cache
+    return g.build_scene(v, res=(32, 32), radius=1.3, **kw).emit(Clock(t=0.0), Cache())
+
+
+def test_material_gold_is_default_conductor():
+    v = g.pick_variant(5, _args("--dims", "6"), {})
+    body = _scene_body(v)                       # default material
+    assert "preset gold" in body
+    assert "dielectric" not in body
+
+
+def test_material_glass_emits_clear_dielectric():
+    v = g.pick_variant(5, _args("--dims", "6"), {})
+    body = _scene_body(v, material="glass")
+    assert "dielectric" in body
+    assert "glass:BK7" in body
+    assert "preset gold" not in body
+    # the isosurface still references the shared surface material name
+    assert 'material "surf"' in body
+
+
+def test_material_invalid_raises():
+    v = g.pick_variant(5, _args("--dims", "6"), {})
+    with pytest.raises(SystemExit):
+        _scene_body(v, material="wood")
+
+
+def test_material_recorded_in_header():
+    v = g.pick_variant(5, _args("--dims", "6"), {})
+    assert "surface material      : glass" in g.header(v, 0, 1, material="glass")
+    assert "surface material      : gold" in g.header(v, 0, 1, material="gold")
+
+
+def test_material_cli_choice_validated():
+    # argparse rejects an unknown --material choice
+    with pytest.raises(SystemExit):
+        _args("--material", "wood")
+    assert _args("--material", "glass").material == "glass"
+
+
 def test_reproducible_from_seed():
     args = _args()
     a = g.pick_variant(555, args, {})
