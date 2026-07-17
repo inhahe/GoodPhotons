@@ -5,6 +5,29 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-17): loom preview server (`-serve`) is resident-process only
+
+The M12 preview server (ftrace `-serve` in `src/main.cpp` `runServe`, loom
+`loom/preview.py` `PreviewServer`) delivers only the *resident-process* win: it
+keeps the process, live window, CUDA context, and spectral tables alive across
+frames, re-rendering each `.ftsl` path streamed on stdin. What it does **not** yet
+do (DESIGN.md §11.9 — the real interactivity speedup):
+
+- **Per-frame delta push.** Loom bakes a whole new scene per frame; only a handful
+  of constants actually change between adjacent frames. `-serve` still re-parses the
+  full ftsl and rebuilds everything each frame. Proper fix: a delta protocol
+  (loom sends only changed baked constants; ftrace patches them in place).
+- **Static-geometry / BVH caching.** Geometry that doesn't move between frames is
+  re-tessellated and its accel structure rebuilt every frame. Needs primitive
+  identity + an incremental/cached BVH so unchanged geometry is reused.
+- **Preview LOD.** No reduced-fidelity fast path (e.g. coarser isosurface fineness /
+  fewer samples) distinct from the final render budget.
+
+Also: the resident live window keeps the *first* frame's resolution for the whole
+session (`liveWindowUpdate` / raster window create are guarded by `!g_liveWin`), so a
+preview run must hold `-r` constant. Fine for a fixed-size scrub; revisit if
+per-frame resolution changes are ever needed.
+
 ### DONE (2026-07-16): raster see-through for clear objects (`-see-through`)
 
 Opt-in preview transparency for the `-raster` viewer, so clear materials read as
