@@ -537,6 +537,28 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     return scene
 
 
+# ---------------------------------------------------------------------------
+# human-readable axis / variant labels
+# ---------------------------------------------------------------------------
+
+def axis_name(i: int) -> str:
+    """Dimension index -> axis letter.  0/1/2 -> X/Y/Z (the real rendered axes),
+    3 -> W, and any higher hidden dimension -> ``d<index>`` (e.g. d4, d5)."""
+    return "XYZW"[i] if 0 <= i < 4 else f"d{i}"
+
+
+def axis_list(indices: List[int]) -> str:
+    """Comma-joined axis letters for a list of dimension indices, or 'none'."""
+    return ",".join(axis_name(i) for i in indices) if indices else "none"
+
+
+def dims_desc(v: Variant) -> str:
+    """e.g. 'D=3 (X,Y,Z)' or 'D=5 (X,Y,Z + 2 hidden)'."""
+    extra = v.dims - 3
+    base = "D={} (X,Y,Z".format(v.dims)
+    return base + (")" if extra <= 0 else f" + {extra} hidden)")
+
+
 def header(v: Variant, index: int, count: int, *,
            frames: Optional[int] = None, fps: Optional[float] = None,
            transform: str = "drift") -> str:
@@ -548,9 +570,9 @@ def header(v: Variant, index: int, count: int, *,
          "#",
          f"# variant seed          : {v.seed}   (regenerate: --variant-seed {v.seed} + the same locks)",
          f"# dimensions (D)        : {v.dims}   (higher/extra dims beyond x,y,z: {max(0, v.dims - 3)})",
-         f"# oscillating dims      : {len(osc)}  -> {osc}",
-         f"# main dimension        : {v.main}   (fundamental, harmonic 1)",
-         f"# harmonics of the main : {len(v.harmonic_dims)}  -> {v.harmonic_dims}",
+         f"# oscillating dims      : {len(osc)}  -> {axis_list(osc)}  (indices {osc})",
+         f"# main dimension        : {axis_name(v.main) if v.main is not None else '-'}   (fundamental, harmonic 1)",
+         f"# harmonics of the main : {len(v.harmonic_dims)}  -> {axis_list(v.harmonic_dims)}",
          f"# base spatial frequency: {fmt(v.freq)}",
          f"# level set (threshold) : {fmt(v.threshold)}"]
     verb = "rotating" if transform == "rotate" else "drifting"
@@ -561,16 +583,17 @@ def header(v: Variant, index: int, count: int, *,
                  f"{verb} dims -> {moving}")
     rate_col = "turns" if transform == "rotate" else "drift"
     L += ["#",
-          f"# axis  osc  harmonic  {rate_col:<5}  direction (x y z)                 phase     role",
-          "# ----  ---  --------  -----  --------------------------------  --------  -----------"]
+          f"# axis  name  osc  harmonic  {rate_col:<5}  direction (x y z)                 phase     role",
+          "# ----  ----  ---  --------  -----  --------------------------------  --------  -----------"]
     for d in v.dim_list:
         dirs = "(" + " ".join(fmt(c) for c in d.direction) + ")"
+        name = axis_name(d.index)
         if d.oscillate:
             rate = f"{d.winding}" if d.winding > 0 else "-"
-            L.append(f"#  {d.index:>3}  yes  {d.harmonic:>6}  {rate:>5}  {dirs:<32}  "
+            L.append(f"#  {d.index:>3}  {name:>4}  yes  {d.harmonic:>6}  {rate:>5}  {dirs:<32}  "
                      f"{d.phase:>7.4f}   {d.role}")
         else:
-            L.append(f"#  {d.index:>3}   no       -      -  {dirs:<32}  {'-':>7}   inert")
+            L.append(f"#  {d.index:>3}  {name:>4}   no       -      -  {dirs:<32}  {'-':>7}   inert")
     L += ["#",
           "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
     if transform == "rotate":
@@ -1005,8 +1028,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         v = pick_variant(vseed, args, axis_locks)
         base = f"{args.name}{k:0{width}d}"
         # Brief, in-place status: which gyroid, its values, and the live frame/phase.
-        label = (f"[gyroid_nd] gyroid {k + 1}/{count}  D={v.dims} osc={v.oscillating} "
-                 f"harm={v.harmonic_dims} freq={fmt(v.freq)} seed={v.seed}")
+        label = (f"[gyroid_nd] gyroid {k + 1}/{count}  {dims_desc(v)}  "
+                 f"oscillating={axis_list(v.oscillating)}  "
+                 f"harmonics={axis_list(v.harmonic_dims)}  "
+                 f"freq={fmt(v.freq)} seed={v.seed}")
         if args.video:
             # Videos and their .txt sidecars collect in the shared outdir; each video's
             # per-frame .ftsl/.png files live in their own subdir <outdir>/<base>/.
