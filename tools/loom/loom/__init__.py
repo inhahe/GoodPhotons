@@ -38,6 +38,10 @@ from .pov import pov, PovFn, POV_FUNCS, POV_ND_GENERALIZABLE
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
+from .canvas import (
+    Canvas2D, Marker, Stroke, curve_points,
+    render_canvas, render_canvas_still,
+)
 
 __all__ = [
     "Signal", "Clock", "Cache", "Const", "TimeFn",
@@ -61,4 +65,6 @@ __all__ = [
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
+    "Canvas2D", "Marker", "Stroke", "curve_points",
+    "render_canvas", "render_canvas_still",
 ]

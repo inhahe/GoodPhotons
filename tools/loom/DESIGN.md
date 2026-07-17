@@ -330,10 +330,17 @@ tools/loom/
   (name→arity); validate param count in Python; params are Signal-drivable (baked per
   frame). Golden-value tests per function against known shapes. Honesty per §11.7:
   affine-slice all, genuine N-D only for the symmetric subset.
-- **M10 — 2D backend.** A parallel output driver (SVG / small canvas rasterizer) over
-  the *same* dimension-agnostic core — 2D is a slice, patterns are already 2D-native,
-  sweeps degenerate to strokes. Add as an emitter, **not** a fork; resist leaking
-  2D-specific cases into the core. Payoff: seamless-looping generative motion graphics.
+- **M10 — 2D backend.** ✅ done (`loom/canvas.py`). A parallel output driver over the
+  *same* dimension-agnostic DAG — **not** a fork. The core primitive is the user's model:
+  `Canvas2D.plot(x, y, color, ...)` plots an RGB at an (x, y) **at the current clock**,
+  so a single call traces a moving/colour-cycling marker over the loop (seamless from
+  periodic leaves, open under `loop=False`). Two output formats (both, per the user):
+  **SVG** = resolution-independent vector primitives (markers + strokes); **raster PNG**
+  (Pillow/numpy) = pixels, so it also renders a full-canvas per-pixel `field(fn)` and
+  assembles a seamless GIF. `stroke()` polylines a point list; `curve_points()` samples a
+  `LoopCurve` to a stroke (sweeps→strokes). y-up world `view` box; colours RGB in [0,1].
+  Honesty: SVG has no per-pixel surface, so it omits `field`. Tests: `tests/test_canvas.py`
+  (mapping, per-frame animation, seamless wrap vs open endpoints, field, strokes, cycles).
 - **M11 (deferred) — "transform video" script.** Separate two-pass tool (§11.8):
   materialize a clip into a 4-D block → apply a spacetime (time-coupled) rotation →
   re-slice to frames. Open clip in/out by default; looped output is the torus-constrained
