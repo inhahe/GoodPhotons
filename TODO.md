@@ -216,10 +216,15 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       `coef *= sqrt(2)` shortcut is subsumed, not duplicated. No legacy/opt-in branch. **Open sub-question:**
       the seed-driven **default word** when the user gives no explicit one — keep it the current disjoint
       pairing (each visible axis <-> one hidden dim; clean, predictable, tight bound) re-expressed in the
-      general framework, or make the default itself a richer overlapping draw. Leaning: keep the default
-      disjoint-clean (good UX + tight bound + guaranteed the slice tips out of the 3-space), with explicit
-      ordered words the route to richer motion. Deliverables: (a) grammar for the ordered plane word (an
-      extension of the `--oscillate`/`--lock` word grammar; list order significant); (b) the single general
+      general framework, or make the default itself a richer overlapping draw. **Decided (2026-07-18): default
+      stays disjoint-clean; the richer interacting motion is opt-in via an explicit ordered word.** Good UX
+      + tight bound + guaranteed the slice tips out of the 3-space; the full-group richness is one explicit
+      word away. Deliverables: (a) grammar for the ordered plane word via a new **`--tumble-sequence`** flag
+      (provisional name; fits the `--tumble-mode`/`--tumble-lock`/`--tumble-amp` family) — an ordered,
+      comma-separated list of axis pairs like `0-3,3-4,0-4` (each optionally carrying a turn count, e.g.
+      `0-3x2`); **list order is significant** and pairs may overlap (that's what unlocks order-dependent
+      motion). Plain `--oscillate tumble` with no `--tumble-sequence` keeps the tidy automatic default; (b)
+      the single general
       construction; (c) the general row-norm bound (>= sqrt(2), only ever safer; `max_gradient` affects
       march step / hole-safety, never the converged image, so this is safe); (d) tests: an overlapping word
       produces motion a disjoint set can't, seamless-loop preservation (product = I at t=1 regardless of
