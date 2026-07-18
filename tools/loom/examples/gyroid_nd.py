@@ -2593,11 +2593,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--oscillate", nargs="*", default=None, metavar="GROUP",
                    help="unified change-axis grammar (OSCILLATE_GRAMMAR.md): space-separated "
                         "GROUPs, each a comma-joined list of [amp*]axis items sharing one "
-                        "oscillator. Axes: motions drift/rotate/tumble, the bloom crossfade, and "
+                        "oscillator. Axes: motions drift/rotate/tumble, the bloom crossfade, "
                         "scalar swingers freq/threshold/thickness (each takes its own amp, e.g. "
-                        "'2*freq'). Replaces --transform + --bloom/--bloom-amp/--tumble-* (mutually "
-                        "exclusive with --transform). Per-group 'rate'/'phase' and bare dim indices "
-                        "are accepted by the parser but not wired to behavior yet.")
+                        "'2*freq'), and bare spatial-dim indices. A group takes 'rate <expr>' and "
+                        "'phase <expr>' (the shared clock): on a motion group 'rate' caps the "
+                        "per-dim winding cycle (like --max-winding); a bare dim index winds exactly "
+                        "round(amp*rate) turns (e.g. '3 rate 2' winds dim 3 twice) and forces that "
+                        "dim on; 'phase' (radians, 2*pi=one turn) offsets the winder clock. Replaces "
+                        "--transform + --bloom/--bloom-amp/--tumble-* (mutually exclusive with "
+                        "--transform). (swinger 'rate'/'phase' is not wired yet — the bloom "
+                        "envelope's clock is fixed.)")
     g.add_argument("--lock", nargs="*", default=None, metavar="GROUP",
                    help="same grammar as --oscillate, naming axes to HOLD FIXED. Currently dim "
                         "indices map to the tumble lock (axes excluded from the slice rotation).")
