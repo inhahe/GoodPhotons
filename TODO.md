@@ -332,7 +332,28 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       38 new tests (504 loom green); render-validated (`--dims 5 --oscillate tumble --surface f_ellipsoid
       --lock rx=1.8 ry=0.6 rz=1.0`: t=0 face-on ellipsoid, t=0.25 the x-axis folded into a hidden dim —
       hole-free, seamless at the loop ends). **P3.4 complete.**
-- [ ] **P3.5** Ordered / overlapping N-D tumble (design captured 2026-07-18; do *after* P3.3, it's
+- [x] **P3.5** Ordered / overlapping N-D tumble via **`--tumble-sequence`** — DONE 2026-07-18.
+      Implemented exactly the agreed "supersede, not alongside" single-path design. `--tumble-sequence
+      i-j[xN],…` (`_parse_tumble_sequence`) parses an **ordered** word of `(i,j,winding)` Givens planes
+      whose list order = composition order and whose pairs may **overlap** (share an axis); it overrides
+      `--tumble-lock` and, when absent, plain `--oscillate tumble` keeps the tidy disjoint default.
+      pick_variant (~1404) branches to the explicit word when given, else the existing disjoint draw. The
+      one rigor change is the periodic-field Lipschitz bound: `coef *= sqrt(2)` → `coef *=
+      _tumble_rownorm_factor(v)` = **sqrt(max connected-component size)** of the plane graph (union-find;
+      Cauchy–Schwarz — a row draws amplitude only from its component). That **auto-returns sqrt(2) for any
+      disjoint word** (each plane its own size-2 component, so the disjoint default's bound is *byte-
+      identical* to the old shortcut — the waiver on tumble byte-identity was never even needed for the
+      default) and grows only for overlapping words (`0-3,3-4,0-4` → component {0,3,4} → sqrt(3)). The POV
+      affine (S6) and N-D (P3.4) paths already compute σ_max from the **exact** per-frame matrix via
+      `_tumbled_directions`/direct plane iteration, so they honor overlapping words with **zero** changes.
+      Deliverables all met: (a) `--tumble-sequence` flag + parser with full validation (axis range, self-
+      pair, turn count); (b) single general construction (no legacy branch); (c) general row-norm bound;
+      (d) 11 new tests (parse+validation, component-size bound incl. disjoint=sqrt2 / triangle=sqrt3 /
+      chain=2, exact plane wiring, lock-override, seamless+starts-from-base, **overlap is order-dependent /
+      disjoint is order-independent**, bound-never-underestimates on the composed rotation, default still
+      reorients, and the N-D POV path honoring an overlapping word). **515 loom tests green** (was 504).
+      Docs: OSCILLATE_GRAMMAR.md §7.y, `--tumble-sequence` help text. **P3.5 complete.**
+  - **P3.5 design notes (historical, for reference — superseded by the DONE entry above):** Ordered / overlapping N-D tumble (design captured 2026-07-18; do *after* P3.3, it's
       orthogonal to the surface library). Today's `tumble` is confined to a set of **disjoint** Givens
       planes (`pick_variant` lines ~1328-1353) — i.e. a **maximal torus of SO(N)**, a commuting abelian
       subgroup where rotation order is a no-op *by construction*. Generalize to an **ordered word** of

@@ -1386,39 +1386,47 @@ def pick_variant(seed: int, args: argparse.Namespace,
         if dm.oscillate:
             dm.hidden_offset = rng.uniform(0.5, 2.0)
 
-    # `tumble` transform: build the disjoint set of Givens planes whose product is the
-    # per-frame N-D rotation of the whole slice basis.  Couple each visible axis (0,1,2)
-    # with a distinct hidden dim so the slice tips *out of* the rendered 3-space and back;
-    # pair any leftover hidden dims among themselves.  Disjoint => each direction row is
-    # mixed with at most one other, so |rotated dir| <= sqrt(2) (the marcher bound holds).
-    # Drawn last (like hidden_offset) and only when needed, so the other transforms' RNG
-    # streams — and thus their reproducibility — are untouched.
+    # `tumble` transform: build the ordered word of Givens planes whose product is the per-frame
+    # N-D rotation of the whole slice basis.  Two sources:
+    #   * an explicit --tumble-sequence (P3.5) — an ORDERED, possibly-overlapping word (list order
+    #     = composition order); non-commuting planes reach reorientation paths the disjoint set
+    #     can't.  Fully user-specified, so it overrides --tumble-lock.
+    #   * otherwise the automatic DISJOINT default — couple each visible axis (0,1,2) with a
+    #     distinct hidden dim so the slice tips *out of* the rendered 3-space and back, then pair
+    #     leftover hidden dims among themselves.  Disjoint => each direction row mixes with at most
+    #     one other, so |rotated dir| <= sqrt(2) (the marcher bound holds).
+    # Drawn last (like hidden_offset) and only when needed, so the other transforms' RNG streams —
+    # and thus their reproducibility — are untouched.
     tumble_planes: List[Tuple[int, int, int]] = []
     _tl = getattr(args, "tumble_lock", ())
     tumble_locked: Tuple[int, ...] = (_parse_tumble_lock(_tl) if isinstance(_tl, str)
                                       else tuple(sorted(_tl or ())))
     if _has(transform, "tumble"):
-        max_w = eff_max_w
-        locked = set(a for a in tumble_locked if 0 <= a < D)
-        rest = [d for d in range(3, D) if d not in locked]
-        rng.shuffle(rest)                               # random hidden partners per seed
-        w = 1
-        for i in range(min(3, D)):                      # visible axes -> hidden partners
-            if i in locked:                             # this axis is pinned; skip it
-                continue
-            if not rest:
-                break
-            j = rest.pop()
-            tumble_planes.append((i, j, w))
-            w = w % max_w + 1
-        while len(rest) >= 2:                           # pair up leftover hidden dims
-            i = rest.pop(); j = rest.pop()
-            tumble_planes.append((i, j, w))
-            w = w % max_w + 1
-        if not tumble_planes and D >= 2:                # nothing paired -> spin two free axes
-            free = [d for d in range(D) if d not in locked]
-            if len(free) >= 2:
-                tumble_planes.append((free[0], free[-1], 1))
+        seq = getattr(args, "tumble_sequence", None)
+        if seq:
+            tumble_planes = _parse_tumble_sequence(seq, D)   # explicit word overrides the default
+        else:
+            max_w = eff_max_w
+            locked = set(a for a in tumble_locked if 0 <= a < D)
+            rest = [d for d in range(3, D) if d not in locked]
+            rng.shuffle(rest)                               # random hidden partners per seed
+            w = 1
+            for i in range(min(3, D)):                      # visible axes -> hidden partners
+                if i in locked:                             # this axis is pinned; skip it
+                    continue
+                if not rest:
+                    break
+                j = rest.pop()
+                tumble_planes.append((i, j, w))
+                w = w % max_w + 1
+            while len(rest) >= 2:                           # pair up leftover hidden dims
+                i = rest.pop(); j = rest.pop()
+                tumble_planes.append((i, j, w))
+                w = w % max_w + 1
+            if not tumble_planes and D >= 2:                # nothing paired -> spin two free axes
+                free = [d for d in range(D) if d not in locked]
+                if len(free) >= 2:
+                    tumble_planes.append((free[0], free[-1], 1))
 
     surface = resolve_surface(getattr(args, "surface", "gyroid"))
     pov_values = pov_default_values(surface) if _is_pov_surface(surface) else ()
@@ -2010,6 +2018,84 @@ def _parse_tumble_lock(spec: Optional[str]) -> Tuple[int, ...]:
         if a not in out:
             out.append(a)
     return tuple(sorted(out))
+
+
+def _parse_tumble_sequence(spec: Optional[str], dims: int) -> List[Tuple[int, int, int]]:
+    """Parse a ``--tumble-sequence`` word into an ordered list of ``(i, j, winding)`` Givens
+    planes (P3.5).  Grammar: a comma-separated list of ``i-j`` axis pairs, each optionally
+    suffixed ``xN`` for a whole-turn count (default 1), e.g. ``0-3,3-4x2,0-4``.
+
+    List order is the composition order and pairs may overlap (share an axis) — that is exactly
+    what unlocks order-dependent, non-commuting reorientation the disjoint default cannot reach.
+    Validates every axis into ``[0, dims)`` and rejects a self-pair / non-positive turn count.
+    """
+    planes: List[Tuple[int, int, int]] = []
+    for raw in (spec or "").split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        pair, sep, tc = tok.partition("x")
+        winding = 1
+        if sep:
+            try:
+                winding = int(tc)
+            except ValueError:
+                raise SystemExit(f"error: --tumble-sequence '{tok}': turn count after 'x' "
+                                 f"must be an integer (e.g. 0-3x2)")
+            if winding < 1:
+                raise SystemExit(f"error: --tumble-sequence '{tok}': turn count must be >= 1")
+        a, dash, b = pair.partition("-")
+        if not dash:
+            raise SystemExit(f"error: --tumble-sequence '{tok}': expected an axis pair 'i-j' "
+                             f"(optionally 'i-jxN')")
+        try:
+            i, j = int(a), int(b)
+        except ValueError:
+            raise SystemExit(f"error: --tumble-sequence '{tok}': axis indices must be integers")
+        for ax in (i, j):
+            if not (0 <= ax < dims):
+                raise SystemExit(f"error: --tumble-sequence '{tok}': axis {ax} is out of range "
+                                 f"for --dims {dims} (valid 0..{dims - 1})")
+        if i == j:
+            raise SystemExit(f"error: --tumble-sequence '{tok}': a plane needs two distinct axes")
+        planes.append((i, j, winding))
+    return planes
+
+
+def _tumble_rownorm_factor(v: "Variant") -> float:
+    """The rigorous worst-case direction-row norm the tumble word can grow a unit row to (P3.5).
+
+    The per-frame slice rotation ``R(t)`` (product of the variant's Givens planes) is applied to
+    the stacked unit direction rows; row ``i`` of ``R(t)·D`` can only draw amplitude from the dims
+    in ``i``'s connected component of the plane graph, so ``|row_i| <= sqrt(|component_i|)`` (
+    Cauchy–Schwarz on an orthonormal row of ``R``).  The bound is therefore ``sqrt(max component
+    size)`` — **t-independent, rigorous, and auto-``sqrt(2)`` for a disjoint word** (every plane its
+    own size-2 component), growing only when planes overlap.  This subsumes the old ``sqrt(2)``
+    shortcut with no special-case code and no change to the disjoint default's bound."""
+    planes = getattr(v, "tumble_planes", ()) or ()
+    if not planes:
+        return 1.0
+    parent: Dict[int, int] = {}
+
+    def find(a: int) -> int:
+        parent.setdefault(a, a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for (i, j, _w) in planes:
+        parent.setdefault(i, i)
+        parent.setdefault(j, j)
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+    sizes: Dict[int, int] = {}
+    for a in list(parent):
+        r = find(a)
+        sizes[r] = sizes.get(r, 0) + 1
+    max_size = max(sizes.values()) if sizes else 1
+    return math.sqrt(max_size)
 
 
 def _bloom_env(t: float) -> float:
@@ -2742,11 +2828,13 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
         fr = bloom_freq(v, t)
     coef = 1.1
     if _has(transform, "tumble"):
-        # The N-D slice rotation can grow a direction row's norm to sqrt(2) (disjoint planes,
-        # so at most two unit rows mix), scaling that term's gradient up by the same factor —
-        # inflate the bound so the sphere-marcher never oversteps the surface (no holes).
-        # (rotate only *shrinks* a term's frequency by cos(alpha), so it needs no inflation.)
-        coef *= math.sqrt(2.0)
+        # The N-D slice rotation grows a direction row's norm, scaling that term's gradient up by
+        # the same factor — inflate the bound so the sphere-marcher never oversteps the surface (no
+        # holes).  _tumble_rownorm_factor is the rigorous worst-case row norm of the composed
+        # rotation: sqrt(2) for the disjoint default (each plane its own size-2 component, so this
+        # is byte-identical to the old shortcut) and sqrt(component size) for an overlapping
+        # --tumble-sequence word.  (rotate only *shrinks* a term by cos(alpha); no inflation.)
+        coef *= _tumble_rownorm_factor(v)
     grad_bound = coef * fr * max(1, weighted)
     rad = radius if radius is not None else _POV_DEFAULT_RADIUS   # TPMS keep the classic default
     box = rad * 1.05                                     # contained_by half-extent
@@ -3677,6 +3765,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--tumble-amp", type=float, default=0.25, help=argparse.SUPPRESS)
     g.add_argument("--tumble-lock", type=str, default=None, metavar="A[,A...]",
                    help=argparse.SUPPRESS)
+    g.add_argument("--tumble-sequence", type=str, default=None, metavar="i-j[xN],...",
+                   help="tumble only: an explicit ORDERED word of Givens planes replacing the "
+                        "automatic disjoint pairing — a comma-separated list of axis pairs like "
+                        "'0-3,3-4,0-4' (each optionally carrying a whole-turn count, e.g. "
+                        "'0-3x2'). List order is the composition order and pairs MAY overlap "
+                        "(share an axis), which yields order-dependent reorientation the disjoint "
+                        "default cannot reach. Overrides --tumble-lock. Plain --oscillate tumble "
+                        "with no --tumble-sequence keeps the tidy automatic default.")
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
                         "through its higher dimensions); the videos + .txt sidecars collect "

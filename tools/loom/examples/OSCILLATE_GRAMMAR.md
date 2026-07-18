@@ -603,6 +603,41 @@ new tests (466 loom green); render-validated with `--dims 5 --oscillate tumble -
 a face-on torus, t=0.40 a tilted ring, t=0.25 a near-edge-on sliver, all hole-free and un-clipped, with
 t=0 and t=1 identical. **This completes P3.3.**
 
+### 7.x P3.4 — true N-D forms for the generalizable POV solids
+
+The S6 affine remap above rotates a POV solid *rigidly* — it is honest, but a sphere under
+tumble stays a sphere, because `f(M·p+b)` can only apply a 3×3 map. The nine
+`POV_ND_GENERALIZABLE` builtins (`f_sphere`, `f_ellipsoid`, `f_superellipsoid`, `f_paraboloid`,
+`f_quartic_paraboloid`, `f_ovals_of_cassini`, `f_isect_ellipsoids`, `f_cross_ellipsoids`,
+`f_poly4`) instead get a genuinely N-dimensional field: for one of them at `--dims>3` under
+**tumble**, loom emits a hand-written expansion `F(ξ₀…ξ_{D-1})` where `ξ = A·p + c` and `A` is the
+`D×3` slice Jacobian (rows 0/1/2 the visible axes, hidden rows folded in by the same Givens planes).
+At `t=0`/`t=1` the rest embedding (`A_i=e_i`, hidden rows 0, `c=0`) makes `F` reduce **bit-for-bit** to
+the base `f_*(x,y,z)` — so the loop is seamless — but mid-loop the extra dims genuinely participate
+(a sphere can bulge into an ovoid, an ellipsoid's axis folds away). Rigor: `|∇_p F| ≤ σ_max(A)·|∇_ξ F|`
+with σ from the 3×3 Gram `AᵀA` (`_matn3_singular_extremes`), a per-function ξ-space gradient bound
+(`nd_grad_bound_xi`, with a fallback for `f_superellipsoid` which has none), and a container grown by
+`(nat_rad+|c|)/max(0.15, σ_min)`. Gated by `_pov_use_nd` (pov_motion ∧ tumble ∧ dims>3 ∧ surface∈the
+nine); every other case keeps the exact pre-P3.4 S6 affine path byte-for-byte. **This completes P3.4.**
+
+### 7.y P3.5 — ordered / overlapping tumble words (`--tumble-sequence`)
+
+The automatic tumble default pairs each visible axis with a distinct hidden dim in **disjoint**
+Givens planes (order-independent, each direction row mixes ≤2 unit rows so `|row| ≤ √2`).
+`--tumble-sequence i-j[xN],…` replaces it with an explicit **ordered word** of planes — list order is
+the composition order and pairs **may overlap** (share an axis), e.g. `0-3,3-4,0-4`. Overlapping planes
+don't commute, so the word reaches order-dependent reorientation the disjoint set cannot (swap two
+overlapping planes → a different mid-loop slice; a disjoint word is unchanged by any reordering). Each
+plane is still a whole-turn factor (`xN` = N turns), so the loop stays seamless for **any** ordering.
+The only rigor change is the periodic-field Lipschitz bound: the static `coef *= √2` shortcut becomes
+`coef *= _tumble_rownorm_factor(v)` = **√(max connected-component size)** of the plane graph (union-find;
+Cauchy–Schwarz: a row draws amplitude only from its component). That auto-returns √2 for a disjoint word
+(every plane its own size-2 component → the disjoint default's bound is byte-identical), and grows only
+when planes overlap (`0-3,3-4,0-4` → component {0,3,4} → √3). The POV affine (S6) and N-D (P3.4) paths
+already compute σ_max from the **exact** per-frame matrix, so they honor an overlapping word with no
+change. `--tumble-sequence` overrides `--tumble-lock`; plain `--oscillate tumble` keeps the tidy
+default. **This completes P3.5.**
+
 ---
 
 ## 8. GPU isosurface rendering — kill the per-frame tessellation cost

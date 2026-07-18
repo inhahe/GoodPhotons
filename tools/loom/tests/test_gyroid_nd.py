@@ -13,6 +13,7 @@ import math
 import os
 import re
 import sys
+import types
 
 import pytest
 
@@ -692,6 +693,138 @@ def test_tumble_mode_rejected_without_tumble_transform():
         g.main(["--transform", "rotate", "--tumble-mode", "slide", "--no-video", "--count", "1"])
     with pytest.raises(SystemExit):
         g.main(["--transform", "drift", "--tumble-lock", "0", "--no-video", "--count", "1"])
+
+
+# --------------------------------------------------------------------------
+# --tumble-sequence (P3.5): explicit ORDERED / OVERLAPPING Givens-plane words
+# --------------------------------------------------------------------------
+
+def test_tumble_sequence_parses_ordered_word():
+    # list order is the composition order; the optional 'xN' is a whole-turn count (default 1)
+    assert g._parse_tumble_sequence("0-3,3-4x2,0-4", 5) == [(0, 3, 1), (3, 4, 2), (0, 4, 1)]
+    # blank / whitespace tokens are tolerated
+    assert g._parse_tumble_sequence(" 0-1 , , 2-3 ", 4) == [(0, 1, 1), (2, 3, 1)]
+    assert g._parse_tumble_sequence("", 4) == []
+    assert g._parse_tumble_sequence(None, 4) == []
+
+
+def test_tumble_sequence_validation_errors():
+    for bad in ("0-5",        # axis out of range for dims=5 (valid 0..4)
+                "2-2",        # self-pair
+                "0-3x0",      # non-positive turn count
+                "0-3xz",      # non-integer turn count
+                "0_3",        # malformed pair (no dash)
+                "a-3"):       # non-integer axis
+        with pytest.raises(SystemExit):
+            g._parse_tumble_sequence(bad, 5)
+
+
+def test_tumble_rownorm_factor_component_sizes():
+    # the rigorous bound is sqrt(max connected-component size) of the plane graph
+    mk = lambda planes: types.SimpleNamespace(tumble_planes=planes)
+    assert g._tumble_rownorm_factor(mk([])) == 1.0                       # no rotation at all
+    assert g._tumble_rownorm_factor(mk([(0, 1, 1)])) == pytest.approx(math.sqrt(2))
+    # a disjoint word -> every plane its own size-2 component -> sqrt(2): byte-identical to the old
+    # `coef *= sqrt(2)` shortcut, so the disjoint default's bound is unchanged.
+    assert g._tumble_rownorm_factor(
+        mk([(0, 3, 1), (1, 4, 1), (2, 5, 1)])) == pytest.approx(math.sqrt(2))
+    # overlapping triangle {0,3,4} -> one size-3 component
+    assert g._tumble_rownorm_factor(
+        mk([(0, 3, 1), (3, 4, 1), (0, 4, 1)])) == pytest.approx(math.sqrt(3))
+    # a chain 0-1-2-3 is one size-4 component -> 2
+    assert g._tumble_rownorm_factor(
+        mk([(0, 1, 1), (1, 2, 1), (2, 3, 1)])) == pytest.approx(2.0)
+    # two components -> the larger one wins
+    assert g._tumble_rownorm_factor(
+        mk([(0, 1, 1), (1, 2, 1), (5, 6, 1)])) == pytest.approx(math.sqrt(3))
+
+
+def test_tumble_sequence_wires_exact_planes_into_variant():
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble",
+                                "--tumble-sequence", "0-3,3-4,0-4"), {})
+    assert v.tumble_planes == [(0, 3, 1), (3, 4, 1), (0, 4, 1)]
+
+
+def test_tumble_sequence_overrides_lock():
+    # an explicit word is fully user-specified, so it wins over --tumble-lock (the locked axis
+    # 0 appears in the word rather than being excluded).
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble", "--lock", "0",
+                                "--tumble-sequence", "0-3,3-4,0-4"), {})
+    assert v.tumble_planes == [(0, 3, 1), (3, 4, 1), (0, 4, 1)]
+    assert any(0 in (i, j) for (i, j, _w) in v.tumble_planes)
+
+
+def test_tumble_sequence_loop_is_seamless_and_starts_from_base():
+    # whole-turn planes -> R(0)=R(1)=I regardless of order/overlap; frame 0 == the base gyroid
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble",
+                                "--tumble-sequence", "0-3,3-4,0-4"), {})
+    e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
+    assert e0 == g.field_expr(v)                          # frame 0 = base gyroid
+    for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
+        assert abs(_eval_expr(e0, x, y, z) - _eval_expr(e1, x, y, z)) < 1e-6
+
+
+def test_tumble_sequence_overlap_is_order_dependent():
+    # overlapping planes don't commute: swapping their order changes the mid-loop slice — a
+    # reorientation path no disjoint (always-commuting) word can ever produce.
+    va = g.pick_variant(7, _args("--dims", "5", "--oscillate", "tumble",
+                                 "--tumble-sequence", "0-1,1-2"), {})
+    vb = g.pick_variant(7, _args("--dims", "5", "--oscillate", "tumble",
+                                 "--tumble-sequence", "1-2,0-1"), {})
+    da, db = g._tumbled_directions(va, 0.3), g._tumbled_directions(vb, 0.3)
+    assert max(abs(da[i][k] - db[i][k]) for i in da for k in range(3)) > 1e-3
+    ea, eb = g.field_expr(va, 0.3, "tumble"), g.field_expr(vb, 0.3, "tumble")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    assert max(abs(_eval_expr(ea, *p) - _eval_expr(eb, *p)) for p in pts) > 1e-3
+
+
+def test_tumble_disjoint_word_is_order_independent():
+    # disjoint planes commute, so reordering them leaves the slice rotation identical — the
+    # contrast that makes the overlapping case genuinely new motion.
+    vc = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble",
+                                 "--tumble-sequence", "0-3,1-4"), {})
+    vd = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble",
+                                 "--tumble-sequence", "1-4,0-3"), {})
+    dc, dd = g._tumbled_directions(vc, 0.3), g._tumbled_directions(vd, 0.3)
+    assert max(abs(dc[i][k] - dd[i][k]) for i in dc for k in range(3)) < 1e-12
+
+
+def test_tumble_rownorm_bound_never_underestimates_overlapping():
+    # the composed rotation of an overlapping word can grow a unit direction row past sqrt(2)
+    # (so the general bound is genuinely needed), yet never past sqrt(component size).
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble",
+                                "--tumble-sequence", "0-3,3-4,0-4"), {})
+    factor = g._tumble_rownorm_factor(v)
+    assert factor == pytest.approx(math.sqrt(3))
+    peak = 0.0
+    for k in range(201):
+        d = g._tumbled_directions(v, k / 200.0)
+        peak = max(peak, max(math.sqrt(sum(c * c for c in vec)) for vec in d.values()))
+    assert peak > math.sqrt(2) + 1e-3            # exceeds the disjoint shortcut -> bound needed
+    assert peak <= factor + 1e-9                 # but never the rigorous component-size bound
+
+
+def test_tumble_default_word_still_reorients_and_keeps_sqrt2_bound():
+    # plain --oscillate tumble (no sequence) keeps the tidy disjoint default: sqrt(2) bound, moves
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble"), {})
+    assert g._tumble_rownorm_factor(v) == pytest.approx(math.sqrt(2))
+    e0, eh = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 0.29, "tumble")
+    pts = [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]
+    assert max(abs(_eval_expr(e0, *p) - _eval_expr(eh, *p)) for p in pts) > 1e-3
+
+
+def test_nd_pov_path_honors_overlapping_sequence():
+    # the P3.4 N-D POV path reads the EXACT per-frame matrix (not the static sqrt(2) shortcut),
+    # so an overlapping word stays seamless and hole-safe with zero special-casing.
+    v = _pv("--surface", "f_ellipsoid", "--dims", "5", "--oscillate", "tumble",
+            "--tumble-sequence", "0-3,3-4,0-4")
+    assert v.tumble_planes == [(0, 3, 1), (3, 4, 1), (0, 4, 1)]
+    assert g._pov_use_nd(v, "tumble")
+    assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v, 1.0, "tumble")   # whole-turn seamless
+    body = _auto_body(v, t=0.25, transform="tumble")
+    gb = _grad_bound(body)
+    assert gb > 0.0 and math.isfinite(gb)
+    assert _emitted_clip_radius(body) > 0.0
 
 
 # --------------------------------------------------------------------------
