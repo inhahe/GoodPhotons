@@ -38,12 +38,16 @@ standard way the Schoen gyroid generalizes, giving **m terms** for ``m`` oscilla
 (``sin(u_i)*cos(u_j)``), i.e. ``C(m,2)`` terms — e.g. 15 for 6 dims instead of 6 — a denser,
 more interwoven lattice (the two schemes match in count only for ``m <= 3``, and even at
 ``m = 3`` cover different pairings, so ``--coupling all`` is not the exact classic gyroid).
-Think of the field as a **coupling graph** whose nodes are dimensions and whose edges are
-the ``sin*cos`` terms: ``--axis`` edits *nodes* (turn a dim on/off, set its harmonic) while
-``--pair I,J:on|off`` edits individual *edges* on top of the chosen base graph — delete a
-single term (``I,J:off``) or add an extra chord (``I,J:on``, which forces both endpoints to
-oscillate).  The comma names an edge's two endpoints, distinct from ``--axis``'s hyphen node
-range (``LO-HI``).
+``--coupling none`` gives an **empty** base graph, so the coupling is built up entirely from
+``--pair I,J:on`` chords (below).  Think of the field as a **coupling graph** whose nodes are
+dimensions and whose edges are the ``sin*cos`` terms: ``--axis`` edits *nodes* (turn a dim
+on/off, set its harmonic) while ``--pair I,J:on|off`` edits individual *edges* on top of the
+chosen base graph — delete a single term (``I,J:off``) or add an extra chord (``I,J:on``, which
+forces both endpoints to oscillate).  The comma names an edge's two endpoints, distinct from
+``--axis``'s hyphen node range (``LO-HI``).  Both the node and edge sets follow a **base
+polarity + selective override** model: ``--axis-default {random,on,off}`` sets whether
+un-named axes oscillate by default (then flip individuals with ``--axis``), and ``--coupling``
+picks the base edge set (``cyclic``/``all``/``none``) that ``--pair`` then edits.
 
 The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **thickened
 gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball — on its own, with no Cornell box or
@@ -117,7 +121,12 @@ with ftrace's fast headless rasterizer by default.  Use ``--no-video`` to instea
 single static ``.ftsl`` per variant (with a full comment header).  Any choice can be
 **locked** from the CLI (see ``--help``): the dimension count, how many dims oscillate, how
 many are harmonics of the main, the base frequency, and — per axis — whether it oscillates
-and at what harmonic.
+and at what harmonic.  The numeric locks (``--dims``, ``--oscillating``, ``--harmonics``,
+``--freq``) each take not just a fixed value but also a **range** (``4-8``, a random pick in
+the inclusive span) or a **set** (``4,6,8``, a random pick among the listed values), the same
+shapes ``--axis``'s index field accepts — so you can pin a value, narrow it to a band, or
+enumerate the allowed choices.  A fixed value never draws from the RNG, so pinning one leaves
+every other seed-driven choice bit-for-bit reproducible.
 
 Examples::
 
@@ -126,6 +135,13 @@ Examples::
 
     # reproducible; lock 6 dims, 4 oscillating, 2 of them harmonics of the main
     python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 --oscillating 4 --harmonics 2
+
+    # value locks take ranges/sets too: 5-8 dims, an even oscillating count, freq in 3-5
+    python examples/gyroid_nd.py --count 5 --dims 5-8 --oscillating 4,6,8 --freq 3-5
+
+    # base polarity + override: every axis oscillates except 2 and 5; hand-built coupling
+    python examples/gyroid_nd.py --dims 6 --axis-default on --axis 2:off --axis 5:off
+    python examples/gyroid_nd.py --dims 6 --coupling none --pair 0,1:on --pair 1,2:on --pair 2,0:on
 
     # start on the exact showcase gyroid, then bloom into higher-D structure and back
     python examples/gyroid_nd.py --dims 6 --transform bloom
@@ -317,6 +333,80 @@ def _parse_axis_indices(token: str, spec: str) -> List[int]:
     return [idx]
 
 
+# ---------------------------------------------------------------------------
+# value-lock spec grammar:  V | LO-HI | A,B,C
+# ---------------------------------------------------------------------------
+#
+# The numeric locks (--dims, --oscillating, --harmonics, --freq) accept, like the
+# index field of --axis, three shapes:
+#   * a bare value  V      -> fixed (never randomized; draws nothing from the RNG)
+#   * a range      LO-HI    -> a uniform random pick in [LO, HI] (inclusive)
+#   * a set        A,B,C    -> a uniform random pick among the listed values
+# A fixed value takes no RNG draw (so it can never perturb reproducibility); a range
+# draws exactly as the legacy --*-range fallback did (randint for ints, uniform for
+# freq), so existing seeds still reproduce bit-for-bit.  Parsed into a small tuple:
+#   ("fixed", v) | ("range", lo, hi) | ("set", [v0, v1, ...])
+
+def _parse_value_spec(token: str, name: str, integral: bool = True,
+                      minimum=None):
+    """Parse a value-lock spec (``V`` / ``LO-HI`` / ``A,B,C``) into a tuple.
+
+    ``integral`` selects int vs float parsing; ``minimum`` (if given) is an
+    inclusive lower bound enforced on every value.  Raises ArgumentTypeError on a
+    malformed spec so argparse reports it cleanly."""
+    token = str(token).strip()
+    conv = int if integral else float
+    kind = "integer" if integral else "number"
+
+    def _num(s):
+        try:
+            return conv(s.strip())
+        except (ValueError, TypeError):
+            raise argparse.ArgumentTypeError(
+                f"{name}: '{token}' — expected a {kind}, a range LO-HI, or a set A,B,C")
+
+    def _check(v):
+        if minimum is not None and v < minimum:
+            raise argparse.ArgumentTypeError(f"{name}: value {v} must be >= {minimum}")
+        return v
+
+    if "," in token:
+        parts = [p for p in token.split(",") if p.strip() != ""]
+        if not parts:
+            raise argparse.ArgumentTypeError(f"{name}: empty set '{token}'")
+        return ("set", [_check(_num(p)) for p in parts])
+    hy = token.find("-", 1)                 # a hyphen that isn't a leading sign
+    if hy != -1:
+        lo = _check(_num(token[:hy]))
+        hi = _check(_num(token[hy + 1:]))
+        if hi < lo:
+            raise argparse.ArgumentTypeError(
+                f"{name}: range end {hi} is before start {lo} in '{token}'")
+        return ("range", lo, hi)
+    return ("fixed", _check(_num(token)))
+
+
+def _dims_spec(token):
+    return _parse_value_spec(token, "--dims", integral=True, minimum=3)
+
+
+def _oscillating_spec(token):
+    return _parse_value_spec(token, "--oscillating", integral=True, minimum=2)
+
+
+def _harmonics_spec(token):
+    return _parse_value_spec(token, "--harmonics", integral=True, minimum=0)
+
+
+def _freq_spec(token):
+    spec = _parse_value_spec(token, "--freq", integral=False, minimum=None)
+    # freq must be strictly positive (a zero/negative frequency is degenerate)
+    for v in (spec[1:] if spec[0] != "set" else spec[1]):
+        if v <= 0:
+            raise argparse.ArgumentTypeError(f"--freq: value {v} must be > 0")
+    return spec
+
+
 def parse_axis_lock(spec: str, locks: Dict[int, AxisLock]) -> None:
     parts = spec.split(":")
     if len(parts) < 2:
@@ -448,14 +538,28 @@ def pick_variant(seed: int, args: argparse.Namespace,
 
     # 1) total dimension count -------------------------------------------------
     max_forced_axis = max([*axis_locks, *pair_ref_axes], default=-1)
-    if args.dims is not None:
-        D = args.dims
-        if max_forced_axis >= D:
-            src = "--axis/--pair" if pair_ref_axes else "--axis"
-            raise SystemExit(f"error: {src} references axis {max_forced_axis} but "
-                             f"--dims is {D} (axis index must be < dims)")
+    dims_spec = getattr(args, "dims", None)
+    floor = max(max_forced_axis + 1, 3)         # smallest legal D given forced axes
+    if dims_spec is not None:
+        if dims_spec[0] == "fixed":
+            D = dims_spec[1]
+            if D < floor:
+                src = "--axis/--pair" if pair_ref_axes else "--axis"
+                raise SystemExit(f"error: {src} references axis {max_forced_axis} but "
+                                 f"--dims is {D} (axis index must be < dims)")
+        elif dims_spec[0] == "range":
+            lo = max(dims_spec[1], floor)
+            hi = max(dims_spec[2], lo)
+            D = rng.randint(lo, hi)
+        else:                                   # set: keep only values leaving room for locks
+            opts = [v for v in dims_spec[1] if v >= floor]
+            if not opts:
+                src = "--axis/--pair" if pair_ref_axes else "--axis"
+                raise SystemExit(f"error: --dims set {dims_spec[1]} has no value >= {floor} "
+                                 f"(needed to hold the forced {src} axes)")
+            D = rng.choice(opts)
     else:
-        lo = max(args.dims_range[0], max_forced_axis + 1, 3)
+        lo = max(args.dims_range[0], floor)
         hi = max(args.dims_range[1], lo)
         D = rng.randint(lo, hi)
 
@@ -471,6 +575,20 @@ def pick_variant(seed: int, args: argparse.Namespace,
     if conflict:
         raise SystemExit(f"error: axis {sorted(conflict)} locked both on and off "
                          f"(check --axis / --pair …:on)")
+    # axis polarity default: fill in every axis not named by an explicit lock.  'on'
+    # forces all remaining axes to oscillate (override individuals with --axis d:off);
+    # 'off' forces them inert (override with --axis d:on); 'random' (default) leaves the
+    # picker free.  forced_off / forced_on (and pair-on endpoints) always win, so the
+    # default only touches the still-free axes — mirroring the coupling base polarity.
+    axis_default = getattr(args, "axis_default", "random")
+    if axis_default == "on":
+        for d in range(D):
+            if d not in forced_off:
+                forced_on.add(d)
+    elif axis_default == "off":
+        for d in range(D):
+            if d not in forced_on:
+                forced_off.add(d)
     must_on = sorted(forced_on)
     must_off = sorted(forced_off)
 
@@ -480,11 +598,26 @@ def pick_variant(seed: int, args: argparse.Namespace,
     if hi_m < lo_m:
         raise SystemExit(f"error: cannot satisfy oscillation locks — need at least "
                          f"{lo_m} oscillating dims but only {hi_m} are available")
-    if args.oscillating is not None:
-        M = args.oscillating
-        if M < lo_m or M > hi_m:
-            raise SystemExit(f"error: --oscillating {M} is out of range [{lo_m}, {hi_m}] "
-                             f"given the current locks / dims")
+    osc_spec = getattr(args, "oscillating", None)
+    if osc_spec is not None:
+        if osc_spec[0] == "fixed":
+            M = osc_spec[1]
+            if M < lo_m or M > hi_m:
+                raise SystemExit(f"error: --oscillating {M} is out of range [{lo_m}, {hi_m}] "
+                                 f"given the current locks / dims")
+        elif osc_spec[0] == "range":
+            lo = max(osc_spec[1], lo_m)
+            hi = min(osc_spec[2], hi_m)
+            if hi < lo:
+                raise SystemExit(f"error: --oscillating range {osc_spec[1]}-{osc_spec[2]} "
+                                 f"doesn't intersect the feasible [{lo_m}, {hi_m}]")
+            M = rng.randint(lo, hi)
+        else:
+            opts = [v for v in osc_spec[1] if lo_m <= v <= hi_m]
+            if not opts:
+                raise SystemExit(f"error: --oscillating set {osc_spec[1]} has no value in the "
+                                 f"feasible [{lo_m}, {hi_m}]")
+            M = rng.choice(opts)
     elif bloom_dims:
         # bloom starts as the 3-term classic gyroid and unfolds into the full N-D
         # field, so we want that full field to be as rich as possible: every
@@ -504,11 +637,26 @@ def pick_variant(seed: int, args: argparse.Namespace,
     free = [d for d in non_main if d not in forced_harm]
     lo_h = len(forced_gt1)
     hi_h = len(forced_gt1) + len(free)
-    if args.harmonics is not None:
-        H = args.harmonics
-        if H < lo_h or H > hi_h:
-            raise SystemExit(f"error: --harmonics {H} is out of range [{lo_h}, {hi_h}] "
-                             f"given the current locks / oscillating dims")
+    harm_spec = getattr(args, "harmonics", None)
+    if harm_spec is not None:
+        if harm_spec[0] == "fixed":
+            H = harm_spec[1]
+            if H < lo_h or H > hi_h:
+                raise SystemExit(f"error: --harmonics {H} is out of range [{lo_h}, {hi_h}] "
+                                 f"given the current locks / oscillating dims")
+        elif harm_spec[0] == "range":
+            lo = max(harm_spec[1], lo_h)
+            hi = min(harm_spec[2], hi_h)
+            if hi < lo:
+                raise SystemExit(f"error: --harmonics range {harm_spec[1]}-{harm_spec[2]} "
+                                 f"doesn't intersect the feasible [{lo_h}, {hi_h}]")
+            H = rng.randint(lo, hi)
+        else:
+            opts = [v for v in harm_spec[1] if lo_h <= v <= hi_h]
+            if not opts:
+                raise SystemExit(f"error: --harmonics set {harm_spec[1]} has no value in the "
+                                 f"feasible [{lo_h}, {hi_h}]")
+            H = rng.choice(opts)
     elif bloom_dims:
         # bloom keeps every extra dim at the fundamental (h1) so it unfolds into a
         # clean pure N-D gyroid; complexity comes from the dimensions, not harmonics.
@@ -555,8 +703,14 @@ def pick_variant(seed: int, args: argparse.Namespace,
     for i, d in enumerate(non_main_osc):
         by_index[d].winding = (i % max_w) + 1
 
-    if args.freq is not None:
-        freq = args.freq
+    freq_spec = getattr(args, "freq", None)
+    if freq_spec is not None:
+        if freq_spec[0] == "fixed":
+            freq = freq_spec[1]
+        elif freq_spec[0] == "range":
+            freq = rng.uniform(freq_spec[1], freq_spec[2])
+        else:
+            freq = rng.choice(freq_spec[1])
     elif _has(transform, "bloom"):
         # Bloom's frame 0 IS the showcase gyroid; default its density to match showcase
         # (freq 40 at radius 0.32) for whatever container radius is in use.
@@ -810,7 +964,9 @@ def coupling_pairs(v: "Variant") -> List[Tuple[int, int]]:
     The base graph is either the ``cyclic`` ring (the m consecutive pairs
     ``(o_i, o_{i+1})`` mod m — the standard gyroid; for m=2 this is the two mirrored
     terms ``(o0,o1)`` and ``(o1,o0)``, which are deliberately *not* deduplicated) or
-    the ``all`` complete graph (every unordered pair ``i<j``).  Then any edge in
+    the ``all`` complete graph (every unordered pair ``i<j``), or ``none`` (an empty
+    base graph, so the coupling is built up entirely from ``--pair …:on`` chords).
+    Then any edge in
     ``pair_off`` is deleted, and any edge in ``pair_on`` not already present is added
     as an extra chord (sin of the lower index, cos of the higher).  Only edges whose
     both endpoints oscillate survive.  The returned order is base-graph order first,
@@ -818,8 +974,11 @@ def coupling_pairs(v: "Variant") -> List[Tuple[int, int]]:
     osc = sorted(v.oscillating)
     osc_set = set(osc)
     m = len(osc)
-    if getattr(v, "coupling", "cyclic") == "all":
+    scheme = getattr(v, "coupling", "cyclic")
+    if scheme == "all":
         base = [(osc[i], osc[j]) for i in range(m) for j in range(i + 1, m)]
+    elif scheme == "none":
+        base = []                       # empty base graph — build it up with --pair …:on
     else:
         base = [(osc[i], osc[(i + 1) % m]) for i in range(m)]
     pair_off = getattr(v, "pair_off", frozenset())
@@ -1207,9 +1366,13 @@ def coupling_desc(v: Variant) -> str:
     --pair edits change the base edge count, the actual emitted term count is noted too."""
     m = len(v.oscillating)
     actual = len(coupling_pairs(v))
-    if getattr(v, "coupling", "cyclic") == "all":
+    scheme = getattr(v, "coupling", "cyclic")
+    if scheme == "all":
         base = m * (m - 1) // 2
         desc = f"all pairs ({base} = C({m},2) sin*cos terms)"
+    elif scheme == "none":
+        base = 0
+        desc = "none (empty base graph — coupling built from --pair …:on chords)"
     else:
         base = m
         desc = f"cyclic ({m} consecutive-pair sin*cos term{'s' if m != 1 else ''})"
@@ -1337,7 +1500,7 @@ def header(v: Variant, index: int, count: int, *,
             L.append(f"#   thickness: half(t) *= (1 + {fmt(v.bloom_amp * _BLOOM_SWING['thickness'])}*w)   (sheet swells/thins)")
         L.append("#")
     L += ["#",
-          "# field:  sum over cyclic oscillating pairs (i, i+1) of  sin(u_i) * cos(u_j)"]
+          f"# field:  sum over coupling edges (a, b) of  sin(u_a) * cos(u_b)   [{coupling_desc(v)}]"]
     motions = _motions(transform)
     if motions:
         # The active motion layers compose on each dim's argument (see field_expr): tumble
@@ -1702,10 +1865,23 @@ def build_parser() -> argparse.ArgumentParser:
                 "  I,J:off           delete the single sin(u_I)*cos(u_J) coupling term\n"
                 "  I,J:on            add that term as an extra chord (forces I and J to oscillate)\n"
                 "  (comma = one edge's two endpoints; contrast --axis's hyphen node range LO-HI)\n\n"
+                "value-lock spec for --dims / --oscillating / --harmonics / --freq:\n"
+                "  V                 fixed (never randomized; draws nothing from the RNG)\n"
+                "  LO-HI             inclusive range — a uniform random pick in [LO, HI]\n"
+                "  A,B,C             set — a uniform random pick among the listed values\n\n"
+                "base polarity + override (like --coupling's base edge set):\n"
+                "  --axis-default on|off   default oscillation for un-named axes; flip with --axis\n"
+                "  --coupling none         empty base graph; build coupling from --pair I,J:on\n\n"
                 "examples:\n"
                 "  python examples/gyroid_nd.py --count 10\n"
                 "  python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 "
                 "--oscillating 4 --harmonics 2\n"
+                "  python examples/gyroid_nd.py --count 5 --dims 5-8 --oscillating 4,6,8 "
+                "--freq 3-5   # range/set locks\n"
+                "  python examples/gyroid_nd.py --dims 6 --axis-default on --axis 2:off   "
+                "# all axes on but 2\n"
+                "  python examples/gyroid_nd.py --dims 6 --coupling none --pair 0,1:on "
+                "--pair 1,2:on   # hand-built coupling\n"
                 "  python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 "
                 "--axis 2:on:1   # classic gyroid\n"
                 "  python examples/gyroid_nd.py --dims 7 --axis 3-6:off   "
@@ -1739,26 +1915,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "locks it was made with.")
 
     g = p.add_argument_group("locks (fix a value instead of randomizing it)")
-    g.add_argument("--dims", type=int, default=None,
-                   help="lock the total number of dimensions D (>=3)")
+    g.add_argument("--dims", type=_dims_spec, default=None, metavar="V|LO-HI|A,B,C",
+                   help="lock the total number of dimensions D (>=3). Accepts a fixed value "
+                        "(5), an inclusive range (4-8, random), or a set (4,6,8, random pick); "
+                        "a range/set here supersedes --dims-range. (see epilog)")
     g.add_argument("--dims-range", type=int, nargs=2, metavar=("MIN", "MAX"),
                    default=(3, 8), help="range for a random D when --dims is unset (default 3 8)")
-    g.add_argument("--oscillating", type=int, default=None,
-                   help="lock how many dimensions oscillate (>=2)")
-    g.add_argument("--harmonics", type=int, default=None,
-                   help="lock how many oscillating dims are harmonics (overtones) of the main dim")
+    g.add_argument("--oscillating", type=_oscillating_spec, default=None, metavar="V|LO-HI|A,B,C",
+                   help="lock how many dimensions oscillate (>=2). Fixed value, range, or set "
+                        "(see --dims); a range/set is intersected with the feasible span.")
+    g.add_argument("--harmonics", type=_harmonics_spec, default=None, metavar="V|LO-HI|A,B,C",
+                   help="lock how many oscillating dims are harmonics (overtones) of the main "
+                        "dim. Fixed value, range, or set (see --dims).")
     g.add_argument("--max-harmonic", type=int, default=5,
                    help="largest integer harmonic drawn for an overtone dim (default 5)")
     g.add_argument("--max-winding", type=int, default=2,
                    help="fastest per-dim drift rate: integer cycles a dimension advances "
                         "over one video loop as the slice moves through it (default 2)")
+    g.add_argument("--axis-default", choices=("random", "on", "off"), default="random",
+                   help="base oscillation polarity for axes NOT named by an explicit --axis: "
+                        "'random' (default) lets the picker choose; 'on' makes every un-named "
+                        "axis oscillate (then turn individuals off with --axis d:off); 'off' "
+                        "makes them all inert (then turn individuals on with --axis d:on). "
+                        "Explicit --axis locks and --pair …:on endpoints always win.")
     g.add_argument("--axis", action="append", default=[], metavar="SPEC",
                    help="force an axis (or a LO-HI range of axes) on/off and optionally its "
                         "harmonic; repeatable. INDEX may be a single number (4:off) or an "
                         "inclusive range (3-6:off turns axes 3,4,5,6 off in one flag). "
                         "(see epilog)")
-    g.add_argument("--freq", type=float, default=None,
-                   help="lock the base spatial frequency (cells packed into the ball)")
+    g.add_argument("--freq", type=_freq_spec, default=None, metavar="V|LO-HI|A,B,C",
+                   help="lock the base spatial frequency (cells packed into the ball). Fixed "
+                        "value, range, or set (see --dims); a range/set supersedes --freq-range.")
     g.add_argument("--freq-range", type=float, nargs=2, metavar=("MIN", "MAX"),
                    default=(3.0, 7.0), help="range for a random freq when --freq is unset "
                                             "(default 3 7)")
@@ -1770,12 +1957,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "D=3 all-on reproduce the exact classic gyroid). --no-pin-axes instead "
                         "gives every dimension a random direction — a freely-oriented N-D slice, "
                         "so even the base gyroid comes out tilted.")
-    g.add_argument("--coupling", choices=("cyclic", "all"), default="cyclic",
-                   help="which sin*cos pairs the field sums over. 'cyclic' (default): the m "
-                        "consecutive oscillating pairs (o_i, o_{i+1}) wrapping around — the "
-                        "standard Schoen-gyroid generalization, m terms. 'all': every unordered "
-                        "pair i<j — C(m,2) terms (e.g. 15 for 6 oscillating dims), a denser, "
-                        "more interwoven lattice for m>3 (the two agree in count only for m<=3).")
+    g.add_argument("--coupling", choices=("cyclic", "all", "none"), default="cyclic",
+                   help="base graph of sin*cos pairs the field sums over (the pair polarity). "
+                        "'cyclic' (default): the m consecutive oscillating pairs (o_i, o_{i+1}) "
+                        "wrapping around — the standard Schoen-gyroid generalization, m terms. "
+                        "'all': every unordered pair i<j — C(m,2) terms (e.g. 15 for 6 "
+                        "oscillating dims), a denser lattice (the two agree in count only for "
+                        "m<=3). 'none': an empty base graph — build the coupling up entirely "
+                        "from --pair I,J:on chords. Edit any base with --pair (see epilog).")
     g.add_argument("--pair", action="append", default=[], metavar="I,J:on|off",
                    help="edit an individual coupling *edge* on top of the --coupling base "
                         "graph; repeatable. 'I,J:off' deletes the sin(u_I)*cos(u_J) term; "
@@ -1879,10 +2068,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.dims is not None and args.dims < 3:
-        raise SystemExit("error: --dims must be >= 3")
-    if args.oscillating is not None and args.oscillating < 2:
-        raise SystemExit("error: --oscillating must be >= 2")
+    # (--dims >= 3, --oscillating >= 2, --freq > 0 are validated by their spec parsers.)
     if args.count < 1:
         raise SystemExit("error: --count must be >= 1")
     # Normalize --transform (one name or a comma/plus-separated layered set) to canonical form.

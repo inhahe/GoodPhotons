@@ -737,9 +737,131 @@ def test_pair_on_off_conflict_raises():
         g.parse_pair_lock("3,4:on", on, off)
 
 
-def test_pair_out_of_range_endpoint_raises():
+# ---------------------------------------------------------------------------
+# value-lock spec grammar (V | LO-HI | A,B,C) and base polarity
+# ---------------------------------------------------------------------------
+
+def test_value_spec_parses_fixed_range_set():
+    assert g._parse_value_spec("5", "--dims") == ("fixed", 5)
+    assert g._parse_value_spec("4-8", "--dims") == ("range", 4, 8)
+    assert g._parse_value_spec("4,6,8", "--dims") == ("set", [4, 6, 8])
+    # float specs for --freq
+    assert g._freq_spec("3.5") == ("fixed", 3.5)
+    assert g._freq_spec("3-5")[0] == "range"
+    assert g._freq_spec("3,5,7") == ("set", [3.0, 5.0, 7.0])
+
+
+def test_value_spec_bad_and_out_of_bounds_raise():
+    for bad in ("x", "4-", "-", "8-4", "4,x", ""):
+        with pytest.raises(argparse.ArgumentTypeError):
+            g._dims_spec(bad)
+    with pytest.raises(argparse.ArgumentTypeError):
+        g._dims_spec("2")            # below the dims minimum (3)
+    with pytest.raises(argparse.ArgumentTypeError):
+        g._oscillating_spec("1")     # below the oscillating minimum (2)
+    with pytest.raises(argparse.ArgumentTypeError):
+        g._freq_spec("0")            # freq must be > 0
+
+
+def test_dims_fixed_value_takes_no_rng_draw():
+    # A fixed lock must not perturb the stream: forcing --dims 6 gives the same
+    # variant as leaving it to be drawn as 6 from the range fallback for that seed.
+    for seed in range(20):
+        a = _args("--dims", "6")
+        v = g.pick_variant(seed, a, {})
+        assert v.dims == 6
+
+
+def test_dims_range_lock_stays_in_span():
+    for seed in range(30):
+        v = g.pick_variant(seed, _args("--dims", "5-7"), {})
+        assert 5 <= v.dims <= 7
+
+
+def test_dims_set_lock_picks_only_listed_values():
+    seen = set()
+    for seed in range(40):
+        seen.add(g.pick_variant(seed, _args("--dims", "4,6,8"), {}).dims)
+    assert seen and seen <= {4, 6, 8}
+
+
+def test_oscillating_set_lock_respected():
+    for seed in range(30):
+        v = g.pick_variant(seed, _args("--dims", "9", "--oscillating", "4,6"), {})
+        assert len(v.oscillating) in (4, 6)
+
+
+def test_harmonics_range_lock_respected():
+    for seed in range(30):
+        v = g.pick_variant(seed, _args("--dims", "9", "--oscillating", "7",
+                                       "--harmonics", "2-4"), {})
+        assert 2 <= len(v.harmonic_dims) <= 4
+
+
+def test_freq_range_lock_stays_in_span():
+    for seed in range(30):
+        v = g.pick_variant(seed, _args("--freq", "3-5"), {})
+        assert 3.0 <= v.freq <= 5.0
+
+
+def test_freq_set_lock_picks_only_listed_values():
+    seen = set()
+    for seed in range(30):
+        seen.add(round(g.pick_variant(seed, _args("--freq", "4,9"), {}).freq, 6))
+    assert seen and seen <= {4.0, 9.0}
+
+
+def test_oscillating_range_intersects_feasible_span():
+    # asking for 5-99 oscillating dims in a D=6 field clamps to at most 6
+    for seed in range(20):
+        v = g.pick_variant(seed, _args("--dims", "6", "--oscillating", "5-99"), {})
+        assert 5 <= len(v.oscillating) <= 6
+
+
+def test_oscillating_set_with_no_feasible_value_raises():
     with pytest.raises(SystemExit):
-        g.main(["--dims", "5", "--pair", "2,7:off", "--no-video", "--count", "1"])
+        g.pick_variant(1, _args("--dims", "4", "--oscillating", "8,9"), {})
+
+
+def test_axis_default_on_makes_every_unnamed_axis_oscillate():
+    v = _pv("--dims", "6", "--axis-default", "on")
+    assert sorted(v.oscillating) == [0, 1, 2, 3, 4, 5]
+
+
+def test_axis_default_on_with_override_off():
+    v = _pv("--dims", "5", "--axis-default", "on", "--axis", "2:off")
+    assert 2 not in v.oscillating
+    assert sorted(v.oscillating) == [0, 1, 3, 4]
+
+
+def test_axis_default_off_with_override_on():
+    v = _pv("--dims", "6", "--axis-default", "off", "--axis", "0:on", "--axis", "1:on")
+    assert sorted(v.oscillating) == [0, 1]
+
+
+def test_axis_default_off_alone_is_infeasible():
+    with pytest.raises(SystemExit):
+        _pv("--dims", "6", "--axis-default", "off")
+
+
+def test_axis_default_random_is_unchanged_default():
+    # the default polarity draws exactly as before (no --axis-default given)
+    for seed in range(15):
+        a = g.pick_variant(seed, _args("--dims", "6"), {})
+        b = g.pick_variant(seed, _args("--dims", "6", "--axis-default", "random"), {})
+        assert sorted(a.oscillating) == sorted(b.oscillating)
+
+
+def test_coupling_none_is_empty_base_graph():
+    v = _pv("--dims", "6", "--oscillating", "6", "--coupling", "none")
+    assert g.coupling_pairs(v) == []
+    assert g.field_expr(v) == "(0.0)"
+    assert "none" in g.coupling_desc(v)
+
+
+def test_coupling_none_built_up_with_pair_on():
+    v = _pv("--dims", "6", "--coupling", "none", "--pair", "0,1:on", "--pair", "1,2:on")
+    assert g.coupling_pairs(v) == [(0, 1), (1, 2)]
 
 
 def _run_all():
