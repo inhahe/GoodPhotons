@@ -128,12 +128,22 @@ Three **datasets**, each N-D, each with **every value feedable by a modulator**
 itself a **node in the modulation DAG** (it carries an `id` + `children()`), so it
 is both *modulable* (its stored values are driven by modulators) **and** a
 *modulator* (an interpolator over it is a `Signal`), and `detect_signal_cycle`
-walks *through* the dataset — a control point / grid value / scatter value that
-loops back is caught:
+walks *through* the dataset — a control point / grid value / scatter position or
+value that loops back is caught:
 
 1. **Point-path** — an ordered sequence of N-D points (a curve's control points).
+   The **points themselves are modulable** (each is a `VecSignal`; any coordinate
+   may be a `Signal`), so control points animate over the loop.
 2. **Grid** — N-D values on a regular lattice of *arbitrary rarity* (resolution).
-3. **Scatter** — N-D values at arbitrary positions (no lattice).
+   Only the **values** are modulable; the lattice **positions are deliberately
+   fixed**. That regular structure is the whole point of a Grid — it is what buys
+   the fast **separable N-linear interpolation** — so animating node positions is
+   explicitly *not* a Grid feature. If you want moving sample *positions*, that is
+   exactly what **Scatter** is for.
+3. **Scatter** — N-D values at arbitrary positions (no lattice). **Both** the
+   sample **positions** (each a `VecSignal`) **and** their **values** are modulable,
+   so a scatter point can drift *and* pulse; `ScatterField` re-reads every position
+   and value per frame, and both are walked by the cycle detector.
 
 Plus one composite dataset built on the point-path:
 

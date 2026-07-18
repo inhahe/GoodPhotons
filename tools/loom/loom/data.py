@@ -146,11 +146,16 @@ class TrackedPath:
 
 
 class Grid:
-    """N-D scalar-or-vector values on a regular lattice.
+    """N-D scalar-or-vector values on a **regular, fixed** lattice.
 
     ``shape`` is the number of samples per axis (arbitrary rarity).  ``lo``/``hi``
     are the domain corners.  ``values`` is a flat, C-order list of length
     ``prod(shape)`` of Signals (scalar field) or VecSignals (vector field).
+
+    The lattice **positions are deliberately fixed** — that regular structure is the
+    whole point of a Grid (it buys the fast separable N-linear interpolation).  Only
+    the *values* at those positions are modulable.  If you want moving sample
+    *positions*, that is exactly what :class:`Scatter` is for.
     """
 
     def __init__(self, shape: Sequence[int], lo: Sequence[float],

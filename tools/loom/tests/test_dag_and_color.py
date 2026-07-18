@@ -76,6 +76,43 @@ def test_cycle_through_grid_value_is_caught():
     raise AssertionError("expected a cycle through a grid value")
 
 
+def test_cycle_through_scatter_value_is_caught():
+    ref = RefSignal("v")
+    sc = Scatter([((0.0, 0.0), ref), ((1.0, 1.0), 2.0)])
+    sf = ScatterField(sc, vec(0.5, 0.5))
+    ref.bind(sf)                               # a scatter *value* loops back
+    try:
+        detect_signal_cycle(sf)
+    except SignalCycleError:
+        return
+    raise AssertionError("expected a cycle through a scatter value")
+
+
+def test_cycle_through_scatter_position_is_caught():
+    ref = RefSignal("p")
+    # an animatable scatter *position* whose coordinate loops back through the field
+    sc = Scatter([(vec(ref, 0.0), 1.0), ((1.0, 1.0), 2.0)])
+    sf = ScatterField(sc, vec(0.5, 0.5))
+    ref.bind(sf)                               # a scatter *position* loops back
+    try:
+        detect_signal_cycle(sf)
+    except SignalCycleError:
+        return
+    raise AssertionError("expected a cycle through a scatter position")
+
+
+def test_scatter_position_is_modulable_and_acyclic():
+    from loom import Sine
+    # a moving sample: its y-coordinate is driven by a modulator
+    sc = Scatter([(vec(0.0, Sine(cycles=1, amp=0.5, bias=0.0)), 1.0),
+                  ((1.0, 1.0), 2.0)])
+    sf = ScatterField(sc, vec(0.5, 0.5))
+    detect_signal_cycle(sf)                    # healthy graph: no false positive
+    a = sc.positions[0].at(Clock.at_frame(0, 8), Cache())
+    b = sc.positions[0].at(Clock.at_frame(2, 8), Cache())
+    assert a != b, (a, b)                      # the point actually moves
+
+
 # --- HSV / RGB colour model -------------------------------------------------
 
 def test_hsv_to_rgb_matches_reference():
