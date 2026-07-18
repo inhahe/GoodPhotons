@@ -276,7 +276,20 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       it; a param-only `--oscillate` names a benign `drift` (POV ignores transform) instead of erroring "no
       motion axes"; a bad axis on a POV surface hints the valid param names. 12 new tests (443 loom green);
       render-validated (torus `minor` sweeps 0.25→2.0→0.25, container 1.44→3.06→1.44).
-      Still: (S6) affine remap for dims>3; (S7) `--axis-default` random-draw for unspecified params.
+      **(S7) done 2026-07-18** — `--param-default {default,random}` gives POV batches actual variety. A POV
+      surface ignores the randomized dims/freq/harmonics (its shape is the `f_*` call args, not the N-D
+      field), so a plain `-n N --surface f_torus` batch was N *identical* images. With `--param-default
+      random`, every UNSPECIFIED shape param (not pinned by `--lock NAME=VALUE`, not animated by
+      `--oscillate NAME`) is drawn uniformly in its authored `[lo,hi]` per variant seed, so each variant is a
+      distinct shape; `default` (the flag's default) keeps the current single authored shape. The draw runs
+      *last* in `pick_variant`'s RNG stream (after the hidden-offset / tumble draws) so it never perturbs the
+      field's reproducibility, and it's a no-op on a TPMS (no `pov_values`) — a TPMS's shape already varies
+      via its randomized freq/threshold. Explicit pins and swingers opt their param out of the draw, so
+      `--lock major=1.6 --param-default random` fixes the major radius while the minor still varies. (Named
+      `--param-default`, not `--axis-default`, to avoid colliding with the existing `--axis-default`
+      on/off/random axis-polarity flag.) 7 new tests (450 loom green); smoke-validated (`-n 3 --surface
+      f_torus --param-default random` → 3 distinct `f_torus(...)` calls; `default` → one shared default).
+      Still: (S6) affine remap for dims>3.
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
       split real. After P3.3.

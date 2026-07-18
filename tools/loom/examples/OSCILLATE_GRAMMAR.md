@@ -558,7 +558,25 @@ plumbing: a param-only `--oscillate` (no winder/dims axis) names a benign `drift
 `transform`) so it doesn't trip the "names no motion axes" guard; a swing on a non-POV surface, or a
 bad axis name, errors and (for a POV surface) hints the valid param names. 12 new tests (443 loom
 green); render-validated — a torus `minor` sweep runs `0.25 → 2.0 → 0.25` with the container tracking
-`1.44 → 3.06 → 1.44`. Still to come: S6 affine N-D remap, S7 `--axis-default` random param draw.
+`1.44 → 3.06 → 1.44`. Still to come: S6 affine N-D remap.
+
+**P3.3 slice S7 — `--param-default random` for POV batch variety (done 2026-07-18):** a POV surface's
+shape is its `f_*` call arguments, *not* the N-D field, so it ignores the randomized dims / freq /
+harmonics that give TPMS batches their variety — a plain `-n N --surface f_torus` batch was N
+*identical* images. The new `--param-default {default,random}` flag fixes this: with `random`, every
+**unspecified** shape param — one the user neither pinned with `--lock NAME=VALUE` (S4) nor animated
+with `--oscillate NAME` (S5) — is drawn uniformly within its authored `[lo,hi]` range per variant
+seed, so each variant is a genuinely distinct shape; `default` (the flag's default) keeps the single
+authored default shape (the prior behavior). The draw is the **last** consumer of `pick_variant`'s
+per-variant RNG stream (after the hidden-offset and tumble draws), so turning it on never shifts the
+field's other random choices — a given seed's dims/freq/tumble are byte-identical with or without it.
+It is a no-op on a TPMS (which has no `pov_values`, and already varies via freq/threshold), and an
+explicit pin or swing opts that param out of the draw, so `--lock major=1.6 --param-default random`
+freezes the major radius while the minor still varies from variant to variant. The flag is named
+`--param-default` (not `--axis-default`) to avoid colliding with the pre-existing `--axis-default`
+{random,on,off} axis-polarity flag. 7 new tests (450 loom green); smoke-validated — `-n 3 --surface
+f_torus --param-default random` emits three distinct `f_torus(x,y,z,·,·)` calls where `default` emits
+one shared `f_torus(x,y,z,1,0.25)`. Still to come: S6 affine N-D remap.
 
 ---
 

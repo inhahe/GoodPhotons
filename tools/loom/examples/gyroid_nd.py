@@ -1411,6 +1411,19 @@ def pick_variant(seed: int, args: argparse.Namespace,
             if nm in amap:
                 pv[amap[nm][0]] = float(val)
         pov_values = tuple(pv)
+    # S7: with --param-default random, draw each UNSPECIFIED param (not pinned, not swung) uniformly
+    # in its authored [lo,hi] — this is what makes a POV batch vary (POV surfaces ignore the
+    # randomized dims/freq, so without it every variant is the same default shape).  Drawn last in
+    # the RNG stream (after hidden_offset/tumble) so it never perturbs the field's reproducibility.
+    if pov_values and getattr(args, "param_default", "default") == "random":
+        pinned = set(locks or {})
+        swung = set(getattr(args, "pov_swing", {}) or {})
+        pv = list(pov_values)
+        for i, (axis, _desc, _default, (lo, hi)) in enumerate(pov_params(surface)):
+            if axis in pinned or axis in swung:
+                continue                                # an explicit choice opts out of the draw
+            pv[i] = rng.uniform(lo, hi)
+        pov_values = tuple(pv)
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
@@ -3242,6 +3255,14 @@ def build_parser() -> argparse.ArgumentParser:
                                             "(default 3 7)")
     g.add_argument("--phase0", action="store_true",
                    help="set every phase to 0 (deterministic pattern position) instead of random")
+    g.add_argument("--param-default", choices=("default", "random"), default="default",
+                   help="how a POV surface's UNSPECIFIED shape params (not pinned by --lock nor "
+                        "animated by --oscillate) get their value: 'default' (each param's authored "
+                        "default; the current behavior) or 'random' (draw each uniformly within its "
+                        "authored [lo,hi] range, per variant seed). 'random' is what gives a POV "
+                        "batch (-n N) actual variety — otherwise every variant shares the one default "
+                        "shape (POV surfaces ignore the randomized dims/freq/harmonics). No effect on "
+                        "a TPMS (its shape comes from freq/threshold, already randomized).")
     g.add_argument("--pin-axes", action=argparse.BooleanOptionalAction, default=True,
                    help="pin the first three dimensions to the world X/Y/Z axes so the slice "
                         "always contains the ordinary xyz volume (default; this is what lets "

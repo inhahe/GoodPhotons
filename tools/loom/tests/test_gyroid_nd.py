@@ -1620,6 +1620,61 @@ def test_pov_param_swing_coexists_with_a_lock_pin():
 
 
 # ---------------------------------------------------------------------------
+# S7: --param-default random draws UNSPECIFIED POV shape params (roadmap P3.3)
+# ---------------------------------------------------------------------------
+
+def test_param_default_default_keeps_the_authored_shape():
+    # the ordinary path: every variant shares the one authored default shape
+    for seed in (1, 7, 99):
+        v = _pv("--surface", "f_torus", "--param-default", "default", seed=seed)
+        assert v.pov_values == pytest.approx((1.0, 0.25))
+
+
+def test_param_default_random_varies_across_seeds():
+    seen = {_pv("--surface", "f_torus", "--param-default", "random", seed=s).pov_values
+            for s in range(8)}
+    assert len(seen) > 1                                  # a POV batch finally has variety
+
+
+def test_param_default_random_is_reproducible_for_a_seed():
+    a = _pv("--surface", "f_torus", "--param-default", "random", seed=42)
+    b = _pv("--surface", "f_torus", "--param-default", "random", seed=42)
+    assert a.pov_values == b.pov_values
+
+
+def test_param_default_random_stays_within_each_range():
+    ranges = [rng for _ax, _d, _def, rng in g.pov_params("f_torus")]
+    for s in range(12):
+        vals = _pv("--surface", "f_torus", "--param-default", "random", seed=s).pov_values
+        for val, (lo, hi) in zip(vals, ranges):
+            assert lo <= val <= hi
+
+
+def test_param_default_random_respects_a_lock_pin():
+    # a pinned param opts out of the draw; the rest still vary
+    for s in range(6):
+        v = _pv("--surface", "f_torus", "--param-default", "random",
+                "--lock", "major=1.6", seed=s)
+        assert v.pov_values[0] == pytest.approx(1.6)     # major held at its pin
+
+
+def test_param_default_random_respects_a_swinger():
+    # a swung param keeps its authored base (the swing animates around it); only
+    # the un-swung, un-pinned params get the random draw
+    for s in range(6):
+        v = _pv("--surface", "f_torus", "--param-default", "random",
+                "--oscillate", "minor", seed=s)
+        assert v.pov_values[1] == pytest.approx(0.25)    # minor base un-drawn
+        assert v.pov_swing == {"minor": 1.0}
+
+
+def test_param_default_random_no_effect_on_a_tpms():
+    # a periodic surface has no pov_values, so the flag is a no-op
+    a = _pv("--dims", "6", "--param-default", "random", seed=3)
+    assert a.pov_values == ()
+
+
+# ---------------------------------------------------------------------------
 # unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
 # ---------------------------------------------------------------------------
 
