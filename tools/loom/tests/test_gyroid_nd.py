@@ -1184,10 +1184,11 @@ def test_pov_scene_uses_per_function_grad_bound():
     assert m and abs(float(m.group(1)) - 1.0) < 1e-9
 
 
-def test_pov_unknown_grad_bound_falls_back_to_default():
-    # f_heart has no tabulated bound yet -> the conservative default is used.
+def test_pov_unanalyzable_grad_bound_falls_back_to_default():
+    # f_klein_bottle is not an analyzable algebraic field (the S2 bounder declines it) and it
+    # is not in the cheap table -> the conservative default is emitted.
     import re
-    v = _pv("--surface", "f_heart")
+    v = _pv("--surface", "f_klein_bottle")
     body = _scene_body(v)
     m = re.search(r"max_gradient\s+([0-9.]+)", body)
     assert m and abs(float(m.group(1)) - g._POV_GRAD_DEFAULT) < 1e-9
@@ -1245,6 +1246,52 @@ def test_pov_threshold_shifts_isolevel_on_top_of_level():
     v = _pv("--surface", "f_ellipsoid", "--threshold", "0.2")
     body = _scene_body(v)
     assert "-(1.2)" in body
+
+
+# ---------------------------------------------------------------------------
+# POV tight active-band gradient bound (P3.3 slice S2, Option B): the emitted
+# max_gradient comes from loom.pov_grad's rigorous per-function bounder, not a
+# hand-picked default.
+# ---------------------------------------------------------------------------
+
+def _emitted_grad(body):
+    import re
+    m = re.search(r"max_gradient\s+([0-9.]+)", body)
+    assert m, "no max_gradient in emitted scene"
+    return float(m.group(1))
+
+
+def test_pov_grad_bound_matches_resolver_for_the_box():
+    # the emitted max_gradient is exactly what _pov_grad_bound computes for the render box
+    # (radius 1.3 * 1.05), tying emission to the S2 bounder with no drift.
+    v = _pv("--surface", "f_heart")
+    body = _scene_body(v)
+    want = g._pov_grad_bound("f_heart", v.pov_values, 1.3 * 1.05)
+    # the emitted number is fmt()-rounded, so compare against the same formatting
+    assert _emitted_grad(body) == float(g.fmt(want))
+
+
+def test_pov_heart_grad_bound_is_tight_not_the_default():
+    # f_heart's true |grad| ceiling is ~70 over this box: the bounder must emit that (well
+    # above the 8.0 default, and far below a naive whole-box degree-6 blow-up).
+    v = _pv("--surface", "f_heart")
+    b = _emitted_grad(_scene_body(v))
+    assert b > g._POV_GRAD_DEFAULT           # the old default would have punched holes
+    assert 50.0 < b < 200.0
+
+
+def test_pov_hunt_surface_needs_a_large_bound():
+    # f_hunt_surface is degree 6 with big coefficients: its ceiling is ~1e4, so the 8.0 default
+    # would be a catastrophic under-estimate.  The bounder catches this.
+    v = _pv("--surface", "f_hunt_surface")
+    b = _emitted_grad(_scene_body(v))
+    assert b > 1000.0
+
+
+def test_pov_sphere_grad_bound_is_analytic_one():
+    # the SDF-like primitives get their exact analytic bound, no interval machinery.
+    v = _pv("--surface", "f_sphere")
+    assert abs(_emitted_grad(_scene_body(v)) - 1.0) < 1e-9
 
 
 # ---------------------------------------------------------------------------

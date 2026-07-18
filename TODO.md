@@ -220,13 +220,22 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       negated (sign flip leaves `|∇f|`/`max_gradient` unchanged), non-zero-level funcs (f_ellipsoid, surface
       at level 1) shifted first; un-tabulated funcs fall back to honest `(+1,0)`. Validated: f_heart renders a
       solid valentine, f_ellipsoid a solid unit sphere (both were broken). 6 more tests (384 loom green).
-      Still: (S2) SymPy/interval per-function gradient
-      table — **Option B chosen (user, 2026-07-18):** bound `|∇f|` only over the *active band* near the
-      surface (where the clamped function isn't railed), giving tight/fast bounds; rigor via interval
-      arithmetic (SymPy + mpmath.iv) with branch-and-bound subdivision discarding fully-clamped sub-boxes,
-      and safe defaults kept for the noise/atan2/ROT2D functions. (S3) bbox container table + `--shell`; (S4) named params as `--lock NAME=VALUE` fixed values;
+      **(S2) done 2026-07-18 (Option B)** — tight active-band gradient bound in new `loom/pov_grad.py`,
+      wired into `build_scene` via `_pov_grad_bound(name, values, box)`. A **correctness** fix, not just
+      speed: POV algebraic builtins are `clamp(P0·r, ±10)` and a high-degree `r` has a huge gradient far
+      from the surface — f_hunt_surface's true `|∇f|` ≈ 11000, so the old `8.0` default was a catastrophic
+      under-estimate (marcher oversteps → holes). Bound `|∇f|` only over the un-railed **active band**
+      (`|P0·r|<10`): rigorous (crossing ±10→0 takes ≥ `10/bound` of travel, so sphere-tracing never
+      oversteps) and tight (skips the railed tails). Impl: vectorised adaptive interval branch-and-bound
+      (numpy `_IV` intervals on the *factored* derivatives w/ exact even-power handling; certify a lower
+      bound from band sample points, discard sub-boxes provably below it, octasect survivors, stop within
+      tol; ×1.02 safety). Closed forms for SDF-like primitives (sphere/torus→1, ellipsoid→max|semi-axis|);
+      returns None for noise/atan2/rotation → caller keeps default. Cross-checked vs dense numeric sample:
+      rigorous + ≈1.05× tight; render-validated f_hunt_surface hole-free. 13 more tests (397 loom green).
+      Still: (S3) bbox container table + `--shell`; (S4) named params as `--lock NAME=VALUE` fixed values;
       (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
-      random-draw for unspecified params.
+      random-draw for unspecified params. **Note for S5:** the S2 bound is per (name, params, box) and
+      cached — animating a param means recomputing it per frame (or bounding once over the param range).
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
       split real. After P3.3.

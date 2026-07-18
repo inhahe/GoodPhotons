@@ -1533,14 +1533,17 @@ def surface_names() -> List[str]:
 # (rather than a bare "unknown surface").
 _TPMS_CATALOG_ONLY = frozenset({"schwarz_d", "neovius"})
 
-# A conservative default Lipschitz bound for a POV field whose true |grad| ceiling is not
-# yet tabulated.  S2 replaces this with a per-function table derived symbolically; until
-# then over-estimating only shrinks the safe march step (never punches holes).
+# A conservative fallback Lipschitz bound for a POV field whose true |grad| ceiling can't be
+# derived (noise / atan2 / rotation builtins).  For the algebraic builtins S2's active-band
+# bounder (loom.pov_grad) computes a tight, rigorous ceiling instead; this default is only used
+# when neither the bounder nor the table below applies.  NOTE: for a high-degree algebraic field
+# this default is a *massive under-estimate* (f_hunt_surface's true ceiling is ~11000), so it must
+# never be relied on for those — the bounder exists precisely to avoid holes there.
 _POV_GRAD_DEFAULT = 8.0
 
-# Per-function |grad f| ceilings for the POV builtins whose bound is known cheaply.  Many
-# POV primitives are exact or near-signed-distance fields (|grad| == 1), so their bound is
-# just a small safety margin.  Entries here override _POV_GRAD_DEFAULT.
+# Cheap closed-form |grad f| ceilings, tried before the default when the S2 bounder declines a
+# function (or as a fast path for the SDF-like primitives).  Entries here override
+# _POV_GRAD_DEFAULT; the bounder (when it returns a value) overrides these.
 _POV_GRAD_BOUND = {
     "f_sphere": 1.0,        # -P0 + sqrt(x^2+y^2+z^2): exact SDF, |grad| == 1
     "f_torus": 1.0,         # -P1 + sqrt((sqrt(x^2+z^2)-P0)^2 + y^2): |grad| == 1
@@ -1584,6 +1587,27 @@ def _pov_solid_meta(name: str) -> Tuple[float, float]:
     to the honest ``(+1, 0)`` for functions not yet individually validated.
     """
     return _POV_SOLID_META.get(name, (1.0, 0.0))
+
+
+def _pov_grad_bound(name: str, values: Tuple[float, ...], box_half: float) -> float:
+    """The ``max_gradient`` to emit for POV builtin ``name`` sliced over the cube of half-width
+    ``box_half`` at shape params ``values``.
+
+    Prefers S2's tight, rigorous *active-band* bound (:func:`loom.pov_grad.active_band_grad_bound`),
+    which is essential — not merely nice — for the high-degree algebraic builtins whose true
+    ``|grad f|`` ceiling dwarfs any hand-picked default (understate it and the sphere-marcher
+    oversteps and punches holes).  Falls back to the cheap :data:`_POV_GRAD_BOUND` table, then
+    the conservative :data:`_POV_GRAD_DEFAULT`, when the bounder can't analyze the field (a
+    noise / atan2 / rotation builtin) or its optional deps (numpy/sympy) are missing.
+    """
+    try:
+        from loom.pov_grad import active_band_grad_bound
+        b = active_band_grad_bound(name, values, box_half)
+        if b is not None and b > 0.0:
+            return float(b)
+    except Exception:                            # optional deps absent, or an unforeseen field
+        pass                                     # -> honest conservative fallback below
+    return _POV_GRAD_BOUND.get(name, _POV_GRAD_DEFAULT)
 
 
 def _is_pov_surface(name: str) -> bool:
@@ -2135,8 +2159,11 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
             sheet = inner if sign > 0 else f"-({inner})"
         else:
             sheet = f"({expr})" if sign > 0 else f"-({expr})"
-        grad_bound = _POV_GRAD_BOUND.get(surface, _POV_GRAD_DEFAULT)
         box = radius * 1.05                              # contained_by half-extent
+        # S2: tight active-band gradient bound over the actual container box (sign flip and the
+        # level/threshold shift are pure offsets — neither changes |grad f| — so the bound is
+        # computed on the raw field and reused verbatim for the emitted `sheet`).
+        grad_bound = _pov_grad_bound(surface, tuple(getattr(v, "pov_values", ())), box)
         r = radius
         return _assemble_iso_scene(sheet, grad_bound, radius, box, r, res,
                                    env_file, mat_def)

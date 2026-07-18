@@ -462,10 +462,32 @@ threshold))`, so a positive-inside function is negated (a sign flip leaves `|∇
 `f_ellipsoid`, `≥ 0` everywhere with the surface at level 1) is shifted before the sign
 test. Un-tabulated functions fall back to the honest `(+1, 0)` passthrough. Validated:
 `f_heart` now renders as a solid valentine and `f_ellipsoid` as a solid unit sphere (both
-were broken before). Still to come: S2 symbolic per-function gradient table (Option B —
-tight bound over the active band near the surface via interval arithmetic), S3 bbox
-containers + `--shell`, S4 `--lock NAME=VALUE`, S5 params as `--oscillate` swingers, S6
-affine N-D remap, S7 `--axis-default` random param draw.
+were broken before).
+
+**P3.3 slice S2 — tight active-band gradient bound (done 2026-07-18, Option B):** the
+`max_gradient` a POV solid emits is now a *rigorous, tight* per-function ceiling computed by
+`loom.pov_grad.active_band_grad_bound`, not the hand-picked `8.0` default. This is a
+**correctness** fix, not just a speed one: most POV algebraic builtins are
+`f = clamp(P0·r(x,y,z), −10, +10)`, and a high-degree `r` has an enormous gradient far from
+the surface — `f_hunt_surface`'s true `|∇f|` ceiling is ≈ 11000, so the old `8.0` default was
+a catastrophic *under*-estimate that would make ftrace's sphere-marcher overstep and punch
+holes. The key insight (Option B): the gradient only matters on the **active band** where the
+field is un-railed (`|P0·r| < 10`); in the railed tails `f` is pinned to ±10 and flat, so a
+band-only bound is both rigorous (sphere-tracing never oversteps: crossing from ±10 to 0 takes
+at least `10/bound` of travel) and tight (ignores the railed high-gradient tails). The bounder
+runs a **vectorised adaptive interval branch-and-bound**: cut the box into a grid, enclose
+`|∇f|` per sub-box with natural interval arithmetic on the *factored* derivatives (with exact
+even-power handling so the dependency blow-up never happens), certify a lower bound from
+active-band sample points, discard every sub-box provably below it, octasect the survivors, and
+stop when the max outstanding interval-sup is within tol of the certified max — times a small
+safety factor so it never dips under the true sup. Closed-form fast paths cover the SDF-like
+primitives (`f_sphere`/`f_torus` → 1, `f_ellipsoid` → `max|semi-axis|`). Noise / `atan2` /
+rotation builtins aren't analyzable → the bounder returns `None` and the caller keeps the
+conservative default. Cross-checked against a dense numerical gradient sample: rigorous (never
+under) and tight (≈ 1.05×) for `f_heart`/`f_hunt_surface`/`f_kummer_surface_v1`; render-validated
+`f_hunt_surface` as a clean hole-free solid. New module `loom/pov_grad.py` (+ `test_pov_grad.py`);
+397 loom green. Still to come: S3 bbox containers + `--shell`, S4 `--lock NAME=VALUE`, S5 params
+as `--oscillate` swingers, S6 affine N-D remap, S7 `--axis-default` random param draw.
 
 ---
 
