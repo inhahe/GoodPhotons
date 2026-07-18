@@ -1301,14 +1301,93 @@ def test_oscillate_conflicts_with_legacy_bloom_flag():
         g.main(["--oscillate", "freq", "--bloom", "threshold", "--no-video", "--count", "1"])
 
 
-def test_oscillate_rate_not_wired_yet():
-    with pytest.raises(SystemExit):
-        g.pick_variant(3, _args("--dims", "6", "--oscillate", "tumble", "rate", "2"), {})
+# --- P1.4: winder rate (= winding), phase, and bare dim-index axes ---
+
+def _d(v, idx):
+    return [d for d in v.dim_list if d.index == idx][0]
 
 
-def test_oscillate_bare_dim_not_wired_yet():
+def test_oscillate_motion_rate_equals_max_winding():
+    # `rate R` on a motion group is the ceiling of the varied winding cycle == --max-winding R
+    _osc_equiv(11, ["--dims", "8", "--oscillate", "drift", "rate", "3"],
+               ["--dims", "8", "--transform", "drift", "--max-winding", "3"])
+
+
+def test_oscillate_tumble_rate_equals_max_winding():
+    _osc_equiv(7, ["--dims", "8", "--oscillate", "tumble", "rate", "2"],
+               ["--dims", "8", "--transform", "tumble", "--max-winding", "2"])
+
+
+def test_oscillate_motion_rate_records_ceiling():
+    a = _args("--dims", "8", "--oscillate", "drift", "rate", "5")
+    g.resolve_oscillate(a)
+    assert a.osc_max_winding == 5
+    assert a.transform == "drift"
+
+
+def test_oscillate_bare_dim_pins_exact_winding():
+    # a lone dim index is forced on and pinned to an exact winding (round(amp*rate))
+    v = g.pick_variant(3, _args("--dims", "6", "--oscillate", "3", "rate", "2"), {})
+    d3 = _d(v, 3)
+    assert d3.oscillate
+    assert d3.winding == 2
+
+
+def test_oscillate_bare_dim_amp_is_winding():
+    # amp == rate for a winder, so 2*3 (amp) and `3 rate 2` both give dim 3 winding 2
+    v = g.pick_variant(3, _args("--dims", "6", "--oscillate", "2*3"), {})
+    assert _d(v, 3).winding == 2 and _d(v, 3).oscillate
+
+
+def test_oscillate_bare_dim_defaults_to_drift():
+    a = _args("--dims", "6", "--oscillate", "3")
+    g.resolve_oscillate(a)
+    assert a.transform == "drift"            # a bare dim moves via drift
+    assert a.osc_dim_windings == {3: 1}      # default amp*rate == 1
+
+
+def test_oscillate_bare_dim_raises_dim_floor():
+    # naming dim 5 forces D >= 6, so --dims 4 is infeasible
     with pytest.raises(SystemExit):
-        g.pick_variant(3, _args("--dims", "6", "--oscillate", "3"), {})
+        g.pick_variant(3, _args("--dims", "4", "--oscillate", "5"), {})
+
+
+def test_oscillate_bare_dim_conflicts_with_axis_off():
+    with pytest.raises(SystemExit):
+        g.pick_variant(3, _args("--dims", "6", "--oscillate", "3"),
+                       {3: g.AxisLock(on=False)})
+
+
+def test_oscillate_phase_loops_seamlessly_and_shifts():
+    v = g.pick_variant(11, _args("--dims", "6", "--oscillate", "drift", "phase", "pi/2"), {})
+    assert v.osc_phase == math.pi / 2
+    # seamless: the loop still returns to itself at t=1
+    assert g.field_expr(v, 0.0, "drift") == g.field_expr(v, 1.0, "drift")
+    # but the phase genuinely offsets the start relative to the unphased loop
+    v0 = g.pick_variant(11, _args("--dims", "6", "--oscillate", "drift"), {})
+    assert g.field_expr(v, 0.0, "drift") != g.field_expr(v0, 0.0, "drift")
+
+
+def test_oscillate_phase_default_is_byte_identical():
+    # no phase given => osc_phase 0 => identical to the plain drift loop
+    v = g.pick_variant(11, _args("--dims", "6", "--oscillate", "drift"), {})
+    assert v.osc_phase == 0.0
+    vb = g.pick_variant(11, _args("--dims", "6", "--transform", "drift"), {})
+    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+        assert g.field_expr(v, t, "drift") == g.field_expr(vb, t, "drift")
+
+
+def test_oscillate_conflicting_rates_error():
+    # two independent motion groups with different rates can't share the one winding clock
+    with pytest.raises(SystemExit):
+        g.pick_variant(3, _args("--dims", "8", "--oscillate", "drift", "rate", "2",
+                                "rotate", "rate", "3"), {})
+
+
+def test_oscillate_swinger_rate_rejected():
+    # freq/threshold/thickness/bloom ride the fixed sin^2 envelope: no adjustable clock yet
+    with pytest.raises(SystemExit):
+        g.pick_variant(3, _args("--dims", "6", "--oscillate", "freq", "rate", "2"), {})
 
 
 def _run_all():

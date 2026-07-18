@@ -224,7 +224,24 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
    `--oscillate bloom,freq` render through the full CLI→ftrace pipeline, and a byte-identical
    `.ftsl` diff (incl. the `1.5*freq` per-axis-amp case). 314 loom tests green.
 4. **Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims) with per-group `rate`
-   (= winding) and `phase`. Replace `--tumble-*`. Add tests; keep aliases.
+   (= winding) and `phase`. ✅ **DONE 2026-07-18.** `resolve_oscillate` now emits three
+   winder-clock outputs the picker honors (all no-ops on the legacy `--transform` path,
+   so those variants stay bit-identical): `args.osc_dim_windings` — a bare dim index is
+   the atomic winder, forced on and pinned to an **exact** integer winding
+   `round(amp*rate)` (`--oscillate 3 rate 2` → dim 3 winds twice; `2*3` is the same since
+   `amp≡rate`); `args.osc_max_winding` — an explicit `rate` on a **motion** group
+   (`drift`/`rotate`/`tumble`) is the **ceiling** of the RNG-varied `1..N` winding cycle
+   (overrides `--max-winding`, keeps the distinct-rate spread — "how fast, at most",
+   consistent with a lone dim's exact rate); `args.osc_phase` — a constant radians offset
+   (`2*pi` = one turn) added to the shared winding clock (drift/rotate/tumble), from a
+   winder group's `phase`, which shifts where the loop starts while keeping `t=0==t=1`.
+   The engine has one shared winding clock, so conflicting motion rates/phases across
+   independent groups are rejected, as is `rate`/`phase` on a swinger (its `sin²(πt)`
+   envelope has no adjustable clock — that's a later step). Bare dims with no named motion
+   default to `drift`. Validated by 12 new tests (motion-rate ≡ `--max-winding`, bare-dim
+   exact/amp winding, dim-floor + off-lock conflicts, seamless phase offset, rate/phase
+   conflict + swinger-rate guards) and a real `--oscillate drift rate 3` video through the
+   CLI→ftrace pipeline. 324 loom tests green. Still TODO: flip the default (step 5).
 5. **Flip the default** so `--oscillate` is primary and `--transform` prints a
    deprecation notice. Update README, module docstring, epilog, `--help`.
 6. **(Phase 2) `--couple` cluster command** (§6): parse clusters → the existing

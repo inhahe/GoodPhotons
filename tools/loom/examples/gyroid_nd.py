@@ -283,6 +283,9 @@ class Variant:
     tumble_locked: Tuple[int, ...] = () # tumble transform only: axis indices excluded from the
     #                                     slice-orientation rotation (they stay fixed while the
     #                                     other axes tumble).
+    osc_phase: float = 0.0              # constant radians offset added to the shared winding
+    #                                     clock (2*pi = one turn); from a --oscillate winder
+    #                                     group's `phase`.  0 (legacy) => t=0 is the base field.
     surface: str = "gyroid"             # which triply-periodic minimal surface family the
     #                                     field belongs to.  'gyroid' (default): the pairwise
     #                                     Schoen gyroid, sum over coupling edges (a,b) of
@@ -796,14 +799,34 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
       :func:`transform_to_oscillate`, so an ``--oscillate`` spec and its equivalent
       ``--transform`` spec produce identical variants.
 
-    Per-group ``rate``/``phase`` (the shared clock, and bare-dim targeting) are not wired
-    yet — they arrive in the next staging step — so an explicit ``rate``/``phase`` or a
-    bare dim index raises a clear "not yet" error rather than silently doing nothing."""
+    Winder ``rate``/``phase`` and bare dim indices (P1.4) resolve to three extra
+    outputs the picker honors on top of the legacy fields, all no-ops on the legacy
+    path:
+
+    * ``args.osc_dim_windings`` — ``{dim: winding}`` from bare dim-index axes (e.g.
+      ``--oscillate 3 rate 2`` -> ``{3: 2}``): each names one winder dim and pins it to
+      that **exact** integer winding (``round(amp*rate)``), forcing it to oscillate.
+    * ``args.osc_max_winding`` — the ceiling of the RNG-varied ``1..N`` winding cycle,
+      taken from an explicit ``rate`` on a **motion** group (``drift``/``rotate``/
+      ``tumble``); it overrides ``--max-winding`` while keeping the distinct-rate spread
+      (so ``rate`` on a motion is "how fast, at most", consistent with a lone dim index
+      whose ``rate`` is its exact winding).
+    * ``args.osc_phase`` — a constant radians offset added to the shared winding clock
+      (``2*pi`` = one turn), from a winder group's ``phase``.
+
+    The engine has a single shared winding clock, so conflicting motion rates/phases
+    across independent groups are rejected; ``rate``/``phase`` on a swinger axis (whose
+    fixed ``sin^2(pi t)`` bloom envelope has no adjustable clock) is likewise refused."""
     if getattr(args, "_oscillate_resolved", False):
         return
     args._oscillate_resolved = True
     if getattr(args, "bloom_amps", None) is None:
         args.bloom_amps = {}
+    # Winder-clock outputs (P1.4). Always set so the picker's getattr fallbacks are exact;
+    # the legacy --transform path returns below with these no-op defaults intact.
+    args.osc_dim_windings = {}
+    args.osc_max_winding = None
+    args.osc_phase = 0.0
 
     osc = getattr(args, "oscillate", None)
     lock = getattr(args, "lock", None)
@@ -831,24 +854,39 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
 
     groups = parse_oscillate(osc or [])
     lock_axes = parse_lock_axes(lock or [])
-    for grp in groups:
-        if grp.rate_set or grp.phase_set:
-            raise SystemExit("error: --oscillate 'rate'/'phase' (the per-group clock) is "
-                             "not wired yet — omit it for now (coming in the next step)")
 
     motions: List[str] = []
     bloom_active = False
     bloom_params: List[str] = []
     bloom_amps: Dict[str, float] = {}
     tumble_mode, tumble_amp = "rotate", 0.25
+    dim_windings: Dict[int, int] = {}       # bare dim-index -> exact winding
+    motion_ceilings: set = set()            # distinct explicit rate ceilings from motion groups
+    winder_phases: set = set()              # distinct explicit phases from winder groups
 
     for grp in groups:
+        g_axes = [ax for _, ax in grp.items]
+        has_winder = any(ax in _WINDER_MOTIONS or ax.isdigit() for ax in g_axes)
+        has_swinger = any(ax == "bloom" or ax in _SCALAR_SWINGERS for ax in g_axes)
+        # The scalar swingers / bloom ride the fixed sin^2(pi t) envelope, which has no
+        # adjustable clock, so an explicit rate/phase on one can't be honored yet.
+        if (grp.rate_set or grp.phase_set) and has_swinger:
+            raise SystemExit("error: --oscillate 'rate'/'phase' on a swinger axis "
+                             "(freq/threshold/thickness/bloom) is not wired yet — the "
+                             "bloom envelope's clock is fixed (winders only for now)")
+        if grp.phase_set and has_winder:
+            winder_phases.add(grp.phase)
         for amp, ax in grp.items:
             if ax in _WINDER_MOTIONS:
                 if ax == "tumble" and amp != 1.0:
                     tumble_mode, tumble_amp = "slide", float(amp)
                 if ax not in motions:
                     motions.append(ax)
+                # rate on a motion caps the varied winding cycle (option 2: "how fast, at
+                # most"); amp on drift/rotate is unusual and amp on tumble already means the
+                # slide amplitude, so the ceiling reads the group rate only.
+                if grp.rate_set:
+                    motion_ceilings.add(int(round(grp.rate)))
             elif ax == "bloom":
                 bloom_active = True
                 if "dims" not in bloom_params:
@@ -859,12 +897,40 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
                     bloom_params.append(ax)
                 bloom_amps[ax] = float(amp)
             elif ax.isdigit():
-                raise SystemExit(f"error: --oscillate: a bare spatial-dim index ({ax}) is "
-                                 f"not wired yet — needs the per-dim rate coming next step")
+                # A lone dim index is the atomic winder: its amp*rate (turns) is that dim's
+                # exact winding, and naming it pins it on (base+override, Q3).
+                d = int(ax)
+                w = int(round(amp * grp.rate))
+                if w < 1:
+                    raise SystemExit(f"error: --oscillate: dim {d} resolves to winding {w} "
+                                     f"(amp {amp:g} * rate {grp.rate:g}); a winder needs at "
+                                     f"least 1 whole turn")
+                dim_windings[d] = w
             else:
                 raise SystemExit(f"error: --oscillate: unknown axis {ax!r}")
 
+    # One shared winding clock in the engine: independent motion groups can't carry
+    # different rates or phases, so reject a conflict rather than silently dropping one.
+    if len(motion_ceilings) > 1:
+        raise SystemExit(f"error: --oscillate: conflicting winder rates {sorted(motion_ceilings)} "
+                         f"— the slice has a single shared winding clock, so all motion groups "
+                         f"must agree on one rate")
+    if len(winder_phases) > 1:
+        raise SystemExit(f"error: --oscillate: conflicting winder phases {sorted(winder_phases)} "
+                         f"— one shared clock allows only one phase")
+    if motion_ceilings:
+        args.osc_max_winding = next(iter(motion_ceilings))
+        if args.osc_max_winding < 1:
+            raise SystemExit("error: --oscillate: a motion 'rate' must be >= 1 (whole turns)")
+    if winder_phases:
+        args.osc_phase = next(iter(winder_phases))
+    args.osc_dim_windings = dim_windings
+
     canon = [m for m in _WINDER_MOTIONS if m in motions]
+    if dim_windings and not canon:
+        # Bare dim indices with no named motion animate via drift (the phase-advance that
+        # consumes each dim's winding), so make that explicit.
+        canon = ["drift"]
     if bloom_active:
         canon.append("bloom")
     if not canon:
@@ -903,6 +969,14 @@ def pick_variant(seed: int, args: argparse.Namespace,
     bloom_dims = "dims" in bloom_params    # crossfade the full N-D field in (vs. only pulsing
     #                                        scalar params around the fixed classic gyroid)
 
+    # Winder-clock outputs from --oscillate (P1.4). No-ops on the legacy --transform path
+    # ({}/None/0.0), so those variants stay bit-identical.
+    osc_dim_windings = {int(d): int(w) for d, w in
+                        (getattr(args, "osc_dim_windings", {}) or {}).items()}
+    osc_max_winding = getattr(args, "osc_max_winding", None)
+    osc_phase = float(getattr(args, "osc_phase", 0.0) or 0.0)
+    eff_max_w = max(1, osc_max_winding if osc_max_winding is not None else args.max_winding)
+
     # coupling-edge edits (--pair): endpoints of every referenced edge must be valid
     # dims, and an 'on' edge forces both its endpoints to oscillate (an edge needs two
     # waving axes to couple), mirroring how a forced harmonic implies an oscillating axis.
@@ -912,7 +986,9 @@ def pick_variant(seed: int, args: argparse.Namespace,
     pair_ref_axes = pair_on_axes | (set().union(*pair_off) if pair_off else set())
 
     # 1) total dimension count -------------------------------------------------
-    max_forced_axis = max([*axis_locks, *pair_ref_axes], default=-1)
+    # bare dim-index axes in --oscillate are forced-on winders, so they raise the dim floor
+    # just like an --axis/--pair reference.
+    max_forced_axis = max([*axis_locks, *pair_ref_axes, *osc_dim_windings], default=-1)
     dims_spec = getattr(args, "dims", None)
     floor = max(max_forced_axis + 1, 3)         # smallest legal D given forced axes
     if dims_spec is not None:
@@ -946,6 +1022,11 @@ def pick_variant(seed: int, args: argparse.Namespace,
     for d in forced_harm:                       # a forced harmonic implies oscillating
         forced_on.add(d)
     forced_on |= pair_on_axes                   # an 'on' coupling edge implies both endpoints wave
+    forced_on |= set(osc_dim_windings)          # a bare dim-index axis pins that dim on (Q3)
+    osc_win_conflict = set(osc_dim_windings) & forced_off
+    if osc_win_conflict:
+        raise SystemExit(f"error: axis {sorted(osc_win_conflict)} is both named in --oscillate "
+                         f"(forced on) and locked off (--axis d:off / --lock)")
     conflict = forced_on & forced_off
     if conflict:
         raise SystemExit(f"error: axis {sorted(conflict)} locked both on and off "
@@ -1071,12 +1152,18 @@ def pick_variant(seed: int, args: argparse.Namespace,
     # Animation drift: the main dim anchors (winding 0); every other oscillating dim
     # advances its phase by an integer number of cycles over one loop, so the slice
     # translates *through* that dimension and the interference pattern morphs.  Rates
-    # are distinct-ish (1,2,..,max,1,2,..) so no two dims move in lockstep.
-    max_w = max(1, args.max_winding)
+    # are distinct-ish (1,2,..,max,1,2,..) so no two dims move in lockstep.  A --oscillate
+    # 'rate' on a motion group raises the ceiling (eff_max_w) but keeps that spread.
+    max_w = eff_max_w
     non_main_osc = [d for d in sorted(osc) if d != main]
     by_index = {dm.index: dm for dm in dims}
     for i, d in enumerate(non_main_osc):
         by_index[d].winding = (i % max_w) + 1
+    # Bare dim-index axes (--oscillate 3 rate 2) pin an exact per-dim winding, overriding the
+    # varied cycle above.  Applied after (no RNG drawn) so unspecified dims keep their stream.
+    for d, w in osc_dim_windings.items():
+        if d in by_index and by_index[d].oscillate:
+            by_index[d].winding = w
 
     freq_spec = getattr(args, "freq", None)
     if freq_spec is not None:
@@ -1114,7 +1201,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
     tumble_locked: Tuple[int, ...] = (_parse_tumble_lock(_tl) if isinstance(_tl, str)
                                       else tuple(sorted(_tl or ())))
     if _has(transform, "tumble"):
-        max_w = max(1, args.max_winding)
+        max_w = eff_max_w
         locked = set(a for a in tumble_locked if 0 <= a < D)
         rest = [d for d in range(3, D) if d not in locked]
         rng.shuffle(rest)                               # random hidden partners per seed
@@ -1143,7 +1230,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_planes=tumble_planes,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
-                   tumble_locked=tumble_locked,
+                   tumble_locked=tumble_locked, osc_phase=osc_phase,
                    surface=getattr(args, "surface", "gyroid"),
                    coupling=getattr(args, "coupling", "cyclic"),
                    pair_on=pair_on, pair_off=pair_off, dim_list=dims)
@@ -1191,15 +1278,16 @@ def _tumbled_directions(v: "Variant", t: float) -> Dict[int, Tuple[float, float,
     dirs: Dict[int, List[float]] = {d.index: list(d.direction) for d in v.dim_list}
     two_pi = 2.0 * math.pi
     slide = (v.tumble_mode == "slide")
+    oph = getattr(v, "osc_phase", 0.0)      # --oscillate winder phase (0 on the legacy path)
     for (i, j, wind) in v.tumble_planes:
         di = dirs.get(i)
         dj = dirs.get(j)
         if di is None or dj is None:
             continue
         if slide:
-            a = (two_pi * v.tumble_amp) * math.sin(two_pi * wind * t)
+            a = (two_pi * v.tumble_amp) * math.sin(two_pi * wind * t + oph)
         else:
-            a = two_pi * wind * t
+            a = two_pi * wind * t + oph
         ca, sa = math.cos(a), math.sin(a)
         dirs[i] = [ca * di[k] - sa * dj[k] for k in range(3)]
         dirs[j] = [sa * di[k] + ca * dj[k] for k in range(3)]
@@ -1478,6 +1566,9 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
     tdirs = _tumbled_directions(v, t) if do_tumble else None
     u = {}
     two_pi = 2.0 * math.pi
+    # --oscillate winder phase: a constant radians offset on the shared clock (0 on the
+    # legacy path).  It shifts where the loop starts but keeps t=0==t=1 seamless.
+    oph = getattr(v, "osc_phase", 0.0)
     for d in osc:
         dim = by_index[d]
         k = dim.harmonic * fr                       # base in-slice frequency for this dim
@@ -1485,11 +1576,11 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         coeff = k
         phase = dim.phase
         if do_rotate:
-            alpha = two_pi * dim.winding * t
+            alpha = two_pi * dim.winding * t + oph
             coeff *= math.cos(alpha)
             phase += k * dim.hidden_offset * math.sin(alpha)
         if do_drift:
-            phase += two_pi * dim.winding * t
+            phase += two_pi * dim.winding * t + oph
         # Reduce the phase modulo 2*pi so t=0 and t=1 emit the *same* constant (whole-cycle
         # advances) -> a perfectly seamless loop despite float rounding.
         u[d] = _arg_expr(direction, coeff, phase % two_pi)

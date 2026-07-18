@@ -121,8 +121,23 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
         314 loom tests green.
       - *Deferred to P1.4 (guarded with clear "not yet" errors):* per-group `rate`/`phase` (the
         shared clock / winding override) and bare spatial-dim-index axes.
-- [ ] **P1.4 Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims), per-group `rate` (= winding) +
-      `phase`; replace `--tumble-*` (keep aliases). Tests.
+- [x] **P1.4 Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims), per-group `rate` (= winding) +
+      `phase`; replace `--tumble-*` (keep aliases). ✅ 2026-07-18.
+      - `resolve_oscillate` emits three winder-clock outputs the picker honors, all no-ops on the
+        legacy `--transform` path (those variants stay bit-identical):
+        - `args.osc_dim_windings` — a **bare dim index** is the atomic winder: forced on and pinned
+          to an **exact** integer winding `round(amp*rate)` (`--oscillate 3 rate 2` → dim 3 winds
+          twice; `2*3` is identical since `amp≡rate`). Raises the dim floor; off-lock conflict errors.
+        - `args.osc_max_winding` — an explicit `rate` on a **motion** group is the **ceiling** of the
+          RNG-varied `1..N` winding cycle (overrides `--max-winding`, keeps the distinct-rate spread
+          — "how fast, at most", consistent with a lone dim's exact rate).
+        - `args.osc_phase` — a constant radians offset (`2π` = one turn) on the shared winding clock
+          (drift/rotate/tumble), from a group's `phase`; shifts the loop start, keeps `t=0==t=1`.
+      - One shared winding clock ⇒ conflicting motion rates/phases across groups are rejected, as is
+        `rate`/`phase` on a swinger (fixed `sin²(πt)` envelope — later step). Bare dims with no named
+        motion default to `drift`.
+      - **Validated:** 12 new tests + a real `--oscillate drift rate 3` video through the CLI→ftrace
+        pipeline. 324 loom tests green.
 - [ ] **P1.5 Flip default** — `--oscillate` primary, `--transform` prints deprecation notice; update
       README, module docstring, epilog, `--help`.
 
@@ -212,3 +227,12 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   the legacy `--transform` form (incl. `1.5*freq`). 314 loom green. (Corrected an earlier bad call:
   the live-preview rule never blocked rendering-to-validate — CLAUDE.md reworded to say so.)
   Next: P1.4 (wire winder `rate`/`phase` + bare-dim axes — the RNG-order-sensitive winding piece).
+- 2026-07-18: **P1.4 done.** Wired the winder axes. `resolve_oscillate` now emits `osc_dim_windings`
+  (bare dim index → exact `round(amp*rate)` winding, forced on), `osc_max_winding` (a motion group's
+  `rate` = the ceiling of the varied `1..N` cycle, per the user's option-2 call — consistent with a
+  lone dim's exact rate), and `osc_phase` (a constant radians offset on the shared winding clock);
+  the picker applies windings after the RNG cycle (no draw consumed) and threads phase into
+  `field_expr`/`_tumbled_directions`, all no-ops on the legacy path so existing variants stay
+  bit-identical. Single shared clock ⇒ conflicting motion rates/phases and swinger `rate`/`phase`
+  are rejected. 12 new tests + a real `--oscillate drift rate 3` video (CLI→ftrace). 324 loom green.
+  Next: P1.5 (flip default — `--oscillate` primary, `--transform` deprecation notice + docs).
