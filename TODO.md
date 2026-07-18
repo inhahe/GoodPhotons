@@ -410,9 +410,18 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 
 ## C. Renderer roadmap follow-ups  *(origin: `ROADMAP.md` — main items DONE; these remain)*
 
-- [ ] **C1 Mode M true final gather.** Mode M does a *direct density query* at the first diffuse hit,
-      not a secondary-hemisphere final gather. A real final-gather pass is the future enhancement
-      (noted in `known-issues.md`).
+- [x] **C1 Mode M true final gather.** DONE 2026-07-14 (`-pmfg <K>` / `g_pmFinalGather`). At the first
+      diffuse hit mode M now shoots `K` cosine-weighted hemisphere sub-rays (`photonGatherSub`,
+      `photonmap_render.h`), traces one bounce each, and queries the map at *those* points, so the
+      density-estimate blur lives one bounce away — the standard Jensen secondary-hemisphere final
+      gather. Direct light uses low-variance NEE (`neeLight`); gather rays collect indirect/env only
+      (no double-count). `K=0` keeps the original direct query (a pure superset). Validated on the
+      diffuse Cornell box: final gather matches mode R in energy (diffuse-mask M/R=1.010) and is
+      essentially unbiased at a large gather radius (M/R=0.994 vs. the direct query's 0.929
+      corner-darkening). See `known-issues.md` "Mode M optional Jensen final gather". *Remaining
+      GPU caveat (separate, lesser item): the shared GPU mode-M path still falls back to CPU when
+      `-pmfg` is set — porting the final-gather sub-ray pass to CUDA is future work, tracked in
+      known-issues.md.*
 - [ ] **C2 VDB: native sparse device sampler.** Today the NanoVDB grid is baked to a **dense** float
       lattice for the device sampler; a native sparse GPU sampler is the follow-up.
 - [ ] **C3 VDB: fp16 + emission/temperature grids** (fire) — currently float density grids only.
@@ -430,10 +439,87 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 
 ## D. Hero-room showcase scene  *(origin: `ROADMAP_heroroom.md`)*
 
+> **BLOCKED on user sign-off.** None of D2/D3 (the expensive verify renders) proceed until the
+> user has personally verified — in the interactive rasterizer flyby-definition tool (the
+> camera_curve editor) — that they *like the room and the flyby*. The look-dev of the room
+> composition and the camera path is a human aesthetic decision, so don't burn photon-map renders
+> on a room/flyby that hasn't been approved. Once the user says "I like it", D2/D3 are unblocked.
+
 - [~] **D1 Flyby photon-map render** — GPU shared photon-map path (build once, gather all 144 frames),
       `-savemap gallery/hero_map.ftpmap`. (Was in progress.)
 - [ ] **D2 Verify still** — raster + a real photon-mapped render frame; confirm all pieces read.
 - [ ] **D3 Verify flyby** — render frames + assemble; confirm gyroid thread + glass pass + seamless loop.
+
+---
+
+## E. Feature ideas captured 2026-07-18  *(user-proposed; design-captured, not yet scheduled)*
+
+### E1 — Procedural (function-defined) skin, UV-space  *(ftrace; small–medium, self-contained)*
+**Idea.** Let a skin be defined by a *function* `f(u,v)` evaluated on demand instead of a pre-drawn
+image, but applied through the **exact same UV-wrap machinery** an image skin uses — poll `f(u,v)` in
+place of `image(u,v)` for each hit's interpolated UV. **Verdict: worth adding.** It's a genuine gap:
+ftrace today has (a) UV-mapped *image* skins (`texture "name" { file … }`, sampled at each hit's UV —
+`loom.Texture`/`skin`) and (b) *3-D-space* procedural patterns (`FuncPattern`/`SpatialExpr`, evaluated
+at the surface point's world/object XYZ via `dPatternEval`). What's missing is the third square of the
+matrix — a **UV-space procedural**: an arbitrary ftsl expression whose variables are the surface `u,v`
+(and, cheaply, its derivatives / the hit's other channels), bound like a texture. The evaluator already
+exists (`dPatternEval` runs arbitrary postfix bytecode on host+device); the work is (1) expose `u,v` as
+pattern inputs when a pattern is bound in a *texture* slot, (2) a `texture "name" { expr … }` (or
+`pattern uv:<name>`) grammar so a material's `reflect texture:<name>` resolves to the function instead
+of a bitmap, (3) loom `FuncSkin`/`skin(expr=…)` emit, (4) tests + a render. Low risk, high reuse. Open
+sub-q: also expose bump/normal-from-UV-gradient for free (the derivative is analytic on the bytecode).
+
+### E2 — General N-D curve → scene-variable animation via the rasterizer curve editor  *(loom + ftrace; LARGE, design; extends §A)*
+**Idea.** Generalize ftrace's existing interactive **camera_curve editor** (drop control points,
+scrub/play, paint local speed, edit-in-place, save a real `camera_curve` block — `main.cpp` ~4473+)
+from "edit a camera flyby" into "edit an **N-D curve through a grid/scatterplot** whose curve variables
+can drive **any** scene variable," with **loom as the go-between** (`.ftsl` can't express animation, so
+the animation binding must live in loom, which emits the per-frame `.ftsl`). **Verdict: worth capturing
+as a design item; it's big and overlaps §A — schedule after §A lands.** The locked-in pieces of the
+user's design:
+- **Two authoring modes, chosen up front:** *pure flyby* vs. *true animation*. For most render modes the
+  distinction "costs nothing." In **flyby** mode everything sampled — `curve(which, frame, dim)` or
+  `grid/scatter(curve-coords, dim)` — collapses to just **camera position + orientation at time t**. In
+  **animation** mode any sampled value can map to **any** scene variable (e.g. in the gyroid_nd
+  isosurface example, any isosurface function parameter).
+- **One exceedingly-simple binding API** (lives in the loom go-between, not `.ftsl`): *plug any curve
+  variable into any scene variable* — camera position/orientation, or a surface param, etc.
+- **The scene informs the editor**, through that same API, of: the curve's dimensionality, how many
+  curves are tacked onto it, and the full array of **starting control points** to seed the editor with.
+- **Modulable curve points are OUT for the editor.** The user resolved this: the rasterizer *already*
+  owns the time dimension via curve points, so passing loom-modulable (time-varying) control points would
+  introduce a *second* time axis — incoherent. So the editor receives a **static starting array** of
+  control points; modulation of the points, if any, stays a loom-side concern that is *not* round-tripped
+  through the editor.
+- **Likely simplification (open q the user leaned toward "yes"):** there may be **no real distinction**
+  between higher-D aspects of the curve itself (a 4-D curve) and extra dimensions "tacked on" (e.g. camera
+  density), because the editor ignores every spatial dimension past the first three anyway — so the API
+  and editing UX can treat them uniformly (one flat list of per-point dimensions).
+- **Relation to §A:** §A already covers "loom emits a real `camera_curve` + ftrace orientation axes." E2
+  is the strict generalization — same editor, same emit path, but the curve's sampled channels fan out to
+  arbitrary scene variables, not only camera pose. Build §A first (it nails the camera/orientation case
+  and the emit grammar), then E2 widens the binding target set and the editor's scene-driven seeding.
+
+### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; design decided)*
+**Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
+models — (1) emit one sample value per time tick, vs. (2) random-access a sample array (`buf[t] += v`,
+`=`, `*=`, …) and serialize at the end. **Decision (from `loomsound.txt`): build ONE back-end — the
+random-access sample buffer as the single source of truth — and make "one sample per tick" a thin cursor
+wrapper on top (`emit(v)` ≡ `buf[cursor++] += v`), NOT a second parallel pipeline.** Rationale: the
+buffer model strictly subsumes streaming (it enables mixing multiple voices, overlap-add, reverb/delay
+tails past a note's end, range fades, whole-file normalize-before-write, revision) — additive/subtractive
+synthesis *is* the buffer model; per-tick streaming is just the buffer with a monotone write cursor and
+no look-back/ahead. Two separate systems would duplicate dithering/clip/normalize/interleave/format-write
+(divergent-code-path tech debt). Concrete shape: **core** = a per-channel float sample buffer (read/write/
+accumulate at any index); **producers** write however they like (per-tick cursor *or* scatter-write
+ranges); a single **`finalize()`** does gain/normalize/dither/clip → format-encode → write. "Per-tick" and
+"whole-file" become two front-ends over one back-end. **The one genuine fork** that would force a separate
+path is *real-time / unbounded* output (live to speakers, or an effectively-infinite stream you can't hold
+in RAM) — then you must flush fixed-size blocks and can't revise the past; even then, share everything
+below "how samples are produced" (mixer, format, dither, clip/normalize, writer). **Deciding question
+before building:** is loom's audio strictly *offline & bounded* (render a finite file) — then build only
+the buffer model — or is live playback ever on the table? (Assume offline-only unless the user says
+otherwise.) *Note: loom has no audio subsystem today, so this is a new capability, not a refactor.*
 
 ---
 
@@ -529,3 +615,12 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   (rate stored + peaks at t=¼,¾; default byte-identity; integer-rate seamless; phase flips the bump
   but still loops; `bloom`→`dims` keying; non-integer warning via `main`), 365 loom green.
   Next: P3.3.
+- 2026-07-18: **P3.4 + P3.5 done** (see §B entries) — true N-D forms for the 9 generalizable POV solids,
+  then ordered/overlapping tumble via `--tumble-sequence`. 515 loom green; both render-validated.
+- 2026-07-18: **Housekeeping.** Verified **C1 (mode-M final gather) was already done** (2026-07-14,
+  `-pmfg`) and marked it off (GPU-port of the sub-ray pass remains a lesser follow-up). Added a
+  **BLOCKED-on-user-sign-off** gate to §D (no D2/D3 verify renders until the user approves the room +
+  flyby in the rasterizer camera_curve editor). Captured three user-proposed features as §E: E1
+  UV-space procedural skin (ftrace, small), E2 general N-D-curve→scene-variable animation via the
+  rasterizer curve editor (loom+ftrace, large, extends §A), E3 loom procedural audio (one buffer
+  back-end, per-tick as a thin front-end — decided).
