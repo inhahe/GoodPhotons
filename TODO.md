@@ -101,8 +101,11 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       parser, not yet wired to behavior. 17 unit tests in `test_gyroid_nd.py` (grouping,
       amplitudes incl. `2*pi*x`, rate/phase either order, reserved-word/duplicate/empty/
       bad-expr errors, lock flatten+dedup). 285 loom tests green.
-- [ ] **P1.2 Desugar `--transform` → groups.** Route existing transform code through the group
-      model; all existing tests pass unchanged.
+- [x] **P1.2 Desugar `--transform` → groups.** ✅ 2026-07-18. Added `transform_to_oscillate(...)`
+      + `oscillate_spec(...)` in `gyroid_nd.py`: behavior-preserving bridge re-expressing today's
+      `--transform`/`--bloom`/`--bloom-amp`/`--tumble-*` flags as one canonical composite
+      `OscGroup` per §3 migration map. Pure model, execution path untouched; 13 new tests, 298
+      loom tests green.
 - [ ] **P1.3 Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`), `amp` = amplitude;
       replace `--bloom`/`--bloom-amp` (keep as aliases). Tests.
 - [ ] **P1.4 Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims), per-group `rate` (= winding) +
@@ -179,3 +182,8 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 - 2026-07-18: **P1.1 done.** Standalone `--oscillate`/`--lock` grammar parser + `OscGroup` model +
   safe arithmetic evaluator in `gyroid_nd.py`; 17 parser unit tests; 285 loom tests green. No
   behavior wired yet (that's P1.2 — desugar `--transform` through the group model). Next: P1.2.
+- 2026-07-18: **P1.2 done.** `transform_to_oscillate(...)` + `oscillate_spec(...)` desugaring bridge
+  maps today's `--transform`/`--bloom`/`--bloom-amp`/`--tumble-*` to one canonical composite
+  `OscGroup` (§3 migration map). Pure model — execution path untouched, all existing tests pass
+  unchanged. 13 new tests; 298 loom tests green. Next: P1.3 (wire swinger axes freq/threshold/
+  thickness/bloom to real behavior — the deterministic, non-RNG-sensitive half).

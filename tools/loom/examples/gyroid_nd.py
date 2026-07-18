@@ -685,6 +685,76 @@ def parse_lock_axes(tokens) -> List[str]:
     return list(seen.keys())
 
 
+def transform_to_oscillate(transform: str, *, bloom_params=("dims",),
+                           bloom_amp: float = 1.0, tumble_mode: str = "rotate",
+                           tumble_amp: float = 0.25) -> List[OscGroup]:
+    """Desugar today's ``--transform`` (+ its satellite ``--bloom`` / ``--bloom-amp``
+    / ``--tumble-mode`` / ``--tumble-amp`` flags) into the canonical ``--oscillate``
+    group model (OSCILLATE_GRAMMAR.md §3 migration map).
+
+    This is the behavior-preserving bridge for staging step 2: the *same* semantics
+    the tool implements today, re-expressed as a single composite :class:`OscGroup`.
+    Layered transforms and bloom parameters all ride one shared clock (rate 1, phase
+    0), matching the current single-loop cadence — the migration table maps e.g.
+    ``--transform drift,tumble`` -> ``--oscillate drift,tumble`` (one composite) and
+    ``--transform bloom --bloom freq,threshold`` -> ``--oscillate bloom,freq,threshold``.
+
+    Item amplitudes capture today's magnitude knobs:
+
+    * winders (``drift``/``rotate``/``tumble``) — amplitude 1 (winding is carried by
+      ``rate``, left RNG-random per dim), except ``tumble`` under ``--tumble-mode
+      slide`` which becomes ``tumble_amp*tumble`` (its bounded rock in turns);
+    * ``bloom`` (the dimensional cross-fade) — amplitude 1, present iff ``dims`` is a
+      bloom target (``--bloom dims``; the envelope itself carries no ``--bloom-amp``);
+    * scalar swingers (``freq``/``threshold``/``thickness``) — amplitude ``bloom_amp``,
+      present iff both the ``bloom`` transform is active and the parameter is a
+      ``--bloom`` target.
+
+    Returns ``[]`` for an empty/pinned transform (no motion). The result is a list for
+    forward-compatibility with independent oscillators, but today's flags only ever
+    produce a single group."""
+    items: List[Tuple[float, str]] = []
+    has_bloom = _has(transform, "bloom")
+    # winder motions in canonical TRANSFORMS order (drift, rotate, tumble)
+    for m in _motions(transform):
+        if m == "tumble" and tumble_mode == "slide":
+            items.append((float(tumble_amp), "tumble"))
+        else:
+            items.append((1.0, m))
+    if has_bloom:
+        bp = tuple(bloom_params or ())
+        if "dims" in bp:
+            items.append((1.0, "bloom"))
+        # scalar swingers keep BLOOM_PARAMS order (freq, threshold, thickness)
+        for p in ("freq", "threshold", "thickness"):
+            if p in bp:
+                items.append((float(bloom_amp), p))
+    return [OscGroup(items)] if items else []
+
+
+def oscillate_spec(groups: List[OscGroup]) -> str:
+    """Render a list of :class:`OscGroup` back to a canonical ``--oscillate`` spec
+    string (inverse of :func:`parse_oscillate` up to formatting). Groups are joined
+    by spaces, items within a group by commas; an amplitude of 1 is elided, ``rate``
+    and ``phase`` are printed only when non-default. Useful for the ``--transform``
+    deprecation notice and for equivalence tests."""
+    def fmt_num(x: float) -> str:
+        return str(int(x)) if float(x).is_integer() else repr(x)
+
+    out: List[str] = []
+    for grp in groups:
+        parts = []
+        for amp, ax in grp.items:
+            parts.append(ax if amp == 1.0 else f"{fmt_num(amp)}*{ax}")
+        chunk = ",".join(parts)
+        if grp.rate != 1.0:
+            chunk += f" rate {fmt_num(grp.rate)}"
+        if grp.phase != 0.0:
+            chunk += f" phase {fmt_num(grp.phase)}"
+        out.append(chunk)
+    return " ".join(out)
+
+
 # ---------------------------------------------------------------------------
 # the picker
 # ---------------------------------------------------------------------------

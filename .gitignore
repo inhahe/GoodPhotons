@@ -71,3 +71,4 @@ __pycache__/
 # OS
 Thumbs.db
 Desktop.ini
+/build_nocuda/

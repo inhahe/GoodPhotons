@@ -200,9 +200,15 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
    parser — not yet wired to any behavior. Unit-tested in isolation (17 tests in
    `tests/test_gyroid_nd.py`: grouping, amplitudes incl. `2*pi*x`, rate/phase either order,
    reserved-word/duplicate/empty/bad-expr errors, `--lock` flatten+dedup). 285 loom tests green.
-2. **Desugar `--transform` → groups.** Route the *existing* transform code through the
-   new group model (transform names → default groups with today's semantics). All 106
-   existing tests must still pass unchanged.
+2. **Desugar `--transform` → groups. ✅ DONE 2026-07-18.** Added
+   `transform_to_oscillate(transform, *, bloom_params, bloom_amp, tumble_mode,
+   tumble_amp) -> List[OscGroup]` (and the inverse `oscillate_spec(groups) -> str`)
+   in `examples/gyroid_nd.py`: the behavior-preserving bridge that re-expresses
+   today's `--transform` + `--bloom`/`--bloom-amp`/`--tumble-mode`/`--tumble-amp`
+   flags as one canonical composite `OscGroup` per §3's migration map (winders amp 1,
+   tumble-slide → `tumble_amp*tumble`, `dims`→`bloom`, scalar swingers at amp
+   `bloom_amp`, scalars only under an active bloom). Pure model — the execution path is
+   untouched, so all existing tests pass unchanged. 13 new tests (298 loom tests green).
 3. **Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`) so `amp` = amplitude,
    replacing `--bloom`/`--bloom-amp`. Add tests; keep old flags as aliases.
 4. **Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims) with per-group `rate`

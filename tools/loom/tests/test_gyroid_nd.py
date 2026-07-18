@@ -1106,6 +1106,82 @@ def test_lock_flattens_and_dedups():
     assert axes == ["tumble", "bloom", "0"]    # order preserved, deduped
 
 
+# --- P1.2: --transform -> --oscillate desugaring bridge (OSCILLATE_GRAMMAR §3) ---
+
+def test_transform_desugar_drift_default():
+    grps = g.transform_to_oscillate("drift")
+    assert g.oscillate_spec(grps) == "drift"
+
+
+def test_transform_desugar_rotate():
+    assert g.oscillate_spec(g.transform_to_oscillate("rotate")) == "rotate"
+
+
+def test_transform_desugar_tumble_rotate_mode():
+    # default tumble mode 'rotate' -> plain tumble (amp 1)
+    assert g.oscillate_spec(g.transform_to_oscillate("tumble")) == "tumble"
+
+
+def test_transform_desugar_layered_is_one_composite_group():
+    grps = g.transform_to_oscillate("drift+tumble")
+    assert len(grps) == 1                       # comma-joined single composite
+    assert g.oscillate_spec(grps) == "drift,tumble"
+
+
+def test_transform_desugar_bloom_dims_default():
+    # --transform bloom (default --bloom dims) -> just 'bloom'
+    grps = g.transform_to_oscillate("bloom", bloom_params=("dims",))
+    assert g.oscillate_spec(grps) == "bloom"
+
+
+def test_transform_desugar_bloom_scalar_params():
+    grps = g.transform_to_oscillate("bloom", bloom_params=("freq", "threshold"))
+    # 'dims' absent -> no bloom envelope item; freq/threshold swingers at amp 1
+    assert g.oscillate_spec(grps) == "freq,threshold"
+
+
+def test_transform_desugar_bloom_dims_and_scalars():
+    grps = g.transform_to_oscillate("bloom", bloom_params=("dims", "freq", "threshold"))
+    assert g.oscillate_spec(grps) == "bloom,freq,threshold"
+
+
+def test_transform_desugar_bloom_amp_scales_swingers():
+    grps = g.transform_to_oscillate("bloom", bloom_params=("freq",), bloom_amp=1.5)
+    assert g.oscillate_spec(grps) == "1.5*freq"
+    # the dims-crossfade 'bloom' item is never scaled by bloom_amp
+    grps2 = g.transform_to_oscillate("bloom", bloom_params=("dims", "freq"), bloom_amp=1.5)
+    assert g.oscillate_spec(grps2) == "bloom,1.5*freq"
+
+
+def test_transform_desugar_scalars_only_under_bloom():
+    # scalar swingers do nothing without the bloom transform active
+    grps = g.transform_to_oscillate("drift", bloom_params=("freq",))
+    assert g.oscillate_spec(grps) == "drift"
+
+
+def test_transform_desugar_tumble_slide_uses_tumble_amp():
+    grps = g.transform_to_oscillate("tumble", tumble_mode="slide", tumble_amp=0.3)
+    assert g.oscillate_spec(grps) == "0.3*tumble"
+
+
+def test_transform_desugar_full_stack():
+    grps = g.transform_to_oscillate("drift+tumble+bloom",
+                                    bloom_params=("dims", "freq"), bloom_amp=2)
+    assert g.oscillate_spec(grps) == "drift,tumble,bloom,2*freq"
+
+
+def test_transform_desugar_empty_is_no_groups():
+    assert g.transform_to_oscillate("") == []
+
+
+def test_transform_desugar_roundtrips_through_parser():
+    # desugared spec must parse back to an equivalent group model
+    grps = g.transform_to_oscillate("drift+tumble+bloom",
+                                    bloom_params=("dims", "freq"), bloom_amp=2)
+    reparsed = g.parse_oscillate(g.oscillate_spec(grps).split())
+    assert g.oscillate_spec(reparsed) == g.oscillate_spec(grps)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
