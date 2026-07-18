@@ -154,6 +154,67 @@ def test_coercion_errors():
         raise AssertionError("a string must not coerce into a spatial expr")
 
 
+def test_rings_center_shifts_source_and_default_is_unchanged():
+    from loom.spatial import rings
+    # default-centred rings emits the plain x/y/z distance (byte-identical to old form)
+    assert "sqrt(((((x)*(x))+((y)*(y)))+((z)*(z))))" in _emit(rings(2.0))
+    # a shifted centre subtracts the offset -> the pattern moves
+    shifted = rings(2.0, center=(0.5, 0.0, 0.0))
+    assert "(x)-(0.5)" in _emit(shifted)
+    # numerically: the crest that sat at the origin is displaced
+    xs = np.array([0.0, 0.5])
+    at = lambda e, x: e.eval_np((np.array([x]), 0.0, 0.0), Clock(t=0.0), Cache())[0]
+    assert abs(at(rings(6.0), 0.0) - at(rings(6.0, center=(0.5, 0, 0)), 0.5)) < 1e-9
+
+
+def test_interference_superposes_two_sources_in_range():
+    from loom.spatial import interference
+    e = interference(3.0)
+    # two radial sources -> two sqrt distance terms in the emitted field
+    assert _emit(e).count("sqrt") == 2
+    # stays in [0, 1] across the plane
+    xs, ys = np.meshgrid(np.linspace(-1, 1, 40), np.linspace(-1, 1, 40))
+    v = e.eval_np((xs, ys, np.zeros_like(xs)), Clock(t=0.0), Cache())
+    assert v.min() >= -1e-9 and v.max() <= 1.0 + 1e-9
+    # on the perpendicular bisector (x=0) the two path lengths are equal -> full crest
+    mid = e.eval_np((np.array([0.0]), np.array([0.0]), np.array([0.0])),
+                    Clock(t=0.0), Cache())[0]
+    assert mid > 0.99
+
+
+def test_interference_animated_source_loops():
+    from loom.spatial import interference
+    # a moving emitter (Signal x-coordinate) makes the field time-varying but seamless
+    sx = Sine(cycles=1.0, amp=0.4)
+    e = interference(6.0, source_a=(sx, 0.0, 0.0))
+    assert e.uses_time()
+    a = _emit(e, clock=Clock.at_frame(0, 12))
+    b = _emit(e, clock=Clock.at_frame(3, 12))
+    assert a != b                                        # animates
+    # frame N wraps back to frame 0 (closed loop)
+    assert _emit(e, clock=Clock.at_frame(0, 12)) == _emit(e, clock=Clock.at_frame(12, 12))
+
+
+def test_moire_two_gratings_and_animated_angle():
+    from loom.spatial import moire
+    e = moire(6.0, angle=0.2)
+    assert _emit(e).count("sin(((6)*") == 2              # two overlaid freq-6 rulings
+    xs, ys = np.meshgrid(np.linspace(-1, 1, 40), np.linspace(-1, 1, 40))
+    v = e.eval_np((xs, ys, np.zeros_like(xs)), Clock(t=0.0), Cache())
+    assert v.min() >= -1e-9 and v.max() <= 1.0 + 1e-9
+    # an animated rotation angle makes the fringes crawl
+    m = moire(6.0, angle=Sine(cycles=1.0, amp=0.3))
+    assert m.uses_time()
+    assert _emit(m, clock=Clock(t=0.0)) != _emit(m, clock=Clock(t=0.3))
+
+
+def test_new_spatial_presets_registered():
+    for name in ("interference", "moire"):
+        assert name in SPATIAL_PATTERNS
+        expr = SPATIAL_PATTERNS[name](4.0)
+        assert isinstance(expr, SpatialExpr)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
