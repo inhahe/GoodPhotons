@@ -42,7 +42,7 @@ Full 3-D camera rotation = 3 DOF. We author it as two independent axes; the thir
 - **right** — 0 DOF, **always derived**: `right = normalize(forward × up)`, then up is
   re-orthogonalized `up = right × forward`. Never authored.
 
-### Per-curve reference frame (locked: per curve, `travel | world`)
+### Reference frame (locked: **per orientation axis**, `travel | world`)
 An orthogonal choice of what "reference up / straight ahead" *mean* before the `fwd_at`/`up_at`/
 `roll_at` overrides apply:
 - **`world`** — fixed world axes (a global up vector; today's behavior).
@@ -52,13 +52,25 @@ An orthogonal choice of what "reference up / straight ahead" *mean* before the `
   orientation returns to itself seamlessly (same technique the sweep engine's closed-spine frame
   uses, `DESIGN.md` §7a).
 
+**This is an ftrace decision; loom mirrors it 1:1.** The orientation math lives in ftrace's
+`camera_curve`; loom's bridge only emits `.ftsl` text and can express exactly what ftrace parses.
+ftrace does **none** of this today (only tangent-look + world `up` + scalar `roll_at`), so we are
+choosing ftrace's new behavior — not matching an existing one. **Decision: the frame is chosen
+per orientation axis** (`fwd_at` and `up_at` each carry their own optional `frame travel|world`,
+with a curve-level default), *not* one switch for the whole camera. Per-axis is strictly more
+expressive — a single global frame is just "both axes set the same" — and it's the only way to
+express e.g. *forward locked to a fixed world subject across the room while up rides the travel
+frame so the shot still banks into turns*. It costs ftrace's parser one optional keyword per curve
+instead of per block. loom exposes the same per-axis `frame` and emits it into each track.
+
 ### Tasks
 - [ ] **ftrace: `fwd_at` vector track** on `camera_curve` — parse + store a per-keyframe 3-vector
       forward direction; sample on the same `u` as position; normalize; fall back to tangent/aim
       when absent.
 - [ ] **ftrace: `up_at` vector track** — parse + store a per-keyframe 3-vector up; re-orthogonalize
       against forward; fall back to reference up (`roll_at` still composes on top).
-- [ ] **ftrace: per-curve `frame travel|world`** keyword — select world axes vs RMF reference.
+- [ ] **ftrace: per-axis `frame travel|world`** keyword — `fwd_at` and `up_at` each select world
+      axes vs RMF reference independently (curve-level default); global frame = both set the same.
 - [ ] **ftrace: RMF construction** (double-reflection parallel transport) + **closed-loop twist
       distribution** for seamless closed curves.
 - [ ] **ftrace: `right = forward × up` derivation** + up re-orthogonalization, roll composed on top.
@@ -66,7 +78,8 @@ An orthogonal choice of what "reference up / straight ahead" *mean* before the `
       to today (tangent look + world up + `roll_at`).
 - [ ] **loom: `CameraCurve` scene element** — emit a real `camera_curve` from a `TrackedCurve`/points:
       position → `point`, speed/density track → `density_at`, roll track → `roll_at`, orientation
-      tracks → `fwd_at`/`up_at`, per-curve `frame`.
+      tracks → `fwd_at`/`up_at`, per-axis `frame`. Mirrors ftrace's grammar 1:1 (no orientation
+      semantics loom can't emit).
 - [ ] **Docs** — README (ftrace camera_curve grammar) + loom docstrings; update `DESIGN.md` with a
       milestone (M13) once landed.
 - [ ] **Tests** — loom `CameraCurve` emit golden; ftrace parse of `fwd_at`/`up_at`/`frame`; RMF +
