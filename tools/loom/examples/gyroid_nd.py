@@ -38,6 +38,12 @@ standard way the Schoen gyroid generalizes, giving **m terms** for ``m`` oscilla
 (``sin(u_i)*cos(u_j)``), i.e. ``C(m,2)`` terms — e.g. 15 for 6 dims instead of 6 — a denser,
 more interwoven lattice (the two schemes match in count only for ``m <= 3``, and even at
 ``m = 3`` cover different pairings, so ``--coupling all`` is not the exact classic gyroid).
+Think of the field as a **coupling graph** whose nodes are dimensions and whose edges are
+the ``sin*cos`` terms: ``--axis`` edits *nodes* (turn a dim on/off, set its harmonic) while
+``--pair I,J:on|off`` edits individual *edges* on top of the chosen base graph — delete a
+single term (``I,J:off``) or add an extra chord (``I,J:on``, which forces both endpoints to
+oscillate).  The comma names an edge's two endpoints, distinct from ``--axis``'s hyphen node
+range (``LO-HI``).
 
 The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **thickened
 gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball — on its own, with no Cornell box or
@@ -250,6 +256,11 @@ class Variant:
     #                                     dims); 'all' = every unordered pair i<j, sin(u_i)cos(u_j)
     #                                     (C(m,2) terms — a denser, more interwoven lattice for
     #                                     m>3; identical term *count* to cyclic only at m<=3).
+    pair_on: frozenset = frozenset()    # individual coupling *edges* forced on (extra chords):
+    #                                     each a frozenset({i, j}); both endpoints oscillate.
+    pair_off: frozenset = frozenset()   # individual coupling edges deleted from the field:
+    #                                     each a frozenset({i, j}); the sin(u_i)cos(u_j) term is
+    #                                     dropped (edits on top of the 'cyclic'/'all' base graph).
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -347,6 +358,65 @@ def parse_axis_lock(spec: str, locks: Dict[int, AxisLock]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# pair-lock parsing:  i,j:on | i,j:off   (an individual coupling *edge*)
+# ---------------------------------------------------------------------------
+#
+# Where --axis operates on *nodes* (dimensions) of the coupling graph, --pair
+# operates on individual *edges* — one sin(u_i)*cos(u_j) coupling term.  The
+# comma (i,j) names the two endpoints of a single edge, distinct from the hyphen
+# range (lo-hi) that --axis uses to name a run of nodes.  ':off' deletes that
+# edge from the field; ':on' adds it as an extra chord (both endpoints must
+# oscillate, so an 'on' edge forces its endpoints on, mirroring how a forced
+# harmonic implies an oscillating axis).
+
+def parse_pair_lock(spec: str, on_set: set, off_set: set) -> None:
+    """Parse a single ``--pair i,j:on|off`` spec into the on/off edge sets.
+
+    Each edge is stored as a ``frozenset({i, j})`` (unordered — an edge has no
+    intrinsic direction; the field emits sin of the lower index, cos of the
+    higher).  Raises on a malformed spec or an edge locked both on and off."""
+    parts = spec.split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"--pair '{spec}': expected I,J:on|off (e.g. 3,5:off), where I and J "
+            f"are the two dimension indices of one coupling edge")
+    ends = [e.strip() for e in parts[0].split(",")]
+    if len(ends) != 2:
+        raise argparse.ArgumentTypeError(
+            f"--pair '{spec}': an edge needs exactly two endpoints separated by a "
+            f"comma (e.g. 3,5); got '{parts[0]}'")
+    try:
+        i, j = int(ends[0]), int(ends[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--pair '{spec}': endpoints must be integers (e.g. 3,5)")
+    if i < 0 or j < 0:
+        raise argparse.ArgumentTypeError(f"--pair '{spec}': axis index must be >= 0")
+    if i == j:
+        raise argparse.ArgumentTypeError(
+            f"--pair '{spec}': an edge needs two distinct endpoints (got {i},{j})")
+    state = parts[1].strip().lower()
+    if state in ("on", "osc", "oscillate", "true", "1", "yes"):
+        on = True
+    elif state in ("off", "no", "false", "0", "static", "inert"):
+        on = False
+    else:
+        raise argparse.ArgumentTypeError(
+            f"--pair '{spec}': state must be 'on' or 'off', got '{parts[1]}'")
+    edge = frozenset((i, j))
+    if on:
+        if edge in off_set:
+            raise argparse.ArgumentTypeError(
+                f"--pair: edge {i},{j} locked both on and off")
+        on_set.add(edge)
+    else:
+        if edge in on_set:
+            raise argparse.ArgumentTypeError(
+                f"--pair: edge {i},{j} locked both on and off")
+        off_set.add(edge)
+
+
+# ---------------------------------------------------------------------------
 # the picker
 # ---------------------------------------------------------------------------
 
@@ -368,12 +438,21 @@ def pick_variant(seed: int, args: argparse.Namespace,
     bloom_dims = "dims" in bloom_params    # crossfade the full N-D field in (vs. only pulsing
     #                                        scalar params around the fixed classic gyroid)
 
+    # coupling-edge edits (--pair): endpoints of every referenced edge must be valid
+    # dims, and an 'on' edge forces both its endpoints to oscillate (an edge needs two
+    # waving axes to couple), mirroring how a forced harmonic implies an oscillating axis.
+    pair_on = frozenset(getattr(args, "pair_on", frozenset()))
+    pair_off = frozenset(getattr(args, "pair_off", frozenset()))
+    pair_on_axes = set().union(*pair_on) if pair_on else set()
+    pair_ref_axes = pair_on_axes | (set().union(*pair_off) if pair_off else set())
+
     # 1) total dimension count -------------------------------------------------
-    max_forced_axis = max(axis_locks) if axis_locks else -1
+    max_forced_axis = max([*axis_locks, *pair_ref_axes], default=-1)
     if args.dims is not None:
         D = args.dims
         if max_forced_axis >= D:
-            raise SystemExit(f"error: --axis references axis {max_forced_axis} but "
+            src = "--axis/--pair" if pair_ref_axes else "--axis"
+            raise SystemExit(f"error: {src} references axis {max_forced_axis} but "
                              f"--dims is {D} (axis index must be < dims)")
     else:
         lo = max(args.dims_range[0], max_forced_axis + 1, 3)
@@ -387,9 +466,11 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    if lk.harmonic is not None}
     for d in forced_harm:                       # a forced harmonic implies oscillating
         forced_on.add(d)
+    forced_on |= pair_on_axes                   # an 'on' coupling edge implies both endpoints wave
     conflict = forced_on & forced_off
     if conflict:
-        raise SystemExit(f"error: axis {sorted(conflict)} locked both on and off")
+        raise SystemExit(f"error: axis {sorted(conflict)} locked both on and off "
+                         f"(check --axis / --pair …:on)")
     must_on = sorted(forced_on)
     must_off = sorted(forced_off)
 
@@ -533,7 +614,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
                    tumble_locked=tumble_locked,
-                   coupling=getattr(args, "coupling", "cyclic"), dim_list=dims)
+                   coupling=getattr(args, "coupling", "cyclic"),
+                   pair_on=pair_on, pair_off=pair_off, dim_list=dims)
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +802,46 @@ def bloom_thickness_scale(v: "Variant", t: float) -> float:
     return 1.0
 
 
+def coupling_pairs(v: "Variant") -> List[Tuple[int, int]]:
+    """The ordered ``(a, b)`` coupling edges of the field — one ``sin(u_a)*cos(u_b)``
+    term each — after applying the base scheme (:attr:`Variant.coupling`) and the
+    per-edge ``--pair`` edits (:attr:`Variant.pair_on` / :attr:`Variant.pair_off`).
+
+    The base graph is either the ``cyclic`` ring (the m consecutive pairs
+    ``(o_i, o_{i+1})`` mod m — the standard gyroid; for m=2 this is the two mirrored
+    terms ``(o0,o1)`` and ``(o1,o0)``, which are deliberately *not* deduplicated) or
+    the ``all`` complete graph (every unordered pair ``i<j``).  Then any edge in
+    ``pair_off`` is deleted, and any edge in ``pair_on`` not already present is added
+    as an extra chord (sin of the lower index, cos of the higher).  Only edges whose
+    both endpoints oscillate survive.  The returned order is base-graph order first,
+    then the added chords sorted by endpoints (stable, for reproducible expressions)."""
+    osc = sorted(v.oscillating)
+    osc_set = set(osc)
+    m = len(osc)
+    if getattr(v, "coupling", "cyclic") == "all":
+        base = [(osc[i], osc[j]) for i in range(m) for j in range(i + 1, m)]
+    else:
+        base = [(osc[i], osc[(i + 1) % m]) for i in range(m)]
+    pair_off = getattr(v, "pair_off", frozenset())
+    pair_on = getattr(v, "pair_on", frozenset())
+    out: List[Tuple[int, int]] = []
+    present = set()
+    for (a, b) in base:
+        if frozenset((a, b)) in pair_off:
+            continue                    # deleted edge
+        out.append((a, b))
+        present.add(frozenset((a, b)))
+    for edge in sorted(pair_on, key=lambda s: sorted(s)):
+        a, b = sorted(edge)
+        if a not in osc_set or b not in osc_set:
+            continue                    # endpoint isn't oscillating -> no term to add
+        if frozenset((a, b)) in pair_off or frozenset((a, b)) in present:
+            continue                    # conflicting/off, or already an edge
+        out.append((a, b))              # extra chord: sin(lower) * cos(higher)
+        present.add(frozenset((a, b)))
+    return out
+
+
 def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
                freq: Optional[float] = None) -> str:
     """Emit the gyroid field at loop phase ``t`` in [0,1) under the chosen ``transform``.
@@ -774,7 +896,6 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         return f"({fmt(1.0 - w)})*({g_classic})+({fmt(w)})*({g_full})"
     fr = v.freq if freq is None else freq
     osc = sorted(v.oscillating)
-    m = len(osc)
     by_index = {d.index: d for d in v.dim_list}
     # The three motion layers *compose* on each dim's argument u_d = coeff*(dir . xyz) + phase:
     #   tumble — remap the whole slice basis in N-D (dir_d -> rotated row; the phases stay put
@@ -802,21 +923,12 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         # Reduce the phase modulo 2*pi so t=0 and t=1 emit the *same* constant (whole-cycle
         # advances) -> a perfectly seamless loop despite float rounding.
         u[d] = _arg_expr(direction, coeff, phase % two_pi)
-    # Sum the sin*cos coupling terms.  'cyclic' (default) sums the m consecutive pairs
-    # (o_i, o_{i+1}) taken mod m — the standard gyroid, m terms.  'all' sums every unordered
-    # pair i<j (sin of the lower index, cos of the higher) — C(m,2) terms, a denser, more
-    # interwoven lattice for m>3.  Both coincide (up to which pairs) only for m<=3.
-    terms = []
-    if getattr(v, "coupling", "cyclic") == "all":
-        for i in range(m):
-            for j in range(i + 1, m):
-                terms.append(f"sin({u[osc[i]]})*cos({u[osc[j]]})")
-    else:
-        for i in range(m):
-            a = osc[i]
-            b = osc[(i + 1) % m]
-            terms.append(f"sin({u[a]})*cos({u[b]})")
-    return "+".join(terms)
+    # Sum the sin*cos coupling terms.  The set of edges comes from coupling_pairs(): the
+    # 'cyclic' ring (m consecutive pairs — the standard gyroid) or the 'all' complete graph
+    # (every unordered pair i<j), then the per-edge --pair edits (drop 'off' edges, add 'on'
+    # chords).  Each edge (a,b) emits one sin(u_a)*cos(u_b) term.
+    terms = [f"sin({u[a]})*cos({u[b]})" for (a, b) in coupling_pairs(v)]
+    return "+".join(terms) if terms else "(0.0)"
 
 
 # ---------------------------------------------------------------------------
@@ -946,30 +1058,35 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
         thr = v.threshold
     inner = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
     sheet = f"abs({inner})-({fmt(half)})"
-    # Lipschitz bound for the sphere-marcher: |grad f| <= (per-dim term count)*freq*sum(harmonic_d).
-    # In bloom mode the classic base always contributes its 3 unit terms, so floor the sum at 3;
-    # and use the peak (possibly 'freq'-bloomed) frequency at this frame so the bound stays valid.
-    sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
+    # Lipschitz bound for the sphere-marcher: the field is a sum of sin(u_a)*cos(u_b) edges
+    # (see coupling_pairs), and each edge contributes at most (k_a + k_b) to |grad f|, where
+    # k_d = freq*harmonic_d.  Summed over the whole edge list that is freq * Σ_d degree_d*h_d,
+    # where degree_d is how many edges touch dim d.  Deriving the degrees from the *actual*
+    # emitted edge list makes the bound exact under any --coupling / --pair edit: cyclic gives
+    # every dim degree 2 (-> 2*freq*sum_h, the classic 2.2*sum_h with a 10% margin), 'all'
+    # gives degree m-1, and dropping/adding edges lowers/raises the touched dims' degree in
+    # step.  Over-estimating only shrinks the safe march step, so the bound never punches holes.
+    by_index = {d.index: d for d in v.dim_list}
+    degree: Dict[int, int] = {}
+    for (a, b) in coupling_pairs(v):
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+    weighted = sum(deg * by_index[idx].harmonic for idx, deg in degree.items())
     fr = v.freq
-    # How many sin*cos terms each oscillating dim appears in sets how fast |grad f| grows:
-    # the cyclic field puts every dim in exactly 2 terms (bound 2*freq*sum_h -> coef 2.2 with
-    # 10% margin); the 'all' field pairs each dim with every other, so it appears in (m-1)
-    # terms and the gradient — hence the marcher's bound — scales up the same way.  Over-
-    # estimating max_gradient only shrinks the safe march step, so it never punches holes.
-    per_dim_terms = 2.0
-    if getattr(v, "coupling", "cyclic") == "all":
-        per_dim_terms = max(2.0, float(m - 1))
-    coef = 1.1 * per_dim_terms
     if _has(transform, "bloom"):
-        sum_h = max(sum_h, 3)
+        # Bloom cross-fades the full field with the classic 3-D gyroid (3 dims, degree 2,
+        # harmonic 1 -> weighted 6), so the effective bound is the larger of the two ends;
+        # and the peak (possibly 'freq'-bloomed) frequency applies at this frame.
+        weighted = max(weighted, 6)
         fr = bloom_freq(v, t)
+    coef = 1.1
     if _has(transform, "tumble"):
         # The N-D slice rotation can grow a direction row's norm to sqrt(2) (disjoint planes,
         # so at most two unit rows mix), scaling that term's gradient up by the same factor —
         # inflate the bound so the sphere-marcher never oversteps the surface (no holes).
         # (rotate only *shrinks* a term's frequency by cos(alpha), so it needs no inflation.)
         coef *= math.sqrt(2.0)
-    grad_bound = coef * fr * max(1, sum_h)
+    grad_bound = coef * fr * max(1, weighted)
     box = radius * 1.05                                  # contained_by half-extent
     r = radius
 
@@ -1086,12 +1203,19 @@ def variant_banner(v: Variant, index: int, count: int) -> str:
 
 def coupling_desc(v: Variant) -> str:
     """Human-readable summary of the field's pairing scheme and its resulting sin*cos
-    term count, e.g. 'cyclic (6 consecutive pairs)' or 'all pairs (15 = C(6,2))'."""
+    term count, e.g. 'cyclic (6 consecutive pairs)' or 'all pairs (15 = C(6,2))'.  When
+    --pair edits change the base edge count, the actual emitted term count is noted too."""
     m = len(v.oscillating)
+    actual = len(coupling_pairs(v))
     if getattr(v, "coupling", "cyclic") == "all":
-        n = m * (m - 1) // 2
-        return f"all pairs ({n} = C({m},2) sin*cos terms)"
-    return f"cyclic ({m} consecutive-pair sin*cos term{'s' if m != 1 else ''})"
+        base = m * (m - 1) // 2
+        desc = f"all pairs ({base} = C({m},2) sin*cos terms)"
+    else:
+        base = m
+        desc = f"cyclic ({m} consecutive-pair sin*cos term{'s' if m != 1 else ''})"
+    if actual != base:
+        desc += f"  [--pair edits -> {actual} term{'s' if actual != 1 else ''}]"
+    return desc
 
 
 def bloom_params_desc(v: Variant) -> str:
@@ -1568,12 +1692,16 @@ def build_parser() -> argparse.ArgumentParser:
         description=("Generate N higher-dimensional gyroid-slice .ftsl scene files with "
                      "randomized\ndimension counts, oscillating axes and harmonics - every "
                      "choice lockable, and\nrecorded in a comment header in each output file."),
-        epilog=("axis-lock format for --axis (repeatable):\n"
+        epilog=("axis-lock format for --axis (repeatable) — operates on nodes (dimensions):\n"
                 "  INDEX is a single axis (4) or an inclusive range (3-6 = axes 3,4,5,6)\n"
                 "  INDEX:on          force this axis to oscillate (random harmonic role)\n"
                 "  INDEX:off         force this axis inert (no term; surface invariant along it)\n"
                 "  INDEX:on:H        force it to oscillate at integer harmonic H "
                 "(H>=2 = overtone of the main)\n\n"
+                "edge-edit format for --pair (repeatable) — operates on coupling edges:\n"
+                "  I,J:off           delete the single sin(u_I)*cos(u_J) coupling term\n"
+                "  I,J:on            add that term as an extra chord (forces I and J to oscillate)\n"
+                "  (comma = one edge's two endpoints; contrast --axis's hyphen node range LO-HI)\n\n"
                 "examples:\n"
                 "  python examples/gyroid_nd.py --count 10\n"
                 "  python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 "
@@ -1584,6 +1712,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "# range: axes 3,4,5,6 inert in one flag\n"
                 "  python examples/gyroid_nd.py --dims 6 --oscillating 6 --coupling all   "
                 "# all 15 pairs, not 6\n"
+                "  python examples/gyroid_nd.py --dims 6 --oscillating 6 --coupling all --pair 0,3:off   "
+                "# 15 pairs minus edge 0-3\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
                 "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid"))
@@ -1646,6 +1776,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "standard Schoen-gyroid generalization, m terms. 'all': every unordered "
                         "pair i<j — C(m,2) terms (e.g. 15 for 6 oscillating dims), a denser, "
                         "more interwoven lattice for m>3 (the two agree in count only for m<=3).")
+    g.add_argument("--pair", action="append", default=[], metavar="I,J:on|off",
+                   help="edit an individual coupling *edge* on top of the --coupling base "
+                        "graph; repeatable. 'I,J:off' deletes the sin(u_I)*cos(u_J) term; "
+                        "'I,J:on' adds it as an extra chord (both endpoints are forced to "
+                        "oscillate). The comma names an edge's two endpoints — distinct from "
+                        "--axis's hyphen range (LO-HI) that names a run of nodes. (see epilog)")
 
     g = p.add_argument_group("scene")
     g.add_argument("--threshold", type=float, default=0.0,
@@ -1772,6 +1908,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             parse_axis_lock(spec, axis_locks)
         except argparse.ArgumentTypeError as e:
             parser.error(str(e))
+
+    # --pair edits to the coupling *edges* (on top of the --coupling base graph).
+    pair_on: set = set()
+    pair_off: set = set()
+    for spec in args.pair:
+        try:
+            parse_pair_lock(spec, pair_on, pair_off)
+        except argparse.ArgumentTypeError as e:
+            parser.error(str(e))
+    args.pair_on = frozenset(pair_on)
+    args.pair_off = frozenset(pair_off)
 
     # Resolve --out to an absolute path (relative to the invoking cwd): the frames are
     # rendered by ftrace with cwd = repo_root, so a relative outdir would be written under

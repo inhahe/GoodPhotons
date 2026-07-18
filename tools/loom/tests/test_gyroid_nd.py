@@ -627,6 +627,121 @@ def test_tumble_mode_rejected_without_tumble_transform():
         g.main(["--transform", "drift", "--tumble-lock", "0", "--no-video", "--count", "1"])
 
 
+# --------------------------------------------------------------------------
+# --coupling / --pair (coupling-graph node + edge edits)
+# --------------------------------------------------------------------------
+
+def _pv(*argv, seed=1):
+    """pick_variant with the same --pair wiring main() applies (parse the edge
+    specs onto args.pair_on / args.pair_off, plus --axis locks)."""
+    args = _args(*argv)
+    on, off = set(), set()
+    for s in args.pair:
+        g.parse_pair_lock(s, on, off)
+    args.pair_on = frozenset(on)
+    args.pair_off = frozenset(off)
+    locks = {}
+    for s in args.axis:
+        g.parse_axis_lock(s, locks)
+    return g.pick_variant(seed, args, locks)
+
+
+def test_coupling_cyclic_is_the_consecutive_ring():
+    v = _pv("--dims", "6", "--oscillating", "6")
+    assert g.coupling_pairs(v) == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]
+
+
+def test_coupling_all_is_every_unordered_pair():
+    v = _pv("--dims", "6", "--oscillating", "6", "--coupling", "all")
+    pairs = g.coupling_pairs(v)
+    assert len(pairs) == 15                              # C(6,2)
+    assert set(map(frozenset, pairs)) == {frozenset((i, j))
+                                          for i in range(6) for j in range(i + 1, 6)}
+
+
+def test_pair_off_deletes_one_edge():
+    v = _pv("--dims", "6", "--oscillating", "6", "--coupling", "all", "--pair", "0,3:off")
+    pairs = g.coupling_pairs(v)
+    assert len(pairs) == 14
+    assert frozenset((0, 3)) not in set(map(frozenset, pairs))
+
+
+def test_pair_off_removes_term_from_field_expr():
+    base = _pv("--dims", "6", "--oscillating", "6", "--coupling", "all")
+    edit = _pv("--dims", "6", "--oscillating", "6", "--coupling", "all", "--pair", "0,3:off")
+    # the edited field has exactly one fewer sin*cos term
+    assert g.field_expr(edit).count("sin(") == g.field_expr(base).count("sin(") - 1
+
+
+def test_pair_on_adds_chord_to_cyclic():
+    v = _pv("--dims", "6", "--oscillating", "6", "--pair", "0,3:on")
+    pairs = g.coupling_pairs(v)
+    assert len(pairs) == 7                               # 6 cyclic + 1 chord
+    assert (0, 3) in pairs                               # sin(lower)*cos(higher)
+
+
+def test_pair_on_forces_endpoints_to_oscillate():
+    # only 2 dims asked to oscillate, but an 'on' edge needs both its endpoints waving
+    v = _pv("--dims", "8", "--oscillating", "2", "--pair", "5,6:on")
+    assert 5 in v.oscillating and 6 in v.oscillating
+
+
+def test_pair_on_of_existing_edge_is_noop():
+    base = _pv("--dims", "6", "--oscillating", "6")
+    same = _pv("--dims", "6", "--oscillating", "6", "--pair", "0,1:on")
+    assert g.coupling_pairs(base) == g.coupling_pairs(same)
+
+
+def test_pair_off_all_edges_gives_empty_field():
+    # a 2-osc cyclic field is the two mirrored terms on edge {0,1}; turning it off empties it
+    v = _pv("--dims", "3", "--oscillating", "2", "--axis", "0:on", "--axis", "1:on",
+            "--pair", "0,1:off")
+    assert g.coupling_pairs(v) == []
+    assert g.field_expr(v) == "(0.0)"
+
+
+def test_pair_edit_reflected_in_coupling_desc():
+    v = _pv("--dims", "6", "--oscillating", "6", "--coupling", "all", "--pair", "0,3:off")
+    assert "--pair edits -> 14 terms" in g.coupling_desc(v)
+
+
+def test_pair_grad_bound_drops_when_edges_removed():
+    # deleting an edge lowers the touched dims' degree, so the Lipschitz bound shrinks
+    from loom import Clock, Cache
+
+    def _grad(v):
+        body = g.build_scene(v).emit(Clock(t=0.0), Cache())
+        return float(re.search(r"max_gradient ([0-9.]+)", body).group(1))
+
+    full = _grad(_pv("--dims", "6", "--oscillating", "6", "--coupling", "all"))
+    cut = _grad(_pv("--dims", "6", "--oscillating", "6", "--coupling", "all",
+                    "--pair", "0,3:off"))
+    assert cut < full
+
+
+def test_pair_bad_specs_raise():
+    for bad in ("3:off", "3,4,5:off", "3,3:off", "3,x:off", "3,4:maybe", "-1,4:off"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            g.parse_pair_lock(bad, set(), set())
+
+
+def test_pair_on_off_conflict_raises():
+    on, off = set(), set()
+    g.parse_pair_lock("3,4:on", on, off)
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_pair_lock("3,4:off", on, off)
+    # order-independent (comma endpoints are unordered)
+    on, off = set(), set()
+    g.parse_pair_lock("4,3:off", on, off)
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_pair_lock("3,4:on", on, off)
+
+
+def test_pair_out_of_range_endpoint_raises():
+    with pytest.raises(SystemExit):
+        g.main(["--dims", "5", "--pair", "2,7:off", "--no-video", "--count", "1"])
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
