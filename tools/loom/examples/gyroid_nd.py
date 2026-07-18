@@ -299,13 +299,19 @@ class Variant:
     osc_phase: float = 0.0              # constant radians offset added to the shared winding
     #                                     clock (2*pi = one turn); from a --oscillate winder
     #                                     group's `phase`.  0 (legacy) => t=0 is the base field.
-    surface: str = "gyroid"             # which triply-periodic minimal surface family the
-    #                                     field belongs to.  'gyroid' (default): the pairwise
-    #                                     Schoen gyroid, sum over coupling edges (a,b) of
-    #                                     sin(u_a)*cos(u_b) — uses the --coupling/--pair graph.
-    #                                     'primitive': the Schwarz P surface, sum over each
-    #                                     oscillating node d of cos(u_d) — per-node, no edges,
-    #                                     so --coupling/--pair do not apply.
+    surface: str = "gyroid"             # which surface the field belongs to.  'gyroid'
+    #                                     (default): the pairwise Schoen gyroid, sum over
+    #                                     coupling edges (a,b) of sin(u_a)*cos(u_b) — uses the
+    #                                     --coupling/--pair graph.  'primitive': the Schwarz P
+    #                                     surface, sum over each oscillating node d of cos(u_d)
+    #                                     — per-node, no edges, so --coupling/--pair do not
+    #                                     apply.  Or any POV builtin (f_sphere, f_torus, ...):
+    #                                     a solid isosurface sliced from src/pov_functions.h
+    #                                     with shape params from pov_values (P3.3).
+    pov_values: Tuple[float, ...] = ()   # POV-surface shape-param values in call order (arity
+    #                                     - 3 of them), used only when `surface` is a POV
+    #                                     builtin.  Empty for the TPMS families and for a
+    #                                     0-parameter POV helper.
     coupling: str = "cyclic"            # which sin*cos pairs the field sums over:
     #                                     'cyclic' (default) = the m consecutive pairs
     #                                     (o_i, o_{i+1}) wrapping around, i.e. the standard
@@ -1352,6 +1358,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
             if len(free) >= 2:
                 tumble_planes.append((free[0], free[-1], 1))
 
+    surface = resolve_surface(getattr(args, "surface", "gyroid"))
+    pov_values = pov_default_values(surface) if _is_pov_surface(surface) else ()
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
@@ -1362,7 +1370,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
                    tumble_locked=tumble_locked, osc_phase=osc_phase,
-                   surface=getattr(args, "surface", "gyroid"),
+                   surface=surface, pov_values=pov_values,
                    coupling=getattr(args, "coupling", "cyclic"),
                    pair_on=pair_on, pair_off=pair_off, dim_list=dims,
                    couple_clusters=couple_clusters)
@@ -1517,6 +1525,74 @@ def surface_names() -> List[str]:
     return [n for n, _d, _a in _TPMS_CATALOG] + list(POV_FUNCS)
 
 
+# ---------------------------------------------------------------------------
+# POV surface emission (P3.3): slice one of the POV isosurface builtins as a solid.
+# ---------------------------------------------------------------------------
+# TPMS families that are catalog-only reference entries — they appear in --list-surfaces
+# but have no renderable N-D field yet, so --surface rejects them with a clear message
+# (rather than a bare "unknown surface").
+_TPMS_CATALOG_ONLY = frozenset({"schwarz_d", "neovius"})
+
+# A conservative default Lipschitz bound for a POV field whose true |grad| ceiling is not
+# yet tabulated.  S2 replaces this with a per-function table derived symbolically; until
+# then over-estimating only shrinks the safe march step (never punches holes).
+_POV_GRAD_DEFAULT = 8.0
+
+# Per-function |grad f| ceilings for the POV builtins whose bound is known cheaply.  Many
+# POV primitives are exact or near-signed-distance fields (|grad| == 1), so their bound is
+# just a small safety margin.  Entries here override _POV_GRAD_DEFAULT.
+_POV_GRAD_BOUND = {
+    "f_sphere": 1.0,        # -P0 + sqrt(x^2+y^2+z^2): exact SDF, |grad| == 1
+    "f_torus": 1.0,         # -P1 + sqrt((sqrt(x^2+z^2)-P0)^2 + y^2): |grad| == 1
+}
+
+
+def _is_pov_surface(name: str) -> bool:
+    """True if ``name`` selects a POV isosurface builtin (vs a periodic TPMS family)."""
+    return name in POV_FUNCS
+
+
+def resolve_surface(name: str) -> str:
+    """Canonicalize a ``--surface`` value to a renderable surface name.
+
+    Resolves TPMS aliases (``schwarz_p`` -> ``primitive``), passes through the two native
+    families (``gyroid``/``primitive``) and any POV builtin unchanged, and raises
+    :class:`SystemExit` for a catalog-only TPMS (``schwarz_d``/``neovius`` — listed but not
+    yet renderable) or an unknown name.
+    """
+    canon = _TPMS_ALIASES.get(name, name)
+    if canon in _TPMS_SELECTABLE:
+        return canon
+    if canon in _TPMS_CATALOG_ONLY:
+        raise SystemExit(
+            f"error: surface {name!r} is a catalog-only reference entry (no renderable "
+            f"field yet); pick one of {', '.join(_TPMS_SELECTABLE)} or a POV builtin "
+            f"(see --list-surfaces).")
+    if canon in POV_FUNCS:
+        return canon
+    avail = ", ".join(surface_names())
+    raise SystemExit(f"error: unknown surface {name!r}; see --list-surfaces "
+                     f"({len(surface_names())} available: {avail})")
+
+
+def pov_default_values(name: str) -> Tuple[float, ...]:
+    """The authored default shape-param values for POV builtin ``name`` (empty for a
+    0-parameter helper), in call order — i.e. what an un-driven slice uses."""
+    return tuple(default for _axis, _desc, default, _rng in pov_params(name))
+
+
+def _pov_call_expr(name: str, values: Tuple[float, ...],
+                   coords: Tuple[str, str, str] = ("x", "y", "z")) -> str:
+    """Emit the FTSL call string for POV builtin ``name`` on ``coords`` with shape params
+    ``values`` — e.g. ``f_torus(x,y,z,0.8,0.25)``.  ``values`` must match the function's
+    param count (arity - 3); a mismatch is a programming error and raises."""
+    want = POV_FUNCS[name] - 3
+    if len(values) != want:
+        raise ValueError(f"{name} takes {want} shape param(s), got {len(values)}")
+    args = list(coords) + [fmt(v) for v in values]
+    return f"{name}({','.join(args)})"
+
+
 def _list_surfaces_text() -> str:
     """The --list-surfaces report: every surface grouped by N-D honesty class, one line
     each with its shape-param count and whether it loops seamlessly / generalizes N-D."""
@@ -1527,7 +1603,7 @@ def _list_surfaces_text() -> str:
     # periodic TPMS
     lines.append("periodic minimal surfaces (nd, loop; no shape params - use freq/threshold/thickness):")
     for name, desc, aliases in _TPMS_CATALOG:
-        tag = "  <- --surface accepts this today" if name in _TPMS_SELECTABLE else ""
+        tag = "" if name in _TPMS_SELECTABLE else "  (catalog-only: not yet renderable)"
         alias = f"  (aka {', '.join(aliases)})" if aliases else ""
         lines.append(f"  {name:<22} params=0  [nd] [loop]  {desc}{alias}{tag}")
     # N-D-generalizable POV
@@ -1548,8 +1624,9 @@ def _list_surfaces_text() -> str:
                  f"({len(_TPMS_CATALOG)} periodic, {len(POV_ND_GENERALIZABLE)} N-D POV, "
                  f"{len(affine)} affine-only POV).")
     lines.append("Run --surface-help NAME for one surface's shape parameters.")
-    lines.append("Note: --surface currently selects a periodic family (gyroid/primitive); "
-                 "the POV library becomes selectable in P3.3.")
+    lines.append("Note: --surface now selects any surface above at its default shape params "
+                 "(P3.3); param animation and N-D remap of the POV builtins arrive in later "
+                 "slices.")
     return "\n".join(lines)
 
 
@@ -1818,6 +1895,13 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
       and *unfolds* into its higher-dimensional structure at mid-loop, then folds back —
       a seamless "bloom".  The higher dimensions still drift while blended in.
     """
+    surf = getattr(v, "surface", "gyroid")
+    if _is_pov_surface(surf):
+        # A POV builtin is a *static solid* field: the surface itself, called on x/y/z with
+        # its shape params.  It carries none of the periodic-lattice machinery (no freq /
+        # harmonics / coupling / drift), so every transform/bloom layer is a no-op here in
+        # S1 — animation of the params and N-D remap arrive in later P3.3 slices.
+        return _pov_call_expr(surf, tuple(getattr(v, "pov_values", ())))
     if _has(transform, "bloom"):
         # ``bloom`` pins frame 0 (and frame 1) to the base gyroid, then oscillates the
         # selected parameters over the loop with the envelope w = sin^2(pi t).  The
@@ -1994,6 +2078,20 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
         raise SystemExit(f"error: --material '{material}' is not one of "
                          f"{', '.join(sorted(MATERIALS))}")
     expr = field_expr(v, t, transform)
+    surface = getattr(v, "surface", "gyroid")
+    if _is_pov_surface(surface):
+        # A POV builtin renders as a *solid*: the interior {field < threshold} bounded by
+        # the field's own level set.  No abs()-shell (that would carve a thin sheet out of
+        # the solid) and no frequency-scaled Lipschitz bound (the field has no lattice
+        # frequency) — thr shifts the level set, default 0 gives the surface itself, and the
+        # bound comes from the per-function table (conservative default until S2 tabulates it).
+        thr = v.threshold
+        sheet = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
+        grad_bound = _POV_GRAD_BOUND.get(surface, _POV_GRAD_DEFAULT)
+        box = radius * 1.05                              # contained_by half-extent
+        r = radius
+        return _assemble_iso_scene(sheet, grad_bound, radius, box, r, res,
+                                   env_file, mat_def)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
     # amplitude (M=3 reproduces the classic 0.5).
@@ -2024,7 +2122,6 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     #   'primitive' — a sum of cos(u_d), one per oscillating node; each contributes k_d, so
     #                 weighted = Σ_d h_d over the oscillating dims (every node has degree 1).
     # Over-estimating only shrinks the safe march step, so the bound never punches holes.
-    surface = getattr(v, "surface", "gyroid")
     by_index = {d.index: d for d in v.dim_list}
     if surface == "primitive":
         weighted = sum(by_index[d].harmonic for d in v.oscillating)
@@ -2053,7 +2150,17 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     grad_bound = coef * fr * max(1, weighted)
     box = radius * 1.05                                  # contained_by half-extent
     r = radius
+    return _assemble_iso_scene(sheet, grad_bound, radius, box, r, res,
+                               env_file, mat_def)
 
+
+def _assemble_iso_scene(sheet: str, grad_bound: float, radius: float, box: float,
+                        r: float, res, env_file: Optional[str], mat_def: str) -> Scene:
+    """Build the shared studio scene: the isosurface ``function { expr sheet }`` clipped to a
+    ball of ``radius`` inside a ``box`` container with the given ``max_gradient``, plus the
+    material and studio (or flat-fallback) env light.  The gyroid/primitive and POV paths of
+    :func:`build_scene` differ only in how they derive ``sheet``/``grad_bound``, then hand off
+    here."""
     scene = Scene(Camera(eye=(0.0, 0.7 * r, 4.0 * r), look_at=(0, 0, 0),
                          up=(0, 1, 0), fov_y=36, mode="R", res=res))
 
@@ -2845,17 +2952,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "D=3 all-on reproduce the exact classic gyroid). --no-pin-axes instead "
                         "gives every dimension a random direction — a freely-oriented N-D slice, "
                         "so even the base gyroid comes out tilted.")
-    g.add_argument("--surface", choices=SURFACES, default="gyroid",
-                   help="which triply-periodic minimal surface to slice. 'gyroid' (default): the "
-                        "pairwise Schoen gyroid, sum over coupling edges (a,b) of sin(u_a)*cos(u_b) "
-                        "— uses the --coupling/--pair edge graph. 'primitive': the Schwarz P "
-                        "surface, sum over each oscillating dim d of cos(u_d) — a per-node field "
-                        "with no edges, so --coupling/--pair do not apply to it (a warning is "
-                        "printed if they are given). Both share the whole N-D slice machinery "
-                        "(--dims/--oscillating/--harmonics/--transform/bloom all work identically); "
-                        "they differ only in how the per-dim arguments combine into the field. "
-                        "Run --list-surfaces to see the full library and --surface-help NAME for "
-                        "one surface's shape parameters.")
+    g.add_argument("--surface", default="gyroid", metavar="NAME",
+                   help="which surface to slice (validated at runtime; --list-surfaces shows all). "
+                        "'gyroid' (default): the pairwise Schoen gyroid, sum over coupling edges "
+                        "(a,b) of sin(u_a)*cos(u_b) — uses the --coupling/--pair edge graph. "
+                        "'primitive' (aka schwarz_p): the Schwarz P surface, sum over each "
+                        "oscillating dim d of cos(u_d) — a per-node field with no edges, so "
+                        "--coupling/--pair do not apply to it (a warning is printed if they are "
+                        "given). Both TPMS families share the whole N-D slice machinery "
+                        "(--dims/--oscillating/--harmonics/--transform/bloom all work identically). "
+                        "Or any POV isosurface builtin (f_sphere, f_torus, f_heart, ...): a solid "
+                        "primitive sliced from src/pov_functions.h with its default shape params "
+                        "(P3.3; param animation/N-D remap arrive in later slices). Run "
+                        "--list-surfaces to see the full library and --surface-help NAME for one "
+                        "surface's shape parameters.")
     g.add_argument("--list-surfaces", action="store_true",
                    help="print the whole surface library (periodic TPMS / N-D POV / affine-only "
                         "POV), grouped with each surface's shape-param count and N-D status, then "
@@ -3057,6 +3167,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     # with a non-default --coupling / any --pair (resolve_couple raises on conflict).
     resolve_couple(args)
 
+    # Validate + canonicalize --surface up front (resolves schwarz_p->primitive, rejects a
+    # catalog-only TPMS or an unknown name) so a bad value fails cleanly before any rendering.
+    args.surface = resolve_surface(args.surface)
+
     # The coupling graph (--coupling/--pair/--couple) is a pairwise-gyroid concept; a per-node
     # surface (Schwarz P) has no edges to wire, so those flags are inert there.  Warn rather than
     # error so a batch script that sets a house-style coupling can still switch --surface freely.
@@ -3071,7 +3185,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if ignored:
             print(f"[gyroid_nd] note: {' and '.join(ignored)} only affect --surface gyroid "
                   f"(the pairwise coupling graph); ignored for --surface {args.surface} "
-                  f"(a per-node field with no edges).")
+                  f"(no coupling edges to wire).")
 
     # Resolve --out to an absolute path (relative to the invoking cwd): the frames are
     # rendered by ftrace with cwd = repo_root, so a relative outdir would be written under

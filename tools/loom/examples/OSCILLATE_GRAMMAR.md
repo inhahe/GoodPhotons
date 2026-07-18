@@ -361,8 +361,9 @@ e.g. `--couple 0,1,2:full 3,4` (clique cluster + default-ring cluster).
 
 ## 7. Surface library & per-surface parameters
 
-`--surface` currently offers only `gyroid` / `primitive`. It will expand to the
-**whole isosurface library already in the repo**, in two collections:
+`--surface` now selects the **whole isosurface library already in the repo** (P3.3
+slice S1, 2026-07-18): the two native TPMS families plus every POV builtin, each sliced
+at its authored default shape params. The library is two collections:
 
 * **Periodic TPMS** — `tools/loom/loom/iso.py` `FIELDS`: `gyroid`, `schwarz_p`
   ("primitive"), `schwarz_d` ("diamond"), `neovius`. These are `2π`-periodic per axis
@@ -435,8 +436,20 @@ With that table, add discovery commands. **P3.2 (done 2026-07-18):** both landed
 
 This is **phase 3+** work (after the core `--oscillate` grammar lands). Order:
 (a) ~~author the param-metadata table + generator + test~~ **done (P3.1)**;
-(b) ~~`--list-surfaces` / `--surface-help`~~ **done (P3.2)**; (c) widen `--surface` choices
-to the full library with the N-D and seamless-motion guards from the caveats above (P3.3).
+(b) ~~`--list-surfaces` / `--surface-help`~~ **done (P3.2)**; (c) widen `--surface` to the
+full library with the N-D and seamless-motion guards from the caveats above (P3.3).
+
+**P3.3 slice S1 (done 2026-07-18):** `--surface` now accepts any POV builtin (validated
+at runtime, `schwarz_p` alias resolved, catalog-only `schwarz_d`/`neovius` and unknown
+names rejected with a clear message). A POV surface emits as a **solid** isosurface —
+the interior `{f(x,y,z, defaults…) < threshold}` bounded by the field's own level set (no
+`abs()`-shell, no frequency-scaled Lipschitz bound; a per-function `max_gradient` from a
+small table, conservative default `8.0` until S2 tabulates the rest). Shape params take
+their authored defaults; the N-D slice machinery (drift/rotate/tumble/bloom) is a no-op
+on a POV field for now. Smoke-rendered `f_sphere` (exact SDF, bound 1.0) and `f_torus`
+(bound 1.0) as clean solids. Still to come: S2 symbolic per-function gradient table, S3
+bbox containers + `--shell`, S4 `--lock NAME=VALUE`, S5 params as `--oscillate` swingers,
+S6 affine N-D remap, S7 `--axis-default` random param draw.
 
 ---
 

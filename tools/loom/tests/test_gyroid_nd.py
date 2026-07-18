@@ -1083,6 +1083,117 @@ def test_primitive_coupling_desc_is_per_node():
 
 
 # ---------------------------------------------------------------------------
+# POV surface selection (P3.3 slice S1): --surface accepts any POV builtin and
+# emits it as a solid isosurface at its default shape params.
+# ---------------------------------------------------------------------------
+
+def test_resolve_surface_passes_native_families():
+    assert g.resolve_surface("gyroid") == "gyroid"
+    assert g.resolve_surface("primitive") == "primitive"
+
+
+def test_resolve_surface_resolves_tpms_alias():
+    assert g.resolve_surface("schwarz_p") == "primitive"
+
+
+def test_resolve_surface_passes_pov_builtins():
+    assert g.resolve_surface("f_sphere") == "f_sphere"
+    assert g.resolve_surface("f_torus") == "f_torus"
+
+
+def test_resolve_surface_rejects_catalog_only_tpms():
+    for name in ("schwarz_d", "neovius"):
+        try:
+            g.resolve_surface(name)
+        except SystemExit as e:
+            assert "catalog-only" in str(e)
+        else:
+            raise AssertionError(f"{name} must raise (catalog-only, not renderable)")
+
+
+def test_resolve_surface_rejects_unknown():
+    try:
+        g.resolve_surface("f_not_real")
+    except SystemExit as e:
+        assert "unknown surface" in str(e)
+    else:
+        raise AssertionError("an unknown surface must raise")
+
+
+def test_is_pov_surface_only_true_for_pov():
+    assert g._is_pov_surface("f_sphere")
+    assert g._is_pov_surface("f_torus")
+    assert not g._is_pov_surface("gyroid")
+    assert not g._is_pov_surface("primitive")
+
+
+def test_pov_default_values_match_authored_defaults():
+    from loom import pov_params
+    for name in ("f_sphere", "f_torus", "f_ellipsoid", "f_r"):
+        want = tuple(d for _a, _de, d, _r in pov_params(name))
+        assert g.pov_default_values(name) == want
+    assert g.pov_default_values("f_r") == ()        # 0-param helper
+
+
+def test_pov_call_expr_shape_and_arity():
+    assert g._pov_call_expr("f_sphere", (1.0,)) == "f_sphere(x,y,z,1)"
+    assert g._pov_call_expr("f_torus", (0.8, 0.25)) == "f_torus(x,y,z,0.8,0.25)"
+    # a param-count mismatch is a programming error
+    try:
+        g._pov_call_expr("f_sphere", (1.0, 2.0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("wrong param count must raise")
+
+
+def test_pick_variant_sets_pov_values_from_surface():
+    v = _pv("--surface", "f_torus")
+    assert v.surface == "f_torus"
+    assert v.pov_values == g.pov_default_values("f_torus")
+    # a TPMS carries no pov_values
+    assert _pv("--surface", "gyroid").pov_values == ()
+
+
+def test_pov_field_expr_is_the_solid_call():
+    v = _pv("--surface", "f_sphere")
+    expr = g.field_expr(v, 0.0, "drift")
+    assert expr == "f_sphere(x,y,z,1)"
+    # POV fields are static in S1: no transform/bloom machinery touches them
+    assert g.field_expr(v, 0.5, "bloom") == expr
+    assert g.field_expr(v, 0.5, "drift+rotate+tumble") == expr
+
+
+def test_pov_scene_is_solid_no_abs_shell():
+    # A POV solid renders the interior {field < thr}; no abs()-shell (that would carve a
+    # thin sheet) and the field call appears verbatim.
+    v = _pv("--surface", "f_sphere")
+    body = _scene_body(v)
+    assert "f_sphere(x,y,z,1)" in body
+    assert "abs(f_sphere" not in body
+    assert "max_gradient" in body
+
+
+def test_pov_scene_uses_per_function_grad_bound():
+    # f_sphere is an exact SDF (|grad| == 1); the table bound is emitted, not a
+    # frequency-scaled gyroid bound.
+    import re
+    v = _pv("--surface", "f_sphere")
+    body = _scene_body(v)
+    m = re.search(r"max_gradient\s+([0-9.]+)", body)
+    assert m and abs(float(m.group(1)) - 1.0) < 1e-9
+
+
+def test_pov_unknown_grad_bound_falls_back_to_default():
+    # f_heart has no tabulated bound yet -> the conservative default is used.
+    import re
+    v = _pv("--surface", "f_heart")
+    body = _scene_body(v)
+    m = re.search(r"max_gradient\s+([0-9.]+)", body)
+    assert m and abs(float(m.group(1)) - g._POV_GRAD_DEFAULT) < 1e-9
+
+
+# ---------------------------------------------------------------------------
 # unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
 # ---------------------------------------------------------------------------
 

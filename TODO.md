@@ -206,11 +206,17 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
           ones (paraboloid/cylinders/helices). POV coords are **not** freq-scaled (unit authored scale).
       (5) *Unspecified params* — default to a **random draw within the authored (lo,hi) range** per seed
           (consistent with unnamed dims), governed by `--axis-default` (off=freeze at default, on=swing).
-      Build order (small green slices): (S1) `--surface` accepts POV names + solid-boundary emission at
-      dims=3 with default params + conservative safe bound + explicit radius, wired through build_scene;
-      (S2) SymPy/interval per-function gradient table; (S3) bbox container table + `--shell`; (S4) named
-      params as `--lock NAME=VALUE` fixed values; (S5) params as `--oscillate` swinger axes; (S6) affine
-      remap for dims>3; (S7) `--axis-default` random-draw for unspecified params.
+      Build order (small green slices): **(S1) done 2026-07-18** — `--surface` accepts any POV name
+      (validated at runtime via `resolve_surface`: `schwarz_p` alias resolved, catalog-only
+      `schwarz_d`/`neovius` + unknown names rejected). POV emits as a **solid** (`(f)-(threshold)`, no
+      abs-shell) at dims=3 with authored default params, a per-function `max_gradient` from `_POV_GRAD_BOUND`
+      (f_sphere/f_torus = 1.0, conservative `_POV_GRAD_DEFAULT` 8.0 otherwise), wired through `build_scene`
+      via a shared `_assemble_iso_scene` helper. New Variant field `pov_values`; early POV branch in
+      `field_expr` (all transforms are no-ops on a POV field for now); 13 new tests (378 loom green);
+      smoke-rendered f_sphere + f_torus as clean solids. Still: (S2) SymPy/interval per-function gradient
+      table; (S3) bbox container table + `--shell`; (S4) named params as `--lock NAME=VALUE` fixed values;
+      (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
+      random-draw for unspecified params.
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
       split real. After P3.3.
