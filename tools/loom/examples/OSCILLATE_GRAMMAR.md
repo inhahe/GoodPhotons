@@ -236,12 +236,24 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
    (`2*pi` = one turn) added to the shared winding clock (drift/rotate/tumble), from a
    winder group's `phase`, which shifts where the loop starts while keeping `t=0==t=1`.
    The engine has one shared winding clock, so conflicting motion rates/phases across
-   independent groups are rejected, as is `rate`/`phase` on a swinger (its `sin²(πt)`
-   envelope has no adjustable clock — that's a later step). Bare dims with no named motion
+   independent groups are rejected. Bare dims with no named motion
    default to `drift`. Validated by 12 new tests (motion-rate ≡ `--max-winding`, bare-dim
    exact/amp winding, dim-floor + off-lock conflicts, seamless phase offset, rate/phase
    conflict + swinger-rate guards) and a real `--oscillate drift rate 3` video through the
    CLI→ftrace pipeline. 324 loom tests green.
+   - ✅ **DONE (P3.2b)** — the swinger envelope now carries its own clock, uniform with
+     winders/bloom. Each swinger's bloom is `w(t) = 0.5·(1 − cos(2π·rate·t + phase))`
+     (`_bloom_env_p`), where `rate` (`Variant.bloom_rates[key]`, default 1) is how many
+     bumps it makes over the loop and `phase` (`Variant.bloom_phases[key]`, radians,
+     default 0) offsets it; `bloom`/dims is keyed `"dims"`, the scalar swingers by their
+     own name. `rate`/`phase` are read from the swinger's group and no longer rejected.
+     Default rate 1 / phase 0 is byte-identical to the legacy fixed `sin²(πt)` envelope
+     (the `--transform` path leaves both tables empty). An **integer** rate loops
+     seamlessly for any phase; a **non-integer** rate pulses faster but breaks the loop
+     (last frame ≠ first), so `main()` prints a one-line "won't loop seamlessly" note.
+     Validated by 6 new tests (rate stored + peaks at t=¼,¾; default byte-identity;
+     integer-rate seamless; phase offset flips the bump but still loops; `bloom`→`dims`
+     keying; non-integer-rate warning via `main`). 365 loom tests green.
 5. ✅ **DONE (P1.5)** — made `--oscillate` the single documented surface. `--transform`
    and its satellites (`--bloom`/`--bloom-amp`/`--tumble-mode`/`--tumble-amp`/
    `--tumble-lock`) are hidden from `--help` (`argparse.SUPPRESS`) but stay fully

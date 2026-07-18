@@ -182,6 +182,13 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       `schwarz_p`→`primitive` alias. Both are early-exit (return 0 before any generation), ASCII-safe
       for the Windows console, and cross-referenced from `--surface` help + the epilog. 11 new tests,
       360 loom green.
+- [x] **P3.2b** Generalize the swinger envelope to carry its own `rate`/`phase`, uniform with
+      winders/bloom. *Done 2026-07-18:* each swinger's bloom is now
+      `w(t) = 0.5·(1 − cos(2π·rate·t + phase))` (`_bloom_env_p`), keyed by `Variant.bloom_rates`
+      / `bloom_phases` (`"dims"` for `bloom`, own name for freq/threshold/thickness). `rate`/`phase`
+      are read from the swinger's group and no longer rejected. Default (rate 1 / phase 0) is
+      byte-identical to the legacy fixed `sin²(πt)` envelope; integer rate loops seamlessly, a
+      non-integer rate pulses faster but breaks the loop and `main()` warns. 6 new tests, 365 loom green.
 - [ ] **P3.3** Widen `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
       + `pov.py` `POV_FUNCS`, with the N-D (`POV_ND_GENERALIZABLE`) and seamless-motion (periodic-only
       `drift`) guards. Per-surface shape params become `--oscillate`/`--lock` axes.
@@ -311,3 +318,16 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   emit ASCII-only text (Windows-console-safe). Cross-referenced from `--surface` help + epilog.
   11 new tests, 360 loom green. Next: P3.3 (widen `--surface` to the full library — the design-heavy
   step: map POV builtins into the N-D slice machinery with the N-D + seamless-motion guards).
+- 2026-07-18: **P3.2b done.** Generalized the swinger envelope to carry an independent clock,
+  making swingers uniform with winders/bloom (the user's insight: there was no good reason for
+  freq/threshold/thickness to lack a rate/phase once seamless-looping was demoted from a hard
+  requirement). Each swinger's bloom is now `w(t) = 0.5·(1 − cos(2π·rate·t + phase))` via the new
+  `_bloom_env_p(v, key, t)`, reading `Variant.bloom_rates`/`bloom_phases` (keyed `"dims"` for the
+  dimensional crossfade, own name for the scalar swingers). `resolve_oscillate` records the swinger
+  group's `rate`/`phase` instead of rejecting them. Default rate 1 / phase 0 is byte-for-byte the
+  legacy fixed `sin²(πt)` envelope (the `--transform` path leaves both tables empty, so all existing
+  seeds reproduce exactly). An integer rate loops seamlessly for any phase; a non-integer rate pulses
+  faster but breaks the loop, so `main()` prints a one-line "won't loop seamlessly" note. 6 new tests
+  (rate stored + peaks at t=¼,¾; default byte-identity; integer-rate seamless; phase flips the bump
+  but still loops; `bloom`→`dims` keying; non-integer warning via `main`), 365 loom green.
+  Next: P3.3.

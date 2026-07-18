@@ -1445,10 +1445,59 @@ def test_oscillate_conflicting_rates_error():
                                 "rotate", "rate", "3"), {})
 
 
-def test_oscillate_swinger_rate_rejected():
-    # freq/threshold/thickness/bloom ride the fixed sin^2 envelope: no adjustable clock yet
-    with pytest.raises(SystemExit):
-        g.pick_variant(3, _args("--dims", "6", "--oscillate", "freq", "rate", "2"), {})
+def test_oscillate_swinger_rate_accepted_and_stored():
+    # P3.2b: swingers now carry their own envelope clock, uniform with winders/bloom.
+    v = g.pick_variant(3, _args("--dims", "6", "--oscillate", "freq", "rate", "2"), {})
+    assert v.bloom_rates.get("freq") == 2.0
+    # rate 2 => two full bumps over the loop => the envelope peaks at t=0.25 and t=0.75
+    lo = bloom_freq0 = g.bloom_freq(v, 0.0)
+    assert g.bloom_freq(v, 0.25) > lo
+    assert g.bloom_freq(v, 0.75) > lo
+    # and it returns to the trough at the mid-loop (t=0.5) between the two bumps
+    assert abs(g.bloom_freq(v, 0.5) - lo) < 1e-12
+
+
+def test_oscillate_swinger_rate_default_is_byte_identical():
+    # no rate/phase => rate 1 / phase 0 => byte-for-byte the legacy fixed sin^2 envelope
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "freq"), {})
+    assert v.bloom_rates == {} and v.bloom_phases == {}
+    vb = g.pick_variant(7, _args("--dims", "6", "--transform", "bloom", "--bloom", "freq"), {})
+    for t in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
+        assert g.bloom_freq(v, t) == g.bloom_freq(vb, t)
+        assert g.field_expr(v, t, "bloom") == g.field_expr(vb, t, "bloom")
+
+
+def test_oscillate_swinger_integer_rate_still_loops():
+    # an integer rate keeps the loop seamless (last frame == first) for any phase
+    v = g.pick_variant(5, _args("--dims", "6", "--oscillate", "freq", "rate", "3",
+                                "phase", "pi/2"), {})
+    # seamless up to floating-point (cos(2*pi*3 + phase) rounds slightly off cos(phase))
+    assert abs(g.bloom_freq(v, 0.0) - g.bloom_freq(v, 1.0)) < 1e-9
+
+
+def test_oscillate_swinger_phase_offsets_but_loops():
+    # a phase offset shifts the envelope but (integer default rate) still loops seamlessly
+    v = g.pick_variant(5, _args("--dims", "6", "--oscillate", "freq", "phase", "pi"), {})
+    assert v.bloom_phases.get("freq") == math.pi
+    assert abs(g.bloom_freq(v, 0.0) - g.bloom_freq(v, 1.0)) < 1e-9
+    # phase pi flips the sin^2 bump: it now *peaks* at t=0 instead of troughing there
+    v0 = g.pick_variant(5, _args("--dims", "6", "--oscillate", "freq"), {})
+    assert g.bloom_freq(v, 0.0) > g.bloom_freq(v0, 0.0)
+
+
+def test_oscillate_bloom_dims_rate_stored():
+    # the dimensional crossfade ('bloom') is keyed 'dims' in the rate/phase tables
+    v = g.pick_variant(5, _args("--dims", "6", "--oscillate", "bloom", "rate", "2"), {})
+    assert v.bloom_rates.get("dims") == 2.0
+
+
+def test_oscillate_swinger_noninteger_rate_warns(capsys):
+    # a non-integer rate pulses faster but breaks the seamless loop: main() must warn
+    g.main(["--dims", "6", "--oscillate", "freq", "rate", "2.5",
+            "--no-video", "--count", "1"])
+    out = capsys.readouterr().out
+    assert "won't loop seamlessly" in out
+    assert "freq" in out
 
 
 # --------------------------------------------------------------------------

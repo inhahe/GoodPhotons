@@ -265,6 +265,19 @@ class Variant:
     #                                     threshold), where each swinger carries its own
     #                                     amplitude. Empty (the legacy --bloom/--bloom-amp
     #                                     path) => every swinger falls back to bloom_amp.
+    bloom_rates: Dict[str, float] = dc_field(default_factory=dict)
+    #                                     per-swinger envelope rate: full cycles of the sin^2
+    #                                     bump over the loop (keyed like bloom_amps, plus 'dims'
+    #                                     for the dimensional cross-fade). From a --oscillate
+    #                                     swinger group's `rate`. Empty/absent => 1 (the single
+    #                                     mid-loop bump; byte-identical to the legacy path). An
+    #                                     *integer* rate still loops seamlessly; a non-integer
+    #                                     rate pulses faster but the last frame != the first.
+    bloom_phases: Dict[str, float] = dc_field(default_factory=dict)
+    #                                     per-swinger envelope phase offset in radians (2*pi =
+    #                                     one full bump-cycle, matching the winder clock), same
+    #                                     keys. From a swinger group's `phase`. Absent => 0.
+    #                                     With an integer rate any phase still loops seamlessly.
     tumble_planes: List[Tuple[int, int, int]] = dc_field(default_factory=list)
     #                                     tumble transform only: disjoint (i, j, winding)
     #                                     Givens rotations composing the per-frame N-D
@@ -905,13 +918,23 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
       (``2*pi`` = one turn), from a winder group's ``phase``.
 
     The engine has a single shared winding clock, so conflicting motion rates/phases
-    across independent groups are rejected; ``rate``/``phase`` on a swinger axis (whose
-    fixed ``sin^2(pi t)`` bloom envelope has no adjustable clock) is likewise refused."""
+    across independent groups are rejected.  A swinger axis (``freq``/``threshold``/
+    ``thickness``/``bloom``), by contrast, is an independent scalar, so it *does* take its
+    own ``rate``/``phase`` (P3.2b): they generalize its ``sin^2`` bloom bump to
+    ``0.5*(1-cos(2*pi*rate*t + phase))`` via ``args.bloom_rates`` / ``args.bloom_phases``.
+    ``rate 1, phase 0`` (the default) is the legacy single mid-loop bump; an integer rate
+    still loops seamlessly, a non-integer one pulses faster but won't close the loop."""
     if getattr(args, "_oscillate_resolved", False):
         return
     args._oscillate_resolved = True
     if getattr(args, "bloom_amps", None) is None:
         args.bloom_amps = {}
+    # Per-swinger envelope clocks (P3.2b). Empty => rate 1 / phase 0 everywhere, i.e. the
+    # legacy fixed sin^2 bump; the --transform path returns below with these intact.
+    if getattr(args, "bloom_rates", None) is None:
+        args.bloom_rates = {}
+    if getattr(args, "bloom_phases", None) is None:
+        args.bloom_phases = {}
     # Winder-clock outputs (P1.4). Always set so the picker's getattr fallbacks are exact;
     # the legacy --transform path returns below with these no-op defaults intact.
     args.osc_dim_windings = {}
@@ -949,6 +972,8 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     bloom_active = False
     bloom_params: List[str] = []
     bloom_amps: Dict[str, float] = {}
+    bloom_rates: Dict[str, float] = {}      # per-swinger envelope rate (P3.2b)
+    bloom_phases: Dict[str, float] = {}     # per-swinger envelope phase (radians)
     tumble_mode, tumble_amp = "rotate", 0.25
     dim_windings: Dict[int, int] = {}       # bare dim-index -> exact winding
     motion_ceilings: set = set()            # distinct explicit rate ceilings from motion groups
@@ -957,13 +982,11 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     for grp in groups:
         g_axes = [ax for _, ax in grp.items]
         has_winder = any(ax in _WINDER_MOTIONS or ax.isdigit() for ax in g_axes)
-        has_swinger = any(ax == "bloom" or ax in _SCALAR_SWINGERS for ax in g_axes)
-        # The scalar swingers / bloom ride the fixed sin^2(pi t) envelope, which has no
-        # adjustable clock, so an explicit rate/phase on one can't be honored yet.
-        if (grp.rate_set or grp.phase_set) and has_swinger:
-            raise SystemExit("error: --oscillate 'rate'/'phase' on a swinger axis "
-                             "(freq/threshold/thickness/bloom) is not wired yet — the "
-                             "bloom envelope's clock is fixed (winders only for now)")
+        # A group's rate/phase applies to *all* its items uniformly (one shared clock): a
+        # winder reads it as the winding ceiling / phase, and each swinger records it as its
+        # own envelope clock (P3.2b — the sin^2 bump now runs at that rate/phase instead of
+        # the fixed single mid-loop bump).  Independent swingers don't share a basis, so
+        # their clocks never conflict (unlike the winders, checked below).
         if grp.phase_set and has_winder:
             winder_phases.add(grp.phase)
         for amp, ax in grp.items:
@@ -977,15 +1000,17 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
                 # slide amplitude, so the ceiling reads the group rate only.
                 if grp.rate_set:
                     motion_ceilings.add(int(round(grp.rate)))
-            elif ax == "bloom":
+            elif ax == "bloom" or ax in _SCALAR_SWINGERS:
                 bloom_active = True
-                if "dims" not in bloom_params:
-                    bloom_params.append("dims")
-            elif ax in _SCALAR_SWINGERS:
-                bloom_active = True
-                if ax not in bloom_params:
-                    bloom_params.append(ax)
-                bloom_amps[ax] = float(amp)
+                key = "dims" if ax == "bloom" else ax
+                if key not in bloom_params:
+                    bloom_params.append(key)
+                if ax in _SCALAR_SWINGERS:
+                    bloom_amps[ax] = float(amp)     # 'bloom'/dims carries no amp of its own
+                if grp.rate_set:
+                    bloom_rates[key] = grp.rate
+                if grp.phase_set:
+                    bloom_phases[key] = grp.phase
             elif ax.isdigit():
                 # A lone dim index is the atomic winder: its amp*rate (turns) is that dim's
                 # exact winding, and naming it pins it on (base+override, Q3).
@@ -1029,6 +1054,8 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     if bloom_active:
         args.bloom = ",".join(p for p in ("dims",) + _SCALAR_SWINGERS if p in bloom_params)
     args.bloom_amps = bloom_amps
+    args.bloom_rates = bloom_rates
+    args.bloom_phases = bloom_phases
     args.tumble_mode = tumble_mode
     args.tumble_amp = tumble_amp
     lock_dims = sorted({int(a) for a in lock_axes if a.isdigit()})
@@ -1329,6 +1356,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
                    bloom_amps=dict(getattr(args, "bloom_amps", {}) or {}),
+                   bloom_rates=dict(getattr(args, "bloom_rates", {}) or {}),
+                   bloom_phases=dict(getattr(args, "bloom_phases", {}) or {}),
                    tumble_planes=tumble_planes,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
@@ -1635,9 +1664,27 @@ def _parse_tumble_lock(spec: Optional[str]) -> Tuple[int, ...]:
 
 
 def _bloom_env(t: float) -> float:
-    """The bloom envelope w(t) = sin^2(pi t): 0 at t=0 and t=1 (so both loop ends are
+    """The base bloom envelope w(t) = sin^2(pi t): 0 at t=0 and t=1 (so both loop ends are
     *exactly* the base gyroid and the loop is seamless), 1 at the mid-loop peak."""
     return 0.5 * (1.0 - math.cos(2.0 * math.pi * t))
+
+
+def _bloom_env_p(v: "Variant", key: str, t: float) -> float:
+    """The per-swinger bloom envelope for parameter ``key`` at loop phase ``t``.
+
+    Generalizes :func:`_bloom_env` with the swinger's own clock (P3.2b):
+
+        w(t) = 0.5 * (1 - cos(2*pi*rate*t + phase))
+
+    where ``rate`` (``v.bloom_rates[key]``, default 1) is how many full bumps the swinger
+    makes over the loop and ``phase`` (``v.bloom_phases[key]`` radians, default 0) offsets
+    where it starts.  ``rate=1, phase=0`` is byte-identical to :func:`_bloom_env`.  An
+    *integer* rate returns to its start at t=1 for any phase (still a seamless loop); a
+    non-integer rate pulses faster but no longer closes the loop.  The range stays [0, 1]
+    (peak 1) regardless, so every swing amplitude / gradient bound is unaffected."""
+    rate = v.bloom_rates.get(key, 1.0)
+    phase = v.bloom_phases.get(key, 0.0)
+    return 0.5 * (1.0 - math.cos(2.0 * math.pi * rate * t + phase))
 
 
 def _swing_amp(v: "Variant", param: str) -> float:
@@ -1653,21 +1700,21 @@ def bloom_freq(v: "Variant", t: float) -> float:
     """The (possibly time-varying) base frequency at loop phase ``t``.  Equals ``v.freq``
     unless 'freq' is a bloom target, in which case it swells to its peak at mid-loop."""
     if "freq" in v.bloom_params:
-        return v.freq * (1.0 + _swing_amp(v, "freq") * _BLOOM_SWING["freq"] * _bloom_env(t))
+        return v.freq * (1.0 + _swing_amp(v, "freq") * _BLOOM_SWING["freq"] * _bloom_env_p(v, "freq", t))
     return v.freq
 
 
 def bloom_threshold(v: "Variant", t: float) -> float:
     """The isosurface level set at ``t`` (shifted from ``v.threshold`` when 'threshold' blooms)."""
     if "threshold" in v.bloom_params:
-        return v.threshold + _swing_amp(v, "threshold") * _BLOOM_SWING["threshold"] * _bloom_env(t)
+        return v.threshold + _swing_amp(v, "threshold") * _BLOOM_SWING["threshold"] * _bloom_env_p(v, "threshold", t)
     return v.threshold
 
 
 def bloom_thickness_scale(v: "Variant", t: float) -> float:
     """Multiplier on the sheet half-width at ``t`` (1 unless 'thickness' blooms)."""
     if "thickness" in v.bloom_params:
-        return 1.0 + _swing_amp(v, "thickness") * _BLOOM_SWING["thickness"] * _bloom_env(t)
+        return 1.0 + _swing_amp(v, "thickness") * _BLOOM_SWING["thickness"] * _bloom_env_p(v, "thickness", t)
     return 1.0
 
 
@@ -1776,7 +1823,7 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         # selected parameters over the loop with the envelope w = sin^2(pi t).  The
         # frequency swing (if 'freq' blooms) applies to *both* the classic base and the
         # full field, so the whole pattern pulses in intricacy together.
-        w = _bloom_env(t)
+        w = _bloom_env_p(v, "dims", t)
         fr = bloom_freq(v, t)
         g_classic = _classic_expr(getattr(v, "surface", "gyroid"), fr)
         if "dims" not in v.bloom_params:
@@ -1952,7 +1999,7 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     # amplitude (M=3 reproduces the classic 0.5).
     m = max(1, len(v.oscillating))
     if _has(transform, "bloom"):
-        w = _bloom_env(t)
+        w = _bloom_env_p(v, "dims", t)
         if "dims" in v.bloom_params:
             # Match the field cross-fade: at t=0,1 the sheet is exactly showcase's (half =
             # thickness); at the bloom peak it thickens to the full-field half.
@@ -2968,6 +3015,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.bloom is not None and not _has(args.transform, "bloom"):
         raise SystemExit("error: --bloom only applies when 'bloom' is in --transform")
     _parse_bloom_params(args.bloom)     # validate early (raises on a bad parameter name)
+    # A swinger with a non-integer envelope rate pulses faster but no longer returns to its
+    # start at t=1, so the loop is no longer seamless.  Allowed (looping is a nicety, not a
+    # requirement), but note it once so a silently non-looping video isn't a surprise.
+    _nonlooping = sorted(k for k, r in getattr(args, "bloom_rates", {}).items()
+                         if float(r) != round(float(r)))
+    if _nonlooping:
+        print(f"[gyroid_nd] note: non-integer --oscillate rate on {', '.join(_nonlooping)} "
+              f"pulses faster but won't loop seamlessly (last frame != first).")
 
     # tumble options only apply when 'tumble' is in --transform.
     if not _has(args.transform, "tumble"):
