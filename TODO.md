@@ -525,9 +525,31 @@ user's design:
   program that models a scene and emits per-frame `.ftsl`; it already has the curve system (`TrackedCurve`/
   `LoopCurve`/`Grid`/`Scatter`) and the scene-variable graph. A separate go-between would duplicate all of
   that. So the go-between = loom, exposing the two-channel API above (config in/out + per-frame live-value
-  in → `.ftsl` out). The only question is process boundary: the editor (C++) talks to loom (Python) over
-  the sidecar file for config and over a lightweight channel (stdin/stdout pipe, local socket, or
-  poll-a-file) for the per-frame live values during interactive preview — decide that when E2 is scheduled.
+  in → `.ftsl` out).
+- **OPEN Q3 — transport for the two channels (editor C++ ↔ loom Python).** *Analysis (2026-07-18):* the two
+  channels have different needs, so pick per channel:
+  - **Config channel (a):** written rarely (once per edit), not latency-sensitive → the **serialized
+    sidecar file** from Q1 is fine (use atomic write/rename to avoid half-read races).
+  - **Live-value channel (b):** per-frame during scrub → **latency-sensitive, so NOT file-poll** (polling
+    lag + disk I/O + half-written-read races). Ranking:
+    1. **Anonymous stdin/stdout pipe (preferred to start).** *There is already working precedent:*
+       `loom.PreviewServer` spawns a resident `ftrace -serve` child and streams it one `.ftsl` path per
+       frame over stdin, reading status over stdout (`preview.py` `_build_cmd`/`show`). Anonymous stdio
+       pipes are very cross-platform (subprocess stdin/stdout is identical on Windows/Linux/macOS) and
+       **not** fragile in the parent-child model (coupled lifetime = child dies with parent, no ports, no
+       firewall). Caveat: E2's live flow is *editor→loom* (push curve values) then *loom→ftrace* (`.ftsl`),
+       i.e. more bidirectional than PreviewServer's one-way drive — doable over two pipes, slightly more
+       plumbing. **Extend this channel first.**
+    2. **TCP-loopback socket (`127.0.0.1`)** — reach for this *only if* E2's UX needs **decoupled,
+       restartable** processes (editor restarts without killing loom) or a cleaner bidirectional protocol.
+       Most portable socket option (identical Berkeley/Winsock API everywhere), decoupled lifetimes,
+       reconnection; costs bind/listen/accept + port mgmt + occasional Windows firewall prompt; sub-ms
+       loopback latency is negligible here.
+    3. **Named pipe / Unix-domain socket — AVOID.** This is where the real cross-platform pain lives
+       (`mkfifo` vs `\\.\pipe\…`; `AF_UNIX` patchy on Windows). No advantage over 1/2 for this use.
+  - **Net:** live values over the existing **stdio-pipe** path (upgrade to TCP-loopback only if
+    decoupled/restartable processes are wanted); config over the **sidecar file**. Decide the final wire
+    format when E2 is scheduled.
 
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; design decided)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
