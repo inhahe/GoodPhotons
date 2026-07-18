@@ -1416,10 +1416,14 @@ def test_shell_flag_defaults_off_and_tpms_ignores_it():
 # ---------------------------------------------------------------------------
 
 def _resolved_args(*argv):
-    """argparse args with --surface resolved and POV param pins extracted (main()'s wiring)."""
+    """argparse args wired exactly as main() does for the --lock pipeline: resolve the surface,
+    extract/validate the POV param pins, THEN run the motion-grammar parse on what's left.  The
+    ordering matters -- resolve_oscillate() rejects a leftover 'NAME=VALUE' token -- so running it
+    here is what catches an ordering regression (a plain resolve_pov_param_locks call would not)."""
     args = _args(*argv)
     args.surface = g.resolve_surface(getattr(args, "surface", "gyroid"))
     g.resolve_pov_param_locks(args)
+    g.resolve_oscillate(args)
     return args
 
 
@@ -1474,8 +1478,11 @@ def test_lock_out_of_range_value_is_honored_with_warning():
 
 
 def test_resolve_splits_pins_from_motion_tokens():
-    # a mixed --lock keeps motion/dim tokens in args.lock and pulls the NAME=VALUE pins out
-    args = _resolved_args("--surface", "f_torus", "--lock", "minor=0.5", "1")
+    # a mixed --lock keeps the dim-lock token ('1') in args.lock and pulls the NAME=VALUE pin
+    # out; the split then survives resolve_oscillate (which needs a real motion -> --oscillate
+    # tumble, and 1 is a dim held out of the tumble rotation).
+    args = _resolved_args("--surface", "f_torus", "--oscillate", "tumble",
+                          "--lock", "minor=0.5", "1")
     assert args.pov_param_locks == {"minor": 0.5}
     assert args.lock == ["1"]
 
@@ -1503,6 +1510,15 @@ def test_pinned_param_resizes_autosized_container():
 def test_no_pins_leaves_pov_values_at_defaults():
     v = _pv("--surface", "f_torus")
     assert v.pov_values == g.pov_default_values("f_torus")
+
+
+def test_pin_survives_the_motion_grammar_parse():
+    # regression: main() strips NAME=VALUE pins in resolve_pov_param_locks() BEFORE
+    # resolve_oscillate() parses the rest of --lock through the motion/axis grammar, which
+    # rejects a '=' token.  A pins-only --lock must reach resolve_oscillate as None.
+    args = _resolved_args("--surface", "f_torus", "--lock", "minor=0.4")
+    assert args.pov_param_locks == {"minor": 0.4}
+    assert args.lock is None                             # collapsed, so the parse saw no '='
 
 
 # ---------------------------------------------------------------------------

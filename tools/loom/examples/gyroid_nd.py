@@ -3339,6 +3339,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.transform is not None:
         print("[gyroid_nd] note: --transform (and --bloom/--bloom-amp/--tumble-*) is "
               "deprecated; use --oscillate instead (see OSCILLATE_GRAMMAR.md). It still works.")
+    # S4: pull POV shape-param value pins (`--lock NAME=VALUE`) out of --lock and validate them
+    # against the surface.  MUST run before resolve_oscillate(), which parses the remaining
+    # --lock tokens through the motion/axis grammar (which never uses '=' and would reject a
+    # pin token); a pins-only --lock collapses to None so it doesn't engage that grammar or
+    # trip the --transform mutual-exclusion.  (resolve_pov_param_locks resolves the surface
+    # itself, idempotently, and returns early when there are no pins.)
+    resolve_pov_param_locks(args)
+
     # Resolve the unified --oscillate/--lock grammar (if used) onto the canonical
     # transform/bloom/tumble fields, or default --transform to 'drift'. Then normalize
     # --transform (one name or a comma/plus-separated layered set) to canonical form.
@@ -3408,11 +3416,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[gyroid_nd] note: {' and '.join(ignored)} only affect --surface gyroid "
                   f"(the pairwise coupling graph); ignored for --surface {args.surface} "
                   f"(no coupling edges to wire).")
-
-    # S4: pull POV shape-param value pins (`--lock NAME=VALUE`) out of --lock and validate them
-    # against the (already-resolved) surface.  Space separates pins — `--lock rx=2 minor=0.5`
-    # sets two — while comma keeps its composite-oscillator meaning in the rest of the grammar.
-    resolve_pov_param_locks(args)
 
     # Resolve --out to an absolute path (relative to the invoking cwd): the frames are
     # rendered by ftrace with cwd = repo_root, so a relative outdir would be written under
