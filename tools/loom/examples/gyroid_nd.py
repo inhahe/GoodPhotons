@@ -257,7 +257,7 @@ class Variant:
 
 
 # ---------------------------------------------------------------------------
-# axis-lock parsing:  d:on | d:off | d:on:h
+# axis-lock parsing:  d:on | d:off | d:on:h   (d may be a range  lo-hi)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -266,17 +266,41 @@ class AxisLock:
     harmonic: Optional[int] = None
 
 
-def parse_axis_lock(spec: str, locks: Dict[int, AxisLock]) -> None:
-    parts = spec.split(":")
-    if len(parts) < 2:
-        raise argparse.ArgumentTypeError(
-            f"--axis '{spec}': expected INDEX:on|off[:HARMONIC] (e.g. 4:on:3)")
+def _parse_axis_indices(token: str, spec: str) -> List[int]:
+    """Parse the index field of an --axis spec into a list of axis indices.
+
+    Accepts a single index (``4``) or an inclusive range (``3-6`` -> 3,4,5,6),
+    so a run of dimensions can be locked in one flag instead of one per axis."""
+    token = token.strip()
+    if "-" in token:
+        lo_s, _, hi_s = token.partition("-")
+        try:
+            lo, hi = int(lo_s), int(hi_s)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--axis '{spec}': range must be INT-INT (e.g. 3-6)")
+        if lo < 0 or hi < 0:
+            raise argparse.ArgumentTypeError(f"--axis '{spec}': axis index must be >= 0")
+        if hi < lo:
+            raise argparse.ArgumentTypeError(
+                f"--axis '{spec}': range end {hi} is before start {lo}")
+        return list(range(lo, hi + 1))
     try:
-        idx = int(parts[0])
+        idx = int(token)
     except ValueError:
         raise argparse.ArgumentTypeError(f"--axis '{spec}': axis index must be an integer")
     if idx < 0:
         raise argparse.ArgumentTypeError(f"--axis '{spec}': axis index must be >= 0")
+    return [idx]
+
+
+def parse_axis_lock(spec: str, locks: Dict[int, AxisLock]) -> None:
+    parts = spec.split(":")
+    if len(parts) < 2:
+        raise argparse.ArgumentTypeError(
+            f"--axis '{spec}': expected INDEX:on|off[:HARMONIC] (e.g. 4:on:3), "
+            f"where INDEX is a number or a range (e.g. 3-6)")
+    indices = _parse_axis_indices(parts[0], spec)
     state = parts[1].strip().lower()
     if state in ("on", "osc", "oscillate", "true", "1", "yes"):
         on = True
@@ -296,17 +320,18 @@ def parse_axis_lock(spec: str, locks: Dict[int, AxisLock]) -> None:
         if not on:
             raise argparse.ArgumentTypeError(
                 f"--axis '{spec}': can't set a harmonic on an 'off' axis")
-    lk = locks.setdefault(idx, AxisLock())
-    if lk.on is not None and lk.on != on:
-        raise argparse.ArgumentTypeError(
-            f"--axis: axis {idx} locked both on and off")
-    lk.on = on
-    if harmonic is not None:
-        if lk.harmonic is not None and lk.harmonic != harmonic:
+    for idx in indices:
+        lk = locks.setdefault(idx, AxisLock())
+        if lk.on is not None and lk.on != on:
             raise argparse.ArgumentTypeError(
-                f"--axis: axis {idx} locked to two different harmonics "
-                f"({lk.harmonic} and {harmonic})")
-        lk.harmonic = harmonic
+                f"--axis: axis {idx} locked both on and off")
+        lk.on = on
+        if harmonic is not None:
+            if lk.harmonic is not None and lk.harmonic != harmonic:
+                raise argparse.ArgumentTypeError(
+                    f"--axis: axis {idx} locked to two different harmonics "
+                    f"({lk.harmonic} and {harmonic})")
+            lk.harmonic = harmonic
 
 
 # ---------------------------------------------------------------------------
@@ -1503,6 +1528,7 @@ def build_parser() -> argparse.ArgumentParser:
                      "randomized\ndimension counts, oscillating axes and harmonics - every "
                      "choice lockable, and\nrecorded in a comment header in each output file."),
         epilog=("axis-lock format for --axis (repeatable):\n"
+                "  INDEX is a single axis (4) or an inclusive range (3-6 = axes 3,4,5,6)\n"
                 "  INDEX:on          force this axis to oscillate (random harmonic role)\n"
                 "  INDEX:off         force this axis inert (no term; surface invariant along it)\n"
                 "  INDEX:on:H        force it to oscillate at integer harmonic H "
@@ -1513,6 +1539,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "--oscillating 4 --harmonics 2\n"
                 "  python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 "
                 "--axis 2:on:1   # classic gyroid\n"
+                "  python examples/gyroid_nd.py --dims 7 --axis 3-6:off   "
+                "# range: axes 3,4,5,6 inert in one flag\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
                 "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid"))
@@ -1552,7 +1580,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fastest per-dim drift rate: integer cycles a dimension advances "
                         "over one video loop as the slice moves through it (default 2)")
     g.add_argument("--axis", action="append", default=[], metavar="SPEC",
-                   help="force one axis on/off and optionally its harmonic; repeatable "
+                   help="force an axis (or a LO-HI range of axes) on/off and optionally its "
+                        "harmonic; repeatable. INDEX may be a single number (4:off) or an "
+                        "inclusive range (3-6:off turns axes 3,4,5,6 off in one flag). "
                         "(see epilog)")
     g.add_argument("--freq", type=float, default=None,
                    help="lock the base spatial frequency (cells packed into the ball)")
