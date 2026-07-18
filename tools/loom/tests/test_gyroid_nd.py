@@ -1206,6 +1206,111 @@ def test_transform_desugar_roundtrips_through_parser():
     assert g.oscillate_spec(reparsed) == g.oscillate_spec(grps)
 
 
+# --- P1.3: --oscillate wiring == the equivalent legacy --transform invocation ---
+
+def _osc_equiv(seed, osc_argv, legacy_argv):
+    """Assert `--oscillate <osc_argv>` yields a variant behaviorally identical to the
+    legacy `--transform <legacy_argv>` at the same seed: same normalized transform,
+    bloom targets, tumble config, and identical emitted field / swinger values."""
+    va = g.pick_variant(seed, _args(*osc_argv), {})
+    vb = g.pick_variant(seed, _args(*legacy_argv), {})
+    tr = _reparse_transform(osc_argv, legacy_argv)
+    assert va.dims == vb.dims
+    assert va.freq == vb.freq
+    assert va.bloom_params == vb.bloom_params
+    assert va.tumble_mode == vb.tumble_mode
+    assert va.tumble_amp == vb.tumble_amp
+    assert va.tumble_locked == vb.tumble_locked
+    assert va.tumble_planes == vb.tumble_planes
+    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+        assert g.bloom_freq(va, t) == g.bloom_freq(vb, t)
+        assert g.bloom_threshold(va, t) == g.bloom_threshold(vb, t)
+        assert g.bloom_thickness_scale(va, t) == g.bloom_thickness_scale(vb, t)
+        assert g.field_expr(va, t, tr) == g.field_expr(vb, t, tr)
+
+
+def _reparse_transform(osc_argv, legacy_argv):
+    # both invocations must resolve to the same canonical transform string
+    a = _args(*legacy_argv)
+    g.resolve_oscillate(a)
+    return g._parse_transforms(a.transform)
+
+
+def test_oscillate_drift_equals_default():
+    _osc_equiv(11, ["--oscillate", "drift"], ["--transform", "drift"])
+
+
+def test_oscillate_layered_equals_legacy():
+    _osc_equiv(11, ["--dims", "6", "--oscillate", "drift,tumble"],
+               ["--dims", "6", "--transform", "drift,tumble"])
+
+
+def test_oscillate_tumble_equals_legacy():
+    _osc_equiv(7, ["--dims", "6", "--oscillate", "tumble"],
+               ["--dims", "6", "--transform", "tumble"])
+
+
+def test_oscillate_tumble_slide_amp_equals_legacy():
+    _osc_equiv(7, ["--dims", "6", "--oscillate", "0.3*tumble"],
+               ["--dims", "6", "--transform", "tumble", "--tumble-mode", "slide",
+                "--tumble-amp", "0.3"])
+
+
+def test_oscillate_bloom_equals_legacy():
+    _osc_equiv(5, ["--dims", "6", "--oscillate", "bloom"],
+               ["--dims", "6", "--transform", "bloom"])
+
+
+def test_oscillate_freq_swinger_equals_legacy():
+    _osc_equiv(5, ["--dims", "6", "--oscillate", "freq"],
+               ["--dims", "6", "--transform", "bloom", "--bloom", "freq"])
+
+
+def test_oscillate_bloom_freq_equals_legacy():
+    _osc_equiv(5, ["--dims", "6", "--oscillate", "bloom,freq"],
+               ["--dims", "6", "--transform", "bloom", "--bloom", "dims,freq"])
+
+
+def test_oscillate_freq_amp_equals_legacy_bloom_amp():
+    _osc_equiv(5, ["--dims", "6", "--oscillate", "1.5*freq"],
+               ["--dims", "6", "--transform", "bloom", "--bloom", "freq",
+                "--bloom-amp", "1.5"])
+
+
+def test_oscillate_lock_maps_to_tumble_lock():
+    _osc_equiv(7, ["--dims", "6", "--oscillate", "tumble", "--lock", "0,1"],
+               ["--dims", "6", "--transform", "tumble", "--tumble-lock", "0,1"])
+
+
+def test_oscillate_per_axis_swinger_amps():
+    # two swingers, each its own amplitude (not expressible with a single --bloom-amp)
+    v = g.pick_variant(5, _args("--dims", "6", "--oscillate", "2*freq,0.5*threshold"), {})
+    assert v.bloom_params == ("freq", "threshold")
+    assert v.bloom_amps == {"freq": 2.0, "threshold": 0.5}
+    assert g._swing_amp(v, "freq") == 2.0
+    assert g._swing_amp(v, "threshold") == 0.5
+
+
+def test_oscillate_conflicts_with_transform():
+    with pytest.raises(SystemExit):
+        g.main(["--oscillate", "drift", "--transform", "tumble", "--no-video", "--count", "1"])
+
+
+def test_oscillate_conflicts_with_legacy_bloom_flag():
+    with pytest.raises(SystemExit):
+        g.main(["--oscillate", "freq", "--bloom", "threshold", "--no-video", "--count", "1"])
+
+
+def test_oscillate_rate_not_wired_yet():
+    with pytest.raises(SystemExit):
+        g.pick_variant(3, _args("--dims", "6", "--oscillate", "tumble", "rate", "2"), {})
+
+
+def test_oscillate_bare_dim_not_wired_yet():
+    with pytest.raises(SystemExit):
+        g.pick_variant(3, _args("--dims", "6", "--oscillate", "3"), {})
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

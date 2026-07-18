@@ -574,6 +574,8 @@ class OscGroup:
     items: List[Tuple[float, str]]
     rate: float = 1.0
     phase: float = 0.0
+    rate_set: bool = False              # True iff `rate <expr>` was given explicitly
+    phase_set: bool = False             # True iff `phase <expr>` was given explicitly
 
     def axes(self) -> List[str]:
         return [ax for _, ax in self.items]
@@ -664,6 +666,7 @@ def parse_oscillate(tokens) -> List[OscGroup]:
                 f"--oscillate/--lock: {head!r} must follow a group, not begin one")
         items = [_osc_item(p) for p in head.split(",")]
         rate, phase = 1.0, 0.0
+        rate_set = phase_set = False
         seen = set()
         while i < len(toks) and toks[i].lower() in _OSC_RESERVED:
             kw = toks[i].lower(); i += 1
@@ -676,10 +679,10 @@ def parse_oscillate(tokens) -> List[OscGroup]:
                     f"--oscillate/--lock: {kw!r} needs an expression after it")
             val = _osc_eval_num(toks[i], kw); i += 1
             if kw == "rate":
-                rate = val
+                rate = val; rate_set = True
             else:
-                phase = val
-        groups.append(OscGroup(items, rate, phase))
+                phase = val; phase_set = True
+        groups.append(OscGroup(items, rate, phase, rate_set, phase_set))
     return groups
 
 
@@ -764,6 +767,119 @@ def oscillate_spec(groups: List[OscGroup]) -> str:
     return " ".join(out)
 
 
+# Axis kinds for the unified grammar (see OSCILLATE_GRAMMAR.md §2). Winder *motions*
+# drive the slice's orientation over the loop; scalar *swingers* pulse a surface
+# parameter. `bloom` is the dimensional-crossfade envelope (a swinger with no amp of
+# its own). Bare spatial-dim indices are winders too but need per-dim `rate` (P1.4).
+_WINDER_MOTIONS = ("drift", "rotate", "tumble")
+_SCALAR_SWINGERS = ("freq", "threshold", "thickness")
+
+
+def resolve_oscillate(args: argparse.Namespace) -> None:
+    """Normalize the loop-motion inputs on ``args`` into the canonical fields the rest
+    of the generator reads (``transform`` / ``bloom`` / ``bloom_amps`` / ``tumble_mode``
+    / ``tumble_amp`` / ``tumble_lock``). Idempotent (guarded by a sentinel) so it can be
+    called from both ``main`` and ``pick_variant``.
+
+    Two input paths converge here:
+
+    * **legacy** — ``--transform`` (+ ``--bloom``/``--bloom-amp``/``--tumble-*``): left
+      as-is (only defaulting ``transform`` to ``drift`` when unset). Byte-identical to
+      before this layer existed.
+    * **unified** — ``--oscillate``/``--lock`` (OSCILLATE_GRAMMAR.md): the parsed group
+      model is mapped onto those same legacy fields, so ``pick_variant`` needs no new
+      code path. Motions (``drift``/``rotate``/``tumble``) become the transform string;
+      ``bloom`` and the scalar swingers (``freq``/``threshold``/``thickness``) become the
+      ``--bloom`` target set, with each swinger's per-item ``amp`` recorded in
+      ``bloom_amps``; ``amp*tumble`` selects slide mode with that amplitude; ``--lock``
+      dim indices become ``tumble_lock``. This is the exact inverse of
+      :func:`transform_to_oscillate`, so an ``--oscillate`` spec and its equivalent
+      ``--transform`` spec produce identical variants.
+
+    Per-group ``rate``/``phase`` (the shared clock, and bare-dim targeting) are not wired
+    yet — they arrive in the next staging step — so an explicit ``rate``/``phase`` or a
+    bare dim index raises a clear "not yet" error rather than silently doing nothing."""
+    if getattr(args, "_oscillate_resolved", False):
+        return
+    args._oscillate_resolved = True
+    if getattr(args, "bloom_amps", None) is None:
+        args.bloom_amps = {}
+
+    osc = getattr(args, "oscillate", None)
+    lock = getattr(args, "lock", None)
+    raw_transform = getattr(args, "transform", None)
+
+    if osc is None and lock is None:
+        if raw_transform is None:               # --transform default is None (see parser)
+            args.transform = "drift"
+        return
+
+    if raw_transform is not None:
+        raise SystemExit("error: specify the loop motion with either --transform or "
+                         "--oscillate, not both")
+    # the legacy satellite flags are subsumed by the grammar; reject them here so an
+    # --oscillate spec is never silently overridden by a stray --bloom/--tumble-* flag.
+    _legacy = (("--bloom", getattr(args, "bloom", None), None),
+               ("--bloom-amp", getattr(args, "bloom_amp", 1.0), 1.0),
+               ("--tumble-mode", getattr(args, "tumble_mode", "rotate"), "rotate"),
+               ("--tumble-amp", getattr(args, "tumble_amp", 0.25), 0.25),
+               ("--tumble-lock", getattr(args, "tumble_lock", None), None))
+    for flag, val, default in _legacy:
+        if val != default:
+            raise SystemExit(f"error: {flag} is a --transform option; with --oscillate use "
+                             f"the axis grammar instead (e.g. amplitudes like '2*freq')")
+
+    groups = parse_oscillate(osc or [])
+    lock_axes = parse_lock_axes(lock or [])
+    for grp in groups:
+        if grp.rate_set or grp.phase_set:
+            raise SystemExit("error: --oscillate 'rate'/'phase' (the per-group clock) is "
+                             "not wired yet — omit it for now (coming in the next step)")
+
+    motions: List[str] = []
+    bloom_active = False
+    bloom_params: List[str] = []
+    bloom_amps: Dict[str, float] = {}
+    tumble_mode, tumble_amp = "rotate", 0.25
+
+    for grp in groups:
+        for amp, ax in grp.items:
+            if ax in _WINDER_MOTIONS:
+                if ax == "tumble" and amp != 1.0:
+                    tumble_mode, tumble_amp = "slide", float(amp)
+                if ax not in motions:
+                    motions.append(ax)
+            elif ax == "bloom":
+                bloom_active = True
+                if "dims" not in bloom_params:
+                    bloom_params.append("dims")
+            elif ax in _SCALAR_SWINGERS:
+                bloom_active = True
+                if ax not in bloom_params:
+                    bloom_params.append(ax)
+                bloom_amps[ax] = float(amp)
+            elif ax.isdigit():
+                raise SystemExit(f"error: --oscillate: a bare spatial-dim index ({ax}) is "
+                                 f"not wired yet — needs the per-dim rate coming next step")
+            else:
+                raise SystemExit(f"error: --oscillate: unknown axis {ax!r}")
+
+    canon = [m for m in _WINDER_MOTIONS if m in motions]
+    if bloom_active:
+        canon.append("bloom")
+    if not canon:
+        raise SystemExit("error: --oscillate names no motion axes")
+    args.transform = "+".join(canon)
+    if bloom_active:
+        args.bloom = ",".join(p for p in ("dims",) + _SCALAR_SWINGERS if p in bloom_params)
+    args.bloom_amps = bloom_amps
+    args.tumble_mode = tumble_mode
+    args.tumble_amp = tumble_amp
+    lock_dims = sorted({int(a) for a in lock_axes if a.isdigit()})
+    if lock_dims:
+        args.tumble_lock = ",".join(str(d) for d in lock_dims)
+
+
 # ---------------------------------------------------------------------------
 # the picker
 # ---------------------------------------------------------------------------
@@ -780,7 +896,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
                  axis_locks: Dict[int, AxisLock]) -> Variant:
     rng = random.Random(seed)
 
-    transform = _parse_transforms(getattr(args, "transform", "drift"))
+    resolve_oscillate(args)             # normalize --oscillate/--lock -> canonical fields
+    transform = _parse_transforms(getattr(args, "transform", "drift") or "drift")
     bloom_params = (_parse_bloom_params(getattr(args, "bloom", None))
                     if _has(transform, "bloom") else ())
     bloom_dims = "dims" in bloom_params    # crossfade the full N-D field in (vs. only pulsing
@@ -1022,6 +1139,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
+                   bloom_amps=dict(getattr(args, "bloom_amps", {}) or {}),
                    tumble_planes=tumble_planes,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
@@ -2381,8 +2499,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="square render size when --size is unset (default 480)")
 
     g = p.add_argument_group("video (per variant)")
-    g.add_argument("--transform", type=str, default="drift", metavar="T[,T...]",
-                   help="how the higher dimensions animate the loop. One name, or a "
+    g.add_argument("--oscillate", nargs="*", default=None, metavar="GROUP",
+                   help="unified change-axis grammar (OSCILLATE_GRAMMAR.md): space-separated "
+                        "GROUPs, each a comma-joined list of [amp*]axis items sharing one "
+                        "oscillator. Axes: motions drift/rotate/tumble, the bloom crossfade, and "
+                        "scalar swingers freq/threshold/thickness (each takes its own amp, e.g. "
+                        "'2*freq'). Replaces --transform + --bloom/--bloom-amp/--tumble-* (mutually "
+                        "exclusive with --transform). Per-group 'rate'/'phase' and bare dim indices "
+                        "are accepted by the parser but not wired to behavior yet.")
+    g.add_argument("--lock", nargs="*", default=None, metavar="GROUP",
+                   help="same grammar as --oscillate, naming axes to HOLD FIXED. Currently dim "
+                        "indices map to the tumble lock (axes excluded from the slice rotation).")
+    g.add_argument("--transform", type=str, default=None, metavar="T[,T...]",
+                   help="how the higher dimensions animate the loop (default 'drift' when neither "
+                        "--transform nor --oscillate is given). One name, or a "
                         "comma-separated set to LAYER several at once (e.g. 'drift,tumble' or "
                         "'drift,rotate,tumble,bloom'). Options: 'drift' (default) translates the "
                         "slice through them (the pattern slides); 'rotate' turns each dim's "
@@ -2467,7 +2597,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     # (--dims >= 3, --oscillating >= 2, --freq > 0 are validated by their spec parsers.)
     if args.count < 1:
         raise SystemExit("error: --count must be >= 1")
-    # Normalize --transform (one name or a comma/plus-separated layered set) to canonical form.
+    # Resolve the unified --oscillate/--lock grammar (if used) onto the canonical
+    # transform/bloom/tumble fields, or default --transform to 'drift'. Then normalize
+    # --transform (one name or a comma/plus-separated layered set) to canonical form.
+    resolve_oscillate(args)
     args.transform = _parse_transforms(args.transform)
     if args.bloom is not None and not _has(args.transform, "bloom"):
         raise SystemExit("error: --bloom only applies when 'bloom' is in --transform")

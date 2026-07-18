@@ -210,7 +210,19 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
    `bloom_amp`, scalars only under an active bloom). Pure model — the execution path is
    untouched, so all existing tests pass unchanged. 13 new tests (298 loom tests green).
 3. **Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`) so `amp` = amplitude,
-   replacing `--bloom`/`--bloom-amp`. Add tests; keep old flags as aliases.
+   replacing `--bloom`/`--bloom-amp`. ✅ **DONE 2026-07-18.** Added per-axis
+   `Variant.bloom_amps` + `_swing_amp()` (each swinger uses its own amp, else the shared
+   `bloom_amp`), the `--oscillate`/`--lock` argparse flags, and an idempotent
+   `resolve_oscillate(args)` that maps the parsed group model onto the canonical
+   `transform`/`bloom`/`bloom_amps`/`tumble_*` fields — the exact inverse of
+   `transform_to_oscillate`, so `pick_variant` needs no new code path. `--transform` default
+   became `None` (clean mutual-exclusion with `--oscillate`); the legacy `--bloom`/`--bloom-amp`
+   /`--tumble-*` flags stay as `--transform`-only aliases (a conflict guard rejects mixing).
+   `amp*tumble` selects slide mode; `--lock <dims>` → tumble lock. Per-group `rate`/`phase` and
+   bare dim indices raise a clear "not yet wired" error (they land in step 4). Validated by 14
+   new tests (field-expression equivalence to the legacy `--transform` forms + guards), a real
+   `--oscillate bloom,freq` render through the full CLI→ftrace pipeline, and a byte-identical
+   `.ftsl` diff (incl. the `1.5*freq` per-axis-amp case). 314 loom tests green.
 4. **Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims) with per-group `rate`
    (= winding) and `phase`. Replace `--tumble-*`. Add tests; keep aliases.
 5. **Flip the default** so `--oscillate` is primary and `--transform` prints a

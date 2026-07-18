@@ -106,16 +106,21 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       `--transform`/`--bloom`/`--bloom-amp`/`--tumble-*` flags as one canonical composite
       `OscGroup` per §3 migration map. Pure model, execution path untouched; 13 new tests, 298
       loom tests green.
-- [ ] **P1.3 Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`), `amp` = amplitude;
-      replace `--bloom`/`--bloom-amp` (keep as aliases). Tests.
-      - [x] *Data-model foundation (2026-07-18):* added per-axis `Variant.bloom_amps: Dict[str,float]`
-        + `_swing_amp(v, param)` helper; `bloom_freq`/`bloom_threshold`/`bloom_thickness_scale` now
-        read the per-axis override, falling back to the shared `bloom_amp` scalar. Empty dict (the
-        legacy `--bloom`/`--bloom-amp` path) stays byte-identical. 2 new tests; 300 loom green.
-      - [ ] *Remaining (do with user awake for a render eyeball):* the argparse `--oscillate`/`--lock`
-        flags + resolution layer that maps swinger axes → `bloom_params` + `bloom_amps` (and winder
-        axis names → `transform`), plus mutual-exclusion with `--transform`. This is where the flag
-        starts changing what renders look like, so it wants a visual check.
+- [x] **P1.3 Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`), `amp` = amplitude;
+      replace `--bloom`/`--bloom-amp` (kept as aliases). ✅ 2026-07-18.
+      - Per-axis `Variant.bloom_amps: Dict[str,float]` + `_swing_amp()`; the three swinger functions
+        read the per-axis override, falling back to the shared `bloom_amp`.
+      - `--oscillate`/`--lock` argparse flags + idempotent `resolve_oscillate(args)` that maps the
+        parsed group model onto the canonical `transform`/`bloom`/`bloom_amps`/`tumble_*` fields
+        (the exact inverse of `transform_to_oscillate`), so `pick_variant` needs no new path.
+        `--transform` default → `None` for clean mutual-exclusion; conflict guards for `--transform`
+        + the legacy satellite flags; `amp*tumble` → slide mode; `--lock <dims>` → tumble lock.
+      - **Validated:** 14 new tests incl. field-expression equivalence to the legacy `--transform`
+        invocations; a real `--oscillate bloom,freq` render through the full CLI→ftrace pipeline;
+        and a byte-for-byte `.ftsl` diff (`--oscillate` ≡ legacy, incl. the `1.5*freq` amp case).
+        314 loom tests green.
+      - *Deferred to P1.4 (guarded with clear "not yet" errors):* per-group `rate`/`phase` (the
+        shared clock / winding override) and bare spatial-dim-index axes.
 - [ ] **P1.4 Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims), per-group `rate` (= winding) +
       `phase`; replace `--tumble-*` (keep aliases). Tests.
 - [ ] **P1.5 Flip default** — `--oscillate` primary, `--transform` prints deprecation notice; update
@@ -197,7 +202,13 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   thickness/bloom to real behavior — the deterministic, non-RNG-sensitive half).
 - 2026-07-18: **P1.3 foundation (partial).** Added per-axis `Variant.bloom_amps` + `_swing_amp()`;
   the three swinger functions read a per-axis amp override, falling back to the shared `bloom_amp`
-  (empty dict ⇒ byte-identical to the legacy path). 2 new tests; 300 loom green. Stopped short of
-  the argparse `--oscillate`/`--lock` flip: from here `--oscillate` starts changing rendered output
-  (winder→transform mapping, rate-vs-random winding semantics), which wants a visual render check —
-  deferred to a user-awake session rather than landing unvalidated overnight.
+  (empty dict ⇒ byte-identical to the legacy path). 2 new tests; 300 loom green.
+- 2026-07-18: **P1.3 done.** Wired the `--oscillate`/`--lock` flags via an idempotent
+  `resolve_oscillate(args)` that maps the group model onto the canonical transform/bloom/tumble
+  fields — the inverse of `transform_to_oscillate`, so `pick_variant` gets no new path. `--transform`
+  default → None for mutual-exclusion; conflict + "not yet wired" (rate/phase, bare dims) guards.
+  Validated three ways: 14 field-expression-equivalence/guard tests, a real `--oscillate bloom,freq`
+  render through the full CLI→ftrace pipeline (live preview), and a byte-identical `.ftsl` diff vs
+  the legacy `--transform` form (incl. `1.5*freq`). 314 loom green. (Corrected an earlier bad call:
+  the live-preview rule never blocked rendering-to-validate — CLAUDE.md reworded to say so.)
+  Next: P1.4 (wire winder `rate`/`phase` + bare-dim axes — the RNG-order-sensitive winding piece).
