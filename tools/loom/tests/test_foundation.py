@@ -116,8 +116,22 @@ def test_loopnoise_gauss_is_narrower_and_seamless():
                                          width=0.3).at(_clk(0.37))
 
 
+def test_loopnoise_gauss_clip_none_keeps_raw_tails_same_draws():
+    # clip=None drops the clamp but must NOT perturb the drawn sequence: the clamped
+    # cells are exactly the unclamped ones after applying +/- clip*width.
+    raw = LoopNoise(cells=200, seed=3, dist="gauss", width=0.5, clip=None)
+    clamped = LoopNoise(cells=200, seed=3, dist="gauss", width=0.5, clip=2.0)
+    lim = 2.0 * 0.5
+    assert clamped._vals == [max(-lim, min(lim, v)) for v in raw._vals]
+    # with a fat width and many cells, the raw tails exceed what clip would allow
+    assert max(abs(v) for v in raw._vals) > lim
+    # still a seamless, deterministic loop
+    assert abs(raw.at(_clk(0.0)) - raw.at(_clk(1.0))) < 1e-9
+
+
 def test_loopnoise_rejects_bad_distribution():
-    for bad in (dict(dist="weird"), dict(dist="gauss", width=0.0)):
+    for bad in (dict(dist="weird"), dict(dist="gauss", width=0.0),
+                dict(dist="gauss", clip=0.0), dict(dist="gauss", clip=-1.0)):
         try:
             LoopNoise(cells=4, **bad)
         except ValueError:
