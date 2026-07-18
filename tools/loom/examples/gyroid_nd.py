@@ -53,7 +53,7 @@ picks the base edge set (``cyclic``/``all``/``none``) that ``--pair`` then edits
 the pairwise Schoen gyroid described above.  **primitive** is the Schwarz P surface, a
 *per-node* field ``sum_d cos(u_d)`` (one cosine per oscillating dim, no edges).  Both share the
 entire N-D slice machinery — the same ``u_d = harmonic_d * freq * (dir_d . xyz) + phase_d``
-arguments and the same ``--dims``/``--oscillating``/``--harmonics``/``--transform`` (incl.
+arguments and the same ``--dims``/``--oscillating``/``--harmonics``/``--oscillate`` (incl.
 ``bloom``) animation — and differ **only** in how those arguments combine into the scalar
 field.  Because Schwarz P has no coupling edges, ``--coupling``/``--pair`` do not apply to it
 (they only shape the gyroid's pairwise graph; a note is printed if given with ``primitive``).
@@ -74,9 +74,9 @@ for a clear ``--material`` renders it *see-through* — dimmed + milky-hazed via
 
 This script **randomly picks** the field parameters.  For each of ``--count N`` variants it
 **renders a seamless morphing video** in which the higher dimensions move the visible slice.
-Every non-main oscillating dimension gets an integer rate (a "winding"); the ``--transform``
-choice decides what that motion *is*, and all start from the exact current gyroid at frame 0
-and loop seamlessly:
+Every non-main oscillating dimension gets an integer rate (a "winding"); the ``--oscillate``
+axis you name decides what that motion *is*, and all start from the exact current gyroid at
+frame 0 and loop seamlessly:
 
   * ``drift`` (default) — advance each dim's phase a whole number of cycles over the loop,
     translating the slice *through* that dimension.  The pattern slides.
@@ -97,24 +97,23 @@ and loop seamlessly:
     ``scenes/showcase.ftsl`` (``sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)``),
     then swell one or more of its scalar **parameters** out and back with an envelope
     ``w = sin^2(pi t)`` (0 at the loop ends, 1 at the midpoint), so the clip always opens
-    and closes on the recognizable showcase gyroid.  ``--bloom`` picks *which* parameter(s)
-    bloom (comma-separated, default ``dims``):
+    and closes on the recognizable showcase gyroid.  You name *which* parameter(s) bloom as
+    separate ``--oscillate`` swinger axes (``bloom`` is the dims-crossfade envelope itself):
 
-      - ``dims`` — cross-blend the full N-D gyroid in and back out; the lattice *unfolds*
+      - ``bloom`` — cross-blend the full N-D gyroid in and back out; the lattice *unfolds*
         into higher-D structure at the midpoint (the original bloom).
-      - ``freq`` (aliases ``complexity``/``intricacy``) — hold the classic gyroid but pulse
-        its spatial frequency up at mid-loop, so the pattern gets finer/more intricate and
-        relaxes back.
+      - ``freq`` — hold the classic gyroid but pulse its spatial frequency up at mid-loop,
+        so the pattern gets finer/more intricate and relaxes back.
       - ``threshold`` — swell the level-set value, breathing the surface off its zero set.
       - ``thickness`` — swell the sheet's half-thickness so the walls fatten and thin.
 
-    Parameters combine (e.g. ``--bloom dims,freq``), and ``--bloom-amp`` scales every
-    chosen parameter's peak swing (default 1).  The base frequency defaults to the showcase
-    density (freq 40 at radius 0.32) unless ``--freq`` is given.
+    Swingers combine in one composite group (e.g. ``--oscillate bloom,freq``), and a per-item
+    amplitude scales that parameter's peak swing (e.g. ``1.5*freq``; default 1).  The base
+    frequency defaults to the showcase density (freq 40 at radius 0.32) unless ``--freq`` is given.
 
-These transforms **layer**: ``--transform`` accepts a comma-separated set (e.g.
-``--transform drift,tumble`` or ``--transform drift,rotate,tumble,bloom``) and the field
-composes them.  The three *motions* stack on each oscillating dim's argument — ``tumble``
+These transforms **layer**: ``--oscillate`` joins several axes into one composite group
+with commas (e.g. ``--oscillate drift,tumble`` or ``--oscillate drift,rotate,tumble,bloom``)
+and the field composes them.  The three *motions* stack on each oscillating dim's argument — ``tumble``
 rotates the whole slice basis, ``rotate`` turns each wavevector out of the slice, ``drift``
 advances the phase — while ``bloom`` wraps the composed field in its classic->full cross-fade
 envelope (the motions then animate the full field it reveals).  Because every layer is the
@@ -153,33 +152,33 @@ Examples::
     python examples/gyroid_nd.py --dims 6 --coupling none --pair 0,1:on --pair 1,2:on --pair 2,0:on
 
     # start on the exact showcase gyroid, then bloom into higher-D structure and back
-    python examples/gyroid_nd.py --dims 6 --transform bloom
+    python examples/gyroid_nd.py --dims 6 --oscillate bloom
 
     # stay the classic gyroid but pulse its complexity (frequency) up at mid-loop
-    python examples/gyroid_nd.py --transform bloom --bloom complexity
+    python examples/gyroid_nd.py --oscillate freq
 
     # bloom the higher-D unfold *and* an extra-intense frequency pulse together
-    python examples/gyroid_nd.py --dims 6 --transform bloom --bloom dims,freq --bloom-amp 1.5
+    python examples/gyroid_nd.py --dims 6 --oscillate bloom,1.5*freq
 
     # the classic gyroid, animated: x,y,z on at harmonic 1, 90 frames as an mp4
     python examples/gyroid_nd.py --dims 3 --axis 0:on:1 --axis 1:on:1 --axis 2:on:1 \
         --frames 90 --format mp4
 
     # start from the current gyroid and rotate it through the extra dimensions
-    python examples/gyroid_nd.py --dims 6 --transform rotate
+    python examples/gyroid_nd.py --dims 6 --oscillate rotate
 
-    # LAYER several motions at once: drift + tumble + a bloom cross-fade on top
-    python examples/gyroid_nd.py --dims 6 --transform drift,tumble,bloom
+    # LAYER several motions in one composite group: drift + tumble + a bloom cross-fade
+    python examples/gyroid_nd.py --dims 6 --oscillate drift,tumble,bloom
 
     # tumble the whole 3-D slice through N-D space (the viewpoint turns, re-slicing it)
-    python examples/gyroid_nd.py --dims 6 --transform tumble
+    python examples/gyroid_nd.py --dims 6 --oscillate tumble
 
-    # tumble in 'slide' mode: rock the slice between two extremes so the lattice
-    # breathes smaller/larger (bigger --tumble-amp = more dramatic scale swing)
-    python examples/gyroid_nd.py --dims 6 --transform tumble --tumble-mode slide --tumble-amp 0.3
+    # tumble in 'slide' mode: an amplitude on tumble rocks the slice between two extremes
+    # so the lattice breathes smaller/larger (bigger amp = more dramatic scale swing)
+    python examples/gyroid_nd.py --dims 6 --oscillate 0.3*tumble
 
     # tumble but keep world X and Y pinned (only the other axes reorient the slice)
-    python examples/gyroid_nd.py --dims 6 --transform tumble --tumble-lock 0,1
+    python examples/gyroid_nd.py --dims 6 --oscillate tumble --lock 0,1
 
     # render the lattice as clear glass instead of gold (path-traced for real refraction)
     python examples/gyroid_nd.py --count 1 --material glass --no-raster --render-noise 3
@@ -2464,7 +2463,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "# 15 pairs minus edge 0-3\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
-                "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid\n"
+                "  python examples/gyroid_nd.py --dims 6 --oscillate bloom   # opens on the showcase gyroid\n"
                 "  python examples/gyroid_nd.py --surface primitive --dims 5   # Schwarz P (per-node cos)"))
 
     g = p.add_argument_group("output")
