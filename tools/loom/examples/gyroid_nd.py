@@ -49,6 +49,15 @@ polarity + selective override** model: ``--axis-default {random,on,off}`` sets w
 un-named axes oscillate by default (then flip individuals with ``--axis``), and ``--coupling``
 picks the base edge set (``cyclic``/``all``/``none``) that ``--pair`` then edits.
 
+``--surface`` chooses which triply-periodic minimal surface to slice.  **gyroid** (default) is
+the pairwise Schoen gyroid described above.  **primitive** is the Schwarz P surface, a
+*per-node* field ``sum_d cos(u_d)`` (one cosine per oscillating dim, no edges).  Both share the
+entire N-D slice machinery — the same ``u_d = harmonic_d * freq * (dir_d . xyz) + phase_d``
+arguments and the same ``--dims``/``--oscillating``/``--harmonics``/``--transform`` (incl.
+``bloom``) animation — and differ **only** in how those arguments combine into the scalar
+field.  Because Schwarz P has no coupling edges, ``--coupling``/``--pair`` do not apply to it
+(they only shape the gyroid's pairwise graph; a note is printed if given with ``primitive``).
+
 The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **thickened
 gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball — on its own, with no Cornell box or
 glass sphere.  ``--material`` picks its surface: **gold** (default) — a conductor/mirror, so
@@ -265,6 +274,13 @@ class Variant:
     tumble_locked: Tuple[int, ...] = () # tumble transform only: axis indices excluded from the
     #                                     slice-orientation rotation (they stay fixed while the
     #                                     other axes tumble).
+    surface: str = "gyroid"             # which triply-periodic minimal surface family the
+    #                                     field belongs to.  'gyroid' (default): the pairwise
+    #                                     Schoen gyroid, sum over coupling edges (a,b) of
+    #                                     sin(u_a)*cos(u_b) — uses the --coupling/--pair graph.
+    #                                     'primitive': the Schwarz P surface, sum over each
+    #                                     oscillating node d of cos(u_d) — per-node, no edges,
+    #                                     so --coupling/--pair do not apply.
     coupling: str = "cyclic"            # which sin*cos pairs the field sums over:
     #                                     'cyclic' (default) = the m consecutive pairs
     #                                     (o_i, o_{i+1}) wrapping around, i.e. the standard
@@ -768,6 +784,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
                    tumble_locked=tumble_locked,
+                   surface=getattr(args, "surface", "gyroid"),
                    coupling=getattr(args, "coupling", "cyclic"),
                    pair_on=pair_on, pair_off=pair_off, dim_list=dims)
 
@@ -838,6 +855,21 @@ def _classic_gyroid_expr(freq: float) -> str:
     return f"sin({ux})*cos({uy})+sin({uy})*cos({uz})+sin({uz})*cos({ux})"
 
 
+def _classic_primitive_expr(freq: float) -> str:
+    """The plain 3-D Schwarz P (primitive) surface on X/Y/Z at ``freq``:
+    ``cos(f x) + cos(f y) + cos(f z)``.  The per-node analogue of the classic gyroid —
+    the fixed frame-0 subject for the ``bloom`` transform when ``--surface primitive``."""
+    f = fmt(freq)
+    return f"cos({f}*x)+cos({f}*y)+cos({f}*z)"
+
+
+def _classic_expr(surface: str, freq: float) -> str:
+    """The classic 3-D field on X/Y/Z for the chosen surface (bloom's frame-0 subject)."""
+    if surface == "primitive":
+        return _classic_primitive_expr(freq)
+    return _classic_gyroid_expr(freq)
+
+
 # The showcase gyroid's density as a radius*frequency product (radius 0.32, freq 40):
 # matching it at any container radius needs freq = SHOWCASE_RF / radius, so the bloom
 # base reads as *the showcase gyroid* regardless of the ball size (freq 40 at r=0.32).
@@ -851,6 +883,16 @@ SHOWCASE_RF = 0.32 * 40.0
 # full cross-fade envelope (the layered motions then animate the full field it reveals).
 # Every layer is the identity at t=0 and t=1, so any combination still loops seamlessly.
 TRANSFORMS = ("drift", "rotate", "tumble", "bloom")
+
+# Supported triply-periodic minimal-surface families.  Both share the whole N-D slice
+# machinery (each oscillating dim d contributes an argument u_d = coeff*(dir_d . xyz) +
+# phase, animated by drift/rotate/tumble/bloom); they differ ONLY in how those arguments
+# are combined into the scalar field:
+#   'gyroid'    — pairwise: sum over coupling edges (a,b) of sin(u_a)*cos(u_b) (the
+#                 Schoen gyroid; uses the --coupling/--pair edge graph).
+#   'primitive' — per-node: sum over each oscillating dim d of cos(u_d) (the Schwarz P
+#                 surface; no edges, so --coupling/--pair have nothing to act on).
+SURFACES = ("gyroid", "primitive")
 
 
 def _parse_transforms(spec: str) -> str:
@@ -1037,7 +1079,7 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         # full field, so the whole pattern pulses in intricacy together.
         w = _bloom_env(t)
         fr = bloom_freq(v, t)
-        g_classic = _classic_gyroid_expr(fr)
+        g_classic = _classic_expr(getattr(v, "surface", "gyroid"), fr)
         if "dims" not in v.bloom_params:
             # No dimensional bloom: the loop is the recognizable classic gyroid the whole
             # time (frame 0 = showcase); only the scalar parameters pulse around it.
@@ -1082,11 +1124,16 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         # Reduce the phase modulo 2*pi so t=0 and t=1 emit the *same* constant (whole-cycle
         # advances) -> a perfectly seamless loop despite float rounding.
         u[d] = _arg_expr(direction, coeff, phase % two_pi)
-    # Sum the sin*cos coupling terms.  The set of edges comes from coupling_pairs(): the
-    # 'cyclic' ring (m consecutive pairs — the standard gyroid) or the 'all' complete graph
-    # (every unordered pair i<j), then the per-edge --pair edits (drop 'off' edges, add 'on'
-    # chords).  Each edge (a,b) emits one sin(u_a)*cos(u_b) term.
-    terms = [f"sin({u[a]})*cos({u[b]})" for (a, b) in coupling_pairs(v)]
+    # Combine the per-dim arguments into the scalar field.  This is the ONLY surface-specific
+    # step — the u_d above are shared by every surface.
+    #   'primitive' (Schwarz P): one cos(u_d) per oscillating node d (no edges).
+    #   'gyroid' (default): one sin(u_a)*cos(u_b) per coupling edge (a,b) — the edge set comes
+    #     from coupling_pairs(): the 'cyclic' ring / 'all' complete graph / 'none' empty base,
+    #     then the per-edge --pair edits (drop 'off' edges, add 'on' chords).
+    if getattr(v, "surface", "gyroid") == "primitive":
+        terms = [f"cos({u[d]})" for d in osc]
+    else:
+        terms = [f"sin({u[a]})*cos({u[b]})" for (a, b) in coupling_pairs(v)]
     return "+".join(terms) if terms else "(0.0)"
 
 
@@ -1217,26 +1264,35 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
         thr = v.threshold
     inner = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
     sheet = f"abs({inner})-({fmt(half)})"
-    # Lipschitz bound for the sphere-marcher: the field is a sum of sin(u_a)*cos(u_b) edges
-    # (see coupling_pairs), and each edge contributes at most (k_a + k_b) to |grad f|, where
-    # k_d = freq*harmonic_d.  Summed over the whole edge list that is freq * Σ_d degree_d*h_d,
-    # where degree_d is how many edges touch dim d.  Deriving the degrees from the *actual*
-    # emitted edge list makes the bound exact under any --coupling / --pair edit: cyclic gives
-    # every dim degree 2 (-> 2*freq*sum_h, the classic 2.2*sum_h with a 10% margin), 'all'
-    # gives degree m-1, and dropping/adding edges lowers/raises the touched dims' degree in
-    # step.  Over-estimating only shrinks the safe march step, so the bound never punches holes.
+    # Lipschitz bound for the sphere-marcher.  Each surface's field is a sum of terms whose
+    # gradient magnitude is bounded by summing each dim's in-slice frequency k_d = freq*h_d
+    # over the terms that touch it: |grad f| <= freq * weighted, where
+    #   'gyroid'    — a sum of sin(u_a)*cos(u_b) edges; each edge contributes (k_a + k_b), so
+    #                 weighted = Σ_d degree_d*h_d (degree_d = how many edges touch dim d).
+    #                 Deriving degrees from the *actual* emitted edge list makes the bound exact
+    #                 under any --coupling/--pair edit (cyclic -> every dim degree 2 = the classic
+    #                 2.2*sum_h with a 10% margin; 'all' -> degree m-1; edits move it in step).
+    #   'primitive' — a sum of cos(u_d), one per oscillating node; each contributes k_d, so
+    #                 weighted = Σ_d h_d over the oscillating dims (every node has degree 1).
+    # Over-estimating only shrinks the safe march step, so the bound never punches holes.
+    surface = getattr(v, "surface", "gyroid")
     by_index = {d.index: d for d in v.dim_list}
-    degree: Dict[int, int] = {}
-    for (a, b) in coupling_pairs(v):
-        degree[a] = degree.get(a, 0) + 1
-        degree[b] = degree.get(b, 0) + 1
-    weighted = sum(deg * by_index[idx].harmonic for idx, deg in degree.items())
+    if surface == "primitive":
+        weighted = sum(by_index[d].harmonic for d in v.oscillating)
+        classic_weighted = 3            # classic Schwarz P: 3 nodes, harmonic 1
+    else:
+        degree: Dict[int, int] = {}
+        for (a, b) in coupling_pairs(v):
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+        weighted = sum(deg * by_index[idx].harmonic for idx, deg in degree.items())
+        classic_weighted = 6            # classic gyroid: 3 dims, degree 2, harmonic 1
     fr = v.freq
     if _has(transform, "bloom"):
-        # Bloom cross-fades the full field with the classic 3-D gyroid (3 dims, degree 2,
-        # harmonic 1 -> weighted 6), so the effective bound is the larger of the two ends;
-        # and the peak (possibly 'freq'-bloomed) frequency applies at this frame.
-        weighted = max(weighted, 6)
+        # Bloom cross-fades the full field with the classic 3-D surface, so the effective bound
+        # is the larger of the two ends; and the peak (possibly 'freq'-bloomed) frequency
+        # applies at this frame.
+        weighted = max(weighted, classic_weighted)
         fr = bloom_freq(v, t)
     coef = 1.1
     if _has(transform, "tumble"):
@@ -1360,11 +1416,24 @@ def variant_banner(v: Variant, index: int, count: int) -> str:
     return "\n".join(lines)
 
 
+def surface_desc(v: Variant, full: bool = False) -> str:
+    """Human-readable name of the variant's surface family.  ``full`` adds the field form."""
+    surface = getattr(v, "surface", "gyroid")
+    if surface == "primitive":
+        return ("Schwarz P (primitive) — per-node field, sum_d cos(u_d)" if full
+                else "Schwarz P")
+    return ("Schoen gyroid — pairwise field, sum_(a,b) sin(u_a)*cos(u_b)" if full
+            else "gyroid")
+
+
 def coupling_desc(v: Variant) -> str:
-    """Human-readable summary of the field's pairing scheme and its resulting sin*cos
-    term count, e.g. 'cyclic (6 consecutive pairs)' or 'all pairs (15 = C(6,2))'.  When
-    --pair edits change the base edge count, the actual emitted term count is noted too."""
+    """Human-readable summary of the field's term structure.  For the pairwise gyroid this is
+    its pairing scheme and sin*cos term count, e.g. 'cyclic (6 consecutive pairs)' or 'all
+    pairs (15 = C(6,2))' (with any --pair edits noted).  For the per-node Schwarz P surface it
+    is the cos-per-node count instead — there is no coupling graph."""
     m = len(v.oscillating)
+    if getattr(v, "surface", "gyroid") == "primitive":
+        return f"per-node ({m} cos term{'s' if m != 1 else ''}, one per oscillating dim)"
     actual = len(coupling_pairs(v))
     scheme = getattr(v, "coupling", "cyclic")
     if scheme == "all":
@@ -1406,10 +1475,11 @@ def header(v: Variant, index: int, count: int, *,
     osc = v.oscillating
     moving = [d.index for d in v.dim_list if d.oscillate and d.winding > 0]
     L = ["#" + "=" * 74,
-         f"# Higher-dimensional gyroid slice — variant {index + 1}/{count}",
+         f"# Higher-dimensional {surface_desc(v)} slice — variant {index + 1}/{count}",
          f"# generated by gyroid_nd.py",
          "#",
          f"# variant seed          : {v.seed}   (regenerate: --variant-seed {v.seed} + the same locks)",
+         f"# surface family        : {surface_desc(v, full=True)}",
          f"# dimensions (D)        : {v.dims}   (higher/extra dims beyond x,y,z: {max(0, v.dims - 3)})",
          f"# oscillating dims      : {len(osc)}  -> {axis_list(osc)}  (indices {osc})",
          f"# oscillates in         : {osc_harm_list(v)}   (dim(harmonic), the axes that wave)",
@@ -1483,14 +1553,19 @@ def header(v: Variant, index: int, count: int, *,
         L += ["#",
               f"# bloom parameters      : {', '.join(v.bloom_params)}  (amp {fmt(v.bloom_amp)})",
               f"#   oscillated over the loop by w(t) = sin^2(pi t)  (0 at t=0,1; 1 at t=0.5),",
-              "#   so frame 0 (and frame 1) is exactly the base showcase gyroid — seamless."]
+              f"#   so frame 0 (and frame 1) is exactly the base showcase {surface_desc(v)} — seamless."]
+        is_prim = getattr(v, "surface", "gyroid") == "primitive"
+        classic_form = ("cos(f x) + cos(f y) + cos(f z)" if is_prim
+                        else "sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)")
+        classic_name = "Schwarz P" if is_prim else "gyroid"
+        full_name = "Schwarz P" if is_prim else "gyroid"
         if "dims" in v.bloom_params:
             L += ["#   dims:      F(t) = (1-w)*G_classic + w*G_full",
-                  "#     G_classic = sin(f x)cos(f y) + sin(f y)cos(f z) + sin(f z)cos(f x)",
-                  "#                 (the showcase gyroid; f = base frequency, shown at frame 0)",
-                  f"#     G_full    = the full N-D gyroid below ({gf_motion}), blended in 0->1->0"]
+                  f"#     G_classic = {classic_form}",
+                  f"#                 (the showcase {classic_name}; f = base frequency, shown at frame 0)",
+                  f"#     G_full    = the full N-D {full_name} below ({gf_motion}), blended in 0->1->0"]
         else:
-            L += ["#   (no 'dims' bloom: the field stays the classic showcase gyroid all loop;",
+            L += [f"#   (no 'dims' bloom: the field stays the classic showcase {classic_name} all loop;",
                   "#    only the scalar parameters below pulse around it)"]
         if "freq" in v.bloom_params:
             L.append(f"#   freq:      f(t) = {fmt(v.freq)} * (1 + {fmt(v.bloom_amp * _BLOOM_SWING['freq'])}*w)   (intricacy/complexity pulse)")
@@ -1499,8 +1574,11 @@ def header(v: Variant, index: int, count: int, *,
         if "thickness" in v.bloom_params:
             L.append(f"#   thickness: half(t) *= (1 + {fmt(v.bloom_amp * _BLOOM_SWING['thickness'])}*w)   (sheet swells/thins)")
         L.append("#")
-    L += ["#",
-          f"# field:  sum over coupling edges (a, b) of  sin(u_a) * cos(u_b)   [{coupling_desc(v)}]"]
+    if getattr(v, "surface", "gyroid") == "primitive":
+        field_line = "# field:  sum over oscillating dims d of  cos(u_d)"
+    else:
+        field_line = "# field:  sum over coupling edges (a, b) of  sin(u_a) * cos(u_b)"
+    L += ["#", f"{field_line}   [{coupling_desc(v)}]"]
     motions = _motions(transform)
     if motions:
         # The active motion layers compose on each dim's argument (see field_expr): tumble
@@ -1890,6 +1968,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "base polarity + override (like --coupling's base edge set):\n"
                 "  --axis-default on|off   default oscillation for un-named axes; flip with --axis\n"
                 "  --coupling none         empty base graph; build coupling from --pair I,J:on\n\n"
+                "surface family (--surface):\n"
+                "  gyroid            pairwise Schoen gyroid, sum sin(u_a)*cos(u_b) (default; uses --coupling/--pair)\n"
+                "  primitive         Schwarz P, per-node sum cos(u_d) (no edges; --coupling/--pair N/A)\n\n"
                 "examples:\n"
                 "  python examples/gyroid_nd.py --count 10\n"
                 "  python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 "
@@ -1910,7 +1991,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "# 15 pairs minus edge 0-3\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
-                "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid"))
+                "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid\n"
+                "  python examples/gyroid_nd.py --surface primitive --dims 5   # Schwarz P (per-node cos)"))
 
     g = p.add_argument_group("output")
     g.add_argument("-n", "--count", type=int, default=1,
@@ -1975,6 +2057,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "D=3 all-on reproduce the exact classic gyroid). --no-pin-axes instead "
                         "gives every dimension a random direction — a freely-oriented N-D slice, "
                         "so even the base gyroid comes out tilted.")
+    g.add_argument("--surface", choices=SURFACES, default="gyroid",
+                   help="which triply-periodic minimal surface to slice. 'gyroid' (default): the "
+                        "pairwise Schoen gyroid, sum over coupling edges (a,b) of sin(u_a)*cos(u_b) "
+                        "— uses the --coupling/--pair edge graph. 'primitive': the Schwarz P "
+                        "surface, sum over each oscillating dim d of cos(u_d) — a per-node field "
+                        "with no edges, so --coupling/--pair do not apply to it (a warning is "
+                        "printed if they are given). Both share the whole N-D slice machinery "
+                        "(--dims/--oscillating/--harmonics/--transform/bloom all work identically); "
+                        "they differ only in how the per-dim arguments combine into the field.")
     g.add_argument("--coupling", choices=("cyclic", "all", "none"), default="cyclic",
                    help="base graph of sin*cos pairs the field sums over (the pair polarity). "
                         "'cyclic' (default): the m consecutive oscillating pairs (o_i, o_{i+1}) "
@@ -2132,6 +2223,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             parser.error(str(e))
     args.pair_on = frozenset(pair_on)
     args.pair_off = frozenset(pair_off)
+
+    # The coupling graph (--coupling/--pair) is a pairwise-gyroid concept; a per-node surface
+    # (Schwarz P) has no edges to wire, so those flags are inert there.  Warn rather than error
+    # so a batch script that sets a house-style --coupling can still switch --surface freely.
+    if args.surface != "gyroid":
+        ignored = []
+        if getattr(args, "coupling", "cyclic") != "cyclic":
+            ignored.append("--coupling")
+        if args.pair_on or args.pair_off:
+            ignored.append("--pair")
+        if ignored:
+            print(f"[gyroid_nd] note: {' and '.join(ignored)} only affect --surface gyroid "
+                  f"(the pairwise coupling graph); ignored for --surface {args.surface} "
+                  f"(a per-node field with no edges).")
 
     # Resolve --out to an absolute path (relative to the invoking cwd): the frames are
     # rendered by ftrace with cwd = repo_root, so a relative outdir would be written under

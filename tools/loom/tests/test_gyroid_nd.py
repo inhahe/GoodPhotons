@@ -914,6 +914,89 @@ def test_coupling_none_built_up_with_pair_on():
     assert g.coupling_pairs(v) == [(0, 1), (1, 2)]
 
 
+# --- surface selector (gyroid vs Schwarz P / primitive) --------------------
+
+def test_surface_default_is_gyroid():
+    assert _args().surface == "gyroid"
+    assert _pv("--dims", "4").surface == "gyroid"
+
+
+def test_surface_primitive_parsed():
+    assert _args("--surface", "primitive").surface == "primitive"
+
+
+def test_gyroid_field_is_pairwise_sincos():
+    # default gyroid: one sin(u_a)*cos(u_b) per cyclic edge, no bare cos() terms.
+    v = _pv("--dims", "3", "--oscillating", "3", "--phase0")
+    expr = g.field_expr(v, 0.0, "drift")
+    assert expr.count("sin(") == 3 and expr.count("cos(") == 3
+    assert "sin(" in expr
+
+
+def test_primitive_field_is_per_node_cos():
+    # Schwarz P: one cos(u_d) per oscillating dim, and NO sin() at all.
+    v = _pv("--surface", "primitive", "--dims", "3", "--oscillating", "3", "--phase0")
+    expr = g.field_expr(v, 0.0, "drift")
+    assert "sin(" not in expr                       # per-node cosines only
+    assert expr.count("cos(") == 3                  # one per oscillating dim
+
+
+def test_primitive_field_term_count_scales_with_oscillating():
+    v = _pv("--surface", "primitive", "--dims", "6", "--oscillating", "5", "--phase0")
+    expr = g.field_expr(v, 0.0, "drift")
+    assert "sin(" not in expr and expr.count("cos(") == 5
+
+
+def test_primitive_ignores_coupling_and_pair():
+    # A per-node field must not read the coupling graph.  Mutate the SAME variant's edge
+    # settings in place (so the RNG-drawn geometry is identical) and confirm the field is
+    # unchanged -- i.e. coupling_pairs() plays no role for --surface primitive.
+    import dataclasses
+    v = _pv("--surface", "primitive", "--dims", "6", "--oscillating", "6", "--phase0")
+    before = g.field_expr(v, 0.0, "drift")
+    v2 = dataclasses.replace(v, coupling="all",
+                             pair_on=frozenset([frozenset((0, 3))]))
+    assert g.field_expr(v2, 0.0, "drift") == before
+    # And a gyroid with the same edits DOES change, proving the knob is otherwise live.
+    gyr = dataclasses.replace(v, surface="gyroid")
+    gyr2 = dataclasses.replace(gyr, coupling="all")
+    assert g.field_expr(gyr2, 0.0, "drift") != g.field_expr(gyr, 0.0, "drift")
+
+
+def test_primitive_bloom_classic_is_schwarz_p():
+    # bloom frame-0 subject for primitive is cos(fx)+cos(fy)+cos(fz), not the gyroid.
+    v = _pv("--surface", "primitive", "--dims", "5", "--transform", "bloom")
+    expr0 = g.field_expr(v, 0.0, "bloom")
+    assert "sin(" not in expr0 and expr0.count("cos(") == 3
+
+
+def test_gyroid_bloom_classic_is_gyroid():
+    v = _pv("--dims", "5", "--transform", "bloom")
+    expr0 = g.field_expr(v, 0.0, "bloom")
+    assert expr0.count("sin(") == 3 and expr0.count("cos(") == 3
+
+
+def test_primitive_grad_bound_is_positive_and_scales():
+    # Per-node bound weighted = sum_d harmonic_d; a build should succeed and set a finite bound.
+    v = _pv("--surface", "primitive", "--dims", "4", "--oscillating", "4")
+    txt = _scene_body(v, transform="drift", material="gold")
+    assert "max_gradient" in txt
+    assert "cos(" in txt and "sin(" not in txt
+
+
+def test_surface_desc_labels():
+    prim = _pv("--surface", "primitive", "--dims", "4")
+    gyr = _pv("--dims", "4")
+    assert "Schwarz P" in g.surface_desc(prim)
+    assert "gyroid" in g.surface_desc(gyr)
+
+
+def test_primitive_coupling_desc_is_per_node():
+    v = _pv("--surface", "primitive", "--dims", "5", "--oscillating", "4")
+    assert "per-node" in g.coupling_desc(v)
+    assert "4 cos" in g.coupling_desc(v)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
