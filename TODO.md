@@ -192,6 +192,30 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 - [ ] **P3.3** Widen `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
       + `pov.py` `POV_FUNCS`, with the N-D (`POV_ND_GENERALIZABLE`) and seamless-motion (periodic-only
       `drift`) guards. Per-surface shape params become `--oscillate`/`--lock` axes.
+- [ ] **P3.5** Ordered / overlapping N-D tumble (design captured 2026-07-18; do *after* P3.3, it's
+      orthogonal to the surface library). Today's `tumble` is confined to a set of **disjoint** Givens
+      planes (`pick_variant` lines ~1328-1353) — i.e. a **maximal torus of SO(N)**, a commuting abelian
+      subgroup where rotation order is a no-op *by construction*. Generalize to an **ordered word** of
+      possibly-overlapping planes, where list order = composition order and non-commutativity yields
+      genuinely richer reorientation paths the disjoint set can't reach. Key facts that make this cheap:
+      (1) the evaluator `_tumbled_directions` **already composes planes sequentially in list order** — the
+      restriction lives *only* in the construction, not the eval; (2) **seamlessness survives ordering** —
+      each whole-turn factor returns to identity at t=1, so the product is identity at t=1 regardless of
+      order/overlap; (3) the **only real cost is the Lipschitz bound**: disjoint planes cap `|rotated dir|
+      <= sqrt(2)` (the current `coef *= sqrt(2)` shortcut, line ~2052), but overlapping planes can grow a
+      row toward `sqrt(#coupled rows)`, so the general path must compute the true worst-case row norm.
+      **Design decision (agreed): "alongside", not "supersede"** — keep the disjoint construction + fast
+      `sqrt(2)` bound as the untouched default (guarantees byte-identical existing seeds *by construction*,
+      no exact-reduction proof needed), and add an **opt-in mode** that takes a user-specified ordered word
+      of `(axis_i, axis_j, winding)` planes (grammar: an extension of the `--oscillate`/`--lock` word
+      grammar; list order is significant) which switches to the general ordered composition + general
+      row-norm bound. Supersede was rejected because it risks regressing every existing tumble render unless
+      the general path reduces *exactly* to today's construction, and it would slow the common case by
+      dropping the closed-form `sqrt(2)` bound. Deliverables: (a) grammar for the ordered plane word; (b)
+      construction path that honors it; (c) general row-norm bound for overlapping words (>= sqrt(2), so
+      only ever safer); (d) tests: default byte-identity, an overlapping word producing motion a disjoint
+      set can't, seamless-loop preservation, bound-never-under-estimates. Note: `max_gradient` affects only
+      march step size / hole-safety, never the converged image, so the bound generalization is safe.
 
 ### §8 — GPU isosurface rendering (kill per-frame tessellation; independent track)
 - [x] **G1** `--raster-iso <n>` passthrough in `gyroid_nd._render_frame` → ftrace's existing
