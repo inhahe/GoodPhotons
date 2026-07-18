@@ -484,8 +484,21 @@ user's design:
   isosurface example, any isosurface function parameter).
 - **One exceedingly-simple binding API** (lives in the loom go-between, not `.ftsl`): *plug any curve
   variable into any scene variable* — camera position/orientation, or a surface param, etc.
+- **The API has TWO distinct channels** (don't conflate them):
+  - **(a) whole-video config** — the persistent authoring info: number of curve dimensions, the
+    dimension↔scene-parameter *associations* (which sampled channel drives which variable), and the
+    starting control points. This is authored **once for the entire animation**.
+  - **(b) per-frame live values** — while the user scrubs/plays in the editor, the **rasterizer must be
+    able to push the go-between the *current sampled curve values* at the scrub position** so it can
+    generate/preview *that one frame*. This is a transient per-frame data flow, **separate from** (a):
+    (a) decides *what maps to what* for the whole video, (b) supplies *the numbers right now* for one
+    frame. The API must expose both.
 - **The scene informs the editor**, through that same API, of: the curve's dimensionality, how many
   curves are tacked onto it, and the full array of **starting control points** to seed the editor with.
+- **Scene proposes, editor disposes.** The scene sets the *initial* dimension count and the initial
+  dimension↔scene-parameter associations, but the **editor may change them** — doing so just edits the
+  original info stored in the animation definition (the persisted (a) config). So the associations aren't
+  a one-way scene→editor push; they round-trip.
 - **Modulable curve points are OUT for the editor.** The user resolved this: the rasterizer *already*
   owns the time dimension via curve points, so passing loom-modulable (time-varying) control points would
   introduce a *second* time axis — incoherent. So the editor receives a **static starting array** of
@@ -499,6 +512,22 @@ user's design:
   is the strict generalization — same editor, same emit path, but the curve's sampled channels fan out to
   arbitrary scene variables, not only camera pose. Build §A first (it nails the camera/orientation case
   and the emit grammar), then E2 widens the binding target set and the editor's scene-driven seeding.
+- **OPEN Q1 — where does the config (a) live: a loom in-memory data structure, or a separate animation
+  definition file?** *Leaning: BOTH, at different layers — they aren't alternatives.* The **authoritative
+  in-memory model is a loom data structure** (an `Animation`/`CurveDrive` object holding the dimension
+  count, the channel→param bindings, and the control points). But because the editor is a **separate ftrace
+  C++ process**, the config also needs a **serialized form** the editor can read to seed itself and write
+  back when the user edits associations/dimensions/points — i.e. a small persisted **animation-definition
+  sidecar** (JSON or an ftsl-adjacent block). loom owns the struct; the sidecar is its on-disk projection
+  for the round-trip with the editor. (Note this sidecar is exactly "the animation info" that (a)-edits
+  mutate, and it is *not* the `.ftsl` — the `.ftsl` stays per-frame and animation-free.)
+- **OPEN Q2 — is the go-between loom, or a separate program?** *Leaning: loom.* loom is already the Python
+  program that models a scene and emits per-frame `.ftsl`; it already has the curve system (`TrackedCurve`/
+  `LoopCurve`/`Grid`/`Scatter`) and the scene-variable graph. A separate go-between would duplicate all of
+  that. So the go-between = loom, exposing the two-channel API above (config in/out + per-frame live-value
+  in → `.ftsl` out). The only question is process boundary: the editor (C++) talks to loom (Python) over
+  the sidecar file for config and over a lightweight channel (stdin/stdout pipe, local socket, or
+  poll-a-file) for the per-frame live values during interactive preview — decide that when E2 is scheduled.
 
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; design decided)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
@@ -516,10 +545,16 @@ ranges); a single **`finalize()`** does gain/normalize/dither/clip → format-en
 "whole-file" become two front-ends over one back-end. **The one genuine fork** that would force a separate
 path is *real-time / unbounded* output (live to speakers, or an effectively-infinite stream you can't hold
 in RAM) — then you must flush fixed-size blocks and can't revise the past; even then, share everything
-below "how samples are produced" (mixer, format, dither, clip/normalize, writer). **Deciding question
-before building:** is loom's audio strictly *offline & bounded* (render a finite file) — then build only
-the buffer model — or is live playback ever on the table? (Assume offline-only unless the user says
-otherwise.) *Note: loom has no audio subsystem today, so this is a new capability, not a refactor.*
+below "how samples are produced" (mixer, format, dither, clip/normalize, writer). **DECIDED
+2026-07-18 — OFFLINE ONLY: build just the buffer model** (no real-time/streaming path), for three
+reasons the user gave: (1) loom is meant to generate **static products**, not do anything in real time;
+(2) **Python is too slow** to synthesize audio in real time anyway; and (3) real-time **wouldn't even
+work here** — the buffer model's whole point is that producers edit arbitrary past/future indices (mix,
+overlap-add, tails, normalize), which is fundamentally incompatible with a commit-as-you-go stream. So:
+one per-channel float **sample buffer** as the single source of truth; `emit_next(v)` is a thin
+`buf[cursor++] += v` cursor helper for sequential generators; a single `finalize()` (gain/normalize/
+dither/clip → encode → write). No second pipeline, no streaming fork. *Note: loom has no audio
+subsystem today, so this is a new capability, not a refactor.*
 
 ---
 
