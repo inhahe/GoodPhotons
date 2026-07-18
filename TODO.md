@@ -148,9 +148,17 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       motion (neither flag given) is still `drift`. 324 loom green.
 
 ### Phase 2 — `--couple` field-coupling command (§6)
-- [ ] **P2.1** Parse clusters → the existing `coupling_pairs()` edge set; per-cluster `cyclic`/`full`
-      scheme (global `--couple-scheme` default + optional `:full`/`:cyclic` tag). Retire
-      `--coupling`/`--pair` (keep as deprecated aliases). Tests.
+- [x] **P2.1** `--couple CLUSTER CLUSTER…` (comma-joined dims, space-disjoint) with per-cluster
+      `cyclic`/`full` scheme (global `--couple-scheme` default + optional `:full`/`:cyclic` tag).
+      `parse_couple`/`resolve_couple` → `couple_clusters` + forced-on `couple_axes` (fed to
+      `forced_on`/`max_forced_axis` like `--pair …:on`, no new RNG draws). `coupling_pairs()`
+      refactored around a shared `_scheme_edges()` helper: cluster path emits ring/clique edges over
+      oscillating members in CLI order; empty clusters fall through to the legacy `--coupling`/`--pair`
+      base-graph path bit-identically. **Decided: kept `--coupling`/`--pair` on their own path (they
+      resolve over the post-RNG active set; `--couple` names dims at parse time — no clean desugar), so
+      `--couple` is mutually exclusive with a non-default `--coupling`/any `--pair`.** `coupling_desc`
+      + primitive-surface warning updated; docstring/epilog/help + OSCILLATE_GRAMMAR.md §6 updated.
+      11 new tests, 335 green.
 
 ### Phase 3 — surface library & per-surface params (§7)
 - [ ] **P3.1** Author per-surface param-metadata table `{func:[(name,desc,default,[lo,hi]),…]}`
@@ -253,3 +261,16 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   legacy-representation tests and the deliberate desugaring/equivalence references stay on
   `--transform` by design. Default motion (neither flag) is still `drift`. 324 loom green.
   Phase 1 complete — next: P2.1 (`--couple` cluster command).
+- 2026-07-18: **P2.1 done.** `--couple CLUSTER CLUSTER…` — the spatial (field) counterpart of
+  `--oscillate`: each cluster is comma-joined dims sharing sin*cos terms; spaces separate disjoint
+  clusters (a dim in ≤1). Per-cluster `:full`/`:cyclic` tag over a global `--couple-scheme` default.
+  `parse_couple`/`resolve_couple` build `couple_clusters` + a forced-on `couple_axes` set fed into
+  `forced_on`/`max_forced_axis` exactly like a `--pair …:on` endpoint (no new RNG draws).
+  `coupling_pairs()` refactored around a shared `_scheme_edges(dims, scheme)` helper — cluster path
+  emits each cluster's ring/clique edges (over its oscillating members) in CLI order; empty
+  `couple_clusters` falls through to the legacy `--coupling`/`--pair` base-graph path bit-identically.
+  Kept `--coupling`/`--pair` on their own resolution path (they act over the post-RNG active set,
+  `--couple` names explicit dims at parse time — no clean desugar), so `--couple` is mutually
+  exclusive with a non-default `--coupling` / any `--pair`. `coupling_desc` summarizes clusters;
+  primitive warning lists `--couple`; docstring/epilog/help + OSCILLATE_GRAMMAR.md §6 updated.
+  11 new tests, 335 loom green. Next: Phase 3 (P3.1 surface library) or another TODO track.

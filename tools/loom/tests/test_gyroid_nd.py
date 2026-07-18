@@ -805,6 +805,74 @@ def test_pair_on_off_conflict_raises():
 
 
 # ---------------------------------------------------------------------------
+# --couple: spatial-coupling clusters (OSCILLATE_GRAMMAR.md §6)
+# ---------------------------------------------------------------------------
+
+def test_couple_disjoint_cyclic_rings():
+    # two independent clusters -> a cyclic ring within each, concatenated in CLI order
+    v = _pv("--dims", "6", "--couple", "0,1,2", "3,4")
+    assert v.couple_clusters == (((0, 1, 2), "cyclic"), ((3, 4), "cyclic"))
+    assert g.coupling_pairs(v) == [(0, 1), (1, 2), (2, 0), (3, 4), (4, 3)]
+
+
+def test_couple_per_cluster_full_scheme_tag():
+    # a ':full' tag turns that cluster into a clique; the other keeps the default ring
+    v = _pv("--dims", "6", "--couple", "0,1,2:full", "3,4")
+    assert g.coupling_pairs(v) == [(0, 1), (0, 2), (1, 2), (3, 4), (4, 3)]
+
+
+def test_couple_scheme_default_applies_to_all_clusters():
+    v = _pv("--dims", "6", "--couple", "0,1,2", "3,4,5", "--couple-scheme", "full")
+    assert v.couple_clusters == (((0, 1, 2), "full"), ((3, 4, 5), "full"))
+    assert g.coupling_pairs(v) == [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)]
+
+
+def test_couple_forces_cluster_members_to_oscillate():
+    # only 2 dims asked to oscillate, but every clustered dim must wave to couple
+    v = _pv("--dims", "8", "--oscillating", "2", "--couple", "5,6")
+    assert {5, 6} <= set(v.oscillating)
+
+
+def test_couple_member_locked_off_conflicts():
+    with pytest.raises(SystemExit):
+        _pv("--dims", "6", "--couple", "0,1,2", "--axis", "1:off")
+
+
+def test_couple_mutually_exclusive_with_coupling():
+    with pytest.raises(SystemExit):
+        _pv("--dims", "6", "--couple", "0,1", "--coupling", "all")
+
+
+def test_couple_mutually_exclusive_with_pair():
+    with pytest.raises(SystemExit):
+        _pv("--dims", "6", "--couple", "0,1", "--pair", "2,3:on")
+
+
+def test_couple_disjoint_clusters_enforced():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_couple(["0,1", "1,2"])
+
+
+def test_couple_bad_specs_raise():
+    for bad in (["0,x"], ["0,-1"], ["0,1:maybe"], ["0,,1"], [""]):
+        with pytest.raises(argparse.ArgumentTypeError):
+            g.parse_couple(bad)
+
+
+def test_couple_default_path_is_bit_identical():
+    # no --couple -> couple_clusters empty, legacy coupling graph untouched
+    v = _pv("--dims", "6", "--oscillating", "6")
+    assert getattr(v, "couple_clusters", ()) == ()
+    assert g.coupling_pairs(v) == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]
+
+
+def test_couple_reflected_in_coupling_desc():
+    v = _pv("--dims", "6", "--couple", "0,1,2:full", "3,4")
+    desc = g.coupling_desc(v)
+    assert "couple" in desc and "{0,1,2}:clique" in desc and "{3,4}:ring" in desc
+
+
+# ---------------------------------------------------------------------------
 # value-lock spec grammar (V | LO-HI | A,B,C) and base polarity
 # ---------------------------------------------------------------------------
 

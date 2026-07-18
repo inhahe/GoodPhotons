@@ -255,8 +255,23 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
    the deliberate desugaring/equivalence references stay on `--transform` on purpose. The
    default motion when *neither* flag is given is still `drift` (unchanged). 324 tests
    green. (The loom README references gyroid_nd only generically — no flag change needed.)
-6. **(Phase 2) `--couple` cluster command** (§6): parse clusters → the existing
-   `coupling_pairs()` edge set, retiring `--coupling`/`--pair` (kept as aliases).
+6. ✅ **DONE (P2.1) — `--couple` cluster command** (§6): `--couple CLUSTER CLUSTER…`
+   (each cluster `d,d,…` comma-joined, spaces disjoint) with a per-cluster `:full`/
+   `:cyclic` tag over a global `--couple-scheme` default (cyclic). `parse_couple` +
+   `resolve_couple` produce `couple_clusters` (tuple of `(dims, scheme)`) and
+   `couple_axes` (flat forced-on set, fed to `forced_on`/`max_forced_axis` like a
+   `--pair …:on` endpoint — no new RNG draws). `coupling_pairs()` was refactored around a
+   shared `_scheme_edges(dims, scheme)` helper: when `couple_clusters` is set it emits each
+   cluster's ring/clique edges (over its *oscillating* members) in CLI order; otherwise it
+   falls through to the legacy `--coupling`/`--pair` base-graph path unchanged. **Decision
+   (differs from the earlier "deprecated alias" sketch below):** rather than desugaring
+   `--coupling`/`--pair` into `--couple` clusters, they keep their own resolution path and
+   `--couple` is **mutually exclusive** with a non-default `--coupling` / any `--pair`
+   (they resolve at different times — `--coupling` acts over the post-RNG active set,
+   `--couple` names explicit dims at parse time — so a clean desugar isn't possible without
+   changing behavior). Empty `couple_clusters` ⇒ legacy path is bit-identical. `coupling_desc`
+   summarizes clusters (`couple {0,1,2}:clique {3,4}:ring (N terms)`); the primitive-surface
+   warning now also lists `--couple`. 11 new tests; 335 green.
 7. **(Phase 3) Surface library** (§7): author the per-surface param-metadata table
    (+ generator + test), add `--list-surfaces` / `--surface-help`, then widen
    `--surface` to the full `iso.py` TPMS + `pov.py` `POV_FUNCS` set with the N-D and
@@ -316,15 +331,19 @@ are **disjoint coupling groups** (a dim belongs to at most one cluster).
 | `--pair 0,1:on` | put `0` and `1` in the same cluster |
 | `--pair 0,3:off` | keep `0` and `3` in *different* clusters |
 
-`--coupling`/`--pair` remain as **deprecated aliases** that desugar to `--couple`
-clusters, so existing scripts and the coupling tests keep passing through phase 2.
+**As built (P2.1):** `--coupling`/`--pair` are *not* desugared into `--couple` clusters —
+they keep their own base-graph resolution path (which acts over the post-RNG active set,
+whereas `--couple` names explicit dims at parse time, so a behavior-preserving desugar
+isn't possible). Instead `--couple` is **mutually exclusive** with a non-default
+`--coupling` or any `--pair` (a `SystemExit` nudges you to put the two dims in one cluster
+instead of a `--pair` chord). Both paths stay fully working; existing scripts and the
+legacy coupling tests are untouched and bit-identical.
 
-### Open sub-question (decide when building phase 2)
+### Resolved sub-question — internal scheme syntax
 
-The per-cluster internal scheme (`cyclic` ring vs `full` clique) needs a surface for
-its own syntax — e.g. a trailing tag `--couple 0,1,2,3:full` — versus a global
-`--couple-scheme` default. Recommend a global default (`cyclic`) plus an optional
-per-cluster `:full`/`:cyclic` tag, mirroring how `--coupling` is global today.
+**Resolved:** a global `--couple-scheme {cyclic,full}` default (default `cyclic`) plus an
+optional per-cluster trailing tag `:full`/`:cyclic` that overrides it for that cluster —
+e.g. `--couple 0,1,2:full 3,4` (clique cluster + default-ring cluster).
 
 ---
 

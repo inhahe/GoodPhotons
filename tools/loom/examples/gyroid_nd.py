@@ -304,6 +304,14 @@ class Variant:
     pair_off: frozenset = frozenset()   # individual coupling edges deleted from the field:
     #                                     each a frozenset({i, j}); the sin(u_i)cos(u_j) term is
     #                                     dropped (edits on top of the 'cyclic'/'all' base graph).
+    couple_clusters: tuple = ()         # explicit spatial-coupling clusters from --couple: a
+    #                                     tuple of (dims_tuple_sorted, scheme) pairs, each an
+    #                                     independent group whose members share sin*cos terms
+    #                                     among themselves (scheme 'cyclic' ring or 'full' clique).
+    #                                     Empty (legacy) => coupling_pairs() uses the --coupling/
+    #                                     --pair base-graph path instead.  When set it REPLACES
+    #                                     that base graph (disjoint clusters, base+override like
+    #                                     --axis); dims in no cluster contribute no gyroid term.
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -534,7 +542,89 @@ def parse_pair_lock(spec: str, on_set: set, off_set: set) -> None:
 
 
 # ---------------------------------------------------------------------------
-# unified --oscillate / --lock axis grammar (see examples/OSCILLATE_GRAMMAR.md)
+# --couple: spatial-coupling clusters (see examples/OSCILLATE_GRAMMAR.md §6)
+# ---------------------------------------------------------------------------
+#
+# --couple is the field (space) counterpart to --oscillate (time): each CLUSTER is
+# a comma-joined set of dim indices that share sin*cos terms *among themselves*;
+# space-separated clusters are DISJOINT coupling groups (a dim in at most one).  A
+# cluster's internal scheme is the ring (`cyclic`, default) or clique (`full`), set
+# globally by --couple-scheme or per-cluster with a trailing `:full`/`:cyclic` tag.
+
+def parse_couple(tokens, default_scheme: str = "cyclic"):
+    """Parse the ``--couple`` token stream into a tuple of ``(dims_tuple, scheme)``
+    clusters.  Each token is one CLUSTER ``d,d,…`` with an optional ``:full``/``:cyclic``
+    tag (else ``default_scheme``).  Dims are non-negative ints, sorted and de-duplicated
+    within a cluster; clusters must be pairwise disjoint (a dim belongs to one cluster).
+    Raises :class:`argparse.ArgumentTypeError` on any malformed / overlapping input."""
+    clusters = []
+    seen: Dict[int, int] = {}                   # dim -> index of the cluster that owns it
+    for tok in (tokens or []):
+        spec = tok.strip()
+        if spec == "":
+            raise argparse.ArgumentTypeError("--couple: empty cluster (stray space?)")
+        body, sep, tag = spec.partition(":")
+        scheme = default_scheme
+        if sep:
+            scheme = tag.strip().lower()
+            if scheme not in ("cyclic", "full"):
+                raise argparse.ArgumentTypeError(
+                    f"--couple '{spec}': scheme tag must be ':cyclic' or ':full', "
+                    f"got ':{tag}'")
+        dims = []
+        for part in body.split(","):
+            part = part.strip()
+            if part == "":
+                raise argparse.ArgumentTypeError(
+                    f"--couple '{spec}': empty dim index (stray comma?)")
+            try:
+                d = int(part)
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"--couple '{spec}': dim index must be an integer, got '{part}'")
+            if d < 0:
+                raise argparse.ArgumentTypeError(
+                    f"--couple '{spec}': dim index must be >= 0, got {d}")
+            if d in seen and seen[d] != len(clusters):
+                raise argparse.ArgumentTypeError(
+                    f"--couple: dim {d} appears in two clusters — clusters are "
+                    f"disjoint (a dim belongs to at most one)")
+            if d not in dims:
+                dims.append(d)
+            seen[d] = len(clusters)
+        clusters.append((tuple(sorted(dims)), scheme))
+    return tuple(clusters)
+
+
+def resolve_couple(args: argparse.Namespace) -> None:
+    """Normalize ``--couple`` onto the fields the picker reads: ``couple_clusters`` (the
+    parsed clusters) and ``couple_axes`` (the flat set of all clustered dims, which the
+    picker forces to oscillate, like a ``--pair …:on`` endpoint).  Idempotent.
+
+    ``--couple`` is the primary spatial-coupling surface; it is mutually exclusive with a
+    non-default legacy ``--coupling`` or any ``--pair`` (those still work on their own as
+    the older base-graph path).  On the legacy path this leaves ``couple_clusters=()`` /
+    ``couple_axes=set()`` — no-ops, so those variants stay bit-identical."""
+    if getattr(args, "_couple_resolved", False):
+        return
+    args._couple_resolved = True
+    args.couple_clusters = ()
+    args.couple_axes = set()
+
+    couple = getattr(args, "couple", None)
+    if couple is None:
+        return
+    if getattr(args, "coupling", "cyclic") != "cyclic":
+        raise SystemExit("error: choose the coupling with either --couple or --coupling, "
+                         "not both (--couple is the cluster grammar; --coupling is the "
+                         "legacy whole-graph scheme)")
+    if getattr(args, "pair", None):
+        raise SystemExit("error: --pair edits the legacy --coupling base graph; with "
+                         "--couple put the two dims in the same cluster instead")
+    scheme = getattr(args, "couple_scheme", "cyclic")
+    clusters = parse_couple(couple, scheme)
+    args.couple_clusters = clusters
+    args.couple_axes = {d for members, _ in clusters for d in members}
 # ---------------------------------------------------------------------------
 #
 # One namespace of animatable "change-axes" (spatial dim indices AND named
@@ -962,6 +1052,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
     rng = random.Random(seed)
 
     resolve_oscillate(args)             # normalize --oscillate/--lock -> canonical fields
+    resolve_couple(args)                # normalize --couple -> couple_clusters / couple_axes
     transform = _parse_transforms(getattr(args, "transform", "drift") or "drift")
     bloom_params = (_parse_bloom_params(getattr(args, "bloom", None))
                     if _has(transform, "bloom") else ())
@@ -984,10 +1075,16 @@ def pick_variant(seed: int, args: argparse.Namespace,
     pair_on_axes = set().union(*pair_on) if pair_on else set()
     pair_ref_axes = pair_on_axes | (set().union(*pair_off) if pair_off else set())
 
+    # --couple clusters (P2.1): every clustered dim is forced to oscillate (a coupling
+    # cluster is only meaningful for waving dims), exactly like a --pair …:on endpoint.
+    couple_clusters = tuple(getattr(args, "couple_clusters", ()) or ())
+    couple_axes = {int(d) for d in (getattr(args, "couple_axes", set()) or set())}
+
     # 1) total dimension count -------------------------------------------------
     # bare dim-index axes in --oscillate are forced-on winders, so they raise the dim floor
-    # just like an --axis/--pair reference.
-    max_forced_axis = max([*axis_locks, *pair_ref_axes, *osc_dim_windings], default=-1)
+    # just like an --axis/--pair reference; so do --couple cluster members.
+    max_forced_axis = max([*axis_locks, *pair_ref_axes, *osc_dim_windings, *couple_axes],
+                          default=-1)
     dims_spec = getattr(args, "dims", None)
     floor = max(max_forced_axis + 1, 3)         # smallest legal D given forced axes
     if dims_spec is not None:
@@ -1022,9 +1119,14 @@ def pick_variant(seed: int, args: argparse.Namespace,
         forced_on.add(d)
     forced_on |= pair_on_axes                   # an 'on' coupling edge implies both endpoints wave
     forced_on |= set(osc_dim_windings)          # a bare dim-index axis pins that dim on (Q3)
+    forced_on |= couple_axes                    # a --couple cluster member must oscillate (like :on)
     osc_win_conflict = set(osc_dim_windings) & forced_off
     if osc_win_conflict:
         raise SystemExit(f"error: axis {sorted(osc_win_conflict)} is both named in --oscillate "
+                         f"(forced on) and locked off (--axis d:off / --lock)")
+    couple_conflict = couple_axes & forced_off
+    if couple_conflict:
+        raise SystemExit(f"error: axis {sorted(couple_conflict)} is in a --couple cluster "
                          f"(forced on) and locked off (--axis d:off / --lock)")
     conflict = forced_on & forced_off
     if conflict:
@@ -1232,7 +1334,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_locked=tumble_locked, osc_phase=osc_phase,
                    surface=getattr(args, "surface", "gyroid"),
                    coupling=getattr(args, "coupling", "cyclic"),
-                   pair_on=pair_on, pair_off=pair_off, dim_list=dims)
+                   pair_on=pair_on, pair_off=pair_off, dim_list=dims,
+                   couple_clusters=couple_clusters)
 
 
 # ---------------------------------------------------------------------------
@@ -1454,31 +1557,57 @@ def bloom_thickness_scale(v: "Variant", t: float) -> float:
     return 1.0
 
 
+def _scheme_edges(dims: List[int], scheme: str) -> List[Tuple[int, int]]:
+    """The ordered ``(a, b)`` coupling edges among a run of dims under a base ``scheme``.
+
+    ``dims`` must already be sorted.  ``'all'``/``'full'`` = every unordered pair
+    ``i<j`` (the complete graph / clique).  ``'none'`` = no edges.  Anything else
+    (``'cyclic'``, the default) = the consecutive ring ``(d_i, d_{i+1})`` mod m; for
+    m=2 this is the two mirrored terms ``(d0,d1)`` and ``(d1,d0)`` (deliberately not
+    deduplicated — the classic gyroid), and for m<=1 it is empty (an edge needs two
+    dims).  Shared by the legacy ``--coupling`` base graph and each ``--couple`` cluster."""
+    m = len(dims)
+    if scheme in ("all", "full"):
+        return [(dims[i], dims[j]) for i in range(m) for j in range(i + 1, m)]
+    if scheme == "none":
+        return []
+    if m < 2:
+        return []                       # a ring needs at least two dims
+    return [(dims[i], dims[(i + 1) % m]) for i in range(m)]
+
+
 def coupling_pairs(v: "Variant") -> List[Tuple[int, int]]:
     """The ordered ``(a, b)`` coupling edges of the field — one ``sin(u_a)*cos(u_b)``
-    term each — after applying the base scheme (:attr:`Variant.coupling`) and the
-    per-edge ``--pair`` edits (:attr:`Variant.pair_on` / :attr:`Variant.pair_off`).
+    term each.
 
-    The base graph is either the ``cyclic`` ring (the m consecutive pairs
-    ``(o_i, o_{i+1})`` mod m — the standard gyroid; for m=2 this is the two mirrored
-    terms ``(o0,o1)`` and ``(o1,o0)``, which are deliberately *not* deduplicated) or
-    the ``all`` complete graph (every unordered pair ``i<j``), or ``none`` (an empty
-    base graph, so the coupling is built up entirely from ``--pair …:on`` chords).
-    Then any edge in
-    ``pair_off`` is deleted, and any edge in ``pair_on`` not already present is added
-    as an extra chord (sin of the lower index, cos of the higher).  Only edges whose
-    both endpoints oscillate survive.  The returned order is base-graph order first,
-    then the added chords sorted by endpoints (stable, for reproducible expressions)."""
+    Two source models, mutually exclusive:
+
+    * **explicit clusters** (:attr:`Variant.couple_clusters`, from ``--couple``) — each
+      cluster contributes :func:`_scheme_edges` among its own oscillating members
+      (``cyclic`` ring or ``full`` clique), clusters concatenated in CLI order.  A
+      cluster's edges fully define its coupling; ``--pair`` edits do not apply here.
+    * **base graph + per-edge edits** (legacy ``--coupling``/``--pair``) — the base is
+      the ``cyclic`` ring / ``all`` complete graph / ``none`` empty graph over all
+      oscillating dims, then any edge in ``pair_off`` is deleted and any edge in
+      ``pair_on`` not already present is added as an extra chord (sin of the lower
+      index, cos of the higher).
+
+    Only edges whose both endpoints oscillate survive.  The returned order is
+    base-graph (or cluster) order first, then added chords sorted by endpoints (stable,
+    for reproducible expressions)."""
     osc = sorted(v.oscillating)
     osc_set = set(osc)
-    m = len(osc)
+
+    clusters = getattr(v, "couple_clusters", ())
+    if clusters:
+        out: List[Tuple[int, int]] = []
+        for members, scheme in clusters:
+            mem = [d for d in members if d in osc_set]      # only waving dims couple
+            out.extend(_scheme_edges(mem, scheme))
+        return out
+
     scheme = getattr(v, "coupling", "cyclic")
-    if scheme == "all":
-        base = [(osc[i], osc[j]) for i in range(m) for j in range(i + 1, m)]
-    elif scheme == "none":
-        base = []                       # empty base graph — build it up with --pair …:on
-    else:
-        base = [(osc[i], osc[(i + 1) % m]) for i in range(m)]
+    base = _scheme_edges(osc, scheme)
     pair_off = getattr(v, "pair_off", frozenset())
     pair_on = getattr(v, "pair_on", frozenset())
     out: List[Tuple[int, int]] = []
@@ -1894,6 +2023,15 @@ def coupling_desc(v: Variant) -> str:
     if getattr(v, "surface", "gyroid") == "primitive":
         return f"per-node ({m} cos term{'s' if m != 1 else ''}, one per oscillating dim)"
     actual = len(coupling_pairs(v))
+    clusters = getattr(v, "couple_clusters", ())
+    if clusters:                                # --couple: explicit disjoint cluster graph
+        parts = []
+        for members, cscheme in clusters:
+            dims = ",".join(str(d) for d in members)
+            kind = "clique" if cscheme in ("all", "full") else "ring"
+            parts.append(f"{{{dims}}}:{kind}")
+        return (f"couple {' '.join(parts)} "
+                f"({actual} sin*cos term{'s' if actual != 1 else ''})")
     scheme = getattr(v, "coupling", "cyclic")
     if scheme == "all":
         base = m * (m - 1) // 2
@@ -2461,6 +2599,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "# all 15 pairs, not 6\n"
                 "  python examples/gyroid_nd.py --dims 6 --oscillating 6 --coupling all --pair 0,3:off   "
                 "# 15 pairs minus edge 0-3\n"
+                "  python examples/gyroid_nd.py --dims 6 --couple 0,1,2 3,4,5   "
+                "# two independent 3-dim coupling rings\n"
+                "  python examples/gyroid_nd.py --dims 5 --couple 0,1,2:full 3,4   "
+                "# one clique cluster + one ring\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
                 "  python examples/gyroid_nd.py --dims 6 --oscillate bloom   # opens on the showcase gyroid\n"
@@ -2561,6 +2703,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "'I,J:on' adds it as an extra chord (both endpoints are forced to "
                         "oscillate). The comma names an edge's two endpoints — distinct from "
                         "--axis's hyphen range (LO-HI) that names a run of nodes. (see epilog)")
+    g.add_argument("--couple", nargs="+", default=None, metavar="CLUSTER",
+                   help="spatial-coupling clusters — the field counterpart of --oscillate. "
+                        "Each CLUSTER is comma-joined dims that share sin*cos coupling terms "
+                        "among themselves; spaces separate disjoint clusters (a dim lives in at "
+                        "most one). Cluster members are forced to oscillate (like --pair …:on). "
+                        "e.g. '--couple 0,1,2 3,4' makes two independent rings. Per-cluster "
+                        "scheme tag ':full' (clique) or ':cyclic' (ring, default) overrides "
+                        "--couple-scheme. Mutually exclusive with --coupling/--pair (put the two "
+                        "dims in one cluster instead of a --pair chord).")
+    g.add_argument("--couple-scheme", choices=("cyclic", "full"), default="cyclic",
+                   help="default within-cluster wiring for --couple: 'cyclic' (ring of "
+                        "consecutive pairs, the Schoen-gyroid generalization) or 'full' (clique, "
+                        "every unordered pair). Override per cluster with a ':full'/':cyclic' tag.")
 
     g = p.add_argument_group("scene")
     g.add_argument("--threshold", type=float, default=0.0,
@@ -2707,15 +2862,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.pair_on = frozenset(pair_on)
     args.pair_off = frozenset(pair_off)
 
-    # The coupling graph (--coupling/--pair) is a pairwise-gyroid concept; a per-node surface
-    # (Schwarz P) has no edges to wire, so those flags are inert there.  Warn rather than error
-    # so a batch script that sets a house-style --coupling can still switch --surface freely.
+    # --couple explicit clusters (the field counterpart of --oscillate); mutually exclusive
+    # with a non-default --coupling / any --pair (resolve_couple raises on conflict).
+    resolve_couple(args)
+
+    # The coupling graph (--coupling/--pair/--couple) is a pairwise-gyroid concept; a per-node
+    # surface (Schwarz P) has no edges to wire, so those flags are inert there.  Warn rather than
+    # error so a batch script that sets a house-style coupling can still switch --surface freely.
     if args.surface != "gyroid":
         ignored = []
         if getattr(args, "coupling", "cyclic") != "cyclic":
             ignored.append("--coupling")
         if args.pair_on or args.pair_off:
             ignored.append("--pair")
+        if getattr(args, "couple_clusters", ()):
+            ignored.append("--couple")
         if ignored:
             print(f"[gyroid_nd] note: {' and '.join(ignored)} only affect --surface gyroid "
                   f"(the pairwise coupling graph); ignored for --surface {args.surface} "
