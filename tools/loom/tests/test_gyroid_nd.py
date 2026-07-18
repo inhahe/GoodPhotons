@@ -1451,6 +1451,92 @@ def test_oscillate_swinger_rate_rejected():
         g.pick_variant(3, _args("--dims", "6", "--oscillate", "freq", "rate", "2"), {})
 
 
+# --------------------------------------------------------------------------
+# P3.2: --list-surfaces / --surface-help discovery commands
+# --------------------------------------------------------------------------
+
+def test_surface_catalog_covers_tpms_and_every_pov():
+    names = g.surface_names()
+    # the 4 periodic TPMS families, in order, then every POV builtin, no duplicates
+    assert names[:4] == ["gyroid", "primitive", "schwarz_d", "neovius"]
+    assert set(names) == {"gyroid", "primitive", "schwarz_d", "neovius"} | set(g.POV_FUNCS)
+    assert len(names) == len(set(names)) == 4 + len(g.POV_FUNCS)
+
+
+def test_surface_group_classification_matches_honesty_sets():
+    assert g.surface_group("gyroid") == "periodic"
+    assert g.surface_group("schwarz_p") == "periodic"      # alias of primitive
+    assert g.surface_group("f_sphere") == "nd_pov"         # in POV_ND_GENERALIZABLE
+    assert g.surface_group("f_torus") == "affine_pov"      # ordinary POV builtin
+    # every POV builtin lands in exactly one POV group by its N-D status
+    for name in g.POV_FUNCS:
+        grp = g.surface_group(name)
+        assert grp == ("nd_pov" if name in g.POV_ND_GENERALIZABLE else "affine_pov")
+    with pytest.raises(ValueError):
+        g.surface_group("not_a_surface")
+
+
+def test_list_surfaces_text_is_grouped_and_ascii():
+    txt = g._list_surfaces_text()
+    assert "periodic minimal surfaces" in txt
+    assert "N-D-generalizable POV builtins" in txt
+    assert "affine-only POV builtins" in txt
+    assert "f_sphere" in txt and "params=1" in txt
+    assert f"{len(g.surface_names())} surfaces total" in txt
+    # console-safe: no non-ASCII (Windows cp1252 would mojibake em-dashes)
+    txt.encode("ascii")
+
+
+def test_surface_help_pov_lists_authored_params():
+    txt = g._surface_help_text("f_torus")
+    assert "surface: f_torus" in txt
+    assert "affine-only" in txt
+    assert "major" in txt and "minor" in txt
+    assert "range [0.1, 4]" in txt
+    txt.encode("ascii")
+
+
+def test_surface_help_nd_pov_flags_generalization():
+    txt = g._surface_help_text("f_sphere")
+    assert "N-D-generalizable" in txt and "radius" in txt
+
+
+def test_surface_help_tpms_has_no_shape_params():
+    txt = g._surface_help_text("gyroid")
+    assert "periodic minimal surface" in txt
+    assert "freq / threshold / thickness" in txt
+
+
+def test_surface_help_alias_shows_canonical_and_alias():
+    txt = g._surface_help_text("schwarz_p")
+    assert txt.startswith("surface: primitive")
+    assert "alias: schwarz_p" in txt
+
+
+def test_surface_help_zero_param_helper():
+    txt = g._surface_help_text("f_r")
+    assert "0-parameter helper" in txt
+
+
+def test_surface_help_unknown_name_raises():
+    with pytest.raises(SystemExit):
+        g._surface_help_text("f_not_real")
+
+
+def test_list_surfaces_cli_exits_without_generating(capsys):
+    rc = g.main(["--list-surfaces"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "loom surface library" in out and "f_sphere" in out
+
+
+def test_surface_help_cli_exits_without_generating(capsys):
+    rc = g.main(["--surface-help", "f_torus"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "major" in out and "minor" in out
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

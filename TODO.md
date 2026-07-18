@@ -173,7 +173,15 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       match `arity−3` by construction; `pov_params(name)` accessor returns a copy. Exported from
       `loom/__init__`. 6 new tests (completeness drift-guard, well-formedness: valid/unique axis names +
       default∈[lo,hi], spot-checks, unknown-name reject, copy-safety), 349 loom green.
-- [ ] **P3.2** `--list-surfaces` + `--surface-help NAME` discovery commands; main `--help` pointer.
+- [x] **P3.2** `--list-surfaces` + `--surface-help NAME` discovery commands; main `--help` pointer.
+      *Done 2026-07-18:* surface catalog in `gyroid_nd.py` (`_TPMS_CATALOG` + `POV_FUNCS`), grouped by
+      N-D honesty class (`surface_group`: periodic / nd_pov / affine_pov). `--list-surfaces` prints all
+      82 surfaces (4 periodic TPMS with `[nd] [loop]`, 9 N-D-generalizable POV, 69 affine-only POV) with
+      each one's shape-param count; `--surface-help NAME` prints one surface's params via `pov_params`
+      (axis name/meaning/default/range) or the shared-axis note for a param-free TPMS, resolving the
+      `schwarz_p`→`primitive` alias. Both are early-exit (return 0 before any generation), ASCII-safe
+      for the Windows console, and cross-referenced from `--surface` help + the epilog. 11 new tests,
+      360 loom green.
 - [ ] **P3.3** Widen `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
       + `pov.py` `POV_FUNCS`, with the N-D (`POV_ND_GENERALIZABLE`) and seamless-motion (periodic-only
       `drift`) guards. Per-surface shape params become `--oscillate`/`--lock` axes.
@@ -293,3 +301,13 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   discipline (set-equality with `POV_FUNCS`, exact `arity−3` count, valid+unique axis names,
   default∈[lo,hi] with lo<hi, authored spot-checks, unknown-name reject, copy-safety). 349 loom green.
   Next: P3.2 (`--list-surfaces` / `--surface-help NAME` discovery commands).
+- 2026-07-18: **P3.2 done.** Surface-library discovery commands in `gyroid_nd.py`. A catalog
+  (`_TPMS_CATALOG` for the 4 periodic minimal-surface families + `POV_FUNCS` for the 78 POV builtins)
+  is grouped by N-D honesty class via `surface_group()` → periodic / nd_pov / affine_pov.
+  `--list-surfaces` prints the whole library (82 surfaces) with per-surface shape-param counts and
+  `[nd]`/`[loop]` tags; `--surface-help NAME` prints one surface's shape params (name, meaning,
+  default, range from `pov_params`) or the shared-axis note for a param-free TPMS, resolving the
+  `schwarz_p`→`primitive` alias and raising on unknowns. Both early-exit before any generation and
+  emit ASCII-only text (Windows-console-safe). Cross-referenced from `--surface` help + epilog.
+  11 new tests, 360 loom green. Next: P3.3 (widen `--surface` to the full library — the design-heavy
+  step: map POV builtins into the N-D slice machinery with the N-D + seamless-motion guards).

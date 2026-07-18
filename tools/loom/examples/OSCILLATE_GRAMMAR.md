@@ -406,22 +406,25 @@ completeness is guaranteed *by construction* (a comprehension over `POV_FUNCS`),
 test asserts every entry has exactly `arity − 3` params with valid, unique axis names and
 in-range defaults — the same drift-guard discipline the arity table uses.
 
-With that table, add discovery commands:
+With that table, add discovery commands. **P3.2 (done 2026-07-18):** both landed in
+`gyroid_nd.py`, backed by a surface catalog (`_TPMS_CATALOG` for the periodic families +
+`POV_FUNCS`) grouped by `surface_group()` into `periodic` / `nd_pov` / `affine_pov`:
 
-* **`--list-surfaces`** — print every surface (grouped: periodic TPMS / N-D POV /
-  affine-only POV), one line each with its param count and N-D status.
-* **`--surface-help NAME`** (or `--help NAME`) — print one surface's full parameter
-  list: each param's axis name, meaning, default, range, and swinger/winder kind, so the
-  user knows exactly what they can drop into `--oscillate`/`--lock` for that surface.
-* The main `--help` gains a pointer to both (since the axis namespace is
-  surface-dependent, a static `--help` can't enumerate every surface's params inline).
+* **`--list-surfaces`** — prints every surface (82 total) grouped periodic TPMS / N-D POV
+  / affine-only POV, one line each with its shape-param count and `[nd]`/`[loop]` status.
+* **`--surface-help NAME`** — prints one surface's parameter list from `pov_params(name)`
+  (each param's axis name, meaning, default, range), or the "no shape params — use
+  freq/threshold/thickness" note for a param-free TPMS; resolves the `schwarz_p`→
+  `primitive` alias and errors (listing the catalog) on an unknown name. Both are
+  early-exit (return 0 before generation) and ASCII-only for the Windows console.
+* The main `--help` (`--surface` help text + epilog) points at both.
 
 ### Staging
 
 This is **phase 3+** work (after the core `--oscillate` grammar lands). Order:
 (a) ~~author the param-metadata table + generator + test~~ **done (P3.1)**;
-(b) `--list-surfaces` / `--surface-help` (P3.2); (c) widen `--surface` choices to the
-full library with the N-D and seamless-motion guards from the caveats above (P3.3).
+(b) ~~`--list-surfaces` / `--surface-help`~~ **done (P3.2)**; (c) widen `--surface` choices
+to the full library with the N-D and seamless-motion guards from the caveats above (P3.3).
 
 ---
 

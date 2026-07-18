@@ -211,6 +211,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loom import Scene, Camera, Raw  # noqa: E402
+from loom import POV_FUNCS, POV_ND_GENERALIZABLE, pov_params  # noqa: E402
 from loom.ftsl_emit import fmt  # noqa: E402
 
 
@@ -1444,6 +1445,119 @@ TRANSFORMS = ("drift", "rotate", "tumble", "bloom")
 #                 surface; no edges, so --coupling/--pair have nothing to act on).
 SURFACES = ("gyroid", "primitive")
 
+# ---------------------------------------------------------------------------
+# Surface catalog for the --list-surfaces / --surface-help discovery commands
+# (OSCILLATE_GRAMMAR.md §7, P3.2).  Three honesty groups (DESIGN.md §11.7):
+#   'periodic'  — triply-periodic minimal surfaces: they loop seamlessly under a phase
+#                 drift and generalize to any --dims.  No shape params (driven only by the
+#                 shared freq/threshold/thickness axes).
+#   'nd_pov'    — POV builtins in POV_ND_GENERALIZABLE: genuinely fold into an N-D field.
+#   'affine_pov'— every other POV builtin: an N-D slice is only an affine remap of x/y/z,
+#                 and (being non-periodic) they loop only via a coordinate transform that
+#                 returns to itself, never a linear drift.
+# `--surface` selection is widened to the whole catalog in P3.3; today it accepts the two
+# N-D minimal-surface families below ("gyroid"/"primitive").  The two commands here are
+# pure reference output and list the whole library regardless.
+
+# Periodic TPMS: (name, one-line description, aliases).  These are the loom-native N-D
+# families plus the plain-3-D fields in loom.iso.FIELDS; none carry shape params.
+_TPMS_CATALOG = [
+    ("gyroid", "Schoen gyroid - pairwise sin(u_a)*cos(u_b) minimal surface", ()),
+    ("primitive", "Schwarz P - per-node sum cos(u_d)", ("schwarz_p",)),
+    ("schwarz_d", "Schwarz D (diamond) minimal surface", ()),
+    ("neovius", "Neovius surface - 3*sum cos + 4*prod cos", ()),
+]
+_TPMS_ALIASES = {alias: name for name, _desc, aliases in _TPMS_CATALOG for alias in aliases}
+_TPMS_SELECTABLE = frozenset(SURFACES)   # which TPMS --surface accepts today (pre-P3.3)
+
+
+def surface_group(name: str) -> str:
+    """The honesty group of surface ``name`` — 'periodic', 'nd_pov', or 'affine_pov'."""
+    canon = _TPMS_ALIASES.get(name, name)
+    if canon in {n for n, _d, _a in _TPMS_CATALOG}:
+        return "periodic"
+    if name in POV_ND_GENERALIZABLE:
+        return "nd_pov"
+    if name in POV_FUNCS:
+        return "affine_pov"
+    raise ValueError(f"unknown surface {name!r}")
+
+
+def surface_names() -> List[str]:
+    """Every surface the catalog knows (TPMS + all POV builtins), for --list-surfaces."""
+    return [n for n, _d, _a in _TPMS_CATALOG] + list(POV_FUNCS)
+
+
+def _list_surfaces_text() -> str:
+    """The --list-surfaces report: every surface grouped by N-D honesty class, one line
+    each with its shape-param count and whether it loops seamlessly / generalizes N-D."""
+    lines = ["loom surface library - surfaces you can slice into an N-D isosurface.",
+             "columns: NAME  params=<shape-param count>  [nd]=generalizes to --dims>3  "
+             "[loop]=seamless under a phase drift",
+             ""]
+    # periodic TPMS
+    lines.append("periodic minimal surfaces (nd, loop; no shape params - use freq/threshold/thickness):")
+    for name, desc, aliases in _TPMS_CATALOG:
+        tag = "  <- --surface accepts this today" if name in _TPMS_SELECTABLE else ""
+        alias = f"  (aka {', '.join(aliases)})" if aliases else ""
+        lines.append(f"  {name:<22} params=0  [nd] [loop]  {desc}{alias}{tag}")
+    # N-D-generalizable POV
+    lines.append("")
+    lines.append("N-D-generalizable POV builtins (nd; non-periodic - loop via a returning transform):")
+    for name in sorted(POV_ND_GENERALIZABLE):
+        n = POV_FUNCS[name] - 3
+        lines.append(f"  {name:<22} params={n}  [nd]")
+    # affine-only POV
+    lines.append("")
+    lines.append("affine-only POV builtins (an N-D slice is an affine remap of x/y/z; non-periodic):")
+    affine = sorted(n for n in POV_FUNCS if n not in POV_ND_GENERALIZABLE)
+    for name in affine:
+        n = POV_FUNCS[name] - 3
+        lines.append(f"  {name:<22} params={n}")
+    lines.append("")
+    lines.append(f"{len(surface_names())} surfaces total "
+                 f"({len(_TPMS_CATALOG)} periodic, {len(POV_ND_GENERALIZABLE)} N-D POV, "
+                 f"{len(affine)} affine-only POV).")
+    lines.append("Run --surface-help NAME for one surface's shape parameters.")
+    lines.append("Note: --surface currently selects a periodic family (gyroid/primitive); "
+                 "the POV library becomes selectable in P3.3.")
+    return "\n".join(lines)
+
+
+def _surface_help_text(name: str) -> str:
+    """The --surface-help NAME report: one surface's honesty group and its shape-param
+    axes (name, meaning, default, range), or the shared-axis note for a param-free TPMS."""
+    canon = _TPMS_ALIASES.get(name, name)
+    try:
+        group = surface_group(name)
+    except ValueError:
+        avail = ", ".join(surface_names())
+        raise SystemExit(f"error: unknown surface {name!r}; see --list-surfaces "
+                         f"({len(surface_names())} available: {avail})")
+    lines = [f"surface: {canon}" + (f"  (alias: {name})" if canon != name else "")]
+    if group == "periodic":
+        desc = next(d for n, d, _a in _TPMS_CATALOG if n == canon)
+        lines.append("  group   : periodic minimal surface (generalizes N-D; loops seamlessly)")
+        lines.append(f"  field   : {desc}")
+        lines.append("  params  : none - shaped by the shared axes freq / threshold / thickness")
+        return "\n".join(lines)
+    nd = " (generalizes to --dims>3)" if group == "nd_pov" else \
+        " (N-D slice is only an affine remap of x/y/z)"
+    lines.append(f"  group   : {'N-D-generalizable' if group == 'nd_pov' else 'affine-only'} "
+                 f"POV builtin{nd}")
+    lines.append("  loop    : non-periodic - seamless motion needs a returning coordinate "
+                 "transform, not a linear drift")
+    params = pov_params(name)
+    if not params:
+        lines.append("  params  : none (a 0-parameter helper; just the 3 coordinates)")
+    else:
+        lines.append(f"  params  : {len(params)} shape parameter(s) - each is a "
+                     f"--oscillate/--lock axis once wired (P3.3):")
+        for axis, pdesc, default, (lo, hi) in params:
+            lines.append(f"    {axis:<10} {pdesc}  (default {fmt(default)}, "
+                         f"range [{fmt(lo)}, {fmt(hi)}])")
+    return "\n".join(lines)
+
 
 def _parse_transforms(spec: str) -> str:
     """Normalize a ``--transform`` value — one name or a comma/plus-separated set — into a
@@ -2580,7 +2694,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "  --coupling none         empty base graph; build coupling from --pair I,J:on\n\n"
                 "surface family (--surface):\n"
                 "  gyroid            pairwise Schoen gyroid, sum sin(u_a)*cos(u_b) (default; uses --coupling/--pair)\n"
-                "  primitive         Schwarz P, per-node sum cos(u_d) (no edges; --coupling/--pair N/A)\n\n"
+                "  primitive         Schwarz P, per-node sum cos(u_d) (no edges; --coupling/--pair N/A)\n"
+                "  --list-surfaces   print the whole surface library (periodic TPMS / N-D POV / affine POV)\n"
+                "  --surface-help N  print one surface's shape parameters (name, default, range)\n\n"
                 "examples:\n"
                 "  python examples/gyroid_nd.py --count 10\n"
                 "  python examples/gyroid_nd.py --count 5 --seed 42 --dims 6 "
@@ -2606,7 +2722,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
                 "  python examples/gyroid_nd.py --dims 6 --oscillate bloom   # opens on the showcase gyroid\n"
-                "  python examples/gyroid_nd.py --surface primitive --dims 5   # Schwarz P (per-node cos)"))
+                "  python examples/gyroid_nd.py --surface primitive --dims 5   # Schwarz P (per-node cos)\n"
+                "  python examples/gyroid_nd.py --list-surfaces                # browse the surface library\n"
+                "  python examples/gyroid_nd.py --surface-help f_torus         # one surface's params"))
 
     g = p.add_argument_group("output")
     g.add_argument("-n", "--count", type=int, default=1,
@@ -2688,7 +2806,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "with no edges, so --coupling/--pair do not apply to it (a warning is "
                         "printed if they are given). Both share the whole N-D slice machinery "
                         "(--dims/--oscillating/--harmonics/--transform/bloom all work identically); "
-                        "they differ only in how the per-dim arguments combine into the field.")
+                        "they differ only in how the per-dim arguments combine into the field. "
+                        "Run --list-surfaces to see the full library and --surface-help NAME for "
+                        "one surface's shape parameters.")
+    g.add_argument("--list-surfaces", action="store_true",
+                   help="print the whole surface library (periodic TPMS / N-D POV / affine-only "
+                        "POV), grouped with each surface's shape-param count and N-D status, then "
+                        "exit.")
+    g.add_argument("--surface-help", metavar="NAME", default=None,
+                   help="print one surface's shape parameters (axis name, meaning, default, range) "
+                        "then exit; NAME is any surface from --list-surfaces.")
     g.add_argument("--coupling", choices=("cyclic", "all", "none"), default="cyclic",
                    help="base graph of sin*cos pairs the field sums over (the pair polarity). "
                         "'cyclic' (default): the m consecutive oscillating pairs (o_i, o_{i+1}) "
@@ -2814,6 +2941,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Discovery commands (P3.2): print the surface library / one surface's params, then exit
+    # before any generation work.  --surface-help raises SystemExit on an unknown name.
+    if args.list_surfaces:
+        print(_list_surfaces_text())
+        return 0
+    if args.surface_help is not None:
+        print(_surface_help_text(args.surface_help))
+        return 0
 
     # (--dims >= 3, --oscillating >= 2, --freq > 0 are validated by their spec parsers.)
     if args.count < 1:
