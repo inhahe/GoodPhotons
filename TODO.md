@@ -138,8 +138,14 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
         motion default to `drift`.
       - **Validated:** 12 new tests + a real `--oscillate drift rate 3` video through the CLI→ftrace
         pipeline. 324 loom tests green.
-- [ ] **P1.5 Flip default** — `--oscillate` primary, `--transform` prints deprecation notice; update
-      README, module docstring, epilog, `--help`.
+- [x] **P1.5 Make `--oscillate` the documented surface** ✅ 2026-07-18. `--transform` +
+      satellites (`--bloom`/`--bloom-amp`/`--tumble-*`) hidden from `--help` (`argparse.SUPPRESS`)
+      but still fully supported; passing `--transform` prints a plain one-line deprecation note.
+      Migrated the module docstring examples/prose + epilog to the grammar, and the test suite's
+      incidental `--transform` setup usages to `--oscillate` (23 via
+      `scraps/convert_transform_to_oscillate.py` + 2 hand edits; the `bloom_amps`-representation
+      and deliberate desugaring/equivalence tests intentionally stay on `--transform`). Default
+      motion (neither flag given) is still `drift`. 324 loom green.
 
 ### Phase 2 — `--couple` field-coupling command (§6)
 - [ ] **P2.1** Parse clusters → the existing `coupling_pairs()` edge set; per-cluster `cyclic`/`full`
@@ -236,3 +242,14 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   bit-identical. Single shared clock ⇒ conflicting motion rates/phases and swinger `rate`/`phase`
   are rejected. 12 new tests + a real `--oscillate drift rate 3` video (CLI→ftrace). 324 loom green.
   Next: P1.5 (flip default — `--oscillate` primary, `--transform` deprecation notice + docs).
+- 2026-07-18: **P1.5 done.** `--oscillate` is now the single documented motion surface.
+  `--transform` + its `--bloom`/`--bloom-amp`/`--tumble-*` satellites are hidden from `--help`
+  (`argparse.SUPPRESS`) but stay fully supported; explicitly passing `--transform` prints a plain
+  one-line deprecation note (checked before `resolve_oscillate` synthesizes it). Migrated the
+  module docstring examples/prose + epilog quickstart to the grammar (`--oscillate bloom,1.5*freq`,
+  `--oscillate 0.3*tumble`, `--oscillate tumble --lock 0,1`) and rewrote the test suite's incidental
+  `--transform` setup usages to `--oscillate` (a one-shot `scraps/convert_transform_to_oscillate.py`
+  did 23; 2 hand edits for the dynamic `tr` loop + `base` list). The two `bloom_amps`
+  legacy-representation tests and the deliberate desugaring/equivalence references stay on
+  `--transform` by design. Default motion (neither flag) is still `drift`. 324 loom green.
+  Phase 1 complete — next: P2.1 (`--couple` cluster command).

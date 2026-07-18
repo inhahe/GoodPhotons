@@ -241,9 +241,20 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
    default to `drift`. Validated by 12 new tests (motion-rate ≡ `--max-winding`, bare-dim
    exact/amp winding, dim-floor + off-lock conflicts, seamless phase offset, rate/phase
    conflict + swinger-rate guards) and a real `--oscillate drift rate 3` video through the
-   CLI→ftrace pipeline. 324 loom tests green. Still TODO: flip the default (step 5).
-5. **Flip the default** so `--oscillate` is primary and `--transform` prints a
-   deprecation notice. Update README, module docstring, epilog, `--help`.
+   CLI→ftrace pipeline. 324 loom tests green.
+5. ✅ **DONE (P1.5)** — made `--oscillate` the single documented surface. `--transform`
+   and its satellites (`--bloom`/`--bloom-amp`/`--tumble-mode`/`--tumble-amp`/
+   `--tumble-lock`) are hidden from `--help` (`argparse.SUPPRESS`) but stay fully
+   supported; passing `--transform` now prints a plain one-line deprecation note (before
+   `resolve_oscillate` can synthesize it). The module docstring examples + conceptual
+   prose and the epilog quickstart were migrated to the grammar (e.g. `--oscillate
+   bloom,1.5*freq`, `--oscillate 0.3*tumble`, `--oscillate tumble --lock 0,1`). The test
+   suite's incidental `--transform` setup usages were migrated to `--oscillate` (23
+   auto-converted via `scraps/convert_transform_to_oscillate.py` + 2 hand edits for the
+   dynamic `tr` loop and the `base` list); the two `bloom_amps`-representation tests and
+   the deliberate desugaring/equivalence references stay on `--transform` on purpose. The
+   default motion when *neither* flag is given is still `drift` (unchanged). 324 tests
+   green. (The loom README references gyroid_nd only generically — no flag change needed.)
 6. **(Phase 2) `--couple` cluster command** (§6): parse clusters → the existing
    `coupling_pairs()` edge set, retiring `--coupling`/`--pair` (kept as aliases).
 7. **(Phase 3) Surface library** (§7): author the per-surface param-metadata table
