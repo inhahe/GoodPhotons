@@ -1675,6 +1675,128 @@ def test_param_default_random_no_effect_on_a_tpms():
 
 
 # ---------------------------------------------------------------------------
+# S6: affine N-D remap of a POV surface under an explicit slice motion (P3.3)
+# ---------------------------------------------------------------------------
+
+def _grad_bound(body):
+    m = re.search(r"max_gradient\s+([0-9.]+)", body)
+    assert m, "no max_gradient in emitted scene"
+    return float(m.group(1))
+
+
+def test_pov_static_by_default_leaves_coords_unremapped():
+    # a plain POV render carries no explicit motion: the call stays the literal f(x,y,z)
+    v = _pv("--surface", "f_torus")
+    assert v.pov_motion is False
+    assert g.field_expr(v, 0.0, "drift") == "f_torus(x,y,z,1,0.25)"
+    assert g.field_expr(v, 0.3, "drift") == "f_torus(x,y,z,1,0.25)"
+
+
+def test_pov_param_swing_alone_does_not_trigger_the_affine():
+    # an --oscillate that names only a shape param is not a slice motion
+    v = _pv("--surface", "f_torus", "--oscillate", "minor")
+    assert v.pov_motion is False
+
+
+def test_pov_tumble_sets_motion_and_remaps_mid_loop():
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble")
+    assert v.pov_motion is True
+    mid = g.field_expr(v, 0.25, "tumble")
+    assert mid != g.field_expr(v, 0.0, "tumble")         # the slice has turned
+    assert mid.startswith("f_torus(")                    # same surface
+    assert mid.endswith(",1,0.25)")                      # major/minor params preserved
+
+
+def test_pov_tumble_loops_seamlessly():
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble")
+    assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v, 1.0, "tumble")
+
+
+def test_pov_rotate_loops_seamlessly():
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "rotate")
+    assert g.field_expr(v, 0.0, "rotate") == g.field_expr(v, 1.0, "rotate")
+
+
+def test_pov_drift_is_deliberately_not_seamless():
+    # a non-periodic POV shape linearly panned by drift does NOT return at t=1 (documented)
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "drift")
+    assert v.pov_motion is True
+    assert g.field_expr(v, 0.0, "drift") != g.field_expr(v, 1.0, "drift")
+
+
+def test_pov_affine_is_identity_at_loop_ends():
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble")
+    for t in (0.0, 1.0):
+        M, b = g._pov_affine(v, t, "tumble")
+        smin, smax = g._mat3_singular_extremes(M)
+        assert smin == pytest.approx(1.0, abs=1e-6)
+        assert smax == pytest.approx(1.0, abs=1e-6)
+        assert b == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_pov_no_motion_affine_is_the_identity():
+    v = _pv("--surface", "f_torus")                       # pov_motion False
+    M, b = g._pov_affine(v, 0.4, "drift")
+    assert M == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    assert b == [0.0, 0.0, 0.0]
+
+
+def test_mat3_singular_extremes_identity():
+    assert g._mat3_singular_extremes([[1, 0, 0], [0, 1, 0], [0, 0, 1]]) == pytest.approx((1.0, 1.0))
+
+
+def test_mat3_singular_extremes_diagonal_scale():
+    smin, smax = g._mat3_singular_extremes([[0.5, 0, 0], [0, 2.0, 0], [0, 0, 1.0]])
+    assert smin == pytest.approx(0.5)
+    assert smax == pytest.approx(2.0)
+
+
+def test_mat3_singular_extremes_rotation_is_an_isometry():
+    c, s = math.cos(0.7), math.sin(0.7)
+    R = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    smin, smax = g._mat3_singular_extremes(R)
+    assert smin == pytest.approx(1.0)
+    assert smax == pytest.approx(1.0)
+
+
+def test_pov_tumble_inflates_grad_bound_mid_loop():
+    # the emitted field is f(M.p), so |grad| <= sigma_max(M)*|grad f|; a torus's base bound is 1
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble")
+    base = _grad_bound(_auto_body(v, t=0.0, transform="tumble"))
+    mid = _grad_bound(_auto_body(v, t=0.25, transform="tumble"))
+    assert base == pytest.approx(1.0)                     # identity at the loop end
+    assert mid > base                                     # sigma_max ~ sqrt(2) > 1
+
+
+def test_pov_tumble_grows_container_mid_loop():
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble")
+    base = _emitted_clip_radius(_auto_body(v, t=0.0, transform="tumble"))
+    mid = _emitted_clip_radius(_auto_body(v, t=0.25, transform="tumble"))
+    assert mid > base                                     # 1/sigma_min > 1 as an axis foreshortens
+
+
+def test_pov_explicit_radius_is_not_expanded_by_motion():
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble", "--radius", "2.0")
+    r0 = _emitted_clip_radius(_auto_body(v, t=0.0, transform="tumble", radius=2.0))
+    rmid = _emitted_clip_radius(_auto_body(v, t=0.25, transform="tumble", radius=2.0))
+    assert r0 == pytest.approx(2.0)
+    assert rmid == pytest.approx(2.0)                     # explicit --radius clips, no auto-grow
+
+
+def test_pov_motion_via_explicit_transform_flag():
+    # the legacy --transform tumble also engages the affine (not only --oscillate)
+    v = _pv("--surface", "f_torus", "--dims", "5", "--transform", "tumble")
+    assert v.pov_motion is True
+
+
+def test_tpms_ignores_pov_motion_flag():
+    # a periodic surface animates via its own drift/tumble machinery, not the POV affine
+    v = _pv("--dims", "6", "--oscillate", "tumble")
+    # field is the gyroid sum, unaffected by _pov_affine (which only runs on POV surfaces)
+    assert "f_torus" not in g.field_expr(v, 0.25, "tumble")
+
+
+# ---------------------------------------------------------------------------
 # unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
 # ---------------------------------------------------------------------------
 

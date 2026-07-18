@@ -320,6 +320,14 @@ class Variant:
     #                                     clamp(base + amp*(hi-lo)*env(t), lo, hi) with env the
     #                                     shared sin^2 bump (its own clock in bloom_rates/phases);
     #                                     amp<0 sweeps downward.  Empty => static pov_values.
+    pov_motion: bool = False            # S6: the user explicitly asked for a slice MOTION
+    #                                     (drift/rotate/tumble via --oscillate or --transform),
+    #                                     so a POV surface's (x,y,z) are remapped by the per-frame
+    #                                     affine _pov_affine(v,t,transform) before the f_* call —
+    #                                     tumble tilts/shears the slice out of 3-space, rotate
+    #                                     foreshortens each axis, drift pans it (non-seamless).
+    #                                     False (default, and for a pov_swing-only spec) keeps the
+    #                                     shape a static f(x,y,z) — the pre-S6 behavior.
     coupling: str = "cyclic"            # which sin*cos pairs the field sums over:
     #                                     'cyclic' (default) = the m consecutive pairs
     #                                     (o_i, o_{i+1}) wrapping around, i.e. the standard
@@ -960,6 +968,13 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     args.osc_max_winding = None
     args.osc_phase = 0.0
 
+    # S6: whether the user explicitly requested a slice MOTION (drift/rotate/tumble).  A POV
+    # surface only turns its default static f(x,y,z) into an animated affine remap when this
+    # is True; the default "drift" the early-out installs below, and the benign filler "drift"
+    # a pov_swing-only spec needs, both leave it False so a plain POV render stays static.
+    # Recomputed unconditionally each call (pick_variant re-runs resolve_oscillate).
+    args.pov_motion = False
+
     osc = getattr(args, "oscillate", None)
     lock = getattr(args, "lock", None)
     raw_transform = getattr(args, "transform", None)
@@ -967,6 +982,8 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     if osc is None and lock is None:
         if raw_transform is None:               # --transform default is None (see parser)
             args.transform = "drift"
+        else:
+            args.pov_motion = True              # an explicit --transform is a real motion request
         return
 
     if raw_transform is not None:
@@ -1087,6 +1104,9 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
         # Bare dim indices with no named motion animate via drift (the phase-advance that
         # consumes each dim's winding), so make that explicit.
         canon = ["drift"]
+    # S6: real slice motion (a named drift/rotate/tumble, or bare dim windings) drives the POV
+    # affine remap.  The pov_swing filler "drift" added below is NOT motion, so record this now.
+    args.pov_motion = bool(canon)
     if bloom_active:
         canon.append("bloom")
     if not canon and pov_swing:
@@ -1436,6 +1456,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_locked=tumble_locked, osc_phase=osc_phase,
                    surface=surface, pov_values=pov_values,
                    pov_swing=dict(getattr(args, "pov_swing", {}) or {}),
+                   pov_motion=bool(getattr(args, "pov_motion", False)),
                    coupling=getattr(args, "coupling", "cyclic"),
                    pair_on=pair_on, pair_off=pair_off, dim_list=dims,
                    couple_clusters=couple_clusters)
@@ -2078,6 +2099,106 @@ def _pov_values_at(v: "Variant", t: float) -> Tuple[float, ...]:
     return tuple(vals)
 
 
+# Rows of the 3x3 identity — the un-moved directions of the three visible slice axes.
+_EYE_ROWS = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def _pov_affine(v: "Variant", t: float, transform: str
+                ) -> Tuple[List[List[float]], List[float]]:
+    """S6: the per-frame affine remap ``(M, b)`` a POV surface's ``(x, y, z)`` pass through
+    before the ``f_*`` call — the honest realization of "an N-D slice of a 3-D POV field is an
+    affine remap of (x,y,z)".  The emitted call becomes ``f(M0.p + b0, M1.p + b1, M2.p + b2, …)``.
+
+    Rows 0/1/2 are the three *visible* slice axes' world directions (dims 0,1,2), composed from
+    the same motion layers as the periodic field, but read as coordinate axes rather than
+    wavevectors:
+
+    * ``tumble`` — the whole slice basis rotates in N-D (``_tumbled_directions``), so a visible
+      axis mixes with a hidden dim: its row tilts/foreshortens out of the rendered 3-space and
+      back.  This is the marquee dims>3 effect — the shape is genuinely viewed from a turning
+      N-D frame (an ellipsoid rotates; an asymmetric shape shears).  Identity at t=0 and t=1.
+    * ``rotate`` — each visible axis turns edge-on independently: its row scales by ``cos(alpha)``
+      (the shape stretches along that world axis as the coordinate foreshortens) and picks up a
+      ``hidden_offset * sin(alpha)`` translation.  Identity at t=0 and t=1.
+    * ``drift`` — each axis translates by ``winding * t`` world units: a linear pan.  Unlike the
+      periodic field (where a whole-cycle phase advance loops seamlessly), a non-periodic POV
+      shape does **not** return at t=1, so drift on a POV surface is deliberately *non-seamless*
+      (the user opts into it; tumble/rotate are the seamless motions).
+
+    Returns the identity remap (``M = I``, ``b = 0``) when the variant carries no explicit motion
+    (``v.pov_motion`` False) — the default, keeping a plain POV render a static ``f(x, y, z)``.
+    """
+    if not getattr(v, "pov_motion", False):
+        return [list(r) for r in _EYE_ROWS], [0.0, 0.0, 0.0]
+    do_drift = _has(transform, "drift")
+    do_rotate = _has(transform, "rotate")
+    do_tumble = _has(transform, "tumble")
+    tdirs = _tumbled_directions(v, t) if do_tumble else None
+    by_index = {d.index: d for d in v.dim_list}
+    two_pi = 2.0 * math.pi
+    oph = getattr(v, "osc_phase", 0.0)
+    M: List[List[float]] = []
+    b: List[float] = []
+    for i in range(3):
+        dim = by_index.get(i)
+        direction = tdirs[i] if (do_tumble and tdirs and i in tdirs) \
+            else (dim.direction if dim is not None else _EYE_ROWS[i])
+        coeff = 1.0
+        offset = 0.0
+        if dim is not None:
+            if do_rotate:
+                alpha = two_pi * dim.winding * t + oph
+                coeff *= math.cos(alpha)
+                offset += dim.hidden_offset * math.sin(alpha)
+            if do_drift:
+                offset += dim.winding * t        # linear world-unit pan (non-seamless for POV)
+        M.append([coeff * c for c in direction])
+        b.append(offset)
+    return M, b
+
+
+def _mat3_singular_extremes(M: List[List[float]]) -> Tuple[float, float]:
+    """The smallest and largest singular values ``(sigma_min, sigma_max)`` of a 3x3 matrix ``M``,
+    computed from the eigenvalues of the symmetric PSD matrix ``A = M^T M`` via the analytic
+    3x3-symmetric-eigenvalue closed form (pure stdlib; ``sigma = sqrt(eig)``).
+
+    Used to make the S6 affine remap rigorous: the emitted field is ``f(M.p + b)`` whose gradient
+    is ``M^T grad f``, so ``|grad| <= sigma_max * |grad f|`` (inflate the sphere-marcher bound) and
+    the surface's world extent grows by ``1 / sigma_min`` (enlarge the container as an axis
+    foreshortens)."""
+    # A = M^T M (symmetric 3x3).
+    a00 = M[0][0] ** 2 + M[1][0] ** 2 + M[2][0] ** 2
+    a11 = M[0][1] ** 2 + M[1][1] ** 2 + M[2][1] ** 2
+    a22 = M[0][2] ** 2 + M[1][2] ** 2 + M[2][2] ** 2
+    a01 = M[0][0] * M[0][1] + M[1][0] * M[1][1] + M[2][0] * M[2][1]
+    a02 = M[0][0] * M[0][2] + M[1][0] * M[1][2] + M[2][0] * M[2][2]
+    a12 = M[0][1] * M[0][2] + M[1][1] * M[1][2] + M[2][1] * M[2][2]
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    if p1 < 1e-18:                                    # already diagonal
+        eigs = sorted((a00, a11, a22))
+        return math.sqrt(max(0.0, eigs[0])), math.sqrt(max(0.0, eigs[2]))
+    q = (a00 + a11 + a22) / 3.0
+    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
+    p = math.sqrt(p2 / 6.0)
+    # B = (A - qI) / p ; r = det(B) / 2
+    b00, b11, b22 = (a00 - q) / p, (a11 - q) / p, (a22 - q) / p
+    b01, b02, b12 = a01 / p, a02 / p, a12 / p
+    detB = (b00 * (b11 * b22 - b12 * b12)
+            - b01 * (b01 * b22 - b12 * b02)
+            + b02 * (b01 * b12 - b11 * b02))
+    r = max(-1.0, min(1.0, detB / 2.0))
+    phi = math.acos(r) / 3.0
+    eig_max = q + 2.0 * p * math.cos(phi)
+    eig_min = q + 2.0 * p * math.cos(phi + 2.0 * math.pi / 3.0)
+    return math.sqrt(max(0.0, eig_min)), math.sqrt(max(0.0, eig_max))
+
+
+def _pov_affine_coords(M: List[List[float]], b: List[float]) -> Tuple[str, str, str]:
+    """The three remapped coordinate expressions ``M_i . (x,y,z) + b_i`` for the ``f_*`` call."""
+    return tuple(_arg_expr((row[0], row[1], row[2]), 1.0, off)  # type: ignore[return-value]
+                 for row, off in zip(M, b))
+
+
 def _scheme_edges(dims: List[int], scheme: str) -> List[Tuple[int, int]]:
     """The ordered ``(a, b)`` coupling edges among a run of dims under a base ``scheme``.
 
@@ -2180,12 +2301,18 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
     """
     surf = getattr(v, "surface", "gyroid")
     if _is_pov_surface(surf):
-        # A POV builtin is a solid field: the surface itself, called on x/y/z with its shape
+        # A POV builtin is a solid field: the surface itself, called on (x,y,z) with its shape
         # params.  It carries none of the periodic-lattice machinery (no freq / harmonics /
-        # coupling / drift), so the winder/bloom transform layers are a no-op here.  The one
-        # animation it *does* honor is an --oscillate shape-param swing (S5): the params are
-        # evaluated at this frame's ``t`` (static when nothing swings).  N-D remap is a later slice.
-        return _pov_call_expr(surf, _pov_values_at(v, t))
+        # coupling), so the winder/bloom layers don't build a lattice here.  Two animations it
+        # *does* honor: an --oscillate shape-param swing (S5) evaluates the params at this frame's
+        # ``t``; and an explicit slice motion (S6) remaps (x,y,z) by the per-frame affine
+        # _pov_affine(v,t,transform) — tumble/rotate/drift the shape through the N-D slice.  With
+        # no motion the remap is the identity, so the call stays the static f(x,y,z).
+        values = _pov_values_at(v, t)
+        if not getattr(v, "pov_motion", False):
+            return _pov_call_expr(surf, values)          # static: clean f(x,y,z)
+        M, b = _pov_affine(v, t, transform)
+        return _pov_call_expr(surf, values, _pov_affine_coords(M, b))
     if _has(transform, "bloom"):
         # ``bloom`` pins frame 0 (and frame 1) to the base gyroid, then oscillates the
         # selected parameters over the loop with the envelope w = sin^2(pi t).  The
@@ -2392,13 +2519,30 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
         if shell or _pov_renders_thin(surface):
             sheet = f"abs({sheet})-({fmt(v.thickness)})"
         # S3: auto-size the container to the surface's natural bounding box (an explicit --radius
-        # overrides / clips unbounded shapes).  Camera + clip sphere both track the derived radius.
-        rad = _pov_container_radius(surface, values, level, radius)
-        box = rad * 1.05                                 # contained_by half-extent
-        # S2: tight active-band gradient bound over the actual container box (sign flip, level/
-        # threshold shift and the abs()-shell are pure offsets/reflection — none change |grad f| —
-        # so the bound is computed on the raw field and reused verbatim for the emitted `sheet`).
-        grad_bound = _pov_grad_bound(surface, values, box)
+        # overrides / clips unbounded shapes).  This is the *native* extent, before any S6 remap.
+        nat_rad = _pov_container_radius(surface, values, level, radius)
+        nat_box = nat_rad * 1.05                          # native contained_by half-extent
+        # S6: the emitted field is f(M.p + b) under the per-frame affine remap.  Its gradient is
+        # M^T grad f, so |grad| <= sigma_max(M) * |grad f| (inflate the marcher bound), and the
+        # surface's *world* extent grows by 1/sigma_min(M) plus the |b| translation (enlarge the
+        # container as an axis foreshortens / the shape pans).  With no motion M = I, b = 0 -> the
+        # native values pass through unchanged (exact pre-S6 behavior).
+        M, b = _pov_affine(v, t, transform)
+        sig_min, sig_max = _mat3_singular_extremes(M)
+        b_norm = math.sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2])
+        if radius is None:
+            # Auto-sizing: expand the world container to still contain the remapped surface.  Floor
+            # sigma_min so a near-edge-on axis (cos alpha -> 0) can't blow the container up without
+            # bound; the marcher / view stay sane and an explicit --radius is the way to clip harder.
+            rad = (nat_rad + b_norm) / max(0.15, sig_min)
+        else:
+            rad = nat_rad                                 # explicit --radius clips; don't expand
+        box = rad * 1.05                                  # contained_by half-extent
+        # S2 bound over the *native* box (where the surface + its un-railed active band live),
+        # scaled by sigma_max for the affine.  Sign flip, level/threshold shift and the abs()-shell
+        # are pure offsets/reflection — none change |grad f| — so the bound is computed on the raw
+        # field and reused verbatim for the emitted `sheet`.
+        grad_bound = _pov_grad_bound(surface, values, nat_box) * max(1e-6, sig_max)
         return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
                                    env_file, mat_def)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the

@@ -576,7 +576,32 @@ freezes the major radius while the minor still varies from variant to variant. T
 `--param-default` (not `--axis-default`) to avoid colliding with the pre-existing `--axis-default`
 {random,on,off} axis-polarity flag. 7 new tests (450 loom green); smoke-validated — `-n 3 --surface
 f_torus --param-default random` emits three distinct `f_torus(x,y,z,·,·)` calls where `default` emits
-one shared `f_torus(x,y,z,1,0.25)`. Still to come: S6 affine N-D remap.
+one shared `f_torus(x,y,z,1,0.25)`.
+
+**P3.3 slice S6 — affine N-D remap of a POV surface (done 2026-07-18):** the honest realization of
+caveat 1 above — "a non-generalizable POV function's N-D slice is only an affine remap of (x,y,z)".
+When the user asks for a slice **motion** on a POV surface, its three coordinates now pass through a
+per-frame affine `M·p + b` before the `f_*` call: the emitted field becomes `f(M₀·p+b₀, M₁·p+b₁,
+M₂·p+b₂, params)`. Rows 0/1/2 of `M` are the three visible slice axes' world directions, composed from
+the same motion layers as the periodic field but read as **coordinate axes** rather than wavevectors:
+**tumble** rotates the whole slice basis in N-D (`_tumbled_directions`), so a visible axis mixes with a
+hidden dim — its row tilts and foreshortens out of the rendered 3-space and back, which is the marquee
+`--dims>3` effect (an ellipsoid rotates, an asymmetric shape shears); **rotate** turns each visible
+axis edge-on independently (its row scales by `cos α`, gaining a `hidden_offset·sin α` translation);
+**drift** pans each axis by `winding·t` world units. tumble and rotate return to the identity at t=0,1
+so they loop **seamlessly**; drift, being a linear pan of a *non-periodic* shape, does **not** return
+at t=1 — it is deliberately non-seamless, the user's opt-in (the user chose *full affine* + *allow
+drift*). The render stays rigorous because the emitted field is `f(M·p+b)` whose gradient is `Mᵀ∇f`:
+`_mat3_singular_extremes(M)` (analytic 3×3-symmetric eigenvalues, pure stdlib) gives σ_min/σ_max, the
+S2 marcher bound is scaled by **σ_max**, and the S3 container grows by **1/σ_min** (σ_min floored at
+0.15 so a near-edge-on axis can't inflate the container without bound; an explicit `--radius` clips
+instead of auto-growing). The whole remap is gated on a new `Variant.pov_motion`, set **only** by a
+real explicit motion — a named `drift`/`rotate`/`tumble`, or the legacy `--transform` — so the default
+`drift` the pipeline installs and the benign filler `drift` a shape-param-only `--oscillate` needs both
+leave it False, and a plain `--surface f_torus` stays the static `f(x,y,z)` (exact pre-S6 behavior). 16
+new tests (466 loom green); render-validated with `--dims 5 --oscillate tumble --surface f_torus` — t=0
+a face-on torus, t=0.40 a tilted ring, t=0.25 a near-edge-on sliver, all hole-free and un-clipped, with
+t=0 and t=1 identical. **This completes P3.3.**
 
 ---
 

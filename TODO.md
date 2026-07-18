@@ -189,7 +189,8 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       are read from the swinger's group and no longer rejected. Default (rate 1 / phase 0) is
       byte-identical to the legacy fixed `sin²(πt)` envelope; integer rate loops seamlessly, a
       non-integer rate pulses faster but breaks the loop and `main()` warns. 6 new tests, 365 loom green.
-- [ ] **P3.3** Widen `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
+- [x] **P3.3** (DONE 2026-07-18 — all slices S1–S7 shipped; see the per-slice notes below) Widen
+      `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
       + `pov.py` `POV_FUNCS`, with the N-D (`POV_ND_GENERALIZABLE`) and seamless-motion (periodic-only
       `drift`) guards. Per-surface shape params become `--oscillate`/`--lock` axes.
       **Design locked (2026-07-18), building as a parallel POV emission path:**
@@ -205,7 +206,8 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       (4) *Container* — per-function **bbox table** sizes bounded shapes; explicit `--radius` clips unbounded
           ones (paraboloid/cylinders/helices). POV coords are **not** freq-scaled (unit authored scale).
       (5) *Unspecified params* — default to a **random draw within the authored (lo,hi) range** per seed
-          (consistent with unnamed dims), governed by `--axis-default` (off=freeze at default, on=swing).
+          (consistent with unnamed dims), governed by `--param-default {default,random}` (shipped as S7;
+          renamed from the provisional `--axis-default` to avoid the existing axis-polarity flag).
       Build order (small green slices): **(S1) done 2026-07-18** — `--surface` accepts any POV name
       (validated at runtime via `resolve_surface`: `schwarz_p` alias resolved, catalog-only
       `schwarz_d`/`neovius` + unknown names rejected). POV emits as a **solid** (`(f)-(threshold)`, no
@@ -289,7 +291,27 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       `--param-default`, not `--axis-default`, to avoid colliding with the existing `--axis-default`
       on/off/random axis-polarity flag.) 7 new tests (450 loom green); smoke-validated (`-n 3 --surface
       f_torus --param-default random` → 3 distinct `f_torus(...)` calls; `default` → one shared default).
-      Still: (S6) affine remap for dims>3.
+      **(S6) done 2026-07-18** — affine N-D remap: a POV surface's `(x,y,z)` now pass through a per-frame
+      affine `M·p + b` before the `f_*` call, the honest realization of "an N-D slice of a 3-D POV field is
+      an affine remap of x/y/z" (design confirmed by the user: *full affine* + *allow drift*). Rows 0/1/2 of
+      `M` are the three visible slice axes' world directions, composed from the same motion layers as the
+      periodic field but read as coordinate axes: **tumble** rotates the whole slice basis in N-D (a visible
+      axis mixes with a hidden dim, tilting/foreshortening the shape out of the rendered 3-space and back —
+      the marquee dims>3 effect), **rotate** turns each axis edge-on independently (its row scales by
+      `cos α`, gaining a `hidden_offset·sin α` translation), **drift** pans each axis by `winding·t` world
+      units. tumble/rotate return to identity at t=0,1 (seamless); drift is deliberately *non-seamless* for a
+      non-periodic POV shape (the user opted in). New `_pov_affine(v,t,transform)` builds `(M,b)`;
+      `_mat3_singular_extremes` (analytic 3×3-symmetric eigenvalues, pure stdlib) gives σ_min/σ_max so the
+      render stays rigorous: the emitted field is `f(M·p+b)` whose gradient is `Mᵀ∇f`, so the S2 marcher
+      bound is scaled by σ_max and the S3 container grows by `1/σ_min` (σ_min floored at 0.15 so a near-edge-
+      on axis can't blow the container up unbounded; an explicit `--radius` clips instead of auto-growing).
+      Gated on a new `Variant.pov_motion` (set only by a *real* explicit motion — a named drift/rotate/tumble
+      or `--transform`; a pov_swing-only spec's benign filler `drift` and the default both leave it False), so
+      a plain `--surface f_torus` stays the static `f(x,y,z)` (exact pre-S6 behavior). 16 new tests (466 loom
+      green); render-validated (`--dims 5 --oscillate tumble --surface f_torus`: t=0 face-on torus, t=0.40
+      tilted ring, t=0.25 near-edge-on sliver — all hole-free, no clipping, seamless at the loop ends).
+      **P3.3 complete.** (Known refinement: a flat shape like the torus foreshortens hard mid-tumble, so the
+      auto-container can jump several× within a few frames — pin `--radius` for a steadier camera.)
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
       split real. After P3.3.
