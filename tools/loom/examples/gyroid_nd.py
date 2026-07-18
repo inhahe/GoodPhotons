@@ -32,7 +32,12 @@ Each **dimension** has:
 
 Each dimension's argument is  ``u_d = harmonic_d * freq * (dir_d . (x,y,z)) + phase_d``
 and the emitted field is the cyclic sum ``sum_i sin(u_{o_i}) * cos(u_{o_{i+1}})`` over
-the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating count).
+the oscillating dims ``o_0 < o_1 < ...`` (indices taken mod the oscillating count) — the
+standard way the Schoen gyroid generalizes, giving **m terms** for ``m`` oscillating dims.
+``--coupling all`` instead sums over **every unordered pair** ``i<j`` of oscillating dims
+(``sin(u_i)*cos(u_j)``), i.e. ``C(m,2)`` terms — e.g. 15 for 6 dims instead of 6 — a denser,
+more interwoven lattice (the two schemes match in count only for ``m <= 3``, and even at
+``m = 3`` cover different pairings, so ``--coupling all`` is not the exact classic gyroid).
 
 The rendered subject is just the gyroid from ``scenes/showcase.ftsl`` — a **thickened
 gyroid sheet** (``abs(g) - t``), CSG-clipped to a ball — on its own, with no Cornell box or
@@ -238,6 +243,13 @@ class Variant:
     tumble_locked: Tuple[int, ...] = () # tumble transform only: axis indices excluded from the
     #                                     slice-orientation rotation (they stay fixed while the
     #                                     other axes tumble).
+    coupling: str = "cyclic"            # which sin*cos pairs the field sums over:
+    #                                     'cyclic' (default) = the m consecutive pairs
+    #                                     (o_i, o_{i+1}) wrapping around, i.e. the standard
+    #                                     Schoen-gyroid generalization (m terms for m oscillating
+    #                                     dims); 'all' = every unordered pair i<j, sin(u_i)cos(u_j)
+    #                                     (C(m,2) terms — a denser, more interwoven lattice for
+    #                                     m>3; identical term *count* to cyclic only at m<=3).
     dim_list: List[Dim] = dc_field(default_factory=list)
 
     @property
@@ -520,7 +532,8 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_planes=tumble_planes,
                    tumble_mode=getattr(args, "tumble_mode", "rotate"),
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
-                   tumble_locked=tumble_locked, dim_list=dims)
+                   tumble_locked=tumble_locked,
+                   coupling=getattr(args, "coupling", "cyclic"), dim_list=dims)
 
 
 # ---------------------------------------------------------------------------
@@ -789,11 +802,20 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         # Reduce the phase modulo 2*pi so t=0 and t=1 emit the *same* constant (whole-cycle
         # advances) -> a perfectly seamless loop despite float rounding.
         u[d] = _arg_expr(direction, coeff, phase % two_pi)
+    # Sum the sin*cos coupling terms.  'cyclic' (default) sums the m consecutive pairs
+    # (o_i, o_{i+1}) taken mod m — the standard gyroid, m terms.  'all' sums every unordered
+    # pair i<j (sin of the lower index, cos of the higher) — C(m,2) terms, a denser, more
+    # interwoven lattice for m>3.  Both coincide (up to which pairs) only for m<=3.
     terms = []
-    for i in range(m):
-        a = osc[i]
-        b = osc[(i + 1) % m]
-        terms.append(f"sin({u[a]})*cos({u[b]})")
+    if getattr(v, "coupling", "cyclic") == "all":
+        for i in range(m):
+            for j in range(i + 1, m):
+                terms.append(f"sin({u[osc[i]]})*cos({u[osc[j]]})")
+    else:
+        for i in range(m):
+            a = osc[i]
+            b = osc[(i + 1) % m]
+            terms.append(f"sin({u[a]})*cos({u[b]})")
     return "+".join(terms)
 
 
@@ -924,12 +946,20 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
         thr = v.threshold
     inner = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
     sheet = f"abs({inner})-({fmt(half)})"
-    # Lipschitz bound for the sphere-marcher: |grad f| <= 2*freq*sum(harmonic_d).  In bloom
-    # mode the classic base always contributes its 3 unit terms, so floor the sum at 3; and
-    # use the peak (possibly 'freq'-bloomed) frequency at this frame so the bound stays valid.
+    # Lipschitz bound for the sphere-marcher: |grad f| <= (per-dim term count)*freq*sum(harmonic_d).
+    # In bloom mode the classic base always contributes its 3 unit terms, so floor the sum at 3;
+    # and use the peak (possibly 'freq'-bloomed) frequency at this frame so the bound stays valid.
     sum_h = sum(d.harmonic for d in v.dim_list if d.oscillate)
     fr = v.freq
-    coef = 2.2
+    # How many sin*cos terms each oscillating dim appears in sets how fast |grad f| grows:
+    # the cyclic field puts every dim in exactly 2 terms (bound 2*freq*sum_h -> coef 2.2 with
+    # 10% margin); the 'all' field pairs each dim with every other, so it appears in (m-1)
+    # terms and the gradient — hence the marcher's bound — scales up the same way.  Over-
+    # estimating max_gradient only shrinks the safe march step, so it never punches holes.
+    per_dim_terms = 2.0
+    if getattr(v, "coupling", "cyclic") == "all":
+        per_dim_terms = max(2.0, float(m - 1))
+    coef = 1.1 * per_dim_terms
     if _has(transform, "bloom"):
         sum_h = max(sum_h, 3)
         fr = bloom_freq(v, t)
@@ -1054,6 +1084,16 @@ def variant_banner(v: Variant, index: int, count: int) -> str:
     return "\n".join(lines)
 
 
+def coupling_desc(v: Variant) -> str:
+    """Human-readable summary of the field's pairing scheme and its resulting sin*cos
+    term count, e.g. 'cyclic (6 consecutive pairs)' or 'all pairs (15 = C(6,2))'."""
+    m = len(v.oscillating)
+    if getattr(v, "coupling", "cyclic") == "all":
+        n = m * (m - 1) // 2
+        return f"all pairs ({n} = C({m},2) sin*cos terms)"
+    return f"cyclic ({m} consecutive-pair sin*cos term{'s' if m != 1 else ''})"
+
+
 def bloom_params_desc(v: Variant) -> str:
     """Human-readable list of what the bloom oscillates, e.g. 'higher-D structure,
     frequency (complexity)'."""
@@ -1086,6 +1126,7 @@ def header(v: Variant, index: int, count: int, *,
          f"# dimensions (D)        : {v.dims}   (higher/extra dims beyond x,y,z: {max(0, v.dims - 3)})",
          f"# oscillating dims      : {len(osc)}  -> {axis_list(osc)}  (indices {osc})",
          f"# oscillates in         : {osc_harm_list(v)}   (dim(harmonic), the axes that wave)",
+         f"# coupling / terms      : {coupling_desc(v)}",
          f"# main dimension        : {axis_name(v.main) if v.main is not None else '-'}   (fundamental, harmonic 1)",
          f"# harmonics of the main : {len(v.harmonic_dims)}  -> {axis_list(v.harmonic_dims)}",
          f"# slice orientation     : {orientation_desc(v)}",
@@ -1541,6 +1582,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "--axis 2:on:1   # classic gyroid\n"
                 "  python examples/gyroid_nd.py --dims 7 --axis 3-6:off   "
                 "# range: axes 3,4,5,6 inert in one flag\n"
+                "  python examples/gyroid_nd.py --dims 6 --oscillating 6 --coupling all   "
+                "# all 15 pairs, not 6\n"
                 "  python examples/gyroid_nd.py --dims 6 --axis 4:on:3 --axis 1:off\n"
                 "  python examples/gyroid_nd.py --dims 3 --no-pin-axes   # freely-tilted gyroid slice\n"
                 "  python examples/gyroid_nd.py --dims 6 --transform bloom   # opens on the showcase gyroid"))
@@ -1597,6 +1640,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "D=3 all-on reproduce the exact classic gyroid). --no-pin-axes instead "
                         "gives every dimension a random direction — a freely-oriented N-D slice, "
                         "so even the base gyroid comes out tilted.")
+    g.add_argument("--coupling", choices=("cyclic", "all"), default="cyclic",
+                   help="which sin*cos pairs the field sums over. 'cyclic' (default): the m "
+                        "consecutive oscillating pairs (o_i, o_{i+1}) wrapping around — the "
+                        "standard Schoen-gyroid generalization, m terms. 'all': every unordered "
+                        "pair i<j — C(m,2) terms (e.g. 15 for 6 oscillating dims), a denser, "
+                        "more interwoven lattice for m>3 (the two agree in count only for m<=3).")
 
     g = p.add_argument_group("scene")
     g.add_argument("--threshold", type=float, default=0.0,
