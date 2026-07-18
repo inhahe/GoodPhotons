@@ -256,8 +256,9 @@ def _capture_render_cmd(monkeypatch, tmp_path, **kw):
     monkeypatch.setattr(subprocess, "run", fake_run)
     fp = tmp_path / "f.ftsl"
     fp.write_text("x")
+    kw.setdefault("raster", True)
     g._render_frame("ftrace", tmp_path, fp, tmp_path / "f.png",
-                    size=(16, 16), raster=True, noise=3.0, **kw)
+                    size=(16, 16), **kw)
     return captured["cmd"]
 
 
@@ -292,6 +293,55 @@ def test_path_traced_ignores_see_through(monkeypatch, tmp_path):
                     size=(16, 16), raster=False, noise=3.0, see_through=True, clarity=0.5)
     assert "-see-through" not in captured["cmd"]
     assert "-glass-clarity" not in captured["cmd"]
+
+
+def test_path_trace_default_budget_noise4(monkeypatch, tmp_path):
+    # no explicit budget -> back-compat default of -noise 4.
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, raster=False)
+    assert "-noise" in cmd and cmd[cmd.index("-noise") + 1] == "4"
+    assert "-time" not in cmd and "-spp" not in cmd
+
+
+def test_path_trace_noise_budget(monkeypatch, tmp_path):
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, raster=False, noise=2.5)
+    assert cmd[cmd.index("-noise") + 1] == "2.5"
+    assert "-time" not in cmd and "-spp" not in cmd
+
+
+def test_path_trace_time_budget(monkeypatch, tmp_path):
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, raster=False, time_budget=30.0)
+    assert cmd[cmd.index("-time") + 1] == "30"
+    # time given, no noise -> no default -noise added.
+    assert "-noise" not in cmd and "-spp" not in cmd
+
+
+def test_path_trace_spp_budget(monkeypatch, tmp_path):
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, raster=False, spp=64)
+    assert cmd[cmd.index("-spp") + 1] == "64"
+    assert "-noise" not in cmd and "-time" not in cmd
+
+
+def test_path_trace_combined_budgets(monkeypatch, tmp_path):
+    # all three combine; ftrace stops at whichever fires first.
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, raster=False,
+                              noise=3.0, time_budget=20.0, spp=128)
+    assert cmd[cmd.index("-noise") + 1] == "3"
+    assert cmd[cmd.index("-time") + 1] == "20"
+    assert cmd[cmd.index("-spp") + 1] == "128"
+
+
+def test_raster_ignores_budget_flags(monkeypatch, tmp_path):
+    # budgets are path-trace only; raster frames never carry -noise/-time/-spp.
+    cmd = _capture_render_cmd(monkeypatch, tmp_path, raster=True,
+                              noise=3.0, time_budget=20.0, spp=128)
+    assert "-noise" not in cmd and "-time" not in cmd and "-spp" not in cmd
+
+
+def test_render_budget_cli_parsed():
+    a = _args()
+    assert a.render_noise is None and a.render_time is None and a.render_spp is None
+    a = _args("--render-noise", "2", "--render-time", "45", "--render-spp", "100")
+    assert a.render_noise == 2.0 and a.render_time == 45.0 and a.render_spp == 100
 
 
 def test_glass_clarity_cli_parsed():

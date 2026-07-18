@@ -1678,17 +1678,24 @@ class _PreviewWindow:
 # ---------------------------------------------------------------------------
 
 def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
-                  size: Tuple[int, int], raster: bool, noise: float,
+                  size: Tuple[int, int], raster: bool,
+                  noise: Optional[float] = None, time_budget: Optional[float] = None,
+                  spp: Optional[int] = None,
                   see_through: bool = False, clarity: Optional[float] = None,
                   pump: Optional["Callable[[], None]"] = None) -> None:
     """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
     ``raster`` uses ftrace ``-raster`` (fast solid-shaded z-buffer preview); otherwise
-    a path-traced render to a per-frame noise budget.  ``size`` is the ``(W, H)`` film
-    resolution, passed as ``-r W H``.  No ``-window`` is passed so the process writes
-    the PNG and exits, letting the whole frame range run unattended.  The renderer's
-    own console chatter is captured (kept off the status line) and only surfaced if the
-    frame fails.
+    a path-traced render whose per-frame budget is set by ``noise`` / ``time_budget`` /
+    ``spp`` (path-trace only).  ``size`` is the ``(W, H)`` film resolution, passed as
+    ``-r W H``.  No ``-window`` is passed so the process writes the PNG and exits,
+    letting the whole frame range run unattended.  The renderer's own console chatter is
+    captured (kept off the status line) and only surfaced if the frame fails.
+
+    Path-trace budget (all optional; combine freely — ftrace stops at whichever fires
+    first): ``noise`` = stop when the estimated noise falls to this percent (``-noise``);
+    ``time_budget`` = wall-clock seconds per frame (``-time``); ``spp`` = fixed sample
+    count per pixel (``-spp``).  If none are given, defaults to ``-noise 4``.
 
     ``see_through`` (raster only) passes ftrace ``-see-through`` so clear dielectrics
     (glass) render as dimmed + milky-hazed rather than a solid pale ghost (no refraction —
@@ -1711,7 +1718,15 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
             cmd.append("-see-through")
     else:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-r", str(w), str(h),
-               "-interval", "8", "-checkpoint", "-noise", f"{noise:g}"]
+               "-interval", "8", "-checkpoint"]
+        if noise is None and time_budget is None and spp is None:
+            noise = 4.0                                  # back-compat default budget
+        if noise is not None:
+            cmd += ["-noise", f"{noise:g}"]
+        if time_budget is not None:
+            cmd += ["-time", f"{time_budget:g}"]
+        if spp is not None:
+            cmd += ["-spp", str(spp)]
     if pump is None:
         r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
         rc, out, err = r.returncode, r.stdout, r.stderr
@@ -1778,7 +1793,9 @@ def _video_ext(fmt: str) -> str:
 
 def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label: str,
                frames: int, fps: float, size: Tuple[int, int], radius: float,
-               raster: bool, noise: float, fmt: str, env_file: Optional[str] = None,
+               raster: bool, fmt: str, noise: Optional[float] = None,
+               time_budget: Optional[float] = None, spp: Optional[int] = None,
+               env_file: Optional[str] = None,
                transform: str = "drift", material: str = "gold",
                clarity: Optional[float] = None,
                preview: Optional["_PreviewWindow"] = None) -> Path:
@@ -1814,6 +1831,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         png = fp.with_suffix(".png")
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
         _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise,
+                      time_budget=time_budget, spp=spp,
                       see_through=clear, clarity=frame_clarity,
                       pump=(preview.pump if preview is not None else None))
         pngs.append(png)
@@ -2058,9 +2076,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--preview", action="store_true",
                    help="show each frame as it is rendered in one reusable preview window "
                         "whose title tracks the current gyroid / values / frame")
-    g.add_argument("--render-noise", type=float, default=4.0,
-                   help="per-frame noise-floor budget when path-tracing frames (--no-raster; "
-                        "default 4%%)")
+    g.add_argument("--render-noise", type=float, default=None, metavar="PCT",
+                   help="path-traced frame budget (--no-raster): stop each frame when the "
+                        "estimated noise falls to PCT percent (lower = cleaner, slower). If "
+                        "none of --render-noise/--render-time/--render-spp is given, defaults "
+                        "to 4%%. Combine budgets: ftrace stops at whichever fires first.")
+    g.add_argument("--render-time", type=float, default=None, metavar="SEC",
+                   help="path-traced frame budget (--no-raster): wall-clock seconds to spend "
+                        "per frame before moving on (regardless of noise reached).")
+    g.add_argument("--render-spp", type=int, default=None, metavar="N",
+                   help="path-traced frame budget (--no-raster): render exactly N samples per "
+                        "pixel per frame (a fixed sample count; the mode-R analogue of forward "
+                        "photons). Combine with --render-time/--render-noise as an upper bound.")
     return p
 
 
@@ -2167,7 +2194,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             video = make_video(frames_dir, outdir, base, v, label=label,
                                frames=args.frames, fps=args.fps, size=size,
                                radius=args.radius, raster=args.raster,
-                               noise=args.render_noise, fmt=args.format,
+                               noise=args.render_noise, time_budget=args.render_time,
+                               spp=args.render_spp, fmt=args.format,
                                env_file=env_file, transform=args.transform,
                                material=args.material, clarity=args.glass_clarity,
                                preview=preview)
