@@ -43,6 +43,7 @@ from .iso import (
 from .pov import (
     pov, PovFn, POV_FUNCS, POV_ND_GENERALIZABLE, POV_PARAMS, pov_params,
 )
+from .pov_nd import nd_field_expr, nd_field_eval, nd_grad_bound_xi
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
@@ -83,6 +84,7 @@ __all__ = [
     "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
+    "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
     "PreviewServer", "preview_range",
     "SpatialExpr", "sexpr", "X", "Y", "Z", "T", "SPATIAL_PATTERNS",

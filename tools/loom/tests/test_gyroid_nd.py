@@ -1797,6 +1797,211 @@ def test_tpms_ignores_pov_motion_flag():
 
 
 # ---------------------------------------------------------------------------
+# P3.4: true-N-D forms for the POV_ND_GENERALIZABLE builtins.  Under `tumble`
+# with a hidden dim (dims>3) an nd_pov surface renders as an honest D-coordinate
+# field F(A.p + c) (loom.pov_nd), which reduces to the base f_* exactly at the
+# loop ends but folds the extra axes in between — motion no affine remap can make.
+# ---------------------------------------------------------------------------
+
+# Reference: a direct Python port of the C bodies in src/pov_functions.h (the ground
+# truth the N-D forms must reduce to at N=3).  Kept minimal — only the nine funcs.
+def _pov_c_ref(name, x, y, z, P):
+    import math as _m
+    if name == "f_sphere":
+        return -P[0] + _m.sqrt(x * x + y * y + z * z)
+    if name == "f_ellipsoid":
+        return _m.sqrt(x * x * P[0] ** 2 + y * y * P[1] ** 2 + z * z * P[2] ** 2)
+    if name == "f_paraboloid":
+        return min(10., max(P[0] * (-(x * x - y + z * z)), -10.))
+    if name == "f_quartic_paraboloid":
+        return min(10., max(P[0] * (-(x ** 4 + z ** 4 - y)), -10.))
+    if name == "f_ovals_of_cassini":
+        r2 = x * x + y * y + z * z + P[1] ** 2
+        r = -(r2 * r2 - P[3] * P[1] ** 2 * (x * x + z * z) - P[2] ** 2)
+        return min(10., max(P[0] * r, -10.))
+    if name in ("f_isect_ellipsoids", "f_cross_ellipsoids"):
+        x2, y2, z2 = x * x, y * y, z * z
+        t = [_m.exp(-(x2 * P[0] + y2 * P[0] + z2) * P[1]),
+             _m.exp(-(x2 * P[0] + y2 + z2 * P[0]) * P[1]),
+             _m.exp(-(x2 + y2 * P[0] + z2 * P[0]) * P[1])]
+        r = min(t) if name == "f_isect_ellipsoids" else max(t)
+        return P[3] - r * P[2]
+    if name == "f_poly4":
+        y2 = y * y
+        temp = P[0] + P[1] * y + P[2] * y2 + P[3] * y2 * y + P[4] * y2 * y2
+        temp = max(temp, -5.)
+        return -temp + _m.sqrt(x * x + z * z)
+    if name == "f_superellipsoid":
+        p, n = 2 / P[0], 1 / P[1]
+        return 1 - ((abs(x) ** p + abs(y) ** p) ** (P[0] * n) + abs(z) ** (2 * n)) ** (P[1] * .5)
+    raise AssertionError(name)
+
+
+def _eval_pov_expr(expr, **vars):
+    """Evaluate an emitted N-D field expression (valid Python once the math funcs are bound)."""
+    import math as _m
+
+    def _clamp(v, lo, hi):
+        return min(hi, max(v, lo))
+    ns = {"sqrt": _m.sqrt, "exp": _m.exp, "abs": abs, "pow": pow,
+          "min": min, "max": max, "clamp": _clamp}
+    ns.update(vars)
+    return eval(expr, {"__builtins__": {}}, ns)
+
+
+_ND_SAMPLE_VALUES = {
+    "f_sphere": (1.0,), "f_ellipsoid": (1.0, 1.5, 0.7), "f_paraboloid": (1.0,),
+    "f_quartic_paraboloid": (1.0,), "f_ovals_of_cassini": (1.0, 0.6, 1.1, 2.0),
+    "f_isect_ellipsoids": (1.3, 1.0, 1.0, 1.0), "f_cross_ellipsoids": (1.3, 1.0, 1.0, 1.0),
+    "f_poly4": (1.0, 0.3, -0.5, 0.1, 0.2), "f_superellipsoid": (2.0, 2.5),
+}
+
+
+@pytest.mark.parametrize("name", sorted(g.POV_ND_GENERALIZABLE))
+def test_nd_field_eval_matches_c_body_at_n3(name):
+    # the N-D generalization must reduce to the exact POV builtin when D=3.
+    from loom import nd_field_eval
+    P = _ND_SAMPLE_VALUES[name]
+    import random
+    rng = random.Random(hash(name) & 0xffff)
+    for _ in range(400):
+        x, y, z = (rng.uniform(-1.2, 1.2) for _ in range(3))
+        got = nd_field_eval(name, [x, y, z], P)
+        want = _pov_c_ref(name, x, y, z, P)
+        assert abs(got - want) < 1e-9
+
+
+@pytest.mark.parametrize("name", sorted(g.POV_ND_GENERALIZABLE))
+def test_nd_field_expr_matches_eval(name):
+    # the emitted ftsl string is numerically identical to the reference evaluator, at D>3 too.
+    from loom import nd_field_expr, nd_field_eval
+    P = _ND_SAMPLE_VALUES[name]
+    import random
+    rng = random.Random((hash(name) ^ 0x5555) & 0xffff)
+    for D in (3, 5):
+        coords = [f"c{i}" for i in range(D)]
+        expr = nd_field_expr(name, coords, P)
+        for _ in range(150):
+            xi = [rng.uniform(-1.1, 1.1) for _ in range(D)]
+            got = _eval_pov_expr(expr, **{f"c{i}": xi[i] for i in range(D)})
+            assert abs(got - nd_field_eval(name, xi, P)) < 1e-9
+
+
+@pytest.mark.parametrize("name", sorted(g.POV_ND_GENERALIZABLE))
+def test_nd_grad_bound_never_underestimates(name):
+    # a rigorous marcher needs |grad_xi F| <= bound over |xi_i| <= Xi (over-estimate is safe).
+    from loom import nd_field_eval, nd_grad_bound_xi
+    P = _ND_SAMPLE_VALUES[name]
+    X, h = 1.0, 1e-6
+    import random
+    rng = random.Random((hash(name) ^ 0x1234) & 0xffff)
+    for D in (3, 4, 5):
+        bound = nd_grad_bound_xi(name, P, X, D)
+        if bound is None:                       # f_superellipsoid opts out (non-Lipschitz corners)
+            assert name == "f_superellipsoid"
+            continue
+        for _ in range(500):
+            xi = [rng.uniform(-X, X) for _ in range(D)]
+            grad = []
+            for i in range(D):
+                a, b = list(xi), list(xi)
+                a[i] += h; b[i] -= h
+                grad.append((nd_field_eval(name, a, P) - nd_field_eval(name, b, P)) / (2 * h))
+            gm = math.sqrt(sum(c * c for c in grad))
+            assert gm <= bound * 1.0001
+
+
+def test_nd_field_reduces_to_base_at_loop_start():
+    # at t=0 the N-D embedding is the identity (A_i=e_i, hidden rows 0, c=0), so the emitted
+    # field equals the base f_* builtin numerically for every sample point.
+    from loom import nd_field_eval
+    v = _pv("--surface", "f_ellipsoid", "--dims", "6", "--oscillate", "tumble")
+    assert g._pov_use_nd(v, "tumble")
+    expr = g.field_expr(v, 0.0, "tumble")
+    P = v.pov_values
+    for (x, y, z) in [(0.3, 1.1, -0.7), (0.9, -0.4, 0.5), (-1.1, 0.2, 0.8)]:
+        got = _eval_pov_expr(expr, x=x, y=y, z=z)
+        assert abs(got - _pov_c_ref("f_ellipsoid", x, y, z, P)) < 1e-9
+
+
+def test_nd_field_loops_seamlessly():
+    # tumble is whole-turn, so t=0 and t=1 embeddings coincide -> the emitted field matches.
+    v = _pv("--surface", "f_sphere", "--dims", "5", "--oscillate", "tumble")
+    assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v, 1.0, "tumble")
+
+
+def test_nd_field_moves_mid_loop_and_is_not_an_affine_call():
+    # mid-loop the field is an honest expanded N-D form (not an f_name(...) affine remap) and
+    # differs from the loop-start field: motion no 3x3 remap of f(x,y,z) can produce.
+    v = _pv("--surface", "f_sphere", "--dims", "5", "--oscillate", "tumble")
+    start = g.field_expr(v, 0.0, "tumble")
+    mid = g.field_expr(v, 0.25, "tumble")
+    assert mid != start
+    assert not mid.startswith("f_sphere(")      # expanded field, not a builtin call
+    assert "f_sphere(" not in mid
+
+
+def test_nd_no_motion_stays_clean_builtin_call():
+    # dims>3 without motion keeps the exact static f(x,y,z) call (the nd path is motion-gated).
+    v = _pv("--surface", "f_sphere", "--dims", "6")
+    assert not g._pov_use_nd(v, "tumble")
+    assert g.field_expr(v, 0.0, "tumble") == "f_sphere(x,y,z,1)"
+
+
+def test_nd_path_requires_dims_gt_3():
+    # at D=3 there is no hidden dim to fold, so tumble stays on the S6 affine (f_name call).
+    v = _pv("--surface", "f_sphere", "--dims", "3", "--oscillate", "tumble")
+    assert not g._pov_use_nd(v, "tumble")
+    assert g.field_expr(v, 0.25, "tumble").startswith("f_sphere(")
+
+
+def test_nd_path_requires_generalizable_surface():
+    # f_torus is affine_pov: even at dims>3 under tumble it stays the S6 affine f_torus call.
+    v = _pv("--surface", "f_torus", "--dims", "5", "--oscillate", "tumble")
+    assert not g._pov_use_nd(v, "tumble")
+    assert g.field_expr(v, 0.25, "tumble").startswith("f_torus(")
+
+
+def test_nd_path_requires_tumble():
+    # rotate/drift alone (no tumble) can't fold a hidden dim in, so they keep the affine path.
+    v = _pv("--surface", "f_sphere", "--dims", "5", "--oscillate", "rotate")
+    assert not g._pov_use_nd(v, "rotate")
+    assert g.field_expr(v, 0.25, "rotate").startswith("f_sphere(")
+
+
+def test_nd_scene_emits_finite_grad_bound_and_container():
+    # the auto-sized N-D scene is hole-safe: a finite max_gradient and a positive clip radius.
+    v = _pv("--surface", "f_ellipsoid", "--dims", "5", "--oscillate", "tumble")
+    body = _auto_body(v, t=0.25, transform="tumble")
+    gb = _grad_bound(body)
+    assert gb > 0.0 and math.isfinite(gb)
+    assert _emitted_clip_radius(body) > 0.0
+
+
+def test_nd_superellipsoid_falls_back_to_default_grad_bound():
+    # f_superellipsoid has no Lipschitz bound (nd_grad_bound_xi -> None); the scene still emits a
+    # finite bound via the per-function fallback rather than crashing or emitting None.
+    v = _pv("--surface", "f_superellipsoid", "--dims", "5", "--oscillate", "tumble")
+    assert g._pov_use_nd(v, "tumble")
+    body = _auto_body(v, t=0.25, transform="tumble")
+    gb = _grad_bound(body)
+    assert gb > 0.0 and math.isfinite(gb)
+
+
+def test_matn3_singular_extremes_matches_mat3_on_square():
+    # for a 3-row matrix the D×3 routine agrees with the dedicated 3×3 one.
+    M = [[0.5, 0.1, 0.0], [0.2, 1.3, -0.4], [0.0, 0.3, 0.9]]
+    assert g._matn3_singular_extremes(M) == pytest.approx(g._mat3_singular_extremes(M))
+
+
+def test_matn3_extra_zero_rows_do_not_change_singular_values():
+    # padding a 3×3 with all-zero hidden rows leaves A^T A (and thus the singular values) unchanged.
+    M = [[0.5, 0.1, 0.0], [0.2, 1.3, -0.4], [0.0, 0.3, 0.9]]
+    padded = M + [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    assert g._matn3_singular_extremes(padded) == pytest.approx(g._matn3_singular_extremes(M))
+
+
+# ---------------------------------------------------------------------------
 # unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
 # ---------------------------------------------------------------------------
 

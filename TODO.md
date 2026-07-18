@@ -312,9 +312,26 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       tilted ring, t=0.25 near-edge-on sliver — all hole-free, no clipping, seamless at the loop ends).
       **P3.3 complete.** (Known refinement: a flat shape like the torus foreshortens hard mid-tumble, so the
       auto-container can jump several× within a few frames — pin `--radius` for a steadier camera.)
-- [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
+- [x] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
-      split real. After P3.3.
+      split real. *Done 2026-07-18:* new module `loom/pov_nd.py` supplies, for each of the nine funcs,
+      an honest `D`-coordinate field `F(ξ_0…ξ_{D-1})` (`nd_field_expr` FTSL emission + `nd_field_eval`
+      numeric twin) that at `N=3` reduces **bit-for-bit** to the `f_*` builtin (verified to machine
+      precision against direct ports of the C bodies in `src/pov_functions.h`), plus `nd_grad_bound_xi`,
+      a rigorous conservative bound on `|∇_ξ F|` over the coord box (numerically confirmed to never
+      under-estimate; returns `None` for `f_superellipsoid`'s non-Lipschitz corners → caller falls back
+      to the per-function default). Integrated into `gyroid_nd.py`: `_pov_nd_embedding(v,t,transform)`
+      builds the per-frame `D×3` slice Jacobian `A` (rest = `e_i` for the three visible dims, `0` for
+      hidden dims; `c=0`) and folds hidden axes in via the same tumble Givens rotations as the affine
+      path (plus rotate cos-scaling / drift pan); the emitted field is `F(A·p+c)`. Rigor mirrors S6 with
+      the `D×3` Jacobian: `_matn3_singular_extremes(A)` (shares the new `_sym3_eig_extremes` helper with
+      `_mat3_singular_extremes`) gives σ_min/σ_max from the `3×3` Gram `AᵀA`, so `|∇_p F| ≤ σ_max·|∇_ξ F|`
+      (marcher bound) and the container grows by `(nat_rad+|c|)/max(0.15,σ_min)`. **Gated** on
+      `_pov_use_nd`: `pov_motion ∧ tumble ∧ dims>3 ∧ surface∈POV_ND_GENERALIZABLE` — every other case
+      (no motion, drift/rotate-only, `D≤3`, affine_pov) keeps the exact pre-P3.4 S6 path (byte-identical).
+      38 new tests (504 loom green); render-validated (`--dims 5 --oscillate tumble --surface f_ellipsoid
+      --lock rx=1.8 ry=0.6 rz=1.0`: t=0 face-on ellipsoid, t=0.25 the x-axis folded into a hidden dim —
+      hole-free, seamless at the loop ends). **P3.4 complete.**
 - [ ] **P3.5** Ordered / overlapping N-D tumble (design captured 2026-07-18; do *after* P3.3, it's
       orthogonal to the surface library). Today's `tumble` is confined to a set of **disjoint** Givens
       planes (`pick_variant` lines ~1328-1353) — i.e. a **maximal torus of SO(N)**, a commuting abelian

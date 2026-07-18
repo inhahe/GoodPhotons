@@ -212,6 +212,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loom import Scene, Camera, Raw  # noqa: E402
 from loom import POV_FUNCS, POV_ND_GENERALIZABLE, pov_params  # noqa: E402
+from loom import nd_field_expr, nd_grad_bound_xi  # noqa: E402
 from loom.ftsl_emit import fmt  # noqa: E402
 
 
@@ -1892,9 +1893,10 @@ def _list_surfaces_text() -> str:
                  f"({len(_TPMS_CATALOG)} periodic, {len(POV_ND_GENERALIZABLE)} N-D POV, "
                  f"{len(affine)} affine-only POV).")
     lines.append("Run --surface-help NAME for one surface's shape parameters.")
-    lines.append("Note: --surface now selects any surface above at its default shape params "
-                 "(P3.3); param animation and N-D remap of the POV builtins arrive in later "
-                 "slices.")
+    lines.append("Note: --oscillate animates a POV builtin's shape params, and (with --dims>3) "
+                 "tumble/rotate/drift move it through the slice: an nd_pov surface genuinely "
+                 "folds into a true N-D field, an affine-only surface is reoriented by an affine "
+                 "remap of x/y/z.")
     return "\n".join(lines)
 
 
@@ -2157,6 +2159,32 @@ def _pov_affine(v: "Variant", t: float, transform: str
     return M, b
 
 
+def _sym3_eig_extremes(a00: float, a11: float, a22: float,
+                       a01: float, a02: float, a12: float) -> Tuple[float, float]:
+    """Smallest and largest eigenvalues ``(eig_min, eig_max)`` of the symmetric 3x3 matrix
+    ``[[a00,a01,a02],[a01,a11,a12],[a02,a12,a22]]`` via the analytic closed form (Smith's
+    trigonometric method; pure stdlib).  Shared by the 3x3 and Nx3 singular-value routines —
+    both feed it the Gram matrix ``A^T A`` and take ``sigma = sqrt(eig)``."""
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    if p1 < 1e-18:                                    # already diagonal
+        eigs = sorted((a00, a11, a22))
+        return eigs[0], eigs[2]
+    q = (a00 + a11 + a22) / 3.0
+    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
+    p = math.sqrt(p2 / 6.0)
+    # B = (A - qI) / p ; r = det(B) / 2
+    b00, b11, b22 = (a00 - q) / p, (a11 - q) / p, (a22 - q) / p
+    b01, b02, b12 = a01 / p, a02 / p, a12 / p
+    detB = (b00 * (b11 * b22 - b12 * b12)
+            - b01 * (b01 * b22 - b12 * b02)
+            + b02 * (b01 * b12 - b11 * b02))
+    r = max(-1.0, min(1.0, detB / 2.0))
+    phi = math.acos(r) / 3.0
+    eig_max = q + 2.0 * p * math.cos(phi)
+    eig_min = q + 2.0 * p * math.cos(phi + 2.0 * math.pi / 3.0)
+    return eig_min, eig_max
+
+
 def _mat3_singular_extremes(M: List[List[float]]) -> Tuple[float, float]:
     """The smallest and largest singular values ``(sigma_min, sigma_max)`` of a 3x3 matrix ``M``,
     computed from the eigenvalues of the symmetric PSD matrix ``A = M^T M`` via the analytic
@@ -2173,24 +2201,113 @@ def _mat3_singular_extremes(M: List[List[float]]) -> Tuple[float, float]:
     a01 = M[0][0] * M[0][1] + M[1][0] * M[1][1] + M[2][0] * M[2][1]
     a02 = M[0][0] * M[0][2] + M[1][0] * M[1][2] + M[2][0] * M[2][2]
     a12 = M[0][1] * M[0][2] + M[1][1] * M[1][2] + M[2][1] * M[2][2]
-    p1 = a01 * a01 + a02 * a02 + a12 * a12
-    if p1 < 1e-18:                                    # already diagonal
-        eigs = sorted((a00, a11, a22))
-        return math.sqrt(max(0.0, eigs[0])), math.sqrt(max(0.0, eigs[2]))
-    q = (a00 + a11 + a22) / 3.0
-    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
-    p = math.sqrt(p2 / 6.0)
-    # B = (A - qI) / p ; r = det(B) / 2
-    b00, b11, b22 = (a00 - q) / p, (a11 - q) / p, (a22 - q) / p
-    b01, b02, b12 = a01 / p, a02 / p, a12 / p
-    detB = (b00 * (b11 * b22 - b12 * b12)
-            - b01 * (b01 * b22 - b12 * b02)
-            + b02 * (b01 * b12 - b11 * b02))
-    r = max(-1.0, min(1.0, detB / 2.0))
-    phi = math.acos(r) / 3.0
-    eig_max = q + 2.0 * p * math.cos(phi)
-    eig_min = q + 2.0 * p * math.cos(phi + 2.0 * math.pi / 3.0)
+    eig_min, eig_max = _sym3_eig_extremes(a00, a11, a22, a01, a02, a12)
     return math.sqrt(max(0.0, eig_min)), math.sqrt(max(0.0, eig_max))
+
+
+def _matn3_singular_extremes(A: List[List[float]]) -> Tuple[float, float]:
+    """The smallest and largest singular values ``(sigma_min, sigma_max)`` of a ``D x 3`` matrix
+    ``A`` (``D`` rows, each a 3-vector), from the eigenvalues of the ``3x3`` Gram ``A^T A``.
+
+    Used to make the P3.4 true-N-D remap rigorous: the emitted field is ``F(A.p + c)`` (``A`` the
+    ``D x 3`` slice Jacobian), whose gradient is ``A^T grad_xi F``, so ``|grad_p F| <= sigma_max(A)
+    * |grad_xi F|`` (inflate the marcher bound) and the surface's world extent grows by
+    ``1 / sigma_min(A)`` (enlarge the container as the slice foreshortens)."""
+    a00 = sum(r[0] * r[0] for r in A)
+    a11 = sum(r[1] * r[1] for r in A)
+    a22 = sum(r[2] * r[2] for r in A)
+    a01 = sum(r[0] * r[1] for r in A)
+    a02 = sum(r[0] * r[2] for r in A)
+    a12 = sum(r[1] * r[2] for r in A)
+    eig_min, eig_max = _sym3_eig_extremes(a00, a11, a22, a01, a02, a12)
+    return math.sqrt(max(0.0, eig_min)), math.sqrt(max(0.0, eig_max))
+
+
+# Rows of the D x 3 identity embedding: e_0,e_1,e_2 for the three visible slice axes, 0 for
+# every hidden dim (the rest slice passes through the N-D field's center, so at t=0 with no
+# --oscillate phase the embedded field reduces *exactly* to the base f_*(x,y,z) call).
+def _pov_nd_embedding(v: "Variant", t: float, transform: str
+                      ) -> Tuple[List[List[float]], List[float]]:
+    """P3.4: the per-frame ``D x 3`` slice Jacobian ``A`` and offset ``c`` for a true-N-D POV
+    field.  The emitted field is ``F(A_0.p + c_0, …, A_{D-1}.p + c_{D-1})`` — an honest
+    ``D``-coordinate generalization of the ``nd_pov`` builtin (see :mod:`loom.pov_nd`), not a mere
+    affine remap of ``(x, y, z)``.
+
+    Rest embedding (``t=0``, no motion): ``A_i = e_i`` for the three visible dims ``i < 3`` and
+    ``A_d = 0`` for every hidden dim ``d >= 3``, with ``c = 0`` — so ``xi_i = p_i`` and every hidden
+    ``xi_d = 0``, collapsing the field back to ``f_*(x, y, z)`` bit-for-bit.
+
+    Motion layers (same as :func:`_pov_affine`, composed in the same order):
+
+    * ``tumble`` — the whole ``D``-frame rotates: the product of the variant's Givens planes mixes
+      the ``A`` rows (and ``c``), folding hidden axes *into* the rendered slice.  This is the marquee
+      dims>3 effect and the reason the N-D path exists — an ellipsoid genuinely rotates through the
+      extra dimension rather than only shearing its 3-D shadow.  Identity at t=0 and t=1.
+    * ``rotate`` — each dim's coordinate foreshortens: its row scales by ``cos(alpha)`` and picks up
+      a ``hidden_offset * sin(alpha)`` shift in ``c``.  Identity at t=0 and t=1.
+    * ``drift`` — each dim's coordinate pans by ``winding * t`` (non-seamless for a non-periodic POV
+      field, exactly as in the affine case; the user opts in).
+    """
+    D = int(getattr(v, "dims", 3))
+    A: List[List[float]] = [
+        [1.0 if k == d else 0.0 for k in range(3)] if d < 3 else [0.0, 0.0, 0.0]
+        for d in range(D)
+    ]
+    c: List[float] = [0.0] * D
+    do_drift = _has(transform, "drift")
+    do_rotate = _has(transform, "rotate")
+    do_tumble = _has(transform, "tumble")
+    two_pi = 2.0 * math.pi
+    oph = getattr(v, "osc_phase", 0.0)
+    # tumble first: mix the embedding rows (and their offsets), exactly like _tumbled_directions.
+    if do_tumble:
+        slide = (v.tumble_mode == "slide")
+        for (i, j, wind) in v.tumble_planes:
+            if i >= D or j >= D:
+                continue
+            if slide:
+                a = (two_pi * v.tumble_amp) * math.sin(two_pi * wind * t + oph)
+            else:
+                a = two_pi * wind * t + oph
+            ca, sa = math.cos(a), math.sin(a)
+            Ai, Aj = A[i], A[j]
+            A[i] = [ca * Ai[k] - sa * Aj[k] for k in range(3)]
+            A[j] = [sa * Ai[k] + ca * Aj[k] for k in range(3)]
+            ci, cj = c[i], c[j]
+            c[i] = ca * ci - sa * cj
+            c[j] = sa * ci + ca * cj
+    # then per-dim rotate (foreshorten) + drift (pan) on the resulting rows.
+    by_index = {d.index: d for d in v.dim_list}
+    for d in range(D):
+        dim = by_index.get(d)
+        if dim is None:
+            continue
+        if do_rotate:
+            alpha = two_pi * dim.winding * t + oph
+            ca = math.cos(alpha)
+            A[d] = [ca * x for x in A[d]]
+            c[d] += dim.hidden_offset * math.sin(alpha)
+        if do_drift:
+            c[d] += dim.winding * t
+    return A, c
+
+
+def _pov_nd_coords(A: List[List[float]], c: List[float]) -> List[str]:
+    """The ``D`` coordinate expressions ``A_d . (x,y,z) + c_d`` fed to the N-D field builder."""
+    return [_arg_expr((row[0], row[1], row[2]), 1.0, off)
+            for row, off in zip(A, c)]
+
+
+def _pov_use_nd(v: "Variant", transform: str) -> bool:
+    """True when a POV surface should render as an honest N-D field (P3.4) rather than the S6
+    affine remap: the surface has a true-N-D form, motion is on, the ``tumble`` layer is selected
+    (the only motion that folds a hidden dim into the slice) and there *is* a hidden dim (``D > 3``)
+    to fold.  Every other case — no motion, drift/rotate-only, ``D <= 3``, or an ``affine_pov``
+    surface — keeps the exact pre-P3.4 S6 path (byte-identical)."""
+    return (bool(getattr(v, "pov_motion", False))
+            and _has(transform, "tumble")
+            and int(getattr(v, "dims", 3)) > 3
+            and getattr(v, "surface", "gyroid") in POV_ND_GENERALIZABLE)
 
 
 def _pov_affine_coords(M: List[List[float]], b: List[float]) -> Tuple[str, str, str]:
@@ -2311,6 +2428,13 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
         values = _pov_values_at(v, t)
         if not getattr(v, "pov_motion", False):
             return _pov_call_expr(surf, values)          # static: clean f(x,y,z)
+        if _pov_use_nd(v, transform):
+            # P3.4: a true-N-D field.  The slice tumbles through the extra dimensions and folds
+            # them into an honest D-coordinate generalization F(A.p + c) — not just an affine
+            # reorientation of f(x,y,z).  At t=0 (and t=1) the embedding is the identity, so this
+            # is byte-identical to the static f(x,y,z); in between the hidden axes genuinely bend in.
+            A, c = _pov_nd_embedding(v, t, transform)
+            return nd_field_expr(surf, _pov_nd_coords(A, c), values)
         M, b = _pov_affine(v, t, transform)
         return _pov_call_expr(surf, values, _pov_affine_coords(M, b))
     if _has(transform, "bloom"):
@@ -2522,6 +2646,29 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
         # overrides / clips unbounded shapes).  This is the *native* extent, before any S6 remap.
         nat_rad = _pov_container_radius(surface, values, level, radius)
         nat_box = nat_rad * 1.05                          # native contained_by half-extent
+        if _pov_use_nd(v, transform):
+            # P3.4: the emitted field is the honest N-D form F(A.p + c) (D x 3 slice Jacobian A,
+            # offset c), whose p-gradient is A^T grad_xi F, so |grad_p F| <= sigma_max(A) *
+            # |grad_xi F| and the world extent grows by 1/sigma_min(A) plus the |c| shift — exactly
+            # the affine rigor with the D x 3 Jacobian in place of the 3x3 M.
+            A, c = _pov_nd_embedding(v, t, transform)
+            D = int(getattr(v, "dims", 3))
+            sig_min, sig_max = _matn3_singular_extremes(A)
+            c_norm = math.sqrt(sum(cc * cc for cc in c))
+            c_max = max((abs(cc) for cc in c), default=0.0)
+            if radius is None:
+                rad = (nat_rad + c_norm) / max(0.15, sig_min)
+            else:
+                rad = nat_rad
+            box = rad * 1.05
+            # xi box: |xi_d| = |A_d.p + c_d| <= sigma_max * sqrt(3)*box + max|c_d| over the cube.
+            xi_max = sig_max * math.sqrt(3.0) * box + c_max
+            grad_xi = nd_grad_bound_xi(surface, values, xi_max, D)
+            if grad_xi is None:                           # e.g. f_superellipsoid: no Lipschitz form
+                grad_xi = _pov_grad_bound(surface, values, nat_box)
+            grad_bound = grad_xi * max(1e-6, sig_max)
+            return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
+                                       env_file, mat_def)
         # S6: the emitted field is f(M.p + b) under the per-frame affine remap.  Its gradient is
         # M^T grad f, so |grad| <= sigma_max(M) * |grad f| (inflate the marcher bound), and the
         # surface's *world* extent grows by 1/sigma_min(M) plus the |b| translation (enlarge the
