@@ -523,6 +523,169 @@ def parse_pair_lock(spec: str, on_set: set, off_set: set) -> None:
 
 
 # ---------------------------------------------------------------------------
+# unified --oscillate / --lock axis grammar (see examples/OSCILLATE_GRAMMAR.md)
+# ---------------------------------------------------------------------------
+#
+# One namespace of animatable "change-axes" (spatial dim indices AND named
+# motions/parameters), acted on by two verbs that share this grammar:
+#
+#     --oscillate  <group>  <group>  ...      (motion: these axes move)
+#     --lock       <group>  <group>  ...      (held fixed; amp/rate/phase ignored)
+#
+#     group  =  item , item , ...  [ rate <expr> ] [ phase <expr> ]
+#     item   =  [ amp * ] axisname
+#
+# * comma joins axes into ONE composite oscillator (shared clock, one degree of
+#   freedom along the diagonal of its member axes);
+# * space separates INDEPENDENT oscillators (each its own clock).
+# * amp (per item) = that axis's amplitude / slope of the composite direction.
+# * rate/phase (per group) = the shared clock; `rate`/`phase` are RESERVED words
+#   greedily absorbed after a group until the next non-keyword token (a new group).
+#
+# This layer is the pure *parser + model*: it turns the token stream into a list
+# of `OscGroup`s and validates the grammar (grouping, amplitudes, rate/phase,
+# reserved words, malformed items). It does NOT resolve an axis to winder-vs-
+# swinger semantics or check it exists for the chosen surface — that binding is a
+# later wiring step (the axis namespace is surface-dependent). So an axis token is
+# accepted if it is *syntactically* an axis: a non-negative integer (a spatial dim
+# index) or a lowercase identifier — anything but the reserved `rate`/`phase`.
+
+_OSC_RESERVED = ("rate", "phase")
+_OSC_AXIS_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+@dataclass
+class OscGroup:
+    """One composite oscillator: weighted axes sharing a clock.
+
+    ``items`` is a list of ``(amplitude, axis_name)`` (the comma-joined members);
+    ``rate`` = full cycles of the shared clock over the loop (default 1); ``phase``
+    = starting offset in radians (default 0). For a ``--lock`` group the amplitudes
+    and rate/phase are parsed but semantically ignored (a lock is just "held")."""
+    items: List[Tuple[float, str]]
+    rate: float = 1.0
+    phase: float = 0.0
+
+    def axes(self) -> List[str]:
+        return [ax for _, ax in self.items]
+
+
+def _osc_eval_num(expr: str, what: str) -> float:
+    """Safely evaluate a small arithmetic expression (numbers, ``pi``/``tau``/``e``,
+    ``+ - * / ** %``, parentheses, unary sign). Used for amplitudes and rate/phase
+    so specs like ``pi/2``, ``2*pi``, ``1/3`` work. Rejects anything else."""
+    import ast
+
+    def ev(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) \
+                and not isinstance(n.value, bool):
+            return float(n.value)
+        if isinstance(n, ast.Name):
+            return {"pi": math.pi, "tau": math.tau, "e": math.e}[n.id]
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+            v = ev(n.operand)
+            return +v if isinstance(n.op, ast.UAdd) else -v
+        if isinstance(n, ast.BinOp):
+            a, b = ev(n.left), ev(n.right)
+            op = n.op
+            if isinstance(op, ast.Add): return a + b
+            if isinstance(op, ast.Sub): return a - b
+            if isinstance(op, ast.Mult): return a * b
+            if isinstance(op, ast.Div): return a / b
+            if isinstance(op, ast.Pow): return a ** b
+            if isinstance(op, ast.Mod): return a % b
+        raise ValueError("unsupported expression")
+    try:
+        tree = ast.parse(expr.strip(), mode="eval")
+        return float(ev(tree.body))
+    except (SyntaxError, ValueError, KeyError, ZeroDivisionError, TypeError,
+            OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"--oscillate/--lock: bad {what} expression {expr!r} "
+            f"(allowed: numbers, pi/tau/e, + - * / ** %, parentheses)") from exc
+
+
+def _osc_axis(tok: str) -> str:
+    """Validate one axis name (a non-negative integer or a lowercase identifier);
+    normalize case; reject the reserved words ``rate``/``phase`` and bad forms."""
+    ax = tok.strip().lower()
+    if ax == "":
+        raise argparse.ArgumentTypeError("--oscillate/--lock: empty axis name")
+    if ax in _OSC_RESERVED:
+        raise argparse.ArgumentTypeError(
+            f"--oscillate/--lock: {ax!r} is a reserved word, not an axis name")
+    if ax.isdigit():
+        return ax                                       # spatial dim index
+    if not _OSC_AXIS_RE.match(ax):
+        raise argparse.ArgumentTypeError(
+            f"--oscillate/--lock: {tok!r} is not a valid axis name "
+            f"(expected a non-negative integer or a name like 'tumble')")
+    return ax
+
+
+def _osc_item(part: str) -> Tuple[float, str]:
+    """Parse one ``[amp*]axis`` item into ``(amplitude, axis_name)``. The amplitude
+    (default 1) may itself be an arithmetic expression; it is split on the LAST
+    ``*`` so ``2*pi*tumble`` reads as amp ``2*pi`` on axis ``tumble``."""
+    part = part.strip()
+    if part == "":
+        raise argparse.ArgumentTypeError(
+            "--oscillate/--lock: empty item (stray comma?)")
+    amp_expr, star, axis_tok = part.rpartition("*")
+    if star:
+        amp = _osc_eval_num(amp_expr, "amplitude")
+    else:
+        amp, axis_tok = 1.0, part
+    return amp, _osc_axis(axis_tok)
+
+
+def parse_oscillate(tokens) -> List[OscGroup]:
+    """Parse the ``--oscillate`` token stream into a list of :class:`OscGroup`.
+
+    Each group begins with a comma-joined item token, optionally followed by
+    ``rate <expr>`` and/or ``phase <expr>`` (either order, each at most once),
+    greedily absorbed until the next item token (which starts a new group)."""
+    toks = list(tokens or [])
+    groups: List[OscGroup] = []
+    i = 0
+    while i < len(toks):
+        head = toks[i]; i += 1
+        if head.lower() in _OSC_RESERVED:
+            raise argparse.ArgumentTypeError(
+                f"--oscillate/--lock: {head!r} must follow a group, not begin one")
+        items = [_osc_item(p) for p in head.split(",")]
+        rate, phase = 1.0, 0.0
+        seen = set()
+        while i < len(toks) and toks[i].lower() in _OSC_RESERVED:
+            kw = toks[i].lower(); i += 1
+            if kw in seen:
+                raise argparse.ArgumentTypeError(
+                    f"--oscillate/--lock: {kw!r} given twice for one group")
+            seen.add(kw)
+            if i >= len(toks):
+                raise argparse.ArgumentTypeError(
+                    f"--oscillate/--lock: {kw!r} needs an expression after it")
+            val = _osc_eval_num(toks[i], kw); i += 1
+            if kw == "rate":
+                rate = val
+            else:
+                phase = val
+        groups.append(OscGroup(items, rate, phase))
+    return groups
+
+
+def parse_lock_axes(tokens) -> List[str]:
+    """Parse the ``--lock`` token stream (same grammar as ``--oscillate``) into a
+    flat, de-duplicated, order-preserving list of the axis names to hold fixed.
+    Amplitudes and rate/phase are accepted for grammar symmetry but ignored."""
+    seen: Dict[str, None] = {}
+    for grp in parse_oscillate(tokens):
+        for ax in grp.axes():
+            seen.setdefault(ax, None)
+    return list(seen.keys())
+
+
+# ---------------------------------------------------------------------------
 # the picker
 # ---------------------------------------------------------------------------
 

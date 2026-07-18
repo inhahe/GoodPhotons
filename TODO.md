@@ -80,9 +80,14 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 `--couple` axis grammar. Each phase is independently committable and keeps tests green.
 
 ### Phase 1 — the `--oscillate`/`--lock` core (§5 steps 1–5)
-- [ ] **P1.1 Parser + model, no behavior change.** `--oscillate`/`--lock` grammar →
+- [x] **P1.1 Parser + model, no behavior change.** `--oscillate`/`--lock` grammar →
       `Group{items:[(amp,axis)], rate, phase}`. Unit-test parser in isolation (grouping,
       amplitudes, rate/phase, reserved words `rate`/`phase`, error cases).
+      *Done 2026-07-18:* `OscGroup` dataclass + `parse_oscillate`/`parse_lock_axes` +
+      safe arithmetic evaluator (`pi`/`tau`/`e`, `+ - * / ** %`) in `gyroid_nd.py`; pure
+      parser, not yet wired to behavior. 17 unit tests in `test_gyroid_nd.py` (grouping,
+      amplitudes incl. `2*pi*x`, rate/phase either order, reserved-word/duplicate/empty/
+      bad-expr errors, lock flatten+dedup). 285 loom tests green.
 - [ ] **P1.2 Desugar `--transform` → groups.** Route existing transform code through the group
       model; all existing tests pass unchanged.
 - [ ] **P1.3 Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`), `amp` = amplitude;
@@ -158,3 +163,6 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   (`--raster-iso` passthrough — the trivial, zero-engine-change win).
 - 2026-07-18: **G1 done.** `--raster-iso` flag threaded through `gyroid_nd`; verified end-to-end
   (coarse gyroid at res 40) + 268 loom tests green. Next: P1.1 (the `--oscillate` parser + model).
+- 2026-07-18: **P1.1 done.** Standalone `--oscillate`/`--lock` grammar parser + `OscGroup` model +
+  safe arithmetic evaluator in `gyroid_nd.py`; 17 parser unit tests; 285 loom tests green. No
+  behavior wired yet (that's P1.2 — desugar `--transform` through the group model). Next: P1.2.

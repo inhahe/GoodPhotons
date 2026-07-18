@@ -193,9 +193,13 @@ given amp/rate/phase; every unnamed axis stays RNG-randomized.
 
 ## 5. Staging plan (keep tests green at every step)
 
-1. **Parser + model, no behavior change.** Add an `--oscillate`/`--lock` grammar parser
-   producing a list of `Group{items:[(amp,axis)], rate, phase}`. Unit-test the
-   parser in isolation (grouping, amplitudes, rate/phase, reserved words, errors).
+1. **Parser + model, no behavior change. ✅ DONE 2026-07-18.** Added an `--oscillate`/`--lock`
+   grammar parser producing a list of `OscGroup{items:[(amp,axis)], rate, phase}`
+   (`parse_oscillate`/`parse_lock_axes` in `examples/gyroid_nd.py`), with a safe arithmetic
+   evaluator (`pi`/`tau`/`e`, `+ - * / ** %`, parens) for amplitudes and rate/phase. Pure
+   parser — not yet wired to any behavior. Unit-tested in isolation (17 tests in
+   `tests/test_gyroid_nd.py`: grouping, amplitudes incl. `2*pi*x`, rate/phase either order,
+   reserved-word/duplicate/empty/bad-expr errors, `--lock` flatten+dedup). 285 loom tests green.
 2. **Desugar `--transform` → groups.** Route the *existing* transform code through the
    new group model (transform names → default groups with today's semantics). All 106
    existing tests must still pass unchanged.

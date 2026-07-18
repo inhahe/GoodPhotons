@@ -997,6 +997,115 @@ def test_primitive_coupling_desc_is_per_node():
     assert "4 cos" in g.coupling_desc(v)
 
 
+# ---------------------------------------------------------------------------
+# unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
+# ---------------------------------------------------------------------------
+
+def test_oscillate_single_axis_defaults():
+    grps = g.parse_oscillate(["tumble"])
+    assert len(grps) == 1
+    assert grps[0].items == [(1.0, "tumble")]
+    assert grps[0].rate == 1.0 and grps[0].phase == 0.0
+
+
+def test_oscillate_comma_is_one_composite_group():
+    # comma = ONE oscillator on the shared diagonal (one degree of freedom)
+    grps = g.parse_oscillate(["tumble,bloom"])
+    assert len(grps) == 1
+    assert grps[0].axes() == ["tumble", "bloom"]
+
+
+def test_oscillate_space_is_independent_groups():
+    # space = TWO independent oscillators (a torus)
+    grps = g.parse_oscillate(["tumble", "bloom"])
+    assert len(grps) == 2
+    assert grps[0].axes() == ["tumble"]
+    assert grps[1].axes() == ["bloom"]
+
+
+def test_oscillate_amplitudes():
+    grps = g.parse_oscillate(["2*tumble,1.5*bloom"])
+    assert grps[0].items == [(2.0, "tumble"), (1.5, "bloom")]
+
+
+def test_oscillate_amplitude_expression_splits_on_last_star():
+    # amp may itself be an arithmetic expr; split on the LAST '*'
+    (amp, axis), = g.parse_oscillate(["2*pi*tumble"])[0].items
+    assert axis == "tumble"
+    assert amp == pytest.approx(2 * math.pi)
+
+
+def test_oscillate_rate_and_phase():
+    grps = g.parse_oscillate(["bloom,tumble", "rate", "2", "phase", "pi/2"])
+    assert len(grps) == 1
+    assert grps[0].rate == 2.0
+    assert grps[0].phase == pytest.approx(math.pi / 2)
+
+
+def test_oscillate_rate_phase_either_order():
+    a = g.parse_oscillate(["drift", "rate", "2", "phase", "1"])[0]
+    b = g.parse_oscillate(["drift", "phase", "1", "rate", "2"])[0]
+    assert a.rate == b.rate == 2.0
+    assert a.phase == b.phase == 1.0
+
+
+def test_oscillate_multi_group_with_clocks():
+    grps = g.parse_oscillate(
+        ["bloom,tumble", "rate", "2", "phase", "pi/2", "drift,3", "rate", "1"])
+    assert len(grps) == 2
+    assert grps[0].axes() == ["bloom", "tumble"]
+    assert grps[0].rate == 2.0 and grps[0].phase == pytest.approx(math.pi / 2)
+    assert grps[1].axes() == ["drift", "3"]      # '3' is a spatial dim index
+    assert grps[1].rate == 1.0 and grps[1].phase == 0.0
+
+
+def test_oscillate_dim_index_axis():
+    grps = g.parse_oscillate(["0,1"])
+    assert grps[0].axes() == ["0", "1"]
+
+
+def test_oscillate_reserved_word_as_axis_rejected():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["tumble,phase"])
+
+
+def test_oscillate_keyword_must_follow_a_group():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["rate", "2"])
+
+
+def test_oscillate_keyword_needs_expression():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["tumble", "rate"])
+
+
+def test_oscillate_duplicate_keyword_rejected():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["tumble", "rate", "1", "rate", "2"])
+
+
+def test_oscillate_empty_item_rejected():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["tumble,"])        # stray comma
+
+
+def test_oscillate_bad_expression_rejected():
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["tumble", "rate", "2+"])
+    with pytest.raises(argparse.ArgumentTypeError):
+        g.parse_oscillate(["tumble", "rate", "foo"])       # unknown name
+
+
+def test_oscillate_empty_tokens_gives_no_groups():
+    assert g.parse_oscillate([]) == []
+    assert g.parse_oscillate(None) == []
+
+
+def test_lock_flattens_and_dedups():
+    axes = g.parse_lock_axes(["tumble,bloom", "rate", "2", "tumble", "0"])
+    assert axes == ["tumble", "bloom", "0"]    # order preserved, deduped
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
