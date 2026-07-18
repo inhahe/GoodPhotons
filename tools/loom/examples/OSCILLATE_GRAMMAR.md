@@ -447,9 +447,25 @@ the interior `{f(x,y,z, defaults…) < threshold}` bounded by the field's own le
 small table, conservative default `8.0` until S2 tabulates the rest). Shape params take
 their authored defaults; the N-D slice machinery (drift/rotate/tumble/bloom) is a no-op
 on a POV field for now. Smoke-rendered `f_sphere` (exact SDF, bound 1.0) and `f_torus`
-(bound 1.0) as clean solids. Still to come: S2 symbolic per-function gradient table, S3
-bbox containers + `--shell`, S4 `--lock NAME=VALUE`, S5 params as `--oscillate` swingers,
-S6 affine N-D remap, S7 `--axis-default` random param draw.
+(bound 1.0) as clean solids.
+
+**S1 follow-up — solid orientation + natural isolevel (done 2026-07-18):** POV builtins
+split into two sign conventions and the naive `{f < 0}` render inverts half of them. The
+SDF-like helpers (`f_sphere`, `f_torus`) are *negative* inside and cross zero on the
+surface, but most clamped algebraic builtins are built as `r = -(polynomial)` then
+clamped, so they are *positive* inside and rail to `-10` far away — rendering `{f < 0}`
+gives the *exterior* (a shape-shaped crater, e.g. the heart came out as a sphere with
+heart dimples). A per-function `_POV_SOLID_META = {name: (sign, level)}` table now records
+each builtin's inside-sign and natural isolevel: the emitted field is `sign·(f − (level +
+threshold))`, so a positive-inside function is negated (a sign flip leaves `|∇f|`, hence
+`max_gradient`, unchanged) and a function whose surface lives at a non-zero level (e.g.
+`f_ellipsoid`, `≥ 0` everywhere with the surface at level 1) is shifted before the sign
+test. Un-tabulated functions fall back to the honest `(+1, 0)` passthrough. Validated:
+`f_heart` now renders as a solid valentine and `f_ellipsoid` as a solid unit sphere (both
+were broken before). Still to come: S2 symbolic per-function gradient table (Option B —
+tight bound over the active band near the surface via interval arithmetic), S3 bbox
+containers + `--shell`, S4 `--lock NAME=VALUE`, S5 params as `--oscillate` swingers, S6
+affine N-D remap, S7 `--axis-default` random param draw.
 
 ---
 

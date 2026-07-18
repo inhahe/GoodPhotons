@@ -1194,6 +1194,60 @@ def test_pov_unknown_grad_bound_falls_back_to_default():
 
 
 # ---------------------------------------------------------------------------
+# POV solid orientation (sign) + natural isolevel (level): a positive-inside
+# builtin (f_heart) must be negated so ftrace's {field<0} fills the interior,
+# not the exterior; f_ellipsoid's surface lives at level 1, not 0.
+# ---------------------------------------------------------------------------
+
+def test_pov_solid_meta_defaults_to_honest_passthrough():
+    # an un-tabulated function falls back to (+1, 0): raw {f<0}, emitted unchanged
+    assert g._pov_solid_meta("f_klein_bottle") == (1.0, 0.0)
+
+
+def test_pov_solid_meta_known_orientations():
+    assert g._pov_solid_meta("f_sphere") == (1.0, 0.0)
+    assert g._pov_solid_meta("f_torus") == (1.0, 0.0)
+    assert g._pov_solid_meta("f_ellipsoid") == (1.0, 1.0)
+    assert g._pov_solid_meta("f_heart") == (-1.0, 0.0)
+    assert g._pov_solid_meta("f_hunt_surface") == (-1.0, 0.0)
+
+
+def test_pov_sphere_sign_positive_emits_field_unchanged():
+    # sign=+1, level=0 -> the field call appears verbatim, not negated
+    v = _pv("--surface", "f_sphere")
+    body = _scene_body(v)
+    assert "f_sphere(x,y,z,1)" in body
+    assert "-(f_sphere" not in body and "-(( f_sphere" not in body
+
+
+def test_pov_heart_sign_negative_emits_negated_field():
+    # f_heart is positive-inside -> the emitted solid field must be negated so
+    # ftrace's {field<0} fills the true interior (else it renders a crater)
+    v = _pv("--surface", "f_heart")
+    body = _scene_body(v)
+    call = g._pov_call_expr("f_heart", v.pov_values)
+    assert call in body
+    assert f"-({call})" in body
+
+
+def test_pov_ellipsoid_emits_level_one_shift():
+    # f_ellipsoid is >=0 everywhere with the surface at level 1 -> subtract 1
+    v = _pv("--surface", "f_ellipsoid")
+    body = _scene_body(v)
+    assert "f_ellipsoid(" in body
+    # (expr)-(1) with sign=+1 (no outer negation)
+    assert "-(1)" in body
+    assert "-(f_ellipsoid" not in body
+
+
+def test_pov_threshold_shifts_isolevel_on_top_of_level():
+    # a --threshold adds to the natural level: f_ellipsoid at thr=0.2 -> (expr)-(1.2)
+    v = _pv("--surface", "f_ellipsoid", "--threshold", "0.2")
+    body = _scene_body(v)
+    assert "-(1.2)" in body
+
+
+# ---------------------------------------------------------------------------
 # unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
 # ---------------------------------------------------------------------------
 

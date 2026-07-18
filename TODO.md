@@ -213,8 +213,18 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       (f_sphere/f_torus = 1.0, conservative `_POV_GRAD_DEFAULT` 8.0 otherwise), wired through `build_scene`
       via a shared `_assemble_iso_scene` helper. New Variant field `pov_values`; early POV branch in
       `field_expr` (all transforms are no-ops on a POV field for now); 13 new tests (378 loom green);
-      smoke-rendered f_sphere + f_torus as clean solids. Still: (S2) SymPy/interval per-function gradient
-      table; (S3) bbox container table + `--shell`; (S4) named params as `--lock NAME=VALUE` fixed values;
+      smoke-rendered f_sphere + f_torus as clean solids. **S1 follow-up done 2026-07-18** — solid
+      orientation + natural isolevel: most clamped builtins are `r = -(poly)` (positive-inside), so the
+      naive `{f<0}` rendered their *exterior* (heart came out as a sphere with heart craters). Added
+      `_POV_SOLID_META = {name:(sign,level)}`; emit `sign·(f − (level+threshold))` — positive-inside funcs
+      negated (sign flip leaves `|∇f|`/`max_gradient` unchanged), non-zero-level funcs (f_ellipsoid, surface
+      at level 1) shifted first; un-tabulated funcs fall back to honest `(+1,0)`. Validated: f_heart renders a
+      solid valentine, f_ellipsoid a solid unit sphere (both were broken). 6 more tests (384 loom green).
+      Still: (S2) SymPy/interval per-function gradient
+      table — **Option B chosen (user, 2026-07-18):** bound `|∇f|` only over the *active band* near the
+      surface (where the clamped function isn't railed), giving tight/fast bounds; rigor via interval
+      arithmetic (SymPy + mpmath.iv) with branch-and-bound subdivision discarding fully-clamped sub-boxes,
+      and safe defaults kept for the noise/atan2/ROT2D functions. (S3) bbox container table + `--shell`; (S4) named params as `--lock NAME=VALUE` fixed values;
       (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
       random-draw for unspecified params.
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,

@@ -1546,6 +1546,45 @@ _POV_GRAD_BOUND = {
     "f_torus": 1.0,         # -P1 + sqrt((sqrt(x^2+z^2)-P0)^2 + y^2): |grad| == 1
 }
 
+# Per-function solid orientation (sign) and natural isolevel (level) for the POV builtins.
+# ftrace renders the region {field < 0} as the solid.  A POV function's own convention
+# decides which side of its zero set is "inside" and at what value the intended surface
+# lives, and the two conventions split:
+#
+#   * SDF-like helpers (f_sphere, f_torus) are NEGATIVE inside and cross zero *on* the
+#     surface -> (sign=+1, level=0): {f < 0} is already the solid, emit f unchanged.
+#   * Most clamped algebraic builtins (f_heart, f_hunt_surface, ...) are built as
+#     r = -(polynomial) then clamped, so they are POSITIVE inside and rail to -10 far
+#     outside -> the bare {f < 0} renders the *exterior* (a shape-shaped crater).  We flip
+#     with sign=-1 so the solid is {-f < 0} == {f > 0}, the true interior.
+#   * A few (f_ellipsoid) are >= 0 everywhere with the surface at a non-zero level -> the
+#     natural isolevel is stored in `level` and subtracted before the sign test.
+#
+# Values were read straight from src/pov_functions.h (the exact C ports).  Un-tabulated
+# functions fall back to the honest (sign=+1, level=0) default: their raw {f < 0} is
+# emitted as-is, which is correct for the SDF-like ones and a known-imperfect placeholder
+# for the clamped ones until each is validated and added here.
+_POV_SOLID_META = {
+    "f_sphere": (1.0, 0.0),          # -P0 + sqrt(r^2): negative inside, surface at 0
+    "f_torus": (1.0, 0.0),           # -P1 + sqrt(...): negative inside, surface at 0
+    "f_ellipsoid": (1.0, 1.0),       # sqrt(x^2 P0^2+...): >= 0, surface at level 1
+    "f_heart": (-1.0, 0.0),          # r = -((...)^3 - ...), clamped: positive inside
+    "f_hunt_surface": (-1.0, 0.0),   # r = -(...), clamped: positive inside
+    "f_kummer_surface_v1": (1.0, 0.0),  # negative inside, surface at 0
+}
+
+
+def _pov_solid_meta(name: str) -> Tuple[float, float]:
+    """The (inside_sign, natural_level) for POV builtin ``name``.
+
+    ``inside_sign`` is +1 when ``{f < level}`` is already the solid interior, and -1 when
+    the function is positive-inside (so the interior is ``{f > level}`` and the emitted
+    field must be negated).  ``natural_level`` is the isolevel the intended surface sits on
+    (0 for the SDF-like builtins, non-zero for the few that never reach zero).  Falls back
+    to the honest ``(+1, 0)`` for functions not yet individually validated.
+    """
+    return _POV_SOLID_META.get(name, (1.0, 0.0))
+
 
 def _is_pov_surface(name: str) -> bool:
     """True if ``name`` selects a POV isosurface builtin (vs a periodic TPMS family)."""
@@ -2080,13 +2119,22 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
     expr = field_expr(v, t, transform)
     surface = getattr(v, "surface", "gyroid")
     if _is_pov_surface(surface):
-        # A POV builtin renders as a *solid*: the interior {field < threshold} bounded by
-        # the field's own level set.  No abs()-shell (that would carve a thin sheet out of
-        # the solid) and no frequency-scaled Lipschitz bound (the field has no lattice
-        # frequency) — thr shifts the level set, default 0 gives the surface itself, and the
-        # bound comes from the per-function table (conservative default until S2 tabulates it).
-        thr = v.threshold
-        sheet = f"({expr})-({fmt(thr)})" if abs(thr) > 1e-9 else f"({expr})"
+        # A POV builtin renders as a *solid*: the interior bounded by the field's own
+        # level set.  No abs()-shell (that would carve a thin sheet out of the solid) and
+        # no frequency-scaled Lipschitz bound (the field has no lattice frequency).  Two
+        # per-function conventions are honored via _POV_SOLID_META: `level` is the isolevel
+        # the intended surface lives on (0 for SDF-like builtins, non-zero for a few), and
+        # `sign` orients the solid — ftrace fills {field < 0}, so a positive-inside function
+        # (f_heart, ...) must be negated or the render inverts (a shape-shaped crater).  The
+        # user threshold shifts the level.  Gradient bound from the per-function table
+        # (conservative default until S2 tabulates it); a sign flip leaves |grad| unchanged.
+        sign, level = _pov_solid_meta(surface)
+        lvl = level + v.threshold
+        if abs(lvl) > 1e-9:
+            inner = f"({expr})-({fmt(lvl)})"
+            sheet = inner if sign > 0 else f"-({inner})"
+        else:
+            sheet = f"({expr})" if sign > 0 else f"-({expr})"
         grad_bound = _POV_GRAD_BOUND.get(surface, _POV_GRAD_DEFAULT)
         box = radius * 1.05                              # contained_by half-extent
         r = radius
