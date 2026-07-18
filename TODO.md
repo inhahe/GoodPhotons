@@ -204,18 +204,26 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       order/overlap; (3) the **only real cost is the Lipschitz bound**: disjoint planes cap `|rotated dir|
       <= sqrt(2)` (the current `coef *= sqrt(2)` shortcut, line ~2052), but overlapping planes can grow a
       row toward `sqrt(#coupled rows)`, so the general path must compute the true worst-case row norm.
-      **Design decision (agreed): "alongside", not "supersede"** — keep the disjoint construction + fast
-      `sqrt(2)` bound as the untouched default (guarantees byte-identical existing seeds *by construction*,
-      no exact-reduction proof needed), and add an **opt-in mode** that takes a user-specified ordered word
-      of `(axis_i, axis_j, winding)` planes (grammar: an extension of the `--oscillate`/`--lock` word
-      grammar; list order is significant) which switches to the general ordered composition + general
-      row-norm bound. Supersede was rejected because it risks regressing every existing tumble render unless
-      the general path reduces *exactly* to today's construction, and it would slow the common case by
-      dropping the closed-form `sqrt(2)` bound. Deliverables: (a) grammar for the ordered plane word; (b)
-      construction path that honors it; (c) general row-norm bound for overlapping words (>= sqrt(2), so
-      only ever safer); (d) tests: default byte-identity, an overlapping word producing motion a disjoint
-      set can't, seamless-loop preservation, bound-never-under-estimates. Note: `max_gradient` affects only
-      march step size / hole-safety, never the converged image, so the bound generalization is safe.
+      **Design decision (agreed 2026-07-18, revised): "supersede", not "alongside"** — the user chose the
+      more elegant single path and explicitly **waived byte-identity of existing tumble renders** ("we'll
+      just re-render them"). Scope of the waiver: *only* renders that use `tumble` — non-tumble seeds never
+      build tumble planes, so they stay untouched. So replace the disjoint construction with ONE general
+      path: tumble is an **ordered word** of `(axis_i, axis_j, winding)` Givens planes (list order =
+      composition order; planes may overlap), evaluated by the existing sequential `_tumbled_directions`
+      (already order-honoring), with a **single general bound** = the true worst-case visible-row norm of
+      the composed rotation. That bound *auto-returns* `sqrt(2)` for a disjoint word and grows only for
+      overlapping ones, so there is **no special-case code and no speed loss on the disjoint case** — the
+      `coef *= sqrt(2)` shortcut is subsumed, not duplicated. No legacy/opt-in branch. **Open sub-question:**
+      the seed-driven **default word** when the user gives no explicit one — keep it the current disjoint
+      pairing (each visible axis <-> one hidden dim; clean, predictable, tight bound) re-expressed in the
+      general framework, or make the default itself a richer overlapping draw. Leaning: keep the default
+      disjoint-clean (good UX + tight bound + guaranteed the slice tips out of the 3-space), with explicit
+      ordered words the route to richer motion. Deliverables: (a) grammar for the ordered plane word (an
+      extension of the `--oscillate`/`--lock` word grammar; list order significant); (b) the single general
+      construction; (c) the general row-norm bound (>= sqrt(2), only ever safer; `max_gradient` affects
+      march step / hole-safety, never the converged image, so this is safe); (d) tests: an overlapping word
+      produces motion a disjoint set can't, seamless-loop preservation (product = I at t=1 regardless of
+      order), bound-never-under-estimates, and the default word still meaningfully reorients the slice.
 
 ### §8 — GPU isosurface rendering (kill per-frame tessellation; independent track)
 - [x] **G1** `--raster-iso <n>` passthrough in `gyroid_nd._render_frame` → ftrace's existing
