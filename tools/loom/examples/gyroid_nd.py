@@ -1760,6 +1760,7 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
                   noise: Optional[float] = None, time_budget: Optional[float] = None,
                   spp: Optional[int] = None,
                   see_through: bool = False, clarity: Optional[float] = None,
+                  raster_iso: Optional[int] = None,
                   pump: Optional["Callable[[], None]"] = None) -> None:
     """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
@@ -1780,6 +1781,11 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     that needs path tracing); ``clarity`` (0..1) sets the per-surface transmittance via
     ``-glass-clarity`` (higher = clearer; ftrace's default is 0.85).
 
+    ``raster_iso`` (raster only) sets ftrace ``-raster-iso <n>`` — the marching-cubes grid
+    resolution used to tessellate isosurfaces for the fast preview (ftrace's default 96).
+    A lower value cuts the per-frame CPU tessellation cost (the raster-path bottleneck) at
+    the price of a coarser surface; ``None`` leaves ftrace's default.
+
     ``pump`` is an optional callback invoked repeatedly *while* ftrace runs (used to
     keep the preview window's event loop serviced — otherwise it would freeze for the
     whole render, since a path-traced frame can take seconds).  With it the child is
@@ -1790,6 +1796,8 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     if raster:
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster",
                "-r", str(w), str(h)]
+        if raster_iso is not None:
+            cmd += ["-raster-iso", str(raster_iso)]
         if clarity is not None:
             cmd += ["-glass-clarity", f"{clarity:g}"]   # implies -see-through
         elif see_through:
@@ -1842,7 +1850,7 @@ def _assemble_video(pngs: List[Path], out: Path, *, fps: float, pattern: str,
             raise SystemExit("ffmpeg not found for mp4 output (use --format gif)")
         cmd = [ffmpeg, "-y", "-framerate", f"{fps:g}", "-i", pattern,
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-               "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", out.name]
+               "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", str(out)]
         r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
         if r.returncode != 0:
             sys.stdout.write("\n" + (r.stdout or "") + (r.stderr or ""))
@@ -1875,12 +1883,14 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
                time_budget: Optional[float] = None, spp: Optional[int] = None,
                env_file: Optional[str] = None,
                transform: str = "drift", material: str = "gold",
-               clarity: Optional[float] = None,
-               preview: Optional["_PreviewWindow"] = None) -> Path:
+               clarity: Optional[float] = None, raster_iso: Optional[int] = None,
+               preview: Optional["_PreviewWindow"] = None,
+               video_dir: Optional[Path] = None) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
     The per-frame ``.ftsl``/``.png`` files land in ``frames_dir`` (its own subdirectory),
-    while the assembled video is written to ``out_dir`` (the shared collection directory).
+    while the assembled video is written to ``video_dir`` if given, else ``out_dir`` (the
+    shared collection directory).
     The gyroid drifts through its higher dimensions over a seamless loop (frame ``frames``
     == frame 0).  Frames render at ``size`` = ``(W, H)`` pixels, headless with the
     rasterizer by default.  Progress is shown on a single in-place status line built from
@@ -1910,16 +1920,19 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         _status(f"{label} | {verb} frame {k + 1}/{frames}")
         _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise,
                       time_budget=time_budget, spp=spp,
-                      see_through=clear, clarity=frame_clarity,
+                      see_through=clear, clarity=frame_clarity, raster_iso=raster_iso,
                       pump=(preview.pump if preview is not None else None))
         pngs.append(png)
         if preview is not None:
             preview.show(png, f"{title_base}  |  frame {k + 1}/{frames}")
-    out = out_dir / f"{base}.{_video_ext(fmt)}"
-    # ffmpeg reads the frames from the per-variant subdir, relative to out_dir.
-    pattern = f"{frames_dir.name}/{base}_%0{fw}d.png"
+    vdir = video_dir if video_dir is not None else out_dir
+    vdir.mkdir(parents=True, exist_ok=True)
+    out = vdir / f"{base}.{_video_ext(fmt)}"
+    # ffmpeg reads the frames from frames_dir (its cwd) and writes the video to `out`
+    # (an absolute path), so the video's directory is independent of where the frames live.
+    pattern = f"{base}_%0{fw}d.png"
     _status(f"{label} | assembling {out.suffix.lstrip('.')}")
-    _assemble_video(pngs, out, fps=fps, pattern=pattern, cwd=out_dir)
+    _assemble_video(pngs, out, fps=fps, pattern=pattern, cwd=frames_dir)
     return out
 
 
@@ -1998,14 +2011,23 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("-n", "--count", type=int, default=1,
                    help="number of variant .ftsl files to generate (default 1)")
     g.add_argument("--out", type=str, default=None,
-                   help="output directory (default: <repo>/png/gyroid_nd)")
+                   help="output directory. Accepts an absolute path or one relative to the "
+                        "current directory, and writes straight there (no runNNN subdir unless "
+                        "you also pass --run-subdir). If omitted, defaults to <repo>/png/gyroid_nd "
+                        "with a fresh runNNN subdir per run.")
     g.add_argument("--name", type=str, default="gyroid_nd",
                    help="base filename for the outputs (default gyroid_nd)")
-    g.add_argument("--run-subdir", action=argparse.BooleanOptionalAction, default=True,
+    g.add_argument("--video-out", type=str, default=None,
+                   help="directory for the assembled video file(s) ONLY (the per-frame "
+                        ".ftsl/.png and sidecars still go in the output dir). Accepts an "
+                        "absolute path or one relative to the current directory. If omitted, "
+                        "the video is written alongside the frames in the output dir.")
+    g.add_argument("--run-subdir", action=argparse.BooleanOptionalAction, default=None,
                    help="put each run in a fresh numbered subdirectory (run001, run002, ...) "
-                        "under the output dir so runs never overwrite each other (default). "
-                        "--no-run-subdir writes straight into the output dir (old behavior, "
-                        "overwrites same-named files from prior runs).")
+                        "under the output dir so runs never overwrite each other. Default: ON "
+                        "when --out is omitted (the auto png/<name> location), OFF when --out is "
+                        "given (write straight into the directory you named). --run-subdir / "
+                        "--no-run-subdir force it either way.")
     g.add_argument("--seed", type=int, default=None,
                    help="master RNG seed for a reproducible batch (default: random; the "
                         "chosen value is printed so you can reproduce the run)")
@@ -2164,6 +2186,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--raster", action=argparse.BooleanOptionalAction, default=True,
                    help="render each frame with the fast headless rasterizer (default); "
                         "--no-raster path-traces every frame instead (far slower)")
+    g.add_argument("--raster-iso", type=int, default=None, metavar="N",
+                   help="rasterizer only: marching-cubes grid resolution ftrace uses to "
+                        "tessellate isosurfaces each frame (ftrace default 96). Lower = "
+                        "faster per frame (less CPU tessellation, the raster-path bottleneck) "
+                        "but a coarser surface. Ignored under --no-raster.")
     g.add_argument("--preview", action="store_true",
                    help="show each frame as it is rendered in one reusable preview window "
                         "whose title tracks the current gyroid / values / frame")
@@ -2243,12 +2270,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the user's cwd but looked for under repo_root and fail to open.  (The default outdir
     # is already absolute, repo_root/png/<name>.)
     base_outdir = Path(args.out).resolve() if args.out else _default_outdir(args.name)
-    if args.run_subdir:
+    # Run-subdir default: fresh runNNN when --out is omitted (the auto png/<name> location, so
+    # runs never collide), but write straight into an explicit --out dir.  Either is forceable
+    # with --run-subdir / --no-run-subdir.
+    use_run_subdir = args.run_subdir if args.run_subdir is not None else (args.out is None)
+    if use_run_subdir:
         outdir = _next_run_dir(base_outdir)
         print(f"[gyroid_nd] run dir: {outdir}  (--no-run-subdir to write into {base_outdir})")
     else:
         outdir = base_outdir
+        print(f"[gyroid_nd] output dir: {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Optional separate destination for the assembled video(s); frames/sidecars stay in
+    # outdir.  Resolved (absolute or relative to the invoking cwd) just like --out; when
+    # omitted the video lands alongside the frames.
+    video_outdir = Path(args.video_out).resolve() if args.video_out else None
+    if video_outdir is not None:
+        video_outdir.mkdir(parents=True, exist_ok=True)
+        print(f"[gyroid_nd] video dir: {video_outdir}")
 
     # One procedural studio-lighting environment map shared by the whole batch (see
     # studio_env_pfm).  Embed an absolute forward-slash path so ftrace resolves it from
@@ -2303,7 +2343,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                spp=args.render_spp, fmt=args.format,
                                env_file=env_file, transform=args.transform,
                                material=args.material, clarity=args.glass_clarity,
-                               preview=preview)
+                               raster_iso=args.raster_iso,
+                               preview=preview, video_dir=video_outdir)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
@@ -2322,7 +2363,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if preview is not None:
         preview.close()
     kind = "video(s)" if args.video else "scene file(s)"
-    print(f"[gyroid_nd] wrote {len(made)} {kind} to {outdir}")
+    dest = video_outdir if (args.video and video_outdir is not None) else outdir
+    print(f"[gyroid_nd] wrote {len(made)} {kind} to {dest}")
     return 0
 
 
