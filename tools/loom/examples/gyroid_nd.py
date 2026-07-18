@@ -1311,7 +1311,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
     elif _has(transform, "bloom"):
         # Bloom's frame 0 IS the showcase gyroid; default its density to match showcase
         # (freq 40 at radius 0.32) for whatever container radius is in use.
-        freq = SHOWCASE_RF / max(1e-6, args.radius)
+        freq = SHOWCASE_RF / max(1e-6, args.radius if args.radius is not None else _POV_DEFAULT_RADIUS)
     else:
         freq = rng.uniform(*args.freq_range)
 
@@ -1608,6 +1608,52 @@ def _pov_grad_bound(name: str, values: Tuple[float, ...], box_half: float) -> fl
     except Exception:                            # optional deps absent, or an unforeseen field
         pass                                     # -> honest conservative fallback below
     return _POV_GRAD_BOUND.get(name, _POV_GRAD_DEFAULT)
+
+
+# Default container half-width when a shape can't be auto-sized (unbounded, or no transcribed
+# field) and the user gave no explicit --radius.  The small pad multiplies a *derived* extent so
+# the surface isn't flush against the clip sphere (a little air around it, and the sphere-marcher
+# never grazes the exact tangent).
+_POV_DEFAULT_RADIUS = 1.3
+_POV_CONTAINER_PAD = 1.08
+
+# Surfaces that are genuinely *thin* (a sheet / ribbon / self-intersecting membrane, not a solid
+# body) and so render hollow by default — a solid fill would just look like a lumpy ball.  Any
+# ``*_2d`` planar curve is thin too (matched by suffix).  `--shell` forces *any* POV shape thin.
+_POV_THIN_SURFACES = frozenset({
+    "f_klein_bottle", "f_boy_surface", "f_enneper", "f_steiner_roman",
+    "f_cross_cap", "f_roman", "f_witch_hat",
+})
+
+
+def _pov_renders_thin(name: str) -> bool:
+    """True if POV builtin ``name`` renders as a thin shell by default (a genuinely 2-manifold /
+    self-intersecting surface, or a ``*_2d`` planar curve) rather than a solid body."""
+    return name in _POV_THIN_SURFACES or name.endswith("_2d")
+
+
+def _pov_container_radius(name: str, values: Tuple[float, ...], level: float,
+                          radius_arg: Optional[float]) -> float:
+    """The container half-width to fit POV builtin ``name``'s surface.
+
+    An explicit ``radius_arg`` (user ``--radius``) always wins — it also *clips* an unbounded
+    shape (paraboloid/cylinder/helix) to a finite view.  Otherwise the surface is auto-sized from
+    its natural bounding box (:func:`loom.pov_grad.surface_bbox`, padded); a shape with no
+    transcribed field, or one whose surface runs off to infinity (``bounded == False``), falls back
+    to :data:`_POV_DEFAULT_RADIUS`.
+    """
+    if radius_arg is not None:
+        return float(radius_arg)
+    try:
+        from loom.pov_grad import surface_bbox
+        bb = surface_bbox(name, values, level=level)
+        if bb is not None:
+            extent, bounded = bb
+            if bounded and extent > 1e-6:
+                return float(extent) * _POV_CONTAINER_PAD
+    except Exception:                                # optional deps absent, or an unforeseen field
+        pass                                         # -> conservative default below
+    return _POV_DEFAULT_RADIUS
 
 
 def _is_pov_surface(name: str) -> bool:
@@ -2121,9 +2167,9 @@ def studio_env_pfm(path: Path) -> Path:
     return path
 
 
-def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
+def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
                 env_file: Optional[str] = None, transform: str = "drift",
-                material: str = "gold") -> Scene:
+                material: str = "gold", shell: bool = False) -> Scene:
     """The lone thickened gyroid ball whose lattice is the morphing higher-D field.
 
     ``transform`` selects how the higher dimensions animate over the loop (see
@@ -2153,19 +2199,28 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
         # user threshold shifts the level.  Gradient bound from the per-function table
         # (conservative default until S2 tabulates it); a sign flip leaves |grad| unchanged.
         sign, level = _pov_solid_meta(surface)
+        values = tuple(getattr(v, "pov_values", ()))
         lvl = level + v.threshold
         if abs(lvl) > 1e-9:
             inner = f"({expr})-({fmt(lvl)})"
             sheet = inner if sign > 0 else f"-({inner})"
         else:
             sheet = f"({expr})" if sign > 0 else f"-({expr})"
-        box = radius * 1.05                              # contained_by half-extent
-        # S2: tight active-band gradient bound over the actual container box (sign flip and the
-        # level/threshold shift are pure offsets — neither changes |grad f| — so the bound is
-        # computed on the raw field and reused verbatim for the emitted `sheet`).
-        grad_bound = _pov_grad_bound(surface, tuple(getattr(v, "pov_values", ())), box)
-        r = radius
-        return _assemble_iso_scene(sheet, grad_bound, radius, box, r, res,
+        # S3: a genuinely-thin surface (or an explicit --shell) renders hollow — carve a shell of
+        # half-thickness v.thickness around the level set (abs(sheet)-t).  The sign flip is moot
+        # under abs(); the level/threshold shift is already baked into `sheet`.  Solid shapes skip
+        # this and fill the whole {sheet < 0} interior.
+        if shell or _pov_renders_thin(surface):
+            sheet = f"abs({sheet})-({fmt(v.thickness)})"
+        # S3: auto-size the container to the surface's natural bounding box (an explicit --radius
+        # overrides / clips unbounded shapes).  Camera + clip sphere both track the derived radius.
+        rad = _pov_container_radius(surface, values, level, radius)
+        box = rad * 1.05                                 # contained_by half-extent
+        # S2: tight active-band gradient bound over the actual container box (sign flip, level/
+        # threshold shift and the abs()-shell are pure offsets/reflection — none change |grad f| —
+        # so the bound is computed on the raw field and reused verbatim for the emitted `sheet`).
+        grad_bound = _pov_grad_bound(surface, values, box)
+        return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
                                    env_file, mat_def)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
@@ -2223,9 +2278,9 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=1.3,
         # (rotate only *shrinks* a term's frequency by cos(alpha), so it needs no inflation.)
         coef *= math.sqrt(2.0)
     grad_bound = coef * fr * max(1, weighted)
-    box = radius * 1.05                                  # contained_by half-extent
-    r = radius
-    return _assemble_iso_scene(sheet, grad_bound, radius, box, r, res,
+    rad = radius if radius is not None else _POV_DEFAULT_RADIUS   # TPMS keep the classic default
+    box = rad * 1.05                                     # contained_by half-extent
+    return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
                                env_file, mat_def)
 
 
@@ -2825,7 +2880,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
                transform: str = "drift", material: str = "gold",
                clarity: Optional[float] = None, raster_iso: Optional[int] = None,
                preview: Optional["_PreviewWindow"] = None,
-               video_dir: Optional[Path] = None) -> Path:
+               video_dir: Optional[Path] = None, shell: bool = False) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
     The per-frame ``.ftsl``/``.png`` files land in ``frames_dir`` (its own subdirectory),
@@ -2851,7 +2906,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         t = k / frames                                  # seamless loop: t in [0,1)
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
         scene = build_scene(v, t=t, res=size, radius=radius, env_file=env_file,
-                            transform=transform, material=material)
+                            transform=transform, material=material, shell=shell)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
                           Cache(), assets_dir=frames_dir, tag=f"{k:0{fw}d}")
         fp = frames_dir / f"{base}_{k:0{fw}d}.ftsl"
@@ -3079,8 +3134,14 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("scene")
     g.add_argument("--threshold", type=float, default=0.0,
                    help="isosurface level set f = threshold (default 0; ~+/-0.7 thins the walls)")
-    g.add_argument("--radius", type=float, default=1.3,
-                   help="radius of the spherical container the lattice fills (default 1.3)")
+    g.add_argument("--radius", type=float, default=None,
+                   help="radius of the spherical container the surface fills (default: 1.3 for "
+                        "TPMS; a POV builtin auto-sizes to its own bounding box, so pass this only "
+                        "to override — e.g. to clip an unbounded shape like a paraboloid)")
+    g.add_argument("--shell", action="store_true",
+                   help="render a POV surface hollow (a thin shell of --thickness half-width) "
+                        "instead of a solid body; a few genuinely-thin surfaces (klein_bottle, "
+                        "boy_surface, enneper, *_2d curves) are thin by default. No effect on TPMS.")
     g.add_argument("--thickness", type=float, default=0.5,
                    help="half-width of the thickened sheet (showcase abs(g)-t style; "
                         "default 0.5; auto-scaled up with the oscillating-dim count)")
@@ -3341,13 +3402,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                                env_file=env_file, transform=args.transform,
                                material=args.material, clarity=args.glass_clarity,
                                raster_iso=args.raster_iso,
-                               preview=preview, video_dir=video_outdir)
+                               preview=preview, video_dir=video_outdir, shell=args.shell)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
             scene = build_scene(v, t=0.0, res=size, radius=args.radius, env_file=env_file,
-                                transform=args.transform, material=args.material)
+                                transform=args.transform, material=args.material,
+                                shell=args.shell)
             body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
                               tag=f"{k:0{width}d}")
             fp = outdir / f"{base}.ftsl"

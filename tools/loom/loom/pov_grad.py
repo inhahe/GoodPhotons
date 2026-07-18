@@ -101,6 +101,127 @@ def analyzable(name: str) -> bool:
     return name in _ANALYTIC or name in _R_BUILDERS
 
 
+# --- field builders (for container bbox sizing, P3.3 S3) --------------------------------------
+# Unlike ``_R_BUILDERS`` (the *clamp argument* ``r`` of the algebraic builtins), these return the
+# actual field value ``f(x,y,z)`` whose level set is the rendered surface, for the SDF-like and
+# norm builtins that have no polynomial ``r``.  Used only to locate the surface for auto-sizing
+# the isosurface container (:func:`surface_bbox`); the clamp is irrelevant there (it only rails
+# the field far from the surface, never near the crossing we track), so the algebraic builtins
+# reuse ``P0 * r`` directly.
+_FIELD_BUILDERS: Dict[str, Callable] = {}
+
+
+def _reg_field(name: str):
+    def deco(fn):
+        _FIELD_BUILDERS[name] = fn
+        return fn
+    return deco
+
+
+@_reg_field("f_sphere")
+def _f_sphere(x, y, z, p):
+    # -P0 + sqrt(x^2+y^2+z^2): zero on the radius-P0 sphere.
+    import sympy
+    return -p[0] + sympy.sqrt(x * x + y * y + z * z)
+
+
+@_reg_field("f_torus")
+def _f_torus(x, y, z, p):
+    # -P1 + sqrt((sqrt(x^2+z^2)-P0)^2 + y^2): zero on the (major P0, minor P1) ring torus.
+    import sympy
+    ring = sympy.sqrt(x * x + z * z) - p[0]
+    return -p[1] + sympy.sqrt(ring * ring + y * y)
+
+
+@_reg_field("f_ellipsoid")
+def _f_ellipsoid(x, y, z, p):
+    # sqrt(x^2 P0^2 + y^2 P1^2 + z^2 P2^2): the surface sits at level 1 (semi-axes 1/P0,1/P1,1/P2).
+    import sympy
+    return sympy.sqrt(x * x * p[0] * p[0] + y * y * p[1] * p[1] + z * z * p[2] * p[2])
+
+
+def _field_expr(name: str, x, y, z, p):
+    """The sympy field ``f(x,y,z)`` whose level set is the surface, or ``None`` if ``name`` has
+    no transcribed form.  Prefers an explicit :data:`_FIELD_BUILDERS` entry; otherwise the
+    algebraic builtins' field is ``P0 * r`` (the clamp argument, unclamped)."""
+    if name in _FIELD_BUILDERS:
+        return _FIELD_BUILDERS[name](x, y, z, p)
+    if name in _R_BUILDERS:
+        return p[0] * _R_BUILDERS[name](x, y, z, p)
+    return None
+
+
+def bbox_analyzable(name: str) -> bool:
+    """True if :func:`surface_bbox` can locate ``name``'s surface (so the caller can auto-size
+    the container); False means the caller should keep its explicit / default ``--radius``."""
+    return name in _FIELD_BUILDERS or name in _R_BUILDERS
+
+
+_BBOX_CACHE: Dict[Tuple, Optional[Tuple[float, bool]]] = {}
+
+
+def surface_bbox(name: str, params: Sequence[float], level: float = 0.0,
+                 search_half: float = 8.0, n: int = 97
+                 ) -> Optional[Tuple[float, bool]]:
+    """The natural container half-extent of POV builtin ``name``'s surface.
+
+    Grid-samples the field ``f(x,y,z)`` (see :func:`_field_expr`) over the cube
+    ``[-search_half, search_half]^3`` and finds where it crosses ``level`` (a sign change between
+    adjacent samples marks the surface).  Returns ``(half_extent, bounded)`` where ``half_extent``
+    is the largest ``max(|x|,|y|,|z|)`` over the crossing cells (so a cube of that half-width just
+    contains the surface) and ``bounded`` is ``False`` when the surface reaches the search
+    boundary (an unbounded shape — paraboloid, cylinder, helix — that the caller must clip with an
+    explicit ``--radius``).  Returns ``None`` when the field has no transcribed form or no crossing
+    is found in the window (caller keeps its default).
+
+    ``level`` is the isolevel the intended surface sits on (0 for the SDF-like builtins, non-zero
+    for a few, e.g. f_ellipsoid at 1); it matches the caller's ``_POV_SOLID_META`` natural level.
+    """
+    p = tuple(float(v) for v in params)
+    key = (name, p, round(float(level), 9), round(float(search_half), 9), int(n))
+    if key in _BBOX_CACHE:
+        return _BBOX_CACHE[key]
+
+    import numpy as np
+    import sympy
+
+    x, y, z = sympy.symbols("x y z", real=True)
+    expr = _field_expr(name, x, y, z, p)
+    if expr is None:
+        _BBOX_CACHE[key] = None
+        return None
+    f_fn = sympy.lambdify((x, y, z), expr, modules="numpy")
+
+    g = np.linspace(-search_half, search_half, n)
+    X, Y, Z = np.meshgrid(g, g, g, indexing="ij")
+    with np.errstate(all="ignore"):
+        F = np.asarray(f_fn(X, Y, Z), dtype=float) - float(level)
+    inside = F < 0.0                                    # one side of the level set
+
+    # A surface passes between any two adjacent samples whose side differs.  Mark BOTH cells of
+    # every such pair (along each axis) as "on the surface"; their coordinates bound the shape.
+    change = np.zeros_like(inside, dtype=bool)
+    for axis in (0, 1, 2):
+        d = np.swapaxes(inside, 0, axis)
+        c = np.swapaxes(change, 0, axis)
+        flip = d[:-1] != d[1:]
+        c[:-1] |= flip
+        c[1:] |= flip
+    if not change.any():
+        _BBOX_CACHE[key] = None                         # no surface in the window
+        return None
+
+    absmax = np.maximum(np.maximum(np.abs(X), np.abs(Y)), np.abs(Z))
+    half_extent = float(absmax[change].max())
+    # "Bounded" iff the crossing stays strictly inside the search window (does not touch the outer
+    # ring of cells): a shape whose surface runs off to the boundary is treated as unbounded.
+    cell = 2.0 * search_half / (n - 1)
+    bounded = half_extent < (search_half - 1.5 * cell)
+    out = (half_extent, bounded)
+    _BBOX_CACHE[key] = out
+    return out
+
+
 _CACHE: Dict[Tuple, float] = {}
 
 

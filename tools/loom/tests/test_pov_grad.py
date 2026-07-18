@@ -25,7 +25,8 @@ try:
 except Exception:  # noqa: BLE001
     _HAVE_DEPS = False
 
-from loom.pov_grad import active_band_grad_bound, analyzable  # noqa: E402
+from loom.pov_grad import (active_band_grad_bound, analyzable,  # noqa: E402
+                           bbox_analyzable, surface_bbox)
 
 
 # --- exact-C reference polynomials (for the numerical rigor/tightness cross-check) -----------
@@ -151,6 +152,97 @@ def test_bigger_box_gives_bigger_bound_for_high_degree():
     small = active_band_grad_bound("f_hunt_surface", (1.0,), 1.0)
     big = active_band_grad_bound("f_hunt_surface", (1.0,), 2.0)
     assert big > small
+
+
+# --- S3 container bbox sizing ----------------------------------------------------------------
+
+def test_bbox_analyzable_predicate():
+    assert bbox_analyzable("f_sphere")
+    assert bbox_analyzable("f_torus")
+    assert bbox_analyzable("f_ellipsoid")
+    assert bbox_analyzable("f_heart")
+    assert bbox_analyzable("f_hunt_surface")
+    assert not bbox_analyzable("f_klein_bottle")
+    assert not bbox_analyzable("f_noise3d")
+
+
+def test_bbox_sphere_is_its_radius():
+    if not _HAVE_DEPS:
+        print("  (skip: numpy/sympy unavailable)")
+        return
+    ext, bounded = surface_bbox("f_sphere", (1.0,))
+    assert bounded
+    assert abs(ext - 1.0) < 0.05                      # grid granularity
+    ext2, _ = surface_bbox("f_sphere", (2.5,))
+    assert abs(ext2 - 2.5) < 0.1
+
+
+def test_bbox_ellipsoid_reaches_long_semiaxis():
+    if not _HAVE_DEPS:
+        print("  (skip: numpy/sympy unavailable)")
+        return
+    # semi-axes are 1/P: params (1,2,0.5) -> longest is 1/0.5 = 2 along z, at level 1
+    ext, bounded = surface_bbox("f_ellipsoid", (1.0, 2.0, 0.5), level=1.0)
+    assert bounded
+    assert 1.9 < ext < 2.2
+
+
+def test_bbox_hunt_surface_is_large():
+    if not _HAVE_DEPS:
+        print("  (skip: numpy/sympy unavailable)")
+        return
+    # the motivating case: hunt's surface sits far out (~3.67), well beyond the old 1.3 default
+    ext, bounded = surface_bbox("f_hunt_surface", (1.0,))
+    assert bounded
+    assert 3.0 < ext < 4.5
+
+
+def test_bbox_never_clips_the_surface():
+    # a container of the returned half-extent must actually contain the surface: sample the field
+    # just OUTSIDE the box and confirm it is all on one side (no crossing beyond the box).
+    if not _HAVE_DEPS:
+        print("  (skip: numpy/sympy unavailable)")
+        return
+    for name, params, f in (("f_sphere", (1.0,), _sphere_field),
+                            ("f_heart", (1.0,), _heart)):
+        ext, bounded = surface_bbox(name, params)
+        assert bounded
+        shell = ext * 1.15
+        g = np.linspace(-shell, shell, 41)
+        X, Y, Z = np.meshgrid(g, g, g, indexing="ij")
+        outside = np.maximum(np.maximum(np.abs(X), np.abs(Y)), np.abs(Z)) > ext * 1.02
+        F = f(X, Y, Z)
+        s = F[outside] < 0
+        assert s.all() or (~s).all(), f"{name}: surface crosses beyond the derived box"
+
+
+def _sphere_field(x, y, z):
+    return -1.0 + np.sqrt(x * x + y * y + z * z)
+
+
+def test_bbox_unbounded_surface_is_flagged():
+    if not _HAVE_DEPS:
+        print("  (skip: numpy/sympy unavailable)")
+        return
+    # kummer_v1's zero set has sheets that run to the search boundary -> not auto-sizable
+    res = surface_bbox("f_kummer_surface_v1", (1.0,))
+    assert res is not None
+    _ext, bounded = res
+    assert not bounded
+
+
+def test_bbox_unanalyzable_returns_none():
+    assert surface_bbox("f_klein_bottle", (1.0,)) is None
+    assert surface_bbox("f_noise3d", (1.0,)) is None
+
+
+def test_bbox_cache_returns_identical():
+    if not _HAVE_DEPS:
+        print("  (skip: numpy/sympy unavailable)")
+        return
+    a = surface_bbox("f_torus", (0.8, 0.25))
+    b = surface_bbox("f_torus", (0.8, 0.25))
+    assert a == b
 
 
 def _run_all():

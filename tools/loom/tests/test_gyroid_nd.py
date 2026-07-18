@@ -1295,6 +1295,120 @@ def test_pov_sphere_grad_bound_is_analytic_one():
 
 
 # ---------------------------------------------------------------------------
+# POV container auto-sizing + --shell (P3.3 slice S3): the container fits the
+# surface's own bounding box (no explicit --radius needed); an explicit --radius
+# overrides / clips; genuinely-thin surfaces and --shell render hollow.
+# ---------------------------------------------------------------------------
+
+def _auto_body(v, **kw):
+    """Scene body with NO explicit radius, so the POV path auto-sizes the container."""
+    from loom import Clock, Cache
+    return g.build_scene(v, res=(32, 32), **kw).emit(Clock(t=0.0), Cache())
+
+
+def _emitted_box(body):
+    import re
+    m = re.search(r"contained_by\s*\{\s*min\s+\S+\s+\S+\s+\S+\s+max\s+([0-9.]+)", body)
+    assert m, "no contained_by max in emitted scene"
+    return float(m.group(1))
+
+
+def _emitted_clip_radius(body):
+    import re
+    m = re.search(r"sphere\s*\{\s*center\s+0\s+0\s+0\s+radius\s+([0-9.]+)", body)
+    assert m, "no clip sphere radius in emitted scene"
+    return float(m.group(1))
+
+
+def test_pov_container_auto_sizes_to_larger_surface():
+    # f_hunt_surface's surface sits at radius ~3.67 -> at the old fixed 1.3 it rendered as a
+    # clipped disk.  With no --radius the container must auto-grow to fit it.
+    v = _pv("--surface", "f_hunt_surface")
+    body = _auto_body(v)
+    assert _emitted_clip_radius(body) > 3.0           # derived, not the 1.3 default
+    assert _emitted_box(body) > 3.0
+
+
+def test_pov_container_explicit_radius_overrides_autosize():
+    # an explicit --radius wins over the derived bbox (here it *clips* the big hunt surface)
+    v = _pv("--surface", "f_hunt_surface", "--radius", "1.5")
+    body = _auto_body(v, radius=1.5)
+    assert abs(_emitted_clip_radius(body) - 1.5) < 1e-9
+    assert abs(_emitted_box(body) - 1.5 * 1.05) < 1e-6
+
+
+def test_pov_container_resolver_explicit_wins():
+    # the resolver returns the explicit arg verbatim, ignoring the bbox
+    assert g._pov_container_radius("f_hunt_surface", (1.0,), 0.0, 2.0) == 2.0
+
+
+def test_pov_container_resolver_fits_ellipsoid_long_axis():
+    # f_ellipsoid (semi-axes 1/P): params (1,2,0.5) put the surface out to z=2 -> the container
+    # must reach ~2 (padded), not the 1.3 default that would clip the long lobe.
+    r = g._pov_container_radius("f_ellipsoid", (1.0, 2.0, 0.5), 1.0, None)
+    assert 2.0 <= r <= 2.0 * g._POV_CONTAINER_PAD + 0.2
+
+
+def test_pov_container_unbounded_falls_back_to_default():
+    # f_kummer_surface_v1's surface runs off to the search boundary (unbounded sheets) -> the
+    # resolver can't auto-size and returns the conservative default (user clips with --radius).
+    r = g._pov_container_radius("f_kummer_surface_v1", (1.0,), 0.0, None)
+    assert abs(r - g._POV_DEFAULT_RADIUS) < 1e-9
+
+
+def test_pov_container_no_field_falls_back_to_default():
+    # a builtin with no transcribed field (f_klein_bottle) can't be sized -> default
+    r = g._pov_container_radius("f_klein_bottle", (1.0,), 0.0, None)
+    assert abs(r - g._POV_DEFAULT_RADIUS) < 1e-9
+
+
+def test_pov_solid_by_default_has_no_shell():
+    # a solid POV shape fills its interior: no abs() around the field
+    v = _pv("--surface", "f_sphere")
+    body = _auto_body(v)
+    assert "abs(" not in body
+
+
+def test_pov_shell_flag_makes_any_shape_hollow():
+    # --shell carves a thin shell (abs(sheet) - thickness) out of an otherwise-solid shape
+    v = _pv("--surface", "f_sphere")
+    body = _auto_body(v, shell=True)
+    assert "abs(" in body
+    assert f"-({g.fmt(v.thickness)})" in body
+
+
+def test_pov_shell_thickness_tracks_thickness_flag():
+    v = _pv("--surface", "f_sphere", "--thickness", "0.3")
+    body = _auto_body(v, shell=True)
+    assert "abs(" in body and "-(0.3)" in body
+
+
+def test_pov_thin_surface_renders_hollow_by_default():
+    # a genuinely-thin surface is shelled even without --shell
+    assert g._pov_renders_thin("f_klein_bottle")
+    v = _pv("--surface", "f_klein_bottle")
+    body = _auto_body(v)
+    assert "abs(" in body
+
+
+def test_pov_renders_thin_predicate():
+    assert g._pov_renders_thin("f_klein_bottle")
+    assert g._pov_renders_thin("f_enneper")
+    assert g._pov_renders_thin("f_something_2d")      # *_2d suffix -> thin
+    assert not g._pov_renders_thin("f_sphere")
+    assert not g._pov_renders_thin("f_heart")
+
+
+def test_shell_flag_defaults_off_and_tpms_ignores_it():
+    # --shell defaults off; and it never changes a TPMS render (which always has its own shell)
+    assert _args().shell is False
+    v = g.pick_variant(5, _args("--dims", "6"), {})
+    solid_default = _scene_body(v)
+    # TPMS already emits abs()-shells; passing shell=True doesn't alter its structure
+    assert _scene_body(v, shell=True) == solid_default
+
+
+# ---------------------------------------------------------------------------
 # unified --oscillate / --lock grammar parser (OSCILLATE_GRAMMAR.md, phase 1.1)
 # ---------------------------------------------------------------------------
 

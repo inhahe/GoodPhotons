@@ -232,10 +232,26 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       tol; ×1.02 safety). Closed forms for SDF-like primitives (sphere/torus→1, ellipsoid→max|semi-axis|);
       returns None for noise/atan2/rotation → caller keeps default. Cross-checked vs dense numeric sample:
       rigorous + ≈1.05× tight; render-validated f_hunt_surface hole-free. 13 more tests (397 loom green).
-      Still: (S3) bbox container table + `--shell`; (S4) named params as `--lock NAME=VALUE` fixed values;
+      **(S3) done 2026-07-18** — POV container auto-sizing + `--shell`. Rather than a hand-authored 78-entry
+      bbox table, `loom.pov_grad.surface_bbox(name, params, level)` *derives* each surface's natural extent
+      by grid-sampling the transcribed field `f(x,y,z)` (new `_FIELD_BUILDERS` for the SDF/norm builtins
+      f_sphere/f_torus/f_ellipsoid; the algebraic builtins reuse `P0·r`) and finding where it crosses the
+      isolevel; returns `(half_extent, bounded)` (bounded=False when the surface runs to the search
+      boundary — an unbounded paraboloid/cylinder/helix). `build_scene` now defaults `--radius` to None and
+      calls `_pov_container_radius(name, values, level, radius_arg)`: explicit `--radius` wins (and *clips*
+      unbounded shapes), else auto-size to the padded bbox (×1.08), else the 1.3 default (unbounded / no
+      transcribed field). Fixes f_hunt_surface (surface at r≈3.67 — was a clipped disk at 1.3, now clip
+      radius 3.96 / box 4.16) and f_ellipsoid's long lobes. `--shell` carves any POV shape hollow
+      (`abs(sheet) − thickness`); a tagged thin set (`_POV_THIN_SURFACES`: klein_bottle/boy_surface/enneper/
+      cross_cap/… + any `*_2d` curve) shells by default. TPMS keep their own abs-shell and the 1.3 default,
+      untouched by `--shell`/None-radius. 20 new tests (417 loom green); render-validated f_hunt_surface
+      shows its full surface (not a clipped disk).
+      Still: (S4) named params as `--lock NAME=VALUE` fixed values;
       (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
       random-draw for unspecified params. **Note for S5:** the S2 bound is per (name, params, box) and
       cached — animating a param means recomputing it per frame (or bounding once over the param range).
+      **Note for S4/S5:** container auto-size is also per (name, params) and cached — a param that moves the
+      surface's extent (e.g. ellipsoid semi-axes) needs the same per-frame / range recompute as the bound.
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
       split real. After P3.3.

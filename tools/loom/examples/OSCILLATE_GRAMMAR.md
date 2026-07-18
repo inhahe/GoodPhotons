@@ -489,6 +489,29 @@ under) and tight (≈ 1.05×) for `f_heart`/`f_hunt_surface`/`f_kummer_surface_v
 397 loom green. Still to come: S3 bbox containers + `--shell`, S4 `--lock NAME=VALUE`, S5 params
 as `--oscillate` swingers, S6 affine N-D remap, S7 `--axis-default` random param draw.
 
+**P3.3 slice S3 — auto-sized containers + `--shell` (done 2026-07-18):** a POV surface no longer
+renders inside a fixed radius-1.3 ball (which *clipped* any shape bigger than that — `f_hunt_surface`
+came out a featureless disk because its surface sits at radius ≈ 3.67). `--radius` now defaults to
+**None**, and the container is **auto-sized to each surface's own bounding box**. Rather than a
+hand-authored 78-entry table, `loom.pov_grad.surface_bbox(name, params, level)` *derives* the extent:
+it grid-samples the transcribed field `f(x,y,z)` (new `_FIELD_BUILDERS` give the closed forms for the
+SDF/norm builtins `f_sphere`/`f_torus`/`f_ellipsoid`; the algebraic builtins reuse `P0·r`), finds where
+it crosses the isolevel, and returns `(half_extent, bounded)` — `bounded=False` when the surface runs
+to the search boundary (a genuinely unbounded paraboloid / cylinder / helix, or a non-compact quartic
+like `f_kummer_surface_v1`). `build_scene` calls `_pov_container_radius(name, values, level, radius_arg)`:
+an explicit `--radius` always wins (and is how you *clip* an unbounded shape to a finite view);
+otherwise the padded bbox (×1.08) sizes the clip sphere + `contained_by` box; a shape with no
+transcribed field or an unbounded one falls back to the 1.3 default. So `f_hunt_surface` now sizes to
+clip radius ≈ 3.96 / box ≈ 4.16 and shows its full surface, and `f_ellipsoid`'s long lobes aren't
+clipped. `--shell` carves *any* POV shape hollow — `abs(sheet) − thickness` — and a tagged set of
+genuinely-thin surfaces (`_POV_THIN_SURFACES`: `f_klein_bottle`/`f_boy_surface`/`f_enneper`/`f_cross_cap`/…
+plus any `*_2d` planar curve) shell by default (a solid fill would just be a lumpy ball). TPMS are
+untouched: they keep their own `abs()`-shell and the 1.3 default regardless of `--shell` / a None radius.
+20 new tests (417 loom green); render-validated `f_hunt_surface` shows its full surface, not a clipped
+disk. Still to come: S4 `--lock NAME=VALUE`, S5 params as `--oscillate` swingers, S6 affine N-D remap,
+S7 `--axis-default` random param draw. (Note: like the S2 bound, the auto-size is cached per
+`(name, params)`, so an animated param that moves the surface's extent will need a per-frame recompute.)
+
 ---
 
 ## 8. GPU isosurface rendering — kill the per-frame tessellation cost
