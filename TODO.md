@@ -108,6 +108,14 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       loom tests green.
 - [ ] **P1.3 Wire swinger axes** (`freq`/`threshold`/`thickness`/`bloom`), `amp` = amplitude;
       replace `--bloom`/`--bloom-amp` (keep as aliases). Tests.
+      - [x] *Data-model foundation (2026-07-18):* added per-axis `Variant.bloom_amps: Dict[str,float]`
+        + `_swing_amp(v, param)` helper; `bloom_freq`/`bloom_threshold`/`bloom_thickness_scale` now
+        read the per-axis override, falling back to the shared `bloom_amp` scalar. Empty dict (the
+        legacy `--bloom`/`--bloom-amp` path) stays byte-identical. 2 new tests; 300 loom green.
+      - [ ] *Remaining (do with user awake for a render eyeball):* the argparse `--oscillate`/`--lock`
+        flags + resolution layer that maps swinger axes → `bloom_params` + `bloom_amps` (and winder
+        axis names → `transform`), plus mutual-exclusion with `--transform`. This is where the flag
+        starts changing what renders look like, so it wants a visual check.
 - [ ] **P1.4 Wire winder axes** (`drift`/`rotate`/`tumble`/bare dims), per-group `rate` (= winding) +
       `phase`; replace `--tumble-*` (keep aliases). Tests.
 - [ ] **P1.5 Flip default** — `--oscillate` primary, `--transform` prints deprecation notice; update
@@ -187,3 +195,9 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   `OscGroup` (§3 migration map). Pure model — execution path untouched, all existing tests pass
   unchanged. 13 new tests; 298 loom tests green. Next: P1.3 (wire swinger axes freq/threshold/
   thickness/bloom to real behavior — the deterministic, non-RNG-sensitive half).
+- 2026-07-18: **P1.3 foundation (partial).** Added per-axis `Variant.bloom_amps` + `_swing_amp()`;
+  the three swinger functions read a per-axis amp override, falling back to the shared `bloom_amp`
+  (empty dict ⇒ byte-identical to the legacy path). 2 new tests; 300 loom green. Stopped short of
+  the argparse `--oscillate`/`--lock` flip: from here `--oscillate` starts changing rendered output
+  (winder→transform mapping, rate-vs-random winding semantics), which wants a visual render check —
+  deferred to a user-awake session rather than landing unvalidated overnight.

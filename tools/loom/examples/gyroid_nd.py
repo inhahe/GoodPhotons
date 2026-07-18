@@ -255,7 +255,16 @@ class Variant:
     #                                     pulse the spatial frequency / complexity, 'threshold'
     #                                     = shift the level set, 'thickness' = swell the sheet).
     #                                     Empty for the drift/rotate transforms.
-    bloom_amp: float = 1.0              # scales every bloom parameter's peak swing
+    bloom_amp: float = 1.0              # scales every bloom parameter's peak swing (the
+    #                                     shared --bloom-amp scalar; the default for any
+    #                                     swinger without a per-axis override in bloom_amps).
+    bloom_amps: Dict[str, float] = dc_field(default_factory=dict)
+    #                                     per-axis swinger amplitude overrides, keyed by
+    #                                     parameter ('freq'/'threshold'/'thickness'). Set by
+    #                                     the unified --oscillate grammar (e.g. 2*freq,0.5*
+    #                                     threshold), where each swinger carries its own
+    #                                     amplitude. Empty (the legacy --bloom/--bloom-amp
+    #                                     path) => every swinger falls back to bloom_amp.
     tumble_planes: List[Tuple[int, int, int]] = dc_field(default_factory=list)
     #                                     tumble transform only: disjoint (i, j, winding)
     #                                     Givens rotations composing the per-frame N-D
@@ -1209,25 +1218,34 @@ def _bloom_env(t: float) -> float:
     return 0.5 * (1.0 - math.cos(2.0 * math.pi * t))
 
 
+def _swing_amp(v: "Variant", param: str) -> float:
+    """The effective swing amplitude of a scalar swinger for this variant: its per-axis
+    override in :attr:`Variant.bloom_amps` if present (the unified --oscillate grammar's
+    per-item ``amp``), else the shared :attr:`Variant.bloom_amp` scalar (the legacy
+    ``--bloom-amp`` path). Keeps the two input paths numerically identical when no
+    per-axis override is set."""
+    return v.bloom_amps.get(param, v.bloom_amp)
+
+
 def bloom_freq(v: "Variant", t: float) -> float:
     """The (possibly time-varying) base frequency at loop phase ``t``.  Equals ``v.freq``
     unless 'freq' is a bloom target, in which case it swells to its peak at mid-loop."""
     if "freq" in v.bloom_params:
-        return v.freq * (1.0 + v.bloom_amp * _BLOOM_SWING["freq"] * _bloom_env(t))
+        return v.freq * (1.0 + _swing_amp(v, "freq") * _BLOOM_SWING["freq"] * _bloom_env(t))
     return v.freq
 
 
 def bloom_threshold(v: "Variant", t: float) -> float:
     """The isosurface level set at ``t`` (shifted from ``v.threshold`` when 'threshold' blooms)."""
     if "threshold" in v.bloom_params:
-        return v.threshold + v.bloom_amp * _BLOOM_SWING["threshold"] * _bloom_env(t)
+        return v.threshold + _swing_amp(v, "threshold") * _BLOOM_SWING["threshold"] * _bloom_env(t)
     return v.threshold
 
 
 def bloom_thickness_scale(v: "Variant", t: float) -> float:
     """Multiplier on the sheet half-width at ``t`` (1 unless 'thickness' blooms)."""
     if "thickness" in v.bloom_params:
-        return 1.0 + v.bloom_amp * _BLOOM_SWING["thickness"] * _bloom_env(t)
+        return 1.0 + _swing_amp(v, "thickness") * _BLOOM_SWING["thickness"] * _bloom_env(t)
     return 1.0
 
 

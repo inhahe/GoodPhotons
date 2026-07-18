@@ -140,6 +140,30 @@ def test_bloom_amp_scales_frequency_swing():
     assert abs(g.bloom_freq(v, 0.0) - 4.0) < 1e-9      # ends unchanged
 
 
+def test_bloom_amps_empty_defaults_to_shared_bloom_amp():
+    # the legacy path leaves per-axis bloom_amps empty, so _swing_amp falls back to
+    # the shared bloom_amp scalar -> byte-identical to before the per-axis refactor.
+    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq",
+                                "--freq", "4", "--bloom-amp", "0.5"), {})
+    assert v.bloom_amps == {}
+    assert g._swing_amp(v, "freq") == v.bloom_amp == 0.5
+    assert abs(g.bloom_freq(v, 0.5) - 6.0) < 1e-9
+
+
+def test_bloom_amps_per_axis_override_beats_shared_scalar():
+    # a per-axis override in bloom_amps takes precedence over the shared bloom_amp for
+    # that swinger only; other swingers still use the shared scalar. This is what the
+    # unified --oscillate grammar's per-item amp (e.g. 2*freq,0.5*threshold) will set.
+    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq,threshold",
+                                "--freq", "4", "--bloom-amp", "1.0"), {})
+    v.bloom_amps = {"freq": 0.5}                 # override freq only
+    assert g._swing_amp(v, "freq") == 0.5        # overridden
+    assert g._swing_amp(v, "threshold") == 1.0   # falls back to shared bloom_amp
+    assert abs(g.bloom_freq(v, 0.5) - 6.0) < 1e-9   # 4*(1 + 0.5*1)
+    # threshold still swings at the shared amp 1.0 * _BLOOM_SWING['threshold'] (0.6)
+    assert abs(g.bloom_threshold(v, 0.5) - (v.threshold + 0.6)) < 1e-9
+
+
 def test_bloom_freq_applies_to_full_field_when_dims_also_bloom():
     # --bloom dims,freq: the frequency pulse rides on the full N-D crossfade too.
     v = g.pick_variant(5, _args("--dims", "6", "--transform", "bloom",
