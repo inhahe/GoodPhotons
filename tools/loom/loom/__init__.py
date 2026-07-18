@@ -58,6 +58,7 @@ from .canvas import (
     render_canvas, render_canvas_still,
 )
 from .xvideo import Clip, spacetime_rotate, spacetime_shear
+from .audio import SampleBuffer
 
 __all__ = [
     "Signal", "Clock", "Cache", "Const", "TimeFn",
@@ -94,4 +95,5 @@ __all__ = [
     "Canvas2D", "Marker", "Stroke", "curve_points",
     "render_canvas", "render_canvas_still",
     "Clip", "spacetime_rotate", "spacetime_shear",
+    "SampleBuffer",
 ]

@@ -551,7 +551,7 @@ user's design:
     decoupled/restartable processes are wanted); config over the **sidecar file**. Decide the final wire
     format when E2 is scheduled.
 
-### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; design decided)*
+### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
 models — (1) emit one sample value per time tick, vs. (2) random-access a sample array (`buf[t] += v`,
 `=`, `*=`, …) and serialize at the end. **Decision (from `loomsound.txt`): build ONE back-end — the
@@ -577,6 +577,19 @@ one per-channel float **sample buffer** as the single source of truth; `emit_nex
 `buf[cursor++] += v` cursor helper for sequential generators; a single `finalize()` (gain/normalize/
 dither/clip → encode → write). No second pipeline, no streaming fork. *Note: loom has no audio
 subsystem today, so this is a new capability, not a refactor.*
+
+**DONE 2026-07-18.** Implemented as `loom/audio.py` → `SampleBuffer` (exported from `loom`). One
+per-channel `array('d')` back-end is the single source of truth. Random-access ops (`add`/`set`/`mul`/
+`get`, out-of-range silently ignored), range ops (`add_range` overlap-add, `mul_range`, `fade` linear
+ramp, `mix` another buffer with channel routing + offset). Per-tick front-end is the thin cursor
+wrapper promised (`emit_next(v)` ≡ `buf[cursor] += v; cursor += 1`, plus `seek`/`tell`). Producers:
+`render_fn(fn(i, t_seconds))` and `render_signal(loom Signal)` (audio-rate sampling via
+`Clock.at_frame`, seamless-loop aware), each with add/set/mul modes + gain + start/count windows.
+Analysis: `peak`/`rms`/`channel`. Single `finalize(path)` = gain → normalize → dither (TPDF, seeded,
+default-on for 16-bit) → clip → PCM-encode → WAV (16/24-bit, stdlib `wave`). 30 tests in
+`tests/test_audio.py` (round-trip WAV verify for 16/24-bit mono+stereo, dither determinism,
+normalize, cursor≡add equivalence, seamless-loop signal render); 545 loom green. Smoke-validated a
+real 1 s 220+660 Hz WAV.
 
 ---
 
@@ -681,3 +694,12 @@ subsystem today, so this is a new capability, not a refactor.*
   UV-space procedural skin (ftrace, small), E2 general N-D-curve→scene-variable animation via the
   rasterizer curve editor (loom+ftrace, large, extends §A), E3 loom procedural audio (one buffer
   back-end, per-tick as a thin front-end — decided).
+- 2026-07-18: **E3 done.** New `loom/audio.py` → `SampleBuffer`: one per-channel `array('d')`
+  back-end as the single source of truth; random-access `add`/`set`/`mul`/`get` (out-of-range
+  ignored), range ops (`add_range` overlap-add, `mul_range`, `fade`, `mix` with channel routing),
+  the thin per-tick cursor (`emit_next` ≡ `buf[cursor]+=v; cursor+=1`, `seek`/`tell`), producers
+  `render_fn(fn(i,t_sec))` + `render_signal(Signal)` (audio-rate, seamless-loop aware, add/set/mul
+  modes), `peak`/`rms`, and one `finalize()` (gain→normalize→dither→clip→PCM→WAV, 16/24-bit via
+  stdlib `wave`). Exported from `loom`. 30 new tests (WAV round-trips, dither determinism, cursor≡add,
+  seamless-loop render); 545 loom green; real 220+660 Hz WAV smoke-validated. Next: E1 (UV-space
+  procedural skin).
