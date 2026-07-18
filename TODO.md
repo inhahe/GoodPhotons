@@ -257,12 +257,26 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       non-POV surface, or an unknown param name, errors (SystemExit, lists valid names); out-of-range
       value warns but is honored. `pick_variant` applies pins onto `pov_default_values` before emit, so a
       pinned semi-axis both flows into the emitted `f_*` call *and* resizes the S3 auto-sized container.
-      13 new tests (430 loom green).
-      Still: (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
-      random-draw for unspecified params. **Note for S5:** the S2 bound is per (name, params, box) and
-      cached — animating a param means recomputing it per frame (or bounding once over the param range).
-      **Note for S4/S5:** container auto-size is also per (name, params) and cached — a param that moves the
-      surface's extent (e.g. ellipsoid semi-axes) needs the same per-frame / range recompute as the bound.
+      13 new tests (430 loom green). Also fixed an ordering bug found by render-validation: the pin
+      extraction ran *after* `resolve_oscillate`, so `--lock minor=0.4` crashed (the motion grammar
+      rejects `=`); moved it before, made the `_pv`/`_resolved_args` test helpers faithfully run
+      `resolve_oscillate` (which had hidden the bug), +1 regression test (431 green).
+      **(S5) done 2026-07-18** — POV shape params are now `--oscillate` swinger axes. With a POV `--surface`
+      the grammar's axis set gains that surface's named params: `--surface f_torus --oscillate minor` sweeps
+      the tube radius over the loop. Semantics are range-aware so amp is intuitive: `p(t) = clamp(base +
+      amp*span*env(t), lo, hi)` with `span = (hi-base)` for amp≥0 else `(base-lo)`, and `env` the shared
+      sin²(πt) bump — so `amp=1` reaches the param's authored range *edge* exactly at mid-loop (no plateau,
+      seamless return to base), `amp<0` sweeps the other way, `|amp|>1` over-drives and clamps. Recorded in
+      a new `Variant.pov_swing = {param: amp}` (kept apart from the gyroid dims-bloom swingers since it drives
+      `pov_values` per frame, not the dims cross-fade), sharing the `_bloom_env_p` clock (`bloom_rates`/
+      `bloom_phases`). `field_expr`/`build_scene` evaluate params via `_pov_values_at(v, t)`, so the S2
+      gradient bound and the S3 auto-sized container **recompute per frame** from the swept values (an
+      animated ellipsoid semi-axis grows its container as it lengthens; a torus's SDF bound stays 1). Grammar
+      plumbing: `--surface` now resolves *before* `resolve_oscillate` so a param-name axis classifies against
+      it; a param-only `--oscillate` names a benign `drift` (POV ignores transform) instead of erroring "no
+      motion axes"; a bad axis on a POV surface hints the valid param names. 12 new tests (443 loom green);
+      render-validated (torus `minor` sweeps 0.25→2.0→0.25, container 1.44→3.06→1.44).
+      Still: (S6) affine remap for dims>3; (S7) `--axis-default` random-draw for unspecified params.
 - [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
       bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
       split real. After P3.3.

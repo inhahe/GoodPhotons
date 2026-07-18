@@ -528,8 +528,37 @@ value warns but is still honored (you may deliberately push a param past its aut
 `pick_variant` applies the pins onto `pov_default_values(surface)` before emitting, so a pinned
 semi-axis both flows into the emitted `f_*(...)` call **and** feeds S3's `surface_bbox`, resizing the
 auto-sized container to match (e.g. pinning `rz=0.3` shrinks the clip sphere accordingly). 13 new
-tests (430 loom green). Still to come: S5 params as `--oscillate` swingers, S6 affine N-D remap,
-S7 `--axis-default` random param draw.
+tests (430 loom green). *(A follow-up fixed an ordering bug: the pin extraction ran after
+`resolve_oscillate`, which parses the rest of `--lock` through the motion grammar and rejects `=`;
+it now runs first. `--surface` is also resolved before both, so the grammar can classify a token
+against the surface's params.)*
+
+**P3.3 slice S5 — shape params as `--oscillate` swingers (done 2026-07-18):** selecting a POV
+`--surface` *extends* the `--oscillate` axis set with that surface's named shape params, exactly as
+the doc's "params become axes" promised. `--surface f_torus --oscillate minor` sweeps the tube
+radius over the loop; `--oscillate 0.5*minor` sweeps it half as far; comma-joining with a motion
+(`--oscillate tumble,minor`) shares one clock. The amplitude is **range-aware** so it reads
+intuitively:
+
+```
+p(t) = clamp( base + amp * span * env(t),  lo, hi ),   span = (hi - base) if amp >= 0 else (base - lo)
+```
+
+with `base` the param's default (plus any `--lock` pin) and `env(t) = sin²(πt)` the shared bump (its
+own rate/phase via `bloom_rates`/`bloom_phases`). So `amp = 1` reaches the param's authored **range
+edge** exactly at mid-loop — a single-instant touch, no plateau — and returns to `base` at the loop
+ends (seamless); `amp < 0` sweeps toward `lo` instead; `|amp| > 1` over-drives and is clamped. This
+lives in a new `Variant.pov_swing = {param: amp}`, deliberately **separate** from the gyroid
+dims-bloom swingers (`freq`/`threshold`/`thickness`): a POV surface has no dims cross-fade, so a
+param swing drives `pov_values` per frame rather than the bloom envelope. `field_expr` and
+`build_scene` evaluate the params through `_pov_values_at(v, t)`, which means the S2 gradient bound
+and the S3 auto-sized container **recompute per frame from the swept values** — an ellipsoid whose
+`rz` lengthens grows its container as it goes, while a torus's SDF bound correctly stays 1. Grammar
+plumbing: a param-only `--oscillate` (no winder/dims axis) names a benign `drift` (POV ignores
+`transform`) so it doesn't trip the "names no motion axes" guard; a swing on a non-POV surface, or a
+bad axis name, errors and (for a POV surface) hints the valid param names. 12 new tests (443 loom
+green); render-validated — a torus `minor` sweep runs `0.25 → 2.0 → 0.25` with the container tracking
+`1.44 → 3.06 → 1.44`. Still to come: S6 affine N-D remap, S7 `--axis-default` random param draw.
 
 ---
 

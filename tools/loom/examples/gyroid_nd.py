@@ -311,7 +311,15 @@ class Variant:
     pov_values: Tuple[float, ...] = ()   # POV-surface shape-param values in call order (arity
     #                                     - 3 of them), used only when `surface` is a POV
     #                                     builtin.  Empty for the TPMS families and for a
-    #                                     0-parameter POV helper.
+    #                                     0-parameter POV helper.  These are the *base* values
+    #                                     (defaults, with any --lock NAME=VALUE pins applied);
+    #                                     an animated param (pov_swing) sweeps around its base.
+    pov_swing: Dict[str, float] = dc_field(default_factory=dict)
+    #                                     S5: POV shape params made --oscillate swinger axes,
+    #                                     {param_name: amplitude}.  Per frame the param value is
+    #                                     clamp(base + amp*(hi-lo)*env(t), lo, hi) with env the
+    #                                     shared sin^2 bump (its own clock in bloom_rates/phases);
+    #                                     amp<0 sweeps downward.  Empty => static pov_values.
     coupling: str = "cyclic"            # which sin*cos pairs the field sums over:
     #                                     'cyclic' (default) = the m consecutive pairs
     #                                     (o_i, o_{i+1}) wrapping around, i.e. the standard
@@ -941,6 +949,11 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
         args.bloom_rates = {}
     if getattr(args, "bloom_phases", None) is None:
         args.bloom_phases = {}
+    # S5: POV shape-param swingers ({param: amplitude}); populated below when an --oscillate
+    # axis names one of the surface's shape params.  Always set so the legacy/early-return
+    # paths leave it empty (static pov_values).
+    if getattr(args, "pov_swing", None) is None:
+        args.pov_swing = {}
     # Winder-clock outputs (P1.4). Always set so the picker's getattr fallbacks are exact;
     # the legacy --transform path returns below with these no-op defaults intact.
     args.osc_dim_windings = {}
@@ -984,6 +997,11 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     dim_windings: Dict[int, int] = {}       # bare dim-index -> exact winding
     motion_ceilings: set = set()            # distinct explicit rate ceilings from motion groups
     winder_phases: set = set()              # distinct explicit phases from winder groups
+    pov_swing: Dict[str, float] = {}        # S5: POV shape-param swingers {param: amp}
+    # The surface's named shape-param axes (S5): an --oscillate token matching one of these
+    # swings that param rather than being an unknown axis.  Empty for a non-POV surface.
+    _surface = getattr(args, "surface", "gyroid")
+    pov_axis_map = _pov_param_axis_map(_surface) if _is_pov_surface(_surface) else {}
 
     for grp in groups:
         g_axes = [ax for _, ax in grp.items]
@@ -1027,7 +1045,24 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
                                      f"(amp {amp:g} * rate {grp.rate:g}); a winder needs at "
                                      f"least 1 whole turn")
                 dim_windings[d] = w
+            elif ax in pov_axis_map:
+                # S5: a POV surface's named shape param swings over the loop like freq/threshold,
+                # but range-aware: value(t) = clamp(base + amp*(hi-lo)*env(t), lo, hi).  Recorded
+                # apart from the gyroid bloom swingers (it drives pov_values per frame, not the
+                # dims cross-fade), sharing the same sin^2 envelope with its own clock in
+                # bloom_rates/bloom_phases.  amp<0 sweeps the param downward from its base.
+                pov_swing[ax] = float(amp)
+                if grp.rate_set:
+                    bloom_rates[ax] = grp.rate
+                if grp.phase_set:
+                    bloom_phases[ax] = grp.phase
             else:
+                # A named param of *some other* POV surface (or a plain typo) lands here.  Give a
+                # surface-aware hint when the current surface has shape params to offer.
+                if pov_axis_map:
+                    valid = ", ".join(pov_axis_map.keys())
+                    raise SystemExit(f"error: --oscillate: unknown axis {ax!r} (--surface "
+                                     f"{_surface} shape params: {valid}; or a motion/dims axis)")
                 raise SystemExit(f"error: --oscillate: unknown axis {ax!r}")
 
     # One shared winding clock in the engine: independent motion groups can't carry
@@ -1054,6 +1089,11 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
         canon = ["drift"]
     if bloom_active:
         canon.append("bloom")
+    if not canon and pov_swing:
+        # S5: a POV surface animated only by a shape-param swing carries no winder/dims motion,
+        # but it *is* animated (pov_values sweep per frame).  field_expr ignores `transform` for a
+        # POV surface, so name a benign 'drift' to satisfy the pipeline without a real winder.
+        canon = ["drift"]
     if not canon:
         raise SystemExit("error: --oscillate names no motion axes")
     args.transform = "+".join(canon)
@@ -1062,6 +1102,7 @@ def resolve_oscillate(args: argparse.Namespace) -> None:
     args.bloom_amps = bloom_amps
     args.bloom_rates = bloom_rates
     args.bloom_phases = bloom_phases
+    args.pov_swing = pov_swing          # S5: {param: amp} POV shape-param swingers
     args.tumble_mode = tumble_mode
     args.tumble_amp = tumble_amp
     lock_dims = sorted({int(a) for a in lock_axes if a.isdigit()})
@@ -1381,6 +1422,7 @@ def pick_variant(seed: int, args: argparse.Namespace,
                    tumble_amp=getattr(args, "tumble_amp", 0.25),
                    tumble_locked=tumble_locked, osc_phase=osc_phase,
                    surface=surface, pov_values=pov_values,
+                   pov_swing=dict(getattr(args, "pov_swing", {}) or {}),
                    coupling=getattr(args, "coupling", "cyclic"),
                    pair_on=pair_on, pair_off=pair_off, dim_list=dims,
                    couple_clusters=couple_clusters)
@@ -1850,7 +1892,9 @@ def _surface_help_text(name: str) -> str:
         lines.append("  params  : none (a 0-parameter helper; just the 3 coordinates)")
     else:
         lines.append(f"  params  : {len(params)} shape parameter(s) - pin one with "
-                     f"--lock NAME=VALUE (e.g. --lock {params[0][0]}={fmt(params[0][2])}):")
+                     f"--lock NAME=VALUE (e.g. --lock {params[0][0]}={fmt(params[0][2])}), "
+                     f"or animate it with --oscillate NAME (e.g. --oscillate {params[0][0]}; "
+                     f"amp=1 sweeps to the range edge at mid-loop):")
         for axis, pdesc, default, (lo, hi) in params:
             lines.append(f"    {axis:<10} {pdesc}  (default {fmt(default)}, "
                          f"range [{fmt(lo)}, {fmt(hi)}])")
@@ -1987,6 +2031,40 @@ def bloom_thickness_scale(v: "Variant", t: float) -> float:
     return 1.0
 
 
+def _pov_values_at(v: "Variant", t: float) -> Tuple[float, ...]:
+    """POV shape-param values at loop phase ``t`` (S5).
+
+    ``v.pov_values`` holds each param's *base* value (default + any --lock pin); a param named
+    as an ``--oscillate`` swinger (recorded in ``v.pov_swing`` as ``{name: amp}``) sweeps around
+    it, range-aware so ``amp = 1`` reaches the param's authored extreme exactly at the loop peak:
+
+        p(t) = clamp(base + amp * span * env(t),  lo, hi),   span = (hi - base) if amp >= 0
+                                                                    else (base - lo)
+
+    where ``env(t)`` is the shared sin^2 bump (its own rate/phase via ``bloom_rates``/
+    ``bloom_phases``): 0 at the loop ends, rising to 1 at mid-loop, so the animation loops
+    seamlessly and touches the extreme for a single instant (no plateau).  ``amp > 0`` sweeps up
+    toward ``hi`` (``amp = 1`` -> exactly ``hi`` at the peak), ``amp < 0`` down toward ``lo``;
+    ``|amp| > 1`` over-drives and is clamped to the authored range.  With no swingers this returns
+    the base tuple unchanged.
+    """
+    base = tuple(getattr(v, "pov_values", ()))
+    swing = getattr(v, "pov_swing", None) or {}
+    if not swing or not base:
+        return base
+    amap = _pov_param_axis_map(getattr(v, "surface", ""))
+    vals = list(base)
+    for nm, amp in swing.items():
+        slot = amap.get(nm)
+        if slot is None:
+            continue
+        idx, lo, hi = slot
+        span = (hi - base[idx]) if amp >= 0 else (base[idx] - lo)
+        val = base[idx] + amp * span * _bloom_env_p(v, nm, t)
+        vals[idx] = min(hi, max(lo, val))
+    return tuple(vals)
+
+
 def _scheme_edges(dims: List[int], scheme: str) -> List[Tuple[int, int]]:
     """The ordered ``(a, b)`` coupling edges among a run of dims under a base ``scheme``.
 
@@ -2089,11 +2167,12 @@ def field_expr(v: Variant, t: float = 0.0, transform: str = "drift",
     """
     surf = getattr(v, "surface", "gyroid")
     if _is_pov_surface(surf):
-        # A POV builtin is a *static solid* field: the surface itself, called on x/y/z with
-        # its shape params.  It carries none of the periodic-lattice machinery (no freq /
-        # harmonics / coupling / drift), so every transform/bloom layer is a no-op here in
-        # S1 — animation of the params and N-D remap arrive in later P3.3 slices.
-        return _pov_call_expr(surf, tuple(getattr(v, "pov_values", ())))
+        # A POV builtin is a solid field: the surface itself, called on x/y/z with its shape
+        # params.  It carries none of the periodic-lattice machinery (no freq / harmonics /
+        # coupling / drift), so the winder/bloom transform layers are a no-op here.  The one
+        # animation it *does* honor is an --oscillate shape-param swing (S5): the params are
+        # evaluated at this frame's ``t`` (static when nothing swings).  N-D remap is a later slice.
+        return _pov_call_expr(surf, _pov_values_at(v, t))
     if _has(transform, "bloom"):
         # ``bloom`` pins frame 0 (and frame 1) to the base gyroid, then oscillates the
         # selected parameters over the loop with the envelope w = sin^2(pi t).  The
@@ -2282,7 +2361,11 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
         # user threshold shifts the level.  Gradient bound from the per-function table
         # (conservative default until S2 tabulates it); a sign flip leaves |grad| unchanged.
         sign, level = _pov_solid_meta(surface)
-        values = tuple(getattr(v, "pov_values", ()))
+        # S5: shape params evaluated at this frame's t (an --oscillate param swing sweeps them);
+        # static v.pov_values when nothing swings.  The container + gradient bound below are then
+        # recomputed per frame from these values, so an animated param keeps a hole-free march and
+        # a correctly-sized container as it grows/shrinks.
+        values = _pov_values_at(v, t)
         lvl = level + v.threshold
         if abs(lvl) > 1e-9:
             inner = f"({expr})-({fmt(lvl)})"
@@ -3252,7 +3335,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "GROUPs, each a comma-joined list of [amp*]axis items sharing one "
                         "oscillator. Axes: motions drift/rotate/tumble, the bloom crossfade, "
                         "scalar swingers freq/threshold/thickness (each takes its own amp, e.g. "
-                        "'2*freq'), and bare spatial-dim indices. A group takes 'rate <expr>' and "
+                        "'2*freq'), bare spatial-dim indices, and — with a POV --surface — that "
+                        "surface's named shape params (e.g. '--surface f_torus --oscillate minor'; "
+                        "amp=1 sweeps the param to its authored range edge at mid-loop, amp<0 the "
+                        "other way; see --surface-help NAME). A group takes 'rate <expr>' and "
                         "'phase <expr>' (the shared clock): on a motion group 'rate' caps the "
                         "per-dim winding cycle (like --max-winding); a bare dim index winds exactly "
                         "round(amp*rate) turns (e.g. '3 rate 2' winds dim 3 twice) and forces that "
@@ -3339,12 +3425,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.transform is not None:
         print("[gyroid_nd] note: --transform (and --bloom/--bloom-amp/--tumble-*) is "
               "deprecated; use --oscillate instead (see OSCILLATE_GRAMMAR.md). It still works.")
+    # Validate + canonicalize --surface up front (resolves schwarz_p->primitive, rejects a
+    # catalog-only TPMS or an unknown name) so a bad value fails cleanly before any rendering.
+    # Resolved BEFORE the --lock/--oscillate grammar so those can classify a token against the
+    # surface's named shape params (S4 pins, S5 param swingers).
+    args.surface = resolve_surface(args.surface)
+
     # S4: pull POV shape-param value pins (`--lock NAME=VALUE`) out of --lock and validate them
     # against the surface.  MUST run before resolve_oscillate(), which parses the remaining
     # --lock tokens through the motion/axis grammar (which never uses '=' and would reject a
     # pin token); a pins-only --lock collapses to None so it doesn't engage that grammar or
-    # trip the --transform mutual-exclusion.  (resolve_pov_param_locks resolves the surface
-    # itself, idempotently, and returns early when there are no pins.)
+    # trip the --transform mutual-exclusion.
     resolve_pov_param_locks(args)
 
     # Resolve the unified --oscillate/--lock grammar (if used) onto the canonical
@@ -3396,10 +3487,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --couple explicit clusters (the field counterpart of --oscillate); mutually exclusive
     # with a non-default --coupling / any --pair (resolve_couple raises on conflict).
     resolve_couple(args)
-
-    # Validate + canonicalize --surface up front (resolves schwarz_p->primitive, rejects a
-    # catalog-only TPMS or an unknown name) so a bad value fails cleanly before any rendering.
-    args.surface = resolve_surface(args.surface)
 
     # The coupling graph (--coupling/--pair/--couple) is a pairwise-gyroid concept; a per-node
     # surface (Schwarz P) has no edges to wire, so those flags are inert there.  Warn rather than

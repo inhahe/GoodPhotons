@@ -709,6 +709,7 @@ def _pv(*argv, seed=1):
     args.pair_off = frozenset(off)
     args.surface = g.resolve_surface(getattr(args, "surface", "gyroid"))
     g.resolve_pov_param_locks(args)             # S4: extract/validate --lock NAME=VALUE pins
+    g.resolve_oscillate(args)                   # S5: classify param swingers (and the motion grammar)
     locks = {}
     for s in args.axis:
         g.parse_axis_lock(s, locks)
@@ -1519,6 +1520,103 @@ def test_pin_survives_the_motion_grammar_parse():
     args = _resolved_args("--surface", "f_torus", "--lock", "minor=0.4")
     assert args.pov_param_locks == {"minor": 0.4}
     assert args.lock is None                             # collapsed, so the parse saw no '='
+
+
+# ---------------------------------------------------------------------------
+# S5: POV shape params become --oscillate swinger axes (OSCILLATE_GRAMMAR.md sec 7)
+# ---------------------------------------------------------------------------
+
+def _emitted_pov_params(body, name):
+    """The shape-param values in an emitted POV call ``name(x,y,z, p0, p1, ...)``."""
+    import re
+    m = re.search(re.escape(name) + r"\(x,y,z,([^)]*)\)", body)
+    assert m, f"no {name}(...) call in emitted scene"
+    return tuple(float(x) for x in m.group(1).split(","))
+
+
+def test_oscillate_pov_param_is_recorded_as_a_swinger():
+    v = _pv("--surface", "f_torus", "--oscillate", "minor")
+    assert v.pov_swing == {"minor": 1.0}                 # bare axis => amp 1.0
+    assert v.pov_values == g.pov_default_values("f_torus")   # base is untouched
+
+
+def test_pov_param_swing_only_needs_no_winder_motion():
+    # a param-only --oscillate carries no winder/dims motion but must not error "no motion
+    # axes"; field_expr ignores transform for POV, so a benign 'drift' is named.
+    args = _resolved_args("--surface", "f_torus", "--oscillate", "minor")
+    assert args.pov_swing == {"minor": 1.0}
+    assert "drift" in args.transform
+
+
+def test_pov_param_swing_sweeps_over_the_loop():
+    v = _pv("--surface", "f_torus", "--oscillate", "minor")
+    p0 = _emitted_pov_params(_auto_body(v, t=0.0), "f_torus")
+    pmid = _emitted_pov_params(_auto_body(v, t=0.5), "f_torus")
+    assert p0[1] == pytest.approx(0.25)                  # base minor at the loop ends
+    assert pmid[1] == pytest.approx(2.0)                 # amp=1 reaches the authored hi at peak
+    assert p0[0] == pmid[0]                              # the un-swung major stays put
+
+
+def test_pov_param_swing_loops_seamlessly():
+    v = _pv("--surface", "f_torus", "--oscillate", "minor")
+    p0 = _emitted_pov_params(_auto_body(v, t=0.0), "f_torus")
+    p1 = _emitted_pov_params(_auto_body(v, t=1.0), "f_torus")
+    assert p0 == pytest.approx(p1)                       # t=1 returns exactly to the base
+
+
+def test_pov_param_swing_amplitude_scales():
+    v = _pv("--surface", "f_torus", "--oscillate", "0.5*minor")
+    pmid = _emitted_pov_params(_auto_body(v, t=0.5), "f_torus")
+    assert pmid[1] == pytest.approx(0.25 + 0.5 * (2.0 - 0.25))   # halfway from base to hi
+
+
+def test_pov_param_swing_container_recomputes_per_frame():
+    v = _pv("--surface", "f_torus", "--oscillate", "minor")
+    r0 = _emitted_clip_radius(_auto_body(v, t=0.0))
+    rmid = _emitted_clip_radius(_auto_body(v, t=0.5))
+    assert rmid > r0 + 0.5                               # the torus fattens => container grows
+
+
+def test_pov_param_swing_negative_amp_sweeps_down():
+    # amp<0 sweeps toward lo (a leading-dash amp is awkward on the CLI, so set it directly)
+    v = _pv("--surface", "f_torus")
+    v.pov_swing = {"minor": -1.0}
+    pmid = _emitted_pov_params(_auto_body(v, t=0.5), "f_torus")
+    lo = g.pov_params("f_torus")[1][3][0]
+    assert pmid[1] == pytest.approx(lo)                  # reaches the authored lo at the peak
+
+
+def test_pov_param_swing_over_driven_amp_clamps_to_range():
+    v = _pv("--surface", "f_torus", "--oscillate", "2*minor")
+    pmid = _emitted_pov_params(_auto_body(v, t=0.5), "f_torus")
+    assert pmid[1] == pytest.approx(2.0)                 # clamped at hi despite amp=2
+
+
+def test_pov_param_swing_on_non_pov_surface_errors():
+    with pytest.raises(SystemExit):
+        _pv("--surface", "gyroid", "--oscillate", "minor")
+
+
+def test_pov_param_swing_unknown_param_hints_valid_names():
+    with pytest.raises(SystemExit) as exc:
+        _pv("--surface", "f_torus", "--oscillate", "bogus")
+    assert "major" in str(exc.value) and "minor" in str(exc.value)
+
+
+def test_no_pov_swing_leaves_values_static_across_the_loop():
+    v = _pv("--surface", "f_torus")
+    assert _emitted_pov_params(_auto_body(v, t=0.0), "f_torus") == \
+           _emitted_pov_params(_auto_body(v, t=0.5), "f_torus")
+
+
+def test_pov_param_swing_coexists_with_a_lock_pin():
+    # pin major, swing minor: the pinned base holds while minor sweeps around its default
+    v = _pv("--surface", "f_torus", "--lock", "major=1.6", "--oscillate", "minor")
+    assert v.pov_values[0] == pytest.approx(1.6)
+    assert v.pov_swing == {"minor": 1.0}
+    pmid = _emitted_pov_params(_auto_body(v, t=0.5), "f_torus")
+    assert pmid[0] == pytest.approx(1.6)                 # major un-swung at its pin
+    assert pmid[1] == pytest.approx(2.0)                 # minor at hi
 
 
 # ---------------------------------------------------------------------------
