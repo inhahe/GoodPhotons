@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loom import (  # noqa: E402
     Clock, Cache, Sine,
     Isosurface, FuncPattern, pov, PovFn, POV_FUNCS, POV_ND_GENERALIZABLE,
+    POV_PARAMS, pov_params,
 )
 from loom.ftsl_emit import EmitCtx  # noqa: E402
 
@@ -120,6 +121,62 @@ def test_nd_generalizable_subset_is_honest():
     assert "f_heart" not in POV_ND_GENERALIZABLE
     assert "f_klein_bottle" not in POV_ND_GENERALIZABLE
     assert POV_ND_GENERALIZABLE <= set(POV_FUNCS)
+
+
+_AXIS_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+
+
+def test_pov_params_complete_for_every_function():
+    # the same drift-guard discipline as the arity table: every POV_FUNCS entry
+    # must carry exactly arity - 3 params, no more, no fewer.
+    assert set(POV_PARAMS) == set(POV_FUNCS), (
+        f"POV_PARAMS out of sync with POV_FUNCS; "
+        f"missing={set(POV_FUNCS) - set(POV_PARAMS)}, "
+        f"extra={set(POV_PARAMS) - set(POV_FUNCS)}")
+    for name, arity in POV_FUNCS.items():
+        params = pov_params(name)
+        assert len(params) == arity - 3, (
+            f"{name}: {len(params)} params but arity {arity} wants {arity - 3}")
+
+
+def test_pov_params_are_well_formed():
+    for name in POV_FUNCS:
+        seen = set()
+        for meta in pov_params(name):
+            axis, desc, default, rng = meta
+            assert _AXIS_RE.match(axis), f"{name}: bad axis name {axis!r}"
+            assert axis not in seen, f"{name}: duplicate axis {axis!r}"
+            seen.add(axis)
+            assert isinstance(desc, str) and desc, f"{name}: empty desc for {axis}"
+            lo, hi = rng
+            assert lo < hi, f"{name}.{axis}: empty range ({lo}, {hi})"
+            assert lo <= default <= hi, (
+                f"{name}.{axis}: default {default} outside [{lo}, {hi}]")
+
+
+def test_pov_params_spot_check_authored_metadata():
+    assert [m[0] for m in pov_params("f_torus")] == ["major", "minor"]
+    assert [m[0] for m in pov_params("f_sphere")] == ["radius"]
+    assert [m[0] for m in pov_params("f_ellipsoid")] == ["rx", "ry", "rz"]
+    assert pov_params("f_r") == []          # 0-param spherical helper
+    assert pov_params("f_noise3d") == []
+    # an un-authored function falls back to honest generic p0.. placeholders
+    assert [m[0] for m in pov_params("f_klein_bottle")] == ["p0"]
+
+
+def test_pov_params_unknown_name_rejected():
+    try:
+        pov_params("f_not_a_function")
+    except ValueError:
+        return
+    raise AssertionError("pov_params on an unknown name must raise")
+
+
+def test_pov_params_returns_a_copy():
+    # callers must not be able to mutate the shared table in place
+    a = pov_params("f_torus")
+    a.append(("x", "x", 0.0, (0.0, 1.0)))
+    assert len(pov_params("f_torus")) == 2
 
 
 def _run_all():

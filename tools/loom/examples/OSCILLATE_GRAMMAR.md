@@ -390,11 +390,21 @@ present, the shape-param axes are added on top.
 `POV_FUNCS`/`pov_functions.h` store only **arity** (the param *count*), not param
 **names, meanings, defaults, or ranges**. POV-Ray's docs describe them (e.g.
 `f_torus(x,y,z, P0=major radius, P1=minor radius)`), so we must **author a
-param-metadata table** — `{func: [(name, description, default, [lo,hi]), …]}` — most
-practically emitted by extending `tools/pov_functions_gen.py` to scrape/annotate the
-POV docs, with a hand-maintained fallback. A test should assert every `POV_FUNCS` entry
-has metadata with exactly `arity − 3` params (same drift-guard discipline the arity
-table already uses).
+param-metadata table** — `{func: [(name, description, default, [lo,hi]), …]}`.
+
+**P3.1 (done 2026-07-18):** that table now lives in `loom/pov.py` as `POV_PARAMS`,
+reachable via `pov_params(name)`. It is *not* emitted from `tools/pov_functions_gen.py`
+after all — the C header only needs arity for the VM, and the metadata (names/docs/
+ranges) is Python-side consumer data for `--surface-help`, so hand-authoring it in
+`pov.py` next to `POV_FUNCS`/`POV_ND_GENERALIZABLE` keeps it where it's used. Real
+`(name, description, default, (lo, hi))` tuples are authored for the well-documented and
+N-D-core shapes (f_sphere, f_ellipsoid, f_superellipsoid, f_paraboloid,
+f_quartic_paraboloid, f_rounded_box, f_torus, f_heart, f_noise_generator) plus the
+0-param spherical/noise helpers (f_r/f_th/f_ph/f_noise3d); every remaining `POV_FUNCS`
+entry falls back to honest generic `p0..p{n-1}` placeholders (`_generic_params`). The
+completeness is guaranteed *by construction* (a comprehension over `POV_FUNCS`), and a
+test asserts every entry has exactly `arity − 3` params with valid, unique axis names and
+in-range defaults — the same drift-guard discipline the arity table uses.
 
 With that table, add discovery commands:
 
@@ -409,9 +419,9 @@ With that table, add discovery commands:
 ### Staging
 
 This is **phase 3+** work (after the core `--oscillate` grammar lands). Order:
-(a) author the param-metadata table + generator + test; (b) `--list-surfaces` /
-`--surface-help`; (c) widen `--surface` choices to the full library with the N-D and
-seamless-motion guards from the caveats above.
+(a) ~~author the param-metadata table + generator + test~~ **done (P3.1)**;
+(b) `--list-surfaces` / `--surface-help` (P3.2); (c) widen `--surface` choices to the
+full library with the N-D and seamless-motion guards from the caveats above (P3.3).
 
 ---
 

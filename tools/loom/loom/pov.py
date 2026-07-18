@@ -69,6 +69,74 @@ POV_ND_GENERALIZABLE = frozenset({
     "f_cross_ellipsoids", "f_poly4",
 })
 
+# ---------------------------------------------------------------------------
+# Per-surface shape-parameter metadata (OSCILLATE_GRAMMAR.md §7, P3.1)
+# ---------------------------------------------------------------------------
+# `POV_FUNCS`/`pov_functions.h` store only the param *count* (arity - 3), never
+# param names/meanings/defaults/ranges.  Those live in POV-Ray's docs, so the
+# metadata below is **hand-authored** — a `{func: [ParamMeta, …]}` table where
+# each entry is `(name, description, default, (lo, hi))`, `name` a valid axis
+# identifier (so `--oscillate <name>` can address it once the surface library is
+# wired in P3.3).  `POV_PARAMS` is completed for *every* `POV_FUNCS` entry: the
+# well-documented shapes (and the N-D subset) get real metadata; the rest fall
+# back to honest generic `p0..` placeholders (`_generic_params`).  A test asserts
+# every function has exactly `arity - 3` params with valid, unique names — the
+# same drift-guard discipline the arity table uses.
+
+# (name, description, default, (lo, hi))
+ParamMeta = tuple
+
+_AUTHORED_PARAMS = {
+    # zero-parameter spherical-coordinate / noise helpers
+    "f_r": [], "f_th": [], "f_ph": [], "f_noise3d": [],
+    # --- quadrics / simple solids (the N-D-generalizable core) ---------------
+    "f_sphere": [("radius", "sphere radius", 1.0, (0.1, 4.0))],
+    "f_ellipsoid": [("rx", "x semi-axis", 1.0, (0.1, 4.0)),
+                    ("ry", "y semi-axis", 1.0, (0.1, 4.0)),
+                    ("rz", "z semi-axis", 1.0, (0.1, 4.0))],
+    "f_superellipsoid": [("e_we", "east-west roundness exponent", 1.0, (0.1, 4.0)),
+                         ("e_ns", "north-south roundness exponent", 1.0, (0.1, 4.0))],
+    "f_paraboloid": [("scale", "field scale", 1.0, (0.1, 4.0))],
+    "f_quartic_paraboloid": [("scale", "field scale", 1.0, (0.1, 4.0))],
+    "f_rounded_box": [("round", "edge-rounding radius", 0.1, (0.0, 1.0)),
+                      ("hx", "x half-width", 1.0, (0.1, 4.0)),
+                      ("hy", "y half-width", 1.0, (0.1, 4.0)),
+                      ("hz", "z half-width", 1.0, (0.1, 4.0))],
+    # --- tori ---------------------------------------------------------------
+    "f_torus": [("major", "major (ring) radius", 1.0, (0.1, 4.0)),
+                ("minor", "minor (tube) radius", 0.25, (0.02, 2.0))],
+    # --- named curves / surfaces with a single field-scale parameter --------
+    "f_heart": [("scale", "field scale", 1.0, (0.2, 3.0))],
+    # --- noise --------------------------------------------------------------
+    "f_noise_generator": [("gen", "noise generator select (0..3)", 2.0, (0.0, 3.0))],
+}
+
+
+def _generic_params(n: int) -> List[ParamMeta]:
+    """Honest placeholder metadata for a function whose per-parameter meaning is
+    not (yet) hand-documented: ``n`` neutral ``p0..p{n-1}`` axes."""
+    return [(f"p{i}", f"shape parameter {i} (POV-Ray internal; see POV docs)",
+             1.0, (-4.0, 4.0)) for i in range(n)]
+
+
+# Completed for every POV_FUNCS entry: authored metadata where known, generic
+# fallback otherwise.  Built so the count always matches arity - 3 by construction.
+POV_PARAMS = {
+    name: list(_AUTHORED_PARAMS.get(name, _generic_params(arity - 3)))
+    for name, arity in POV_FUNCS.items()
+}
+
+
+def pov_params(name: str) -> List[ParamMeta]:
+    """The shape-parameter metadata for POV builtin ``name`` — a list of
+    ``(axis_name, description, default, (lo, hi))``, one per ``arity - 3`` param
+    (empty for the 0-param helpers).  Raises for an unknown name."""
+    if name not in POV_PARAMS:
+        raise ValueError(f"unknown POV function {name!r} "
+                         f"(see loom.POV_FUNCS for the {len(POV_FUNCS)} available)")
+    return list(POV_PARAMS[name])
+
+
 Param = Union[Signal, Number]
 
 

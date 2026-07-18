@@ -161,9 +161,18 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       11 new tests, 335 green.
 
 ### Phase 3 — surface library & per-surface params (§7)
-- [ ] **P3.1** Author per-surface param-metadata table `{func:[(name,desc,default,[lo,hi]),…]}`
+- [x] **P3.1** Author per-surface param-metadata table `{func:[(name,desc,default,[lo,hi]),…]}`
       (extend `tools/pov_functions_gen.py` + hand fallback) + a test asserting every `POV_FUNCS`
       entry has exactly `arity−3` params.
+      *Done 2026-07-18:* metadata lives in `loom/pov.py` (Python side, for `--surface-help`), not the
+      C header (the VM only needs arity). `_AUTHORED_PARAMS` hand-authors real
+      `(name,desc,default,(lo,hi))` for the well-documented / N-D-core shapes (f_sphere, f_ellipsoid,
+      f_superellipsoid, f_paraboloid, f_quartic_paraboloid, f_rounded_box, f_torus, f_heart,
+      f_noise_generator) + the 0-param helpers (f_r/f_th/f_ph/f_noise3d); every other `POV_FUNCS` entry
+      falls back to honest generic `p0..` placeholders via `_generic_params`. `POV_PARAMS` is built to
+      match `arity−3` by construction; `pov_params(name)` accessor returns a copy. Exported from
+      `loom/__init__`. 6 new tests (completeness drift-guard, well-formedness: valid/unique axis names +
+      default∈[lo,hi], spot-checks, unknown-name reject, copy-safety), 349 loom green.
 - [ ] **P3.2** `--list-surfaces` + `--surface-help NAME` discovery commands; main `--help` pointer.
 - [ ] **P3.3** Widen `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
       + `pov.py` `POV_FUNCS`, with the N-D (`POV_ND_GENERALIZABLE`) and seamless-motion (periodic-only
@@ -274,3 +283,13 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
   exclusive with a non-default `--coupling` / any `--pair`. `coupling_desc` summarizes clusters;
   primitive warning lists `--couple`; docstring/epilog/help + OSCILLATE_GRAMMAR.md §6 updated.
   11 new tests, 335 loom green. Next: Phase 3 (P3.1 surface library) or another TODO track.
+- 2026-07-18: **P3.1 done.** Per-surface shape-param metadata table in `loom/pov.py` (Python side —
+  it feeds the future `--surface-help`; the C header stays arity-only for the VM). `_AUTHORED_PARAMS`
+  hand-documents real `(name, description, default, (lo, hi))` tuples for the well-understood /
+  N-D-core shapes and the 0-param spherical/noise helpers; `_generic_params(n)` supplies honest
+  `p0..p{n-1}` placeholders for every other `POV_FUNCS` entry. `POV_PARAMS` is built by comprehension
+  so its per-function count always equals `arity−3`; `pov_params(name)` returns a defensive copy and
+  raises on unknown names. Exported from `loom/__init__`. 6 new tests mirror the arity drift-guard
+  discipline (set-equality with `POV_FUNCS`, exact `arity−3` count, valid+unique axis names,
+  default∈[lo,hi] with lo<hi, authored spot-checks, unknown-name reject, copy-safety). 349 loom green.
+  Next: P3.2 (`--list-surfaces` / `--surface-help NAME` discovery commands).
