@@ -68,7 +68,7 @@ def test_freq_scales_gyroid():
 def test_bloom_frame0_is_exact_classic_gyroid():
     # In bloom mode, frame 0 must be *exactly* the classic showcase gyroid regardless of
     # how many higher dimensions the variant has.
-    args = _args("--dims", "6", "--transform", "bloom", "--freq", "1")
+    args = _args("--dims", "6", "--oscillate", "bloom", "--freq", "1")
     v = g.pick_variant(99, args, {})
     expr = g.field_expr(v, 0.0, "bloom")
     for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
@@ -77,7 +77,7 @@ def test_bloom_frame0_is_exact_classic_gyroid():
 
 def test_bloom_is_seamless():
     # t=0 and t=1 both collapse to the classic gyroid -> identical expression (seamless loop).
-    args = _args("--dims", "7", "--transform", "bloom", "--freq", "2")
+    args = _args("--dims", "7", "--oscillate", "bloom", "--freq", "2")
     v = g.pick_variant(7, args, {})
     assert g.field_expr(v, 0.0, "bloom") == g.field_expr(v, 1.0, "bloom")
     assert g.field_expr(v, 0.0, "bloom") == g._classic_gyroid_expr(v.freq)
@@ -85,7 +85,7 @@ def test_bloom_is_seamless():
 
 def test_bloom_midpoint_is_full_field():
     # At t=0.5 the envelope is 1, so the field is the full N-D gyroid (drifting), not classic.
-    args = _args("--dims", "6", "--transform", "bloom", "--freq", "3")
+    args = _args("--dims", "6", "--oscillate", "bloom", "--freq", "3")
     v = g.pick_variant(11, args, {})
     assert g.field_expr(v, 0.5, "bloom") == g.field_expr(v, 0.5, "drift")
     assert g.field_expr(v, 0.5, "bloom") != g._classic_gyroid_expr(v.freq)
@@ -93,17 +93,17 @@ def test_bloom_midpoint_is_full_field():
 
 def test_bloom_default_freq_matches_showcase_density():
     # With no --freq, bloom defaults the density to showcase's (freq 40 at radius 0.32).
-    args = _args("--dims", "5", "--transform", "bloom", "--radius", "0.32")
+    args = _args("--dims", "5", "--oscillate", "bloom", "--radius", "0.32")
     v = g.pick_variant(3, args, {})
     assert abs(v.freq - 40.0) < 1e-6
     # and the density scales inversely with radius (same periods across the ball)
-    args2 = _args("--dims", "5", "--transform", "bloom", "--radius", "1.3")
+    args2 = _args("--dims", "5", "--oscillate", "bloom", "--radius", "1.3")
     assert abs(g.pick_variant(3, args2, {}).freq - (0.32 * 40.0 / 1.3)) < 1e-6
 
 
 def test_bloom_default_param_is_dims():
     # With no --bloom, the bloom transform blooms 'dims' (backward-compatible behavior).
-    v = g.pick_variant(5, _args("--dims", "6", "--transform", "bloom"), {})
+    v = g.pick_variant(5, _args("--dims", "6", "--oscillate", "bloom"), {})
     assert v.bloom_params == ("dims",)
 
 
@@ -121,7 +121,7 @@ def test_bloom_param_parsing_and_aliases():
 
 def test_bloom_freq_holds_classic_and_pulses_frequency():
     # --bloom freq: the whole loop is the classic gyroid, but its frequency swells at mid-loop.
-    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq", "--freq", "5"), {})
+    v = g.pick_variant(5, _args("--oscillate", "freq", "--freq", "5"), {})
     assert v.bloom_params == ("freq",)
     # frame 0 is the exact classic gyroid at the base frequency
     assert g.field_expr(v, 0.0, "bloom") == g._classic_gyroid_expr(5.0)
@@ -133,8 +133,7 @@ def test_bloom_freq_holds_classic_and_pulses_frequency():
 
 
 def test_bloom_amp_scales_frequency_swing():
-    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq",
-                                "--freq", "4", "--bloom-amp", "0.5"), {})
+    v = g.pick_variant(5, _args("--oscillate", "0.5*freq", "--freq", "4"), {})
     # amp 0.5 -> mid-loop frequency is 4*(1 + 0.5*1) = 6
     assert abs(g.bloom_freq(v, 0.5) - 6.0) < 1e-9
     assert abs(g.bloom_freq(v, 0.0) - 4.0) < 1e-9      # ends unchanged
@@ -166,8 +165,7 @@ def test_bloom_amps_per_axis_override_beats_shared_scalar():
 
 def test_bloom_freq_applies_to_full_field_when_dims_also_bloom():
     # --bloom dims,freq: the frequency pulse rides on the full N-D crossfade too.
-    v = g.pick_variant(5, _args("--dims", "6", "--transform", "bloom",
-                                "--bloom", "dims,freq", "--freq", "3"), {})
+    v = g.pick_variant(5, _args("--dims", "6", "--oscillate", "bloom,freq", "--freq", "3"), {})
     assert v.bloom_params == ("dims", "freq")
     assert g.field_expr(v, 0.0, "bloom") == g._classic_gyroid_expr(3.0)   # seamless frame 0
     # mid-loop equals the drift field evaluated at the bloomed (2x) frequency
@@ -176,8 +174,7 @@ def test_bloom_freq_applies_to_full_field_when_dims_also_bloom():
 
 
 def test_bloom_threshold_and_thickness_are_seamless_scalars():
-    v = g.pick_variant(5, _args("--transform", "bloom",
-                                "--bloom", "threshold,thickness"), {})
+    v = g.pick_variant(5, _args("--oscillate", "threshold,thickness"), {})
     assert v.bloom_params == ("threshold", "thickness")
     # both scalars equal their base at the loop ends and swing at the midpoint
     assert g.bloom_threshold(v, 0.0) == v.threshold
@@ -193,7 +190,7 @@ def test_bloom_threshold_and_thickness_are_seamless_scalars():
 def test_bloom_gradient_bound_tracks_bloomed_frequency():
     # The Lipschitz bound must grow with the frequency pulse or the marcher will miss walls.
     from loom import Clock, Cache
-    v = g.pick_variant(5, _args("--transform", "bloom", "--bloom", "freq", "--freq", "5"), {})
+    v = g.pick_variant(5, _args("--oscillate", "freq", "--freq", "5"), {})
     sh = max(3, sum(d.harmonic for d in v.dim_list if d.oscillate))
 
     def bound(t):
@@ -566,14 +563,14 @@ def test_rotate_well_formed_across_seeds():
 
 def test_tumble_starts_from_current_gyroid():
     # the tumble transform at t=0 is the identity rotation -> the exact static field
-    v = g.pick_variant(3, _args("--dims", "6", "--transform", "tumble"), {})
+    v = g.pick_variant(3, _args("--dims", "6", "--oscillate", "tumble"), {})
     assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v, 0.0, "drift")
     assert g.field_expr(v, 0.0, "tumble") == g.field_expr(v)
 
 
 def test_tumble_loop_is_seamless():
     # t=0 and t=1 evaluate identically (whole-turn N-D rotation -> R(0)=R(1)=I)
-    v = g.pick_variant(7, _args("--dims", "6", "--transform", "tumble"), {})
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble"), {})
     e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
     for (x, y, z) in [(0.3, 1.1, -0.7), (2.0, -1.0, 0.5), (-1.5, 0.2, 2.2)]:
         assert abs(_eval_expr(e0, x, y, z) - _eval_expr(e1, x, y, z)) < 1e-6
@@ -582,7 +579,7 @@ def test_tumble_loop_is_seamless():
 def test_tumble_actually_moves_and_differs_from_rotate():
     # mid-loop tumble morphs the field, differently from both drift and rotate (it is a
     # coherent whole-slice rotation, not per-dim wavevector tilts or a slide)
-    v = g.pick_variant(7, _args("--dims", "6", "--transform", "tumble"), {})
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "tumble"), {})
     e0 = g.field_expr(v, 0.0, "tumble")
     et = g.field_expr(v, 0.31, "tumble")
     ed = g.field_expr(v, 0.31, "drift")
@@ -597,7 +594,7 @@ def test_tumble_planes_are_disjoint():
     # each dim index appears in at most one Givens plane, so a rotated direction row mixes
     # at most two unit rows (|dir| <= sqrt(2)) — the marcher's Lipschitz inflation relies on it
     for s in range(20):
-        v = g.pick_variant(s, _args("--dims", "8", "--transform", "tumble"), {})
+        v = g.pick_variant(s, _args("--dims", "8", "--oscillate", "tumble"), {})
         seen = []
         for (i, j, _w) in v.tumble_planes:
             assert i != j
@@ -606,7 +603,7 @@ def test_tumble_planes_are_disjoint():
 
 
 def test_tumble_well_formed_across_seeds():
-    args = _args("--dims", "8", "--transform", "tumble")
+    args = _args("--dims", "8", "--oscillate", "tumble")
     for s in range(20):
         v = g.pick_variant(s, args, {})
         assert v.tumble_planes                       # planes were built for tumble
@@ -619,7 +616,7 @@ def test_tumble_well_formed_across_seeds():
 def test_tumble_3d_falls_back_to_rigid_spin():
     # with no hidden dims (D=3) tumble degenerates to a plane rotation of the visible axes;
     # it must still build a plane, stay seamless, and morph (a rigid spin of the gyroid)
-    v = g.pick_variant(5, _args("--dims", "3", "--transform", "tumble"), {})
+    v = g.pick_variant(5, _args("--dims", "3", "--oscillate", "tumble"), {})
     assert v.tumble_planes                            # a fallback (0,2) plane exists
     e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
     eh = g.field_expr(v, 0.29, "tumble")
@@ -632,15 +629,14 @@ def test_tumble_not_built_for_other_transforms():
     # tumble planes are only drawn when needed, so drift/rotate/bloom variants keep an empty
     # list — and their RNG stream (hence reproducibility) is untouched by the feature
     for tr in ("drift", "rotate", "bloom"):
-        v = g.pick_variant(4, _args("--dims", "6", "--transform", tr), {})
+        v = g.pick_variant(4, _args("--dims", "6", "--oscillate", tr), {})
         assert v.tumble_planes == []
 
 
 def test_tumble_slide_is_seamless():
     # slide mode rocks the slice via sin(2*pi*winding*t); sin is 0 at t=0 and t=1, so both
     # loop ends are exactly the base gyroid — still a seamless loop
-    v = g.pick_variant(7, _args("--dims", "6", "--transform", "tumble",
-                                "--tumble-mode", "slide"), {})
+    v = g.pick_variant(7, _args("--dims", "6", "--oscillate", "0.25*tumble"), {})
     assert v.tumble_mode == "slide"
     e0, e1 = g.field_expr(v, 0.0, "tumble"), g.field_expr(v, 1.0, "tumble")
     assert e0 == g.field_expr(v)                          # frame 0 = base gyroid
@@ -651,9 +647,9 @@ def test_tumble_slide_is_seamless():
 def test_tumble_slide_differs_from_rotate_midloop():
     # slide and rotate share the same planes but different angle schedules, so mid-loop they
     # produce different fields (slide rocks +/-tumble_amp; rotate spins a full turn)
-    base = ["--dims", "6", "--transform", "tumble"]
-    vr = g.pick_variant(11, _args(*base, "--tumble-mode", "rotate"), {})
-    vs = g.pick_variant(11, _args(*base, "--tumble-mode", "slide"), {})
+    base = ["--dims", "6"]
+    vr = g.pick_variant(11, _args(*base, "--oscillate", "tumble"), {})
+    vs = g.pick_variant(11, _args(*base, "--oscillate", "0.25*tumble"), {})
     assert vr.tumble_planes == vs.tumble_planes          # same planes (RNG untouched by mode)
     er = g.field_expr(vr, 0.31, "tumble")
     es = g.field_expr(vs, 0.31, "tumble")
@@ -664,8 +660,7 @@ def test_tumble_slide_differs_from_rotate_midloop():
 def test_tumble_slide_extreme_at_midloop_changes_projected_scale():
     # slide's angle peaks at t=0.25 (sin(2*pi*winding*t) max); with a large amp the slice is
     # tilted well away from identity, so the field must differ substantially from frame 0
-    v = g.pick_variant(3, _args("--dims", "6", "--transform", "tumble",
-                                "--tumble-mode", "slide", "--tumble-amp", "0.25"), {})
+    v = g.pick_variant(3, _args("--dims", "6", "--oscillate", "0.25*tumble"), {})
     e0 = g.field_expr(v, 0.0, "tumble")
     # peak tilt occurs where winding*t = 0.25 for a winding-1 plane, i.e. t=0.25
     epk = g.field_expr(v, 0.25, "tumble")
@@ -676,8 +671,7 @@ def test_tumble_slide_extreme_at_midloop_changes_projected_scale():
 def test_tumble_lock_excludes_axes_from_planes():
     # locked axes must never appear in any tumble plane (they stay fixed while others tumble)
     for s in range(20):
-        v = g.pick_variant(s, _args("--dims", "8", "--transform", "tumble",
-                                    "--tumble-lock", "0,1"), {})
+        v = g.pick_variant(s, _args("--dims", "8", "--oscillate", "tumble", "--lock", "0,1"), {})
         assert v.tumble_locked == (0, 1)
         for (i, j, _w) in v.tumble_planes:
             assert i not in (0, 1) and j not in (0, 1)
@@ -685,8 +679,7 @@ def test_tumble_lock_excludes_axes_from_planes():
 
 def test_tumble_lock_keeps_locked_axis_direction_static():
     # a locked axis's direction row is identical at every t (it is excluded from the rotation)
-    v = g.pick_variant(4, _args("--dims", "7", "--transform", "tumble",
-                                "--tumble-lock", "0"), {})
+    v = g.pick_variant(4, _args("--dims", "7", "--oscillate", "tumble", "--lock", "0"), {})
     d0 = g._tumbled_directions(v, 0.0)
     for t in (0.13, 0.5, 0.87):
         dt = g._tumbled_directions(v, t)
@@ -989,13 +982,13 @@ def test_primitive_ignores_coupling_and_pair():
 
 def test_primitive_bloom_classic_is_schwarz_p():
     # bloom frame-0 subject for primitive is cos(fx)+cos(fy)+cos(fz), not the gyroid.
-    v = _pv("--surface", "primitive", "--dims", "5", "--transform", "bloom")
+    v = _pv("--surface", "primitive", "--dims", "5", "--oscillate", "bloom")
     expr0 = g.field_expr(v, 0.0, "bloom")
     assert "sin(" not in expr0 and expr0.count("cos(") == 3
 
 
 def test_gyroid_bloom_classic_is_gyroid():
-    v = _pv("--dims", "5", "--transform", "bloom")
+    v = _pv("--dims", "5", "--oscillate", "bloom")
     expr0 = g.field_expr(v, 0.0, "bloom")
     assert expr0.count("sin(") == 3 and expr0.count("cos(") == 3
 

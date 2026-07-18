@@ -2606,48 +2606,19 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--lock", nargs="*", default=None, metavar="GROUP",
                    help="same grammar as --oscillate, naming axes to HOLD FIXED. Currently dim "
                         "indices map to the tumble lock (axes excluded from the slice rotation).")
+    # Deprecated legacy motion flags (superseded by --oscillate; see OSCILLATE_GRAMMAR.md).
+    # Still fully supported — using --transform prints a one-line deprecation note (main) —
+    # but hidden from --help so the grammar in --oscillate is the single documented surface.
     g.add_argument("--transform", type=str, default=None, metavar="T[,T...]",
-                   help="how the higher dimensions animate the loop (default 'drift' when neither "
-                        "--transform nor --oscillate is given). One name, or a "
-                        "comma-separated set to LAYER several at once (e.g. 'drift,tumble' or "
-                        "'drift,rotate,tumble,bloom'). Options: 'drift' (default) translates the "
-                        "slice through them (the pattern slides); 'rotate' turns each dim's "
-                        "wavevector out of the 3-D slice into a hidden axis, each independently "
-                        "(the lattice reshapes — a higher-D 'rotation'); 'tumble' rigidly rotates "
-                        "the WHOLE 3-D slice through the N-D space (the visible axes swing out and "
-                        "hidden ones swing in, re-slicing the lattice from a turning viewpoint; "
-                        "needs >=4 oscillating dims for real morphing, else it just spins); "
-                        "'bloom' pins frame 0 to the exact classic showcase gyroid and cross-blends "
-                        "the full N-D field in and back out (w=sin^2(pi t)), so the clip opens as "
-                        "the showcase gyroid and unfolds into higher-D structure. When layered, the "
-                        "three motions (drift/rotate/tumble) compose on the field and 'bloom' wraps "
-                        "the result in its cross-fade envelope. Every layer is the identity at t=0, "
-                        "so any combination starts from a seamless frame 0 and loops.")
+                   help=argparse.SUPPRESS)
     g.add_argument("--bloom", type=str, default=None, metavar="P[,P...]",
-                   help="for --transform bloom: which parameter(s) oscillate over the loop "
-                        "(comma-separated; default 'dims'). Choices: 'dims' (cross-blend the "
-                        "full N-D field in and out — the original bloom), 'freq' (pulse the "
-                        "spatial frequency = pattern intricacy/complexity; alias 'complexity'), "
-                        "'threshold' (shift the level set so channels open/close), 'thickness' "
-                        "(swell and thin the gold sheet). Frame 0 is always the base showcase "
-                        "gyroid. e.g. --bloom freq  or  --bloom dims,freq")
-    g.add_argument("--bloom-amp", type=float, default=1.0,
-                   help="scale the peak swing of every bloomed parameter (default 1.0; at 1.0 "
-                        "'freq'/'thickness' reach 2x at mid-loop). Only used with --transform bloom.")
+                   help=argparse.SUPPRESS)
+    g.add_argument("--bloom-amp", type=float, default=1.0, help=argparse.SUPPRESS)
     g.add_argument("--tumble-mode", choices=("rotate", "slide"), default="rotate",
-                   help="for --transform tumble: 'rotate' (default) spins the whole 3-D slice "
-                        "through full N-D turns; 'slide' rocks it back and forth between two "
-                        "extremes so the lattice appears to breathe smaller/larger (the "
-                        "projected frequency swells and shrinks). Only used with --transform tumble.")
-    g.add_argument("--tumble-amp", type=float, default=0.25,
-                   help="for --transform tumble --tumble-mode slide: peak swing in turns each "
-                        "way (default 0.25 = a quarter-turn rock). Larger = more dramatic "
-                        "size breathing. Only used with --tumble-mode slide.")
+                   help=argparse.SUPPRESS)
+    g.add_argument("--tumble-amp", type=float, default=0.25, help=argparse.SUPPRESS)
     g.add_argument("--tumble-lock", type=str, default=None, metavar="A[,A...]",
-                   help="for --transform tumble: comma-separated axis indices to EXCLUDE from "
-                        "the slice-orientation rotation (they stay fixed while the other axes "
-                        "tumble). e.g. --tumble-lock 0,1 keeps world X and Y pinned. Only used "
-                        "with --transform tumble.")
+                   help=argparse.SUPPRESS)
     g.add_argument("--video", action=argparse.BooleanOptionalAction, default=True,
                    help="render a seamless morphing video per variant (the gyroid drifting "
                         "through its higher dimensions); the videos + .txt sidecars collect "
@@ -2693,6 +2664,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # (--dims >= 3, --oscillating >= 2, --freq > 0 are validated by their spec parsers.)
     if args.count < 1:
         raise SystemExit("error: --count must be >= 1")
+    # --transform (and its --bloom/--tumble-* satellites) is deprecated in favour of the
+    # unified --oscillate grammar; still fully supported, but nudge the user once. Checked
+    # before resolve_oscillate() runs, since that may synthesize args.transform itself.
+    if args.transform is not None:
+        print("[gyroid_nd] note: --transform (and --bloom/--bloom-amp/--tumble-*) is "
+              "deprecated; use --oscillate instead (see OSCILLATE_GRAMMAR.md). It still works.")
     # Resolve the unified --oscillate/--lock grammar (if used) onto the canonical
     # transform/bloom/tumble fields, or default --transform to 'drift'. Then normalize
     # --transform (one name or a comma/plus-separated layered set) to canonical form.
