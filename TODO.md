@@ -192,6 +192,28 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 - [ ] **P3.3** Widen `--surface` to the full `iso.py` TPMS (`gyroid`/`schwarz_p`/`schwarz_d`/`neovius`)
       + `pov.py` `POV_FUNCS`, with the N-D (`POV_ND_GENERALIZABLE`) and seamless-motion (periodic-only
       `drift`) guards. Per-surface shape params become `--oscillate`/`--lock` axes.
+      **Design locked (2026-07-18), building as a parallel POV emission path:**
+      (1) *Solid vs shell* — POV shapes render **solid** (`f - threshold`, no abs); a small tagged set of
+          genuinely-thin surfaces (klein_bottle, boy_surface, enneper, the `*_2d` curves, ...) render thin;
+          a `--shell` flag forces any shape hollow. TPMS keep the abs()-shell.
+      (2) *Gradient bound* — **per-function table** derived with SymPy + `mpmath.iv` (interval arithmetic)
+          from the exact bodies in `src/pov_functions.h` (auto-generated exact POV ports); render-test for
+          holes. Many are near-SDF (f_sphere/f_torus have |grad|~1); only the polynomial ones need work.
+      (3) *N-D* — **affine remap** of x/y/z for all 78 now (extra dims only reorient via tumble/rotate);
+          hand-written **true-N-D** forms for the 9 `POV_ND_GENERALIZABLE` deferred to **P3.4**. Named params
+          (from `pov_params`) become `--oscillate`/`--lock` axes inheriting P3.2b rate/phase.
+      (4) *Container* — per-function **bbox table** sizes bounded shapes; explicit `--radius` clips unbounded
+          ones (paraboloid/cylinders/helices). POV coords are **not** freq-scaled (unit authored scale).
+      (5) *Unspecified params* — default to a **random draw within the authored (lo,hi) range** per seed
+          (consistent with unnamed dims), governed by `--axis-default` (off=freeze at default, on=swing).
+      Build order (small green slices): (S1) `--surface` accepts POV names + solid-boundary emission at
+      dims=3 with default params + conservative safe bound + explicit radius, wired through build_scene;
+      (S2) SymPy/interval per-function gradient table; (S3) bbox container table + `--shell`; (S4) named
+      params as `--lock NAME=VALUE` fixed values; (S5) params as `--oscillate` swinger axes; (S6) affine
+      remap for dims>3; (S7) `--axis-default` random-draw for unspecified params.
+- [ ] **P3.4** True-N-D forms for the 9 `POV_ND_GENERALIZABLE` funcs (hand-written symmetric N-D FTSL,
+      bypassing the 3-coord `f_*` builtins; must match the `f_*` call at N=3). Makes the nd_pov/affine_pov
+      split real. After P3.3.
 - [ ] **P3.5** Ordered / overlapping N-D tumble (design captured 2026-07-18; do *after* P3.3, it's
       orthogonal to the surface library). Today's `tumble` is confined to a set of **disjoint** Givens
       planes (`pick_variant` lines ~1328-1353) — i.e. a **maximal torus of SO(N)**, a commuting abelian
