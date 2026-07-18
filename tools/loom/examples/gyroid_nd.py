@@ -1360,6 +1360,16 @@ def pick_variant(seed: int, args: argparse.Namespace,
 
     surface = resolve_surface(getattr(args, "surface", "gyroid"))
     pov_values = pov_default_values(surface) if _is_pov_surface(surface) else ()
+    # S4: apply any `--lock NAME=VALUE` shape-param pins, overriding the authored default in the
+    # right call-order slot (names/ranges were validated once in main()).
+    locks = getattr(args, "pov_param_locks", None)
+    if pov_values and locks:
+        amap = _pov_param_axis_map(surface)
+        pv = list(pov_values)
+        for nm, val in locks.items():
+            if nm in amap:
+                pv[amap[nm][0]] = float(val)
+        pov_values = tuple(pv)
     return Variant(seed=seed, dims=D, freq=freq, threshold=args.threshold,
                    thickness=args.thickness, pinned=getattr(args, "pin_axes", True),
                    bloom_params=bloom_params, bloom_amp=getattr(args, "bloom_amp", 1.0),
@@ -1690,6 +1700,79 @@ def pov_default_values(name: str) -> Tuple[float, ...]:
     return tuple(default for _axis, _desc, default, _rng in pov_params(name))
 
 
+def _pov_param_axis_map(name: str) -> Dict[str, Tuple[int, float, float]]:
+    """axis-name -> (call-order index, lo, hi) for POV builtin ``name``'s named shape params.
+    Used to resolve a ``--lock NAME=VALUE`` pin (S4) to the right slot in ``pov_values``."""
+    return {axis: (i, lo, hi)
+            for i, (axis, _desc, _default, (lo, hi)) in enumerate(pov_params(name))}
+
+
+def _is_pov_param_lock_token(tok: str) -> bool:
+    """True if a ``--lock`` token is a POV shape-param pin ``NAME=VALUE`` (the motion/axis
+    grammar never uses ``=``, so this is unambiguous)."""
+    return "=" in tok
+
+
+def resolve_pov_param_locks(args: argparse.Namespace) -> None:
+    """Extract ``--lock NAME=VALUE`` POV shape-param pins from ``args.lock`` and validate them
+    against the resolved ``args.surface`` (S4).
+
+    Mutates ``args`` in place: sets ``args.pov_param_locks`` (``{axis_name: value}``) and strips
+    the pin tokens out of ``args.lock`` so the motion/axis grammar (which never uses ``=``) never
+    sees them; a pins-only ``--lock`` collapses to ``None`` so it doesn't engage that grammar or
+    trip the ``--transform``/``--oscillate`` mutual-exclusion.  Raises :class:`SystemExit` for a
+    pin on a non-POV surface or for an unknown param name; warns (once) on an out-of-range value.
+    Idempotent-safe: only processes tokens still carrying ``=``.
+    """
+    args.pov_param_locks = getattr(args, "pov_param_locks", None) or {}
+    raw_lock = getattr(args, "lock", None)
+    if raw_lock:
+        kept = []
+        for tok in raw_lock:
+            if _is_pov_param_lock_token(tok):
+                nm, val = _parse_pov_param_lock(tok)
+                args.pov_param_locks[nm] = val
+            else:
+                kept.append(tok)
+        args.lock = kept or None
+    if not args.pov_param_locks:
+        return
+    surface = resolve_surface(getattr(args, "surface", "gyroid"))
+    if not _is_pov_surface(surface):
+        raise SystemExit(
+            f"error: --lock NAME=VALUE pins a POV surface shape param, but --surface "
+            f"{surface!r} is not a POV builtin (it has no named shape params; use "
+            f"--freq/--threshold/--thickness for a TPMS).")
+    amap = _pov_param_axis_map(surface)
+    for nm, val in args.pov_param_locks.items():
+        if nm not in amap:
+            valid = ", ".join(amap.keys()) or "(none)"
+            raise SystemExit(
+                f"error: --lock {nm}=...: --surface {surface} has no shape param {nm!r} "
+                f"(its params: {valid}; see --surface-help {surface}).")
+        _idx, lo, hi = amap[nm]
+        if not (lo <= val <= hi):
+            print(f"[gyroid_nd] warning: --lock {nm}={fmt(val)} is outside {surface}'s "
+                  f"authored range [{fmt(lo)}, {fmt(hi)}] (honored anyway).")
+
+
+def _parse_pov_param_lock(tok: str) -> Tuple[str, float]:
+    """Parse a ``NAME=VALUE`` ``--lock`` token into ``(axis_name, value)``.  ``VALUE`` may be an
+    arithmetic expression (numbers, ``pi``/``tau``/``e``, ``+ - * / ** %``), like an
+    ``--oscillate`` amplitude.  Raises :class:`SystemExit` on a malformed token."""
+    name, _eq, val = tok.partition("=")
+    name = name.strip().lower()
+    if not name:
+        raise SystemExit(f"error: --lock {tok!r}: missing parameter name before '='")
+    if not val.strip():
+        raise SystemExit(f"error: --lock {tok!r}: missing value after '='")
+    try:
+        value = _osc_eval_num(val, "value")
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"error: --lock {tok!r}: {exc}")
+    return name, value
+
+
 def _pov_call_expr(name: str, values: Tuple[float, ...],
                    coords: Tuple[str, str, str] = ("x", "y", "z")) -> str:
     """Emit the FTSL call string for POV builtin ``name`` on ``coords`` with shape params
@@ -1766,8 +1849,8 @@ def _surface_help_text(name: str) -> str:
     if not params:
         lines.append("  params  : none (a 0-parameter helper; just the 3 coordinates)")
     else:
-        lines.append(f"  params  : {len(params)} shape parameter(s) - each is a "
-                     f"--oscillate/--lock axis once wired (P3.3):")
+        lines.append(f"  params  : {len(params)} shape parameter(s) - pin one with "
+                     f"--lock NAME=VALUE (e.g. --lock {params[0][0]}={fmt(params[0][2])}):")
         for axis, pdesc, default, (lo, hi) in params:
             lines.append(f"    {axis:<10} {pdesc}  (default {fmt(default)}, "
                          f"range [{fmt(lo)}, {fmt(hi)}])")
@@ -3179,7 +3262,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "envelope's clock is fixed.)")
     g.add_argument("--lock", nargs="*", default=None, metavar="GROUP",
                    help="same grammar as --oscillate, naming axes to HOLD FIXED. Currently dim "
-                        "indices map to the tumble lock (axes excluded from the slice rotation).")
+                        "indices map to the tumble lock (axes excluded from the slice rotation). "
+                        "A 'NAME=VALUE' token instead PINS a POV surface shape param to a fixed "
+                        "value (e.g. --lock minor=0.5; see --surface-help NAME for a surface's "
+                        "param names/ranges); space-separated pins set several (--lock rx=2 rz=0.5).")
     # Deprecated legacy motion flags (superseded by --oscillate; see OSCILLATE_GRAMMAR.md).
     # Still fully supported — using --transform prints a one-line deprecation note (main) —
     # but hidden from --help so the grammar in --oscillate is the single documented surface.
@@ -3322,6 +3408,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[gyroid_nd] note: {' and '.join(ignored)} only affect --surface gyroid "
                   f"(the pairwise coupling graph); ignored for --surface {args.surface} "
                   f"(no coupling edges to wire).")
+
+    # S4: pull POV shape-param value pins (`--lock NAME=VALUE`) out of --lock and validate them
+    # against the (already-resolved) surface.  Space separates pins — `--lock rx=2 minor=0.5`
+    # sets two — while comma keeps its composite-oscillator meaning in the rest of the grammar.
+    resolve_pov_param_locks(args)
 
     # Resolve --out to an absolute path (relative to the invoking cwd): the frames are
     # rendered by ftrace with cwd = repo_root, so a relative outdir would be written under

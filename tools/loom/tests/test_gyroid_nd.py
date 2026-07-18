@@ -707,6 +707,8 @@ def _pv(*argv, seed=1):
         g.parse_pair_lock(s, on, off)
     args.pair_on = frozenset(on)
     args.pair_off = frozenset(off)
+    args.surface = g.resolve_surface(getattr(args, "surface", "gyroid"))
+    g.resolve_pov_param_locks(args)             # S4: extract/validate --lock NAME=VALUE pins
     locks = {}
     for s in args.axis:
         g.parse_axis_lock(s, locks)
@@ -1406,6 +1408,101 @@ def test_shell_flag_defaults_off_and_tpms_ignores_it():
     solid_default = _scene_body(v)
     # TPMS already emits abs()-shells; passing shell=True doesn't alter its structure
     assert _scene_body(v, shell=True) == solid_default
+
+
+# ---------------------------------------------------------------------------
+# POV shape-param value pins (P3.3 slice S4): --lock NAME=VALUE fixes one of a
+# POV surface's named shape params, overriding its authored default.
+# ---------------------------------------------------------------------------
+
+def _resolved_args(*argv):
+    """argparse args with --surface resolved and POV param pins extracted (main()'s wiring)."""
+    args = _args(*argv)
+    args.surface = g.resolve_surface(getattr(args, "surface", "gyroid"))
+    g.resolve_pov_param_locks(args)
+    return args
+
+
+def test_lock_pins_pov_param_value():
+    v = _pv("--surface", "f_torus", "--lock", "minor=0.5")
+    assert v.pov_values == (1.0, 0.5)                 # default minor 0.25 overridden
+    # the un-pinned param keeps its default
+    assert v.pov_values[0] == g.pov_default_values("f_torus")[0]
+
+
+def test_lock_pins_multiple_params_space_separated():
+    v = _pv("--surface", "f_ellipsoid", "--lock", "rx=2", "rz=0.5")
+    assert v.pov_values == (2.0, 1.0, 0.5)
+
+
+def test_lock_param_value_is_an_expression():
+    v = _pv("--surface", "f_torus", "--lock", "minor=1/4")
+    assert v.pov_values == (1.0, 0.25)
+
+
+def test_lock_param_coexists_with_transform():
+    # a POV param pin is orthogonal to the motion grammar, so it doesn't trip the
+    # --transform/--oscillate mutual-exclusion
+    v = _pv("--surface", "f_ellipsoid", "--transform", "tumble", "--lock", "ry=3")
+    assert v.pov_values == (1.0, 3.0, 1.0)
+
+
+def test_lock_unknown_param_errors():
+    with pytest.raises(SystemExit):
+        _pv("--surface", "f_torus", "--lock", "bogus=1")
+
+
+def test_lock_param_on_non_pov_surface_errors():
+    with pytest.raises(SystemExit):
+        _pv("--surface", "gyroid", "--lock", "major=1")
+
+
+def test_lock_malformed_pin_errors():
+    with pytest.raises(SystemExit):
+        _pv("--surface", "f_torus", "--lock", "minor=")      # missing value
+    with pytest.raises(SystemExit):
+        _pv("--surface", "f_torus", "--lock", "=2")          # missing name
+
+
+def test_lock_out_of_range_value_is_honored_with_warning():
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        v = _pv("--surface", "f_torus", "--lock", "minor=9")  # range [0.02, 2]
+    assert v.pov_values == (1.0, 9.0)                 # honored (user intent respected)
+    assert "outside" in buf.getvalue() and "range" in buf.getvalue()
+
+
+def test_resolve_splits_pins_from_motion_tokens():
+    # a mixed --lock keeps motion/dim tokens in args.lock and pulls the NAME=VALUE pins out
+    args = _resolved_args("--surface", "f_torus", "--lock", "minor=0.5", "1")
+    assert args.pov_param_locks == {"minor": 0.5}
+    assert args.lock == ["1"]
+
+
+def test_resolve_pins_only_lock_collapses_to_none():
+    # a --lock carrying ONLY pins must not engage the motion grammar (args.lock -> None)
+    args = _resolved_args("--surface", "f_ellipsoid", "--lock", "rx=2")
+    assert args.pov_param_locks == {"rx": 2.0}
+    assert args.lock is None
+
+
+def test_pinned_param_flows_into_emitted_call():
+    v = _pv("--surface", "f_torus", "--lock", "minor=0.5")
+    body = _auto_body(v)
+    assert "f_torus(x,y,z,1,0.5)" in body
+
+
+def test_pinned_param_resizes_autosized_container():
+    # a longer ellipsoid semi-axis (small P -> 1/P big) must grow the auto-sized container
+    v_default = _pv("--surface", "f_ellipsoid")
+    v_long = _pv("--surface", "f_ellipsoid", "--lock", "rz=0.3")   # z semi-axis ~3.3
+    assert _emitted_clip_radius(_auto_body(v_long)) > _emitted_clip_radius(_auto_body(v_default)) + 1.0
+
+
+def test_no_pins_leaves_pov_values_at_defaults():
+    v = _pv("--surface", "f_torus")
+    assert v.pov_values == g.pov_default_values("f_torus")
 
 
 # ---------------------------------------------------------------------------

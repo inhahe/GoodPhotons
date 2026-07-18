@@ -246,8 +246,19 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       cross_cap/… + any `*_2d` curve) shells by default. TPMS keep their own abs-shell and the 1.3 default,
       untouched by `--shell`/None-radius. 20 new tests (417 loom green); render-validated f_hunt_surface
       shows its full surface (not a clipped disk).
-      Still: (S4) named params as `--lock NAME=VALUE` fixed values;
-      (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
+      **(S4) done 2026-07-18** — POV shape params pinnable via `--lock NAME=VALUE`. Each POV surface has
+      named shape params (`pov_params(name)` → `(axis, desc, default, (lo,hi))`, e.g. f_torus: `major`/
+      `minor`; f_ellipsoid: `rx`/`ry`/`rz`); `--lock major=1.6` overrides that param's default. Rides on
+      the existing `--lock` flag but stays unambiguous: the motion grammar never uses `=`, so any
+      `NAME=VALUE` token is a param pin and everything else (commas, `tumble`, `spin`, …) keeps its
+      motion meaning — `resolve_pov_param_locks(args)` splits the two, pins go to `args.pov_param_locks`,
+      the rest stays on `args.lock` (collapsing to None if only pins were given). Space-separates multiple
+      pins (`--lock "rx=2 rz=0.5"`); values are full `_osc_eval_num` expressions. Validation: pin on a
+      non-POV surface, or an unknown param name, errors (SystemExit, lists valid names); out-of-range
+      value warns but is honored. `pick_variant` applies pins onto `pov_default_values` before emit, so a
+      pinned semi-axis both flows into the emitted `f_*` call *and* resizes the S3 auto-sized container.
+      13 new tests (430 loom green).
+      Still: (S5) params as `--oscillate` swinger axes; (S6) affine remap for dims>3; (S7) `--axis-default`
       random-draw for unspecified params. **Note for S5:** the S2 bound is per (name, params, box) and
       cached — animating a param means recomputing it per frame (or bounding once over the param range).
       **Note for S4/S5:** container auto-size is also per (name, params) and cached — a param that moves the

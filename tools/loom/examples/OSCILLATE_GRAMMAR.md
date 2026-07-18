@@ -512,6 +512,25 @@ disk. Still to come: S4 `--lock NAME=VALUE`, S5 params as `--oscillate` swingers
 S7 `--axis-default` random param draw. (Note: like the S2 bound, the auto-size is cached per
 `(name, params)`, so an animated param that moves the surface's extent will need a per-frame recompute.)
 
+**P3.3 slice S4 — pin shape params with `--lock NAME=VALUE` (done 2026-07-18):** every POV surface
+carries named shape params (`pov_params(name)` → `(axis, desc, default, (lo, hi))`; e.g. `f_torus`
+has `major` / `minor`, `f_ellipsoid` has `rx` / `ry` / `rz`), and you can now override any of them at
+render time: `--lock minor=0.4`, `--lock "rx=2 rz=0.5"`. This **reuses the existing `--lock` flag**
+without colliding with its motion grammar, because that grammar never uses `=` — so any token of the
+form `NAME=VALUE` is unambiguously a *param pin*, while everything else (commas, `tumble`, `spin`,
+axis names…) keeps its motion meaning. `resolve_pov_param_locks(args)` splits the `--lock` string into
+the two worlds: `=`-tokens become `args.pov_param_locks` (a `{name: value}` map), the remaining tokens
+stay on `args.lock` (collapsing to `None` if only pins were given, so lock-motion is untouched). Pins
+space-separate (`"rx=2 rz=0.5"`) and their values are full `_osc_eval_num` expressions, so
+`--lock "minor=0.1+0.2"` works. Validation is strict: a pin on a **non-POV** surface errors, an
+**unknown** param name errors (and lists the valid names for that surface), and an **out-of-range**
+value warns but is still honored (you may deliberately push a param past its authored range).
+`pick_variant` applies the pins onto `pov_default_values(surface)` before emitting, so a pinned
+semi-axis both flows into the emitted `f_*(...)` call **and** feeds S3's `surface_bbox`, resizing the
+auto-sized container to match (e.g. pinning `rz=0.3` shrinks the clip sphere accordingly). 13 new
+tests (430 loom green). Still to come: S5 params as `--oscillate` swingers, S6 affine N-D remap,
+S7 `--axis-default` random param draw.
+
 ---
 
 ## 8. GPU isosurface rendering — kill the per-frame tessellation cost
