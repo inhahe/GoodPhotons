@@ -454,7 +454,23 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 
 ## E. Feature ideas captured 2026-07-18  *(user-proposed; design-captured, not yet scheduled)*
 
-### E1 — Procedural (function-defined) skin, UV-space  *(ftrace; small–medium, self-contained)*
+### E1 — Procedural (function-defined) skin, UV-space  *(ftrace; small–medium, self-contained)*  **DONE 2026-07-18**
+**Implemented (option b — three r/g/b sub-expressions baked as a texture).** A `texture "name"` block
+may now give `rgb "r(u,v)" "g(u,v)" "b(u,v)"` (three quoted ftsl pattern expressions of the surface
+`u,v`, constant `pi`) in place of `file`. ftrace compiles them with `compilePatternExpr` and bakes them
+**once at load** to a `res`×`res` (default 512, 1–8192) **linear** RGB grid via `patternEval` over the
+UV grid (matching `sampleRgb`'s `(1-v)` flip; each output clamped to `[0,1]`), then runs `buildReflCoeff`
+— so the result flows through the *exact same* texture pipeline as an image skin (UV-wrap, Jakob-Hanika
+spectral upsampling, triplanar, GPU, raster; `reflect texture:<name>` binds it unchanged) with **zero
+`render_cuda.cu` changes** and no per-hit fit. This chose the bake-to-grid path over per-hit JH fit (far
+too slow — 40-iter Gauss-Newton) and on-demand eval (no benefit for bounded UV). Fills the third square
+of the skin matrix: image skins × 3-D-space procedural patterns × **UV-space procedurals**. `src/ftsl.h`
+`addTexture` branches on the `rgb` statement; `scenes/procskin.ftsl` render-validated (red=u L→R,
+green=v bottom→top, four blue `sin(2π4u)` stripes — all orientation checks pass). loom: `ProcTexture` /
+`func_skin(name, r, g, b, …)` in `scene.py` (routed into the texture bucket so it emits before its
+material), exported from `loom`, 5 new emit tests (550 loom green). Docs: FTSL.md §5.1,
+docs/scene-language.md §9.1, README Textures.
+
 **Idea.** Let a skin be defined by a *function* `f(u,v)` evaluated on demand instead of a pre-drawn
 image, but applied through the **exact same UV-wrap machinery** an image skin uses — poll `f(u,v)` in
 place of `image(u,v)` for each hit's interpolated UV. **Verdict: worth adding.** It's a genuine gap:
@@ -703,3 +719,8 @@ real 1 s 220+660 Hz WAV.
   stdlib `wave`). Exported from `loom`. 30 new tests (WAV round-trips, dither determinism, cursor≡add,
   seamless-loop render); 545 loom green; real 220+660 Hz WAV smoke-validated. Next: E1 (UV-space
   procedural skin).
+- 2026-07-18: **E1 done** (see §E1) — UV-space procedural color skin, option b (three r/g/b
+  sub-expressions baked to a linear RGB grid at load, then run through the whole existing texture
+  pipeline; zero GPU changes). `src/ftsl.h` `addTexture` `rgb`-branch + `compilePatternExpr`/`patternEval`
+  bake; loom `ProcTexture`/`func_skin`; `scenes/procskin.ftsl` render-validated (all orientation checks
+  pass). 5 new loom tests, 550 loom green. Next: G3 (PatOp::MatMulAdd matrix intrinsic).

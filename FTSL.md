@@ -178,14 +178,41 @@ texture "wood" {
 }
 ```
 
-- `file` is required; the path resolves relative to the working directory.
+- `file` is required (unless `rgb` is given, below); the path resolves relative to
+  the working directory.
 - Reflectance coefficients (Jakob-Hanika) are precomputed at load.
 - `palette { <index> <spectrum-expr> … }` turns the texture's red channel into an
-  indexed spectral lookup (nearest, no upsampling). Indices 0–255.
+  indexed spectral lookup (nearest, no upsampling). Indices 0–255. (File textures only.)
 
 Bind a texture to a material with `reflect texture:wood` (albedo), or to a scalar
 parameter with `roughness texture:<name>` / `film_thickness_map texture:<name>` /
 `weight_map texture:<name>`.
+
+### 5.1 Procedural (function-defined) UV skins
+
+Instead of a bitmap `file`, a texture's albedo may be defined by **three ftsl
+expressions** of the surface UV coordinates — a UV-space procedural:
+
+```
+texture "grad" {
+    rgb "u" "v" "0.5+0.5*sin(2*pi*4*u)"   # r(u,v)  g(u,v)  b(u,v), each quoted
+    res 512                                # bake resolution (default 512, 1–8192)
+    filter bilinear                        # bilinear (default) | nearest
+    wrap clamp                             # repeat | clamp (default) | mirror
+}
+```
+
+- The three expressions use the [`pattern`](#6-pattern--procedural-scalar-fields)
+  infix grammar (`sin cos sqrt min max clamp mix step smoothstep …`, the constant
+  `pi`); their variables are the surface `u, v` (world-space `x y z` carry no value
+  in UV space). Each output is clamped to `[0,1]` and interpreted as **linear** RGB.
+- The skin is baked **once at load** to a `res`×`res` linear grid, then flows through
+  the *exact same* pipeline as an image texture — UV-wrap, Jakob-Hanika spectral
+  upsampling, triplanar, GPU and raster paths all apply, and a material binds it
+  unchanged with `reflect texture:<name>`.
+- `res`, `filter`, `wrap` behave as for file textures. `palette` and `encoding` do
+  not apply (the grid is already linear RGB). loom: `loom.ProcTexture` /
+  `loom.func_skin(name, r, g, b, …)`.
 
 ---
 

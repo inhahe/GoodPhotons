@@ -1302,6 +1302,16 @@ spectra, looked up nearest (CPU only; GPU falls back). A 2-child `mix` can take 
 **blend mask** (`weight_map texture:<name>`) that selects child 0 vs child 1 per hit.
 A scalar map on `ior` remains future work.
 
+A texture's albedo can also be **procedural in UV space**: in place of `file`, give
+three quoted ftsl expressions of the surface UV — `rgb "r(u,v)" "g(u,v)" "b(u,v)"`
+(the pattern infix grammar; variables `u v`, constant `pi`; each output clamped to
+`[0,1]`, interpreted as linear RGB). ftrace bakes them once at load to a `res`×`res`
+grid (default 512) and then treats it exactly like an image texture — the same
+UV-wrap, Jakob–Hanika upsampling, triplanar, GPU and raster paths, and
+`reflect texture:<name>` binding all apply unchanged. This completes the skin matrix
+alongside image skins and 3-D-space procedural patterns: a **UV-space procedural**.
+See `scenes/procskin.ftsl` (loom: `ProcTexture` / `func_skin`).
+
 ## Procedural patterns (math-driven materials)
 
 A `pattern "name" { … }` block compiles a **scalar field** — a function of the hit

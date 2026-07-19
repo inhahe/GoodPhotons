@@ -872,14 +872,9 @@ private:
     bool addTexture(const Block& b, Loaded& L) {
         if (b.name.empty()) { fail("texture needs a \"name\""); return false; }
         if (textureIndex_.count(b.name)) { fail("duplicate texture name '" + b.name + "'"); return false; }
-        std::string file = strOf(b, "file");
-        if (file.empty()) { fail("texture '" + b.name + "' needs a file"); return false; }
         Texture tex;
         tex.name = b.name;
-        std::string enc = strOf(b, "encoding", "srgb");
-        if      (enc == "srgb")   tex.encoding = TexEncoding::sRGB;
-        else if (enc == "linear") tex.encoding = TexEncoding::Linear;
-        else { fail("texture '" + b.name + "': unknown encoding '" + enc + "' (srgb|linear)"); return false; }
+        // Filter + wrap are common to both a file image and a procedural skin.
         std::string flt = strOf(b, "filter", "bilinear");
         if      (flt == "bilinear") tex.filter = TexFilter::Bilinear;
         else if (flt == "nearest")  tex.filter = TexFilter::Nearest;
@@ -889,29 +884,74 @@ private:
         else if (wr == "clamp")  tex.wrap = TexWrap::Clamp;
         else if (wr == "mirror") tex.wrap = TexWrap::Mirror;
         else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
-        std::string terr;
-        if (!tex.load(file, terr)) { fail("texture '" + b.name + "': " + terr); return false; }
-        // Optional indexed-spectral palette (§9.3): `palette { 0 spectrum:navy 1 ... }`.
-        // The nested block's flat word dump is (index, spectrum-ref) pairs in order; we
-        // resolve each ref to a Spectrum now and size the palette to max-index+1. The
-        // texture's red channel then selects an entry per texel (nearest, no upsample).
-        if (const Stmt* ps = find(b, "palette")) {
-            if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
-            const auto& w = ps->val.block->words;
-            if (w.empty() || (w.size() % 2) != 0) {
-                fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
+
+        const Stmt* rgbS = find(b, "rgb");
+        if (rgbS) {
+            // Procedural (function-defined) UV-space skin (E1): three ftsl expressions
+            // r(u,v) g(u,v) b(u,v) over the surface UV, baked once to a `res`x`res`
+            // LINEAR RGB grid at load, then treated as an ordinary texture — so the
+            // whole existing UV-wrap / Jakob-Hanika / triplanar / GPU / raster pipeline
+            // (and the `reflect texture:<name>` binding) applies unchanged with no
+            // per-hit fit cost. The expressions are functions of u,v (and constants);
+            // the world-space pattern variables x y z f nx ny nz r are 0 here since a
+            // UV image carries no world position.
+            if (rgbS->val.words.size() < 3) {
+                fail("texture '" + b.name + "': rgb needs three quoted exprs: rgb \"r(u,v)\" \"g(u,v)\" \"b(u,v)\""); return false;
             }
-            std::vector<std::pair<int, Spectrum>> entries;
-            int maxIdx = -1;
-            for (size_t k = 0; k + 1 < w.size(); k += 2) {
-                int idx = std::atoi(w[k].c_str());
-                if (idx < 0 || idx > 255) { fail("texture '" + b.name + "': palette index out of 0..255"); return false; }
-                Value ref; ref.words.push_back(w[k + 1]);
-                entries.emplace_back(idx, evalSpectrum(ref));
-                if (idx > maxIdx) maxIdx = idx;
+            std::vector<PatNode> pr, pg, pb; std::string perr;
+            if (!compilePatternExpr(rgbS->val.words[0], pr, perr)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[1], pg, perr)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[2], pb, perr)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            int res = (int)dblOf(b, "res", 512.0);
+            if (res < 1) res = 1; else if (res > 8192) res = 8192;
+            tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
+            tex.w = res; tex.h = res;
+            tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
+            auto cl = [](double t) { return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t); };
+            for (int y = 0; y < res; ++y) {
+                // Invert v to match sampleRgb's (1-v) flip so f(u,v) reads back at the
+                // surface UV (top-left storage, v=0 at image bottom / OBJ convention).
+                double v = 1.0 - (y + 0.5) / res;
+                for (int x = 0; x < res; ++x) {
+                    double u = (x + 0.5) / res;
+                    PatCtx c; c.u = u; c.v = v;
+                    double rr = patternEval(pr.data(), (int)pr.size(), c);
+                    double gg = patternEval(pg.data(), (int)pg.size(), c);
+                    double bb = patternEval(pb.data(), (int)pb.size(), c);
+                    tex.rgb[(size_t)y * res + x] = Vec3{cl(rr), cl(gg), cl(bb)};
+                }
             }
-            tex.palette.assign((size_t)maxIdx + 1, constantSpectrum(0.0));
-            for (auto& e : entries) tex.palette[(size_t)e.first] = e.second;
+        } else {
+            std::string file = strOf(b, "file");
+            if (file.empty()) { fail("texture '" + b.name + "' needs a file (or an `rgb \"r\" \"g\" \"b\"` expr triple)"); return false; }
+            std::string enc = strOf(b, "encoding", "srgb");
+            if      (enc == "srgb")   tex.encoding = TexEncoding::sRGB;
+            else if (enc == "linear") tex.encoding = TexEncoding::Linear;
+            else { fail("texture '" + b.name + "': unknown encoding '" + enc + "' (srgb|linear)"); return false; }
+            std::string terr;
+            if (!tex.load(file, terr)) { fail("texture '" + b.name + "': " + terr); return false; }
+            // Optional indexed-spectral palette (§9.3): `palette { 0 spectrum:navy 1 ... }`.
+            // The nested block's flat word dump is (index, spectrum-ref) pairs in order; we
+            // resolve each ref to a Spectrum now and size the palette to max-index+1. The
+            // texture's red channel then selects an entry per texel (nearest, no upsample).
+            if (const Stmt* ps = find(b, "palette")) {
+                if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
+                const auto& w = ps->val.block->words;
+                if (w.empty() || (w.size() % 2) != 0) {
+                    fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
+                }
+                std::vector<std::pair<int, Spectrum>> entries;
+                int maxIdx = -1;
+                for (size_t k = 0; k + 1 < w.size(); k += 2) {
+                    int idx = std::atoi(w[k].c_str());
+                    if (idx < 0 || idx > 255) { fail("texture '" + b.name + "': palette index out of 0..255"); return false; }
+                    Value ref; ref.words.push_back(w[k + 1]);
+                    entries.emplace_back(idx, evalSpectrum(ref));
+                    if (idx > maxIdx) maxIdx = idx;
+                }
+                tex.palette.assign((size_t)maxIdx + 1, constantSpectrum(0.0));
+                for (auto& e : entries) tex.palette[(size_t)e.first] = e.second;
+            }
         }
         tex.buildReflCoeff();   // precompute Jakob-Hanika reflectance coefficients (skipped for palette maps)
         int id = (int)L.scene.textures.size();

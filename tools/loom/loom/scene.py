@@ -108,6 +108,66 @@ class Material(Element):
         return f'material "{self.name}" {{ ' + "  ".join(parts) + " }"
 
 
+class ProcTexture(Element):
+    """A **procedural (function-defined) UV-space skin**: ``texture "name" { rgb
+    "r(u,v)" "g(u,v)" "b(u,v)" res N … }``.
+
+    Instead of a bitmap file, the albedo is three ftsl expressions of the surface
+    UV coordinates ``u`` and ``v`` (and constants / ``pi``), using the ftsl pattern
+    grammar (``sin cos sqrt min max clamp mix step smoothstep noise`` …).  ftrace
+    bakes them once to a ``res``×``res`` **linear** RGB grid at load and then treats
+    the result exactly like an image texture — so the same UV-wrap, Jakob-Hanika
+    spectral upsampling, triplanar, GPU and raster paths apply, and a material binds
+    it with the usual ``reflect texture:<name>``.  The expressions are functions of
+    ``u, v`` only (the world-space pattern variables carry no value in UV space).
+    Like :class:`Texture`, it holds no modulators and is emitted once.  Use
+    :func:`func_skin` to make the texture *and* its material together.
+    """
+
+    def __init__(self, name: str, r: str, g: str, b: str, *, res: int = 512,
+                 filter: str = "bilinear", wrap: str = "clamp") -> None:
+        self.name = name
+        self.r = str(r)
+        self.g = str(g)
+        self.b = str(b)
+        res = int(res)
+        if res < 1:
+            raise ValueError("texture res must be >= 1")
+        if filter not in ("bilinear", "nearest"):
+            raise ValueError('texture filter must be "bilinear" or "nearest"')
+        if wrap not in ("repeat", "clamp", "mirror"):
+            raise ValueError('texture wrap must be "repeat", "clamp" or "mirror"')
+        self.res = res
+        self.filter = filter
+        self.wrap = wrap
+
+    def roots(self) -> List:
+        return []
+
+    def emit(self, ctx: EmitCtx) -> str:
+        return (f'texture "{self.name}" {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
+                f'res {self.res}  filter {self.filter}  wrap {self.wrap} }}')
+
+
+def func_skin(name: str, r: str, g: str, b: str, *, mtype: str = "diffuse",
+              res: int = 512, filter: str = "bilinear", wrap: str = "clamp",
+              **props) -> Tuple["ProcTexture", "Material"]:
+    """Wrap a **procedural** UV-space skin over a surface: build the
+    :class:`ProcTexture` (three ``r(u,v) g(u,v) b(u,v)`` ftsl expressions) **and** a
+    :class:`Material` bound to it::
+
+        scene.add(*func_skin("stripes", "u", "v", "0.5+0.5*sin(2*pi*8*u)"),
+                  Sphere((0, 0, 0), 1, "stripes"))
+
+    The material's ``reflect`` is the baked skin (ftrace's ``reflect texture:<name>``);
+    extra ``props`` (e.g. ``roughness=…``) pass through, and the texture and material
+    share ``name``.
+    """
+    tex = ProcTexture(name, r, g, b, res=res, filter=filter, wrap=wrap)
+    mat = Material(name, mtype, reflect=f"texture:{name}", **props)
+    return tex, mat
+
+
 def skin(name: str, image, *, mtype: str = "diffuse", encoding: str = "srgb",
          filter: str = "bilinear", wrap: str = "repeat",
          **props) -> Tuple["Texture", "Material"]:
@@ -425,7 +485,7 @@ class Scene:
         for e in elems:
             # Textures/patterns are emitted before the materials that bind them
             # (ftrace resolves them in an earlier pass, but keep the text tidy).
-            if isinstance(e, Texture):
+            if isinstance(e, (Texture, ProcTexture)):
                 self.textures.append(e)
             elif isinstance(e, Pattern):
                 self.patterns.append(e)

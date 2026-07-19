@@ -253,6 +253,61 @@ def test_texture_rejects_bad_options():
         raise AssertionError(f"expected ValueError for {bad}")
 
 
+# --- procedural (function-defined) UV skins ---------------------------------
+
+def test_func_skin_makes_proctexture_and_material():
+    from loom import ProcTexture, func_skin
+    tex, mat = func_skin("stripes", "u", "v", "0.5+0.5*sin(2*pi*8*u)",
+                         roughness=0.3)
+    assert isinstance(tex, ProcTexture)
+    assert isinstance(mat, Material)
+    assert (tex.name, mat.name) == ("stripes", "stripes")
+    assert (tex.r, tex.g, tex.b) == ("u", "v", "0.5+0.5*sin(2*pi*8*u)")
+
+
+def test_func_skin_emits_rgb_block_and_binding():
+    from loom import func_skin
+    sc = Scene(Camera(eye=(0, 0, 4), look_at=(0, 0, 0)))
+    sc.add(*func_skin("grad", "u", "v", "0.5", res=256, filter="nearest",
+                      wrap="repeat"),
+           Sphere((0, 0, 0), 1.0, "grad"))
+    sc.check_cycles()
+    out = sc.emit(_clk(), Cache())
+    assert 'texture "grad" { rgb "u" "v" "0.5"' in out
+    assert "res 256" in out
+    assert "filter nearest" in out
+    assert "wrap repeat" in out
+    assert "reflect texture:grad" in out
+    # no bitmap file for a procedural skin
+    assert "file " not in out
+    # texture block precedes the material that binds it
+    assert out.index('texture "grad"') < out.index('material "grad"')
+
+
+def test_proctexture_defaults_and_no_roots():
+    from loom import ProcTexture
+    tex = ProcTexture("t", "u", "v", "0")
+    assert (tex.res, tex.filter, tex.wrap) == (512, "bilinear", "clamp")
+    assert tex.roots() == []
+
+
+def test_proctexture_coerces_non_string_exprs():
+    from loom import ProcTexture
+    tex = ProcTexture("t", 0.25, 1, "u")
+    assert (tex.r, tex.g, tex.b) == ("0.25", "1", "u")
+
+
+def test_proctexture_rejects_bad_options():
+    from loom import ProcTexture
+    bad_opts = [dict(res=0), dict(filter="bogus"), dict(wrap="bogus")]
+    for bad in bad_opts:
+        try:
+            ProcTexture("x", "u", "v", "0", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad}")
+
+
 def _run_all() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
