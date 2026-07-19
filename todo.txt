@@ -1,24 +1,103 @@
-did we ever make the rasterizer show glass as clear on the gpu? and there was one other thing it wouldn't do on the gpu, i don't remember what.
 
-^ pending
+by the way, gold(v*2) works too, right?
 
-test skin support
+
+
+
+
+
+
+
+
+
+
+
+
+oh, one other thing.
+let's say i have
+material "gold" = [spectrum "color" = [0 0 0, 1 1 1](u), reflect "reflectance" = .5*a], i should be able to assign gold to a material with the following syntax: `material = gold(u=v, a=1)` or also `material = gold(u=v a=1)`
+
+and another thing, i shouldn't have to name something if i don't want, so let's be able to omit "color" and "reflectance" in the above entirely.
+
+you said a reference is today declared `spectrum "steel" = rgb 0.55 0.57 0.60`, but then you suggested `rgb = spectrum [ 0.55 .57 .6,  .9 .75 .3,  .85 .45 .3 ]`, why not use the same syntax? (though you seem to be indicating that rgb is currently a keyword to declare a single color tuple, so we can't use that as a name) `spectrum "color"= rgb 0.55 0.57 .6`, so we could do `material "gold" = [[spectrum "color" = rgb .55 .57 .6], reflect "reflectance" = .5]]`, then we could use gold for any object, but we could also use gold.color and gold.reflectance if we wanted to. and if we were declaring an array, like say one to base albedo on, we could do `material "gold" = [[spectrum "color" = rgb .55 .57 .6, .2:0 0 0, 1, 1.1, 1.2], reflect "reflectance" = .5*a]]` (2:0 0 0 indicates where in the interpolated spread that 0 0 0 comes, at point 2 - that was your idea), but then how would we say that "color" is to be indexed by u? maybe it should be the same as reflectance, so do `[spectrum "color" = [rgb .55 .57 .6, .2:0 0 0, 1, 1.1, 1.2](u)]. but we still need a way to declare arbitrary arrays, maybe like `array "some_array" = [[[1 2 3] [3 4 5]] [5 6 7] [8 9 10]] [[11 12 13] [13 14 15]] [15 16 17] [18 19 20]]]. (notice that there's no commas - any of [], comma or space can descend the hierarchy in any order) but when we use that, what's the syntax to say that we look up the a'th index of that array if we want to attach it to albedo? 
+
+
+
+
+also make sure you caught the subtlety that dimensions (like rgb) can be defined as [rgb 0 0 0, 0 1 0, 1 1 1], etc. - meaning that going down the hierarchy of sub-arrays/elements can happen through eitther "[]", comma, or space 
+
+What do do if a curve defined through a field goes out of bounds? (only relevant for grid view, also maybe if the number of dimensions is wrong)
+
+What would be a good pipeline to set up to allow mulitiple changing isosurfaces (from gyroid_nd.py) to be put into one scene? How about gyroid_nd.py outputs to one self-contained loom.py object (might have to port ftrace's new data structures to loom to make that work) within one self-contained room object, and a new loom.py file can be made to load the room object and each isosurface object and change their locations within the room?
+
+
+
+
+
+
+------
+
+Let's make a rasterizer viewer for loom now. Make it list objects in a given loom file to select and view them. For N-D curves, show the curve in 3-D, but allow the user to rotate it on any axis, and allow wall-eyed and cross-eyed stereoscopic viewing and also red-cyan 3d glasses viewing. Put markers along the curve to show curve index. Show every dimensional curve and every tacked on curve in graphs below the image with the same markers but along the bottom of them. Make them scrollable left and right to see the entire thing. Scroll all of them together, not individually. 
+
+For the SweptMesh, tesselate the SweptMesh and view it in the rasterizer. If the user rotates it along a 3d axis, just rotate it in the renderer without re-tesselating. If the user rotates it along any other axis, re-tesselate it (decoupled from the UI thread so it doesn't interfere with his sliding the sliders) and show it again. Show it with any texture it defines (image or formula). If Loom doesn't allow defining textures, add that capability. 
+
+For the modulator DAG, show an arbitrary, well-laid-out arrangement of the DAG with info on each node showing the function that modulates it and an identifier for the node so that you know which variable in the function refers to which node that's connected to it. 
+
+For grids and scatterplots, I'm not sure how to show grids, but scatterplots can at least have their positions shown using the same 3-d-viewing mechanisms, with the ability to click on any particular defined point to see its location and value values.
+
+For loom, add the ability to define a curve through a {{scatterplot field or a grid field} {with the contiguous/interpolated virtual N-D volumes from which you can sample values from coordinate inputs}. You use the curve by polling its N spatial dimensions and the field value at those spatial dimensions a particular curve-progression index.
+
+Should the grid and scatterplot fields allow multi-valued grid points and scatter points for multi-valued contiguous retrieval, or should the user just have to make a separate field if they want more than one value?
+
+Add 3-d stereoscopic view (wall-eyed and cross-eyed) and 3-d red/cyan glasses view abilities to the renderer, for both stills and movies. Allow the user to specify his distance from screen (with a sensible default), the distance between his eyes (witha sensible default), and DPI (default to attempted auto-detect) with CLI parameters. 
+
+^ doing 
+
+
+
+
+
+I changed my mind about whether we should include support in loom to transform volumes (both sparse and dense). Add that feature to todo.md. But note that you didn't like the ability to output volumes alone, but only the ability to use a volume as a basis and then output one. But it would me more complicated to force a couple between reading a volume and being able to output one than not, I think, so being able to write to them and being able to read from them will remain independently usable capabilities...
+
+i have another idea: anything that influences anything else can influence it either in 'mod' mode or in 'pin' mode. mod is modulate - add the input value to what's already there. y=clamp((y-.5)+(x-.5)/2),(0,1)), or something like that, however it's normally done. pin is replace what's already there with the input value.
+
+another idea: any curve (or any other series of values if any others are definable) can influence any other curve (or any other series of values if any others are definable), such as, for example a curve in time could influence the entire elevation of a purely spatial curve over time. but we have to detect that anything that changes with t  can't influence anything else that changes with t. like if the the first curve couldn't change a whole other curve that runs rings around a teapot over time. i mean it could, but it couldn't act on the whole curve over time. it could only act on point t of the curve in lockstep with point t of the first curve. is relying on detection a bad generalization of this? does it create inconsistencies? should there just be two separate data types--one for purely spatial, and one for changing over time? i hope not.
+
+-
+
+^ done
+
+do everything not already done in todo.md
 
 ^ doing
 
 --
 
-would it be possible to make our rasterizer support textures?
+
+"""
+So the two ideas aren't really "GPU tessellation" vs. "skip tessellation" — they're:
+Port marching cubes to CUDA (your first idea): keep making triangles, just make them faster. The "clever parallel scheme" you're picturing is the standard one — evaluate all grid cells in parallel, then prefix-sum/stream-compact the active cells into a triangle buffer. Real, but it's effort spent to keep an intermediate we don't want.
+Ray-march the implicit surface directly on the GPU (your second idea, done right): march primary rays against f=0 in a CUDA kernel, per pixel, reusing the field evaluator that already runs on the device (povFnEval/dPatternEval are host+device per pov_functions.h). No triangles, no marching cubes, no CPU bottleneck — and the surface is exact (no polygonal facets), embarrassingly parallel per pixel, and deterministic (a primary-ray isosurface hit has no Monte-Carlo noise), so it's clean like raster and fast like the GPU. That's the sweet spot.
+
+If #2 works, it makes #1 unnecessary for the actual pain (per-frame preview/video). We'd only want GPU marching cubes if we needed real meshes for something else (mesh export, a specific shading path) — a separate, lower-priority want.
+"""
+the thing is ftrace might still want tesselation for some things, no? is there any case where it would still do its own tesselation?
+
+----
+
+i wonder if we should make C++ versions of the loom tool and the gyroid tool because so much cpu is taken just creating the .ftsl files. or maybe it's mostly taken by doing the marching cubes and writing those? in that case, maybe we could make a .pyd function  that does that part
 
 ^ pending
 
-make loom support using a skin, i guess pass an image file path? that's the only thing that defines skins, right?
 
-^ not done yet
 
-BTW, I forgot one thing in the spec to support: Good Photons' isosurface functions that import 78 of POV-Ray's 80 functions available for isusurface functions
-for "A live viewer (cheap: emit frames → your raster preview) — the 80% of GUI value you actually need to tune loops, without the interactive editor.", I guess we'll just re-use ftrace's rasterizer ability? Or can rasterizing be done significantly faster somehow?
+since we've made this tool so sophisticated, we should unlock more isofunctions than just the gyro, but then, some of the parameters are specific to the gyro, i think? like bloom?
 
+^ not done yet.s
+
+actually, it would be nice if we could specify axes and pairs off by default and then say which ones are on, or on by default and then say which ones are off. and if we do that, we should do it for lock, too
+
+^ doing
 
 Idea: I wonder if this library concepts could be used interestingly to create 2D graphics, too? I'm not sure, but taking on a 2D output generator would be easy peasy.
 
@@ -33,10 +112,6 @@ convert any arbitrarily long string of N-D rotations to a matrix+offset&nbsp; fo
 rotate any 4-d spacetime object into a new spacetime object - I don't think we can modulate anything over time then&nbsp; - but we can if we isolate the 4-d object, e.g., as a transformed video node - except it requires two passes over time/time caching/time freezing<br>
 
 ----
-
-Option to rasterize clear objects as clear, just with no refraction? Just dim the light of what's behind them by a little bit, and the more clear surfaces between you and it, the more it's dimmed? Or not even dimmed, but made a bit milky?
-
-^ done
 
 I find that I can't turn quickly enough while exploring in --explore. We should probably either increase the sensitivity of mouse movements, or make turning non-linear with how far the mouse pointer diverges from the center of the screen.
 
@@ -58,10 +133,6 @@ give the window an extra space below the imagery with buttons you can press. one
 Also have a button to define a flyby curve that simply follows where the user goes. Probably should have uniform timing rather than following the timing of the user. But, let's have another option. While playing, the user can use a slider or mouse wheel to modulatee the speed at which the camera will move at that time (i.e., the inverse of the density of cameras at that point in the camera density curve). Of course, it also modulates the speed at which the flyby is played. And the user can go back and play again and further modify it, and the mouse wheel movement adds to the speed or takes away from the speed. AND add a mode where the user can do this with a rendered video or set of pictures in a directory so they can view the flyby of an actual rendered result and perhaps change the speed. Maybe another option could be that the user can define the camera orientation curves by changing the orientation as they scrub/play through the camera curve, maybe even setting curve points via an interface. Actually, that would be a great way of allowing the user to define his own camera motion curve, too - he can move freely through the scene (in raster mode) and set a point recording the camera's current position and orientation. Or delete a point. Or scrub through the curve he's made so far and then move outside of it and insert a point. Let's work out what it'll be before you commit to anything.
 
 ^ doing
-
-----
-
-verify that the scene description language now has a clause for specifying the preferred render mode.
 
 ----
 
@@ -255,9 +326,6 @@ and let's have the camera make an arc right through the gyroid, but not through 
 Add "progressive" or whatever it was called photon mapping and analytic specular connections to readme eventually.. and the (VCM/UPS = BDPT ∪ photon mapping under MIS. and the five new curve variables for cameras.
 
 from what i can see of the lantern image, it doesn't look hero at all. it's just chromatic sphere, a small dot next to it, and an ugly oblong yellow circle to the right of both of them...
-"The file: path resolves relative to CWD, and a wrong path would silently fall back to 6500K blackbody (white) rather than erroring" i don't like this, i think if the user specifies a file and it can't find it, it shouldn't render it, it should error
-^ done
-	
 there are many colors of LEDs, should we download some more LED data? oh, and i have some filter ideas you might want to use in the ..\spectral-bounce project.. for example, 'Red 25'. but i think they only have 16 frequency bins each. but maybe they could give you ideas for filters to look up further data for.
 ^ doing	n
 
@@ -289,26 +357,7 @@ forward renderer
 The subtlety — and it's important given your physical-lens goal: you cannot connect a diffuse bounce through the lens glass, because refractive lens elements are specular (delta BSDF) and the connection probability is zero (this is the SDS problem again). The fix: connect to the entrance pupil (the front of the lens system), and once you have a position+direction hitting the pupil, the path through the lens elements is deterministic (specular refraction is deterministic given a ray) — trace it through the elements, and if it lands on the film, splat. So (B) works even with a full physical multi-element lens; you're just importance-sampling the pupil instead of praying a photon flies into it. Crucially, each photon is still independent → still GPU-friendly.
 - forward-only rendering (including supporting mirrors, etc.) if the user opts out of connect/splat
 
-ok, let's add some native primitives to our renderer! metaballs, whatever those are, i especially like the idea of isosurfaces (and let the math define more than just boundaries, but transparency, iridescence, fluorescence, transparency, translucency, mirror?), and what other useful primitives does pov-ray have? and how about pov-ray's rounded intersections of primitives?
-^ doing
 
-let's have both isosurface algorithms, selectable within the isosurface language? and how about the ability to use functions to determine various material properties at specific xyz locations? speaking of material properties, we do have translucency and transparency, right?
-^ doing
-
-Isosurfaces — the general case: any scalar field f(x,y,z), surface = {p : f(p)=0}. Metaballs, gyroids, tori, hearts, noise-perturbed spheres all fall out of the function. Two ways to intersect a ray:
-Sphere-tracing an SDF (signed distance function): step by the field value, guaranteed not to overshoot. Fast, robust, but the field must be a true distance (or Lipschitz-bounded).
-Root-finding a general f along the ray: sample f at intervals, bracket a sign change, bisect/regula-falsi. Handles arbitrary f (POV-Ray's approach) but needs a max_gradient/step budget to not miss thin features. 
-^ done
-
-is there any way we can have the UV map for the custom expressions determining material composition for native objects as well as mesh objects, so that we can include U-V variable support? Just use the same algorithm used to wrap UV around meshes but adapted to wrap around native objects?
-^ done
-
-maybe we could provide a primitive to specify a bunch of cameras in a pattern: a 3d curve  specified by points the curve passes through, plus a number of cameras per unit length? but how would the user specify "speed" of the camera moving (as in number of cameras per unit length that varies over the curve, according to a separate curve)?
-can you convert mirror_selfie.ftsl to a png? what's the command to do that? is it in the readme?
-^ done
-
-"I can implement this now — it's pure ftsl.h (a new addCameraCurve next to the two I just wrote), and it'll compile and test in the same build cycle that's currently blocked by your renders. Want me to build it with the density/density_at + look tangent|look_at|look_curve grammar above? I'll fold it into the pending commit alongside camera_orbit and the UV work." yes. don't forget to add it to the language ref.
-^ done
 
 
 

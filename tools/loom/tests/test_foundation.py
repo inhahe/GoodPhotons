@@ -91,6 +91,55 @@ def test_loopnoise_is_periodic():
     assert n.at(_clk(0.37)) == LoopNoise(cells=6, seed=42, freq=1).at(_clk(0.37))
 
 
+def test_loopnoise_uniform_key_is_byte_identical_to_legacy():
+    # the default (uniform) cell draw must match the original pre-`dist` seed key
+    import random
+    n = LoopNoise(cells=6, seed=42, freq=1)
+    rng = random.Random("loomnoise:42:6:1")
+    assert n._vals == [rng.uniform(-1.0, 1.0) for _ in range(6)]
+
+
+def test_loopnoise_gauss_is_narrower_and_seamless():
+    def _std(sig, N=400):
+        vals = [sig.at(_clk(i / N)) for i in range(N)]
+        mean = sum(vals) / N
+        return (sum((v - mean) ** 2 for v in vals) / N) ** 0.5
+
+    g = LoopNoise(cells=64, seed=7, dist="gauss", width=0.3)
+    u = LoopNoise(cells=64, seed=7)
+    assert _std(g) < _std(u)                              # bell curve hugs the centre
+    # cells clamped to +/- clip*width so amp stays a real bound
+    assert all(abs(v) <= 3.0 * 0.3 + 1e-9 for v in g._vals)
+    # still a seamless loop (t=0 == t=1) and deterministic
+    assert abs(g.at(_clk(0.0)) - g.at(_clk(1.0))) < 1e-9
+    assert g.at(_clk(0.37)) == LoopNoise(cells=64, seed=7, dist="gauss",
+                                         width=0.3).at(_clk(0.37))
+
+
+def test_loopnoise_gauss_clip_none_keeps_raw_tails_same_draws():
+    # clip=None drops the clamp but must NOT perturb the drawn sequence: the clamped
+    # cells are exactly the unclamped ones after applying +/- clip*width.
+    raw = LoopNoise(cells=200, seed=3, dist="gauss", width=0.5, clip=None)
+    clamped = LoopNoise(cells=200, seed=3, dist="gauss", width=0.5, clip=2.0)
+    lim = 2.0 * 0.5
+    assert clamped._vals == [max(-lim, min(lim, v)) for v in raw._vals]
+    # with a fat width and many cells, the raw tails exceed what clip would allow
+    assert max(abs(v) for v in raw._vals) > lim
+    # still a seamless, deterministic loop
+    assert abs(raw.at(_clk(0.0)) - raw.at(_clk(1.0))) < 1e-9
+
+
+def test_loopnoise_rejects_bad_distribution():
+    for bad in (dict(dist="weird"), dict(dist="gauss", width=0.0),
+                dict(dist="gauss", clip=0.0), dict(dist="gauss", clip=-1.0)):
+        try:
+            LoopNoise(cells=4, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad}")
+
+
 def test_gridfield_interpolates():
     # 2x2 grid on the unit square; corner values 0,1,2,3 (C-order: (i0,i1)).
     grid = Grid(shape=(2, 2), lo=(0.0, 0.0), hi=(1.0, 1.0),

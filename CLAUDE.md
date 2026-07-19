@@ -38,17 +38,30 @@ in a non-`Console` session in `tasklist`.)
 To actually get a visible window, launch every render with the Bash tool's
 **`dangerouslyDisableSandbox: true`** — that runs it in the interactive **Console
 session**, where the GDI window appears on the real desktop (verify with
-`Get-Process ftrace | Select MainWindowTitle` → `ftrace 🪟 live preview`). This is
-mandatory for every render invocation, alongside `-window` itself.
+`Get-Process ftrace | Select MainWindowTitle` → `ftrace 🪟 live preview`). So whenever
+you want the live preview to actually be visible (the default — see below), launch with
+`dangerouslyDisableSandbox: true` alongside `-window`.
 
-## Running renders — ALWAYS launch with the visual display
+## Running renders — launch with the live preview so the user can watch
 
-Never launch a render as a fire-and-forget black box. **Every render you start
-MUST include the live visual display: always pass `-window`.** No exceptions —
-even quick test/validation renders get the window. It gives both you and the user
-a real, watchable view of the image converging and confirms the render will
-actually finish. On top of `-window`, add periodic crash-safe output so progress
-survives a crash. Concretely, when you start a render:
+**The one rule that matters: whenever you render, put the live preview window up
+(`-window`) so the user can see it.** That's the whole point — the user wants to be
+able to glance over and watch any image you generate converge, without having to ask.
+
+What this rule is **NOT**: it is *not* a reason to avoid rendering, to hold back work,
+or to wait for the user. A preview window harmlessly sitting on the desktop (even
+while the user is away or asleep) is exactly what's wanted, not a problem. Rendering
+to validate your own changes, and then inspecting the output PNGs yourself, is always
+fine and encouraged — the live window doesn't block any of that. Don't invent
+"I can't render right now" blockers out of this rule.
+
+It's also **not absolute**: if you have a genuine reason to skip the live preview for a
+particular render, that's fine — just prefer showing it by default.
+
+So: default to launching every render with the live visual display (`-window`), which
+gives both you and the user a real, watchable view of the image converging and confirms
+the render will actually finish. On top of `-window`, add periodic crash-safe output so
+progress survives a crash. Concretely, when you start a render:
 
 - **ALWAYS pass `-window`.** This opens the real OS live-preview (Win32 GDI)
   showing the actual tone-mapped image refreshed as it converges — the best way to

@@ -108,6 +108,66 @@ class Material(Element):
         return f'material "{self.name}" {{ ' + "  ".join(parts) + " }"
 
 
+class ProcTexture(Element):
+    """A **procedural (function-defined) UV-space skin**: ``texture "name" { rgb
+    "r(u,v)" "g(u,v)" "b(u,v)" res N … }``.
+
+    Instead of a bitmap file, the albedo is three ftsl expressions of the surface
+    UV coordinates ``u`` and ``v`` (and constants / ``pi``), using the ftsl pattern
+    grammar (``sin cos sqrt min max clamp mix step smoothstep noise`` …).  ftrace
+    bakes them once to a ``res``×``res`` **linear** RGB grid at load and then treats
+    the result exactly like an image texture — so the same UV-wrap, Jakob-Hanika
+    spectral upsampling, triplanar, GPU and raster paths apply, and a material binds
+    it with the usual ``reflect texture:<name>``.  The expressions are functions of
+    ``u, v`` only (the world-space pattern variables carry no value in UV space).
+    Like :class:`Texture`, it holds no modulators and is emitted once.  Use
+    :func:`func_skin` to make the texture *and* its material together.
+    """
+
+    def __init__(self, name: str, r: str, g: str, b: str, *, res: int = 512,
+                 filter: str = "bilinear", wrap: str = "clamp") -> None:
+        self.name = name
+        self.r = str(r)
+        self.g = str(g)
+        self.b = str(b)
+        res = int(res)
+        if res < 1:
+            raise ValueError("texture res must be >= 1")
+        if filter not in ("bilinear", "nearest"):
+            raise ValueError('texture filter must be "bilinear" or "nearest"')
+        if wrap not in ("repeat", "clamp", "mirror"):
+            raise ValueError('texture wrap must be "repeat", "clamp" or "mirror"')
+        self.res = res
+        self.filter = filter
+        self.wrap = wrap
+
+    def roots(self) -> List:
+        return []
+
+    def emit(self, ctx: EmitCtx) -> str:
+        return (f'texture "{self.name}" {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
+                f'res {self.res}  filter {self.filter}  wrap {self.wrap} }}')
+
+
+def func_skin(name: str, r: str, g: str, b: str, *, mtype: str = "diffuse",
+              res: int = 512, filter: str = "bilinear", wrap: str = "clamp",
+              **props) -> Tuple["ProcTexture", "Material"]:
+    """Wrap a **procedural** UV-space skin over a surface: build the
+    :class:`ProcTexture` (three ``r(u,v) g(u,v) b(u,v)`` ftsl expressions) **and** a
+    :class:`Material` bound to it::
+
+        scene.add(*func_skin("stripes", "u", "v", "0.5+0.5*sin(2*pi*8*u)"),
+                  Sphere((0, 0, 0), 1, "stripes"))
+
+    The material's ``reflect`` is the baked skin (ftrace's ``reflect texture:<name>``);
+    extra ``props`` (e.g. ``roughness=…``) pass through, and the texture and material
+    share ``name``.
+    """
+    tex = ProcTexture(name, r, g, b, res=res, filter=filter, wrap=wrap)
+    mat = Material(name, mtype, reflect=f"texture:{name}", **props)
+    return tex, mat
+
+
 def skin(name: str, image, *, mtype: str = "diffuse", encoding: str = "srgb",
          filter: str = "bilinear", wrap: str = "repeat",
          **props) -> Tuple["Texture", "Material"]:
@@ -351,6 +411,109 @@ def fan(spine, *, width: float = 0.4, material: str = "default", count: int = 64
 
 
 # ---------------------------------------------------------------------------
+# Participating media / volumes
+# ---------------------------------------------------------------------------
+
+class Volume(Element):
+    """A participating-medium region emitted as ftrace's ``medium { … }`` block.
+
+    ftrace already renders volumes richly — homogeneous fog, bounded
+    heterogeneous blobs whose density is a formula, and imported NanoVDB grids.
+    loom's strength is the *procedural* case: a ``density`` field is loom's bread
+    and butter (it's how :class:`~loom.iso.Isosurface` works), so a ``Volume``
+    lets you animate clouds/fog with the same signal machinery as everything
+    else — the scattering coefficients and the density formula are all
+    :class:`~loom.signals.core.Signal`-valued.
+
+    ``sigma_t`` (extinction), ``albedo`` (single-scatter albedo) and ``g``
+    (Henyey–Greenstein anisotropy) are animatable scalars; ``rayleigh`` swaps the
+    HG phase for a Rayleigh one.
+
+    ``density`` shapes a *heterogeneous* medium (``None`` = uniform):
+
+    * a :class:`~loom.spatial.SpatialExpr` — the natural loom field, emitted as an
+      inline ``density "<expr>"`` over world ``x y z r`` (animatable, seamless);
+    * a ``str`` — either ``"pattern:<name>"`` (bind a named pattern) or a raw ftsl
+      expression;
+    * ``"vdb:<path>"`` — reference an existing NanoVDB grid (loom doesn't *generate*
+      sparse voxels, but it can point at one).
+
+    The region is bounded by exactly one of ``box=(min, max)``, ``sphere=(center,
+    radius)`` or ``obj="name"`` (fill a named scene object's interior).  A
+    heterogeneous medium needs a finite region for the delta-tracking majorant, so
+    give a bound *or* an explicit ``density_max``; ``density_max`` overrides the
+    engine's grid estimate when set.
+    """
+
+    def __init__(self, *, sigma_t=1.0, albedo: Union[Signal, float] = 0.8,
+                 g: Union[Signal, float] = 0.0, rayleigh: bool = False,
+                 density=None, density_max=None,
+                 box: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
+                 sphere: Optional[Tuple[Sequence[float], float]] = None,
+                 obj: Optional[str] = None, name: str = "volume") -> None:
+        n_bounds = sum(x is not None for x in (box, sphere, obj))
+        if n_bounds > 1:
+            raise ValueError("Volume: give at most one of box=, sphere=, obj=")
+        self.sigma_t = sigma_t
+        self.albedo = albedo
+        self.g = g
+        self.rayleigh = bool(rayleigh)
+        self.density = density
+        self.density_max = density_max
+        self.box = (tuple(float(c) for c in box[0]),
+                    tuple(float(c) for c in box[1])) if box is not None else None
+        self.sphere = ((tuple(float(c) for c in sphere[0]), float(sphere[1]))
+                       if sphere is not None else None)
+        self.obj = obj
+        self.name = name
+
+    def roots(self) -> List:
+        out: List = []
+        for v in (self.sigma_t, self.albedo, self.g, self.density_max):
+            if isinstance(v, (Signal, VecSignal)):
+                out.append(v)
+        # A SpatialExpr density exposes its temporal coefficients for cycle checking.
+        if hasattr(self.density, "param_signals"):
+            out.extend(self.density.param_signals())
+        return out
+
+    def _density_token(self, ctx: EmitCtx) -> Optional[str]:
+        d = self.density
+        if d is None:
+            return None
+        if hasattr(d, "emit"):                       # a loom SpatialExpr field
+            return 'density "' + d.emit(("x", "y", "z"), ctx) + '"'
+        s = str(d)
+        if s.startswith("pattern:") or s.startswith("vdb:"):
+            return f"density {s}"
+        return f'density "{s}"'                       # raw ftsl expression
+
+    def emit(self, ctx: EmitCtx) -> str:
+        clock, cache = ctx.clock, ctx.cache
+        parts = [f"sigma_t {fmt(num(self.sigma_t, clock, cache))}",
+                 f"albedo {fmt(num(self.albedo, clock, cache))}",
+                 f"g {fmt(num(self.g, clock, cache))}"]
+        if self.rayleigh:
+            parts.append("rayleigh true")
+        lines = ["medium {", "    " + "  ".join(parts)]
+        if self.box is not None:
+            mn, mx = self.box
+            lines.append(f"    bounds {{ min {fmt3(mn)}  max {fmt3(mx)} }}")
+        elif self.sphere is not None:
+            c, rad = self.sphere
+            lines.append(f"    bounds {{ center {fmt3(c)}  radius {fmt(rad)} }}")
+        elif self.obj is not None:
+            lines.append(f'    bounds {{ object "{self.obj}" }}')
+        dtok = self._density_token(ctx)
+        if dtok is not None:
+            lines.append("    " + dtok)
+        if self.density_max is not None:
+            lines.append(f"    density_max {fmt(num(self.density_max, clock, cache))}")
+        lines.append("}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Lights
 # ---------------------------------------------------------------------------
 
@@ -405,6 +568,161 @@ class Camera(Element):
                 f'}}')
 
 
+class CameraCurve(Element):
+    """A genuine ftrace ``camera_curve`` flypath (milestone M13).
+
+    The eye rides a Catmull-Rom spline through ``points`` with arc-length (or
+    ``density``-shaped) speed, animatable lens/orientation tracks, and ftrace's
+    two-axis orientation model.  Unlike :class:`Camera` — which loom re-bakes to a
+    static ``camera`` block every frame — a ``camera_curve`` is emitted **once** and
+    *ftrace itself* expands the N frames.  So pass it in place of the camera
+    (``Scene(camera=CameraCurve(...))``) and render the single emitted ``.ftsl`` with
+    ftrace to get the whole flyby; loom's per-frame clock does not drive it.
+
+    Orientation mirrors ftrace's grammar 1:1 (nothing here loom can't emit):
+
+    * **forward** (pick one, else the path tangent): ``look_at=(x,y,z)`` fixed target,
+      ``look_points=[(x,y,z), …]`` a second aim spline, or ``fwd_at=[(t,x,y,z), …]``
+      direction keyframes.
+    * **up**: ``up_at=[(t,x,y,z), …]`` vector keyframes, or ``roll``/``roll_at`` an
+      angle (degrees) about the reference up.
+    * **reference frame**: ``frame`` sets the default for both axes and
+      ``fwd_frame`` / ``up_frame`` override per axis — each ``"world"`` (fixed world
+      axes, the classic behavior) or ``"travel"`` (the curve's rotation-minimizing
+      frame, so the shot banks into turns; closed loops close seamlessly).  A
+      ``fwd_at``/``up_at`` vector is read in the travel basis (x=right, y=up,
+      z=forward) when its axis is ``"travel"``, else as a world direction.
+
+    Scalar tracks (``roll_at``/``fov_at``/``zoom_at``/``fstop_at``/``focus_at``) are
+    ``[(t, value), …]``; vector tracks (``fwd_at``/``up_at``) are ``[(t, x, y, z), …]``,
+    with ``t`` the normalized timeline in ``[0, 1]``.
+    """
+
+    _FRAMES = ("world", "travel")
+
+    def __init__(self, points, *, up=(0, 1, 0), fov_y=40.0, mode: str = "R",
+                 res: Tuple[int, int] = (480, 480), frames: Optional[int] = None,
+                 density=None, density_at=None, closed: bool = False,
+                 spline: Optional[str] = None, look_at=None, look_points=None,
+                 roll=None, roll_at=None, fov_at=None, zoom_at=None, fstop_at=None,
+                 focus_at=None, fwd_at=None, up_at=None, frame: Optional[str] = None,
+                 fwd_frame: Optional[str] = None, up_frame: Optional[str] = None,
+                 min_reach=None, look_smooth=None, exposure_lock: bool = False,
+                 fps=None, name: str = "curve") -> None:
+        pts = [tuple(float(c) for c in p) for p in points]
+        if len(pts) < 2:
+            raise ValueError("CameraCurve needs >= 2 control `points`")
+        if frames is None and density is None and density_at is None:
+            raise ValueError("CameraCurve needs `frames=` or a `density=`/`density_at=`")
+        if look_at is not None and look_points is not None:
+            raise ValueError("CameraCurve: give at most one of look_at= / look_points=")
+        for label, fv in (("frame", frame), ("fwd_frame", fwd_frame), ("up_frame", up_frame)):
+            if fv is not None and fv not in self._FRAMES:
+                raise ValueError(f'CameraCurve {label} must be "world" or "travel"')
+        self.points = pts
+        self.up = tuple(float(c) for c in up)
+        self.fov_y = float(fov_y)
+        self.mode = mode
+        self.res = (int(res[0]), int(res[1]))
+        self.frames = None if frames is None else int(frames)
+        self.density = None if density is None else float(density)
+        self.density_at = None if density_at is None else [(float(t), float(r)) for t, r in density_at]
+        self.closed = bool(closed)
+        self.spline = spline
+        self.look_at = None if look_at is None else tuple(float(c) for c in look_at)
+        self.look_points = (None if look_points is None
+                            else [tuple(float(c) for c in p) for p in look_points])
+        self.roll = None if roll is None else float(roll)
+        self._scalar_tracks = {
+            "roll_at": self._norm_scalar(roll_at), "fov_at": self._norm_scalar(fov_at),
+            "zoom_at": self._norm_scalar(zoom_at), "fstop_at": self._norm_scalar(fstop_at),
+            "focus_at": self._norm_scalar(focus_at),
+        }
+        self._vector_tracks = {
+            "fwd_at": self._norm_vector(fwd_at), "up_at": self._norm_vector(up_at),
+        }
+        self.frame = frame
+        self.fwd_frame = fwd_frame
+        self.up_frame = up_frame
+        self.min_reach = None if min_reach is None else float(min_reach)
+        self.look_smooth = None if look_smooth is None else float(look_smooth)
+        self.exposure_lock = bool(exposure_lock)
+        self.fps = None if fps is None else float(fps)
+        self.name = name
+
+    @staticmethod
+    def _norm_scalar(track):
+        if track is None:
+            return None
+        return [(float(t), float(v)) for t, v in track]
+
+    @staticmethod
+    def _norm_vector(track):
+        if track is None:
+            return None
+        out = []
+        for kf in track:
+            t, x, y, z = kf
+            out.append((float(t), float(x), float(y), float(z)))
+        return out
+
+    def roots(self) -> List:
+        return []   # a camera_curve is a static authored flight (no per-frame signals)
+
+    def emit(self, ctx: EmitCtx) -> str:
+        L = [f'camera_curve "{self.name}" {{']
+        for p in self.points:
+            L.append(f"    point {fmt3(p)}")
+        if self.look_points:
+            L.append(f"    look curve")
+            for p in self.look_points:
+                L.append(f"    look_point {fmt3(p)}")
+        elif self.look_at is not None:
+            L.append(f"    look_at {fmt3(self.look_at)}")
+        L.append(f"    up {fmt3(self.up)}   fov_y {fmt(self.fov_y)}   mode {self.mode}")
+        if self.spline is not None:
+            L.append(f"    spline {self.spline}")
+        if self.frames is not None:
+            L.append(f"    frames {self.frames}")
+        if self.density is not None:
+            L.append(f"    density {fmt(self.density)}")
+        if self.density_at:
+            for t, r in self.density_at:
+                L.append(f"    density_at {fmt(t)} {fmt(r)}")
+        if self.closed:
+            L.append(f"    closed")
+        # Reference-frame keywords (only when set; absence == world == legacy behavior).
+        if self.frame is not None:
+            L.append(f"    frame {self.frame}")
+        if self.fwd_frame is not None:
+            L.append(f"    fwd_frame {self.fwd_frame}")
+        if self.up_frame is not None:
+            L.append(f"    up_frame {self.up_frame}")
+        # Orientation vector tracks.
+        for key, track in self._vector_tracks.items():
+            if track:
+                for t, x, y, z in track:
+                    L.append(f"    {key} {fmt(t)} {fmt3((x, y, z))}")
+        # Scalar constant + tracks.
+        if self.roll is not None:
+            L.append(f"    roll {fmt(self.roll)}")
+        for key, track in self._scalar_tracks.items():
+            if track:
+                for t, v in track:
+                    L.append(f"    {key} {fmt(t)} {fmt(v)}")
+        if self.min_reach is not None:
+            L.append(f"    min_reach {fmt(self.min_reach)}")
+        if self.look_smooth is not None:
+            L.append(f"    look_smooth {fmt(self.look_smooth)}")
+        if self.exposure_lock:
+            L.append(f"    exposure_lock")
+        if self.fps is not None:
+            L.append(f"    fps {fmt(self.fps)}")
+        L.append(f"    film {{ res {self.res[0]} {self.res[1]} }}")
+        L.append("}")
+        return "\n".join(L)
+
+
 # ---------------------------------------------------------------------------
 # Scene
 # ---------------------------------------------------------------------------
@@ -417,18 +735,22 @@ class Scene:
         self.spectral = spectral
         self.textures: List[Element] = []
         self.patterns: List[Element] = []
+        self.records: List[Element] = []
         self.materials: List[Material] = []
         self.elements: List[Element] = []
         self.lights: List[Light] = []
 
     def add(self, *elems: Element) -> "Scene":
+        from .record import Record as _Record  # lazy: record.py imports scene.Element
         for e in elems:
-            # Textures/patterns are emitted before the materials that bind them
-            # (ftrace resolves them in an earlier pass, but keep the text tidy).
-            if isinstance(e, Texture):
+            # Textures/patterns/records are emitted before the materials that bind
+            # them (ftrace resolves them in an earlier pass, but keep the text tidy).
+            if isinstance(e, (Texture, ProcTexture)):
                 self.textures.append(e)
             elif isinstance(e, Pattern):
                 self.patterns.append(e)
+            elif isinstance(e, _Record):
+                self.records.append(e)
             elif isinstance(e, Material):
                 self.materials.append(e)
             elif isinstance(e, Light):
@@ -438,8 +760,8 @@ class Scene:
         return self
 
     def _all_elements(self) -> List[Element]:
-        return [*self.textures, *self.patterns, *self.materials, *self.elements,
-                *self.lights, self.camera]
+        return [*self.textures, *self.patterns, *self.records, *self.materials,
+                *self.elements, *self.lights, self.camera]
 
     def check_cycles(self) -> None:
         """Run the loop detector over every modulator in the scene."""
@@ -460,6 +782,10 @@ class Scene:
         for p in self.patterns:
             blocks.append(p.emit(ctx))
         if self.patterns:
+            blocks.append("")
+        for rec in self.records:
+            blocks.append(rec.emit(ctx))
+        if self.records:
             blocks.append("")
         for m in self.materials:
             blocks.append(m.emit(ctx))

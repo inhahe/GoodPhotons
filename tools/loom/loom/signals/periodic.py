@@ -60,20 +60,62 @@ class LoopNoise(Signal):
     values join smoothly — the noise is periodic in ``t`` and repeats exactly
     for a given ``seed``.  ``freq`` is how many times the ring is traversed per
     loop (keep it an integer to stay seamless).
+
+    ``dist`` shapes the *distribution* of the cell values (the texture of the
+    noise), independent of ``amp``/``bias``:
+
+    - ``"uniform"`` (default) — cells drawn flat over ``[-1, 1]``; the noise
+      roams its whole range evenly.
+    - ``"gauss"`` — cells drawn from a **bell curve** ``N(0, width)``: the noise
+      dwells near the centre and only occasionally wanders out, with ``width``
+      (the standard deviation, default ``0.4``) setting how far it strays.
+      Because a Gaussian is unbounded, cells are clamped to ``±clip`` standard
+      deviations (default 3) so ``amp`` stays a meaningful bound and the spline
+      can't overshoot to infinity.  Pass ``clip=None`` to keep the raw unclamped
+      tails (an occasional big spike) — the drawn sequence is identical, only the
+      clamp is dropped, so a value is no longer bounded by ``clip*width``.
+
+    In every mode the output is ``amp * <ring sample> + bias`` — so ``bias`` is
+    the shift (mean offset) and ``amp`` the overall scale, on top of the shape
+    ``dist``/``width`` choose.
     """
 
     def __init__(self, cells: int = 8, seed: int = 0, *,
                  freq: int = 1, amp: Union[Signal, Number] = 1.0,
-                 bias: Union[Signal, Number] = 0.0) -> None:
+                 bias: Union[Signal, Number] = 0.0,
+                 dist: str = "uniform", width: float = 0.4,
+                 clip: Optional[float] = 3.0) -> None:
         super().__init__()
         if cells < 2:
             raise ValueError("LoopNoise needs cells >= 2")
+        if dist not in ("uniform", "gauss"):
+            raise ValueError("LoopNoise dist must be 'uniform' or 'gauss'")
+        if dist == "gauss" and not (width > 0.0):
+            raise ValueError("LoopNoise gauss width must be > 0")
+        if clip is not None and not (clip > 0.0):
+            raise ValueError("LoopNoise clip must be > 0 or None (unclamped)")
         self.cells = int(cells)
         self.freq = int(freq)
         self.amp = as_signal(amp)
         self.bias = as_signal(bias)
-        rng = random.Random(f"loomnoise:{int(seed)}:{self.cells}:{self.freq}")
-        self._vals: List[float] = [rng.uniform(-1.0, 1.0) for _ in range(self.cells)]
+        self.dist = dist
+        self.width = float(width)
+        self.clip = None if clip is None else float(clip)
+        # The uniform key is byte-identical to the original (pre-`dist`) LoopNoise so
+        # existing seeds reproduce exactly; gauss uses its own extended key.  clip is
+        # applied *after* the draw, so it never perturbs the drawn sequence (and stays
+        # out of the key): clip=None just skips the clamp on the same values.
+        key = f"loomnoise:{int(seed)}:{self.cells}:{self.freq}"
+        if dist == "gauss":
+            rng = random.Random(f"{key}:gauss:{self.width}")
+            lim = None if self.clip is None else self.clip * self.width
+            self._vals: List[float] = [
+                rng.gauss(0.0, self.width) if lim is None
+                else max(-lim, min(lim, rng.gauss(0.0, self.width)))
+                for _ in range(self.cells)]
+        else:
+            rng = random.Random(key)
+            self._vals = [rng.uniform(-1.0, 1.0) for _ in range(self.cells)]
 
     def children(self):
         return (self.amp, self.bias)

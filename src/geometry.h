@@ -125,37 +125,95 @@ inline double shadowTerminatorG(const Vec3& wi, const Vec3& ns, const Vec3& ng) 
     return g * g * (1.0 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
 }
 
-inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
-    const double EPS = 1e-9;
-    Vec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
-    Vec3 pv = cross(r.d, e2);
-    double det = dot(e1, pv);
-    if (std::fabs(det) < EPS) return false;
-    double inv = 1.0 / det;
-    Vec3 tv = r.o - tri.v0;
-    double u = dot(tv, pv) * inv;
-    if (u < 0.0 || u > 1.0) return false;
-    Vec3 qv = cross(tv, e1);
-    double v = dot(r.d, qv) * inv;
-    if (v < 0.0 || u + v > 1.0) return false;
-    double t = dot(e2, qv) * inv;
+// Watertight ray-triangle intersection (Woop, Benthin, Wald & Áfra, "Watertight
+// Ray/Triangle Intersection", JCGT 2013). Unlike Möller-Trumbore, each edge is tested
+// via a scaled barycentric edge function built from the *same* two shared vertices that
+// the neighbouring triangle sees (in opposite winding), so the sign of the test is
+// consistent across a shared edge: a ray passing exactly through the edge is claimed by
+// exactly one triangle — never zero (a crack: background leaking through a closed mesh)
+// and never both in a way that drops the hit. Cracks are most visible on the float GPU
+// path; this double-precision CPU port keeps the two backends in lockstep.
+//
+// The per-ray part (axis permutation + shear) depends only on the ray direction, so it
+// is factored into TriShear and computed ONCE per ray (hoisted out of the BVH leaf loop),
+// then reused for every triangle.
+struct TriShear {
+    int    kx, ky, kz;    // permuted axes; kz = ray's dominant (largest |d|) axis
+    double Sx, Sy, Sz;    // shear constants that map the ray direction onto +z
+};
+
+inline TriShear makeTriShear(const Vec3& d) {
+    TriShear s;
+    double ax = std::fabs(d.x), ay = std::fabs(d.y), az = std::fabs(d.z);
+    if (ax >= ay && ax >= az)      s.kz = 0;   // dominant axis of the ray direction
+    else if (ay >= az)             s.kz = 1;
+    else                           s.kz = 2;
+    s.kx = s.kz + 1; if (s.kx == 3) s.kx = 0;
+    s.ky = s.kx + 1; if (s.ky == 3) s.ky = 0;
+    // Swap kx,ky when the dominant component is negative so the winding (and thus the
+    // edge-function sign convention) is preserved.
+    if (d[s.kz] < 0.0) { int tmp = s.kx; s.kx = s.ky; s.ky = tmp; }
+    s.Sx = d[s.kx] / d[s.kz];
+    s.Sy = d[s.ky] / d[s.kz];
+    s.Sz = 1.0     / d[s.kz];
+    return s;
+}
+
+// Watertight test using a precomputed per-ray shear. Callers in a BVH leaf loop should
+// build the shear once (makeTriShear(lr.d)) and pass it here for every triangle.
+inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
+                         double tmin, Hit& hit) {
+    const int kx = sh.kx, ky = sh.ky, kz = sh.kz;
+    // Triangle vertices relative to the ray origin.
+    Vec3 A = tri.v0 - r.o, B = tri.v1 - r.o, C = tri.v2 - r.o;
+    // Shear + scale so the ray direction becomes the +z axis; keep the xy of each vertex.
+    double Ax = A[kx] - sh.Sx * A[kz], Ay = A[ky] - sh.Sy * A[kz];
+    double Bx = B[kx] - sh.Sx * B[kz], By = B[ky] - sh.Sy * B[kz];
+    double Cx = C[kx] - sh.Sx * C[kz], Cy = C[ky] - sh.Sy * C[kz];
+    // Scaled barycentric edge functions (U,V,W weight v0,v1,v2 respectively).
+    double U = Cx * By - Cy * Bx;
+    double V = Ax * Cy - Ay * Cx;
+    double W = Bx * Ay - By * Ax;
+    // Exact-zero fallback in higher precision so a grazing edge lands deterministically
+    // (a no-op precision-wise where long double == double, e.g. MSVC — the watertight
+    // guarantee comes from the consistent edge ordering above, not from this).
+    if (U == 0.0 || V == 0.0 || W == 0.0) {
+        auto ld = [](double a, double b, double c, double d) {
+            return (double)((long double)a * (long double)b - (long double)c * (long double)d);
+        };
+        if (U == 0.0) U = ld(Cx, By, Cy, Bx);
+        if (V == 0.0) V = ld(Ax, Cy, Ay, Cx);
+        if (W == 0.0) W = ld(Bx, Ay, By, Ax);
+    }
+    // Two-sided: reject only when the signs are mixed (point outside the triangle).
+    // All-nonneg or all-nonpos both accept, so front and back faces both hit.
+    if ((U < 0.0 || V < 0.0 || W < 0.0) && (U > 0.0 || V > 0.0 || W > 0.0)) return false;
+    double det = U + V + W;
+    if (det == 0.0) return false;
+    // Interpolated (scaled) hit distance along the ray.
+    double T = U * (sh.Sz * A[kz]) + V * (sh.Sz * B[kz]) + W * (sh.Sz * C[kz]);
+    double invDet = 1.0 / det;
+    double t = T * invDet;
     if (t < tmin || t >= hit.t) return false;
+    double b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
     hit.t = t; hit.p = r.o + r.d * t; hit.valid = true;
     hit.ng = tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
-    // Barycentric weights: u,v here are the Moller-Trumbore weights of v1,v2; the
-    // v0 weight is 1-u-v. Reused for both UVs and the shading normal.
-    double w0 = 1.0 - u - v;
-    hit.u = w0 * tri.uv0.x + u * tri.uv1.x + v * tri.uv2.x;
-    hit.v = w0 * tri.uv0.y + u * tri.uv1.y + v * tri.uv2.y;
-    // Smooth shading normal: interpolate the per-vertex normals (equal to gn for a
-    // flat tri, so this reduces to the geometric normal there). Orient against the
-    // ray to match the geometric-normal convention.
-    Vec3 ns = w0 * tri.n0 + u * tri.n1 + v * tri.n2;
+    // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
+    // b0,b1,b2 == w0,u,v). Orient the shading normal against the ray like the geo normal.
+    hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
+    hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
+    Vec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     double nl = dot(ns, ns);
     ns = (nl > 1e-18) ? ns * (1.0 / std::sqrt(nl)) : tri.gn;
     hit.n = (dot(r.d, ns) < 0.0) ? ns : -ns;
     return true;
+}
+
+// Interface-preserving wrapper: builds the per-ray shear inline. Fine for one-off calls;
+// BVH leaf loops hoist makeTriShear(r.d) and use the overload above instead.
+inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit) {
+    return intersectTri(makeTriShear(r.d), r, tri, tmin, hit);
 }
 
 inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit) {

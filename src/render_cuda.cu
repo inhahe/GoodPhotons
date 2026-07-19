@@ -57,6 +57,7 @@
 #include "render_progress.h"
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
+#include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -137,6 +138,10 @@ struct DVec3 {
     HD DVec3 operator*(Real s)         const { return {x * s, y * s, z * s}; }
     HD DVec3 operator/(Real s)         const { return {x / s, y / s, z / s}; }
     HD DVec3 operator-()               const { return {-x, -y, -z}; }
+    // Indexed component access (0=x,1=y,2=z) for the watertight tri test's axis
+    // permutation. No bounds check (hot path); callers pass 0..2.
+    HD Real  operator[](int i) const { return (&x)[i]; }
+    HD Real& operator[](int i)       { return (&x)[i]; }
 };
 HD static inline Real dot(const DVec3& a, const DVec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
 HD static inline DVec3 cross(const DVec3& a, const DVec3& b) {
@@ -247,6 +252,32 @@ struct DMaterial {
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
     int    priority;
+    // Parametric-record REFLECT binding (§records stage 6a — device twin of the CPU
+    // recordReflectBound path). recReflDriven==0 means no record drives reflect per-hit
+    // (a *constant* selStop binding is instead baked straight into reflect[] at upload,
+    // needing no device branch). recReflDriven==1 means per-hit driven: sample the coeff
+    // LUT recCoeff[recReflOff .. +3*REC_LUT_N) at driver position
+    // d = dPatternEval(recDrivers[recReflDrvOff .. +recReflDrvN)) over the
+    // [recReflLo,recReflHi] domain, then evaluate the JH sigmoid (dRecReflAt). Consulted
+    // by dDiffuseRho / dReflectSlot; BDPT (no per-hit Hit in dBsdfF) rejects driven-record
+    // materials to CPU.
+    int    recReflDriven;
+    int    recReflOff;
+    int    recReflDrvOff, recReflDrvN;
+    float  recReflLo, recReflHi;
+    // Parametric-record ROUGHNESS binding (scalar slot — §records stage 6b, device twin of
+    // the CPU materialRoughness record path). recRoughMode: -1 none; 0 direct scalar
+    // expression (recordIndex<0; program recDrivers[recRoughDrvOff .. +recRoughDrvN));
+    // 1 constant selStop (one stop expr recScalarStops[recRoughStopOff], evaluated per-hit);
+    // 2 per-hit driven (driver recDrivers[recRoughDrvOff..) picks a position over the stop
+    // range, then recScalarStops[recRoughStopOff .. +recRoughStopN) are evaluated per-hit
+    // and interpolated by recRoughInterp — exactly recSampleScalar). Result clamped [0,1];
+    // consulted first by dMatRoughness. BDPT rejects record materials to CPU.
+    int    recRoughMode;
+    int    recRoughDrvOff, recRoughDrvN;
+    int    recRoughStopOff, recRoughStopN;
+    int    recRoughInterp;
+    float  recRoughLo, recRoughHi;
 };
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
 #define D_NO_PRIORITY (-2147483647 - 1)
@@ -493,6 +524,10 @@ struct DEnvMap {
     const double* condFuncInt = nullptr;  // h
 };
 
+// One scalar-record stop on the device (§records stage 6b): its domain position + a slice
+// of the shared recDrivers PatNode pool holding the stop's per-hit expression program.
+struct DRecScalarStop { double pos; int exprOff; int exprN; };
+
 struct DScene {
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
@@ -520,6 +555,17 @@ struct DScene {
     // A material's roughnessPat/filmThicknessPat/mixWeightPat index `patterns`.
     const PatNode*   patNodes;
     const DPattern*  patterns; int nPatterns;
+    // Parametric-record reflect binding (§records stage 6a). recCoeff: each driven reflect
+    // channel's baked JH coeff LUT (REC_LUT_N*3 doubles per channel, sliced by
+    // DMaterial::recReflOff); recDrivers: flat driver-program PatNode pool (sliced by
+    // recReflDrvOff/recReflDrvN). Null when no material drives reflect per-hit off a record.
+    // (Constant selStop bindings are baked into DMaterial::reflect[] and use neither pool.)
+    const double*    recCoeff;
+    const PatNode*   recDrivers;
+    // Parametric-record ROUGHNESS scalar-stop table (§records stage 6b): each driven /
+    // constant-selStop roughness binding's stops (pos + expr slice into recDrivers),
+    // sliced by DMaterial::recRoughStopOff/recRoughStopN. Null when no scalar record is bound.
+    const DRecScalarStop* recScalarStops;
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
@@ -618,6 +664,7 @@ struct DCamera {
     // image radius at the vertical film edge (= dProjRadius(projection, halfFovY)).
     int    projection;
     double halfFovY, rEdge;
+    double frustumShiftX;   // off-axis stereo shear (normalised view units); 0 = on-axis
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
     // pinhole importance normalises by a single pixel's area (see camera.h). This
@@ -631,7 +678,7 @@ struct DCamera {
         if (projection == CAM_RECTILINEAR) {
             if (cz <= (Real)1e-9) return false;
             Real cx = dot(d, u), cy = dot(d, v);
-            Real ix = (cx / cz) / (Real)tanHalfX, iy = (cy / cz) / (Real)tanHalfY;
+            Real ix = (cx / cz) / (Real)tanHalfX - (Real)frustumShiftX, iy = (cy / cz) / (Real)tanHalfY;
             if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
             px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
             py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
@@ -706,7 +753,7 @@ struct DCamera {
         DVec3 Fcenter = eye + nAxis * (Real)filmDist;
         DVec3 Q = A + d * s;
         DVec3 rel = Q - Fcenter;
-        Real ix = -dot(rel, u) / (Real)(filmDist * tanHalfX);
+        Real ix = -dot(rel, u) / (Real)(filmDist * tanHalfX) - (Real)frustumShiftX;
         Real iy = -dot(rel, v) / (Real)(filmDist * tanHalfY);
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
@@ -1453,37 +1500,71 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     return false;
 }
 
-__device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
-                                     Real tmin, DHit& hit) {
-    DVec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
-    DVec3 pv = cross(rd, e2);
-    Real det = dot(e1, pv);
-    if (fabs(det) < DET_EPS) return false;
-    Real inv = (Real)1 / det;
-    DVec3 tv = ro - tri.v0;
-    Real u = dot(tv, pv) * inv;
-    if (u < 0 || u > 1) return false;
-    DVec3 qv = cross(tv, e1);
-    Real vv = dot(rd, qv) * inv;
-    if (vv < 0 || u + vv > 1) return false;
-    Real t = dot(e2, qv) * inv;
+// Watertight ray-triangle intersection (Woop et al., JCGT 2013) — device twin of the
+// host intersectTri in geometry.h. The consistent per-edge sign test means a ray through
+// a shared edge is claimed by exactly one triangle: no cracks (background leaking through
+// a closed mesh) and no dropped hits. This matters most HERE, on the float (Real) path,
+// where the old Moller-Trumbore's independent per-triangle edge signs cracked at grazing
+// angles. The per-ray axis permutation + shear (DTriShear) is hoisted out of the BVH leaf
+// loop and reused for every triangle, exactly like the host.
+struct DTriShear {
+    int  kx, ky, kz;
+    Real Sx, Sy, Sz;
+};
+__device__ static inline DTriShear makeTriShear(const DVec3& d) {
+    DTriShear s;
+    Real ax = fabs(d.x), ay = fabs(d.y), az = fabs(d.z);
+    if (ax >= ay && ax >= az)      s.kz = 0;
+    else if (ay >= az)             s.kz = 1;
+    else                           s.kz = 2;
+    s.kx = s.kz + 1; if (s.kx == 3) s.kx = 0;
+    s.ky = s.kx + 1; if (s.ky == 3) s.ky = 0;
+    if (d[s.kz] < 0) { int tmp = s.kx; s.kx = s.ky; s.ky = tmp; }
+    s.Sx = d[s.kx] / d[s.kz];
+    s.Sy = d[s.ky] / d[s.kz];
+    s.Sz = (Real)1  / d[s.kz];
+    return s;
+}
+__device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const DVec3& rd,
+                                     const DTri& tri, Real tmin, DHit& hit) {
+    const int kx = sh.kx, ky = sh.ky, kz = sh.kz;
+    DVec3 A = tri.v0 - ro, B = tri.v1 - ro, C = tri.v2 - ro;
+    Real Ax = A[kx] - sh.Sx * A[kz], Ay = A[ky] - sh.Sy * A[kz];
+    Real Bx = B[kx] - sh.Sx * B[kz], By = B[ky] - sh.Sy * B[kz];
+    Real Cx = C[kx] - sh.Sx * C[kz], Cy = C[ky] - sh.Sy * C[kz];
+    Real U = Cx * By - Cy * Bx;
+    Real V = Ax * Cy - Ay * Cx;
+    Real W = Bx * Ay - By * Ax;
+    // Exact-zero fallback in double (helps the float path land a grazing edge on one side).
+    if (U == 0 || V == 0 || W == 0) {
+        if (U == 0) U = (Real)((double)Cx * (double)By - (double)Cy * (double)Bx);
+        if (V == 0) V = (Real)((double)Ax * (double)Cy - (double)Ay * (double)Cx);
+        if (W == 0) W = (Real)((double)Bx * (double)Ay - (double)By * (double)Ax);
+    }
+    // Two-sided: reject only when the edge signs are mixed (point outside the triangle).
+    if ((U < 0 || V < 0 || W < 0) && (U > 0 || V > 0 || W > 0)) return false;
+    Real det = U + V + W;
+    if (det == 0) return false;
+    Real T = U * (sh.Sz * A[kz]) + V * (sh.Sz * B[kz]) + W * (sh.Sz * C[kz]);
+    Real invDet = (Real)1 / det;
+    Real t = T * invDet;
     if (t < tmin || t >= hit.t) return false;
+    Real b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
     hit.ng = tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
-    // Barycentric-interpolate the per-vertex UVs (u,vv are the Moller-Trumbore
-    // weights of v1,v2; the v0 weight is 1-u-vv). Mirrors host intersectTri.
-    Real w0 = (Real)1 - u - vv;
-    hit.u = w0 * tri.uv0.x + u * tri.uv1.x + vv * tri.uv2.x;
-    hit.v = w0 * tri.uv0.y + u * tri.uv1.y + vv * tri.uv2.y;
-    // Smooth shading normal: interpolate per-vertex normals (equal to gn for a flat
-    // tri, so this reduces to the geometric normal). Orient against the ray. Mirrors
-    // host intersectTri.
-    DVec3 ns = tri.n0 * w0 + tri.n1 * u + tri.n2 * vv;
+    hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
+    hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
+    DVec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     Real nl = dot(ns, ns);
     ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
     hit.n = (dot(rd, ns) < 0) ? ns : -ns;
     return true;
+}
+// Interface-preserving wrapper (builds the shear inline) for any one-off caller.
+__device__ static inline bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
+                                            Real tmin, DHit& hit) {
+    return intersectTri(makeTriShear(rd), ro, rd, tri, tmin, hit);
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
                                         Real tmin, DHit& hit) {
@@ -1547,6 +1628,7 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
     const int*   P = sc.blasPrim  + bl.primOff;
     const DTri*  T = sc.blasTris   + bl.triOff;
     DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    const DTriShear sh = makeTriShear(lrd);   // watertight shear: once per ray
     Real tMax = h.t;
     bool found = false;
     int stack[48]; int sp = 0; stack[sp++] = 0;
@@ -1557,7 +1639,7 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
-                if (intersectTri(lro, lrd, T[prim], tmin, h)) { tMax = h.t; found = true; }
+                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) { tMax = h.t; found = true; }
             }
         } else {
             Real tL, tR;
@@ -1581,6 +1663,7 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
     const int*   P = sc.blasPrim  + bl.primOff;
     const DTri*  T = sc.blasTris   + bl.triOff;
     DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    const DTriShear sh = makeTriShear(lrd);
     int stack[48]; int sp = 0; stack[sp++] = 0;
     while (sp) {
         const DNode& n = N[stack[--sp]];
@@ -1590,7 +1673,7 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
                 DHit h; h.t = maxDist; h.valid = false;
-                if (intersectTri(lro, lrd, T[prim], tmin, h)) return true;
+                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) return true;
             }
         } else {
             Real tc;
@@ -1620,6 +1703,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     DHit h; h.t = BIG; h.valid = false; h.matId = 0; h.sensorId = -1;
     if (sc.nNodes == 0) return h;
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
+    const DTriShear sh = makeTriShear(rd);
     Real tMax = BIG;
     int stack[64]; int sp = 0; stack[sp++] = 0;
     while (sp) {
@@ -1629,7 +1713,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
-                if (prim < sc.nTris)              { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
+                if (prim < sc.nTris)              { if (intersectTri(sh, ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
                 else {
@@ -1708,6 +1792,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                                  Real maxDist, Real tmin = RAY_EPS) {
     if (sc.nNodes == 0) return false;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
+    const DTriShear sh = makeTriShear(dir);
     Real tMax = maxDist - tmin;
     int stack[64]; int sp = 0; stack[sp++] = 0;
     while (sp) {
@@ -1719,7 +1804,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked;
-                if (prim < sc.nTris)                              blocked = intersectTri(o, dir, sc.tris[prim], tmin, h);
+                if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
                 else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
                 else {
@@ -2770,6 +2855,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
             case PatOp::VarR:     st[sp++] = r;  break;
             case PatOp::VarU:     st[sp++] = u;  break;
             case PatOp::VarV:     st[sp++] = v;  break;
+            case PatOp::VarT:     st[sp++] = 0.0; break;  // flyby timeline: never in scope on-device (camera_curve exprs are consumed at load)
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
             case PatOp::Sqrt:     st[sp-1] = sqrt(fmax(0.0, st[sp-1])); break;
@@ -2825,10 +2911,90 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
                         h.n.x, h.n.y, h.n.z, r, h.u, h.v);
 }
 
+// Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
+__device__ static double dRecFCTangent(const double* pos, const double* sec, int n, int k) {
+    if (k == 0)     return sec[0];
+    if (k == n - 1) return sec[n - 2];
+    double s0 = sec[k - 1], s1 = sec[k];
+    if (s0 * s1 <= 0.0) return 0.0;
+    double h0 = pos[k]     - pos[k - 1];
+    double h1 = pos[k + 1] - pos[k];
+    double w0 = 2.0 * h1 + h0, w1 = h1 + 2.0 * h0;
+    return (w0 + w1) / (w0 / s0 + w1 / s1);
+}
+// Evaluate one scalar-record stop's per-hit expression program at the hit.
+__device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, const DHit& h) {
+    if (s.exprN <= 0) return 0.0;
+    double px = h.p.x, py = h.p.y, pz = h.p.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+}
+// Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
+// evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
+__device__ static double dRecSampleScalar(const DScene& sc, const DRecScalarStop* stops,
+                                          int n, int interp, const DHit& h, double d) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return dRecStopVal(sc, stops[0], h);
+    double lo = stops[0].pos, hi = stops[n - 1].pos;
+    if (d < lo) d = lo; else if (d > hi) d = hi;
+    int i = 0;                                             // recLocate
+    while (i < n - 2 && d > stops[i + 1].pos) ++i;
+    double p0 = stops[i].pos, p1 = stops[i + 1].pos;
+    double span = p1 - p0;
+    double t = (span > 1e-12) ? (d - p0) / span : 0.0;
+    if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+    if (interp == (int)RecInterp::Nearest)
+        return dRecStopVal(sc, stops[t < 0.5 ? i : i + 1], h);
+    double v0 = dRecStopVal(sc, stops[i], h), v1 = dRecStopVal(sc, stops[i + 1], h);
+    if (interp == (int)RecInterp::Linear) return v0 + (v1 - v0) * t;
+    // Smooth: monotone cubic Hermite (evaluate all stop values + secants once).
+    double vs[64], ps[64], sec[64];
+    int m = n < 64 ? n : 64;
+    for (int k = 0; k < m; ++k) { vs[k] = dRecStopVal(sc, stops[k], h); ps[k] = stops[k].pos; }
+    for (int k = 0; k < m - 1; ++k) {
+        double hh = ps[k + 1] - ps[k];
+        sec[k] = (hh > 1e-12) ? (vs[k + 1] - vs[k]) / hh : 0.0;
+    }
+    if (i > m - 2) i = m - 2;
+    double mk  = dRecFCTangent(ps, sec, m, i);
+    double mk1 = dRecFCTangent(ps, sec, m, i + 1);
+    double hh  = ps[i + 1] - ps[i];
+    double t2 = t * t, t3 = t2 * t;
+    double h00 =  2 * t3 - 3 * t2 + 1;
+    double h10 =      t3 - 2 * t2 + t;
+    double h01 = -2 * t3 + 3 * t2;
+    double h11 =      t3 -     t2;
+    return h00 * vs[i] + h10 * hh * mk + h01 * vs[i + 1] + h11 * hh * mk1;
+}
+// Per-hit roughness from a bound scalar record, if the material binds one (device twin of
+// the record branch of materialRoughness). Returns true + sets `out` (clamped [0,1]).
+__device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, const DHit& h, Real& out) {
+    if (m.recRoughMode < 0) return false;
+    double v;
+    if (m.recRoughMode == 0) {                             // direct scalar expression
+        double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
+        v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+    } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
+        v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
+    } else {                                               // per-hit driven
+        double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
+        double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+        v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
+                             m.recRoughInterp, h, d);
+    }
+    out = (Real)(v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v));
+    return true;
+}
+
 // Per-hit glossy roughness / thin-film thickness (device twins of materialRoughness
-// / materialFilmThickness): a bound pattern (highest priority) or scalar map's value
-// at the hit, else the constant.
+// / materialFilmThickness): a bound record (highest priority), then a bound pattern or
+// scalar map's value at the hit, else the constant.
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    Real rr;
+    if (dRecordRoughness(sc, m, h, rr)) return rr;
     if (m.roughnessPat >= 0) {
         double r = dPatternScalarAt(sc, m.roughnessPat, h);
         return (Real)(r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r));
@@ -2860,9 +3026,58 @@ __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, con
     return -1;
 }
 
-// Diffuse reflectance at a hit: texture-sampled when the material binds one, else
-// the constant baked reflect spectrum (mirrors host diffuseReflectance).
+// Per-hit reflectance of a baked driven record channel at driver `d` and wavelength
+// `lambda` (device twin of recReflectanceAt): map d -> LUT position over [lo,hi], lerp
+// the neighbouring bins' JH sigmoid coeffs, evaluate the sigmoid. `coeff` points at the
+// channel's REC_LUT_N*3-double slice (recCoeff + recReflOff).
+__device__ static Real dRecReflAt(const double* coeff, int N, double lo, double hi,
+                                  double d, Real lambda) {
+    if (N <= 0) return (Real)0;
+    if (N == 1) return dReflAt(coeff, lambda);
+    double t = (hi > lo) ? (d - lo) / (hi - lo) : 0.0;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    double fidx = t * (N - 1);
+    int i = (int)fidx; if (i > N - 2) i = N - 2;
+    double f = fidx - i;
+    const double* a = coeff + 3 * i;
+    const double* b = coeff + 3 * (i + 1);
+    double c[3] = { a[0] + (b[0] - a[0]) * f,
+                    a[1] + (b[1] - a[1]) * f,
+                    a[2] + (b[2] - a[2]) * f };
+    return dReflAt(c, lambda);
+}
+
+// Reflect-slot reflectance from a per-hit driven parametric record, if the material
+// binds one (device twin of the driven branch of recordReflectBound). Returns true and
+// sets `out`; false when no record drives reflect per-hit (constant selStop bindings are
+// pre-baked into m.reflect, so they take the ordinary specLookup path). The single point
+// of truth so diffuse albedo AND specular tint see identical driven reflectance.
+__device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
+                                      const DHit& h, Real lambda, Real& out) {
+    if (m.recReflDriven != 1) return false;
+    double px = h.p.x, py = h.p.y, pz = h.p.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+    out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
+                     (double)m.recReflLo, (double)m.recReflHi, d, lambda);
+    return true;
+}
+
+// Reflect-slot reflectance for the SPECULAR families (mirror / glossy / grating /
+// halfmirror): a driven record if present, else the constant baked reflect spectrum
+// (device twin of host reflectSlot; these types never bind a reflect texture).
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real v;
+    if (dRecordReflect(sc, m, h, lambda, v)) return v;
+    return specLookup(m.reflect, lambda);
+}
+
+// Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
+// bound texture, else the constant baked reflect spectrum (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real rv;
+    if (dRecordReflect(sc, m, h, lambda, rv)) return clamp01(rv);
     if (m.reflectTex >= 0) {
         const DTexture& tx = sc.textures[m.reflectTex];
         if (m.triplanarScale > 0.0)
@@ -3110,17 +3325,17 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_MIRROR) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
     } else if (m.type == D_GRATING) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 nro, nrd;
         if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_HALFMIRROR) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
         else { ro = h.p + rd * RAY_EPS; }
         return WF_CONTINUE;
@@ -3133,7 +3348,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
         return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -3714,7 +3929,7 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
     double sy = 2.0 * ((py + jy) / (double)cam.resY) - 1.0;
     ro = cam.eye;
     if (cam.projection == CAM_RECTILINEAR) {
-        rd = normalize(cam.w + cam.u * (Real)(sx * cam.tanHalfX) + cam.v * (Real)(sy * cam.tanHalfY));
+        rd = normalize(cam.w + cam.u * (Real)((sx + cam.frustumShiftX) * cam.tanHalfX) + cam.v * (Real)(sy * cam.tanHalfY));
         return;
     }
     double rho = sqrt(sx * sx + sy * sy);
@@ -3815,19 +4030,19 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_MIRROR: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() >= r) return L;       // RR absorb
                 ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
             }
             case D_GRATING: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() >= r) return L;
                 DVec3 nro, nrd;
                 if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return L;
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_HALFMIRROR: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
                 else                   { ro = h.p + rd * RAY_EPS; }
                 specularArrival = true; break;
@@ -3840,7 +4055,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 specularArrival = true; break;
             }
             case D_GLOSSY: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() >= r) return L;
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                 if (dot(o, h.n) <= 0) return L;
@@ -3924,6 +4139,152 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
         atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
         if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+    }
+}
+
+// ---- G2: deterministic primary-ray isosurface PREVIEW kernel -----------------
+// A GPU sibling of the CPU solid rasterizer (raster.h) that renders implicit
+// isosurfaces (and any other bakeable geometry) WITHOUT tessellation: it casts one
+// deterministic pixel-centre primary ray per pixel through the pinhole/fisheye
+// camera, finds the nearest surface with the shared closestHit (which sphere-traces
+// implicits via intersectImplicit), and shades it once with the SAME preview model
+// the CPU raster uses — flat per-material albedo lit by `ambient + keyScale·Σ(w·N·L·
+// atten·cone) + fill·N·V`. The linear-RGB result + depth/emitter masks are downloaded
+// and run through raster::exposeAndEncode on the host, so the tone map and a
+// camera_path's shared auto-exposure anchor are bit-identical to the CPU preview.
+struct DPLight {
+    DVec3  pos, dir;
+    int    spot;
+    double cosInner, cosOuter, weight, falloff2;
+};
+struct DPreviewLight {
+    const DPLight* lights; int nLights;
+    double ambient, keyScale, fill;
+};
+// Device twin of scene.h spotFalloff (smoothstep penumbra between the cone cosines).
+__device__ static inline double dSpotFalloff(double ct, double cosInner, double cosOuter) {
+    if (ct >= cosInner) return 1.0;
+    if (ct <= cosOuter) return 0.0;
+    double t = (ct - cosOuter) / (cosInner - cosOuter);
+    return t * t * (3.0 - 2.0 * t);
+}
+// ---- image-skin (linear-RGB) sampling for the iso preview -----------------
+// Device twins of raster.h's Texture::sampleRgb / sampleRgbTriplanar (the CPU
+// rasterizer's textured-preview path). All bound skins' texels are flattened into
+// one shared linear-RGB array; each texture's DPTex gives dims/filter/wrap and its
+// first-texel offset. Procedural (formula) skins bake to `rgb` at load (E1), so this
+// one path covers both image and formula skins. Kept a private twin of raster_cuda.cu's
+// dSampleRgb because that sampler lives in a separate translation unit.
+struct DPTex { int w, h, filter, wrap, offset, valid; };
+
+__device__ static inline int dSkinWrap(int i, int n, int wrap) {
+    if (wrap == 1) return (i < 0) ? 0 : (i >= n ? n - 1 : i);        // clamp
+    if (wrap == 2) {                                                 // mirror
+        int period = 2 * n;
+        int m = ((i % period) + period) % period;
+        return (m < n) ? m : (period - 1 - m);
+    }
+    int m = i % n; return (m < 0) ? m + n : m;                       // repeat
+}
+
+__device__ static DVec3 dSkinRgb(const DPTex* meta, const DVec3* texels, int ti,
+                                 double u, double v) {
+    const DPTex& t = meta[ti];
+    if (!t.valid) return DVec3(0.5, 0.5, 0.5);
+    const DVec3* px = texels + t.offset;
+    if (t.filter == 0) {   // nearest
+        int x = dSkinWrap((int)floor(u * t.w), t.w, t.wrap);
+        int y = dSkinWrap((int)floor((1.0 - v) * t.h), t.h, t.wrap);
+        return px[(size_t)y * t.w + x];
+    }
+    double tu = u * t.w - 0.5, tv = (1.0 - v) * t.h - 0.5;
+    double flx = floor(tu), fly = floor(tv);
+    double fx = tu - flx, fy = tv - fly;
+    int x0 = dSkinWrap((int)flx, t.w, t.wrap), x1 = dSkinWrap((int)flx + 1, t.w, t.wrap);
+    int y0 = dSkinWrap((int)fly, t.h, t.wrap), y1 = dSkinWrap((int)fly + 1, t.h, t.wrap);
+    DVec3 c00 = px[(size_t)y0 * t.w + x0], c10 = px[(size_t)y0 * t.w + x1];
+    DVec3 c01 = px[(size_t)y1 * t.w + x0], c11 = px[(size_t)y1 * t.w + x1];
+    DVec3 a = c00 * (1.0 - fx) + c10 * fx;
+    DVec3 b = c01 * (1.0 - fx) + c11 * fx;
+    return a * (1.0 - fy) + b * fy;
+}
+
+__device__ static DVec3 dSkinTri(const DPTex* meta, const DVec3* texels, int ti,
+                                 const DVec3& p, const DVec3& n, double scale) {
+    double ax = fabs(n.x), ay = fabs(n.y), az = fabs(n.z);
+    double wx = ax*ax*ax*ax, wy = ay*ay*ay*ay, wz = az*az*az*az;
+    double s = wx + wy + wz;
+    if (s <= 0.0) return dSkinRgb(meta, texels, ti, p.x * scale, p.y * scale);
+    wx /= s; wy /= s; wz /= s;
+    DVec3 c(0, 0, 0);
+    if (wx > 0.0) c = c + dSkinRgb(meta, texels, ti, p.z * scale, p.y * scale) * wx;
+    if (wy > 0.0) c = c + dSkinRgb(meta, texels, ti, p.x * scale, p.z * scale) * wy;
+    if (wz > 0.0) c = c + dSkinRgb(meta, texels, ti, p.x * scale, p.y * scale) * wz;
+    return c;
+}
+
+__global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
+                            const DVec3* matCol, const int* matEmit, int nMats,
+                            const DPTex* texMeta, const DVec3* texels,
+                            const int* matTex, const double* matTri,
+                            double* accum, float* zbuf, unsigned char* emis,
+                            int W, int H, DVec3 bg, double emisBoost) {
+    int total = W * H;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += gridDim.x * blockDim.x) {
+        int px = idx % W, py = idx / W;
+        // accum row 0 is the image TOP (raster::exposeAndEncode convention), but dGenRay
+        // maps py=0 to sy=-1 (the image BOTTOM), so flip the camera row to match.
+        int camPy = H - 1 - py;
+        DVec3 ro, rd;
+        dGenRay(cam, px, camPy, (Real)0.5, (Real)0.5, ro, rd);   // pixel-centre primary ray
+        DHit h = closestHit(sc, ro, rd);
+        size_t o = (size_t)idx * 3;
+        if (!h.valid) {
+            accum[o + 0] = bg.x; accum[o + 1] = bg.y; accum[o + 2] = bg.z;
+            zbuf[idx] = 0.0f; emis[idx] = 0;
+            continue;
+        }
+        DVec3 col = (h.matId >= 0 && h.matId < nMats) ? matCol[h.matId] : DVec3(0.6, 0.6, 0.6);
+        int   em  = (h.matId >= 0 && h.matId < nMats) ? matEmit[h.matId] : 0;
+        zbuf[idx] = (float)h.t;
+        if (em) {   // emitter: raw tinted glow, boosted so it clips to white (matches CPU)
+            accum[o + 0] = col.x * emisBoost;
+            accum[o + 1] = col.y * emisBoost;
+            accum[o + 2] = col.z * emisBoost;
+            emis[idx] = 1;
+            continue;
+        }
+        emis[idx] = 0;
+        // Image/formula skin: replace the flat material albedo with the texture's linear
+        // RGB, sampled at the interpolated (u,v) or by world triplanar (device twin of
+        // raster.h's textured-preview path; matTex encodes raster.h's binding rule).
+        int ti = (matTex && h.matId >= 0 && h.matId < nMats) ? matTex[h.matId] : -1;
+        if (ti >= 0) {
+            double tri = matTri[h.matId];
+            col = (tri > 0.0) ? dSkinTri(texMeta, texels, ti, h.p, h.n, tri)
+                              : dSkinRgb(texMeta, texels, ti, h.u, h.v);
+        }
+        DVec3 N = normalize(h.n);
+        DVec3 V = normalize(cam.eye - h.p);
+        if (dot(N, V) < 0) N = -N;                            // two-sided preview
+        double lit = 0.0;
+        for (int k = 0; k < pl.nLights; ++k) {
+            const DPLight& lp = pl.lights[k];
+            DVec3 d = lp.pos - h.p;
+            double dist2 = dot(d, d);
+            DVec3 Ld = (dist2 > 1e-12) ? d * (Real)(1.0 / sqrt(dist2)) : V;
+            double ndl = fmax(0.0, (double)dot(N, Ld));
+            if (ndl <= 0.0) continue;
+            double atten = 1.0;
+            if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
+            double cone = 1.0;
+            if (lp.spot) cone = dSpotFalloff((double)dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
+            lit += lp.weight * ndl * atten * cone;
+        }
+        double head = fmax(0.0, (double)dot(N, V));           // camera headlight fill
+        double kk = pl.ambient + pl.keyScale * lit + pl.fill * head;
+        accum[o + 0] = col.x * kk; accum[o + 1] = col.y * kk; accum[o + 2] = col.z * kk;
     }
 }
 
@@ -4137,7 +4498,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     Real jx = rng.uniform(), jy = rng.uniform();
     Real sx = (Real)2 * (((Real)px + jx) / (Real)cam.resX) - (Real)1;
     Real sy = (Real)2 * (((Real)py + jy) / (Real)cam.resY) - (Real)1;
-    DVec3 rd = normalize(cam.w + cam.u * (sx * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
+    DVec3 rd = normalize(cam.w + cam.u * ((sx + (Real)cam.frustumShiftX) * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
@@ -4530,11 +4891,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
-                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
             }
             case D_GLOSSY: {
-                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
                 ro = h.p + h.n * RAY_EPS; rd = o; break;
@@ -4544,7 +4905,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
-                Real r = clamp01(specLookup(m.reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, m, h, lambda));
                 if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
                 else                   { ro = h.p + rd * RAY_EPS; }
                 break;
@@ -4554,7 +4915,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
-                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
             }
         }
@@ -4695,9 +5056,29 @@ bool cudaForwardSupported(const Scene& scene) {
     // frosted/colored glass nor a roughness/film/mix-weight pattern forces a CPU forward
     // fallback here. (The GPU BDPT kernel still can't MIS either — cudaBdptSupported gates
     // both.) Implicit surfaces (isosurface) are gated separately below.
+    // Parametric records (§records) drive a material's slots from a per-hit driver
+    // sampling a named LUT bank. Stages 6a/6b put BOTH slots on the device forward +
+    // backward-reference tracers: REFLECT (constant selStop baked into reflect[], driven
+    // via recCoeff LUT + recDrivers → dRecordReflect / dReflectSlot / dDiffuseRho) and the
+    // SCALAR roughness slot (direct expr / constant selStop / driven stops evaluated
+    // per-hit → dRecordRoughness / dMatRoughness). The only remaining CPU-only case is a
+    // per-hit *driven* scalar channel with >64 stops, which overflows the device interp
+    // arrays (dRecSampleScalar vs[64]) — vanishingly rare, kept on CPU for safety.
+    auto usesRecord = [&](int matId) {
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const RecBinding* rb = scene.mats[matId].recBindingFor(REC_SLOT_ROUGHNESS);
+        if (!rb) return false;
+        if (rb->recordIndex >= 0 && rb->recordIndex < (int)scene.records.size() && rb->selStop < 0) {
+            const Record& rec = scene.records[rb->recordIndex];
+            if (rb->channel >= 0 && rb->channel < (int)rec.channels.size() &&
+                (int)rec.channels[rb->channel].stops.size() > 64) return true;
+        }
+        return false;
+    };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
+        if (usesRecord(matId)) return true;
         // The physical layered stack (coat interface over a weighted body) is CPU-only;
         // the device shadeStep has no Layered branch, so any Layered material forces a
         // CPU forward/backward fallback (like indexed palettes).
@@ -4707,7 +5088,7 @@ bool cudaForwardSupported(const Scene& scene) {
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
             if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
-            for (int c : mx.mixChildren) if (oversizedMultilayer(c)) return true;
+            for (int c : mx.mixChildren) if (oversizedMultilayer(c) || usesRecord(c)) return true;
         }
         return false;
     };
@@ -4934,6 +5315,14 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
     std::vector<DMaterial> mats(scene.mats.size());
     std::vector<double> fluoCdfAll;
+    // Parametric-record reflect pools (§records stage 6a): each per-hit driven reflect
+    // binding flattens its channel's baked JH coeff LUT (REC_LUT_N*3 doubles) into
+    // recCoeffPool and copies its driver program into recDrvPool; DMaterial slices both.
+    std::vector<double>  recCoeffPool;
+    std::vector<PatNode> recDrvPool;
+    // Scalar (roughness) record stops: each stop's domain position + its per-hit expression
+    // program (appended to recDrvPool). DMaterial::recRoughStopOff/N slice this (stage 6b).
+    std::vector<DRecScalarStop> recStopPool;
     for (size_t i = 0; i < scene.mats.size(); ++i) {
         const Material& m = scene.mats[i]; DMaterial& d = mats[i];
         d.type = (int)m.type;
@@ -4977,6 +5366,80 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
+        // --- parametric-record REFLECT binding (§records stage 6a) ---
+        // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
+        // colour straight into reflect[] (so the plain specLookup path is exact, no device
+        // branch). A per-hit driven binding flattens the channel's baked coeff LUT + copies
+        // its driver program, and dRecordReflect samples them. Scalar (roughness) record
+        // bindings are gated to CPU (stage 6b) — cudaForwardSupported rejects them.
+        d.recReflDriven = 0; d.recReflOff = 0;
+        d.recReflDrvOff = 0; d.recReflDrvN = 0;
+        d.recReflLo = 0.0f;  d.recReflHi = 1.0f;
+        if (const RecBinding* rb = m.recBindingFor(REC_SLOT_REFLECT)) {
+            if (rb->recordIndex >= 0 && rb->recordIndex < (int)scene.records.size()) {
+                const Record& rec = scene.records[rb->recordIndex];
+                const RecChannel& ch = rec.channels[rb->channel];
+                if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+                    bakeSpec(ch.stops[rb->selStop].color, d.reflect);   // constant stop → bake
+                } else if ((int)ch.coeff.size() == REC_LUT_N) {
+                    d.recReflDriven = 1;
+                    d.recReflOff = (int)recCoeffPool.size();
+                    for (const auto& c : ch.coeff) {                    // REC_LUT_N * 3 doubles
+                        recCoeffPool.push_back(c[0]);
+                        recCoeffPool.push_back(c[1]);
+                        recCoeffPool.push_back(c[2]);
+                    }
+                    d.recReflDrvOff = (int)recDrvPool.size();
+                    d.recReflDrvN   = (int)rb->driver.size();
+                    recDrvPool.insert(recDrvPool.end(), rb->driver.begin(), rb->driver.end());
+                    d.recReflLo = (float)rec.lo; d.recReflHi = (float)rec.hi;
+                }
+            }
+        }
+        // --- parametric-record ROUGHNESS binding (scalar slot — §records stage 6b) ---
+        // Device twin of the record branch of materialRoughness. Scalar stops evaluate
+        // per-hit (they can reference hit vars), so — unlike the reflect coeff LUT — nothing
+        // bakes to a table: each stop's expression program is copied verbatim and evaluated
+        // on-device. `appendProg` copies a PatNode program into the shared recDrvPool.
+        auto appendProg = [&](const std::vector<PatNode>& prog, int& off, int& n) {
+            off = (int)recDrvPool.size();
+            n   = (int)prog.size();
+            recDrvPool.insert(recDrvPool.end(), prog.begin(), prog.end());
+        };
+        d.recRoughMode = -1;
+        d.recRoughDrvOff = 0; d.recRoughDrvN = 0;
+        d.recRoughStopOff = 0; d.recRoughStopN = 0;
+        d.recRoughInterp = (int)RecInterp::Linear;
+        d.recRoughLo = 0.0f; d.recRoughHi = 1.0f;
+        if (const RecBinding* rb = m.recBindingFor(REC_SLOT_ROUGHNESS)) {
+            if (rb->recordIndex < 0) {                                   // direct scalar expr
+                d.recRoughMode = 0;
+                appendProg(rb->driver, d.recRoughDrvOff, d.recRoughDrvN);
+            } else if (rb->recordIndex < (int)scene.records.size()) {
+                const Record& rec = scene.records[rb->recordIndex];
+                const RecChannel& ch = rec.channels[rb->channel];
+                auto pushStop = [&](const RecStop& s) {
+                    DRecScalarStop ds; ds.pos = s.pos;
+                    appendProg(s.expr, ds.exprOff, ds.exprN);
+                    recStopPool.push_back(ds);
+                };
+                if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+                    d.recRoughMode = 1;                                  // constant selStop
+                    d.recRoughStopOff = (int)recStopPool.size();
+                    d.recRoughStopN   = 1;
+                    pushStop(ch.stops[rb->selStop]);
+                } else if ((int)ch.stops.size() <= 64) {                 // per-hit driven
+                    d.recRoughMode = 2;
+                    appendProg(rb->driver, d.recRoughDrvOff, d.recRoughDrvN);
+                    d.recRoughStopOff = (int)recStopPool.size();
+                    d.recRoughStopN   = (int)ch.stops.size();
+                    for (const RecStop& s : ch.stops) pushStop(s);
+                    d.recRoughInterp = (int)rec.interp;
+                    d.recRoughLo = (float)rec.lo; d.recRoughHi = (float)rec.hi;
+                }
+                // (>64 stops: recRoughMode stays -1; cudaForwardSupported gates it to CPU.)
+            }
+        }
     }
 
     // --- upload geometry/materials ---
@@ -4996,6 +5459,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DTri*       d_blasT  = blasTris.empty()  ? nullptr : (DTri*)keep(uploadVec(blasTris));
     PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
     DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
+    // Parametric-record reflect pools (§records stage 6a) + scalar-stop pool (stage 6b).
+    double*     d_recCoeff = recCoeffPool.empty() ? nullptr : (double*)keep(uploadVec(recCoeffPool));
+    PatNode*    d_recDrv   = recDrvPool.empty()   ? nullptr : (PatNode*)keep(uploadVec(recDrvPool));
+    DRecScalarStop* d_recStops = recStopPool.empty() ? nullptr : (DRecScalarStop*)keep(uploadVec(recStopPool));
 
     // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
@@ -5111,6 +5578,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
+    sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
@@ -5194,6 +5662,7 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
     dc.resX = resX; dc.resY = resY;
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
     dc.projection = cam.projection; dc.halfFovY = cam.halfFovY; dc.rEdge = cam.rEdge;
+    dc.frustumShiftX = cam.frustumShiftX;   // off-axis stereo shear
 
     // Physical multi-element lens (mesh-lens camera). Bake each surface's sensor-side
     // index into an SPEC_N table (air => 1) so the std::function Spectrum stays host-
@@ -5481,6 +5950,13 @@ bool cudaBdptSupported(const Scene& scene) {
         // Procedural patterns drive the same per-hit params; the GPU BDPT kernel's
         // pdf/eval use the constants, so a pattern would bias MIS — use CPU BDPT.
         if (m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0) return true;
+        // Parametric records drive slots from a per-hit driver, but the BDPT connection
+        // BSDF (dBsdfF / dBsdfPdf) has no Hit in scope — it can't sample the driver, so a
+        // record-bound vertex would bias MIS. Forward records run on-device (stage 6a),
+        // but any record binding forces the CPU BDPT here (both driven reflect AND the
+        // constant selStop case, since even the baked reflect would MIS against a driver-
+        // less pdf inconsistently for driven neighbours). Keep BDPT record scenes on CPU.
+        if (m.hasRecordBinding()) return true;
         // Mix blend mask: the GPU BDPT mix-pick uses constant weights; use CPU BDPT.
         if (m.mixWeightTex >= 0) return true;
         if (m.type == MatType::Mix)
@@ -5491,7 +5967,7 @@ bool cudaBdptSupported(const Scene& scene) {
                      scene.mats[c].type == MatType::DiffuseTransmit ||
                      scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
                      scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
-                     scene.mats[c].mixWeightPat >= 0))
+                     scene.mats[c].mixWeightPat >= 0 || scene.mats[c].hasRecordBinding()))
                     return true;
         return false;
     };
@@ -5656,6 +6132,131 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits);
     return out;
+}
+
+// --------------------- G2 iso preview (GPU raster) host ----------------------
+
+bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam) {
+    // The preview only needs closestHit (geometry traversal) + a per-material solid
+    // colour, so it reuses buildUpload's POD scene bake. Gate on the forward-bake
+    // support (buildUploadScene must produce a valid device scene) and a non-physical
+    // camera (dGenRay covers pinhole + fisheye/panoramic; a mesh-lens camera stays on
+    // the CPU raster). Fluorescence etc. never reach the shading here, but the bake path
+    // is shared, so we conservatively require cudaForwardSupported.
+    if (!cudaAvailable()) return false;
+    if (cam.hasLens()) return false;
+    return cudaForwardSupported(scene);
+}
+
+std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
+                                          int W, int H, int nThreads, double exposure,
+                                          bool autoExpose, double* lockAnchor) {
+    using namespace gpu;
+    if (!cudaIsoPreviewSupported(scene, cam)) return {};   // caller falls back to CPU raster
+    if (W <= 0 || H <= 0) return {};
+
+    DUpload up;
+    buildUpload(scene, cam, W, H, up);
+
+    // Distil the scene's lights into preview keys (host deriveLight) and upload them.
+    raster::PreviewLight plHost = raster::deriveLight(scene);
+    std::vector<DPLight> hLights(plHost.lights.size());
+    for (size_t i = 0; i < plHost.lights.size(); ++i) {
+        const raster::PLight& s = plHost.lights[i];
+        DPLight d;
+        d.pos = DVec3(s.pos.x, s.pos.y, s.pos.z);
+        d.dir = DVec3(s.dir.x, s.dir.y, s.dir.z);
+        d.spot = s.spot ? 1 : 0;
+        d.cosInner = s.cosInner; d.cosOuter = s.cosOuter;
+        d.weight = s.weight; d.falloff2 = s.falloff2;
+        hLights[i] = d;
+    }
+    DPreviewLight dpl;
+    dpl.nLights = (int)hLights.size();
+    dpl.lights  = hLights.empty() ? nullptr : (const DPLight*)up.keep(uploadVec(hLights));
+    dpl.ambient = plHost.ambient; dpl.keyScale = plHost.keyScale; dpl.fill = plHost.fill;
+
+    // One solid preview colour + emissive flag per material (host materialColor).
+    std::vector<DVec3> hCol(scene.mats.size());
+    std::vector<int>   hEmit(scene.mats.size());
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        bool em = false;
+        Vec3 c = raster::materialColor(scene.mats[i], em);
+        hCol[i]  = DVec3(c.x, c.y, c.z);
+        hEmit[i] = em ? 1 : 0;
+    }
+    const DVec3* dCol  = hCol.empty()  ? nullptr : (const DVec3*)up.keep(uploadVec(hCol));
+    const int*   dEmit = hEmit.empty() ? nullptr : (const int*)up.keep(uploadVec(hEmit));
+
+    // Image/formula-skin tables: one shared linear-RGB texel array (device twin of
+    // Texture::sampleRgb) + per-material binding (reflectTex index / triplanar scale),
+    // mirroring raster.h buildScene's matTex/matTri rule exactly. Procedural skins bake
+    // to `rgb` at load, so image and formula skins share this one path.
+    std::vector<DPTex> hTexMeta(scene.textures.size());
+    std::vector<DVec3> hTexels;
+    for (size_t i = 0; i < scene.textures.size(); ++i) {
+        const Texture& tx = scene.textures[i];
+        DPTex& m = hTexMeta[i];
+        m.w = tx.w; m.h = tx.h;
+        m.filter = (tx.filter == TexFilter::Nearest) ? 0 : 1;
+        m.wrap   = (tx.wrap == TexWrap::Clamp) ? 1 : (tx.wrap == TexWrap::Mirror ? 2 : 0);
+        m.offset = (int)hTexels.size();
+        m.valid  = tx.valid() ? 1 : 0;
+        if (m.valid)
+            for (const Vec3& c : tx.rgb) hTexels.push_back(DVec3(c.x, c.y, c.z));
+    }
+    std::vector<int>    hMatTex(scene.mats.size(), -1);
+    std::vector<double> hMatTri(scene.mats.size(), 0.0);
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        int rt = scene.mats[i].reflectTex;
+        if (!scene.mats[i].isLight && rt >= 0 && rt < (int)scene.textures.size() &&
+            scene.textures[rt].valid() && !scene.textures[rt].hasPalette()) {
+            hMatTex[i] = rt;
+            hMatTri[i] = scene.mats[i].triplanarScale;
+        }
+    }
+    const DPTex*  dTexMeta = hTexMeta.empty() ? nullptr : (const DPTex*)up.keep(uploadVec(hTexMeta));
+    const DVec3*  dTexels  = hTexels.empty()  ? nullptr : (const DVec3*)up.keep(uploadVec(hTexels));
+    const int*    dMatTex  = hMatTex.empty()  ? nullptr : (const int*)up.keep(uploadVec(hMatTex));
+    const double* dMatTri  = hMatTri.empty()  ? nullptr : (const double*)up.keep(uploadVec(hMatTri));
+
+    const size_t npix = (size_t)W * H;
+    double*        d_accum = nullptr; CUDA_CHECK(cudaMalloc(&d_accum, npix * 3 * sizeof(double)));
+    float*         d_z     = nullptr; CUDA_CHECK(cudaMalloc(&d_z, npix * sizeof(float)));
+    unsigned char* d_emis  = nullptr; CUDA_CHECK(cudaMalloc(&d_emis, npix * sizeof(unsigned char)));
+
+    const double EMIS_BOOST = 4.0;                       // matches raster.h renderFrame
+    const DVec3  bg(0.06, 0.07, 0.09);                   // background tint (raster.h bg)
+    int block = 128;
+    int grid  = (int)((npix + block - 1) / block);
+    if (grid < 1) grid = 1;
+    if (grid > 65535) grid = 65535;
+    kIsoPreview<<<grid, block>>>(up.sc, up.dc, dpl, dCol, dEmit, (int)scene.mats.size(),
+                                 dTexMeta, dTexels, dMatTex, dMatTri,
+                                 d_accum, d_z, d_emis, W, H, bg, EMIS_BOOST);
+    cudaCheckKernel("iso-preview");
+
+    std::vector<double>        accD(npix * 3);
+    std::vector<float>         zf(npix);
+    std::vector<unsigned char> ef(npix);
+    CUDA_CHECK(cudaMemcpy(accD.data(), d_accum, accD.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(zf.data(),   d_z,     npix * sizeof(float),         cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ef.data(),   d_emis,  npix * sizeof(unsigned char), cudaMemcpyDeviceToHost));
+    cudaFree(d_accum); cudaFree(d_z); cudaFree(d_emis);
+    freeUpload(up);
+
+    // Shared host tail: exact same auto-exposure + sRGB tone map as the CPU rasterizer,
+    // so `-raster-gpu` frames match `-raster` and a camera_path's locked anchor carries.
+    std::vector<Vec3>    accum(npix);
+    std::vector<uint8_t> emis(npix);
+    for (size_t i = 0; i < npix; ++i) {
+        accum[i] = Vec3(accD[i * 3 + 0], accD[i * 3 + 1], accD[i * 3 + 2]);
+        emis[i]  = ef[i];
+    }
+    const double expComp = (exposure > 0.0) ? exposure : 1.0;
+    const Vec3 kMilkColor{0.52, 0.55, 0.60};             // unused (seeThrough=false)
+    return raster::exposeAndEncode(accum, zf, emis, W, H, nThreads, expComp, autoExpose,
+                                   lockAnchor, /*seeThrough=*/false, {}, {}, kMilkColor);
 }
 
 // --------------------- photon map (mode M) host ------------------------------

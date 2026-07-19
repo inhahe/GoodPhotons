@@ -34,6 +34,10 @@ enum class PatOp : int {
     VarNx, VarNy, VarNz,             // surface normal (oriented against the ray)
     VarR,                            // radius = sqrt(x*x+y*y+z*z)
     VarU, VarV,                      // surface UV coordinates (mesh or native-primitive wrap)
+    VarT,                            // flyby timeline t in [0,1] — ONLY in scope inside a
+                                     // camera_curve record track (fov_from/roll_from/...);
+                                     // deliberately placed AFTER VarV so patternHasFreeVars'
+                                     // "surface intrinsic" range (VarX..VarV) excludes it.
     // unary: pop 1, push 1
     Neg, Abs, Sqrt, Sin, Cos, Tan, Exp, Log, Floor, Fract, Sign, Saturate,
     // binary: pop 2 (a below b), push 1
@@ -62,6 +66,7 @@ struct PatCtx {
     double nx = 0, ny = 0, nz = 0;// surface normal
     double r = 0;                 // radius |p|
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
+    double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)
 };
 
 inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0) {
@@ -126,6 +131,7 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarR:     st[sp++] = c.r;  break;
             case PatOp::VarU:     st[sp++] = c.u;  break;
             case PatOp::VarV:     st[sp++] = c.v;  break;
+            case PatOp::VarT:     st[sp++] = c.t;  break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = std::fabs(st[sp-1]); break;
             case PatOp::Sqrt:     st[sp-1] = std::sqrt(std::fmax(0.0, st[sp-1])); break;
@@ -257,7 +263,7 @@ inline PatOp binOp(char c) {
     }
 }
 
-inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err) {
+inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err, bool allowT = false) {
     size_t i = 0, n = s.size();
     bool prevValue = false;   // was the previous token a value/RParen (for unary minus)
     while (i < n) {
@@ -289,6 +295,14 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                 Tok t; t.kind = Tok::Num; t.num = 3.14159265358979323846;
                 out.push_back(t); prevValue = true; continue;
             }
+            if (id == "t") {
+                // The flyby timeline is in scope ONLY inside a camera_curve record track.
+                // Everywhere else `t` is out of scope; report that specifically rather than
+                // as a bare "unknown identifier" so the scope rule is legible.
+                if (allowT) { Tok t; t.kind = Tok::Var; t.var = PatOp::VarT; out.push_back(t); prevValue = true; continue; }
+                err = "variable 't' (flyby timeline) is only in scope inside a camera_curve "
+                      "record track (fov_from/roll_from/zoom_from/fstop_from/focus_from)"; return false;
+            }
             if (varOp(id, vop)) {
                 Tok t; t.kind = Tok::Var; t.var = vop; out.push_back(t);
                 prevValue = true; continue;
@@ -312,10 +326,13 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
 }  // namespace pattern_detail
 
 // Compile an infix expression string into a postfix pattern program.
-inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& out, std::string& err) {
+// `allowT` publishes the flyby-timeline variable `t` as in-scope (camera_curve record
+// tracks only). Default false: every other call site keeps `t` an out-of-scope error,
+// so a surface/constant driver can never silently read the timeline.
+inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& out, std::string& err, bool allowT = false) {
     using namespace pattern_detail;
     std::vector<Tok> toks;
-    if (!tokenize(expr, toks, err)) return false;
+    if (!tokenize(expr, toks, err, allowT)) return false;
 
     std::vector<PatNode> queue;             // output (postfix)
     std::vector<Tok>     ops;               // operator stack (Op / Func / LParen)
@@ -389,6 +406,16 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
     if (queue.empty()) { err = "empty expression"; return false; }
     out = std::move(queue);
     return true;
+}
+
+// True if a compiled pattern program references any per-hit surface intrinsic
+// (x y z f nx ny nz r u v). Used by value sites that must be load-time constant
+// (records stage 5a scope check): a constant site has no per-hit context, so it
+// admits only var-free (constant) drivers — a `R.chan(u)` there is a scope error.
+inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
+    for (const PatNode& nd : prog)
+        if (nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,60 @@ from .signals.core import Signal, Number, as_signal, alloc_id
 from .signals.vector import VecSignal, Vecish
 
 
+def _infer_value_dim(values: Sequence[Union[Signal, VecSignal]]) -> Tuple[int, bool]:
+    """Inspect a dataset's stored values and return ``(value_dim, is_vector)``.
+
+    A dataset is either **all scalar** (every value a :class:`Signal`, giving
+    ``value_dim == 1`` and ``is_vector == False``) or **all vector** (every value a
+    :class:`VecSignal` sharing one dimension, giving that dimension and
+    ``is_vector == True``).  Mixing the two, or mixing vector dimensions, is a
+    construction-time error — a field can only interpolate a uniform channel model.
+    """
+    vec: Optional[bool] = None
+    dim: Optional[int] = None
+    for v in values:
+        this_vec = isinstance(v, VecSignal)
+        this_dim = v.dim if this_vec else 1
+        if vec is None:
+            vec, dim = this_vec, this_dim
+        elif this_vec != vec:
+            raise ValueError("dataset values must be all scalar or all vector")
+        elif this_dim != dim:
+            raise ValueError(
+                f"all vector values must share a dimension ({dim} vs {this_dim})")
+    return int(dim or 1), bool(vec)
+
+
+def _check_channels(channels: Optional[Sequence[str]], value_dim: int) -> Optional[Tuple[str, ...]]:
+    if channels is None:
+        return None
+    names = tuple(str(c) for c in channels)
+    if len(names) != value_dim:
+        raise ValueError(
+            f"channels has {len(names)} names but values have dimension {value_dim}")
+    if len(set(names)) != len(names):
+        raise ValueError("channel names must be unique")
+    return names
+
+
+def _resolve_channel(channels: Optional[Tuple[str, ...]], value_dim: int,
+                     channel: Union[int, str]) -> int:
+    """Map a channel selector (index or name) to a component index in range."""
+    if isinstance(channel, str):
+        if channels is None:
+            raise KeyError(f"dataset has no named channels (asked for {channel!r})")
+        try:
+            return channels.index(channel)
+        except ValueError:
+            raise KeyError(f"no channel named {channel!r} (have {list(channels)})")
+    i = int(channel)
+    if i < 0:
+        i += value_dim
+    if not (0 <= i < value_dim):
+        raise IndexError(f"channel index {channel} out of range for dim {value_dim}")
+    return i
+
+
 class PointPath:
     """An ordered sequence of N-D points (each an animatable ``VecSignal``).
 
@@ -146,15 +200,21 @@ class TrackedPath:
 
 
 class Grid:
-    """N-D scalar-or-vector values on a regular lattice.
+    """N-D scalar-or-vector values on a **regular, fixed** lattice.
 
     ``shape`` is the number of samples per axis (arbitrary rarity).  ``lo``/``hi``
     are the domain corners.  ``values`` is a flat, C-order list of length
     ``prod(shape)`` of Signals (scalar field) or VecSignals (vector field).
+
+    The lattice **positions are deliberately fixed** — that regular structure is the
+    whole point of a Grid (it buys the fast separable N-linear interpolation).  Only
+    the *values* at those positions are modulable.  If you want moving sample
+    *positions*, that is exactly what :class:`Scatter` is for.
     """
 
     def __init__(self, shape: Sequence[int], lo: Sequence[float],
-                 hi: Sequence[float], values: Iterable[Union[Signal, VecSignal, Number]]):
+                 hi: Sequence[float], values: Iterable[Union[Signal, VecSignal, Number]],
+                 *, channels: Optional[Sequence[str]] = None):
         self.shape: Tuple[int, ...] = tuple(int(s) for s in shape)
         if any(s < 2 for s in self.shape):
             raise ValueError("each grid axis needs >= 2 samples")
@@ -172,6 +232,8 @@ class Grid:
         self.values: List[Union[Signal, VecSignal]] = [
             v if isinstance(v, (Signal, VecSignal)) else as_signal(v) for v in vals
         ]
+        self.value_dim, self.is_vector = _infer_value_dim(self.values)
+        self.channels = _check_channels(channels, self.value_dim)
         # C-order strides
         self._strides: List[int] = [1] * self.ndim
         for a in range(self.ndim - 2, -1, -1):
@@ -195,6 +257,9 @@ class Grid:
         lo, hi = self.lo[axis], self.hi[axis]
         return [lo + (hi - lo) * (k / (n - 1)) for k in range(n)]
 
+    def channel_index(self, channel: Union[int, str]) -> int:
+        return _resolve_channel(self.channels, self.value_dim, channel)
+
     def children(self):
         return tuple(self.values)
 
@@ -202,7 +267,8 @@ class Grid:
 class Scatter:
     """N-D values at arbitrary positions (positions animatable too)."""
 
-    def __init__(self, samples: Iterable[Tuple[Vecish, Union[Signal, VecSignal, Number]]]):
+    def __init__(self, samples: Iterable[Tuple[Vecish, Union[Signal, VecSignal, Number]]],
+                 *, channels: Optional[Sequence[str]] = None):
         self.positions: List[VecSignal] = []
         self.values: List[Union[Signal, VecSignal]] = []
         for pos, val in samples:
@@ -214,11 +280,16 @@ class Scatter:
         for p in self.positions:
             if p.dim != self.dim:
                 raise ValueError("all Scatter positions must share a dimension")
+        self.value_dim, self.is_vector = _infer_value_dim(self.values)
+        self.channels = _check_channels(channels, self.value_dim)
         self._id = alloc_id()
 
     @property
     def id(self) -> int:
         return self._id
+
+    def channel_index(self, channel: Union[int, str]) -> int:
+        return _resolve_channel(self.channels, self.value_dim, channel)
 
     def __len__(self) -> int:
         return len(self.positions)

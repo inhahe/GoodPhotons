@@ -1210,6 +1210,26 @@ use (`srgbToLinear`, `src/color.h`); data maps (roughness, masks, thickness) are
 `encoding linear` and skip it. HDR/`.hdr`/`.pfm` are already linear (the PFM
 loader forces `encoding linear`).
 
+**Procedural (function-defined) UV skins.** In place of `file`, a texture may give
+three quoted ftsl expressions of the surface UV via `rgb "r(u,v)" "g(u,v)" "b(u,v)"`
+(the [pattern](#pattern) infix grammar; variables `u, v`; constant `pi`). ftrace
+bakes them once at load to a `res`×`res` (default 512) **linear** RGB grid, then
+treats the result exactly like an image texture — the same UV-wrap, Jakob-Hanika
+upsampling, triplanar, GPU and raster paths apply, and `reflect texture:<name>` binds
+it unchanged. `filter`/`wrap` apply; `encoding`/`palette` do not (already linear).
+Each output is clamped to `[0,1]`. Fills the third square of the skin matrix (image
+skins × 3-D-space procedurals × **UV-space procedurals**). loom: `ProcTexture` /
+`func_skin`. Example: `scenes/procskin.ftsl`.
+
+```
+texture "grad" {
+    rgb    "u" "v" "0.5+0.5*sin(2*pi*4*u)"   # r,g,b as functions of surface u,v
+    res    512                               # bake resolution (1–8192)  [implemented]
+    filter bilinear
+    wrap   clamp
+}
+```
+
 ### 9.2 Mapping the skin onto the mesh (the "even / without warp" question)
 
 A texture is sampled at a `(u,v)` produced from the surface hit. How that

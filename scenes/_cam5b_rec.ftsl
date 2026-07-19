@@ -1,0 +1,36 @@
+scene { units meters }
+
+# Stage-5b validation (record-driven camera track). A record whose scalar `fov`
+# channel ramps 60 -> 30 over the domain 0-1 (linear interp), sampled by the flyby
+# timeline t. This must reproduce, frame-for-frame, the `fov_at 0 60 / fov_at 1 30`
+# keyframe track in the companion scene `_cam5b_trk.ftsl` (linear record == linear track).
+zoom = range 0-1 [
+    fov  60  30
+    interp linear
+]
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "gold"  { type glossy  reflect rgb 0.9 0.7 0.25  roughness 0.08 }
+
+quad { origin 0 0 0  u 1 0 0  v 0 0 1  material white }
+quad { origin 0 1 0  u 0 0 1  v 1 0 0  material white }
+quad { origin 0 0 0  u 1 0 0  v 0 1 0  material white }
+quad { origin 0 0 0  u 0 0 1  v 0 1 0  material red }
+quad { origin 1 0 0  u 0 1 0  v 0 0 1  material green }
+
+sphere { center 0.35 0.22 0.55  radius 0.20  material gold }
+sphere { center 0.72 0.16 0.35  radius 0.14  material white }
+
+light area { origin 0.35 0.999 0.35  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  spd preset:bb6500 }
+
+camera_curve "flyrec" {
+    point 0.5 0.5 2.4
+    point 0.5 0.45 2.0
+    point 0.5 0.4 1.7
+    up 0 1 0   mode R   frames 5
+    look_at 0.5 0.30 0.5
+    fov_from zoom.fov          # driver defaults to the raw timeline t
+    film { res 160 120 }
+}

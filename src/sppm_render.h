@@ -116,12 +116,12 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 vp = h; thrOut = thr; vpValid = true;   // record the visible point
                 return;
             case MatType::Mirror: {
-                thr *= clamp01(m.reflect(lambda));
+                thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }
             case MatType::Glossy: {
-                thr *= clamp01(m.reflect(lambda));
+                thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return;
                 ray = Ray{h.p + h.n * 1e-6, o};
@@ -172,7 +172,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             case MatType::HalfMirror: {
-                double r = clamp01(m.reflect(lambda));
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
                 if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
@@ -183,7 +183,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             default: {
-                thr *= clamp01(m.reflect(lambda));
+                thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }

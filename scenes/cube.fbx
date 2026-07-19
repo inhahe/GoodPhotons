@@ -1,0 +1,48 @@
+; FBX 7.4.0 project file
+; Minimal hand-authored ASCII FBX: one unit cube (half-extent 0.5), no normals
+; (ftrace's ufbx bridge sets generate_missing_normals). Used by scenes/fbxcube.ftsl
+; to smoke-test the FBX import path.
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+	Creator: "hand-authored"
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+	}
+}
+Definitions:  {
+	Version: 100
+	Count: 2
+	ObjectType: "Geometry" {
+		Count: 1
+	}
+	ObjectType: "Model" {
+		Count: 1
+	}
+}
+Objects:  {
+	Geometry: 1000, "Geometry::cube", "Mesh" {
+		Vertices: *24 {
+			a: -0.5,-0.5,-0.5, 0.5,-0.5,-0.5, 0.5,0.5,-0.5, -0.5,0.5,-0.5, -0.5,-0.5,0.5, 0.5,-0.5,0.5, 0.5,0.5,0.5, -0.5,0.5,0.5
+		}
+		PolygonVertexIndex: *24 {
+			a: 0,1,5,-5, 3,7,6,-3, 0,3,2,-2, 4,5,6,-8, 0,4,7,-4, 1,2,6,-6
+		}
+	}
+	Model: 2000, "Model::cube", "Mesh" {
+		Version: 232
+	}
+}
+Connections:  {
+	C: "OO", 2000, 0
+	C: "OO", 1000, 2000
+}

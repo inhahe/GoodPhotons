@@ -76,6 +76,43 @@ def test_cycle_through_grid_value_is_caught():
     raise AssertionError("expected a cycle through a grid value")
 
 
+def test_cycle_through_scatter_value_is_caught():
+    ref = RefSignal("v")
+    sc = Scatter([((0.0, 0.0), ref), ((1.0, 1.0), 2.0)])
+    sf = ScatterField(sc, vec(0.5, 0.5))
+    ref.bind(sf)                               # a scatter *value* loops back
+    try:
+        detect_signal_cycle(sf)
+    except SignalCycleError:
+        return
+    raise AssertionError("expected a cycle through a scatter value")
+
+
+def test_cycle_through_scatter_position_is_caught():
+    ref = RefSignal("p")
+    # an animatable scatter *position* whose coordinate loops back through the field
+    sc = Scatter([(vec(ref, 0.0), 1.0), ((1.0, 1.0), 2.0)])
+    sf = ScatterField(sc, vec(0.5, 0.5))
+    ref.bind(sf)                               # a scatter *position* loops back
+    try:
+        detect_signal_cycle(sf)
+    except SignalCycleError:
+        return
+    raise AssertionError("expected a cycle through a scatter position")
+
+
+def test_scatter_position_is_modulable_and_acyclic():
+    from loom import Sine
+    # a moving sample: its y-coordinate is driven by a modulator
+    sc = Scatter([(vec(0.0, Sine(cycles=1, amp=0.5, bias=0.0)), 1.0),
+                  ((1.0, 1.0), 2.0)])
+    sf = ScatterField(sc, vec(0.5, 0.5))
+    detect_signal_cycle(sf)                    # healthy graph: no false positive
+    a = sc.positions[0].at(Clock.at_frame(0, 8), Cache())
+    b = sc.positions[0].at(Clock.at_frame(2, 8), Cache())
+    assert a != b, (a, b)                      # the point actually moves
+
+
 # --- HSV / RGB colour model -------------------------------------------------
 
 def test_hsv_to_rgb_matches_reference():
@@ -211,6 +248,61 @@ def test_texture_rejects_bad_options():
     for bad in [dict(encoding="bogus"), dict(filter="bogus"), dict(wrap="bogus")]:
         try:
             Texture("x", "a.png", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad}")
+
+
+# --- procedural (function-defined) UV skins ---------------------------------
+
+def test_func_skin_makes_proctexture_and_material():
+    from loom import ProcTexture, func_skin
+    tex, mat = func_skin("stripes", "u", "v", "0.5+0.5*sin(2*pi*8*u)",
+                         roughness=0.3)
+    assert isinstance(tex, ProcTexture)
+    assert isinstance(mat, Material)
+    assert (tex.name, mat.name) == ("stripes", "stripes")
+    assert (tex.r, tex.g, tex.b) == ("u", "v", "0.5+0.5*sin(2*pi*8*u)")
+
+
+def test_func_skin_emits_rgb_block_and_binding():
+    from loom import func_skin
+    sc = Scene(Camera(eye=(0, 0, 4), look_at=(0, 0, 0)))
+    sc.add(*func_skin("grad", "u", "v", "0.5", res=256, filter="nearest",
+                      wrap="repeat"),
+           Sphere((0, 0, 0), 1.0, "grad"))
+    sc.check_cycles()
+    out = sc.emit(_clk(), Cache())
+    assert 'texture "grad" { rgb "u" "v" "0.5"' in out
+    assert "res 256" in out
+    assert "filter nearest" in out
+    assert "wrap repeat" in out
+    assert "reflect texture:grad" in out
+    # no bitmap file for a procedural skin
+    assert "file " not in out
+    # texture block precedes the material that binds it
+    assert out.index('texture "grad"') < out.index('material "grad"')
+
+
+def test_proctexture_defaults_and_no_roots():
+    from loom import ProcTexture
+    tex = ProcTexture("t", "u", "v", "0")
+    assert (tex.res, tex.filter, tex.wrap) == (512, "bilinear", "clamp")
+    assert tex.roots() == []
+
+
+def test_proctexture_coerces_non_string_exprs():
+    from loom import ProcTexture
+    tex = ProcTexture("t", 0.25, 1, "u")
+    assert (tex.r, tex.g, tex.b) == ("0.25", "1", "u")
+
+
+def test_proctexture_rejects_bad_options():
+    from loom import ProcTexture
+    bad_opts = [dict(res=0), dict(filter="bogus"), dict(wrap="bogus")]
+    for bad in bad_opts:
+        try:
+            ProcTexture("x", "u", "v", "0", **bad)
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for {bad}")

@@ -204,6 +204,23 @@ paths they can capture at all**.
 > preview it can't accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
+> **No-tessellation GPU isosurface preview — `-raster-gpu`.** The `-device gpu`
+> preview above still *tessellates* the world (marching cubes) first, then rasterizes
+> the triangles — so isosurface-heavy scenes pay a growing CPU tessellation cost every
+> frame. `-raster-gpu` skips tessellation entirely: it casts **one primary ray per
+> pixel** on the device and finds the nearest surface with the shared `closestHit`,
+> which **sphere-traces implicit isosurfaces directly** (no mesh). It shades with the
+> same preview model (per-material albedo — or a sampled **image/procedural skin**, at
+> the hit UV or by world triplanar — plus ambient + weighted N·L keys +
+> a headlight fill) and runs the **same** shared auto-exposure + sRGB tone map on the
+> host, so the image matches `-raster` (surfaces are actually *cleaner* — no marching-
+> cubes faceting) and an exposure-locked flyby still shares one anchor. It falls back
+> to the CPU rasterizer automatically when the GPU can't handle the config (no CUDA
+> device, `-see-through`/`-glass-clarity`, or a physical mesh-lens camera). Ideal for
+> morphing-isosurface video (the `gyroid_nd` loom example routes frames through it with
+> `--raster-gpu`). Example:
+> `ftrace -in scenes/implicit.ftsl -raster-gpu -window -o png/preview.png`.
+>
 > **See-through clear objects — `-see-through`.** By default a clear material
 > (dielectric / thin-film / filter / diffuse-transmit) previews as a solid pale
 > ghost. Pass **`-see-through`** (aliases `-seethrough`, `-glass`) to instead render
@@ -569,7 +586,15 @@ stay non-resumable.
   same pattern VM, and threads the interior-absorption medium through both the forward
   and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
   material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
-  reproduce. `cpu` is fully deterministic and is used for reference/validation baselines.
+  reproduce. **Parametric records** (a material's slots driven by a per-hit driver
+  sampling a named LUT bank — see *Parametric records* below) run on the **GPU forward
+  and backward tracers for both the reflect/albedo and roughness slots** (constant stop
+  selectors bake into the device material; per-hit driven reflect uploads the record's
+  baked LUT + driver program, and a driven scalar/roughness slot uploads each stop's
+  compiled expression + driver — both sampled on-device by exact twins of the CPU
+  sampler). **Any** record-bound scene still falls back on GPU **BDPT** (mode `D`) —
+  its MIS connection BSDF has no per-hit surface point to evaluate the driver. The
+  fallback is automatic. `cpu` is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -766,6 +791,32 @@ material "water" { type dielectric ior 1.33  priority 1 }
 material "glass" { type dielectric ior 1.52  priority 2 }   # wins where it overlaps water
 ```
 
+**Parametric records.** A **record** is a named bank of per-channel look-up tables over
+a shared scalar domain `[lo,hi]`. A single per-hit **driver** scalar samples every
+channel at once, and each channel whose name matches a material slot fills that slot at
+the driven value — so one expression coordinates a sweep across a material's slots
+(`reflect` → diffuse albedo, `roughness` → glossy roughness). Colour channels list
+prefixed spectrum refs and interpolate in linear RGB (then upsample back to a
+reflectance); scalar channels list pattern expressions (the same math VM as procedural
+patterns). `interp nearest|linear|smooth` selects the sampling mode — `smooth` is a
+monotone Fritsch–Carlson cubic (no overshoot).
+
+```
+grad = range 0-1 [
+    reflect  spectrum:steel  spectrum:gold  spectrum:copper   # steel -> gold -> copper
+    interp   smooth
+]
+sphere { center 0 0 0  radius 1  material grad(u) }                   # sweep along u
+sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled by noise
+```
+
+Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
+is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
+A record driving the **reflect/albedo** *or* **roughness** slot runs on the **GPU**
+forward and backward tracers (the LUT/stop programs + driver upload to the device and
+are sampled by device twins of the CPU sampler); any record-bound scene still falls back
+on **GPU BDPT** (mode `D`). Fallback is automatic. See FTSL.md §7.5 for the full grammar.
+
 ---
 
 ## Spectra (SPDs, reflectances, indices)
@@ -936,11 +987,18 @@ sensor gain, and `iso`/`shutter`/`exposure` become true absolute stops (doubling
 
 ## Geometry
 
-`sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ and glTF 2.0 /
-GLB** import — the loader dispatches on file extension). glTF brings its node
-transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness` materials
-(base color upsampled to a reflectance spectrum, metallic → glossy tint, roughness
-→ lobe width; `import_materials no` forces the FTSL `material` instead). OBJ
+`sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ, glTF 2.0 / GLB,
+and Autodesk FBX** import — the loader dispatches on file extension). glTF brings
+its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
+materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
+roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
+**FBX** (`.fbx`, via the vendored MIT/public-domain [`ufbx`](https://github.com/ufbx/ufbx)
+library) imports baked triangle geometry — every mesh instance's faces are
+triangulated and baked through ufbx's world transform, with generated-if-missing
+per-vertex normals and the first UV set filling the same smooth-shading / texturing
+slots the OBJ/glTF paths use; the scene is normalized to right-handed Y-up metres at
+load. (FBX materials, skinning, blend shapes and animation are not yet consumed — see
+known-issues.) OBJ
 supports `usemtl use_names` for per-face materials and `uv use_mesh` for mesh UVs.
 OBJ **vertex normals (`vn`) are read as smooth shading normals** — a hit
 barycentric-interpolates them (CPU and GPU) for smooth-shaded curved meshes, with
@@ -982,6 +1040,13 @@ every render mode, and the memory sharing holds on **both** the CPU and the GPU:
 device also uses a true two-level BVH (shared per-BLAS pools + an instance table that
 transforms the ray into BLAS space), so device memory scales with unique geometry, not
 with the instance count. Everything is accelerated by a BVH.
+
+**Watertight ray–triangle test.** Triangles are intersected with the Woop/Benthin/Wald/Áfra
+watertight test (JCGT 2013) rather than Möller–Trumbore. A ray through a shared edge is
+claimed by *exactly one* of the two triangles that meet there, so closed meshes render with
+**no grazing-edge cracks** (background pixels leaking through a silhouette) and no dropped
+hits. This holds on both the CPU double path and — where it matters most, since floating-point
+edge signs are what used to crack — the GPU float path.
 
 ### Implicit surfaces (`isosurface`)
 
@@ -1302,6 +1367,16 @@ spectra, looked up nearest (CPU only; GPU falls back). A 2-child `mix` can take 
 **blend mask** (`weight_map texture:<name>`) that selects child 0 vs child 1 per hit.
 A scalar map on `ior` remains future work.
 
+A texture's albedo can also be **procedural in UV space**: in place of `file`, give
+three quoted ftsl expressions of the surface UV — `rgb "r(u,v)" "g(u,v)" "b(u,v)"`
+(the pattern infix grammar; variables `u v`, constant `pi`; each output clamped to
+`[0,1]`, interpreted as linear RGB). ftrace bakes them once at load to a `res`×`res`
+grid (default 512) and then treats it exactly like an image texture — the same
+UV-wrap, Jakob–Hanika upsampling, triplanar, GPU and raster paths, and
+`reflect texture:<name>` binding all apply unchanged. This completes the skin matrix
+alongside image skins and 3-D-space procedural patterns: a **UV-space procedural**.
+See `scenes/procskin.ftsl` (loom: `ProcTexture` / `func_skin`).
+
 ## Procedural patterns (math-driven materials)
 
 A `pattern "name" { … }` block compiles a **scalar field** — a function of the hit
@@ -1444,6 +1519,16 @@ rays** — the forward modes (A/B/C), BDPT `D`, and all GPU paths still trace th
 straight (they ignore `ior`), so render a GRIN scene with `-mode R -device cpu` for now.
 Wiring the Eikonal march through the other tracers/GPU is tracked in `known-issues.md`.
 
+**Authoring media procedurally (loom).** The [loom toolkit](tools/loom/README.md) emits
+these `medium {}` blocks from a `loom.Volume(...)`: `sigma_t` / `albedo` / `g` are
+animatable `Signal`s, and a `density` is any loom `SpatialExpr` field (the same
+`X Y Z T` DSL that drives its isosurfaces), so an animated procedural cloud/fog is emitted
+as an inline `density "<expr>"`. Bound it with `box=` / `sphere=` / `obj=`, cap the majorant
+with `density_max=`, or point `density="vdb:<path>"` at an existing NanoVDB grid (loom
+references sparse volumes but doesn't generate them). E.g. a sphere-bounded procedural fog
+blob: `Volume(sigma_t=8.0, albedo=0.9, g=0.4, density=0.6 + 0.4*sin(8*X)*sin(8*Y)*sin(8*Z),
+sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2)`.
+
 ---
 
 ## Scene language (FTSL)
@@ -1563,6 +1648,28 @@ extension), which ffmpeg concatenates into a video. Any flyby block may carry an
   field only in the physical catch modes `A`/`C`; in the pinhole splat `B` the aperture is
   virtual, so there `roll`/`fov`/`zoom` are the visible ones. Lens *projection*/fisheye is
   a discrete whole-flight mode, not a continuous track — set it once with `projection`.)
+  Any of these scalars can instead be driven by a **parametric record** (see *Parametric
+  records* below) with **`<name>_from RECORD.channel[(driver)]`** — the channel is sampled
+  over the flyby timeline, the optional driver defaults to the raw `t` and may be any
+  expression in `t` (`fov_from zoom.fov(t*t)` eases in), and the record's `interp`
+  (nearest/linear/smooth) shapes the curve. A record track overrides an `_at` track, which
+  overrides the constant; a linear record reproduces the matching linear `_at` keyframes
+  frame-for-frame. (The driver sees **only** `t` here — surface variables like `u`/`x` are
+  out of scope and error.)
+
+- **Two-axis camera orientation — `fwd_at` / `up_at` / `frame` / `fwd_frame` / `up_frame`.**
+  The camera basis is set by a **forward** axis and an **up** axis (`right` is always
+  derived, never authored). Each axis is read in a **reference frame** — `frame world|travel`
+  sets the default for both and `fwd_frame`/`up_frame` override it per axis. `world` is the
+  fixed world axes (classic behavior); `travel` is the curve's **rotation-minimizing frame**
+  (RMF), a twist-free moving basis parallel-transported along the path (double-reflection
+  method, *not* the flip-prone Frenet frame) so the shot **banks into turns** — and on a
+  `closed` loop the residual twist is distributed so the frame closes seamlessly. Forward
+  (2 DOF) comes from `fwd_at <t> <x y z>` direction keyframes, else `look_at`/`look curve`,
+  else the tangent; up (1 DOF) comes from `up_at <t> <x y z>`, else `roll`/`roll_at`, else the
+  reference up. A `fwd_at`/`up_at` vector is read **in its axis's frame**: under `travel` its
+  components are `(right, up, forward)` in the RMF basis, under `world` a plain world
+  direction. Authoring none of these keywords reproduces the legacy world-up framing exactly.
 
 **`exposure_lock` — one shared auto-exposure across a whole path.** On any
 `camera_path`/`camera_orbit`/`camera_curve`, `exposure_lock` freezes a single
@@ -1663,6 +1770,66 @@ which falls back to per-camera passes) so each draws its own photons.
 > a multi-camera render of those modes simply renders **each camera independently**
 > (re-tracing the full sample budget per camera), so it costs the same as running them
 > one at a time. Only `A`, `B`, and `M` amortise the forward trace across cameras.
+
+### Stereoscopic 3-D (`-stereo`)
+
+`-stereo <mode>` turns any render — a still *or* every frame of a `camera_path` movie —
+into **3-D stereoscopic output**. Each selected camera is rendered **twice** (a Left and a
+Right eye) and the two images are fused into the `-o` file:
+
+- **`-stereo sbs`** — side-by-side **wall-eyed** (Left\|Right), for free-viewing or a
+  parallel-view stereoscope. Output is `2·resX` wide.
+- **`-stereo cross`** — side-by-side **cross-eyed** (Right\|Left), for the cross-your-eyes
+  free-viewing technique.
+- **`-stereo anaglyph`** — **red-cyan** glasses. Uses the **Dubois** least-squares colour
+  matrices (far less ghosting / retinal rivalry than a naïve channel split). Same
+  resolution as a mono render.
+- **`-stereo anaglyph-gm`** — **green-magenta** Dubois anaglyph.
+
+**Off-axis rig (why it's comfortable).** The two eyes are *parallel* cameras offset along
+the camera **right axis**, each with an **asymmetric (sheared) frustum** that shares a
+single **convergence plane**. This is the correct method: the naïve "toe-in" (rotating the
+two cameras to cross) introduces **vertical parallax** that causes eye strain, which the
+off-axis shear avoids entirely. The convergence plane is the depth that appears *at the
+screen* (zero parallax); objects nearer than it pop out toward you, farther objects recede
+behind the screen.
+
+**Physical geometry.** The baseline (eye separation in the scene) and convergence are
+derived from the real viewing setup, so the depth reads naturally:
+
+- **`-eye-sep <m>`** — your interocular distance (default `0.063` m).
+- **`-view-dist <m>`** — how far you sit from the screen (default `0.6` m).
+- **`-dpi <n|auto>`** — screen pixel density. Given a number, the screen's physical width
+  is `resX·0.0254/dpi`. `auto` reads the Windows *logical* system DPI (a rough hint). If
+  you omit `-dpi` (the default), the screen width is taken as the camera's horizontal field
+  seen at `-view-dist` (`W = 2·view-dist·tan(½·fovX)`).
+- **`-convergence <m>`** — the convergence-plane distance in **scene units** (default: the
+  camera's look-at target distance).
+
+From these the frustum shear is `S = eye-sep / screen-width` (so a point at **infinity**
+lands exactly one interocular apart on screen — parallel gaze, the comfortable far limit),
+and the baseline is `b = 2·convergence·tan(½·fovX)·S`. Equivalently `b/convergence =
+eye-sep/screen-width`: **the camera's separation relative to its subject equals your eyes'
+separation relative to the screen.** Because it's expressed as that ratio, the same flags
+give sensible depth at any scene scale.
+
+Both eyes share a single auto-exposure anchor, so Left and Right — and, for an
+**exposure-locked** `camera_path`, *every frame* — tone-map identically (no L/R brightness
+mismatch or stereo shimmer). Each eye rides the full render pipeline (checkpoints, budgets,
+GPU, the live `-window`), so nothing else about how you render changes. The intermediate
+per-eye PNGs are deleted after compositing unless you pass **`-stereo-keep-eyes`**.
+Rectilinear cameras only — a fisheye/panoramic camera renders mono with a warning.
+
+```
+# red-cyan anaglyph still, physical defaults, convergence on the look-at target
+ftrace -in scene.ftsl -mode B -n 2e8 -stereo anaglyph -o png/scene3d.png -keepwindow
+
+# wall-eyed side-by-side, wider baseline via an explicit near convergence plane
+ftrace -in scene.ftsl -mode B -n 2e8 -stereo sbs -convergence 1.5 -o png/scene_sbs.png -keepwindow
+
+# a whole exposure-locked flyby in green-magenta 3-D (one composite per frame)
+ftrace -in scene.ftsl -camera fly -stereo anaglyph-gm -o png/fly/fly.png
+```
 
 ### Animated geometry (OBJ sequences) → video
 
@@ -1789,6 +1956,12 @@ alone can't restore, so they are not disk-resumable.
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
+| `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
+| `-eye-sep <m>` | Interocular (eye-to-eye) distance for `-stereo`, in metres. Default `0.063` (63 mm, average human). |
+| `-view-dist <m>` | Viewing distance (eye-to-screen) for `-stereo`, in metres. Default `0.6`. Used to derive the screen width (screen shows the camera's horizontal field at this distance) when `-dpi` isn't given. |
+| `-dpi <n\|auto>` | Screen pixel density for `-stereo`. With a number, screen width `= resX·0.0254/dpi`. `auto` reads the Windows **logical** system DPI (a rough hint — often 96; not the panel's physical pitch). Omit it (the default) to instead derive screen width from `-view-dist` × the camera FOV. |
+| `-convergence <m>` | Convergence-plane distance for `-stereo`, in **scene units** — the depth that lands at the screen (zero parallax); nearer objects pop out, farther recede. Default: the camera's **look-at target** distance. |
+| `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,

@@ -14,6 +14,7 @@
 #include "envmap.h"
 #include "vdbgrid.h"
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
+#include "record.h"      // parametric records (§records): named per-channel LUTs
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
@@ -89,6 +90,20 @@ struct Material {
     int roughnessPat = -1;
     int filmThicknessPat = -1;
     int mixWeightPat = -1;   // drives child-0 selection prob of a 2-child Mix (see mixResolveChild)
+
+    // --- Parametric-record drive (§records) ---------------------------------
+    // A material's slots can be driven by parametric records (Scene::records). Each
+    // RecBinding fills ONE slot from a per-hit source (a record channel sampled at a
+    // driver, a constant stop selector, or a direct scalar expression). The inline
+    // `material R(driver)` form and a `material "m" { from R(d) … slot = … }` block's
+    // ordered statements both collapse (last-write-wins) into at most one binding per
+    // slot here. Empty => no record drive (the material uses its constant slots).
+    std::vector<RecBinding> recBindings;
+    bool hasRecordBinding() const { return !recBindings.empty(); }
+    const RecBinding* recBindingFor(int slot) const {
+        for (const auto& rb : recBindings) if (rb.slot == slot) return &rb;
+        return nullptr;
+    }
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
@@ -643,15 +658,17 @@ struct Blas {
     bool intersectLocal(const Ray& lr, double tmin, Hit& h) const {
         bool found = false;
         double tMax = h.t;
+        const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         bvh.traverseClosest(lr, tmin, tMax, [&](int prim, double& tm) {
-            if (intersectTri(lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
+            if (intersectTri(sh, lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
         });
         return found;
     }
     bool occludedLocal(const Ray& lr, double tmin, double maxDist) const {
+        const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
             Hit h; h.t = maxDist;
-            return intersectTri(lr, tris[prim], tmin, h);
+            return intersectTri(sh, lr, tris[prim], tmin, h);
         });
     }
 };
@@ -684,6 +701,7 @@ struct Scene {
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
+    std::vector<Record>  records;    // parametric records: named per-channel LUTs (§records)
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -999,8 +1017,9 @@ struct Scene {
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
+        const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
-            if (prim < (int)nT)            { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
+            if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
             else {
@@ -1027,9 +1046,10 @@ struct Scene {
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
         const double seg = maxDist - tmin;
+        const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(r, tris[prim], tmin, h);
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
             const MeshInstance& inst = instances[prim - nT - nS - nI];
@@ -1041,7 +1061,8 @@ struct Scene {
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
-        for (const auto& t : tris)     intersectTri(r, t, tmin, h);
+        const TriShear sh = makeTriShear(r.d);
+        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h);
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h);
         for (const auto& inst : instances) {
@@ -1056,11 +1077,51 @@ struct Scene {
     }
 };
 
-// Diffuse albedo at a hit: the material's spatially-varying texture reflectance if
-// one is bound (Phase 3b), else its constant `reflect` spectrum. Shared by the
-// forward tracer and the backward reference so both see identical albedo.
+// Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
+// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
+inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
+
+// Reflect-slot reflectance from a bound parametric record, if the material has a
+// REC_SLOT_REFLECT binding. Returns true and sets `out` (constant-stop selector, or
+// the driven sample at this hit); false when no record drives the reflect slot. The
+// single point of truth so diffuse albedo AND specular tint (mirror/glossy/…) see
+// identical record-driven reflectance.
+inline bool recordReflectBound(const Scene& scene, const Material& m,
+                               const Hit& h, double lambda, double& out) {
+    const RecBinding* rb = m.recBindingFor(REC_SLOT_REFLECT);
+    if (!rb || rb->recordIndex < 0 || rb->recordIndex >= (int)scene.records.size())
+        return false;
+    const Record& rec = scene.records[rb->recordIndex];
+    const RecChannel& ch = rec.channels[rb->channel];
+    if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+        out = ch.stops[rb->selStop].color(lambda);            // constant stop selector
+    } else {
+        double d = patternEval(rb->driver.data(), (int)rb->driver.size(),
+                               patCtxFromHit(h));
+        out = recReflectanceAt(rec, ch, d, lambda);
+    }
+    return true;
+}
+
+// Reflect-slot reflectance for the SPECULAR families (Mirror / Glossy / Grating /
+// HalfMirror) whose tint reads the reflect slot directly: a bound record if present,
+// else the constant `reflect` spectrum. (These types never bind a reflect texture,
+// so — unlike diffuseReflectance — there is no texture path.)
+inline double reflectSlot(const Scene& scene, const Material& m,
+                          const Hit& h, double lambda) {
+    double v;
+    if (recordReflectBound(scene, m, h, lambda, v)) return v;
+    return m.reflect(lambda);
+}
+
+// Diffuse albedo at a hit: a bound parametric record (highest priority), else the
+// material's spatially-varying texture reflectance if one is bound (Phase 3b), else
+// its constant `reflect` spectrum. Shared by the forward tracer and the backward
+// reference so both see identical albedo.
 inline double diffuseReflectance(const Scene& scene, const Material& m,
                                  const Hit& h, double lambda) {
+    double rv;
+    if (recordReflectBound(scene, m, h, lambda, rv)) return rv;
     if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
         const Texture& tx = scene.textures[m.reflectTex];
         if (m.triplanarScale > 0.0)
@@ -1069,10 +1130,6 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
     }
     return m.reflect(lambda);
 }
-
-// Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
-// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
-inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern
 // value, or `dflt` if `pat` is out of range.
@@ -1087,6 +1144,25 @@ inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double 
 // constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf see the
 // SAME roughness at a hit — otherwise the density and the sample diverge.
 inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
+    if (const RecBinding* rb = m.recBindingFor(REC_SLOT_ROUGHNESS)) {
+        PatCtx c = patCtxFromHit(h);
+        double r = 0.0;
+        if (rb->recordIndex < 0) {
+            // direct scalar expression, e.g. `roughness = sin(v*3.14159)`
+            r = patternEval(rb->driver.data(), (int)rb->driver.size(), c);
+        } else if (rb->recordIndex < (int)scene.records.size()) {
+            const Record& rec = scene.records[rb->recordIndex];
+            const RecChannel& ch = rec.channels[rb->channel];
+            if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+                const std::vector<PatNode>& e = ch.stops[rb->selStop].expr;   // constant stop selector
+                r = e.empty() ? 0.0 : patternEval(e.data(), (int)e.size(), c);
+            } else {
+                double d = patternEval(rb->driver.data(), (int)rb->driver.size(), c);
+                r = recSampleScalar(rec, ch, d, c);
+            }
+        }
+        return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
+    }
     if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
         double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(h));
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);

@@ -49,8 +49,9 @@ tools/loom/
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
-│   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry (all animatable)
+│   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
 │   ├── canvas.py    2-D canvas (motion graphics: markers, strokes)
+│   ├── audio.py     procedural audio: one sample-buffer back-end → WAV (offline)
 │   ├── xvideo.py    two-pass spacetime transforms (rotate/shear a 4-D block)
 │   ├── ftsl_emit.py .ftsl emission
 │   ├── drive.py     drivers: render a frame range → ftrace → GIF/MP4 assembly

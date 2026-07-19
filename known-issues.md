@@ -5,6 +5,108 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-19): loom RBF scatter field rebuilds the interpolator every frame
+`RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) rebuild the
+`scipy.interpolate.RBFInterpolator` once per frame because sample positions/values are
+animatable (Signals), so the kernel factorization is frame-dependent. When positions are
+**static** (the common case) the O(M³) kernel factorization only depends on positions and
+could be reused across frames, re-solving only for changed values — but scipy's
+`RBFInterpolator` bakes values at construction and exposes no "refactor with new RHS" API.
+Proper fix: detect static positions (all-`Const` position components) and, for that case,
+cache the factorization across frames — either by dropping to scipy's lower-level linear
+solve (build the kernel matrix + polynomial tail once, LU-factor, re-solve per frame) or by
+keeping the `RBFInterpolator` alive when values are also static. Until then, per-frame
+rebuild is correct but wasteful for long animations with many samples. `neighbors=` (local
+k-NN RBF) mitigates the cost for large point sets.
+
+### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
+**Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)
+can *reference* an existing NanoVDB grid via `density="vdb:<path>"`, but loom has no way to
+*generate* a `.nvdb` from a Python field or to wrap OpenVDB's tooling.
+
+- **What it would be.** A `loom` helper that bakes a loom `SpatialExpr` / `Grid` density field
+  into a NanoVDB `FloatGrid` on disk (dense or sparse), so a procedural cloud authored in loom
+  could ship as a real sparse asset instead of an inline `density "<expr>"`. Optionally a thin
+  wrapper over OpenVDB's `nanovdb_convert` for `.vdb → .nvdb`.
+- **Why we skip it now.** The procedural path already covers loom's sweet spot: an animated
+  density formula emits straight into `medium { density "<expr>" }` and renders unbiased on CPU
+  and GPU (validated by `scraps/_volume_test.py`). Baking to voxels only helps when a field is
+  too costly to evaluate per-sample or must interop with external VDB assets — neither is a
+  current need. The engine already imports `.nvdb` (`scraps/make_nvdb.cpp` makes test assets).
+- **When to revisit.** When a loom scene needs a genuinely sparse, prebaked cloud (huge extent,
+  expensive field, or sharing an asset with a DCC pipeline).
+
+### DEFERRED (2026-07-18): `PatOp::MatMulAdd` — a fused matrix·vec+offset pattern opcode (future optimization)
+**Status: intentionally not built. This is an optimization of an already-working path, not a
+missing capability.** Why we may want it someday, and why we don't need it now:
+
+- **The need it *seems* to fill is already met.** loom's N-D isosurfaces (`gyroid_nd`) rotate the
+  lattice in higher dimensions by an affine map `A·(x,y,z) + c` fed into the field — and that matrix
+  multiply **must** live inside the isosurface function ftrace evaluates. It already does: `_arg_expr()`
+  (and `_pov_nd_coords`/`_pov_affine_coords`) in `tools/loom/examples/gyroid_nd.py` emit each matrix row
+  as a plain scalar expression `(coeff*((a)*x+(b)*y+(c)*z)+phase)`. ftrace's pattern parser
+  (`src/pattern.h`) compiles that straight into `Const/VarX/VarY/VarZ/Mul/Add` postfix bytecode and
+  evaluates it directly on both CPU and GPU (the `-raster-gpu` iso preview ray-marches D=8 tumble gyroids
+  today with the matrix baked in). So there is **no field ftrace currently fails to render** for lack of
+  a matrix op.
+- **What MatMulAdd would actually buy.** Purely a more compact *encoding*: one fused opcode replacing the
+  ~6 scalar ops per emitted matrix row (`Const, VarX, Mul, VarY, Mul, Add, …`). Same math, bit-identical
+  result — fewer `PatNode`s in the compiled program and a slightly cheaper inner eval. It is **not** a new
+  capability.
+- **Why we skip it now.** Per-frame pattern evaluation is not the bottleneck (the sin/cos/`PovFn` terms
+  and the sphere-march dominate the field eval), and the postfix programs are well within any practical
+  size. The payoff is marginal; the cleanest correct implementation still isn't free (see below).
+- **When to revisit.** If a real workload ever makes pattern-eval node count or throughput a measured
+  problem — e.g. very high-D fields with many coupling edges producing enormous postfix programs, or a
+  profile showing the linear ops as a hot fraction of field eval.
+- **How to build it (the design fork), if revisited.** The pattern VM is a single-scalar-stack machine:
+  every `PatNode` is a POD `{PatOp op; double a;}` that pops N and pushes **exactly one** scalar. A
+  matrix·vec+offset is 12 coefficients in → a **3-vector** out, which doesn't fit that contract. Two ways:
+  - **Option A — single-output "matrow" + coefficient pool (preferred).** Add a `MatRow` op computing one
+    output component `m0·x + m1·y + m2·z + off`; emit 3 per point. Preserves the one-push-per-node
+    invariant and the POD/GPU-uploadable node, but needs `PatNode` to gain a side-array index (the single
+    `double a` can't hold 4 coeffs). Contained; the five standard PatOp touch-points (opcode enum
+    `pattern.h:29`, CPU eval switch `pattern.h:112`, device eval switch `render_cuda.cu` ~2754, the
+    parser, and PatNode storage) plus the coefficient pool.
+  - **Option B — true multi-output (invasive, not recommended for an ergonomics gain).** Give the stack
+    vector semantics so a node can push 3 values. Cleanest for "transform a point," but rewrites the VM's
+    fundamental one-scalar-out contract across CPU eval, device eval, arity accounting, and every consumer.
+
+### ~~TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)~~ — FIXED 2026-07-19 (G5)
+The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
+wired as `-raster-gpu`) cast one ray/pixel with the shared `closestHit` and shaded
+each hit with a **flat per-material solid colour** (`raster::materialColor` baked into
+`matCol[]`), unlike the *triangle* GPU rasterizer — so a textured mesh previewed as flat
+colour. **FIXED 2026-07-19 (TODO G5):** ported the CPU rasterizer's textured-preview path
+(`Texture::sampleRgb`/`sampleRgbTriplanar`) into `kIsoPreview`. A shared flattened
+linear-RGB texel array + per-texture `DPTex` meta + per-material `matTex`/`matTri` binding
+(mirroring `raster.h` buildScene's rule exactly) are uploaded alongside `matCol`; the
+kernel samples the hit `(u,v)` (or world triplanar) and replaces the flat albedo for
+non-emitter hits. Covers **image** skins and, because E1 procedural (formula) skins bake
+to `rgb` at load, **formula** skins too — one path. Flat (no-texture) hits are unchanged
+(`matTex==-1` skips the sampler). Validated: `-raster-gpu` matches CPU `-raster` within
+edge-coverage tolerance on `procskin.ftsl` (formula), `textured.ftsl` (image UV) and
+`triplanar.ftsl` (mean channel diff ~0.03/255, ~1033 shared box-edge px); flat
+`implicit.ftsl` unchanged. The device sampler is a private twin of `raster_cuda.cu`'s
+(separate translation unit).
+
+### TECH DEBT (2026-07-18): FBX import (C8) consumes geometry only — no materials/skinning/animation
+The new FBX loader (`src/fbx_load.cpp`, vendored `ufbx`) imports **baked triangle
+geometry + generated-if-missing normals + the first UV set**, applying every mesh
+instance's `geometry_to_world`. It does **not** yet consume:
+- **FBX materials** (Phong/Lambert/PBR) — every triangle takes the mesh block's
+  FTSL `material`. glTF already maps `pbrMetallicRoughness`; FBX should get a similar
+  material bridge (ufbx exposes `ufbx_material` + `pbr`/`fbx` property maps).
+- **Skinning / blend shapes** — `ufbx_load_opts` could `evaluate` a bind/rest pose,
+  but the loader currently reads the static mesh. A future path could bake a chosen
+  animation time (ufbx supports `ufbx_evaluate_scene`).
+- **Animation** — no per-frame FBX animation sampling (loom emits frames instead).
+- **Multiple UV sets / per-face materials / vertex colors** — only `vertex_uv` set 0
+  is read; `face_material` segmentation is ignored.
+These are additive follow-ups; the geometry path is validated (`scenes/cube.fbx` →
+8 verts / 12 tris, `scenes/fbxcube.ftsl`). The proper fix for materials is a
+`ufbx_material` → spectral-BSDF mapping mirroring `gltf.h`'s material import.
+
 ### TECH DEBT (2026-07-17): GPU preview rasterizer — feature parity with the CPU rasterizer
 
 The GPU preview rasterizer (`src/raster_cuda.{h,cu}`, wired into `main.cpp`'s
@@ -2804,3 +2906,11 @@ correctly on **both** backends.
   e.g. attach `procdump -ma -e` to the live PID, or `procdump -i -ma <dir>` (admin) to
   install a system postmortem catcher — then analyze `.dmp` (`!analyze -v`) to confirm
   whether it is `nvcuda`/driver teardown vs. app code.
+
+## FIXED (2026-07-19): `-n` ignored scientific notation (`-n 2e8` → 2 photons)
+`-n <count>` was parsed with `std::atoll`, which stops at the first non-digit — so the
+common shorthand `-n 2e8` / `-n 8e7` (used in README examples) silently parsed as just the
+leading integer (`2`, `8`), rendering a near-black image from a handful of photons. Fixed
+in `run()` (src/main.cpp): tokens containing `e`/`E`/`.` are now parsed as a double and
+rounded to the nearest count; plain integers still go through `atoll` exactly. Found while
+validating `-stereo`.

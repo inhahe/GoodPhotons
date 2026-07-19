@@ -472,7 +472,7 @@ struct BackwardRenderer {
                     break;
                 }
                 case MatType::Mirror: {
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     if (rng.uniform() >= r) return L;      // RR absorb
                     ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                     specularArrival = true;
@@ -481,7 +481,7 @@ struct BackwardRenderer {
                 case MatType::Grating: {
                     // The grating equation is reciprocal, so backward tracing reuses
                     // the same diffraction (m <-> -m symmetric). Specular per order.
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     if (rng.uniform() >= r) return L;      // RR absorb
                     bool absorbedG;
                     Ray nr = mats.gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
@@ -491,7 +491,7 @@ struct BackwardRenderer {
                     break;
                 }
                 case MatType::HalfMirror: {
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                     else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                     specularArrival = true;
@@ -508,7 +508,7 @@ struct BackwardRenderer {
                     break;
                 }
                 case MatType::Glossy: {
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     if (rng.uniform() >= r) return L;
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                     if (dot(o, h.n) <= 0) return L;

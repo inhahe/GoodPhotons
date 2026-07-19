@@ -323,9 +323,61 @@ def waves(freq: Union[SpatialExpr, Signal, Number] = 1.0, axis: int = 0) -> Spat
     return 0.5 + 0.5 * sin(freq * c)
 
 
-def rings(freq: Union[SpatialExpr, Signal, Number] = 1.0) -> SpatialExpr:
-    """Concentric shells ``0.5 + 0.5 sin(freq |p|)`` in [0, 1]."""
-    return 0.5 + 0.5 * sin(freq * sqrt(X * X + Y * Y + Z * Z))
+Coord3 = Tuple[Union[SpatialExpr, Signal, Number],
+               Union[SpatialExpr, Signal, Number],
+               Union[SpatialExpr, Signal, Number]]
+
+
+def _offset(coord: SpatialExpr, c: Union[SpatialExpr, Signal, Number]) -> SpatialExpr:
+    # ``coord - c``, but a literal 0 offset drops out — so a default-centered
+    # source emits the plain ``x``/``y``/``z`` (byte-identical to the old rings)
+    # and costs no per-pixel subtraction.
+    if isinstance(c, (int, float)) and c == 0.0:
+        return coord
+    return coord - c
+
+
+def _radial(freq: Union[SpatialExpr, Signal, Number],
+            center: Coord3 = (0.0, 0.0, 0.0)) -> SpatialExpr:
+    """Signed radial wave ``sin(freq * |p - center|)`` from a point source at
+    ``center``.  ``freq`` and each ``center`` component may be a number or an
+    animated :class:`~loom.signals.core.Signal` (baked per frame)."""
+    cx, cy, cz = center
+    dx, dy, dz = _offset(X, cx), _offset(Y, cy), _offset(Z, cz)
+    return sin(freq * sqrt(dx * dx + dy * dy + dz * dz))
+
+
+def rings(freq: Union[SpatialExpr, Signal, Number] = 1.0,
+          center: Coord3 = (0.0, 0.0, 0.0)) -> SpatialExpr:
+    """Concentric shells ``0.5 + 0.5 sin(freq |p - center|)`` in [0, 1] from a
+    point source at ``center`` (default origin)."""
+    return 0.5 + 0.5 * _radial(freq, center)
+
+
+def interference(freq: Union[SpatialExpr, Signal, Number] = 1.0,
+                 source_a: Coord3 = (-0.5, 0.0, 0.0),
+                 source_b: Coord3 = (0.5, 0.0, 0.0)) -> SpatialExpr:
+    """Two-source interference in [0, 1]: the superposition (sum) of two radial
+    waves from ``source_a`` and ``source_b``.  Where the two path lengths differ
+    by a constant the crests reinforce, tracing the classic hyperbolic two-slit
+    fringes; feed a :class:`~loom.signals.core.Signal` into a source coordinate
+    to move an emitter and the fringes sweep (loop-safe if it returns by whole
+    cycles per loop).  This is the *spatial* counterpart of the temporal beat you
+    get for free from ``Sine(cycles=a) + Sine(cycles=b)``."""
+    return 0.5 + 0.25 * (_radial(freq, source_a) + _radial(freq, source_b))
+
+
+def moire(freq: Union[SpatialExpr, Signal, Number] = 1.0,
+          angle: Union[Signal, Number] = 0.2,
+          freq2: Union[SpatialExpr, Signal, Number, None] = None) -> SpatialExpr:
+    """Moiré in [0, 1]: the superposition of two line gratings, the second
+    rotated by ``angle`` radians (and optionally ruled at its own ``freq2``).
+    The slow beat between the two nearly-aligned rulings is the moiré envelope;
+    an animated ``angle`` :class:`~loom.signals.core.Signal` rotates one grating
+    and the fringes crawl."""
+    f2 = freq if freq2 is None else freq2
+    xr = cos(angle) * X - sin(angle) * Y      # X of the grating rotated by `angle`
+    return 0.5 + 0.25 * (sin(freq * X) + sin(f2 * xr))
 
 
 def checker(freq: Union[SpatialExpr, Signal, Number] = 1.0) -> SpatialExpr:
@@ -342,4 +394,5 @@ def gyroid(freq: Union[SpatialExpr, Signal, Number] = 1.0) -> SpatialExpr:
 
 SPATIAL_PATTERNS = {
     "waves": waves, "rings": rings, "checker": checker, "gyroid": gyroid,
+    "interference": interference, "moire": moire,
 }

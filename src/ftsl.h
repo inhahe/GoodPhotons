@@ -67,6 +67,7 @@
 #include "materials.h"
 #include "mesh.h"
 #include "gltf.h"
+#include "fbx.h"
 #include "upsample.h"
 #include "color.h"
 
@@ -99,7 +100,7 @@ inline Spectrum glassOrDefault(const char* name, double fallbackN) {
 // ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
-enum class Tok { Word, String, LBrace, RBrace, Newline, End };
+enum class Tok { Word, String, LBrace, RBrace, LBracket, RBracket, Newline, End };
 struct Token { Tok kind; std::string text; int line; };
 
 inline std::vector<Token> tokenize(const std::string& src) {
@@ -113,6 +114,8 @@ inline std::vector<Token> tokenize(const std::string& src) {
         if (c == '#') { while (i < n && src[i] != '\n') ++i; continue; }
         if (c == '{') { out.push_back({Tok::LBrace, "{", line}); ++i; continue; }
         if (c == '}') { out.push_back({Tok::RBrace, "}", line}); ++i; continue; }
+        if (c == '[') { out.push_back({Tok::LBracket, "[", line}); ++i; continue; }
+        if (c == ']') { out.push_back({Tok::RBracket, "]", line}); ++i; continue; }
         if (c == '"') {
             ++i; std::string s;
             while (i < n && src[i] != '"') { if (src[i] == '\n') ++line; s += src[i++]; }
@@ -125,7 +128,7 @@ inline std::vector<Token> tokenize(const std::string& src) {
         while (i < n) {
             char d = src[i];
             if (d == ' ' || d == '\t' || d == '\r' || d == '\n' ||
-                d == '{' || d == '}' || d == '#' || d == '"') break;
+                d == '{' || d == '}' || d == '[' || d == ']' || d == '#' || d == '"') break;
             w += d; ++i;
         }
         out.push_back({Tok::Word, w, line});
@@ -175,6 +178,24 @@ struct Parser {
     // begins the next statement's key. A trailing `{` opens a nested brace block
     // (table/film/…) whose type is the preceding word, or the statement key.
     void parseValue(const std::string& key, Value& v) {
+        // Record-override assignment: `slot = <rhs>` (used inside a `material "m" { … }`
+        // record block, §records stage 4). A standalone `=` first token never begins a
+        // normal statement value, so this is unambiguous. The RHS is a single token
+        // (an expression, a channel name, or `REC.chan`), optionally followed by a
+        // `[i]` stop selector — which we fold back into the RHS token (`REC.chan[i]`) so
+        // the bracket tokens don't leak into the generic brace-body statement stream.
+        if (is(Tok::Word) && cur().text == "=") {
+            v.words.push_back("="); adv();
+            if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
+            if (is(Tok::LBracket)) {
+                adv();
+                std::string idx;
+                while (is(Tok::Word)) { idx += cur().text; adv(); }
+                if (is(Tok::RBracket)) adv(); else fail("record-override selector missing ']'");
+                if (!v.words.empty()) v.words.back() += "[" + idx + "]";
+            }
+            return;
+        }
         bool firstWasString = false;
         if (is(Tok::Word) || is(Tok::String)) {
             firstWasString = is(Tok::String);
@@ -193,6 +214,18 @@ struct Parser {
                 if (!cont) break;
             }
             v.words.push_back(cur().text); adv();
+        }
+        // Records stage 5a: a trailing `[i]` stop selector on a record-channel ref
+        // (`RECORD.channel[i]`) at an ordinary value site — fold the bracket tokens back
+        // into the preceding word so they don't leak into the brace-body statement stream
+        // (the `=` override path above already does this). Only when the preceding word
+        // looks like a dotted reference, so a stray `[` elsewhere still surfaces as an error.
+        if (is(Tok::LBracket) && !v.words.empty() && v.words.back().find('.') != std::string::npos) {
+            adv();
+            std::string idx;
+            while (is(Tok::Word)) { idx += cur().text; adv(); }
+            if (is(Tok::RBracket)) adv(); else fail("record selector missing ']'");
+            v.words.back() += "[" + idx + "]";
         }
         if (is(Tok::LBrace)) {
             std::string btype = key, bname;
@@ -227,12 +260,58 @@ struct Parser {
         else fail("unterminated '{'");
     }
 
+    // Parse a record body `[ <lines> ]` into stmts (one per non-empty line: a channel
+    // name key + its stop tokens). Unlike a brace body, NEWLINES delimit statements and
+    // a value holds many barewords (the stops), so this does NOT use parseValue. Assumes
+    // cur() == LBracket.
+    void parseRecordBody(Block& b) {
+        adv();  // consume '['
+        while (!is(Tok::RBracket) && !is(Tok::End)) {
+            if (is(Tok::Newline)) { adv(); continue; }
+            if (!is(Tok::Word)) { fail("record line must start with a channel name"); return; }
+            Stmt s; s.line = cur().line;
+            s.key = cur().text; adv();
+            while (is(Tok::Word) || is(Tok::String)) { s.val.words.push_back(cur().text); adv(); }
+            b.stmts.push_back(std::move(s));
+        }
+        if (is(Tok::RBracket)) adv();
+        else fail("unterminated '[' in record");
+    }
+
+    // Parse `NAME = range LO-HI [ ... ]` (the leading `NAME = range` already consumed;
+    // `name` is NAME). Stores the domain as a stmt `range <tokens>` plus one stmt per
+    // channel line, all under a Block of type "record".
+    bool parseRecord(Block& b, const std::string& name) {
+        b.type = "record";
+        b.name = name;
+        Stmt dom; dom.key = "range"; dom.line = cur().line;
+        while (is(Tok::Word)) { dom.val.words.push_back(cur().text); adv(); }
+        b.stmts.push_back(std::move(dom));
+        skipNewlines();
+        if (!is(Tok::LBracket)) { fail("record '" + name + "' needs '[ ... ]' after `range LO-HI`"); return false; }
+        parseRecordBody(b);
+        return err.empty();
+    }
+
     // Parse ONE top-level block (or a `prefer { } else { }` construct) starting at
     // cur() (which must be a Word). Fills `b`; returns false on a parse error.
     bool parseOneTopBlock(Block& b) {
         if (!is(Tok::Word)) { fail("expected a block type"); return false; }
         b.type = cur().text; adv();
         if (b.type == "prefer") return parsePrefer(b);
+        // Parametric record: `NAME = range LO-HI [ ... ]` (ROADMAP_records.md). Detected
+        // by a bare first word immediately followed by '=' then `range` — spectrum uses
+        // a *quoted* name before '=', so there is no collision.
+        if (is(Tok::Word) && cur().text == "=") {
+            std::string name = b.type;
+            adv();  // consume '='
+            if (is(Tok::Word) && cur().text == "range") {
+                adv();  // consume 'range'
+                return parseRecord(b, name);
+            }
+            fail("unknown '=' declaration '" + name + "' (expected `= range`)");
+            return false;
+        }
         if (is(Tok::String)) { b.name = cur().text; adv(); }
         // Optional bareword subtype (light area / light collimated), but not '='.
         if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
@@ -467,6 +546,30 @@ struct ScalarTrack {
     }
 };
 
+// A piecewise-linear 3-vector animation track over t in [0,1] (the Vec3 analogue of
+// ScalarTrack), flat-clamped at the ends. Used by `camera_curve`'s orientation axes
+// (`fwd_at`/`up_at`): a per-keyframe forward direction or up vector, interpolated
+// component-wise (the caller normalizes / re-orthogonalizes the result).
+struct Vec3Track {
+    struct Key { double t; Vec3 v; };
+    std::vector<Key> keys;
+    bool active() const { return !keys.empty(); }
+    void sort() { std::sort(keys.begin(), keys.end(),
+                            [](const Key& a, const Key& b){ return a.t < b.t; }); }
+    Vec3 sample(double t) const {
+        if (keys.empty()) return Vec3{0, 0, 0};
+        if (t <= keys.front().t) return keys.front().v;
+        if (t >= keys.back().t)  return keys.back().v;
+        for (size_t j = 0; j + 1 < keys.size(); ++j)
+            if (t >= keys[j].t && t <= keys[j + 1].t) {
+                double sp = keys[j + 1].t - keys[j].t;
+                double f = (sp > 1e-12) ? (t - keys[j].t) / sp : 0.0;
+                return keys[j].v * (1.0 - f) + keys[j + 1].v * f;
+            }
+        return keys.back().v;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -592,6 +695,7 @@ public:
     std::string err;
 
     bool build(const std::vector<Block>& blocks, Loaded& L) {
+        records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
         // Pass 0: global scene settings — the length unit and spectral range. All
         // authored lengths are scaled to the internal unit (metres) at load time,
         // so a scene authored in cm and one in m render identically.
@@ -641,12 +745,18 @@ public:
             if (!addPattern(b, L)) return false;
         }
 
+        // Pass 1d: parametric records (must exist before materials that reference them).
+        for (const auto& b : blocks) {
+            if (b.type != "record") continue;
+            if (!addRecord(b, L)) return false;
+        }
+
         // Pass 2: materials (must exist before geometry references them).
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
             if (b.name.empty()) { fail("material needs a \"name\""); return false; }
             int id = (int)L.scene.mats.size();
-            Material m = buildMaterial(b);
+            Material m = buildMaterial(b, L);
             if (!err.empty()) return false;
             L.scene.mats.push_back(m);
             matIndex_[b.name] = id;
@@ -692,7 +802,8 @@ public:
             else if (b.type == "camera_curve") { if (!addCameraCurve(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
-                     b.type == "texture" || b.type == "pattern" || b.type == "mesh_asset") { /* handled */ }
+                     b.type == "texture" || b.type == "pattern" || b.type == "record" ||
+                     b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
@@ -716,6 +827,8 @@ private:
     std::unordered_map<std::string, int> matIndex_;
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
+    std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
+    const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
 
     // Named-object registries for `medium { bounds { object "name" } }` resolution.
@@ -741,6 +854,238 @@ private:
         return it->second;
     }
 
+    // Map a slot keyword to its RecSlot id, or -1 if it isn't a record-fillable slot.
+    static int recSlotId(const std::string& name) {
+        if (name == "reflect")   return REC_SLOT_REFLECT;
+        if (name == "roughness") return REC_SLOT_ROUGHNESS;
+        return -1;
+    }
+
+    // Install one slot binding, applying last-write-wins: drop any existing binding for
+    // the same slot first (so a later `from`/assignment overrides an earlier one).
+    static void setBinding(Material& m, const RecBinding& rb) {
+        auto& v = m.recBindings;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [&](const RecBinding& e) { return e.slot == rb.slot; }),
+                v.end());
+        v.push_back(rb);
+    }
+
+    // Apply `from R(drv)`: bind every slot whose name matches a channel of record
+    // `recIdx` (the kind must match the slot — reflect wants a Spectrum channel,
+    // roughness a Scalar channel), each sampled at the shared driver `drv`. Lenient:
+    // an unmatched channel is ignored, an unfilled slot keeps its constant.
+    static void applyFrom(Material& m, int recIdx, const std::vector<PatNode>& drv,
+                          const Record& rec) {
+        int ci = rec.channelIndex("reflect");
+        if (ci >= 0 && rec.channels[ci].kind == ChanKind::Spectrum) {
+            RecBinding rb; rb.slot = REC_SLOT_REFLECT; rb.recordIndex = recIdx;
+            rb.channel = ci; rb.driver = drv; setBinding(m, rb);
+        }
+        int ri = rec.channelIndex("roughness");
+        if (ri >= 0 && rec.channels[ri].kind == ChanKind::Scalar) {
+            RecBinding rb; rb.slot = REC_SLOT_ROUGHNESS; rb.recordIndex = recIdx;
+            rb.channel = ri; rb.driver = drv; setBinding(m, rb);
+        }
+    }
+
+    // Synthesize a record-driven material (§records §2.2): a default (diffuse) material
+    // whose slots are filled per-hit by record `recIdx` sampled at driver `driverExpr`
+    // (the inline `material R(driver)` form — equivalent to a lone `from R(driver)`).
+    // Returns the new material's index in Scene::mats, or -1 on error.
+    int buildRecordMaterial(int recIdx, const std::string& driverExpr, Loaded& L) {
+        Material m;   // default type: diffuse
+        m.reflect = constantSpectrum(0.75);
+        std::vector<PatNode> drv;
+        std::string cerr;
+        if (!compilePatternExpr(driverExpr, drv, cerr)) {
+            fail("record material driver '" + driverExpr + "': " + cerr);
+            return -1;
+        }
+        applyFrom(m, recIdx, drv, L.scene.records[recIdx]);
+        int id = (int)L.scene.mats.size();
+        L.scene.mats.push_back(std::move(m));
+        return id;
+    }
+
+    // Resolve a geometry block's `material` field to a Scene::mats index. Accepts both
+    // a plain material name and the inline record form `RECORD(driver)` (§2.2). Sets
+    // `err` (via fail) and returns -1 on any problem; if the field is absent, fails
+    // with "<geom> needs a material". `optional` suppresses the absent-field error and
+    // returns -1 silently (for an optional per-instance override).
+    int matFieldId(const Block& b, Loaded& L, const char* geom, bool optional = false) {
+        const Stmt* s = find(b, "material");
+        if (!s || s->val.words.empty()) {
+            if (!optional) fail(std::string(geom) + " needs a material");
+            return -1;
+        }
+        // Reconstruct the raw field text (a spaced driver expression spans >1 token).
+        std::string raw = s->val.words[0];
+        for (size_t k = 1; k < s->val.words.size(); ++k) raw += " " + s->val.words[k];
+        size_t lp = raw.find('(');
+        if (lp != std::string::npos) {
+            std::string name = raw.substr(0, lp);
+            auto rit = recordIndex_.find(name);
+            if (rit != recordIndex_.end()) {
+                size_t rp = raw.rfind(')');
+                if (rp == std::string::npos || rp <= lp) {
+                    fail("record material '" + raw + "': missing ')'");
+                    return -1;
+                }
+                std::string driver = raw.substr(lp + 1, rp - lp - 1);
+                return buildRecordMaterial(rit->second, driver, L);
+            }
+        }
+        auto it = matIndex_.find(raw);
+        if (it == matIndex_.end()) { fail("unknown material '" + raw + "'"); return -1; }
+        return it->second;
+    }
+
+    // Records stage 5a: resolve a record channel reference used as a CONSTANT spectrum
+    // value — `RECORD.channel[i]` (the channel's i-th stop colour) or `RECORD.channel(c)`
+    // (sample the colour channel at a constant driver `c`). Accepted anywhere a spectrum
+    // is read (light `spd`, top-level `spectrum`, material `reflect`/`transmit`/…).
+    // Returns true if `tok` names a known record — the form was recognised, so `out` is
+    // filled or `fail` is set — and false if `tok` isn't a record ref (the caller then
+    // falls through to the other spectrum forms). The `(c)` driver must be a load-time
+    // constant: a per-hit driver like `R.chan(u)` is a scope error at a value site (a
+    // constant site publishes no per-hit variables), matching the 5a free-variable rule.
+    bool recordConstSpectrumRef(const std::string& tok, Spectrum& out) {
+        size_t dot = tok.find('.');
+        if (dot == std::string::npos) return false;
+        std::string head = tok.substr(0, dot);
+        auto rit = recordIndex_.find(head);
+        if (rit == recordIndex_.end()) return false;                 // not a record -> not our form
+        if (!records_ || rit->second >= (int)records_->size()) return false;
+        const Record& rec = (*records_)[rit->second];
+        std::string rest = tok.substr(dot + 1);                      // channel[i] | channel(c) | channel
+        out = constantSpectrum(0);
+        auto colourChannel = [&](const std::string& chan, int& ci) -> bool {
+            ci = rec.channelIndex(chan);
+            if (ci < 0) { fail("record ref '" + tok + "': record '" + head + "' has no channel '" + chan + "'"); return false; }
+            if (rec.channels[ci].kind != ChanKind::Spectrum) {
+                fail("record ref '" + tok + "': channel '" + chan + "' is scalar, not a colour channel"); return false;
+            }
+            return true;
+        };
+        // Stop selector: `channel[i]`.
+        size_t lb = rest.find('[');
+        if (lb != std::string::npos) {
+            size_t rb = rest.rfind(']');
+            std::string idxs = (rb != std::string::npos && rb > lb) ? rest.substr(lb + 1, rb - lb - 1) : "";
+            if (idxs.empty() || !isNumber(idxs)) { fail("record ref '" + tok + "': bad stop selector"); return true; }
+            int ci; if (!colourChannel(rest.substr(0, lb), ci)) return true;
+            const RecChannel& ch = rec.channels[ci];
+            int i = (int)num(idxs);
+            if (i < 0 || i >= (int)ch.stops.size()) {
+                fail("record ref '" + tok + "': stop index " + idxs + " out of range (0.." +
+                     std::to_string((int)ch.stops.size() - 1) + ")"); return true;
+            }
+            out = ch.stops[i].color;
+            return true;
+        }
+        // Sample form: `channel(c)` with a constant driver c.
+        size_t lp = rest.find('(');
+        if (lp != std::string::npos) {
+            size_t rp = rest.rfind(')');
+            if (rp == std::string::npos || rp <= lp) { fail("record ref '" + tok + "': malformed `channel(constant)`"); return true; }
+            std::string cexpr = rest.substr(lp + 1, rp - lp - 1);
+            int ci; if (!colourChannel(rest.substr(0, lp), ci)) return true;
+            std::vector<PatNode> drv; std::string cerr;
+            if (!compilePatternExpr(cexpr, drv, cerr)) { fail("record ref '" + tok + "' driver '" + cexpr + "': " + cerr); return true; }
+            if (patternHasFreeVars(drv)) {
+                fail("record ref '" + tok + "': driver must be a constant here — no per-hit variables "
+                     "(x/y/z/u/v/…) are in scope at this value site"); return true;
+            }
+            PatCtx zero{};
+            double c = drv.empty() ? 0.0 : patternEval(drv.data(), (int)drv.size(), zero);
+            out = recSampleSpectrum(rec, rec.channels[ci], c);
+            return true;
+        }
+        // Bare `RECORD.channel` with no selector/sample: ambiguous at a constant site.
+        fail("record ref '" + tok + "': use `RECORD.channel[i]` (a stop) or `RECORD.channel(constant)` at a value site");
+        return true;
+    }
+
+    // Records stage 5a (scalar sibling of recordConstSpectrumRef): resolve a record
+    // channel reference used as a CONSTANT scalar value — `RECORD.channel[i]` (the
+    // channel's i-th stop value) or `RECORD.channel(c)` (sample the scalar channel at a
+    // constant driver `c`). Returns true if `tok` names a known record (recognised — `out`
+    // filled or `fail` set) and false if it isn't a record ref (caller falls through to
+    // numeric parse). Same free-variable scope rule as the spectrum path: the `(c)` driver
+    // must be constant, and a stop whose expression carries per-hit variables is not a
+    // constant here, so it is rejected rather than silently evaluated at a zero context.
+    bool recordConstScalarRef(const std::string& tok, double& out) {
+        size_t dot = tok.find('.');
+        if (dot == std::string::npos) return false;
+        std::string head = tok.substr(0, dot);
+        auto rit = recordIndex_.find(head);
+        if (rit == recordIndex_.end()) return false;                 // not a record -> not our form
+        if (!records_ || rit->second >= (int)records_->size()) return false;
+        const Record& rec = (*records_)[rit->second];
+        std::string rest = tok.substr(dot + 1);                      // channel[i] | channel(c) | channel
+        out = 0.0;
+        auto scalarChannel = [&](const std::string& chan, int& ci) -> bool {
+            ci = rec.channelIndex(chan);
+            if (ci < 0) { fail("record ref '" + tok + "': record '" + head + "' has no channel '" + chan + "'"); return false; }
+            if (rec.channels[ci].kind != ChanKind::Scalar) {
+                fail("record ref '" + tok + "': channel '" + chan + "' is a colour channel, not scalar"); return false;
+            }
+            return true;
+        };
+        auto stopIsConst = [&](const RecStop& st) { return !patternHasFreeVars(st.expr); };
+        // Stop selector: `channel[i]`.
+        size_t lb = rest.find('[');
+        if (lb != std::string::npos) {
+            size_t rb = rest.rfind(']');
+            std::string idxs = (rb != std::string::npos && rb > lb) ? rest.substr(lb + 1, rb - lb - 1) : "";
+            if (idxs.empty() || !isNumber(idxs)) { fail("record ref '" + tok + "': bad stop selector"); return true; }
+            int ci; if (!scalarChannel(rest.substr(0, lb), ci)) return true;
+            const RecChannel& ch = rec.channels[ci];
+            int i = (int)num(idxs);
+            if (i < 0 || i >= (int)ch.stops.size()) {
+                fail("record ref '" + tok + "': stop index " + idxs + " out of range (0.." +
+                     std::to_string((int)ch.stops.size() - 1) + ")"); return true;
+            }
+            if (!stopIsConst(ch.stops[i])) {
+                fail("record ref '" + tok + "': stop " + idxs + " is an expression with per-hit "
+                     "variables — not a constant at this value site"); return true;
+            }
+            PatCtx zero{};
+            const std::vector<PatNode>& e = ch.stops[i].expr;
+            out = e.empty() ? 0.0 : patternEval(e.data(), (int)e.size(), zero);
+            return true;
+        }
+        // Sample form: `channel(c)` with a constant driver c.
+        size_t lp = rest.find('(');
+        if (lp != std::string::npos) {
+            size_t rp = rest.rfind(')');
+            if (rp == std::string::npos || rp <= lp) { fail("record ref '" + tok + "': malformed `channel(constant)`"); return true; }
+            std::string cexpr = rest.substr(lp + 1, rp - lp - 1);
+            int ci; if (!scalarChannel(rest.substr(0, lp), ci)) return true;
+            const RecChannel& ch = rec.channels[ci];
+            std::vector<PatNode> drv; std::string cerr;
+            if (!compilePatternExpr(cexpr, drv, cerr)) { fail("record ref '" + tok + "' driver '" + cexpr + "': " + cerr); return true; }
+            if (patternHasFreeVars(drv)) {
+                fail("record ref '" + tok + "': driver must be a constant here — no per-hit variables "
+                     "(x/y/z/u/v/…) are in scope at this value site"); return true;
+            }
+            for (const RecStop& st : ch.stops) {
+                if (!stopIsConst(st)) {
+                    fail("record ref '" + tok + "': channel '" + ch.name + "' has expression stops with "
+                         "per-hit variables — not a constant curve at this value site"); return true;
+                }
+            }
+            PatCtx zero{};
+            double c = drv.empty() ? 0.0 : patternEval(drv.data(), (int)drv.size(), zero);
+            out = recSampleScalar(rec, ch, c, zero);
+            return true;
+        }
+        // Bare `RECORD.channel` with no selector/sample: ambiguous at a constant site.
+        fail("record ref '" + tok + "': use `RECORD.channel[i]` (a stop) or `RECORD.channel(constant)` at a value site");
+        return true;
+    }
+
     // ---- spectrum evaluation ----
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
         if (depth > 16) { fail("spectrum reference cycle"); return constantSpectrum(0); }
@@ -759,6 +1104,14 @@ private:
         const std::string& h = w[0];
 
         if (isNumber(h) && w.size() == 1) return constantSpectrum(num(h));
+
+        // Records stage 5a: a record colour channel used as a constant value —
+        // `RECORD.channel[i]` / `RECORD.channel(const)`. Fires only when h's head names
+        // a known record; otherwise falls through to the ordinary spectrum forms below.
+        if (w.size() == 1) {
+            Spectrum rs;
+            if (recordConstSpectrumRef(h, rs)) return rs;
+        }
 
         if (h == "blackbody")  return blackbody(w.size() > 1 ? num(w[1]) : 6500.0);
         if (h == "ior")        return iorConstant(w.size() > 1 ? num(w[1]) : 1.5);
@@ -864,6 +1217,23 @@ private:
         return evalSpectrum(s->val);
     }
 
+    // Records stage 5a: scalar-slot reader that also accepts a constant record channel
+    // ref (`RECORD.channel[i]` / `RECORD.channel(const)`) — the scalar analogue of
+    // spectrumParam. Absent key -> default; a plain number -> that number; a token whose
+    // head names a record -> recordConstScalarRef (which fills the value or sets fail).
+    // This is the chokepoint that gives material scalar slots (roughness, film_ior, …)
+    // record-ref support without each call site knowing about records.
+    double dblParam(const Block& b, const char* key, double dflt) {
+        const Stmt* s = find(b, key);
+        if (!s || s->val.words.empty()) return dflt;
+        const std::string& w0 = s->val.words[0];
+        if (w0.find('.') != std::string::npos && !isNumber(w0)) {
+            double rv;
+            if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
+        }
+        return num(w0);
+    }
+
     // ---- textures ----
     // A `texture "name" { file "path" [encoding srgb|linear] [filter nearest|
     // bilinear] [wrap repeat|clamp|mirror] }` block loads an image into
@@ -872,14 +1242,9 @@ private:
     bool addTexture(const Block& b, Loaded& L) {
         if (b.name.empty()) { fail("texture needs a \"name\""); return false; }
         if (textureIndex_.count(b.name)) { fail("duplicate texture name '" + b.name + "'"); return false; }
-        std::string file = strOf(b, "file");
-        if (file.empty()) { fail("texture '" + b.name + "' needs a file"); return false; }
         Texture tex;
         tex.name = b.name;
-        std::string enc = strOf(b, "encoding", "srgb");
-        if      (enc == "srgb")   tex.encoding = TexEncoding::sRGB;
-        else if (enc == "linear") tex.encoding = TexEncoding::Linear;
-        else { fail("texture '" + b.name + "': unknown encoding '" + enc + "' (srgb|linear)"); return false; }
+        // Filter + wrap are common to both a file image and a procedural skin.
         std::string flt = strOf(b, "filter", "bilinear");
         if      (flt == "bilinear") tex.filter = TexFilter::Bilinear;
         else if (flt == "nearest")  tex.filter = TexFilter::Nearest;
@@ -889,29 +1254,74 @@ private:
         else if (wr == "clamp")  tex.wrap = TexWrap::Clamp;
         else if (wr == "mirror") tex.wrap = TexWrap::Mirror;
         else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
-        std::string terr;
-        if (!tex.load(file, terr)) { fail("texture '" + b.name + "': " + terr); return false; }
-        // Optional indexed-spectral palette (§9.3): `palette { 0 spectrum:navy 1 ... }`.
-        // The nested block's flat word dump is (index, spectrum-ref) pairs in order; we
-        // resolve each ref to a Spectrum now and size the palette to max-index+1. The
-        // texture's red channel then selects an entry per texel (nearest, no upsample).
-        if (const Stmt* ps = find(b, "palette")) {
-            if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
-            const auto& w = ps->val.block->words;
-            if (w.empty() || (w.size() % 2) != 0) {
-                fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
+
+        const Stmt* rgbS = find(b, "rgb");
+        if (rgbS) {
+            // Procedural (function-defined) UV-space skin (E1): three ftsl expressions
+            // r(u,v) g(u,v) b(u,v) over the surface UV, baked once to a `res`x`res`
+            // LINEAR RGB grid at load, then treated as an ordinary texture — so the
+            // whole existing UV-wrap / Jakob-Hanika / triplanar / GPU / raster pipeline
+            // (and the `reflect texture:<name>` binding) applies unchanged with no
+            // per-hit fit cost. The expressions are functions of u,v (and constants);
+            // the world-space pattern variables x y z f nx ny nz r are 0 here since a
+            // UV image carries no world position.
+            if (rgbS->val.words.size() < 3) {
+                fail("texture '" + b.name + "': rgb needs three quoted exprs: rgb \"r(u,v)\" \"g(u,v)\" \"b(u,v)\""); return false;
             }
-            std::vector<std::pair<int, Spectrum>> entries;
-            int maxIdx = -1;
-            for (size_t k = 0; k + 1 < w.size(); k += 2) {
-                int idx = std::atoi(w[k].c_str());
-                if (idx < 0 || idx > 255) { fail("texture '" + b.name + "': palette index out of 0..255"); return false; }
-                Value ref; ref.words.push_back(w[k + 1]);
-                entries.emplace_back(idx, evalSpectrum(ref));
-                if (idx > maxIdx) maxIdx = idx;
+            std::vector<PatNode> pr, pg, pb; std::string perr;
+            if (!compilePatternExpr(rgbS->val.words[0], pr, perr)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[1], pg, perr)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[2], pb, perr)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            int res = (int)dblOf(b, "res", 512.0);
+            if (res < 1) res = 1; else if (res > 8192) res = 8192;
+            tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
+            tex.w = res; tex.h = res;
+            tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
+            auto cl = [](double t) { return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t); };
+            for (int y = 0; y < res; ++y) {
+                // Invert v to match sampleRgb's (1-v) flip so f(u,v) reads back at the
+                // surface UV (top-left storage, v=0 at image bottom / OBJ convention).
+                double v = 1.0 - (y + 0.5) / res;
+                for (int x = 0; x < res; ++x) {
+                    double u = (x + 0.5) / res;
+                    PatCtx c; c.u = u; c.v = v;
+                    double rr = patternEval(pr.data(), (int)pr.size(), c);
+                    double gg = patternEval(pg.data(), (int)pg.size(), c);
+                    double bb = patternEval(pb.data(), (int)pb.size(), c);
+                    tex.rgb[(size_t)y * res + x] = Vec3{cl(rr), cl(gg), cl(bb)};
+                }
             }
-            tex.palette.assign((size_t)maxIdx + 1, constantSpectrum(0.0));
-            for (auto& e : entries) tex.palette[(size_t)e.first] = e.second;
+        } else {
+            std::string file = strOf(b, "file");
+            if (file.empty()) { fail("texture '" + b.name + "' needs a file (or an `rgb \"r\" \"g\" \"b\"` expr triple)"); return false; }
+            std::string enc = strOf(b, "encoding", "srgb");
+            if      (enc == "srgb")   tex.encoding = TexEncoding::sRGB;
+            else if (enc == "linear") tex.encoding = TexEncoding::Linear;
+            else { fail("texture '" + b.name + "': unknown encoding '" + enc + "' (srgb|linear)"); return false; }
+            std::string terr;
+            if (!tex.load(file, terr)) { fail("texture '" + b.name + "': " + terr); return false; }
+            // Optional indexed-spectral palette (§9.3): `palette { 0 spectrum:navy 1 ... }`.
+            // The nested block's flat word dump is (index, spectrum-ref) pairs in order; we
+            // resolve each ref to a Spectrum now and size the palette to max-index+1. The
+            // texture's red channel then selects an entry per texel (nearest, no upsample).
+            if (const Stmt* ps = find(b, "palette")) {
+                if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
+                const auto& w = ps->val.block->words;
+                if (w.empty() || (w.size() % 2) != 0) {
+                    fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
+                }
+                std::vector<std::pair<int, Spectrum>> entries;
+                int maxIdx = -1;
+                for (size_t k = 0; k + 1 < w.size(); k += 2) {
+                    int idx = std::atoi(w[k].c_str());
+                    if (idx < 0 || idx > 255) { fail("texture '" + b.name + "': palette index out of 0..255"); return false; }
+                    Value ref; ref.words.push_back(w[k + 1]);
+                    entries.emplace_back(idx, evalSpectrum(ref));
+                    if (idx > maxIdx) maxIdx = idx;
+                }
+                tex.palette.assign((size_t)maxIdx + 1, constantSpectrum(0.0));
+                for (auto& e : entries) tex.palette[(size_t)e.first] = e.second;
+            }
         }
         tex.buildReflCoeff();   // precompute Jakob-Hanika reflectance coefficients (skipped for palette maps)
         int id = (int)L.scene.textures.size();
@@ -1030,8 +1440,338 @@ private:
         return true;
     }
 
+    // ---- parametric records (§records) ----
+    // Parse a record domain: either one hyphen-joined token "LO-HI" (the common form,
+    // e.g. `range 0-1`) or two number tokens (`range 0 1`). Requires HI > LO.
+    static bool parseRecordDomain(const std::vector<std::string>& w, double& lo, double& hi) {
+        if (w.size() == 2 && isNumber(w[0]) && isNumber(w[1])) {
+            lo = num(w[0]); hi = num(w[1]); return hi > lo;
+        }
+        if (w.size() == 1) {
+            const std::string& s = w[0];
+            // Split at a '-' that yields two numbers, skipping a leading sign and any
+            // exponent marker (so "1e-3-2", "-1-1", "0.5-2.5" all parse).
+            for (size_t k = 1; k < s.size(); ++k) {
+                if (s[k] != '-') continue;
+                char p = s[k - 1];
+                if (p == 'e' || p == 'E' || p == '+' || p == '-') continue;
+                std::string a = s.substr(0, k), b = s.substr(k + 1);
+                if (isNumber(a) && isNumber(b)) { lo = num(a); hi = num(b); return hi > lo; }
+            }
+        }
+        return false;
+    }
+
+    // Assign domain positions to a channel's stops: an author `p:<pos>` pins a stop;
+    // the first/last unpinned stops anchor to lo/hi; each interior run of unpinned
+    // stops spreads evenly between its fixed neighbours.
+    static void redistributeStops(RecChannel& ch, double lo, double hi) {
+        const int n = (int)ch.stops.size();
+        std::vector<char> fixed(n, 0);
+        for (int i = 0; i < n; ++i) fixed[i] = ch.stops[i].pinned ? 1 : 0;
+        if (n == 1) { if (!fixed[0]) ch.stops[0].pos = lo; return; }
+        if (!fixed[0])     { ch.stops[0].pos = lo;     fixed[0] = 1; }
+        if (!fixed[n - 1]) { ch.stops[n - 1].pos = hi; fixed[n - 1] = 1; }
+        int a = 0;
+        while (a < n) {
+            if (!fixed[a]) { ++a; continue; }
+            int b = a + 1;
+            while (b < n && !fixed[b]) ++b;
+            if (b < n && b > a + 1) {
+                double pa = ch.stops[a].pos, pb = ch.stops[b].pos;
+                int gaps = b - a;
+                for (int j = a + 1; j < b; ++j)
+                    ch.stops[j].pos = pa + (pb - pa) * double(j - a) / double(gaps);
+            }
+            a = b;
+        }
+    }
+
+    // Build one Record from a `NAME = range LO-HI [ ... ]` block: parse the domain,
+    // interp, channels and stops; redistribute positions (stage 1); then compile each
+    // stop into a scalar pattern program or a resolved colour + linear-RGB (stage 2).
+    bool addRecord(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("record needs a name"); return false; }
+        if (recordIndex_.count(b.name)) { fail("duplicate record name '" + b.name + "'"); return false; }
+        Record rec;
+        rec.name = b.name;
+        bool haveRange = false;
+        for (const auto& s : b.stmts) {
+            if (s.key == "range") {
+                if (!parseRecordDomain(s.val.words, rec.lo, rec.hi)) {
+                    fail("record '" + rec.name + "': bad `range` (need LO-HI or LO HI with HI>LO)");
+                    return false;
+                }
+                haveRange = true;
+                continue;
+            }
+            if (s.key == "interp") {
+                const std::string& m = s.val.words.empty() ? std::string() : s.val.words[0];
+                if      (m == "nearest") rec.interp = RecInterp::Nearest;
+                else if (m == "linear")  rec.interp = RecInterp::Linear;
+                else if (m == "smooth")  rec.interp = RecInterp::Smooth;
+                else { fail("record '" + rec.name + "': interp must be nearest|linear|smooth"); return false; }
+                continue;
+            }
+            // Otherwise: a channel line. Its words are the stops, with optional `p:<pos>`
+            // prefixes pinning the position of the following value.
+            RecChannel ch;
+            ch.name = s.key;
+            bool havePin = false; double pinPos = 0.0;
+            for (const auto& w : s.val.words) {
+                if (w.rfind("p:", 0) == 0) {
+                    if (!isNumber(w.substr(2))) {
+                        fail("record '" + rec.name + "' channel '" + ch.name + "': bad p:<pos> '" + w + "'");
+                        return false;
+                    }
+                    havePin = true; pinPos = num(w.substr(2));
+                    continue;
+                }
+                RecStop st; st.token = w;
+                if (havePin) { st.pinned = true; st.pos = pinPos; havePin = false; }
+                ch.stops.push_back(std::move(st));
+            }
+            if (havePin) {
+                fail("record '" + rec.name + "' channel '" + ch.name + "': trailing p:<pos> with no value");
+                return false;
+            }
+            if (ch.stops.empty()) {
+                fail("record '" + rec.name + "' channel '" + ch.name + "' has no stops");
+                return false;
+            }
+            redistributeStops(ch, rec.lo, rec.hi);
+            rec.channels.push_back(std::move(ch));
+        }
+        if (!haveRange) { fail("record '" + rec.name + "' has no `range LO-HI`"); return false; }
+        if (rec.channels.empty()) { fail("record '" + rec.name + "' has no channels"); return false; }
+        // Validate: pinned positions in [lo,hi] and non-decreasing per channel.
+        for (const auto& ch : rec.channels) {
+            for (const auto& st : ch.stops) {
+                if (st.pos < rec.lo - 1e-9 || st.pos > rec.hi + 1e-9) {
+                    fail("record '" + rec.name + "' channel '" + ch.name + "': stop position " +
+                         std::to_string(st.pos) + " is outside the domain");
+                    return false;
+                }
+            }
+            for (size_t i = 1; i < ch.stops.size(); ++i) {
+                if (ch.stops[i].pos < ch.stops[i - 1].pos - 1e-12) {
+                    fail("record '" + rec.name + "' channel '" + ch.name + "': stop positions must be non-decreasing");
+                    return false;
+                }
+            }
+        }
+        // Stage 2: compile stop tokens. A stop is a COLOUR iff its token is a prefixed
+        // spectrum ref (contains ':', e.g. spectrum:steel / metal:copper / rgb:... );
+        // otherwise it is a SCALAR pattern expression (a literal, or math over
+        // intrinsics x y z nx ny nz r u v f + functions). A channel must be homogeneous.
+        for (auto& ch : rec.channels) {
+            bool anyColour = false, anyScalar = false;
+            for (const auto& st : ch.stops)
+                (st.token.find(':') != std::string::npos ? anyColour : anyScalar) = true;
+            if (anyColour && anyScalar) {
+                fail("record '" + rec.name + "' channel '" + ch.name +
+                     "': mixes colour (spectrum:...) and scalar stops");
+                return false;
+            }
+            ch.kind = anyColour ? ChanKind::Spectrum : ChanKind::Scalar;
+            for (auto& st : ch.stops) {
+                if (ch.kind == ChanKind::Scalar) {
+                    std::string cerr;
+                    if (!compilePatternExpr(st.token, st.expr, cerr)) {
+                        fail("record '" + rec.name + "' channel '" + ch.name +
+                             "': bad stop expression '" + st.token + "': " + cerr);
+                        return false;
+                    }
+                } else {
+                    Value v; v.words = { st.token };
+                    st.color = evalSpectrum(v);
+                    if (!err.empty()) return false;   // evalSpectrum already set the message
+                    st.rgb = reflectanceToLinearSrgbD65(st.color);
+                }
+            }
+        }
+        recBakeSpectrumChannels(rec);   // colour channels -> per-domain JH coeff LUT
+        int id = (int)L.scene.records.size();
+        recordIndex_[rec.name] = id;
+        L.scene.records.push_back(std::move(rec));
+        return true;
+    }
+
     // ---- materials ----
-    Material buildMaterial(const Block& b) {
+    // True if a material block is a §records override block: it either bulk-imports a
+    // record (`from R(d)`) or assigns a slot from a record/expression (`slot = …`, whose
+    // parsed value begins with a lone `=` token). Such blocks are built by
+    // buildRecordOverrideMaterial instead of the ordinary key→value path.
+    static bool isRecordOverrideBlock(const Block& b) {
+        for (const auto& s : b.stmts) {
+            if (s.key == "from") return true;
+            if (!s.val.words.empty() && s.val.words[0] == "=") return true;
+        }
+        return false;
+    }
+
+    // Build a material from a §records override block (stage 4): an ordered list of
+    // `type <kind>`, `from R(driver)`, and `slot = <rhs>` statements. Statements are
+    // processed top→bottom and each write to a slot overrides earlier ones (last-write-
+    // wins). RHS forms: a scalar expression (scalar slots), a bare imported-channel
+    // name, `REC.chan` (driven by the most recent `from REC(...)`), or a constant
+    // selector `REC.chan[i]` / `self.chan[i]` (the channel's i-th stop).
+    Material buildRecordOverrideMaterial(const Block& b, Loaded& L) {
+        Material m;                          // default type: diffuse
+        m.reflect = constantSpectrum(0.75);
+        // Base type (optional) — lets a record drive e.g. a glossy base.
+        if (find(b, "type")) {
+            std::string type = strOf(b, "type", "diffuse");
+            if      (type == "diffuse")   m.type = MatType::Diffuse;
+            else if (type == "glossy")  { m.type = MatType::Glossy; m.reflect = constantSpectrum(0.75); }
+            else { fail("record-override material: unsupported base `type " + type +
+                        "` (only diffuse/glossy)"); return m; }
+        }
+        // Channels imported by a `from` (name -> its source), for `slot = channel` and
+        // `slot = self.chan[i]` lookups; plus each record's most-recent `from` driver
+        // (for a bare `slot = REC.chan` that needs a driver).
+        struct ImportedChan { int recIdx, chanIdx; std::vector<PatNode> driver; };
+        std::unordered_map<std::string, ImportedChan> imported;
+        std::unordered_map<std::string, std::pair<int, std::vector<PatNode>>> fromDriver;  // recName -> (idx,drv)
+
+        for (const auto& s : b.stmts) {
+            if (s.key == "type") continue;                       // already handled
+            if (s.key == "from") {
+                if (s.val.words.empty()) { fail("`from` needs RECORD(driver)"); return m; }
+                std::string raw = s.val.words[0];
+                for (size_t k = 1; k < s.val.words.size(); ++k) raw += " " + s.val.words[k];
+                size_t lp = raw.find('('), rp = raw.rfind(')');
+                if (lp == std::string::npos || rp == std::string::npos || rp <= lp) {
+                    fail("`from " + raw + "`: expected RECORD(driver)"); return m;
+                }
+                std::string rname = raw.substr(0, lp);
+                std::string dexpr = raw.substr(lp + 1, rp - lp - 1);
+                auto rit = recordIndex_.find(rname);
+                if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
+                std::vector<PatNode> drv; std::string cerr;
+                if (!compilePatternExpr(dexpr, drv, cerr)) {
+                    fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
+                }
+                const Record& rec = L.scene.records[rit->second];
+                applyFrom(m, rit->second, drv, rec);
+                for (int c = 0; c < (int)rec.channels.size(); ++c)
+                    imported[rec.channels[c].name] = { rit->second, c, drv };
+                fromDriver[rname] = { rit->second, drv };
+                continue;
+            }
+            // Otherwise: a `slot = <rhs>` assignment. val.words == ["=", rhs?].
+            const std::string& slot = s.key;
+            int slotId = recSlotId(slot);
+            if (slotId < 0) { fail("record-override material: '" + slot +
+                                   "' is not a record-fillable slot (reflect|roughness)"); return m; }
+            if (s.val.words.size() < 2 || s.val.words[0] != "=") {
+                fail("record-override material: `" + slot + " = <value>` needs a right-hand side"); return m;
+            }
+            const std::string& rhs = s.val.words[1];
+            bool ok = true;
+
+            // Split a trailing `[i]` stop selector, if any: `REC.chan[i]` / `self.chan[i]`.
+            std::string base = rhs; int selStop = -1;
+            size_t lb = rhs.find('[');
+            if (lb != std::string::npos) {
+                size_t rb = rhs.rfind(']');
+                if (rb == std::string::npos || rb <= lb || !isNumber(rhs.substr(lb + 1, rb - lb - 1))) {
+                    fail("record-override `" + slot + " = " + rhs + "`: bad stop selector"); return m;
+                }
+                selStop = (int)num(rhs.substr(lb + 1, rb - lb - 1));
+                base = rhs.substr(0, lb);
+            }
+
+            // A channel reference (`REC.chan`, `self.chan`, or a bare imported-channel
+            // name) is a *simple* token — identifier chars plus a single dotted qualifier
+            // — never a numeric literal or an expression (which carries parens/operators
+            // or a decimal point). This keeps `roughness = sin(v*3.14159)` an expression
+            // rather than mis-reading `3.14159`'s dot as `REC.chan`. A `[i]` selector was
+            // already stripped, so its presence forces the reference interpretation.
+            auto isSimpleRef = [](const std::string& s) {
+                if (s.empty()) return false;
+                for (char c : s)
+                    if (!(std::isalnum((unsigned char)c) || c == '_' || c == '.')) return false;
+                return true;
+            };
+            bool refForm = selStop >= 0 || (isSimpleRef(base) && !isNumber(base));
+
+            // Resolve the base reference to (recordIndex, channelIndex, driver). A dotted
+            // `REC.chan` names a record channel directly; `self.chan` / a bare name looks
+            // up an imported channel. A bare name that is not an imported channel falls
+            // through to a scalar expression (scalar slots only).
+            int recIdx = -1, chanIdx = -1; std::vector<PatNode> drv; bool haveSrc = false;
+            size_t dot = base.find('.');
+            if (refForm && dot != std::string::npos) {
+                std::string head = base.substr(0, dot), chan = base.substr(dot + 1);
+                if (head == "self") {
+                    auto ic = imported.find(chan);
+                    if (ic == imported.end()) { fail("record-override `self." + chan +
+                        "`: no channel '" + chan + "' imported by a preceding `from`"); return m; }
+                    recIdx = ic->second.recIdx; chanIdx = ic->second.chanIdx; drv = ic->second.driver;
+                } else {
+                    auto rit = recordIndex_.find(head);
+                    if (rit == recordIndex_.end()) { fail("record-override: unknown record '" + head + "'"); return m; }
+                    recIdx = rit->second;
+                    chanIdx = L.scene.records[recIdx].channelIndex(chan);
+                    if (chanIdx < 0) { fail("record-override: record '" + head +
+                        "' has no channel '" + chan + "'"); return m; }
+                    // Driver: reuse the most recent `from head(...)` in this block. Not
+                    // needed for a constant stop selector.
+                    auto fd = fromDriver.find(head);
+                    if (fd != fromDriver.end()) drv = fd->second.second;
+                    else if (selStop < 0) { fail("record-override `" + base +
+                        "`: needs a driver — add `from " + head + "(<driver>)` first"); return m; }
+                }
+                haveSrc = true;
+            } else if (refForm) {
+                // A bare simple reference: an imported-channel name.
+                auto ic = imported.find(base);
+                if (ic != imported.end()) {
+                    recIdx = ic->second.recIdx; chanIdx = ic->second.chanIdx; drv = ic->second.driver;
+                    haveSrc = true;
+                } else if (selStop >= 0) {
+                    fail("record-override `" + rhs + "`: no channel '" + base +
+                         "' imported by a preceding `from`"); return m;
+                }
+                // else: an unqualified identifier that is not an imported channel — let it
+                // fall through to the expression compiler (e.g. a bare intrinsic like `u`).
+            }
+
+            RecBinding rb; rb.slot = slotId; rb.selStop = selStop;
+            if (haveSrc) {
+                const RecChannel& ch = L.scene.records[recIdx].channels[chanIdx];
+                if (slotId == REC_SLOT_REFLECT && ch.kind != ChanKind::Spectrum) {
+                    fail("record-override `reflect = " + rhs + "`: channel '" + ch.name +
+                         "' is scalar, not a colour channel"); return m;
+                }
+                if (slotId == REC_SLOT_ROUGHNESS && ch.kind != ChanKind::Scalar) {
+                    fail("record-override `roughness = " + rhs + "`: channel '" + ch.name +
+                         "' is a colour channel, not scalar"); return m;
+                }
+                rb.recordIndex = recIdx; rb.channel = chanIdx; rb.driver = std::move(drv);
+            } else {
+                // Not a channel reference: a direct scalar expression (scalar slots only).
+                if (slotId == REC_SLOT_REFLECT) {
+                    fail("record-override `reflect = " + rhs + "`: expected a colour channel "
+                         "(a spectrum channel of a record), not an expression"); return m;
+                }
+                if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
+                    "`: a stop selector needs a record channel"); return m; }
+                std::string cerr;
+                if (!compilePatternExpr(rhs, rb.driver, cerr)) {
+                    fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
+                }
+                rb.recordIndex = -1;
+            }
+            setBinding(m, rb);
+            (void)ok;
+        }
+        return m;
+    }
+
+    Material buildMaterial(const Block& b, Loaded& L) {
+        if (isRecordOverrideBlock(b)) return buildRecordOverrideMaterial(b, L);
         Material m;
         // Built-in whole-material recipe: `preset <name>` fills a complete material
         // (metal / glass / iridescent film). A few common knobs may still be
@@ -1042,10 +1782,10 @@ private:
             if (find(b, "roughness")) {
                 if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
                     !bindScalarTexture(b, "roughness", m.roughnessTex))
-                    m.roughness = dblOf(b, "roughness", m.roughness);
+                    m.roughness = dblParam(b, "roughness", m.roughness);
             }
-            if (find(b, "film_ior"))       m.filmIor       = dblOf(b, "film_ior", m.filmIor);
-            if (find(b, "film_thickness")) m.filmThickness = dblOf(b, "film_thickness", m.filmThickness);
+            if (find(b, "film_ior"))       m.filmIor       = dblParam(b, "film_ior", m.filmIor);
+            if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
@@ -1077,7 +1817,7 @@ private:
             // `roughness pattern:<name>` (§4) or `texture:<name>` binds a per-hit map.
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
-            else m.roughness = dblOf(b, "roughness", 0.0);
+            else m.roughness = dblParam(b, "roughness", 0.0);
             // Interior absorption sigma_a(lambda) per metre travelled inside the glass
             // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb 3 0.5 0.3`
             // (per-channel, upsampled) gives green-tinted glass.
@@ -1104,14 +1844,14 @@ private:
             // roughness map (grayscale = roughness directly, both 0..1); else a constant.
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
-            else m.roughness = dblOf(b, "roughness", 0.2);
+            else m.roughness = dblParam(b, "roughness", 0.2);
         } else if (type == "thinfilm") {
             m.type = MatType::ThinFilm;
             m.ior = spectrumParam(b, "ior", iorConstant(1.5));
-            m.filmIor = dblOf(b, "film_ior", 1.30);
+            m.filmIor = dblParam(b, "film_ior", 1.30);
             // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
             // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
-            m.filmThickness = dblOf(b, "film_thickness", 300.0);
+            m.filmThickness = dblParam(b, "film_thickness", 300.0);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             // Substrate extinction kappa (spectral): 0 = transparent dielectric
@@ -1122,15 +1862,15 @@ private:
         } else if (type == "grating") {
             m.type = MatType::Grating;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
-            m.grooveSpacing = dblOf(b, "groove_spacing", 1000.0);
+            m.grooveSpacing = dblParam(b, "groove_spacing", 1000.0);
             Vec3 gd{0, 1, 0}; vec3Of(b, "groove_dir", gd); m.grooveDir = gd;
-            m.gratingMaxOrder = (int)dblOf(b, "max_order", 3);
+            m.gratingMaxOrder = (int)dblParam(b, "max_order", 3);
         } else if (type == "fluorescent") {
             m.type = MatType::Fluorescent;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.1));
             m.fluoAbsorb = spectrumParam(b, "absorb", shortPass(490.0, 0.15, 1.0));
             m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
-            m.fluoYield = dblOf(b, "yield", 1.0);
+            m.fluoYield = dblParam(b, "yield", 1.0);
             m.fluoEmitSampler.build(m.fluoEmit, 1.0);
         } else if (type == "multilayer") {
             // Multilayer thin-film stack (Bragg / dichroic). Substrate index/kappa
@@ -1242,9 +1982,7 @@ private:
     bool addSphere(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
         double r = dblOf(b, "radius", 1.0);
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("sphere needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "sphere"); if (id < 0) return false;
         // A sphere stays a sphere only under translate + rotation + UNIFORM scale;
         // a non-uniform scale would make it an ellipsoid the analytic primitive
         // cannot represent (see known-issues.md — true instancing/quadrics).
@@ -1259,9 +1997,7 @@ private:
     bool addQuad(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 o{0, 0, 0}, u{1, 0, 0}, v{0, 0, 1};
         vec3Of(b, "origin", o); vec3Of(b, "u", u); vec3Of(b, "v", v);
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("quad needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "quad"); if (id < 0) return false;
         Vec3 a = P(xf.apply(o)), bb = P(xf.apply(o + u)),
              cc = P(xf.apply(o + u + v)), dd = P(xf.apply(o + v));
         // UVs span the parallelogram: origin=(0,0), +u=(1,0), +v=(0,1). The two
@@ -1278,18 +2014,14 @@ private:
     bool addTriangle(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 v0{0, 0, 0}, v1{1, 0, 0}, v2{0, 1, 0};
         vec3Of(b, "v0", v0); vec3Of(b, "v1", v1); vec3Of(b, "v2", v2);
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("triangle needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "triangle"); if (id < 0) return false;
         L.scene.tris.push_back(Tri{P(xf.apply(v0)), P(xf.apply(v1)), P(xf.apply(v2)), id, -1, {}});
         return true;
     }
     bool addMesh(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh needs a file"); return false; }
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("mesh needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "mesh"); if (id < 0) return false;
         MeshXform mx;
         vec3Of(b, "translate", mx.translate);
         vec3Of(b, "rotate", mx.rotDeg);
@@ -1378,6 +2110,13 @@ private:
             if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
                 fail("mesh: " + gerr); return false;
             }
+        } else if (ext == ".fbx") {
+            // Autodesk FBX via the vendored ufbx bridge. `uv use_mesh` pulls the file's
+            // first UV set; procedural UV projections and crease smoothing are OBJ-only.
+            std::string ferr;
+            if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                fail("mesh: " + ferr); return false;
+            }
         } else {
             // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
             // smooth shading normals, merging faces across edges softer than <deg>
@@ -1430,9 +2169,7 @@ private:
         if (blasIndex_.count(b.name)) { fail("duplicate mesh_asset name '" + b.name + "'"); return false; }
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh_asset '" + b.name + "' needs a file"); return false; }
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("mesh_asset '" + b.name + "' needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "mesh_asset"); if (id < 0) return false;
 
         bool loadUV = (strOf(b, "uv") == "use_mesh");
         bool useNames = (strOf(b, "usemtl") == "use_names");
@@ -1456,6 +2193,11 @@ private:
             std::string gerr;
             if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
                 fail("mesh_asset: " + gerr); return false;
+            }
+        } else if (ext == ".fbx") {
+            std::string ferr;
+            if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                fail("mesh_asset: " + ferr); return false;
             }
         } else {
             double creaseAngleDeg = -1.0;
@@ -1510,8 +2252,10 @@ private:
         xf.t = xf.t * L_;
 
         int matOverride = -1;
-        std::string mat = strOf(b, "material");
-        if (!mat.empty()) { matOverride = matId(mat); if (!err.empty()) return false; }
+        if (find(b, "material")) {
+            matOverride = matFieldId(b, L, "instance", /*optional=*/true);
+            if (matOverride < 0 && !err.empty()) return false;
+        }
 
         MeshInstance inst;
         inst.blasId = it->second;
@@ -1719,9 +2463,7 @@ private:
     }
 
     bool addIsosurface(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("isosurface needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "isosurface"); if (id < 0) return false;
         // The enclosing group's transform (identity at top level) composes OUTSIDE the
         // isosurface's own translate/rotate/scale, so a settled `group { translate ..
         // rotate .. <isosurface> }` rest pose bakes into the field's local->world map.
@@ -3070,6 +3812,152 @@ private:
         ScalarTrack focusTrk = readTrack("focus_at");
         if (!trkOk) return false;
 
+        // ---- Record-driven tracks (stage 5b) ---------------------------------------
+        // `<scalar>_from RECORD.channel[(<driver in t>)]` drives an animatable camera
+        // scalar from a parametric-record channel sampled over the flyby timeline t in
+        // [0,1] — the "records-as-keyframe-tracks" form: a named, reusable curve bank in
+        // place of hand-placed `<scalar>_at` keyframes. The driver defaults to the bare
+        // timeline `t` (so `fov_from zoom.fov` walks the channel start->end across the
+        // flight) but may be any expression in `t` (`fov_from zoom.fov(1-t)` reverses it,
+        // `(t*t)` eases in, …). `t` is the ONLY variable in scope here: a surface intrinsic
+        // (x/y/z/u/v/…) in the driver — or in the channel's stops — is an out-of-scope
+        // error. Record and `_at` track are mutually exclusive per scalar; a record wins.
+        struct RecTrack {
+            int recIdx = -1, chanIdx = -1;
+            std::vector<PatNode> driver;
+            bool active() const { return recIdx >= 0; }
+        };
+        bool recOk = true;
+        auto readRecTrack = [&](const char* key, RecTrack& rt) {
+            const Stmt* s = find(b, key);
+            if (!s || s->val.words.empty()) return;
+            // Rejoin the value tokens (a driver written with spaces, `zoom.fov(1 - t)`,
+            // splits across words); strip whitespace — the RECORD.channel head has none and
+            // the pattern compiler ignores it inside the driver.
+            std::string joined = s->val.words[0];
+            for (size_t k = 1; k < s->val.words.size(); ++k) joined += s->val.words[k];
+            std::string tok; for (char c : joined) if (!std::isspace((unsigned char)c)) tok += c;
+            std::string headChan = tok, dexpr = "t";       // default driver = the raw timeline
+            size_t lp = tok.find('(');
+            if (lp != std::string::npos) {
+                size_t rp = tok.rfind(')');
+                if (rp == std::string::npos || rp <= lp) {
+                    fail("camera_curve '" + base + "' " + key + " '" + tok + "': malformed `RECORD.channel(driver)`");
+                    recOk = false; return;
+                }
+                headChan = tok.substr(0, lp);
+                dexpr    = tok.substr(lp + 1, rp - lp - 1);
+            }
+            size_t dot = headChan.find('.');
+            if (dot == std::string::npos) {
+                fail("camera_curve '" + base + "' " + key + " needs `RECORD.channel[(driver)]`");
+                recOk = false; return;
+            }
+            std::string rname = headChan.substr(0, dot), chan = headChan.substr(dot + 1);
+            auto rit = recordIndex_.find(rname);
+            if (rit == recordIndex_.end()) {
+                fail("camera_curve '" + base + "' " + key + ": unknown record '" + rname + "'");
+                recOk = false; return;
+            }
+            const Record& rec = L.scene.records[(size_t)rit->second];
+            int ci = rec.channelIndex(chan);
+            if (ci < 0) {
+                fail("camera_curve '" + base + "' " + key + ": record '" + rname + "' has no channel '" + chan + "'");
+                recOk = false; return;
+            }
+            if (rec.channels[(size_t)ci].kind != ChanKind::Scalar) {
+                fail("camera_curve '" + base + "' " + key + ": channel '" + chan + "' is a colour channel, not scalar");
+                recOk = false; return;
+            }
+            for (const RecStop& st : rec.channels[(size_t)ci].stops)
+                if (patternHasFreeVars(st.expr)) {
+                    fail("camera_curve '" + base + "' " + key + ": channel '" + chan + "' has stop expressions with "
+                         "per-hit surface variables — only the flyby timeline `t` is in scope here");
+                    recOk = false; return;
+                }
+            std::vector<PatNode> drv; std::string cerr;
+            if (!compilePatternExpr(dexpr, drv, cerr, /*allowT=*/true)) {
+                fail("camera_curve '" + base + "' " + key + " driver '" + dexpr + "': " + cerr);
+                recOk = false; return;
+            }
+            if (patternHasFreeVars(drv)) {
+                fail("camera_curve '" + base + "' " + key + " driver '" + dexpr +
+                     "': references a surface variable — only the flyby timeline `t` is in scope here");
+                recOk = false; return;
+            }
+            rt.recIdx = rit->second; rt.chanIdx = ci; rt.driver = std::move(drv);
+        };
+        RecTrack fovRec, rollRec, zoomRec, fstopRec, focusRec;
+        readRecTrack("fov_from",   fovRec);
+        readRecTrack("roll_from",  rollRec);
+        readRecTrack("zoom_from",  zoomRec);
+        readRecTrack("fstop_from", fstopRec);
+        readRecTrack("focus_from", focusRec);
+        if (!recOk) return false;
+        // Sample a record track at timeline position `fr`: evaluate its driver (in t), then
+        // the record channel at that driven value. Stops are constant (checked above), so
+        // the PatCtx only needs `t`.
+        auto recSample = [&](const RecTrack& rt, double fr) -> double {
+            PatCtx c{}; c.t = fr;
+            double d = rt.driver.empty() ? fr : patternEval(rt.driver.data(), (int)rt.driver.size(), c);
+            const Record& rec = L.scene.records[(size_t)rt.recIdx];
+            return recSampleScalar(rec, rec.channels[(size_t)rt.chanIdx], d, c);
+        };
+
+        // ---- Orientation axes (camera_curve bridge, milestone M13) ------------------
+        // Full 3-DOF camera rotation is authored as two independent axes; the third is
+        // derived by the camera basis (`Camera::lookAt`: right = forward x up, then up is
+        // re-orthogonalized). So here we only produce, per frame, a FORWARD direction (into
+        // `cs.look = eye + forward`) and a reference UP (into `cs.up`).
+        //   * forward (2 DOF): `fwd_at <t> x y z` direction track  >  aim-point
+        //     (`look_at`/`look_curve`)  >  path tangent (today's default).
+        //   * up (1 DOF): `up_at <t> x y z` vector track  >  reference up + `roll`.
+        // Each axis has an optional reference `frame world|travel`: `world` uses fixed world
+        // axes (today's behavior); `travel` uses the curve's rotation-minimizing frame (RMF,
+        // parallel-transported — banks into turns, no torsion flips; closed loops distribute
+        // the holonomy twist for a seamless seam). A `fwd_at`/`up_at` vector is interpreted
+        // in that frame's basis (x=right, y=up, z=forward) when `travel`, else as a world
+        // direction. Curve-level `frame` sets the default for both; `fwd_frame`/`up_frame`
+        // override per axis. With none of these authored the block is byte-identical to the
+        // legacy tangent-look + world-up + `roll_at` path.
+        bool vecTrkOk = true;
+        auto readVecTrack = [&](const char* atKey) -> Vec3Track {
+            Vec3Track tk;
+            for (const auto& s : b.stmts) {
+                if (s.key != atKey) continue;
+                if (s.val.words.size() < 4) {
+                    fail("camera_curve '" + base + "' " + atKey + " needs: <t> <x> <y> <z>");
+                    vecTrkOk = false; continue;
+                }
+                tk.keys.push_back({num(s.val.words[0]),
+                                   Vec3{num(s.val.words[1]), num(s.val.words[2]), num(s.val.words[3])}});
+            }
+            tk.sort();
+            return tk;
+        };
+        Vec3Track fwdTrk = readVecTrack("fwd_at");
+        Vec3Track upTrk  = readVecTrack("up_at");
+        if (!vecTrkOk) return false;
+
+        auto parseFrameKw = [&](const char* key, bool def, bool& out) -> bool {
+            const Stmt* s = find(b, key);
+            if (!s) { out = def; return true; }
+            const std::string& v = s->val.words.empty() ? std::string() : s->val.words[0];
+            if      (v == "world")  out = false;
+            else if (v == "travel") out = true;
+            else { fail("camera_curve '" + base + "' " + key + " must be world|travel"); return false; }
+            return true;
+        };
+        bool defTravel = false, fwdFrameTravel = false, upFrameTravel = false;
+        if (!parseFrameKw("frame",     false,     defTravel))     return false;
+        if (!parseFrameKw("fwd_frame", defTravel, fwdFrameTravel)) return false;
+        if (!parseFrameKw("up_frame",  defTravel, upFrameTravel))  return false;
+        // The RMF is only needed when some axis actually references the travel frame: a
+        // `fwd_at`/`up_at` vector *in* travel mode, or an up axis whose reference (the
+        // default up when no `up_at`) is the travel frame. `fwd_at world` / `up_at world`
+        // never touch it, so a legacy curve skips the whole precompute.
+        bool needRMF = (fwdTrk.active() && fwdFrameTravel) || upFrameTravel;
+
         // Base (constant) values a track falls back to and that the whole-flight optics
         // were derived from. Captured from the same keywords readFilmExposure consumed so
         // per-frame re-derivation starts from the authored baseline (never double-applies).
@@ -3080,9 +3968,11 @@ private:
         double baseFstop  = dblOf(b, "fstop", 0.0);
         double hmm        = (shared.filmH_mm > 0.0) ? shared.filmH_mm : 24.0;
         double baseFocus  = shared.focus;   // metres (Len-scaled)
-        bool haveRoll   = rollTrk.active() || find(b, "roll");
+        bool haveRoll   = rollTrk.active() || find(b, "roll") || rollRec.active();
         bool haveOptics = fovTrk.active() || zoomTrk.active() ||
-                          fstopTrk.active() || focusTrk.active();
+                          fstopTrk.active() || focusTrk.active() ||
+                          fovRec.active() || zoomRec.active() ||
+                          fstopRec.active() || focusRec.active();
         const double DEG = 3.141592653589793 / 180.0;
 
         bool pathLock = parseExposureLock(b, shared);
@@ -3149,6 +4039,72 @@ private:
             }
         }
 
+        // ---- Rotation-minimizing frame (RMF) pre-pass ------------------------------
+        // Parallel-transport an "up" reference along the curve so the travel frame twists
+        // as little as possible (Bishop/RMF, not Frenet — no torsion flips). Built with the
+        // double-reflection method (Wang, Jüttler, Zheng & Liu 2008), which is exact to
+        // second order and robust at inflections. For a CLOSED loop the transported frame
+        // generally does not return to itself (holonomy); the residual twist is measured and
+        // distributed linearly along the loop so the seam is seamless (same idea as the
+        // sweep engine's closed-spine frame, DESIGN.md §7a). Frames align with the same `fr`
+        // sampling as the render loop. rmfRight[i] = tangent x rmfUp is filled for basis use.
+        std::vector<Vec3> rmfTan, rmfUp, rmfRight;
+        if (needRMF) {
+            rmfTan.resize((size_t)N); rmfUp.resize((size_t)N); rmfRight.resize((size_t)N);
+            auto frAt   = [&](int i){ return closed ? ((double)i / N) : (N == 1 ? 0.5 : (double)i / (N - 1)); };
+            auto tanAtG = [&](double g) -> Vec3 {
+                double eps = (nSeg > 0) ? (double)nSeg / (M * 2.0) : 1e-3;
+                Vec3 a = catmullRomAt(pts, closed, closed ? g - eps : std::max(0.0, g - eps), splineAlpha);
+                Vec3 c = catmullRomAt(pts, closed, closed ? g + eps : std::min((double)nSeg, g + eps), splineAlpha);
+                Vec3 d = c - a;
+                return (length(d) > 1e-12) ? normalize(d) : Vec3{0, 0, -1};
+            };
+            std::vector<Vec3> eyeAt((size_t)N);
+            for (int i = 0; i < N; ++i) {
+                double g = invertC(frAt(i) * Cmax);
+                eyeAt[(size_t)i] = catmullRomAt(pts, closed, g, splineAlpha);
+                rmfTan[(size_t)i] = tanAtG(g);
+            }
+            // Seed: project the world reference up perpendicular to the first tangent; if the
+            // path starts dead-vertical (up ~parallel to tangent), fall back to a world axis.
+            auto perp = [&](const Vec3& ref, const Vec3& t) -> Vec3 {
+                Vec3 r = ref - t * dot(ref, t);
+                if (length(r) < 1e-9) { Vec3 alt = (std::fabs(t.x) < 0.9) ? Vec3{1,0,0} : Vec3{0,1,0};
+                                        r = alt - t * dot(alt, t); }
+                return normalize(r);
+            };
+            rmfUp[0] = perp(shared.up, rmfTan[0]);
+            // Double-reflection transport of the reference vector r along the samples.
+            auto transport = [&](const Vec3& r_i, const Vec3& x_i, const Vec3& t_i,
+                                 const Vec3& x_j, const Vec3& t_j) -> Vec3 {
+                Vec3 v1 = x_j - x_i; double c1 = dot(v1, v1);
+                if (c1 < 1e-24) return r_i;                       // coincident samples: no rotation
+                Vec3 rL = r_i - v1 * (2.0 / c1 * dot(v1, r_i));
+                Vec3 tL = t_i - v1 * (2.0 / c1 * dot(v1, t_i));
+                Vec3 v2 = t_j - tL; double c2 = dot(v2, v2);
+                if (c2 < 1e-24) return rL;
+                return rL - v2 * (2.0 / c2 * dot(v2, rL));
+            };
+            for (int i = 1; i < N; ++i)
+                rmfUp[(size_t)i] = normalize(transport(rmfUp[(size_t)i-1],
+                                    eyeAt[(size_t)i-1], rmfTan[(size_t)i-1],
+                                    eyeAt[(size_t)i],   rmfTan[(size_t)i]));
+            if (closed && N >= 2) {
+                // Transport once more from the last frame back onto frame 0's tangent to read
+                // the holonomy angle between the wrapped-around up and the seed up.
+                Vec3 wrap = normalize(transport(rmfUp[(size_t)N-1], eyeAt[(size_t)N-1], rmfTan[(size_t)N-1],
+                                                 eyeAt[0], rmfTan[0]));
+                Vec3 t0 = rmfTan[0], u0 = rmfUp[0], r0 = cross(t0, u0);
+                double ang = std::atan2(dot(wrap, r0), dot(wrap, u0));   // signed twist about t0
+                // Distribute -ang * (i/N) so frame N would land exactly on the seed.
+                for (int i = 0; i < N; ++i)
+                    rmfUp[(size_t)i] = normalize(rotateAboutAxis(rmfUp[(size_t)i], rmfTan[(size_t)i],
+                                                                 -ang * ((double)i / N)));
+            }
+            for (int i = 0; i < N; ++i)
+                rmfRight[(size_t)i] = normalize(cross(rmfTan[(size_t)i], rmfUp[(size_t)i]));
+        }
+
         // ---- Round-trip capture: record this curve's CONTROL POINTS for the editor ----
         // The in-viewer camera_curve editor seeds its `editPts` from this so an existing
         // curve can be loaded and edited in place (rather than starting from an empty
@@ -3198,6 +4154,8 @@ private:
             double g = invertC(fr * Cmax);
             CamSpec cs = shared;
             cs.eye = catmullRomAt(pts, closed, g, splineAlpha);
+            // Forward axis: default aim (look_curve / look_at / tangent), then an optional
+            // `fwd_at` direction override (world vector, or travel-frame components).
             if (lookCurve) {
                 cs.look = catmullRomAt(lookPts, closed, fr * lookSeg, splineAlpha);
             } else if (lookFixed) {
@@ -3210,25 +4168,51 @@ private:
                 // treatment) is precomputed in tangentDirs above.
                 cs.look = cs.eye + tangentDirs[(size_t)i];
             }
+            if (fwdTrk.active()) {
+                Vec3 fv = fwdTrk.sample(fr);
+                Vec3 fwd = fwdFrameTravel
+                    ? (rmfRight[(size_t)i] * fv.x + rmfUp[(size_t)i] * fv.y + rmfTan[(size_t)i] * fv.z)
+                    : fv;
+                if (length(fwd) > 1e-12) cs.look = cs.eye + normalize(fwd);
+            }
             // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.
             // cs starts as `shared`, so restore its aperture before re-deriving in case a
             // static f-stop had already set it (a live fstop track will overwrite it).
             if (haveOptics) {
-                double fov = fovTrk.sample(fr, baseFovDeg);
-                double zm  = zoomTrk.sample(fr, baseZoom);
-                double fs  = fstopTrk.sample(fr, baseFstop);
-                double fo  = focusTrk.active() ? Len(focusTrk.sample(fr, 0.0)) : baseFocus;
+                // Per scalar: a record track (5b) wins over an `_at` keyframe track, which
+                // wins over the authored base constant.
+                double fov = fovRec.active()   ? recSample(fovRec,   fr) : fovTrk.sample(fr, baseFovDeg);
+                double zm  = zoomRec.active()  ? recSample(zoomRec,  fr) : zoomTrk.sample(fr, baseZoom);
+                double fs  = fstopRec.active() ? recSample(fstopRec, fr) : fstopTrk.sample(fr, baseFstop);
+                double fo  = focusRec.active() ? Len(recSample(focusRec, fr))
+                                               : (focusTrk.active() ? Len(focusTrk.sample(fr, 0.0)) : baseFocus);
                 cs.aperture = shared.aperture;
                 cs.focus    = fo;
                 deriveCameraOptics(cs, fov, baseLensMM, zm, fs, hmm, fo);
             }
-            // Per-frame roll: bank `up` about the view direction (Rodrigues). Applied after
-            // look so the axis is the final view ray; starts from the authored `up`.
-            if (haveRoll) {
-                double rollDeg = rollTrk.sample(fr, rollConst);
+            // Up axis: an explicit `up_at` vector wins; otherwise the reference up (world
+            // `up`, or the travel-frame RMF up) with `roll` banked on top about the view
+            // ray. camera.h re-orthogonalizes this reference against forward, so it need not
+            // be exactly perpendicular. Byte-identical to the legacy roll path when no
+            // `up_at`/travel frame is authored (reference up == shared.up).
+            {
                 Vec3 w = cs.look - cs.eye;
-                if (length(w) > 1e-12)
-                    cs.up = rotateAboutAxis(shared.up, normalize(w), rollDeg * DEG);
+                bool wok = length(w) > 1e-12;
+                if (upTrk.active()) {
+                    Vec3 uv = upTrk.sample(fr);
+                    Vec3 up = upFrameTravel
+                        ? (rmfRight[(size_t)i] * uv.x + rmfUp[(size_t)i] * uv.y + rmfTan[(size_t)i] * uv.z)
+                        : uv;
+                    if (length(up) > 1e-12) cs.up = up;
+                } else {
+                    Vec3 refUp = upFrameTravel ? rmfUp[(size_t)i] : shared.up;
+                    if (haveRoll && wok) {
+                        double rollDeg = rollRec.active() ? recSample(rollRec, fr) : rollTrk.sample(fr, rollConst);
+                        cs.up = rotateAboutAxis(refUp, normalize(w), rollDeg * DEG);
+                    } else {
+                        cs.up = refUp;
+                    }
+                }
             }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;

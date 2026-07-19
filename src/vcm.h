@@ -255,7 +255,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             Vec3 mdir = reflect(rayDir, ns);
             wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
-            double r = clamp01(mp->reflect(lambda));
+            double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = r;
@@ -275,7 +275,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Mirror: {
-            double r = clamp01(mp->reflect(lambda));
+            double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             wi = reflect(rayDir, ns); betaFactor = r; delta = true;
             if (r <= 0) terminate = true;
             break;
@@ -325,7 +325,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::HalfMirror: {
-            double r = clamp01(mp->reflect(lambda));
+            double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             if (rng.uniform() < r) wi = reflect(rayDir, ns);
             else                   wi = rayDir;
             betaFactor = 1.0; delta = true;
@@ -350,7 +350,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Grating: {
-            double r = clamp01(mp->reflect(lambda));
+            double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             if (r <= 0) { terminate = true; break; }
             bool absorbedG; Ray nr = mats.gratingDiffract(*mp, h, rayDir, lambda, rng, absorbedG);
             if (absorbedG) { terminate = true; break; }

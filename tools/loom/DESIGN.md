@@ -128,12 +128,22 @@ Three **datasets**, each N-D, each with **every value feedable by a modulator**
 itself a **node in the modulation DAG** (it carries an `id` + `children()`), so it
 is both *modulable* (its stored values are driven by modulators) **and** a
 *modulator* (an interpolator over it is a `Signal`), and `detect_signal_cycle`
-walks *through* the dataset — a control point / grid value / scatter value that
-loops back is caught:
+walks *through* the dataset — a control point / grid value / scatter position or
+value that loops back is caught:
 
 1. **Point-path** — an ordered sequence of N-D points (a curve's control points).
+   The **points themselves are modulable** (each is a `VecSignal`; any coordinate
+   may be a `Signal`), so control points animate over the loop.
 2. **Grid** — N-D values on a regular lattice of *arbitrary rarity* (resolution).
-3. **Scatter** — N-D values at arbitrary positions (no lattice).
+   Only the **values** are modulable; the lattice **positions are deliberately
+   fixed**. That regular structure is the whole point of a Grid — it is what buys
+   the fast **separable N-linear interpolation** — so animating node positions is
+   explicitly *not* a Grid feature. If you want moving sample *positions*, that is
+   exactly what **Scatter** is for.
+3. **Scatter** — N-D values at arbitrary positions (no lattice). **Both** the
+   sample **positions** (each a `VecSignal`) **and** their **values** are modulable,
+   so a scatter point can drift *and* pulse; `ScatterField` re-reads every position
+   and value per frame, and both are walked by the cycle detector.
 
 Plus one composite dataset built on the point-path:
 
@@ -151,10 +161,24 @@ output can feed another modulator — "it's just another function"):
    produces an arc from `mid(A,B)` through `B` to `mid(B,C)`; wrap with modulo for a
    **seamless closed** curve (no seam angle to choose). Verified to generalize to any
    dimension (the construction is per-component). Open/closed both supported.
-2. **`GridField`** — N-linear interpolation of grid values → a value anywhere in the
-   volume.
-3. **`ScatterField`** — smooth interpolation of scatter values (inverse-distance /
-   RBF; **quality/speed tradeoff is an open tuning item**, see §11).
+2. **`GridField`** — grid interpolation → a value anywhere in the volume.
+   `interp="linear"` (default, N-linear) or `interp="cubic"` (separable Catmull-Rom
+   / tricubic; smoother C1, may overshoot). Boundary phantoms are linearly
+   extrapolated so cubic reproduces linear ramps to the edge.
+3. **`ScatterField`** — Shepard inverse-distance interpolation of scatter values
+   (robust, C0, flattens toward the mean far from samples).
+3b. **`RbfScatterField`** — radial-basis interpolation (`scipy.interpolate.RBFInterpolator`,
+   an *optional* dep, lazily imported). Smooth, exact at samples, meshless, any N-D.
+   Default kernel `thin_plate_spline` (parameter-free); `on_outside="clamp"` guards the
+   convex-hull extrapolation. Rebuilt once per frame (positions/values animate).
+
+Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
+with named `channels=`). `VecGridField` / `VecScatterField` / `VecRbfScatterField`
+interpolate those as a `VecSignal`: the **domain weights (or RBF factorization) are
+computed once** and applied to every channel (RBF uses a multi-column RHS — one solve
+for all channels), so a vector field's `.channel(name|idx)` equals the scalar field over
+that channel, and the single-valued field is just the one-channel case. Grid fields also
+take `interp="linear"|"cubic"` (see §2 above).
 
 And, over a `TrackedPath`, one multi-curve sampler:
 
@@ -165,6 +189,14 @@ And, over a `TrackedPath`, one multi-curve sampler:
    retimes traversal through **`Reparam`** — an inverse-CDF over equal `u`-bins that
    maps a uniform travel param `s` to a `u` that *dwells* where the density track is
    large (the distinguishing behavior of a camera-curve speed curve).
+
+And one **field-routed** curve:
+
+5. **`FieldCurve`** — a curve routed **through a field**. `FieldCurve(curve, field_builder, u)`
+   pairs a position curve with a field built over that curve's point (`field_builder` is a
+   callable `q -> field`, so any grid/scatter field composes in). `.position`, `.value` and
+   `.channel(name|idx)` are DAG nodes that can drive scene variables; `.sample(u, clock)`
+   polls at an explicit progression index → `(coords, {channel: value})`.
 
 Because interpolators are `Signal`s, you can: feed a modulator into a control point;
 *or* feed an N-D value into an interpolator to read a value out and pass it onward;
@@ -211,6 +243,49 @@ over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property an
 - **Serialize / round-trip** the whole model (JSON). This is the discipline that keeps
   "GUI as add-on" cheap: the GUI is just another reader/writer of this format.
 
+### 8a. Parametric records (`Record`) — a loom twin of the FTSL record
+A **`Record`** (`record.py`) mirrors ftrace's parametric record (`src/record.h`,
+`ROADMAP_records.md`): a bank of named per-channel curves over a shared scalar driver
+domain `[lo, hi]`, sampled `nearest`/`linear`/`smooth`. Each **channel** is named
+after a destination slot and holds ordered **stops**; a channel is either *scalar*
+(`D==1`; numeric-literal or pattern-expression stops) or *colour* (`D==3`;
+`spectrum:`/`metal:`/`rgb:` refs) — the two arities ftrace materializes today. Stops
+carry a raw `token` (preserved verbatim) and an optional `p:<pos>` pin; unpinned stops
+redistribute evenly between anchors exactly as ftrace does.
+- **Emit** produces the `NAME = range LO-HI [ … ]` block (routed through `Scene`
+  before the materials that bind it); **`Record.parse` / `parse_all`** read one (or
+  every) record block back out of `.ftsl` text — the round-trip that lets loom *copy*
+  an existing scene's records (J3a; round-tripped against `scenes/_record_*.ftsl`).
+- **`Record.sample(channel, d)`** is a numeric sampler (Fritsch–Carlson monotone cubic
+  for `smooth`) for all-numeric scalar channels; colour and *expression* stops are
+  represented and re-emitted faithfully but not evaluated (that needs the pattern VM —
+  deferred to the full-scene parser, J3c). Higher channel arities are the loom-only
+  superset (J3b).
+
+**Ladder parser (`ladder.py`, J3b item 2).** The generalized stop grammar
+(`ROADMAP_records.md` §3.1) authors arbitrary-arity nested values with a delimiter
+*precedence ladder* — **whitespace binds like `×`, comma like `+`, brackets are parens**
+— so `1 1 1, 2 2 2` parses like `(1·1·1)+(2·2·2)` and structure is recoverable from the
+delimiters alone. `parse_ladder(str)` → nested `list`/`str` tree (leaves are raw tokens);
+`emit_ladder(v)` renders it back canonically (space-join a flat vector, comma-join with
+bracket-wrapped multi-level children — round-trips); `shape(v)` reports rectangular dims.
+Parens `( )` are **not** a ladder delimiter (reserved for expressions / the §3.2
+application surface) — a parenthesised run is an opaque atom, so `clamp(x,0,1)` is one
+leaf. This is loom-only authoring; current ftrace's tokenizer is not comma-aware and
+cannot parse it.
+
+**Arbitrary-arity (vector) channels (J3b item 1).** `RecordStop` now holds
+`.components` (a `D`-tuple of tokens; `.token` is the single component of an arity-1
+stop, `.arity`/`.as_vector()` the vector view), so a `RecordChannel.kind` is `scalar`
+(arity 1) / `colour` (`:`-refs) / **`vector`** (arity `D` ≥ 2, homogeneous). `Record`
+gains `sample_vec(name, d)` (per-component interpolation; scalar `sample` still returns a
+float). Because current-FTSL uses *whitespace* to separate stops but the ladder uses it
+for *components*, the two grammars stay separate: `emit`/`parse` remain the J3a
+whitespace form (and `emit` rejects a vector channel), while `emit_generalized` /
+`parse_generalized` use the ladder (comma-separated stops) so vector channels round-trip.
+Inline-`rgb` colour channels + their lowering to synthesized `spectrum` decls are the
+remaining J3b piece (not yet built).
+
 ---
 
 ## 9. Layer 6 — Drivers / IO
@@ -247,6 +322,8 @@ tools/loom/
     sweep.py                sweep engine + frame field + 4 presets (new)
     iso.py                  isosurface + N-D slicer emit (new)
     material.py             function-driven material emit (new)
+    record.py               parametric record twin: emit + parse + sample (J3a)
+    ladder.py               delimiter-precedence-ladder parser (J3b item 2)
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
@@ -465,6 +542,23 @@ tools/loom/
   reduced preview LOD (§11.9). Each frame is still a full independent render, and the live
   window keeps the first frame's resolution for the session. Those remain the real future
   speedup; `-serve` is the bounded, correct increment they build on.
+
+- **M13 — `CameraCurve` element + two-axis orientation.** ✅ done (`loom/scene.py`
+  `CameraCurve`). loom gained a genuine ftrace `camera_curve` element: unlike `Camera`
+  (re-baked to a static `camera` block every frame by loom's clock), a `CameraCurve` is
+  emitted **once** and *ftrace* expands the N flyby frames — pass it in place of the camera
+  (`Scene(camera=CameraCurve(...))`). It mirrors ftrace's grammar 1:1: `points` spline,
+  `frames`/`density`/`density_at` speed, `look_at`/`look_points` aim, and the animatable
+  lens/orientation tracks. The orientation half also required the underlying ftrace feature
+  (`src/ftsl.h` `addCameraCurve`): a **two-axis** model where forward (`fwd_at`, else
+  `look_at`/tangent) and up (`up_at`, else `roll`, else reference up) are authored and
+  `right` is derived, each read in a `world` or `travel` **reference frame**. `travel` is a
+  rotation-minimizing frame (RMF) built by double-reflection parallel transport (`Vec3Track`
+  + the RMF pre-pass) with closed-loop holonomy distributed for a seamless loop, so shots
+  bank into turns. Authoring no orientation keywords is byte-identical to the legacy world-up
+  framing. Tests: `tests/test_emit.py` (`test_camera_curve_*` — golden emit, orientation
+  axes, scalar tracks, validation, in-scene); ftrace-side validation scene
+  `scenes/_camA_travel.ftsl`.
 
 Each milestone: keep `known-issues.md` current, commit at green checkpoints, never
 `git push`. Update this doc if the plan changes.

@@ -2443,7 +2443,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
-                              "palette, or oversized multilayer/mix material)";
+                              "palette, parametric record, or oversized multilayer/mix "
+                              "material)";
             if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else {
@@ -3098,6 +3099,115 @@ static int reviewMode(const std::string& base) {
     return 0;
 }
 
+// --- Stereoscopic (3-D) output helpers (-stereo) ------------------------------
+// The two eyes render as two ordinary rectilinear cameras (offset along the right
+// axis u, each with an off-axis sheared frustum via Camera::frustumShiftX), then this
+// post-pass composites their PNGs into one side-by-side or anaglyph image. Reusing the
+// full render pipeline per eye means checkpoints, budgets, GPU and the live window all
+// work unchanged; only the compositing lives here.
+enum StereoMode { STEREO_OFF = 0, STEREO_SBS, STEREO_CROSS, STEREO_ANAGLYPH_RC, STEREO_ANAGLYPH_GM };
+
+// Best-effort screen DPI for `-dpi auto`. On Windows this is the LOGICAL system DPI
+// (usually 96 unless the user scaled the desktop), NOT the monitor's physical pixel
+// pitch — reading true physical DPI needs the panel's EDID, which we don't parse. So it
+// is only a rough hint; pass a measured -dpi (or rely on the -view-dist / FOV mapping,
+// the default) for a physically exact baseline. Returns 0 when unknown.
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) unsigned int __stdcall GetDpiForSystem(void);
+#endif
+static double stereoDetectDpi() {
+#if defined(_WIN32)
+    unsigned int d = GetDpiForSystem();
+    return (d > 0) ? (double)d : 0.0;
+#else
+    return 0.0;
+#endif
+}
+
+// Dubois least-squares anaglyph mixing matrices (row-major 3x3, applied to sRGB in
+// [0,1]). Far less ghosting / retinal rivalry than a naive channel split. From Eric
+// Dubois' optimised projections (the same matrices bino/3dtv use). out = ML*left +
+// MR*right, then clamp. Red-cyan (default) and green-magenta variants.
+static const double kDuboisRC_L[9] = {
+     0.437,  0.449,  0.164,
+    -0.062, -0.062, -0.024,
+    -0.048, -0.050, -0.017 };
+static const double kDuboisRC_R[9] = {
+    -0.011, -0.032, -0.007,
+     0.377,  0.761,  0.009,
+    -0.026, -0.093,  1.234 };
+static const double kDuboisGM_L[9] = {
+    -0.062, -0.158, -0.039,
+     0.284,  0.668,  0.143,
+    -0.015, -0.027,  0.021 };
+static const double kDuboisGM_R[9] = {
+     0.529,  0.705,  0.024,
+    -0.016, -0.015, -0.065,
+     0.009,  0.075,  0.937 };
+
+// Composite two already-rendered eye PNGs into one stereo image at `outPath`.
+// Returns true on success. `left`/`right` are the on-disk eye files.
+static bool stereoComposite(int mode, const std::string& left, const std::string& right,
+                            const std::string& outPath) {
+    int lw = 0, lh = 0, lc = 0, rw = 0, rh = 0, rc = 0;
+    unsigned char* lp = stbi_load(left.c_str(),  &lw, &lh, &lc, 3);
+    unsigned char* rp = stbi_load(right.c_str(), &rw, &rh, &rc, 3);
+    if (!lp || !rp) {
+        std::fprintf(stderr, "[stereo] could not load eye images (%s / %s)\n",
+                     left.c_str(), right.c_str());
+        if (lp) stbi_image_free(lp);
+        if (rp) stbi_image_free(rp);
+        return false;
+    }
+    if (lw != rw || lh != rh) {
+        std::fprintf(stderr, "[stereo] eye images differ in size (%dx%d vs %dx%d)\n",
+                     lw, lh, rw, rh);
+        stbi_image_free(lp); stbi_image_free(rp);
+        return false;
+    }
+    const int W = lw, H = lh;
+    bool ok = false;
+    if (mode == STEREO_SBS || mode == STEREO_CROSS) {
+        // Side-by-side: wall-eyed puts Left|Right, cross-eyed swaps to Right|Left.
+        const unsigned char* halfL = (mode == STEREO_SBS) ? lp : rp;   // shown on the left
+        const unsigned char* halfR = (mode == STEREO_SBS) ? rp : lp;   // shown on the right
+        std::vector<uint8_t> out((size_t)W * 2 * H * 3);
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                size_t s = ((size_t)y * W + x) * 3;
+                size_t dL = ((size_t)y * (2 * W) + x) * 3;
+                size_t dR = ((size_t)y * (2 * W) + (W + x)) * 3;
+                for (int c = 0; c < 3; ++c) { out[dL + c] = halfL[s + c]; out[dR + c] = halfR[s + c]; }
+            }
+        }
+        ok = writeImage(outPath, 2 * W, H, out);
+    } else {
+        const double* ML = (mode == STEREO_ANAGLYPH_GM) ? kDuboisGM_L : kDuboisRC_L;
+        const double* MR = (mode == STEREO_ANAGLYPH_GM) ? kDuboisGM_R : kDuboisRC_R;
+        std::vector<uint8_t> out((size_t)W * H * 3);
+        for (size_t i = 0; i < (size_t)W * H; ++i) {
+            const unsigned char* Lc = lp + i * 3;
+            const unsigned char* Rc = rp + i * 3;
+            double l0 = Lc[0] / 255.0, l1 = Lc[1] / 255.0, l2 = Lc[2] / 255.0;
+            double r0 = Rc[0] / 255.0, r1 = Rc[1] / 255.0, r2 = Rc[2] / 255.0;
+            for (int c = 0; c < 3; ++c) {
+                double v = ML[c*3+0]*l0 + ML[c*3+1]*l1 + ML[c*3+2]*l2
+                         + MR[c*3+0]*r0 + MR[c*3+1]*r1 + MR[c*3+2]*r2;
+                out[i * 3 + c] = (uint8_t)std::clamp(v * 255.0 + 0.5, 0.0, 255.0);
+            }
+        }
+        ok = writeImage(outPath, W, H, out);
+    }
+    stbi_image_free(lp); stbi_image_free(rp);
+    if (ok) std::printf("[stereo] composited -> %s (%s)\n", outPath.c_str(),
+                        mode == STEREO_SBS   ? "side-by-side wall-eyed" :
+                        mode == STEREO_CROSS ? "side-by-side cross-eyed" :
+                        mode == STEREO_ANAGLYPH_GM ? "green-magenta anaglyph"
+                                                   : "red-cyan anaglyph");
+    else std::fprintf(stderr, "[stereo] failed to write %s\n", outPath.c_str());
+    return ok;
+}
+
 static int run(int argc, char** argv) {
     // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
     // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
@@ -3185,9 +3295,17 @@ static int run(int argc, char** argv) {
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
+    // --- Stereoscopic (3-D) output (-stereo) ---
+    int    stereoMode    = STEREO_OFF; // -stereo sbs|cross|anaglyph|anaglyph-gm
+    double stereoEyeSep  = 0.063;      // -eye-sep <m>: interocular distance (default 63 mm)
+    double stereoViewDist= 0.6;        // -view-dist <m>: viewing distance (default 60 cm)
+    double stereoDpi     = 0.0;        // -dpi <n|auto>: screen pixel density (0 = derive screen width from view-dist + FOV)
+    double stereoConverge= 0.0;        // -convergence <m>: convergence-plane distance in scene units (0 = look-at target)
+    bool   stereoKeepEyes= false;      // -stereo-keep-eyes: keep the intermediate per-eye PNGs (else deleted after compositing)
 
     // --- FTSL scene file (-in <file>) --------------------------------------
     // Load the scene from a file *before* parsing the rest of argv, so any explicit
@@ -3267,7 +3385,14 @@ static int run(int argc, char** argv) {
     }
 
     for (int i = 1; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = std::atoll(argv[++i]);
+        if (!std::strcmp(argv[i], "-n") && i + 1 < argc) {
+            // Photon count. Accept both plain integers ("200000000") and scientific /
+            // float shorthand ("2e8", "1.5e9") — atoll stops at the 'e', so parse the
+            // token as a double when it contains one and round to the nearest count.
+            const char* s = argv[++i];
+            if (std::strpbrk(s, "eE.")) N = (long long)std::llround(std::atof(s));
+            else                        N = std::atoll(s);
+        }
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) {
             res = std::atoi(argv[++i]); resFromCli = true;
             // Optional second numeric token makes a non-square film: `-r W H`.
@@ -3349,6 +3474,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
+        else if (!std::strcmp(argv[i], "-raster-gpu")) { doRaster = true; rasterGpu = true; }
         else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
             // Interactive fly-through: start at the first selected camera frame and let
             // the user explore with the raster viewer instead of rendering every frame.
@@ -3363,6 +3489,32 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
+        else if (!std::strcmp(argv[i], "-stereo") && i + 1 < argc) {
+            std::string m = argv[++i];
+            for (auto& c : m) c = (char)std::tolower((unsigned char)c);
+            if      (m=="sbs"||m=="side-by-side"||m=="wall"||m=="walleye"||m=="wall-eyed") stereoMode = STEREO_SBS;
+            else if (m=="cross"||m=="sbs-cross"||m=="crosseye"||m=="cross-eyed")           stereoMode = STEREO_CROSS;
+            else if (m=="anaglyph"||m=="rc"||m=="red-cyan"||m=="redcyan")                  stereoMode = STEREO_ANAGLYPH_RC;
+            else if (m=="anaglyph-gm"||m=="gm"||m=="green-magenta"||m=="greenmagenta")     stereoMode = STEREO_ANAGLYPH_GM;
+            else { std::fprintf(stderr, "error: -stereo mode '%s' unknown "
+                                        "(sbs|cross|anaglyph|anaglyph-gm)\n", m.c_str()); return 1; }
+        }
+        else if (!std::strcmp(argv[i], "-eye-sep") && i + 1 < argc) stereoEyeSep = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-view-dist") && i + 1 < argc) stereoViewDist = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-dpi") && i + 1 < argc) {
+            const char* v = argv[++i];
+            if (!std::strcmp(v, "auto")) {
+                stereoDpi = stereoDetectDpi();
+                if (stereoDpi > 0.0)
+                    std::printf("[stereo] -dpi auto -> %.0f (logical system DPI; pass a measured "
+                                "-dpi for a physically exact baseline)\n", stereoDpi);
+                else
+                    std::fprintf(stderr, "[stereo] -dpi auto: could not detect DPI; using the "
+                                         "-view-dist/FOV screen-width mapping instead\n");
+            } else stereoDpi = std::atof(v);
+        }
+        else if (!std::strcmp(argv[i], "-convergence") && i + 1 < argc) stereoConverge = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-stereo-keep-eyes")) stereoKeepEyes = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
@@ -3935,6 +4087,79 @@ static int run(int argc, char** argv) {
         return stem + "_" + name + ext;
     };
 
+    // --- Stereoscopic expansion (-stereo): each camera -> a Left/Right eye pair --------
+    // Off-axis method: two PARALLEL rectilinear cameras offset ±baseline/2 along the M13
+    // camera right axis u, each with a horizontally SHEARED frustum (Camera::frustumShiftX)
+    // so the convergence plane sits at zero parallax — no toe-in, hence no vertical
+    // parallax / eye strain. Baseline & convergence come from the physical viewing
+    // geometry (interocular, screen width from -dpi or the -view-dist/FOV mapping, and the
+    // convergence distance). Both eyes share one exposure group so they (and, for an
+    // exposure-locked path, every frame) tone-map identically. After the render loop the
+    // two eye PNGs are composited (side-by-side or Dubois anaglyph) into the -o path.
+    struct StereoPair { std::string finalPath, leftPath, rightPath; };
+    std::vector<StereoPair> stereoPairs;
+    if (stereoMode != STEREO_OFF) {
+        if (doRaster || exploreMode) {
+            std::fprintf(stderr, "[stereo] ignored: -stereo needs a light-transport render "
+                                 "(not -raster/-explore)\n");
+        } else {
+            // Final composite path for each ORIGINAL camera, resolved before we expand
+            // toRender (outFor keys off toRender.size()).
+            std::vector<std::string> finalPaths;
+            finalPaths.reserve(toRender.size());
+            for (const auto& rc : toRender) finalPaths.push_back(outFor(rc.name));
+
+            std::vector<RenderCam> expanded;
+            expanded.reserve(toRender.size() * 2);
+            int syntheticGroup = 1000000;   // per-pair exposure groups for unlocked (per-frame) cameras
+            std::vector<std::pair<size_t, size_t>> pairIdx;   // (leftIdx,rightIdx) in `expanded`; SIZE_MAX = mono
+            bool announced = false;
+            for (size_t k = 0; k < toRender.size(); ++k) {
+                const RenderCam& rc = toRender[k];
+                if (rc.cam.projection != CAM_RECTILINEAR) {
+                    std::fprintf(stderr, "[stereo] '%s' is fisheye/panoramic; stereo needs a "
+                                         "rectilinear lens — rendering it mono\n",
+                                 rc.name.empty() ? "<camera>" : rc.name.c_str());
+                    pairIdx.push_back({expanded.size(), SIZE_MAX});
+                    expanded.push_back(rc);
+                    continue;
+                }
+                Vec3 toTgt = rc.lookAt - rc.cam.eye;
+                double C = (stereoConverge > 0.0) ? stereoConverge : std::sqrt(dot(toTgt, toTgt));
+                if (!(C > 0.0)) C = 1.0;                                   // no target -> unit convergence
+                // Screen width in metres: from a measured DPI, else assume the screen shows
+                // the camera's horizontal field at the viewing distance (W = 2·d·tanHalfX).
+                double W = (stereoDpi > 0.0) ? ((double)rc.res * 0.0254 / stereoDpi)
+                                             : (2.0 * stereoViewDist * rc.cam.tanHalfX);
+                double S = (W > 0.0) ? stereoEyeSep / W : 0.0;            // shear: infinity -> interocular on screen
+                double b = 2.0 * C * rc.cam.tanHalfX * S;                  // baseline (scene units): b/C = eyeSep/screenW
+                int grp = (rc.expGroup >= 0) ? rc.expGroup : syntheticGroup++;
+                RenderCam L = rc, R = rc;
+                L.cam.eye = rc.cam.eye - rc.cam.u * (b * 0.5); L.cam.frustumShiftX = +S; L.expGroup = grp;
+                R.cam.eye = rc.cam.eye + rc.cam.u * (b * 0.5); R.cam.frustumShiftX = -S; R.expGroup = grp;
+                std::string tag = rc.name.empty() ? std::string("stereo") : rc.name;
+                L.name = tag + "__eyeL"; R.name = tag + "__eyeR";
+                pairIdx.push_back({expanded.size(), expanded.size() + 1});
+                expanded.push_back(L); expanded.push_back(R);
+                if (!announced) {
+                    std::printf("[stereo] eye-sep %.4g m, view-dist %.4g m, screen width %.4g m (%s); "
+                                "'%s' -> baseline %.4g, convergence %.4g (scene units), shear %.4f\n",
+                                stereoEyeSep, stereoViewDist, W,
+                                stereoDpi > 0.0 ? "from -dpi" : "from -view-dist/FOV",
+                                rc.name.empty() ? "<camera>" : rc.name.c_str(), b, C, S);
+                    announced = true;
+                }
+            }
+            toRender.swap(expanded);   // now size>1 so outFor yields the per-eye file paths
+            for (size_t p = 0; p < pairIdx.size(); ++p) {
+                if (pairIdx[p].second == SIZE_MAX) continue;   // mono camera: no composite
+                stereoPairs.push_back({ finalPaths[p],
+                                        outFor(toRender[pairIdx[p].first].name),
+                                        outFor(toRender[pairIdx[p].second].name) });
+            }
+        }
+    }
+
     // Shared auto-exposure anchors, one per exposure-lock group (see RenderCam.expGroup).
     // A group's anchor is normally computed by the first frame rendered and reused by the
     // rest (no dolly flicker); the meter pre-pass below can instead *pre-populate* it from
@@ -4115,7 +4340,25 @@ static int run(int argc, char** argv) {
     // selection / -window live view as the real renderer.
     // -----------------------------------------------------------------------------
     if (doRaster) {
-        std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
+        // -raster-gpu (G2): render implicit isosurfaces by casting a deterministic primary
+        // ray per pixel on the GPU (renderIsoPreviewCuda) instead of marching-cubes
+        // tessellation. Requires CUDA + a POD-bakeable scene; see-through mode and a
+        // physical-lens camera aren't covered, so those fall back to CPU tessellation.
+#ifdef HAVE_CUDA
+        bool useGpuIso = rasterGpu && !rasterSeeThrough && cudaAvailable() && cudaForwardSupported(scene);
+        if (rasterGpu && !useGpuIso) {
+            if (rasterSeeThrough)      std::fprintf(stderr, "[raster] -raster-gpu doesn't support see-through; using CPU tessellation\n");
+            else if (!cudaAvailable()) std::fprintf(stderr, "[raster] -raster-gpu: no CUDA device; using CPU tessellation\n");
+            else                       std::fprintf(stderr, "[raster] -raster-gpu: scene not GPU-bakeable; using CPU tessellation\n");
+        }
+#else
+        const bool useGpuIso = false;
+        if (rasterGpu) std::fprintf(stderr, "[raster] -raster-gpu needs a CUDA build; using CPU tessellation\n");
+#endif
+        if (useGpuIso)
+            std::printf("[raster] GPU iso preview: primary-ray isosurface render on the GPU (no tessellation)\n");
+        else
+            std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
         if (rasterSeeThrough)
             std::printf("[raster] see-through: clear objects dim/haze what's behind them (clarity %.2f, no refraction)\n", rasterClarity);
         std::fflush(stdout);
@@ -4133,38 +4376,58 @@ static int run(int argc, char** argv) {
             }
             g_liveWin = std::make_unique<LiveWindow>(pw, ph, g_windowTitle.c_str());
             g_liveWin->update(pw, ph, placeholder);
-            const size_t nImp = scene.implicits.size();
-            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
-                                (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
+            if (useGpuIso) {
+                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  GPU iso preview\xE2\x80\xA6");
+            } else {
+                const size_t nImp = scene.implicits.size();
+                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
+                                    (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
+            }
         }
 
-        auto rt0 = std::chrono::steady_clock::now();
-        // Progress callback: update the window title (and a periodic stdout line) as the
-        // heavy isosurface/CSG implicits are marched one by one.
-        auto lastTick = std::chrono::steady_clock::now();
-        auto tessProgress = [&](int done, int total) {
-            if (total <= 0) return;
-            int pct = (int)std::lround(100.0 * done / total);
-            if (g_liveWin && !g_liveWin->closed()) {
-                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
-                                    std::to_string(done) + "/" + std::to_string(total) +
-                                    ", " + std::to_string(pct) + "%)");
-            }
-            auto now = std::chrono::steady_clock::now();
-            if (done == 0 || done == total ||
-                std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
-                std::printf("[raster] tessellating implicit %d/%d (%d%%)\n", done, total, pct);
-                std::fflush(stdout);
-                lastTick = now;
-            }
-        };
-        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso, tessProgress);
         raster::PreviewLight plight = raster::deriveLight(scene);
-        auto rt1 = std::chrono::steady_clock::now();
-        std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
-                    prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
-                    toRender.size(), nThreads, g_showWindow ? " — live window" : "");
-        std::fflush(stdout);
+        std::vector<raster::PTri> prims;   // tessellated lazily (empty in pure GPU-iso mode)
+        bool tessellated = false;
+        // Tessellate on demand: the CPU / GPU-triangle path calls this immediately; the GPU
+        // iso path skips it entirely and only tessellates if a frame must fall back (e.g. a
+        // physical-lens camera the primary-ray kernel can't handle).
+        auto ensurePrims = [&]() {
+            if (tessellated) return;
+            tessellated = true;
+            auto rt0 = std::chrono::steady_clock::now();
+            // Progress callback: update the window title (and a periodic stdout line) as the
+            // heavy isosurface/CSG implicits are marched one by one.
+            auto lastTick = std::chrono::steady_clock::now();
+            auto tessProgress = [&](int done, int total) {
+                if (total <= 0) return;
+                int pct = (int)std::lround(100.0 * done / total);
+                if (g_liveWin && !g_liveWin->closed()) {
+                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
+                                        std::to_string(done) + "/" + std::to_string(total) +
+                                        ", " + std::to_string(pct) + "%)");
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (done == 0 || done == total ||
+                    std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
+                    std::printf("[raster] tessellating implicit %d/%d (%d%%)\n", done, total, pct);
+                    std::fflush(stdout);
+                    lastTick = now;
+                }
+            };
+            prims = raster::tessellate(scene, rasterIso, tessProgress);
+            auto rt1 = std::chrono::steady_clock::now();
+            std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
+                        prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
+                        toRender.size(), nThreads, g_showWindow ? " — live window" : "");
+            std::fflush(stdout);
+        };
+        if (!useGpuIso) {
+            ensurePrims();
+        } else {
+            std::printf("[raster] rendering %zu camera(s) on the GPU (primary-ray iso)%s\n",
+                        toRender.size(), g_showWindow ? " — live window" : "");
+            std::fflush(stdout);
+        }
 
         // GPU preview rasterizer (-device gpu|auto). Bake the world triangles + image skins
         // to the device ONCE (reused for every camera / flyby frame), then each frame runs the
@@ -4178,7 +4441,7 @@ static int run(int argc, char** argv) {
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && raster_cuda::available()) {
+            if (!useGpuIso && (wantGpu || wantAuto) && raster_cuda::available()) {
                 gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
                 if (gpuRaster)
                     std::printf("[raster] GPU rasterizer: frames on the GPU "
@@ -4196,6 +4459,14 @@ static int run(int argc, char** argv) {
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
+            // G2: cast primary rays straight at the implicit on the GPU (no tessellation).
+            // A physical-lens camera isn't covered by the pinhole/fisheye ray-gen, so it
+            // falls through to the tessellated path (built lazily on first need).
+            if (useGpuIso && !cam.hasLens()) {
+                std::vector<uint8_t> img =
+                    renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock);
+                if (!img.empty()) return img;
+            }
             if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
@@ -4203,6 +4474,7 @@ static int run(int argc, char** argv) {
                 if (!img.empty()) return img;
             }
 #endif
+            ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
                                        rasterSeeThrough, rasterClarity, &scene.textures);
         };
@@ -5555,6 +5827,23 @@ static int run(int argc, char** argv) {
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
                            preview, intervalSec, noiseTarget, wavefront, anchor);
         if (rv != 0) return rv;
+    }
+
+    // --- Stereoscopic compositing (-stereo): fuse each eye pair into the -o image ------
+    // Every eye rendered to its own PNG (sharing an exposure anchor for identical tone-
+    // mapping); combine them into the requested output (side-by-side or Dubois anaglyph),
+    // then delete the intermediate eye files (+ any .ftbuf) unless -stereo-keep-eyes.
+    if (!stereoPairs.empty() && !g_stopRequested) {
+        for (const StereoPair& sp : stereoPairs) {
+            if (!stereoComposite(stereoMode, sp.leftPath, sp.rightPath, sp.finalPath))
+                sharedWriteFail = true;
+            if (!stereoKeepEyes) {
+                std::remove(sp.leftPath.c_str());
+                std::remove(sp.rightPath.c_str());
+                std::remove((sp.leftPath  + ".ftbuf").c_str());
+                std::remove((sp.rightPath + ".ftbuf").c_str());
+            }
+        }
     }
     return sharedWriteFail ? 1 : 0;
 }

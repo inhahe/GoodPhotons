@@ -129,3 +129,17 @@ inline Spectrum rgbToReflectanceJH(double r, double g, double b) {
     std::array<double, 3> c = upsample::fit(r, g, b);
     return [c](double lambda) { return upsample::reflAt(c, lambda); };
 }
+
+// Reduce an arbitrary reflectance Spectrum to a linear-sRGB triple by integrating
+// it under D65 through the CIE observer (the same basis rgbToReflectanceJH inverts,
+// so the two round-trip). Used to interpolate colour stops in linear RGB. Not
+// clamped — the caller may lerp several of these before upsampling back.
+inline Vec3 reflectanceToLinearSrgbD65(const Spectrum& refl) {
+    const upsample::Basis& B = upsample::basis();
+    double X = 0, Y = 0, Z = 0;
+    for (int i = 0; i < B.N; ++i) {
+        double s = refl ? std::max(0.0, refl(B.lam[i])) : 0.0;
+        X += s * B.wX[i]; Y += s * B.wY[i]; Z += s * B.wZ[i];
+    }
+    return xyzToLinearSrgb({X, Y, Z});
+}
