@@ -952,15 +952,25 @@ stereo.
   interocular baseline direction.
 
 **Tasks:**
-- [ ] **I1 — off-axis stereo core.** Render the scene twice from two parallel, asymmetric-frustum eyes
-      offset along the camera right axis; share the auto-exposure anchor across the pair (as camera_path
-      does) so L/R tone-map identically. Works for stills and per-frame in movies.
-- [ ] **I2 — output modes.** Side-by-side **wall-eyed (L|R)** and **cross-eyed (R|L)**; **anaglyph**
-      compositing via the **Dubois matrix** (red-cyan default, green-magenta option). One CLI switch to
-      pick the mode.
-- [ ] **I3 — CLI + physical geometry.** `-stereo <mode>`, `-eye-sep <m>` (interocular), `-view-dist <m>`,
-      `-dpi <n>` (auto-detect default); compute baseline + convergence from viewing distance / interocular
-      / DPI. Document in README (stills + movies).
+- [x] **I1 — off-axis stereo core.** DONE. `Camera::frustumShiftX` (normalised off-axis shear) added and
+      applied consistently in `project()`/`genRay()`/`lensImage()` (rectilinear only) on both the CPU and the
+      GPU `DCamera` (photon splat, backward genRay, BDPT camera subpath). `-stereo` expands each rendered
+      camera into a Left/Right eye pair: two PARALLEL rectilinear cameras offset ±baseline/2 along the M13
+      right axis `u`, each with a sheared frustum so the convergence plane has zero parallax (no toe-in ⇒ no
+      vertical parallax). The pair shares one exposure group so both eyes — and, for an exposure-locked
+      camera_path, every frame — tone-map identically. Works for stills and per-frame movies, reusing the
+      whole render pipeline per eye (checkpoints/budgets/GPU/live window unchanged).
+- [x] **I2 — output modes.** DONE. Post-render `stereoComposite()` fuses each eye pair's PNGs into the `-o`
+      image: **side-by-side wall-eyed (L\|R)** (`sbs`), **cross-eyed (R\|L)** (`cross`), and **anaglyph** via
+      the **Dubois least-squares matrices** — **red-cyan** default (`anaglyph`), **green-magenta** option
+      (`anaglyph-gm`). Intermediate per-eye files are deleted afterwards (kept with `-stereo-keep-eyes`).
+- [x] **I3 — CLI + physical geometry.** DONE. `-stereo <mode>`, `-eye-sep <m>` (interocular, default 0.063),
+      `-view-dist <m>` (default 0.6), `-dpi <n|auto>`, `-convergence <m>` (scene units; default = look-at
+      target distance). Baseline/convergence are physical: screen width `W` comes from a measured `-dpi`
+      (`W = resX·0.0254/dpi`) or, by default, from the viewing distance × FOV (`W = 2·d·tanHalfX`); the
+      frustum shear `S = eyeSep/W` puts infinity at exactly interocular separation on screen (parallel gaze),
+      and the baseline `b = 2·C·tanHalfX·S` so that `b/C = eyeSep/W` (camera-to-subject ratio = eye-to-screen
+      ratio). `-dpi auto` reports the Windows *logical* DPI as a rough hint. Documented in README. **§I complete.**
 
 ---
 
@@ -1163,3 +1173,18 @@ stereo.
   {channel: value})` with channel names from the dataset when present. This is the object §E2 (curve
   vars → scene vars) and §F6 (viewer inspection) build on. 8 new tests (`tests/test_fieldcurve.py`); 597
   loom tests green. §H (multi-valued fields + interpolation + field-sampled curve) is now fully done.
+- 2026-07-19: **§I done — ftrace stereoscopic / anaglyph output.** Off-axis (asymmetric-frustum) 3-D output
+  for stills and movies. Engine: `Camera::frustumShiftX` (a normalised horizontal shear) added to camera.h
+  and applied consistently in `project()`/`genRay()`/`lensImage()` (rectilinear only) plus the GPU `DCamera`
+  mirror in render_cuda.cu (photon-splat project, backward `dGenRay`, BDPT camera subpath, lensImage) — 0 by
+  default so every non-stereo render stays byte-identical. `-stereo <sbs|cross|anaglyph|anaglyph-gm>` expands
+  each rendered camera into a Left/Right eye pair (two parallel cameras offset ±b/2 along the right axis `u`,
+  each sheared so the convergence plane has zero parallax — no toe-in, no vertical parallax), sharing one
+  exposure group so L/R (and every frame of an exposure-locked path) tone-map identically. Each eye rides the
+  full existing pipeline (checkpoints/budgets/GPU/live window); a post-pass `stereoComposite()` fuses the two
+  eye PNGs — side-by-side wall-eyed/cross-eyed or Dubois least-squares anaglyph (red-cyan default,
+  green-magenta option) — into the `-o` file and deletes the intermediates (kept with `-stereo-keep-eyes`).
+  Physical geometry: `-eye-sep`/`-view-dist`/`-dpi`/`-convergence` set screen width `W` (from dpi or
+  view-dist×FOV), shear `S = eyeSep/W` (infinity at interocular ⇒ parallel gaze), baseline `b = 2·C·tanHalfX·S`
+  (so camera:subject ratio = eye:screen ratio). README updated. Next §I candidates exhausted; roadmap: §F
+  (loom viewer) or §C2–C6 (VDB/mesh) remain, both large and unstarted.

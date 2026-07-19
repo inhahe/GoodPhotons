@@ -2906,3 +2906,11 @@ correctly on **both** backends.
   e.g. attach `procdump -ma -e` to the live PID, or `procdump -i -ma <dir>` (admin) to
   install a system postmortem catcher — then analyze `.dmp` (`!analyze -v`) to confirm
   whether it is `nvcuda`/driver teardown vs. app code.
+
+## FIXED (2026-07-19): `-n` ignored scientific notation (`-n 2e8` → 2 photons)
+`-n <count>` was parsed with `std::atoll`, which stops at the first non-digit — so the
+common shorthand `-n 2e8` / `-n 8e7` (used in README examples) silently parsed as just the
+leading integer (`2`, `8`), rendering a near-black image from a handful of photons. Fixed
+in `run()` (src/main.cpp): tokens containing `e`/`E`/`.` are now parsed as a double and
+rounded to the nearest count; plain integers still go through `atoll` exactly. Found while
+validating `-stereo`.

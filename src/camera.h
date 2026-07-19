@@ -82,6 +82,15 @@ struct Camera {
     double lensF     = 0.0;  // thin-lens focal length; 0 => no lens (straight-through
                              // camera obscura: blurred everywhere, no focus plane).
 
+    // Off-axis (asymmetric-frustum) horizontal shift, in normalised [-1,1] view units.
+    // Used ONLY by stereoscopic rendering: the two eyes are two PARALLEL cameras offset
+    // along the right axis u, each with a horizontally SHEARED frustum so a shared
+    // convergence plane has zero parallax (the correct off-axis method — no toe-in, so
+    // no vertical parallax / eye strain). project()/genRay()/lensImage() add this shift
+    // consistently so they remain exact inverses of one another. Rectilinear only;
+    // 0 (the default) keeps every non-stereo render byte-for-byte identical.
+    double frustumShiftX = 0.0;
+
     // Optional physical multi-element lens (the "mesh-lens" camera). When set, the
     // backward reference tracer (mode R) generates rays by tracing them from the film
     // out through the real glass interfaces (genLensRay), superseding the analytic
@@ -122,7 +131,7 @@ struct Camera {
         if (projection == CAM_RECTILINEAR) {
             if (cz <= 1e-9) return false;
             double cx = dot(d, u), cy = dot(d, v);
-            double ix = (cx / cz) / tanHalfX;   // [-1,1] in view
+            double ix = (cx / cz) / tanHalfX - frustumShiftX;   // [-1,1] in view (off-axis shear)
             double iy = (cy / cz) / tanHalfY;
             if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
             px = (int)((ix * 0.5 + 0.5) * film.resX);
@@ -192,7 +201,7 @@ struct Camera {
         double sx = 2.0 * ((px + jx) / (double)film.resX) - 1.0;
         double sy = 2.0 * ((py + jy) / (double)film.resY) - 1.0;
         if (projection == CAM_RECTILINEAR) {
-            Vec3 d = normalize(w + u * (sx * tanHalfX) + v * (sy * tanHalfY));
+            Vec3 d = normalize(w + u * ((sx + frustumShiftX) * tanHalfX) + v * (sy * tanHalfY));
             return Ray{eye, d};
         }
         // Fisheye/panoramic: the normalised film radius rho maps to a ray angle th.
@@ -281,7 +290,7 @@ struct Camera {
         Vec3 Fcenter = eye + nAxis * filmDist;               // film centre (= eye - w*filmDist)
         Vec3 Q = A + d * s;
         Vec3 rel = Q - Fcenter;
-        double ix = -dot(rel, u) / (filmDist * tanHalfX);    // un-invert real image
+        double ix = -dot(rel, u) / (filmDist * tanHalfX) - frustumShiftX;  // un-invert real image (off-axis shear)
         double iy = -dot(rel, v) / (filmDist * tanHalfY);
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * 0.5 + 0.5) * film.resX);

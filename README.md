@@ -1771,6 +1771,66 @@ which falls back to per-camera passes) so each draws its own photons.
 > (re-tracing the full sample budget per camera), so it costs the same as running them
 > one at a time. Only `A`, `B`, and `M` amortise the forward trace across cameras.
 
+### Stereoscopic 3-D (`-stereo`)
+
+`-stereo <mode>` turns any render — a still *or* every frame of a `camera_path` movie —
+into **3-D stereoscopic output**. Each selected camera is rendered **twice** (a Left and a
+Right eye) and the two images are fused into the `-o` file:
+
+- **`-stereo sbs`** — side-by-side **wall-eyed** (Left\|Right), for free-viewing or a
+  parallel-view stereoscope. Output is `2·resX` wide.
+- **`-stereo cross`** — side-by-side **cross-eyed** (Right\|Left), for the cross-your-eyes
+  free-viewing technique.
+- **`-stereo anaglyph`** — **red-cyan** glasses. Uses the **Dubois** least-squares colour
+  matrices (far less ghosting / retinal rivalry than a naïve channel split). Same
+  resolution as a mono render.
+- **`-stereo anaglyph-gm`** — **green-magenta** Dubois anaglyph.
+
+**Off-axis rig (why it's comfortable).** The two eyes are *parallel* cameras offset along
+the camera **right axis**, each with an **asymmetric (sheared) frustum** that shares a
+single **convergence plane**. This is the correct method: the naïve "toe-in" (rotating the
+two cameras to cross) introduces **vertical parallax** that causes eye strain, which the
+off-axis shear avoids entirely. The convergence plane is the depth that appears *at the
+screen* (zero parallax); objects nearer than it pop out toward you, farther objects recede
+behind the screen.
+
+**Physical geometry.** The baseline (eye separation in the scene) and convergence are
+derived from the real viewing setup, so the depth reads naturally:
+
+- **`-eye-sep <m>`** — your interocular distance (default `0.063` m).
+- **`-view-dist <m>`** — how far you sit from the screen (default `0.6` m).
+- **`-dpi <n|auto>`** — screen pixel density. Given a number, the screen's physical width
+  is `resX·0.0254/dpi`. `auto` reads the Windows *logical* system DPI (a rough hint). If
+  you omit `-dpi` (the default), the screen width is taken as the camera's horizontal field
+  seen at `-view-dist` (`W = 2·view-dist·tan(½·fovX)`).
+- **`-convergence <m>`** — the convergence-plane distance in **scene units** (default: the
+  camera's look-at target distance).
+
+From these the frustum shear is `S = eye-sep / screen-width` (so a point at **infinity**
+lands exactly one interocular apart on screen — parallel gaze, the comfortable far limit),
+and the baseline is `b = 2·convergence·tan(½·fovX)·S`. Equivalently `b/convergence =
+eye-sep/screen-width`: **the camera's separation relative to its subject equals your eyes'
+separation relative to the screen.** Because it's expressed as that ratio, the same flags
+give sensible depth at any scene scale.
+
+Both eyes share a single auto-exposure anchor, so Left and Right — and, for an
+**exposure-locked** `camera_path`, *every frame* — tone-map identically (no L/R brightness
+mismatch or stereo shimmer). Each eye rides the full render pipeline (checkpoints, budgets,
+GPU, the live `-window`), so nothing else about how you render changes. The intermediate
+per-eye PNGs are deleted after compositing unless you pass **`-stereo-keep-eyes`**.
+Rectilinear cameras only — a fisheye/panoramic camera renders mono with a warning.
+
+```
+# red-cyan anaglyph still, physical defaults, convergence on the look-at target
+ftrace -in scene.ftsl -mode B -n 2e8 -stereo anaglyph -o png/scene3d.png -keepwindow
+
+# wall-eyed side-by-side, wider baseline via an explicit near convergence plane
+ftrace -in scene.ftsl -mode B -n 2e8 -stereo sbs -convergence 1.5 -o png/scene_sbs.png -keepwindow
+
+# a whole exposure-locked flyby in green-magenta 3-D (one composite per frame)
+ftrace -in scene.ftsl -camera fly -stereo anaglyph-gm -o png/fly/fly.png
+```
+
 ### Animated geometry (OBJ sequences) → video
 
 Camera animation (above) moves the camera over **one static scene**. To animate the
@@ -1896,6 +1956,12 @@ alone can't restore, so they are not disk-resumable.
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
+| `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
+| `-eye-sep <m>` | Interocular (eye-to-eye) distance for `-stereo`, in metres. Default `0.063` (63 mm, average human). |
+| `-view-dist <m>` | Viewing distance (eye-to-screen) for `-stereo`, in metres. Default `0.6`. Used to derive the screen width (screen shows the camera's horizontal field at this distance) when `-dpi` isn't given. |
+| `-dpi <n\|auto>` | Screen pixel density for `-stereo`. With a number, screen width `= resX·0.0254/dpi`. `auto` reads the Windows **logical** system DPI (a rough hint — often 96; not the panel's physical pitch). Omit it (the default) to instead derive screen width from `-view-dist` × the camera FOV. |
+| `-convergence <m>` | Convergence-plane distance for `-stereo`, in **scene units** — the depth that lands at the screen (zero parallax); nearer objects pop out, farther recede. Default: the camera's **look-at target** distance. |
+| `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,

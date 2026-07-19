@@ -664,6 +664,7 @@ struct DCamera {
     // image radius at the vertical film edge (= dProjRadius(projection, halfFovY)).
     int    projection;
     double halfFovY, rEdge;
+    double frustumShiftX;   // off-axis stereo shear (normalised view units); 0 = on-axis
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
     // pinhole importance normalises by a single pixel's area (see camera.h). This
@@ -677,7 +678,7 @@ struct DCamera {
         if (projection == CAM_RECTILINEAR) {
             if (cz <= (Real)1e-9) return false;
             Real cx = dot(d, u), cy = dot(d, v);
-            Real ix = (cx / cz) / (Real)tanHalfX, iy = (cy / cz) / (Real)tanHalfY;
+            Real ix = (cx / cz) / (Real)tanHalfX - (Real)frustumShiftX, iy = (cy / cz) / (Real)tanHalfY;
             if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
             px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
             py = (int)((iy * (Real)0.5 + (Real)0.5) * resY);
@@ -752,7 +753,7 @@ struct DCamera {
         DVec3 Fcenter = eye + nAxis * (Real)filmDist;
         DVec3 Q = A + d * s;
         DVec3 rel = Q - Fcenter;
-        Real ix = -dot(rel, u) / (Real)(filmDist * tanHalfX);
+        Real ix = -dot(rel, u) / (Real)(filmDist * tanHalfX) - (Real)frustumShiftX;
         Real iy = -dot(rel, v) / (Real)(filmDist * tanHalfY);
         if (ix < -1 || ix >= 1 || iy < -1 || iy >= 1) return false;
         px = (int)((ix * (Real)0.5 + (Real)0.5) * resX);
@@ -3928,7 +3929,7 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
     double sy = 2.0 * ((py + jy) / (double)cam.resY) - 1.0;
     ro = cam.eye;
     if (cam.projection == CAM_RECTILINEAR) {
-        rd = normalize(cam.w + cam.u * (Real)(sx * cam.tanHalfX) + cam.v * (Real)(sy * cam.tanHalfY));
+        rd = normalize(cam.w + cam.u * (Real)((sx + cam.frustumShiftX) * cam.tanHalfX) + cam.v * (Real)(sy * cam.tanHalfY));
         return;
     }
     double rho = sqrt(sx * sx + sy * sy);
@@ -4497,7 +4498,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     Real jx = rng.uniform(), jy = rng.uniform();
     Real sx = (Real)2 * (((Real)px + jx) / (Real)cam.resX) - (Real)1;
     Real sy = (Real)2 * (((Real)py + jy) / (Real)cam.resY) - (Real)1;
-    DVec3 rd = normalize(cam.w + cam.u * (sx * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
+    DVec3 rd = normalize(cam.w + cam.u * ((sx + (Real)cam.frustumShiftX) * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
@@ -5661,6 +5662,7 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
     dc.resX = resX; dc.resY = resY;
     dc.apertureR = cam.apertureR; dc.filmDist = cam.filmDist; dc.lensF = cam.lensF;
     dc.projection = cam.projection; dc.halfFovY = cam.halfFovY; dc.rEdge = cam.rEdge;
+    dc.frustumShiftX = cam.frustumShiftX;   // off-axis stereo shear
 
     // Physical multi-element lens (mesh-lens camera). Bake each surface's sensor-side
     // index into an SPEC_N table (air => 1) so the std::function Spectrum stays host-
