@@ -1647,6 +1647,14 @@ extension), which ffmpeg concatenates into a video. Any flyby block may carry an
   field only in the physical catch modes `A`/`C`; in the pinhole splat `B` the aperture is
   virtual, so there `roll`/`fov`/`zoom` are the visible ones. Lens *projection*/fisheye is
   a discrete whole-flight mode, not a continuous track — set it once with `projection`.)
+  Any of these scalars can instead be driven by a **parametric record** (see *Parametric
+  records* below) with **`<name>_from RECORD.channel[(driver)]`** — the channel is sampled
+  over the flyby timeline, the optional driver defaults to the raw `t` and may be any
+  expression in `t` (`fov_from zoom.fov(t*t)` eases in), and the record's `interp`
+  (nearest/linear/smooth) shapes the curve. A record track overrides an `_at` track, which
+  overrides the constant; a linear record reproduces the matching linear `_at` keyframes
+  frame-for-frame. (The driver sees **only** `t` here — surface variables like `u`/`x` are
+  out of scope and error.)
 
 **`exposure_lock` — one shared auto-exposure across a whole path.** On any
 `camera_path`/`camera_orbit`/`camera_curve`, `exposure_lock` freezes a single

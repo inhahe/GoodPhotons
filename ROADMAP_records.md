@@ -183,15 +183,31 @@ struct Record {
      general rule that answers "can a light have a `from`?" — a light *may* carry a
      record ref, but only a constant one; a per-hit driver there is rejected because
      its variables aren't in scope, not because lights are special-cased.
-   - **5b — camera-curve `t`-driver (optional, gated on user go-ahead).** A second
-     varying context besides per-hit surface intrinsics: a `camera_curve` /
-     `camera_path` sweeps a flyby parameter `t`∈[0,1] as it expands into discrete
-     `CamSpec` frames at load time (paralleling the existing `ScalarTrack` keyframe
-     mechanism for roll/fov/zoom/fstop/focus). 5b would publish `t` as the in-scope
-     driver variable for camera-scalar sites so a record can drive fov/roll/zoom/
-     fstop/focus along the flyby (records-as-keyframe-tracks). Everything outside
-     these two varying contexts (per-hit surface; per-frame curve `t`) is load-time
-     constant and admits only the constant record forms from 5a.
+   - **5b — camera-curve `t`-driver (DONE).** A second varying context besides
+     per-hit surface intrinsics: a `camera_curve` / `camera_path` sweeps a flyby
+     parameter `t`∈[0,1] as it expands into discrete `CamSpec` frames at load time
+     (paralleling the existing `ScalarTrack` keyframe mechanism for roll/fov/zoom/
+     fstop/focus). 5b publishes `t` as the in-scope driver variable for camera-scalar
+     sites so a record can drive fov/roll/zoom/fstop/focus along the flyby
+     (records-as-keyframe-tracks). Syntax: `<scalar>_from RECORD.channel[(driver)]`
+     where `<scalar>` ∈ {`fov`,`roll`,`zoom`,`fstop`,`focus`}; the driver defaults to
+     the raw timeline `t` and may be any expression in `t` (e.g. `zoom.fov(t*t)` for
+     ease-in). A record track wins over an `_at` keyframe track, which wins over the
+     authored base constant. **Scope model (leak-free, one flag + `patternHasFreeVars`
+     reuse):** `t` is gated behind an `allowT` parameter that only camera `_from`
+     sites pass to `tokenize`/`compilePatternExpr`; surface/constant sites leave it
+     false so `t` hard-errors ("only in scope inside a camera_curve record track"),
+     and the driver is additionally checked with `patternHasFreeVars` to reject
+     surface vars ("only the flyby timeline `t` is in scope here"). The record stops
+     themselves must be constant (no surface vars). Camera scalars are consumed at
+     load time (baked into `CamSpec`), so this is CPU-only by construction — no GPU
+     path needed (`dPatternEval` carries a `VarT`→0 case only for exhaustiveness).
+     Validated frame-for-frame identical: `scenes/_cam5b_rec.ftsl` (`fov_from
+     zoom.fov`, a `60→30` linear record) vs `scenes/_cam5b_trk.ftsl` (`fov_at 0 60 /
+     fov_at 1 30` keyframe track) render bit-identical across all 5 flyby frames
+     (0.000%, max 0.0). Everything outside these two varying contexts (per-hit
+     surface; per-frame curve `t`) is load-time constant and admits only the constant
+     record forms from 5a.
 6. **GPU parity.** Upload the record LUTs + driver programs; device channel-sample
    mirroring the CPU path (bake like `ProcTexture`). Verify CPU/GPU bit/visual parity.
    Split into 6a/6b mirroring the 5a reflect/scalar split:

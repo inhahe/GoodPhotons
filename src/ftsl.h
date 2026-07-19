@@ -3788,6 +3788,98 @@ private:
         ScalarTrack focusTrk = readTrack("focus_at");
         if (!trkOk) return false;
 
+        // ---- Record-driven tracks (stage 5b) ---------------------------------------
+        // `<scalar>_from RECORD.channel[(<driver in t>)]` drives an animatable camera
+        // scalar from a parametric-record channel sampled over the flyby timeline t in
+        // [0,1] — the "records-as-keyframe-tracks" form: a named, reusable curve bank in
+        // place of hand-placed `<scalar>_at` keyframes. The driver defaults to the bare
+        // timeline `t` (so `fov_from zoom.fov` walks the channel start->end across the
+        // flight) but may be any expression in `t` (`fov_from zoom.fov(1-t)` reverses it,
+        // `(t*t)` eases in, …). `t` is the ONLY variable in scope here: a surface intrinsic
+        // (x/y/z/u/v/…) in the driver — or in the channel's stops — is an out-of-scope
+        // error. Record and `_at` track are mutually exclusive per scalar; a record wins.
+        struct RecTrack {
+            int recIdx = -1, chanIdx = -1;
+            std::vector<PatNode> driver;
+            bool active() const { return recIdx >= 0; }
+        };
+        bool recOk = true;
+        auto readRecTrack = [&](const char* key, RecTrack& rt) {
+            const Stmt* s = find(b, key);
+            if (!s || s->val.words.empty()) return;
+            // Rejoin the value tokens (a driver written with spaces, `zoom.fov(1 - t)`,
+            // splits across words); strip whitespace — the RECORD.channel head has none and
+            // the pattern compiler ignores it inside the driver.
+            std::string joined = s->val.words[0];
+            for (size_t k = 1; k < s->val.words.size(); ++k) joined += s->val.words[k];
+            std::string tok; for (char c : joined) if (!std::isspace((unsigned char)c)) tok += c;
+            std::string headChan = tok, dexpr = "t";       // default driver = the raw timeline
+            size_t lp = tok.find('(');
+            if (lp != std::string::npos) {
+                size_t rp = tok.rfind(')');
+                if (rp == std::string::npos || rp <= lp) {
+                    fail("camera_curve '" + base + "' " + key + " '" + tok + "': malformed `RECORD.channel(driver)`");
+                    recOk = false; return;
+                }
+                headChan = tok.substr(0, lp);
+                dexpr    = tok.substr(lp + 1, rp - lp - 1);
+            }
+            size_t dot = headChan.find('.');
+            if (dot == std::string::npos) {
+                fail("camera_curve '" + base + "' " + key + " needs `RECORD.channel[(driver)]`");
+                recOk = false; return;
+            }
+            std::string rname = headChan.substr(0, dot), chan = headChan.substr(dot + 1);
+            auto rit = recordIndex_.find(rname);
+            if (rit == recordIndex_.end()) {
+                fail("camera_curve '" + base + "' " + key + ": unknown record '" + rname + "'");
+                recOk = false; return;
+            }
+            const Record& rec = L.scene.records[(size_t)rit->second];
+            int ci = rec.channelIndex(chan);
+            if (ci < 0) {
+                fail("camera_curve '" + base + "' " + key + ": record '" + rname + "' has no channel '" + chan + "'");
+                recOk = false; return;
+            }
+            if (rec.channels[(size_t)ci].kind != ChanKind::Scalar) {
+                fail("camera_curve '" + base + "' " + key + ": channel '" + chan + "' is a colour channel, not scalar");
+                recOk = false; return;
+            }
+            for (const RecStop& st : rec.channels[(size_t)ci].stops)
+                if (patternHasFreeVars(st.expr)) {
+                    fail("camera_curve '" + base + "' " + key + ": channel '" + chan + "' has stop expressions with "
+                         "per-hit surface variables — only the flyby timeline `t` is in scope here");
+                    recOk = false; return;
+                }
+            std::vector<PatNode> drv; std::string cerr;
+            if (!compilePatternExpr(dexpr, drv, cerr, /*allowT=*/true)) {
+                fail("camera_curve '" + base + "' " + key + " driver '" + dexpr + "': " + cerr);
+                recOk = false; return;
+            }
+            if (patternHasFreeVars(drv)) {
+                fail("camera_curve '" + base + "' " + key + " driver '" + dexpr +
+                     "': references a surface variable — only the flyby timeline `t` is in scope here");
+                recOk = false; return;
+            }
+            rt.recIdx = rit->second; rt.chanIdx = ci; rt.driver = std::move(drv);
+        };
+        RecTrack fovRec, rollRec, zoomRec, fstopRec, focusRec;
+        readRecTrack("fov_from",   fovRec);
+        readRecTrack("roll_from",  rollRec);
+        readRecTrack("zoom_from",  zoomRec);
+        readRecTrack("fstop_from", fstopRec);
+        readRecTrack("focus_from", focusRec);
+        if (!recOk) return false;
+        // Sample a record track at timeline position `fr`: evaluate its driver (in t), then
+        // the record channel at that driven value. Stops are constant (checked above), so
+        // the PatCtx only needs `t`.
+        auto recSample = [&](const RecTrack& rt, double fr) -> double {
+            PatCtx c{}; c.t = fr;
+            double d = rt.driver.empty() ? fr : patternEval(rt.driver.data(), (int)rt.driver.size(), c);
+            const Record& rec = L.scene.records[(size_t)rt.recIdx];
+            return recSampleScalar(rec, rec.channels[(size_t)rt.chanIdx], d, c);
+        };
+
         // Base (constant) values a track falls back to and that the whole-flight optics
         // were derived from. Captured from the same keywords readFilmExposure consumed so
         // per-frame re-derivation starts from the authored baseline (never double-applies).
@@ -3798,9 +3890,11 @@ private:
         double baseFstop  = dblOf(b, "fstop", 0.0);
         double hmm        = (shared.filmH_mm > 0.0) ? shared.filmH_mm : 24.0;
         double baseFocus  = shared.focus;   // metres (Len-scaled)
-        bool haveRoll   = rollTrk.active() || find(b, "roll");
+        bool haveRoll   = rollTrk.active() || find(b, "roll") || rollRec.active();
         bool haveOptics = fovTrk.active() || zoomTrk.active() ||
-                          fstopTrk.active() || focusTrk.active();
+                          fstopTrk.active() || focusTrk.active() ||
+                          fovRec.active() || zoomRec.active() ||
+                          fstopRec.active() || focusRec.active();
         const double DEG = 3.141592653589793 / 180.0;
 
         bool pathLock = parseExposureLock(b, shared);
@@ -3932,10 +4026,13 @@ private:
             // cs starts as `shared`, so restore its aperture before re-deriving in case a
             // static f-stop had already set it (a live fstop track will overwrite it).
             if (haveOptics) {
-                double fov = fovTrk.sample(fr, baseFovDeg);
-                double zm  = zoomTrk.sample(fr, baseZoom);
-                double fs  = fstopTrk.sample(fr, baseFstop);
-                double fo  = focusTrk.active() ? Len(focusTrk.sample(fr, 0.0)) : baseFocus;
+                // Per scalar: a record track (5b) wins over an `_at` keyframe track, which
+                // wins over the authored base constant.
+                double fov = fovRec.active()   ? recSample(fovRec,   fr) : fovTrk.sample(fr, baseFovDeg);
+                double zm  = zoomRec.active()  ? recSample(zoomRec,  fr) : zoomTrk.sample(fr, baseZoom);
+                double fs  = fstopRec.active() ? recSample(fstopRec, fr) : fstopTrk.sample(fr, baseFstop);
+                double fo  = focusRec.active() ? Len(recSample(focusRec, fr))
+                                               : (focusTrk.active() ? Len(focusTrk.sample(fr, 0.0)) : baseFocus);
                 cs.aperture = shared.aperture;
                 cs.focus    = fo;
                 deriveCameraOptics(cs, fov, baseLensMM, zm, fs, hmm, fo);
@@ -3943,7 +4040,7 @@ private:
             // Per-frame roll: bank `up` about the view direction (Rodrigues). Applied after
             // look so the axis is the final view ray; starts from the authored `up`.
             if (haveRoll) {
-                double rollDeg = rollTrk.sample(fr, rollConst);
+                double rollDeg = rollRec.active() ? recSample(rollRec, fr) : rollTrk.sample(fr, rollConst);
                 Vec3 w = cs.look - cs.eye;
                 if (length(w) > 1e-12)
                     cs.up = rotateAboutAxis(shared.up, normalize(w), rollDeg * DEG);

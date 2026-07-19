@@ -1006,7 +1006,39 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
 
 `closed` loops the curve (wrap-around Catmull-Rom, sampled i/N so frame N == frame 0);
 an open curve spans both endpoints via i/(N−1). All frames share
-up/fov/mode/film/lens; `exposure_lock` shares the frame-0 exposure anchor.
+up/mode/film; `exposure_lock` shares the frame-0 exposure anchor.
+
+**Animated camera scalars.** `fov`, `roll`, `zoom`, `fstop` and `focus` may vary along
+the flyby as a function of the normalized timeline `t ∈ [0,1]` (`t=0` at the first
+frame, `t=1` at the last). Two mechanisms, both keyed on `t`:
+
+- **Keyframe track — `<scalar>_at <t> <value>`** (repeatable): piecewise-linear
+  interpolation between keyframes, e.g. `fov_at 0 60   fov_at 1 30` sweeps the field of
+  view 60°→30° across the flyby. Also `roll_at`, `zoom_at`, `fstop_at`, `focus_at`.
+- **Record track — `<scalar>_from RECORD.channel[(driver)]`**: drive the scalar from a
+  parametric [`record`](#75-record--parametric-slot-luts) channel (records-as-keyframe-
+  tracks). The channel is sampled at the driver, which defaults to the raw timeline `t`
+  and may be any expression **in `t`** — e.g. `fov_from zoom.fov` (linear over `t`) or
+  `fov_from zoom.fov(t*t)` (ease-in). The record's own `interp` (nearest/linear/smooth)
+  controls the curve shape, so `smooth` gives eased motion for free. The record's stops
+  must be constant (no per-hit surface variables), and the driver may reference **only**
+  `t` — surface variables like `u`/`x`/`noise` are out of scope here and error.
+
+Precedence per scalar: a `_from` record track wins over an `_at` keyframe track, which
+wins over the authored base constant (`fov_y`, `roll`, etc.). A linear record track is
+exactly equivalent to the matching linear `_at` keyframes — e.g. `fov_from zoom.fov`
+with
+
+```
+zoom = range 0-1 [
+    fov 60 30
+    interp linear
+]
+```
+
+renders frame-for-frame identical to `fov_at 0 60   fov_at 1 30`. These camera scalars
+are baked into each frame at load time, so record camera tracks work in every render
+mode (no GPU restriction).
 
 ---
 

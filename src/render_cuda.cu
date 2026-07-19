@@ -2854,6 +2854,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
             case PatOp::VarR:     st[sp++] = r;  break;
             case PatOp::VarU:     st[sp++] = u;  break;
             case PatOp::VarV:     st[sp++] = v;  break;
+            case PatOp::VarT:     st[sp++] = 0.0; break;  // flyby timeline: never in scope on-device (camera_curve exprs are consumed at load)
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
             case PatOp::Sqrt:     st[sp-1] = sqrt(fmax(0.0, st[sp-1])); break;
