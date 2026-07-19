@@ -10,6 +10,27 @@ Origin tags point at the authoritative design text for each item.
 
 ---
 
+## NEXT UP — unify element headers to `name = KIND { … }` (do before the ftrace grammar port)
+
+- [ ] **Switch the whole scene grammar + loom emitters to `name = KIND { … }` (and anonymous `KIND { … }`).**
+      *(User-approved 2026-07-19; do this next.)* Replace the inconsistent `KIND "name" { … }` headers
+      (`camera "cam" {…}`, `material "gold" {…}`, `texture "hide" {…}`, `light … {…}`) with a single binding
+      shape: **`hero = camera { … }`**, **`gold = material { … }`**, **`hide = texture { … }`**, with the
+      **anonymous** form just dropping `name =` (`camera { … }`, a nameless light, etc.). Records already use this
+      shape (`NAME = range LO-HI [ … ]`), so they fold in as the `range` kind — the entire grammar collapses to
+      `binding = (NAME '=')? KIND block`. Reads like assignment and makes anonymity natural.
+      **Why now:** we're about to freeze the shared `ftsl.epeg` grammar into ftrace's C++ front-end (J3c option-a),
+      so change loom's emitters (`scene.py` `emit`) **and** the shared grammar + reader **in lockstep**, once, so both
+      sides adopt the new header together and we never ship two spellings into the C++ parser. **Scope:** (1) loom
+      `Element.emit` for camera/material/texture/light (+ any other named block); (2) `ftsl.epeg` element rules +
+      `reader.py` builders (name now optional, kind after `=`); (3) update `test_grammar_*` samples + any golden
+      `.ftsl` fixtures; (4) decide the migration story for existing hand-authored `.ftsl` (support both during a
+      transition, or a one-shot converter — TBD). Breaking change to emitted `.ftsl`, but pre-freeze is the cheapest
+      moment. *(Design detail also mirrored in the J3c "PROPOSAL" bullet below; this NEXT-UP entry is the actionable
+      one.)*
+
+---
+
 ## 0. Parametric records — FTSL data structure  *(design locked; full spec in `ROADMAP_records.md`)*
 
 A named record over a scalar domain whose channels are named after real material slots,
