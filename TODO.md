@@ -12,8 +12,8 @@ Origin tags point at the authoritative design text for each item.
 
 ## NEXT UP — unify element headers to `name = KIND { … }` (do before the ftrace grammar port)
 
-- [ ] **Switch the whole scene grammar + loom emitters to `name = KIND { … }` (and anonymous `KIND { … }`).**
-      *(User-approved 2026-07-19; do this next.)* Replace the inconsistent `KIND "name" { … }` headers
+- [~] **Switch the whole scene grammar + loom emitters to `name = KIND { … }` (and anonymous `KIND { … }`).**
+      *(User-approved 2026-07-19; in progress.)* Replace the inconsistent `KIND "name" { … }` headers
       (`camera "cam" {…}`, `material "gold" {…}`, `texture "hide" {…}`, `light … {…}`) with a single binding
       shape: **`hero = camera { … }`**, **`gold = material { … }`**, **`hide = texture { … }`**, with the
       **anonymous** form just dropping `name =` (`camera { … }`, a nameless light, etc.). Records already use this
@@ -28,6 +28,17 @@ Origin tags point at the authoritative design text for each item.
       transition, or a one-shot converter — TBD). Breaking change to emitted `.ftsl`, but pre-freeze is the cheapest
       moment. *(Design detail also mirrored in the J3c "PROPOSAL" bullet below; this NEXT-UP entry is the actionable
       one.)*
+      **Migration story DECIDED:** ftrace's hand-written C++ parser **accepts both spellings** during the transition
+      (`KIND "name" {…}` and `name = KIND {…}`); loom + the shared grammar hard-switch to the new form; old-form C++
+      support is dropped once the shared grammar is ported into ftrace's front-end. This keeps the pipeline green at
+      every commit.
+      **Progress (2026-07-19, v0.9.1):** *Increment 1 — ftrace C++ accept-both — DONE & verified.* `parseOneTopBlock`
+      now parses `NAME = KIND { … }` alongside `NAME = range …` and legacy `KIND "name" {…}`; the light subtype falls
+      back to a `kind` property when no bareword subtype is present (`sun = light { kind sphere … }`), at both the
+      top-level and group-nested dispatch sites. Validated by rendering both `scraps/newform_test.ftsl` and
+      `scraps/oldform_test.ftsl`. *Remaining — Increment 2:* flip loom emitters (`scene.py`/`iso.py`/`material.py`),
+      the shared `ftsl.epeg` + `reader.py` builders (light kind as a property), and the `test_grammar_*`
+      samples/fixtures, then run the loom suite green.
 
 - [ ] **DECISION — color-vector / array syntax (locked in conversation 2026-07-19).** How numbers, commas,
       brackets, and colorspace keywords (`rgb`/`hsl`/`hsv`) group into colors and lists of colors. Settled model,

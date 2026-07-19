@@ -303,13 +303,29 @@ struct Parser {
         // by a bare first word immediately followed by '=' then `range` — spectrum uses
         // a *quoted* name before '=', so there is no collision.
         if (is(Tok::Word) && cur().text == "=") {
-            std::string name = b.type;
+            std::string name = b.type;   // the leading bare word is the binding NAME
             adv();  // consume '='
             if (is(Tok::Word) && cur().text == "range") {
                 adv();  // consume 'range'
                 return parseRecord(b, name);
             }
-            fail("unknown '=' declaration '" + name + "' (expected `= range`)");
+            // Unified element header `NAME = KIND { ... }` (the loom-emitted form):
+            // the word after '=' is the block KIND (material/texture/camera/light/
+            // isosurface/pattern/geometry) and NAME is its name. Body parses exactly
+            // like the legacy `KIND "name" { ... }`. Accepted alongside the legacy
+            // spelling during the grammar transition (J3c); one spelling once ftrace's
+            // front-end is ported from the shared grammar.
+            if (is(Tok::Word)) {
+                b.type = cur().text; adv();          // KIND
+                b.name = name;
+                // Optional bareword subtype (`sun = light point { }`); the new grammar
+                // prefers a `kind` property instead, but accept both here.
+                if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
+                if (!is(Tok::LBrace)) { fail("expected '{' after `" + name + " = " + b.type + "`"); return false; }
+                parseBraceBody(b);
+                return true;
+            }
+            fail("unknown '=' declaration '" + name + "' (expected `= range` or `= KIND { ... }`)");
             return false;
         }
         if (is(Tok::String)) { b.name = cur().text; adv(); }
@@ -2298,7 +2314,7 @@ private:
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
             else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
             else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
-            else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
+            else if (s.key == "light")    { if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
             else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, light, group)"); return false; }
         }
@@ -2636,8 +2652,13 @@ private:
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
-    bool addLight(const Block& b, Loaded& L, const std::string& subtype,
+    bool addLight(const Block& b, Loaded& L, std::string subtype,
                   const Affine& xf = Affine::identity()) {
+        // New unified header form `NAME = light { kind <subtype>  ... }` carries the
+        // light subtype in a `kind` property rather than a bareword after the KIND.
+        // When no bareword subtype was parsed (empty), fall back to the property.
+        // Old default point/area lights have no `kind`, so they stay empty as before.
+        if (subtype.empty()) subtype = strOf(b, "kind", "");
         Spectrum spd = spectrumParam(b, "spd", blackbody(6500.0));
         // Uniform scale of the enclosing group chain (spheres/pencils scale by it;
         // a non-uniform scale is only meaningful for the flat quad/mesh emitters).
