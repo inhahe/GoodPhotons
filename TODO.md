@@ -1162,10 +1162,17 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
   time, e.g. a wave whose phase lags with distance `field.at(t = T − X/c)`. Two things to get right when building
   it: (1) **cache** — `Cache` keys on `(node_id, frame)` and assumes one-`t`-per-node-per-frame; a retime node
   must key its child's memo on the actual (continuous) sample point, or scope a nested cache — do NOT restrict
-  off-current-`t` sampling (that would defeat the feature). (2) **cycles** — pure-function DAGs are acyclic so
-  any `t` (past OR future) is safe today; the acyclicity guard only becomes necessary if/when a *recurrent/stateful*
-  node exists (integrator, feedback delay, physics step), and then it's a **cycle check on the recurrence**, not a
-  blanket "no future `t`" rule.
+  off-current-`t` sampling (that would defeat the feature). (2) **cycles — two distinct guards, don't conflate.**
+  (2a) The **plain structural DAG cycle check already exists and is already enforced**: `detect_signal_cycle`
+  (`signals/core.py`, 3-color DFS on `.id`/`.children()`) raises `SignalCycleError` before every render
+  (`canvas.py`, `scene.py`), so a bad graph fails loudly instead of hanging/stack-overflowing — nothing to add,
+  and it stays first-line. (It's effectively defensive today since Signals are immutable/bottom-up so a structural
+  knot can't be tied through the API.) (2b) The **temporal-causality guard is the separate, deferred one**: a
+  recurrent node (`v(t)=f(v(t−dt))`) is *structurally* a self-reference legitimately broken by a strict delay.
+  Design so instantaneous edges stay in `.children()` (structural check owns them; a zero-delay algebraic loop =
+  error, unchanged) and the recurrent/delayed edge is a **distinct edge kind** the structural check ignores and a
+  new causality validator checks: "every path around a recurrence must cross ≥1 strict delay." Only ships with
+  the first recurrent node.
 
 ---
 
