@@ -735,18 +735,22 @@ class Scene:
         self.spectral = spectral
         self.textures: List[Element] = []
         self.patterns: List[Element] = []
+        self.records: List[Element] = []
         self.materials: List[Material] = []
         self.elements: List[Element] = []
         self.lights: List[Light] = []
 
     def add(self, *elems: Element) -> "Scene":
+        from .record import Record as _Record  # lazy: record.py imports scene.Element
         for e in elems:
-            # Textures/patterns are emitted before the materials that bind them
-            # (ftrace resolves them in an earlier pass, but keep the text tidy).
+            # Textures/patterns/records are emitted before the materials that bind
+            # them (ftrace resolves them in an earlier pass, but keep the text tidy).
             if isinstance(e, (Texture, ProcTexture)):
                 self.textures.append(e)
             elif isinstance(e, Pattern):
                 self.patterns.append(e)
+            elif isinstance(e, _Record):
+                self.records.append(e)
             elif isinstance(e, Material):
                 self.materials.append(e)
             elif isinstance(e, Light):
@@ -756,8 +760,8 @@ class Scene:
         return self
 
     def _all_elements(self) -> List[Element]:
-        return [*self.textures, *self.patterns, *self.materials, *self.elements,
-                *self.lights, self.camera]
+        return [*self.textures, *self.patterns, *self.records, *self.materials,
+                *self.elements, *self.lights, self.camera]
 
     def check_cycles(self) -> None:
         """Run the loop detector over every modulator in the scene."""
@@ -778,6 +782,10 @@ class Scene:
         for p in self.patterns:
             blocks.append(p.emit(ctx))
         if self.patterns:
+            blocks.append("")
+        for rec in self.records:
+            blocks.append(rec.emit(ctx))
+        if self.records:
             blocks.append("")
         for m in self.materials:
             blocks.append(m.emit(ctx))

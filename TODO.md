@@ -1058,13 +1058,17 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
   is). This maps cleanly onto loom, whose `Signal`/`VecSignal` + `Grid`/`Scatter` already carry
   scalar-or-vector-of-any-dim values — so the loom record twin (J3a) is arbitrary-arity by construction.
 
-- [ ] **J3a — loom record type mirroring the FTSL record.** Named channels, each an **arbitrary-arity**
-      curve (scalar or `D`-vector; `Signal`/`VecSignal`-valued), positioned (`p:`-pinned) stops with even
-      redistribution, per-record `interp nearest|linear|smooth` (monotone-cubic = Fritsch–Carlson),
-      expression stops, colour/spectrum stops (linear-RGB lerp → JH on the `D=3` Colour channels). Emit the
-      `NAME = range LO-HI [ … ]` block **and** parse one back; round-trip test against
-      `scenes/_record_*.ftsl`. (ftrace only materializes `D∈{1,3}`; loom carries all arities — emitting a
-      non-{1,3} channel is a loom-superset / J3b concern.)
+- [x] **J3a — loom record type mirroring the FTSL record.** **DONE.** `loom/record.py` — `Record`
+      (`Element`) + `RecordChannel` + `RecordStop`. Named channels (scalar `D=1` numeric/expression stops
+      or colour `D=3` `spectrum:`/`metal:`/`rgb:` refs; homogeneity enforced), positioned (`p:`-pinned)
+      stops with even redistribution (`_redistribute` ports ftrace `redistributeStops`), per-record
+      `interp nearest|linear|smooth`. **Emit** the `NAME = range LO-HI [ … ]` block (routed through `Scene`
+      before materials); **`Record.parse`/`parse_all`** read one/every record block back out of `.ftsl`
+      text (comment-stripped). **`Record.sample(channel, d)`** numeric sampler mirrors `recSampleScalar`
+      (Fritsch–Carlson monotone cubic for `smooth`) for all-numeric scalar channels; colour/expression
+      stops are re-emitted faithfully but not evaluated (needs the pattern VM → J3c). Round-trips every
+      `scenes/_record_*.ftsl` fixture. 23 tests (`tests/test_record.py`); 627 loom green. (ftrace only
+      materializes `D∈{1,3}`; non-{1,3} arities are the loom superset / J3b.)
 - [ ] **J3b — loom N-D superset** (loom-only authoring: N-D *input* domain and/or non-{1,3} channel arities;
       emits down to the J3a form or a documented construct).
 - [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
@@ -1077,6 +1081,14 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **§J3a done.** Built `loom/record.py` — a loom twin of the FTSL parametric record
+  (`Record`/`RecordChannel`/`RecordStop`). Emits the `NAME = range LO-HI [ … ]` block (wired into `Scene`
+  before materials), parses one/every block back (`parse`/`parse_all`, comment-stripped), redistributes
+  unpinned stops and numerically samples all-numeric scalar channels (nearest/linear/smooth = Fritsch–
+  Carlson) exactly as ftrace's `recSampleScalar`. Round-trips every `scenes/_record_*.ftsl` fixture.
+  Colour + expression stops re-emit faithfully but aren't evaluated (pattern VM → J3c). 23 new tests, 627
+  loom green. Exported from `loom/__init__`; documented in loom `DESIGN.md` §8a. Next: J3b (N-D superset)
+  or J3c (full-scene `.ftsl` parser) — or §J2 (placed isosurfaces + Room).
 - 2026-07-19: **Generalized the record output-arity spec.** User observed `.ftsl` records already carry
   arbitrary per-row output dimensionality (an `rgb` channel is a series of 3-tuples living alongside a
   scalar reflectance/roughness curve). Formalized in `ROADMAP_records.md` §3: a channel outputs an

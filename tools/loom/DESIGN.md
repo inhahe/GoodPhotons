@@ -243,6 +243,25 @@ over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property an
 - **Serialize / round-trip** the whole model (JSON). This is the discipline that keeps
   "GUI as add-on" cheap: the GUI is just another reader/writer of this format.
 
+### 8a. Parametric records (`Record`) — a loom twin of the FTSL record
+A **`Record`** (`record.py`) mirrors ftrace's parametric record (`src/record.h`,
+`ROADMAP_records.md`): a bank of named per-channel curves over a shared scalar driver
+domain `[lo, hi]`, sampled `nearest`/`linear`/`smooth`. Each **channel** is named
+after a destination slot and holds ordered **stops**; a channel is either *scalar*
+(`D==1`; numeric-literal or pattern-expression stops) or *colour* (`D==3`;
+`spectrum:`/`metal:`/`rgb:` refs) — the two arities ftrace materializes today. Stops
+carry a raw `token` (preserved verbatim) and an optional `p:<pos>` pin; unpinned stops
+redistribute evenly between anchors exactly as ftrace does.
+- **Emit** produces the `NAME = range LO-HI [ … ]` block (routed through `Scene`
+  before the materials that bind it); **`Record.parse` / `parse_all`** read one (or
+  every) record block back out of `.ftsl` text — the round-trip that lets loom *copy*
+  an existing scene's records (J3a; round-tripped against `scenes/_record_*.ftsl`).
+- **`Record.sample(channel, d)`** is a numeric sampler (Fritsch–Carlson monotone cubic
+  for `smooth`) for all-numeric scalar channels; colour and *expression* stops are
+  represented and re-emitted faithfully but not evaluated (that needs the pattern VM —
+  deferred to the full-scene parser, J3c). Higher channel arities are the loom-only
+  superset (J3b).
+
 ---
 
 ## 9. Layer 6 — Drivers / IO
@@ -279,6 +298,7 @@ tools/loom/
     sweep.py                sweep engine + frame field + 4 presets (new)
     iso.py                  isosurface + N-D slicer emit (new)
     material.py             function-driven material emit (new)
+    record.py               parametric record twin: emit + parse + sample (J3a)
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
