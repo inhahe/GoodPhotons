@@ -266,33 +266,71 @@ class TrackedCurve:
 # vector field pays for the domain math exactly once per frame, then reuses the
 # weights across every channel.
 
-def _cell_base_frac(grid: Grid, axis: int, coord: float) -> Tuple[int, float]:
+_GRID_OUTSIDE = frozenset(("clamp", "raise", "wrap"))
+_GRID_OOB_TOL = 1e-9
+
+
+def _parse_on_outside(on_outside: str) -> str:
+    """Validate a Grid out-of-domain policy name (``clamp``/``raise``/``wrap``)."""
+    key = str(on_outside).lower()
+    if key not in _GRID_OUTSIDE:
+        raise ValueError(f"unknown on_outside {on_outside!r}; "
+                         f"choose from {sorted(_GRID_OUTSIDE)}")
+    return key
+
+
+def _cell_base_frac(grid: Grid, axis: int, coord: float,
+                    on_outside: str = "clamp") -> Tuple[int, float]:
     """Lower cell index ``i`` and in-cell fraction ``f in [0,1]`` for ``coord`` on
-    ``axis``.  Out-of-domain coords clamp to the boundary cell (edge-extend)."""
+    ``axis``.
+
+    ``on_outside`` picks the out-of-domain behaviour: ``"clamp"`` (default) pins to
+    the boundary cell (edge-extend); ``"raise"`` errors past the domain; ``"wrap"``
+    folds the coordinate periodically (period ``hi-lo``, so sample ``n-1`` aliases
+    sample ``0`` — the stencil index wrap is applied by the callers)."""
     n = grid.shape[axis]
     lo, hi = grid.lo[axis], grid.hi[axis]
-    p = (coord - lo) / (hi - lo) * (n - 1) if hi != lo else 0.0
+    if hi == lo:
+        return 0, 0.0
+    p = (coord - lo) / (hi - lo) * (n - 1)
+    if on_outside == "wrap":
+        span = n - 1
+        p -= math.floor(p / span) * span          # fold into [0, n-1)
+        i = int(math.floor(p))
+        if i >= span:                              # numerical guard at the seam
+            return 0, 0.0
+        return i, p - i
     if p <= 0.0:
+        if on_outside == "raise" and p < -_GRID_OOB_TOL:
+            raise ValueError(f"grid query {coord} is below axis {axis} domain "
+                             f"[{lo}, {hi}] (on_outside='raise')")
         return 0, 0.0
     if p >= n - 1:
+        if on_outside == "raise" and p > (n - 1) + _GRID_OOB_TOL:
+            raise ValueError(f"grid query {coord} is above axis {axis} domain "
+                             f"[{lo}, {hi}] (on_outside='raise')")
         return n - 2, 1.0
     i = int(math.floor(p))
     return i, p - i
 
 
-def _catmull_rom_axis(grid: Grid, axis: int, coord: float) -> List[Tuple[int, float]]:
+def _catmull_rom_axis(grid: Grid, axis: int, coord: float,
+                      on_outside: str = "clamp") -> List[Tuple[int, float]]:
     """1-D Catmull-Rom contributions ``(sample_index, weight)`` on one axis.
 
     Four samples at offsets ``-1,0,+1,+2`` around the cell.  Weights sum to 1 but may
-    be negative (the overshoot that gives cubic its snap).  A phantom point off the
-    end of the axis is **linearly extrapolated** (``p[-1] = 2·p0 − p1``), folding its
-    weight back onto the two edge samples — this keeps the boundary reproducing linear
-    ramps exactly, unlike a plain edge-clamp.  Axes with < 3 samples fall back to
-    linear (can't form the 4-point stencil)."""
+    be negative (the overshoot that gives cubic its snap).  Off the end of the axis the
+    ``on_outside`` policy applies: ``"clamp"``/``"raise"`` **linearly extrapolate** a
+    phantom point (``p[-1] = 2·p0 − p1``), folding its weight back onto the two edge
+    samples — this keeps the boundary reproducing linear ramps exactly, unlike a plain
+    edge-clamp; ``"wrap"`` folds the stencil index periodically (index ``n-1`` aliases
+    ``0``).  Axes with < 3 samples fall back to linear (can't form the 4-point
+    stencil)."""
     n = grid.shape[axis]
-    i, f = _cell_base_frac(grid, axis, coord)
+    i, f = _cell_base_frac(grid, axis, coord, on_outside)
     if n < 3:
-        return [(i, 1.0 - f), (i + 1, f)]
+        i1 = (i + 1) % (n - 1) if on_outside == "wrap" else i + 1
+        return [(i, 1.0 - f), (i1, f)]
     f2 = f * f
     f3 = f2 * f
     w = (0.5 * (-f3 + 2.0 * f2 - f),
@@ -304,7 +342,10 @@ def _catmull_rom_axis(grid: Grid, axis: int, coord: float) -> List[Tuple[int, fl
         if wj == 0.0:
             continue
         idx = i + off
-        if idx < 0:                     # phantom below 0: 2·p0 − p1
+        if on_outside == "wrap":        # periodic: n-1 aliases 0
+            k = idx % (n - 1)
+            acc[k] = acc.get(k, 0.0) + wj
+        elif idx < 0:                   # phantom below 0: 2·p0 − p1
             acc[0] = acc.get(0, 0.0) + 2.0 * wj
             acc[1] = acc.get(1, 0.0) - wj
         elif idx > n - 1:               # phantom above n-1: 2·p_{n-1} − p_{n-2}
@@ -316,19 +357,22 @@ def _catmull_rom_axis(grid: Grid, axis: int, coord: float) -> List[Tuple[int, fl
 
 
 def _grid_weights(grid: Grid, coords: Tuple[float, ...],
-                  cubic: bool = False) -> List[Tuple[int, float]]:
+                  cubic: bool = False, on_outside: str = "clamp"
+                  ) -> List[Tuple[int, float]]:
     """Separable interpolation weights for ``coords``: ``(flat_index, weight)`` list.
 
     ``cubic=False`` (default) is N-linear (2^ndim corners); ``cubic=True`` is
-    separable **Catmull-Rom** (up to 4^ndim taps, weights may be negative).  Both
-    edge-extend outside the domain and drop zero-weight taps.
+    separable **Catmull-Rom** (up to 4^ndim taps, weights may be negative).
+    ``on_outside`` selects the out-of-domain behaviour (``clamp``/``raise``/``wrap``,
+    see :func:`_cell_base_frac`).  Zero-weight taps are dropped.
     """
+    wrap = (on_outside == "wrap")
     if not cubic:
         # fast N-linear path (kept dedicated for the common default).
         base: List[int] = []
         fracs: List[float] = []
         for axis in range(grid.ndim):
-            i, f = _cell_base_frac(grid, axis, coords[axis])
+            i, f = _cell_base_frac(grid, axis, coords[axis], on_outside)
             base.append(i)
             fracs.append(f)
         out: List[Tuple[int, float]] = []
@@ -337,7 +381,10 @@ def _grid_weights(grid: Grid, coords: Tuple[float, ...],
             idx: List[int] = []
             for axis in range(grid.ndim):
                 bit = (corner >> axis) & 1
-                idx.append(base[axis] + bit)
+                k = base[axis] + bit
+                if wrap:                       # periodic: n-1 aliases 0
+                    k %= (grid.shape[axis] - 1)
+                idx.append(k)
                 w *= fracs[axis] if bit else (1.0 - fracs[axis])
             if w == 0.0:
                 continue
@@ -346,7 +393,7 @@ def _grid_weights(grid: Grid, coords: Tuple[float, ...],
     # cubic: tensor product of per-axis Catmull-Rom contributions.
     combos: List[Tuple[List[int], float]] = [([], 1.0)]
     for axis in range(grid.ndim):
-        contrib = _catmull_rom_axis(grid, axis, coords[axis])
+        contrib = _catmull_rom_axis(grid, axis, coords[axis], on_outside)
         combos = [(idxs + [ci], w * cw)
                   for idxs, w in combos for ci, cw in contrib]
     return [(grid.flat_index(idxs), w) for idxs, w in combos if w != 0.0]
@@ -403,12 +450,15 @@ class GridField(Signal):
 
     Query rank must equal the grid's ndim.  ``interp`` selects the kernel:
     ``"linear"`` (default, separable N-linear) or ``"cubic"`` (separable
-    Catmull-Rom / tricubic — smoother, C1, may overshoot).  Out-of-domain queries
-    are clamped to the boundary cell (edge-extend).  For a vector-valued grid use
-    :class:`VecGridField`.
+    Catmull-Rom / tricubic — smoother, C1, may overshoot).  ``on_outside`` picks the
+    out-of-domain policy: ``"clamp"`` (default, edge-extend), ``"raise"`` (error past
+    the domain — the guard you want when a curve must stay inside the box), or
+    ``"wrap"`` (periodic fold, apt for a triply-periodic field like a gyroid).  For a
+    vector-valued grid use :class:`VecGridField`.
     """
 
-    def __init__(self, grid: Grid, query: Vecish, *, interp: str = "linear") -> None:
+    def __init__(self, grid: Grid, query: Vecish, *, interp: str = "linear",
+                 on_outside: str = "clamp") -> None:
         super().__init__()
         self.grid = grid
         self.q = VecSignal.of(query)
@@ -418,6 +468,7 @@ class GridField(Signal):
             raise TypeError("GridField requires scalar grid values; "
                             "use VecGridField for a vector-valued Grid")
         self._cubic = _parse_grid_interp(interp)
+        self._outside = _parse_on_outside(on_outside)
 
     def children(self):
         return tuple(self.q.components) + (self.grid,)
@@ -426,7 +477,7 @@ class GridField(Signal):
         g = self.grid
         coords = self.q.at(clock, cache)
         return math.fsum(w * g.values[fi].at(clock, cache)  # type: ignore[union-attr]
-                         for fi, w in _grid_weights(g, coords, self._cubic))
+                         for fi, w in _grid_weights(g, coords, self._cubic, self._outside))
 
 
 class VecGridField(VecSignal):
@@ -435,11 +486,14 @@ class VecGridField(VecSignal):
     Every channel is blended with the *same* interpolation weights (computed once
     per frame), so this is a true vector field — not N independent scalar fields
     recomputing the domain math.  ``interp`` is ``"linear"`` (default) or ``"cubic"``
-    (Catmull-Rom / tricubic).  ``.channel(name_or_index)`` returns a scalar view of
-    one channel (by name if the grid was built with ``channels=``, else by index).
+    (Catmull-Rom / tricubic).  ``on_outside`` picks the out-of-domain policy
+    (``"clamp"`` default / ``"raise"`` / ``"wrap"``, see :class:`GridField`).
+    ``.channel(name_or_index)`` returns a scalar view of one channel (by name if the
+    grid was built with ``channels=``, else by index).
     """
 
-    def __init__(self, grid: Grid, query: Vecish, *, interp: str = "linear") -> None:
+    def __init__(self, grid: Grid, query: Vecish, *, interp: str = "linear",
+                 on_outside: str = "clamp") -> None:
         # like LoopCurve: synthesize component views, override at()/children().
         self.grid = grid
         self.q = VecSignal.of(query)
@@ -449,6 +503,7 @@ class VecGridField(VecSignal):
             raise TypeError("VecGridField requires a vector-valued Grid; "
                             "use GridField for a scalar Grid")
         self._cubic = _parse_grid_interp(interp)
+        self._outside = _parse_on_outside(on_outside)
         self._vdim = grid.value_dim
         self._id = alloc_id()
         self.components: List[Signal] = [
@@ -468,7 +523,7 @@ class VecGridField(VecSignal):
         g = self.grid
         coords = self.q.at(clock, cache)
         acc = [0.0] * self._vdim
-        for fi, w in _grid_weights(g, coords, self._cubic):
+        for fi, w in _grid_weights(g, coords, self._cubic, self._outside):
             vv = g.values[fi].at(clock, cache)  # tuple (VecSignal value)
             for a in range(self._vdim):
                 acc[a] += w * vv[a]
@@ -840,7 +895,13 @@ class FieldCurve:
             raise TypeError(
                 "field must be a builder callable(query_vecsignal) -> field node")
         self._build = field
-        self.value = field(self.position)               # DAG-facing sampled value
+        try:
+            self.value = field(self.position)           # DAG-facing sampled value
+        except ValueError as exc:
+            # sharpen the common "curve dim != field domain dim" mismatch
+            raise ValueError(
+                f"FieldCurve: curve position (dim {self.position.dim}) is "
+                f"incompatible with the field — {exc}") from exc
         self.is_vector = isinstance(self.value, VecSignal)
         # discover channel names from the underlying dataset, if any.
         ds = getattr(self.value, "grid", None)

@@ -974,7 +974,109 @@ stereo.
 
 ---
 
+## J. loom field/scene enhancements  *(loom; design-captured 2026-07-19 — this conversation)*
+
+Three related decisions made while discussing "a curve through a field going out of bounds" and
+"multiple changing isosurfaces in one scene". None started yet; J1 is small and unambiguous, J2 is
+medium, J3 is large (and is the item the user actually cares most about — a loom twin of the FTSL
+record so loom can round-trip `.ftsl` scenes).
+
+### J1 — Grid field out-of-domain policy (small, back-compatible)
+**Problem.** A `FieldCurve` routed through a `Grid` that wanders outside the lattice **silently
+edge-extends** (`interp.py:_cell_base_frac` clamps `p<=0→0`, `p>=n-1→n-2`). That is inconsistent with
+the RBF scatter field, which already has a first-class `on_outside` policy
+(`"clamp"`/`"raise"`/`"extrapolate"`, interp.py ~592). Only the **Grid** field has this gap — analytic
+fields (gyroid expr / `SpatialExpr`) are defined everywhere; Scatter/RBF already guard the hull.
+Dimension mismatch is **already** a hard construction-time error (`GridField`/`VecGridField.__init__`
+raise `query dim != grid ndim`, and `FieldCurve` builds the field eagerly), so no silent failure there.
+
+**Decision.** Give `GridField`/`VecGridField` (and the shared `_cell_base_frac`/`_grid_weights`) the same
+`on_outside` policy the RBF field has. **DONE 2026-07-19** (`tools/loom/loom/interp.py`; 6 new tests in
+`test_gridinterp.py` + a FieldCurve dim-mismatch test; 604 loom tests green):
+- [x] **`"clamp"`** — current edge-extend; **default**, so behavior stays byte-identical (verified against
+      the old default path).
+- [x] **`"raise"`** — error on leaving the domain (boundary inclusive), the guard for "grid view" authoring
+      where the curve must stay inside the box.
+- [x] **`"wrap"`** — periodic fold (period `hi-lo`; sample `n-1` aliases `0`), for both linear and
+      Catmull-Rom stencils. Apt for a gyroid (2π-periodic) → seamless tour.
+- [ ] optional **`"extrapolate"`** — linear extrapolation off the boundary cell. **Deferred** (not needed
+      yet; the cubic phantom-point machinery already exists if we want it).
+- [x] Re-raise the `FieldCurve` dimension-mismatch `ValueError` with FieldCurve context (names the curve's
+      dim). *(J1 complete bar the optional extrapolate mode.)*
+
+### J2 — Placed isosurfaces + a Room/Group element (multi-changing-isosurface pipeline)
+**Problem.** `Isosurface` (`iso.py`) has **no position**: its frame is `freq*(row·xyz)+drift`, with no
+`- center`. So a gyroid clipped to a container at (5,0,0) shows the *same phase* as one at the origin —
+the container moves but the pattern does not follow. (A translation is *expressible* today by hand-folding
+`drift' = drift − freq*(M·c)`, but the `contained_by` box/sphere won't track it — manual and error-prone.)
+loom already has the affine machinery to fix this cleanly: `mathnd.Affine` (`linear @ x + offset`, both
+animatable, composable) and `spatial._offset`.
+
+**Decision (the two missing primitives):**
+- [ ] **Placement on `Isosurface`** — a `center`/`Affine` that offsets **both** the coordinate frame
+      (`freq*(M·(x − center))+drift`) **and** the `contained_by` box/sphere, animatable, so a blob can
+      drift/tumble around the room over the loop.
+- [ ] **`Room`/`Group` `Element`** — owns a child list + an animatable `Affine` frame, emits each child with
+      the composed placement (`room_frame ∘ child_placement`), namespaces child names (`room/gyroidA`) so
+      the emitted `isosurface "…"` names don't collide; may emit the shell (box / 6 planes) + shared
+      materials/lights.
+- [ ] **Driver pattern / factory** — refactor `gyroid_nd.py` to expose a factory (`make_gyroid(**params) ->
+      Isosurface`); a new driver script builds a `Room`, instances the factory N times with different
+      params/materials, and assigns each a placement (static, on a closed `LoopCurve`, or from a
+      `VecGridField`/`Scatter` of placements).
+- **Caveats to design in:** seamless loop (translations on *closed* curves, rotations by integer turns,
+  drift by 2π·k); overlap (separate `contained_by` boxes keep blobs disjoint & cheap; union/blend is a
+  CSG question ftrace-side); validate ftrace stays efficient with many overlapping sphere-traced
+  isosurface containers.
+
+### J3 — Port the FTSL **parametric-record** data structure into loom (large; the user's real ask)
+**Clarified intent (2026-07-19).** *Not* loom's existing `Grid`/`Scatter`. The user wants a **loom twin of
+the §0 FTSL record** (`ROADMAP_records.md`): one data type that **names its output channels** after real
+destination slots, so a single record bundles **one interpolated curve per property** (e.g. every slot of a
+material), each named for export. Structurally the record is **(driver domain) × (named-channel axis)** — a
+bank of per-channel curves over a shared scalar driver; "each property is a named curve" is exactly what §0
+already defines (my earlier "1-D" referred only to the *driver input* being one scalar). Stops sit at
+**defined positions** (`p:`-pinned, else evenly redistributed), are **interpolated**
+(`nearest|linear|smooth`), and may be **expressions**. Goal: a loom program can **read, represent, and
+re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
+
+**Locked decisions (2026-07-19):**
+- **ftrace's record grammar is UNCHANGED** — one scalar driver × N named channels. No N-D *input* domain in
+  ftrace (the user sees no need). The "at least 2-D" the record needs = domain × named-channel, which it
+  already is.
+- **loom may be a superset** — loom MAY offer a genuine N-D *input* domain for its own authoring, but that
+  superset stays loom-side (emits down to constructs ftrace already understands, or is loom-only). It does
+  NOT push back into FTSL.
+- **Round-trip = semantic re-emit**, not byte-faithful: parse `.ftsl` → loom `Element` tree → re-emit in
+  loom's canonical style (equivalent scene, not identical formatting/ordering).
+
+- [ ] **J3a — loom record type mirroring the 1-D FTSL record exactly.** Named channels, positioned
+      (`p:`-pinned) stops with even redistribution, per-record `interp nearest|linear|smooth`
+      (monotone-cubic = Fritsch–Carlson), expression stops, spectrum stops (linear-RGB lerp → JH). A
+      `Signal`/`VecSignal`-valued node. Emit the `NAME = range LO-HI [ … ]` block **and** parse one back;
+      round-trip test against `scenes/_record_*.ftsl`.
+- [ ] **J3b — loom N-D superset** (loom-only authoring; emits down to the J3a form or a documented construct).
+- [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
+      complement the emitters so a whole scene round-trips (semantic re-emit). Audit every `Element.emit`
+      against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
+      `uv planar axis=`, `type mix layer … weight_map pattern:…`, record `from`/dot-override blocks).
+- **Dependency note:** the FTSL record itself (§0) is fully implemented (Stages 1–6 + GPU parity DONE), so
+  this is a loom-side mirror + parser effort, not blocked on ftrace.
+
+---
+
 ## Progress log
+- 2026-07-19: **§J1 done.** Grid out-of-domain policy `on_outside` = `clamp` (default, byte-identical) /
+  `raise` / `wrap` (periodic, linear + cubic) added to `GridField`/`VecGridField` and the shared
+  `_cell_base_frac`/`_catmull_rom_axis`/`_grid_weights`; FieldCurve now re-raises a dim-mismatch with its
+  own context. `extrapolate` mode deferred. 604 loom tests green. Next candidates: §J2 (placed
+  isosurfaces + Room) or §J3a (loom record type).
+- 2026-07-19: **§I stereoscopic output complete** (I1/I2/I3) and committed (764e9b3), plus a pre-existing
+  `-n` scientific-notation parse bug fixed (`-n 2e8` was truncating to 2 photons). Validated with a
+  200M-photon red-cyan anaglyph of the Cornell box. Then **captured §J** (loom field/scene enhancements)
+  from the design discussion: J1 Grid `on_outside` policy (small), J2 placed isosurfaces + Room/Group
+  (medium), J3 port the FTSL parametric-record data structure into loom + make loom scene syntax
+  `.ftsl`-round-trippable (large — the user's real ask). Nothing in §J started yet.
 - 2026-07-18: file created; consolidated undone items from DESIGN.md, OSCILLATE_GRAMMAR.md, ROADMAP.md,
   ROADMAP_heroroom.md, and the just-designed camera-curve bridge (§A). Starting on item G1
   (`--raster-iso` passthrough — the trivial, zero-engine-change win).

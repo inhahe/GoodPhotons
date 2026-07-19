@@ -123,5 +123,16 @@ def test_fieldcurve_bad_args():
         FieldCurve(42, lambda q: GridField(grid, q), u=Const(0.1))      # bad curve
 
 
+def test_fieldcurve_dim_mismatch_message():
+    # a 2-D curve routed through a 3-D grid: the field builder's dim check fires,
+    # and FieldCurve re-raises it with its own context so the author knows where.
+    path = _square_path()                      # dim 2
+    grid3 = Grid(shape=(2, 2, 2), lo=(0, 0, 0), hi=(1, 1, 1),
+                 values=[float(i) for i in range(8)])
+    with pytest.raises(ValueError) as ei:
+        FieldCurve(path, lambda q: GridField(grid3, q), u=Const(0.1))
+    assert "FieldCurve" in str(ei.value)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

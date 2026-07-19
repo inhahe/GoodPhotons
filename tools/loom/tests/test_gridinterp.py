@@ -106,5 +106,70 @@ def test_unknown_interp_rejected():
                      vec(0.5), interp="bogus")
 
 
+# --- J1: out-of-domain policy (clamp / raise / wrap) -----------------------
+
+def test_on_outside_default_is_clamp():
+    g = _grid1d([0.0, 1.0, 2.0, 3.0])
+    for x in (-2.0, -0.5, 3.5, 9.0):
+        default = GridField(g, vec(x)).at(_clk())
+        clamp = GridField(g, vec(x), on_outside="clamp").at(_clk())
+        assert default == clamp
+    # clamp edge-extends to the boundary sample
+    assert GridField(g, vec(-5.0), on_outside="clamp").at(_clk()) == 0.0
+    assert GridField(g, vec(99.0), on_outside="clamp").at(_clk()) == 3.0
+
+
+def test_on_outside_raise():
+    g = _grid1d([0.0, 1.0, 2.0, 3.0])          # domain [0, 3]
+    # inside (and exactly on the boundary) must NOT raise
+    for x in (0.0, 1.5, 3.0):
+        GridField(g, vec(x), on_outside="raise").at(_clk())
+    # outside must raise, on either side
+    for x in (-0.5, 3.5):
+        with pytest.raises(ValueError):
+            GridField(g, vec(x), on_outside="raise").at(_clk())
+
+
+def test_on_outside_wrap_periodic():
+    # value[0] == value[n-1] makes this a genuine period-4 field.
+    g = _grid1d([0.0, 1.0, 2.0, 3.0, 0.0])     # domain [0, 4], period 4
+    def w(x):
+        return GridField(g, vec(x), on_outside="wrap").at(_clk())
+    # folding by one period returns the same value
+    assert abs(w(4.5) - w(0.5)) < 1e-12
+    assert abs(w(-0.5) - w(3.5)) < 1e-12
+    # explicit values: 0.5 -> lerp(v0=0, v1=1) = 0.5
+    assert abs(w(0.5) - 0.5) < 1e-12
+    # -0.5 wraps to 3.5 -> lerp(v3=3, v4->v0=0) = 1.5
+    assert abs(w(-0.5) - 1.5) < 1e-12
+    # at the seam coord == hi folds to sample 0
+    assert abs(w(4.0) - 0.0) < 1e-12
+
+
+def test_on_outside_wrap_cubic_constant_and_node():
+    g = _grid1d([5.0, 5.0, 5.0, 5.0, 5.0])
+    # partition of unity holds under wrap, even for a query a full period out
+    assert abs(GridField(g, vec(6.3), interp="cubic",
+                         on_outside="wrap").at(_clk()) - 5.0) < 1e-12
+    # exact at an interior node under cubic+wrap
+    g2 = _grid1d([0.0, 2.0, -1.0, 4.0, 0.0])
+    assert abs(GridField(g2, vec(2.0), interp="cubic",
+                         on_outside="wrap").at(_clk()) - (-1.0)) < 1e-12
+
+
+def test_on_outside_vec_field_wrap():
+    g = Grid(shape=(5,), lo=(0,), hi=(4,),
+             values=[vec(float(i % 4), 0.0) for i in range(5)],  # a: 0,1,2,3,0
+             channels=("a", "b"))
+    vf = VecGridField(g, vec(4.5), on_outside="wrap")
+    assert abs(vf.channel("a").at(_clk()) - 0.5) < 1e-12
+
+
+def test_on_outside_unknown_rejected():
+    g = _grid1d([0.0, 1.0, 2.0])
+    with pytest.raises(ValueError):
+        GridField(g, vec(0.5), on_outside="reflect")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
