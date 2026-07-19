@@ -643,15 +643,17 @@ struct Blas {
     bool intersectLocal(const Ray& lr, double tmin, Hit& h) const {
         bool found = false;
         double tMax = h.t;
+        const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         bvh.traverseClosest(lr, tmin, tMax, [&](int prim, double& tm) {
-            if (intersectTri(lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
+            if (intersectTri(sh, lr, tris[prim], tmin, h)) { tm = h.t; found = true; }
         });
         return found;
     }
     bool occludedLocal(const Ray& lr, double tmin, double maxDist) const {
+        const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
             Hit h; h.t = maxDist;
-            return intersectTri(lr, tris[prim], tmin, h);
+            return intersectTri(sh, lr, tris[prim], tmin, h);
         });
     }
 };
@@ -999,8 +1001,9 @@ struct Scene {
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
+        const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
-            if (prim < (int)nT)            { if (intersectTri(r, tris[prim], tmin, h)) tm = h.t; }
+            if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
             else {
@@ -1027,9 +1030,10 @@ struct Scene {
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
         const double seg = maxDist - tmin;
+        const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(r, tris[prim], tmin, h);
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
             const MeshInstance& inst = instances[prim - nT - nS - nI];
@@ -1041,7 +1045,8 @@ struct Scene {
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
-        for (const auto& t : tris)     intersectTri(r, t, tmin, h);
+        const TriShear sh = makeTriShear(r.d);
+        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h);
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h);
         for (const auto& inst : instances) {

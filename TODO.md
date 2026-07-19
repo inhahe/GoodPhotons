@@ -444,7 +444,24 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       (only `.nvdb` is ingested today; `.vdb→.nvdb` is a manual step).
 - [ ] **C5 Mesh: emissive triangles** (mesh area lights).
 - [ ] **C6 Mesh: tangent-space normal maps.**
-- [ ] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.
+- [x] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.  **DONE 2026-07-18**.
+      Replaced Möller–Trumbore with the Woop/Benthin/Wald/Áfra watertight test (JCGT 2013) on BOTH the
+      CPU double path (`src/geometry.h`) and the GPU float path (`src/render_cuda.cu`). Per-ray the test
+      picks the dominant axis of the ray direction, permutes the other two (swapping them when the
+      dominant component is negative to preserve winding), and precomputes shear constants (`TriShear` /
+      `DTriShear`, built by `makeTriShear`); per-triangle it shears the relative vertices into the ray
+      frame and forms the three scaled barycentric edge functions U,V,W. A hit needs the edge signs to
+      agree (two-sided: all-nonneg OR all-nonpos), with an exact-zero fallback in higher precision so a
+      grazing edge lands deterministically on exactly one of the two triangles sharing it — no cracks
+      (background leaking through a closed mesh) and no dropped hits. The shear is **hoisted once per ray**
+      at every BVH leaf loop (5 host call sites in `scene.h`, 4 device sites in `render_cuda.cu`) so the
+      per-triangle cost is only the shear+edge math; an interface-preserving `intersectTri(ray, tri, …)`
+      overload that builds the shear inline remains for one-off callers. The barycentric convention
+      (U,V,W weight v0,v1,v2 ⇔ old w0,u,v) matches the retired M–T code, so UVs and interpolated shading
+      normals are unchanged. **Validated:** `scenes/triplanar.ftsl` (16 384-tri closed torus, the shape
+      whose silhouette used to crack at grazing angles) renders a clean continuous silhouette with no
+      background leak on BOTH the GPU float path (where M–T's independent per-triangle edge signs cracked
+      worst) and the CPU double path, with byte-identical energy (`absorbed=0.7794`).
 - [x] **C8 FBX import via `ufbx`**  **DONE 2026-07-18**. Vendored the MIT / public-domain single-file
       `ufbx` (v0.23.0: `src/third_party/ufbx.{h,c}` + `ufbx-LICENSE`) and confined it to one TU
       (`src/fbx_load.cpp`, mirroring `vdbgrid.cpp`/`stb_image_impl.cpp`) behind a lightweight

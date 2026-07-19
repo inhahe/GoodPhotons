@@ -138,6 +138,10 @@ struct DVec3 {
     HD DVec3 operator*(Real s)         const { return {x * s, y * s, z * s}; }
     HD DVec3 operator/(Real s)         const { return {x / s, y / s, z / s}; }
     HD DVec3 operator-()               const { return {-x, -y, -z}; }
+    // Indexed component access (0=x,1=y,2=z) for the watertight tri test's axis
+    // permutation. No bounds check (hot path); callers pass 0..2.
+    HD Real  operator[](int i) const { return (&x)[i]; }
+    HD Real& operator[](int i)       { return (&x)[i]; }
 };
 HD static inline Real dot(const DVec3& a, const DVec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
 HD static inline DVec3 cross(const DVec3& a, const DVec3& b) {
@@ -1454,37 +1458,71 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     return false;
 }
 
-__device__ static bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
-                                     Real tmin, DHit& hit) {
-    DVec3 e1 = tri.v1 - tri.v0, e2 = tri.v2 - tri.v0;
-    DVec3 pv = cross(rd, e2);
-    Real det = dot(e1, pv);
-    if (fabs(det) < DET_EPS) return false;
-    Real inv = (Real)1 / det;
-    DVec3 tv = ro - tri.v0;
-    Real u = dot(tv, pv) * inv;
-    if (u < 0 || u > 1) return false;
-    DVec3 qv = cross(tv, e1);
-    Real vv = dot(rd, qv) * inv;
-    if (vv < 0 || u + vv > 1) return false;
-    Real t = dot(e2, qv) * inv;
+// Watertight ray-triangle intersection (Woop et al., JCGT 2013) — device twin of the
+// host intersectTri in geometry.h. The consistent per-edge sign test means a ray through
+// a shared edge is claimed by exactly one triangle: no cracks (background leaking through
+// a closed mesh) and no dropped hits. This matters most HERE, on the float (Real) path,
+// where the old Moller-Trumbore's independent per-triangle edge signs cracked at grazing
+// angles. The per-ray axis permutation + shear (DTriShear) is hoisted out of the BVH leaf
+// loop and reused for every triangle, exactly like the host.
+struct DTriShear {
+    int  kx, ky, kz;
+    Real Sx, Sy, Sz;
+};
+__device__ static inline DTriShear makeTriShear(const DVec3& d) {
+    DTriShear s;
+    Real ax = fabs(d.x), ay = fabs(d.y), az = fabs(d.z);
+    if (ax >= ay && ax >= az)      s.kz = 0;
+    else if (ay >= az)             s.kz = 1;
+    else                           s.kz = 2;
+    s.kx = s.kz + 1; if (s.kx == 3) s.kx = 0;
+    s.ky = s.kx + 1; if (s.ky == 3) s.ky = 0;
+    if (d[s.kz] < 0) { int tmp = s.kx; s.kx = s.ky; s.ky = tmp; }
+    s.Sx = d[s.kx] / d[s.kz];
+    s.Sy = d[s.ky] / d[s.kz];
+    s.Sz = (Real)1  / d[s.kz];
+    return s;
+}
+__device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const DVec3& rd,
+                                     const DTri& tri, Real tmin, DHit& hit) {
+    const int kx = sh.kx, ky = sh.ky, kz = sh.kz;
+    DVec3 A = tri.v0 - ro, B = tri.v1 - ro, C = tri.v2 - ro;
+    Real Ax = A[kx] - sh.Sx * A[kz], Ay = A[ky] - sh.Sy * A[kz];
+    Real Bx = B[kx] - sh.Sx * B[kz], By = B[ky] - sh.Sy * B[kz];
+    Real Cx = C[kx] - sh.Sx * C[kz], Cy = C[ky] - sh.Sy * C[kz];
+    Real U = Cx * By - Cy * Bx;
+    Real V = Ax * Cy - Ay * Cx;
+    Real W = Bx * Ay - By * Ax;
+    // Exact-zero fallback in double (helps the float path land a grazing edge on one side).
+    if (U == 0 || V == 0 || W == 0) {
+        if (U == 0) U = (Real)((double)Cx * (double)By - (double)Cy * (double)Bx);
+        if (V == 0) V = (Real)((double)Ax * (double)Cy - (double)Ay * (double)Cx);
+        if (W == 0) W = (Real)((double)Bx * (double)Ay - (double)By * (double)Ax);
+    }
+    // Two-sided: reject only when the edge signs are mixed (point outside the triangle).
+    if ((U < 0 || V < 0 || W < 0) && (U > 0 || V > 0 || W > 0)) return false;
+    Real det = U + V + W;
+    if (det == 0) return false;
+    Real T = U * (sh.Sz * A[kz]) + V * (sh.Sz * B[kz]) + W * (sh.Sz * C[kz]);
+    Real invDet = (Real)1 / det;
+    Real t = T * invDet;
     if (t < tmin || t >= hit.t) return false;
+    Real b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
     hit.ng = tri.gn;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
-    // Barycentric-interpolate the per-vertex UVs (u,vv are the Moller-Trumbore
-    // weights of v1,v2; the v0 weight is 1-u-vv). Mirrors host intersectTri.
-    Real w0 = (Real)1 - u - vv;
-    hit.u = w0 * tri.uv0.x + u * tri.uv1.x + vv * tri.uv2.x;
-    hit.v = w0 * tri.uv0.y + u * tri.uv1.y + vv * tri.uv2.y;
-    // Smooth shading normal: interpolate per-vertex normals (equal to gn for a flat
-    // tri, so this reduces to the geometric normal). Orient against the ray. Mirrors
-    // host intersectTri.
-    DVec3 ns = tri.n0 * w0 + tri.n1 * u + tri.n2 * vv;
+    hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
+    hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
+    DVec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     Real nl = dot(ns, ns);
     ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
     hit.n = (dot(rd, ns) < 0) ? ns : -ns;
     return true;
+}
+// Interface-preserving wrapper (builds the shear inline) for any one-off caller.
+__device__ static inline bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
+                                            Real tmin, DHit& hit) {
+    return intersectTri(makeTriShear(rd), ro, rd, tri, tmin, hit);
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
                                         Real tmin, DHit& hit) {
@@ -1548,6 +1586,7 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
     const int*   P = sc.blasPrim  + bl.primOff;
     const DTri*  T = sc.blasTris   + bl.triOff;
     DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    const DTriShear sh = makeTriShear(lrd);   // watertight shear: once per ray
     Real tMax = h.t;
     bool found = false;
     int stack[48]; int sp = 0; stack[sp++] = 0;
@@ -1558,7 +1597,7 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
-                if (intersectTri(lro, lrd, T[prim], tmin, h)) { tMax = h.t; found = true; }
+                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) { tMax = h.t; found = true; }
             }
         } else {
             Real tL, tR;
@@ -1582,6 +1621,7 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
     const int*   P = sc.blasPrim  + bl.primOff;
     const DTri*  T = sc.blasTris   + bl.triOff;
     DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    const DTriShear sh = makeTriShear(lrd);
     int stack[48]; int sp = 0; stack[sp++] = 0;
     while (sp) {
         const DNode& n = N[stack[--sp]];
@@ -1591,7 +1631,7 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
                 DHit h; h.t = maxDist; h.valid = false;
-                if (intersectTri(lro, lrd, T[prim], tmin, h)) return true;
+                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) return true;
             }
         } else {
             Real tc;
@@ -1621,6 +1661,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     DHit h; h.t = BIG; h.valid = false; h.matId = 0; h.sensorId = -1;
     if (sc.nNodes == 0) return h;
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
+    const DTriShear sh = makeTriShear(rd);
     Real tMax = BIG;
     int stack[64]; int sp = 0; stack[sp++] = 0;
     while (sp) {
@@ -1630,7 +1671,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
-                if (prim < sc.nTris)              { if (intersectTri(ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
+                if (prim < sc.nTris)              { if (intersectTri(sh, ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
                 else {
@@ -1709,6 +1750,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                                  Real maxDist, Real tmin = RAY_EPS) {
     if (sc.nNodes == 0) return false;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
+    const DTriShear sh = makeTriShear(dir);
     Real tMax = maxDist - tmin;
     int stack[64]; int sp = 0; stack[sp++] = 0;
     while (sp) {
@@ -1720,7 +1762,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 int prim = sc.primIdx[n.first + i];
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked;
-                if (prim < sc.nTris)                              blocked = intersectTri(o, dir, sc.tris[prim], tmin, h);
+                if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
                 else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
                 else {

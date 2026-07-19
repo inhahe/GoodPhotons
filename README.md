@@ -1006,6 +1006,13 @@ device also uses a true two-level BVH (shared per-BLAS pools + an instance table
 transforms the ray into BLAS space), so device memory scales with unique geometry, not
 with the instance count. Everything is accelerated by a BVH.
 
+**Watertight ray–triangle test.** Triangles are intersected with the Woop/Benthin/Wald/Áfra
+watertight test (JCGT 2013) rather than Möller–Trumbore. A ray through a shared edge is
+claimed by *exactly one* of the two triangles that meet there, so closed meshes render with
+**no grazing-edge cracks** (background pixels leaking through a silhouette) and no dropped
+hits. This holds on both the CPU double path and — where it matters most, since floating-point
+edge signs are what used to crack — the GPU float path.
+
 ### Implicit surfaces (`isosurface`)
 
 Besides the explicit primitives above, geometry can be defined *implicitly* as the

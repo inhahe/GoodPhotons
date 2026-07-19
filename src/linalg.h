@@ -12,6 +12,10 @@ struct Vec3 {
     Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
     Vec3 operator-() const { return {-x, -y, -z}; }
     Vec3& operator+=(const Vec3& b) { x += b.x; y += b.y; z += b.z; return *this; }
+    // Indexed component access (0=x, 1=y, 2=z) — used by the watertight ray-triangle
+    // test's axis permutation. No bounds check (hot path); callers pass 0..2.
+    double  operator[](int i) const { return (&x)[i]; }
+    double& operator[](int i)       { return (&x)[i]; }
 };
 
 inline Vec3 operator*(double s, const Vec3& v) { return v * s; }
