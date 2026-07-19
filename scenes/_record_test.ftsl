@@ -4,6 +4,11 @@
 # top-level `NAME = range LO-HI [ ... ]` grammar is inert until used.
 scene { units meters }
 
+# palette the record's colour channels reference (stage-2 resolves these refs)
+spectrum "steel"  = rgb 0.55 0.57 0.60
+spectrum "gold"   = rgb 0.90 0.75 0.30
+spectrum "copper" = rgb 0.85 0.45 0.30
+
 funny_mirror = range 0-1 [
     reflect    spectrum:steel  spectrum:gold  spectrum:copper
     roughness  0.0  p:0.7 0.4  1.0

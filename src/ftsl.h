@@ -1174,9 +1174,9 @@ private:
         }
     }
 
-    // Build one Record from a `NAME = range LO-HI [ ... ]` block. STAGE 1: structural
-    // only — parse the domain, interp, channels and stops; redistribute positions.
-    // Compiling stop tokens (expressions / colours) and sampling land in later stages.
+    // Build one Record from a `NAME = range LO-HI [ ... ]` block: parse the domain,
+    // interp, channels and stops; redistribute positions (stage 1); then compile each
+    // stop into a scalar pattern program or a resolved colour + linear-RGB (stage 2).
     bool addRecord(const Block& b, Loaded& L) {
         if (b.name.empty()) { fail("record needs a name"); return false; }
         if (recordIndex_.count(b.name)) { fail("duplicate record name '" + b.name + "'"); return false; }
@@ -1244,6 +1244,36 @@ private:
                 if (ch.stops[i].pos < ch.stops[i - 1].pos - 1e-12) {
                     fail("record '" + rec.name + "' channel '" + ch.name + "': stop positions must be non-decreasing");
                     return false;
+                }
+            }
+        }
+        // Stage 2: compile stop tokens. A stop is a COLOUR iff its token is a prefixed
+        // spectrum ref (contains ':', e.g. spectrum:steel / metal:copper / rgb:... );
+        // otherwise it is a SCALAR pattern expression (a literal, or math over
+        // intrinsics x y z nx ny nz r u v f + functions). A channel must be homogeneous.
+        for (auto& ch : rec.channels) {
+            bool anyColour = false, anyScalar = false;
+            for (const auto& st : ch.stops)
+                (st.token.find(':') != std::string::npos ? anyColour : anyScalar) = true;
+            if (anyColour && anyScalar) {
+                fail("record '" + rec.name + "' channel '" + ch.name +
+                     "': mixes colour (spectrum:...) and scalar stops");
+                return false;
+            }
+            ch.kind = anyColour ? ChanKind::Spectrum : ChanKind::Scalar;
+            for (auto& st : ch.stops) {
+                if (ch.kind == ChanKind::Scalar) {
+                    std::string cerr;
+                    if (!compilePatternExpr(st.token, st.expr, cerr)) {
+                        fail("record '" + rec.name + "' channel '" + ch.name +
+                             "': bad stop expression '" + st.token + "': " + cerr);
+                        return false;
+                    }
+                } else {
+                    Value v; v.words = { st.token };
+                    st.color = evalSpectrum(v);
+                    if (!err.empty()) return false;   // evalSpectrum already set the message
+                    st.rgb = reflectanceToLinearSrgbD65(st.color);
                 }
             }
         }
