@@ -323,7 +323,10 @@ inputs with no default and no binding are an error at the use site.
 **Positional application** follows the per-property rule but guards the multi-input case:
 `gold(v)` is allowed **only when the material has exactly one free input** (matching the
 shipped `material NAME(driver)` inline form); a material with several free inputs
-**requires named arguments** (`gold(u=v, a=1)`), since positional order is fragile.
+**requires named arguments** (`gold(u=v, a=1)`), since positional order is fragile. The
+argument — positional or the RHS of a `name=…` binding — is an **arbitrary expression**
+in the consumer's scope, not just a bare variable: `gold(v*2)` ≡ `gold(u=v*2)` binds the
+sole free input to `v*2`, exactly as a per-property `gold.prop(v*2)` (§3.2) would.
 
 *(Loom/J3b authoring superset — shipped ftrace has only the single-driver
 `material NAME(driver)` inline form.)*
