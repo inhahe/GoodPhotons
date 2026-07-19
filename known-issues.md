@@ -5,19 +5,25 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH DEBT (2026-07-19): loom RBF scatter field rebuilds the interpolator every frame
-`RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) rebuild the
-`scipy.interpolate.RBFInterpolator` once per frame because sample positions/values are
-animatable (Signals), so the kernel factorization is frame-dependent. When positions are
-**static** (the common case) the O(M³) kernel factorization only depends on positions and
-could be reused across frames, re-solving only for changed values — but scipy's
-`RBFInterpolator` bakes values at construction and exposes no "refactor with new RHS" API.
-Proper fix: detect static positions (all-`Const` position components) and, for that case,
-cache the factorization across frames — either by dropping to scipy's lower-level linear
-solve (build the kernel matrix + polynomial tail once, LU-factor, re-solve per frame) or by
-keeping the `RBFInterpolator` alive when values are also static. Until then, per-frame
-rebuild is correct but wasteful for long animations with many samples. `neighbors=` (local
-k-NN RBF) mitigates the cost for large point sets.
+### DONE (2026-07-19): loom RBF scatter field rebuilt the interpolator every frame
+`RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) used to rebuild the
+`scipy.interpolate.RBFInterpolator` once per frame, gated only on the frame number, even when
+the sample positions and values were completely static — pure waste for the very common case
+of a fixed scatter field queried along a moving path over a long animation.
+**Fixed** by replacing the bare per-frame gate with change detection: `_RbfEngine` now caches
+the last-built interpolator together with the exact position/value arrays it was built from,
+and on a frame advance re-evaluates the sample arrays and reuses the cached interpolator
+verbatim (bit-for-bit identical output) unless the positions or values actually changed. A
+static field now builds exactly once regardless of animation length; animated values still
+rebuild per changed frame (correct, and cheap at realistic scatter sizes). Tests in
+`tests/test_rbf.py` assert build-once for static fields (scalar + vector), bit-identical reuse
+vs. a fresh rebuild, and correct rebuild-on-change for animated values.
+Deliberately **not** done: the deeper "static positions, animated values → reuse the O(M³)
+factorization, re-solve only the RHS" optimization. scipy exposes no public refactor-with-new-RHS
+API, so it would require coupling to scipy's private compiled internals
+(`_rbfinterp_np._build_system`) — a version-fragile dependency for a gain that is negligible at
+the small scatter sizes loom fields realistically use. `neighbors=` (local k-NN RBF) still
+mitigates cost for large point sets.
 
 ### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
 **Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)

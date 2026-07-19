@@ -170,7 +170,9 @@ output can feed another modulator — "it's just another function"):
 3b. **`RbfScatterField`** — radial-basis interpolation (`scipy.interpolate.RBFInterpolator`,
    an *optional* dep, lazily imported). Smooth, exact at samples, meshless, any N-D.
    Default kernel `thin_plate_spline` (parameter-free); `on_outside="clamp"` guards the
-   convex-hull extrapolation. Rebuilt once per frame (positions/values animate).
+   convex-hull extrapolation. Rebuilt **only when the sampled positions/values actually
+   change** (change-detection cache in `_RbfEngine`): a static field builds once and is
+   reused verbatim across the whole animation even as the query moves.
 
 Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
 with named `channels=`). `VecGridField` / `VecScatterField` / `VecRbfScatterField`

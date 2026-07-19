@@ -128,5 +128,59 @@ def test_rbf_cache_consistent():
     assert a == b == f.at(_clk())
 
 
+# --- change-detection caching (rebuild only when the samples actually move) ---
+
+def test_rbf_static_field_builds_once_across_frames():
+    # Static positions AND values, but the query moves every frame.  The
+    # interpolator must be built exactly once and reused for every frame.
+    sc = _square()
+    q = vec(Sine(cycles=1.0, amp=0.3, bias=0.5), Sine(cycles=1.0, amp=0.3, bias=0.5))
+    f = RbfScatterField(sc, q)
+    for frame in range(20):
+        f.at(_clk(t=frame / 20.0, frame=frame))
+    assert f._eng._builds == 1, f._eng._builds
+
+
+def test_rbf_static_reuse_is_bit_identical():
+    # The value produced from the reused cache must be bit-for-bit identical to a
+    # freshly rebuilt interpolator at the same query point.
+    sc = _square()
+    q = vec(Sine(cycles=1.0, amp=0.3, bias=0.5), Sine(cycles=1.0, amp=0.3, bias=0.5))
+    cached = RbfScatterField(sc, q)
+    for frame in range(1, 15):
+        clk = _clk(t=frame / 15.0, frame=frame)
+        fresh = RbfScatterField(sc, q)          # its own engine -> always rebuilds
+        assert cached.at(clk) == fresh.at(clk)  # bit-identical, not just close
+    assert cached._eng._builds == 1
+
+
+def test_rbf_animated_values_rebuild_each_change_and_stay_correct():
+    # Values change every frame -> the interpolator must rebuild, and the result
+    # must match a freshly built interpolator bit-for-bit.
+    drivers = [Sine(cycles=1.0, amp=1.0, bias=1.0, phase=k * 0.1) for k in range(5)]
+    pts = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
+    sc = Scatter([(vec(x, y), d) for (x, y), d in zip(pts, drivers)])
+    q = vec(0.35, 0.55)
+    cached = RbfScatterField(sc, q)
+    for frame in range(1, 8):
+        clk = _clk(t=frame / 8.0, frame=frame)
+        fresh = RbfScatterField(sc, q)
+        assert cached.at(clk) == fresh.at(clk)
+    # one build per distinct frame that was evaluated (frames 1..7, plus none reused)
+    assert cached._eng._builds == 7, cached._eng._builds
+
+
+def test_rbf_vector_static_field_builds_once():
+    pts = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.4, 0.6)]
+    sc = Scatter([(vec(x, y), vec(av, bv))
+                  for (x, y), av, bv in zip(pts, [0, 1, 2, 3, 1.5], [10, 8, 6, 4, 7])],
+                 channels=("a", "b"))
+    q = vec(Sine(cycles=1.0, amp=0.3, bias=0.5), Sine(cycles=1.0, amp=0.3, bias=0.5))
+    vf = VecRbfScatterField(sc, q)
+    for frame in range(12):
+        vf.at(_clk(t=frame / 12.0, frame=frame))
+    assert vf._eng._builds == 1, vf._eng._builds
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
