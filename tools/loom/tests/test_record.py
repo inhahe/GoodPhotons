@@ -207,5 +207,88 @@ def test_roundtrip_fixture_scenes(path):
         assert _canon(rec) == _canon(reparsed), os.path.basename(path)
 
 
+# ---------------------------------------------------------------------------
+# J3b — arbitrary-arity (vector) channels
+
+def _canon_gen(rec: Record):
+    """Structural snapshot including per-stop components (for vector channels)."""
+    return (rec.name, rec.lo, rec.hi, rec.interp,
+            tuple((ch.name, ch.arity,
+                   tuple((tuple(s.components), s.pos) for s in ch.stops))
+                  for ch in rec.channels))
+
+
+def test_stop_arity_and_accessors():
+    s = RecordStop(["0", "1", "2"])
+    assert s.arity == 3
+    assert s.components == ["0", "1", "2"]
+    assert s.as_vector() == [0.0, 1.0, 2.0]
+    with pytest.raises(TypeError):
+        s.token          # a vector stop has no single token
+    scalar = RecordStop("0.5")
+    assert scalar.arity == 1 and scalar.token == "0.5"
+
+
+def test_vector_channel_kind_and_ragged_rejected():
+    ch = RecordChannel("tint", [RecordStop(["0", "0", "0"]), RecordStop(["1", "1", "1"])])
+    assert ch.kind == "vector" and ch.arity == 3
+    with pytest.raises(ValueError):
+        RecordChannel("bad", [RecordStop(["0", "0"]), RecordStop(["1", "1", "1"])]).kind
+
+
+def test_from_channels_vector_and_pins():
+    rec = Record.from_channels(
+        "grad", 0, 1,
+        [("tint", [["0", "0", "0"], (["1", "0", "0"], 0.7), ["1", "1", "1"]])])
+    ch = rec.channel("tint")
+    assert ch.arity == 3
+    assert [s.components for s in ch.stops] == \
+        [["0", "0", "0"], ["1", "0", "0"], ["1", "1", "1"]]
+    assert rec.positions("tint") == pytest.approx([0.0, 0.7, 1.0])
+
+
+def test_sample_vec_per_component():
+    rec = Record.from_channels("grad", 0, 1, [("tint", [["0", "0", "0"], ["1", "2", "4"]])])
+    assert rec.sample_vec("tint", 0.0) == pytest.approx([0.0, 0.0, 0.0])
+    assert rec.sample_vec("tint", 0.5) == pytest.approx([0.5, 1.0, 2.0])
+    assert rec.sample_vec("tint", 1.0) == pytest.approx([1.0, 2.0, 4.0])
+    # scalar channel still works through sample() and sample_vec()
+    r2 = Record.from_channels("a", 0, 1, [("v", ["0.0", "0.6"])])
+    assert r2.sample("v", 0.5) == pytest.approx(0.3)
+    assert r2.sample_vec("v", 0.5) == pytest.approx([0.3])
+
+
+def test_sample_rejects_vector_scalar_api():
+    rec = Record.from_channels("grad", 0, 1, [("tint", [["0", "0"], ["1", "1"]])])
+    with pytest.raises(TypeError):
+        rec.sample("tint", 0.5)          # scalar API on a vector channel
+
+
+def test_emit_rejects_vector_but_generalized_roundtrips():
+    rec = Record.from_channels(
+        "grad", 0, 1,
+        [("tint", [["0", "0", "0"], (["1", "0", "0"], 0.7), ["1", "1", "1"]]),
+         ("rough", ["0.0", "0.5", "1.0"])],
+        interp="smooth")
+    with pytest.raises(TypeError):
+        rec.emit()                       # vector channel: not current-FTSL representable
+    text = rec.emit_generalized()
+    assert "0 0 0, p:0.7 1 0 0, 1 1 1" in text
+    reparsed = Record.parse_generalized(text)
+    assert _canon_gen(rec) == _canon_gen(reparsed)
+
+
+def test_generalized_roundtrip_scalar_and_colour():
+    # generalized emit/parse must also round-trip plain scalar + colour-ref channels
+    rec = Record.from_channels(
+        "m", 0, 1,
+        [("reflect", ["spectrum:steel", "spectrum:gold"]),
+         ("rough", ["0.0", ("0.4", 0.7), "1.0"])],
+        interp="linear")
+    reparsed = Record.parse_generalized(rec.emit_generalized())
+    assert _canon_gen(rec) == _canon_gen(reparsed)
+    assert reparsed.channel("reflect").kind == "colour"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

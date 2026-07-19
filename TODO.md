@@ -1106,6 +1106,18 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **J3b item 1 (core) — arbitrary-arity vector channels in `Record`.** Generalized `RecordStop`
+  to hold `.components` (a `D`-tuple; `.token` = the single component of an arity-1 stop, `.arity` /
+  `.as_vector()` the vector view) — J3a scalar/colour paths unchanged (`.token` back-compat). `RecordChannel.kind`
+  now returns `scalar` (arity 1) / `colour` (`:`-refs) / **`vector`** (arity `D` ≥ 2, homogeneous; ragged
+  arity rejected), with a `.arity`. `Record.sample_vec(name, d)` interpolates per-component (scalar `sample`
+  still returns a float and rejects vector channels). Because current-FTSL separates stops by *whitespace*
+  but the ladder uses whitespace for *components*, the grammars stay separate: `emit`/`parse` remain J3a
+  (whitespace stops; `emit` now rejects a vector channel), and new `emit_generalized`/`parse_generalized` use
+  the ladder (comma-separated stops, `p:` pins) so vector channels round-trip. `from_channels` accepts vector
+  stops (lists) + `(value, pos)` pins. 7 new record tests (30 total), 656 loom green; DESIGN.md §8a updated.
+  **Remaining J3b item 1:** inline-`rgb` colour channels + lowering to synthesized `spectrum` decls; then
+  item 3 (binding/application surface) + item 4 (N-D input domain).
 - 2026-07-19: **Extended the binding model — materials-as-bundles + optional names (§3.3).** Two more locked
   grammar points from the user. (1) A **material is a parameterized bundle**: its free-input set is the union
   of its properties' free inputs, and applying it binds them across the whole bundle at the use site —

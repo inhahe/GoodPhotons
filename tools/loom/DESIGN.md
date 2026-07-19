@@ -272,8 +272,19 @@ bracket-wrapped multi-level children — round-trips); `shape(v)` reports rectan
 Parens `( )` are **not** a ladder delimiter (reserved for expressions / the §3.2
 application surface) — a parenthesised run is an opaque atom, so `clamp(x,0,1)` is one
 leaf. This is loom-only authoring; current ftrace's tokenizer is not comma-aware and
-cannot parse it. *Not yet wired into `Record` — the next J3b step is arbitrary-arity
-channels built on this parser.*
+cannot parse it.
+
+**Arbitrary-arity (vector) channels (J3b item 1).** `RecordStop` now holds
+`.components` (a `D`-tuple of tokens; `.token` is the single component of an arity-1
+stop, `.arity`/`.as_vector()` the vector view), so a `RecordChannel.kind` is `scalar`
+(arity 1) / `colour` (`:`-refs) / **`vector`** (arity `D` ≥ 2, homogeneous). `Record`
+gains `sample_vec(name, d)` (per-component interpolation; scalar `sample` still returns a
+float). Because current-FTSL uses *whitespace* to separate stops but the ladder uses it
+for *components*, the two grammars stay separate: `emit`/`parse` remain the J3a
+whitespace form (and `emit` rejects a vector channel), while `emit_generalized` /
+`parse_generalized` use the ladder (comma-separated stops) so vector channels round-trip.
+Inline-`rgb` colour channels + their lowering to synthesized `spectrum` decls are the
+remaining J3b piece (not yet built).
 
 ---
 
