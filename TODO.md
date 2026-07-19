@@ -1142,10 +1142,17 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `uv planar axis=`, `type mix layer … weight_map pattern:…`, record `from`/dot-override blocks).
       **PARSER: use the user's GraphParser (GPDA) — `D:\visual studio projects\GraphParser`.** Write ONE shared
       EPEG `.ftsl` grammar (unified EPEG: regex terminals, `@skip`/`@mode`/`@longest`/`@left`/`@right`, actions).
-      **DONE (foundation + record block, 2026-07-19):** vendored the pinned tokenized `gpda.py` as
-      `loom/grammar/_gpda.py` (commit 1ac4cbf, self-contained), shared grammar `loom/grammar/ftsl.epeg`
-      (start=`record`, grows toward `scene`), reader `loom/grammar/reader.py` (`parse_record` → structural parity
-      with the hand-written `Record.parse` oracle across every channel form; emit is a fixed point). **KEY FINDING
+      **DONE (foundation + record + material/texture blocks, 2026-07-19):** vendored the pinned tokenized `gpda.py`
+      as `loom/grammar/_gpda.py` (commit 1ac4cbf, self-contained), shared grammar `loom/grammar/ftsl.epeg`
+      (start=`element` = `record | material | texture`, grows toward `scene`), reader `loom/grammar/reader.py`
+      (`parse_record` → structural parity with the hand-written `Record.parse` oracle across every channel form;
+      `parse_element` → `record`/`material`/`texture` blocks). Records prove parity vs the oracle; materials/textures
+      (no `.parse` oracle) prove **emit is a fixed point** (emit → parse_element → re-emit byte-identical) + rebuilt
+      kind/field round-trip, across image `Texture`, procedural `ProcTexture` (rgb-function), and scalar / vector /
+      spectrum-ref / texture-ref material props over all material types (`tests/test_grammar_material.py`, 20 tests).
+      *(Gotcha fixed en route: GPDA collapses a single-terminal rule's value onto the rule node **and** keeps the child
+      leaf, so the flat-`_terminals` walk must only take `node.value` on true leaves, else prop values duplicate.)*
+      **KEY FINDING
       — the record ladder does NOT need scannerless.** The whitespace-form vs comma-form (§3.1) distinction is
       recoverable purely from explicit COMMA / NEWLINE tokens via a *"comma-form requires a comma"* ordered choice,
       with inter-token whitespace always `@skip`ped — so the **tokenized** flavour handles it (faster, and matches

@@ -10,11 +10,12 @@
 # explicit COMMA / NEWLINE tokens via a "comma-form requires a comma"
 # ordered choice, with inter-token whitespace always skipped.
 #
-# Scope today: the parametric `record` block.  Grows toward a full scene
-# grammar (start rule will become `scene`); `record` stays a sub-rule.
+# Scope today: a single top-level `element` — the parametric `record` block
+# and the `material` / `texture` blocks.  Grows toward a full scene grammar
+# (start will become `scene`); these stay sub-rules.
 # =====================================================================
 
-start record
+start element
 
 # ---- skips + terminals ----------------------------------------------
 WS      = /[ \t]+/ @skip           # inter-token whitespace, always invisible
@@ -27,7 +28,11 @@ DOMAIN  = /-?[0-9]+(\.[0-9]+)?-[0-9]+(\.[0-9]+)?/
 NUMBER  = /-?[0-9]+(\.[0-9]+)?([eE][+\-]?[0-9]+)?/
 PIN     = /p:-?[0-9]+(\.[0-9]+)?/          # `p:<pos>` position pin prefix
 REF     = /[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]+/   # e.g. spectrum:steel, metal:gold
+STRING  = /"[^"]*"/                                 # quoted name / path / expression
 NAME    = /[A-Za-z_][A-Za-z0-9_]*/
+
+# ---- top-level element ----------------------------------------------
+element = record | material | texture
 
 # ---- record block ---------------------------------------------------
 # NEWLINE stays significant (one channel line = one channel), but the newlines
@@ -53,3 +58,14 @@ vstop      = PIN? NUMBER+                            # space-separated component
 
 ws_stops   = ws_stop+
 ws_stop    = PIN? (NUMBER | REF)                     # one whitespace word = one stop
+
+# ---- material / texture blocks --------------------------------------
+# Both are `KIND "name" { <prop>* }` with newline-insensitive bodies (loom
+# emits single-line, but a hand-authored scene may wrap).  A property value
+# greedily takes its tokens until the next NAME key or `}` — the same
+# key/value shape used for the record's whitespace stops.
+material = nl? 'material' STRING '{' mbody '}' nl?
+texture  = nl? 'texture'  STRING '{' mbody '}' nl?
+mbody    = (nl? prop)* nl?
+prop     = NAME pvalue
+pvalue   = REF | STRING+ | NUMBER+ | NAME            # ref / quoted / vector-or-scalar / enum
