@@ -1087,6 +1087,12 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          rebindable at the use site (`gold.color(u=x)` ≡ `gold.reflect(a=x)`); `[…](u)` seals the array inside
          a function of `u` (reachable via `u=x`) whereas bare `[…]` leaves the driver for the consumer. loom
          authors this surface; shipped ftrace keeps the two constant accessors + fixed scope model.
+         Also (`ROADMAP_records.md` §3.3): **materials are parameterized bundles** — a material's free-input
+         set is the union of its properties' inputs, and applying it binds them across the bundle at the use
+         site (`material = gold(u=v, a=1)` ≡ `gold(u=v a=1)`, ladder-separated; partial application falls back
+         to system defaults; positional `gold(v)` only when there's a single free input). And **property names
+         are optional** — the leading type/slot keyword identifies the property; the quoted name is only an
+         external dot-handle (`spectrum = …` anonymous vs `spectrum "color" = …` for `gold.color`).
       4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
@@ -1100,6 +1106,15 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **Extended the binding model — materials-as-bundles + optional names (§3.3).** Two more locked
+  grammar points from the user. (1) A **material is a parameterized bundle**: its free-input set is the union
+  of its properties' free inputs, and applying it binds them across the whole bundle at the use site —
+  `material = gold(u=v, a=1)` ≡ `gold(u=v a=1)` (arg list uses the same ladder, comma ≡ space); partial
+  application leaves unbound inputs at their system defaults; positional `gold(v)` is allowed only for a
+  single-free-input material (matching the shipped `material NAME(driver)` form). (2) **Property names are
+  optional** — the leading type/slot keyword identifies the property; the quoted name is just an external
+  dot-handle (`spectrum = …` anonymous vs `spectrum "color" = …` for `gold.color`). Written into
+  `ROADMAP_records.md` new §3.3 + §3.2 naming note; folded into TODO §J3b item 3.
 - 2026-07-19: **J3b started — delimiter-precedence-ladder parser (`loom/ladder.py`, item 2).** Built the pure
   parser for the generalized stop grammar locked in §3.1: `parse_ladder(str)` → nested `list`/`str` tree with
   whitespace = `×` (juxtaposition/vector), comma = `+` (outer level), brackets = parens; single-level groups

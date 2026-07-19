@@ -283,10 +283,50 @@ from the bare `[…]`, not "data with a default binding." To let the consumer re
 array you omit `(u)` (they drive it with `gold.color(x)`); to give a default *and* still
 allow indexing you include `(u)` and they reach it via `gold.color(u=x)`.
 
+**Naming is optional.** The **leading type/slot keyword identifies the property**; the
+quoted name is only an external dot-handle. Write `spectrum "color" = …` to get
+`gold.color` access, or just `spectrum = …` anonymously (still bound to its slot by the
+keyword). You name a property only when you want to refer to it; omitting the name never
+affects input binding (below), since input variables and property dot-handles are
+different namespaces.
+
 *(This whole section is the loom/J3b authoring superset. Shipped ftrace exposes the two
 constant accessors `R.chan[i]` / `R(const)` from Stage 5a and drives records by the fixed
 per-hit/`t` scope model; the uniform named-input rebinding surface above is the
 generalized target, not v1.)*
+
+### 3.3 Materials as parameterized bundles — *target, not v1*
+
+A **material is a bundle of slot→expression bindings**, and it is itself a function: its
+**free-input set is the union of its properties' free inputs**. Given
+
+```
+material "gold" = [ spectrum "color"    = [0 0 0, 1 1 1](u),
+                    reflect  "reflect"  = .5*a ]
+```
+
+`gold` exposes the inputs `{u, a}`. **Applying** the material binds those inputs across
+the whole bundle at once, at the use site:
+
+```
+material = gold(u=v, a=1)      # bind u<-v, a<-1
+material = gold(u=v a=1)       # identical — the argument list uses the same ladder (comma == space)
+material = gold(u=v)           # partial: a stays at its system default (albedo)
+```
+
+This is §3.2's per-property rebinding (`gold.color(u=x)`) lifted to **bundle granularity**
+— several inputs bound in one call. Each `name=expr` RHS is evaluated in the *consumer's*
+scope (so `u=v` feeds the consumer's surface coord `v` into gold's `u`), under the same
+scope-check shipped in Stage 5a. Unbound inputs fall back to their system defaults;
+inputs with no default and no binding are an error at the use site.
+
+**Positional application** follows the per-property rule but guards the multi-input case:
+`gold(v)` is allowed **only when the material has exactly one free input** (matching the
+shipped `material NAME(driver)` inline form); a material with several free inputs
+**requires named arguments** (`gold(u=v, a=1)`), since positional order is fragile.
+
+*(Loom/J3b authoring superset — shipped ftrace has only the single-driver
+`material NAME(driver)` inline form.)*
 
 ---
 
