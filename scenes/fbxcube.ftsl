@@ -1,0 +1,46 @@
+# FBX import smoke test (C8): a unit cube loaded from a hand-authored ASCII FBX
+# (scenes/cube.fbx) via the vendored ufbx bridge, dropped into a Cornell box and
+# flat-shaded off ufbx's generated per-face normals (a cube has hard edges, so the
+# synthesized normals are per-face, not smoothed). Exercises `mesh { file "*.fbx" }`
+# — the ufbx loader triangulates each quad face, bakes world positions through
+# ufbx's geometry_to_world, and applies the mesh block's authored transform on top.
+# FBX's native unit is centimetres; the loader intentionally consumes raw vertex
+# coordinates (no unit conversion) so the mesh block's `scale` controls final size.
+#
+#   ftrace -in scenes/fbxcube.ftsl -window -keepwindow -o png/fbxcube.png -noise 6
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+material "amber" { type diffuse reflect rgb 0.80 0.55 0.18 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+# The imported FBX cube, scaled and centred in the box, tilted so several faces show.
+mesh {
+    file      scenes/cube.fbx
+    material  amber
+    scale     0.35
+    rotate    20 30 0
+    translate 0.5 0.35 0.5
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

@@ -430,8 +430,20 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 - [ ] **C5 Mesh: emissive triangles** (mesh area lights).
 - [ ] **C6 Mesh: tangent-space normal maps.**
 - [ ] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.
-- [ ] **C8 FBX import via `ufbx`** (decided: vendor MIT single-file `ufbx` into `src/third_party/`,
-      like the glTF/JSON headers). Consumes baked geometry/normals/UVs/materials/skinning/animation.
+- [x] **C8 FBX import via `ufbx`**  **DONE 2026-07-18**. Vendored the MIT / public-domain single-file
+      `ufbx` (v0.23.0: `src/third_party/ufbx.{h,c}` + `ufbx-LICENSE`) and confined it to one TU
+      (`src/fbx_load.cpp`, mirroring `vdbgrid.cpp`/`stb_image_impl.cpp`) behind a lightweight
+      `src/fbx.h` declaration so the 220-KB header stays out of every other TU. `loadFbx` walks each
+      mesh-instance node, triangulates faces with `ufbx_triangulate_face`, bakes world positions via
+      ufbx's `geometry_to_world` (+ inverse-transpose for normals), then applies the mesh block's
+      authored affine on top — filling the SAME `Tri` position/normal/UV slots the OBJ/glTF paths use,
+      so smooth shading + texturing come free. Load opts normalize to right-handed **Y-up metres** and
+      `generate_missing_normals`, so FBX lands in the engine's convention. Wired `.fbx` into `addMesh`
+      **and** `addMeshAsset` extension dispatch (CMake gained `LANGUAGES … C` for `ufbx.c`). Validated:
+      hand-authored `scenes/cube.fbx` → `loadFbx: … 8 verts, 12 tris`, `scenes/fbxcube.ftsl`
+      render-checked. **Scope now:** baked triangle geometry + normals + first UV set. **Not yet
+      consumed** (follow-ups, logged in known-issues): FBX materials, skinning/blend-shapes, animation,
+      multiple UV sets, per-face materials.
 - [ ] **C9 Alembic (`.abc`) import** — heavy SDK (Imath + HDF5/Ogawa); **deferred**, decide if an
       OBJ/glTF/FBX sequence suffices before taking the build weight.
 

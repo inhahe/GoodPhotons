@@ -67,6 +67,7 @@
 #include "materials.h"
 #include "mesh.h"
 #include "gltf.h"
+#include "fbx.h"
 #include "upsample.h"
 #include "color.h"
 
@@ -1418,6 +1419,13 @@ private:
             if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
                 fail("mesh: " + gerr); return false;
             }
+        } else if (ext == ".fbx") {
+            // Autodesk FBX via the vendored ufbx bridge. `uv use_mesh` pulls the file's
+            // first UV set; procedural UV projections and crease smoothing are OBJ-only.
+            std::string ferr;
+            if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                fail("mesh: " + ferr); return false;
+            }
         } else {
             // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
             // smooth shading normals, merging faces across edges softer than <deg>
@@ -1496,6 +1504,11 @@ private:
             std::string gerr;
             if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
                 fail("mesh_asset: " + gerr); return false;
+            }
+        } else if (ext == ".fbx") {
+            std::string ferr;
+            if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                fail("mesh_asset: " + ferr); return false;
             }
         } else {
             double creaseAngleDeg = -1.0;

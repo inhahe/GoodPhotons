@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(forward_raytracer LANGUAGES CXX)
+project(forward_raytracer LANGUAGES CXX C)   # C for the vendored ufbx.c (FBX loader)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,8 @@ add_executable(ftrace
     src/stb_image_impl.cpp   # compiles vendored stb_image (texture load) + stb_image_write (PNG/JPG output) once
     src/livewindow.cpp       # -window live-preview OS window (Win32 GDI; no-op stub off Windows)
     src/vdbgrid.cpp          # confines vendored NanoVDB.h to one TU; bakes .nvdb -> dense fog grid
+    src/fbx_load.cpp         # FBX mesh loader (bridge over vendored ufbx); confines ufbx.h to one TU
+    src/third_party/ufbx.c   # vendored single-file FBX parser (MIT / public-domain), compiled as C
 )
 target_include_directories(ftrace PRIVATE src)
 

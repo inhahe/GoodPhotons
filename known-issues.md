@@ -5,6 +5,23 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-18): FBX import (C8) consumes geometry only — no materials/skinning/animation
+The new FBX loader (`src/fbx_load.cpp`, vendored `ufbx`) imports **baked triangle
+geometry + generated-if-missing normals + the first UV set**, applying every mesh
+instance's `geometry_to_world`. It does **not** yet consume:
+- **FBX materials** (Phong/Lambert/PBR) — every triangle takes the mesh block's
+  FTSL `material`. glTF already maps `pbrMetallicRoughness`; FBX should get a similar
+  material bridge (ufbx exposes `ufbx_material` + `pbr`/`fbx` property maps).
+- **Skinning / blend shapes** — `ufbx_load_opts` could `evaluate` a bind/rest pose,
+  but the loader currently reads the static mesh. A future path could bake a chosen
+  animation time (ufbx supports `ufbx_evaluate_scene`).
+- **Animation** — no per-frame FBX animation sampling (loom emits frames instead).
+- **Multiple UV sets / per-face materials / vertex colors** — only `vertex_uv` set 0
+  is read; `face_material` segmentation is ignored.
+These are additive follow-ups; the geometry path is validated (`scenes/cube.fbx` →
+8 verts / 12 tris, `scenes/fbxcube.ftsl`). The proper fix for materials is a
+`ufbx_material` → spectral-BSDF mapping mirroring `gltf.h`'s material import.
+
 ### TECH DEBT (2026-07-17): GPU preview rasterizer — feature parity with the CPU rasterizer
 
 The GPU preview rasterizer (`src/raster_cuda.{h,cu}`, wired into `main.cpp`'s
