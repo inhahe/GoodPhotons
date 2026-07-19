@@ -768,3 +768,125 @@ class VecRbfScatterField(VecSignal):
         if cache is not None:
             cache.set(self._id, clock.frame, out)
         return out
+
+
+# ---------------------------------------------------------------------------
+# 4. FieldCurve — a curve routed through a field (poll = coords + {channel: value})
+# ---------------------------------------------------------------------------
+
+class _MutableComp(Signal):
+    """Scalar view of one axis of a :class:`_MutableVec` (never cached: it reads a
+    value the owner mutates between evaluations, so caching would freeze it)."""
+
+    def __init__(self, owner: "_MutableVec", axis: int) -> None:
+        super().__init__()
+        self.owner = owner
+        self.axis = axis
+
+    def children(self):
+        return ()
+
+    def at(self, clock: Clock, cache: Optional[Cache] = None) -> float:
+        return self.owner._val[self.axis]
+
+
+class _MutableVec(VecSignal):
+    """A settable query point used only for :meth:`FieldCurve.sample` probing."""
+
+    def __init__(self, dim: int) -> None:
+        self._val: Tuple[float, ...] = tuple(0.0 for _ in range(dim))
+        self._id = alloc_id()
+        self.components: List[Signal] = [_MutableComp(self, a) for a in range(dim)]
+
+    def set(self, v) -> None:
+        self._val = tuple(float(x) for x in v)
+
+    def children(self):
+        return tuple(self.components)
+
+    def at(self, clock: Clock, cache: Optional[Cache] = None) -> Tuple[float, ...]:
+        return self._val
+
+
+class FieldCurve:
+    """A loom curve **routed through a field**: at a progression index it yields the
+    curve's N spatial coordinates *and* the field's ``{channel: value}`` there.
+
+    Give it a ``PointPath`` (or a ready position ``VecSignal``) and a ``field``
+    *builder* — a callable mapping a query ``VecSignal`` to a field node, e.g.
+    ``lambda q: VecGridField(grid, q, interp="cubic")`` or ``lambda q: ScatterField(sc, q)``.
+    Both the position and the sampled value are real DAG nodes, so either can drive
+    scene variables (this is the object §E2's "curve variables drive scene variables"
+    and §F6's inspection build on):
+
+    - :attr:`position` — the spatial coordinate ``VecSignal`` (a ``LoopCurve`` when built
+      from a ``PointPath``);
+    - :attr:`value` — the field output (a scalar ``Signal`` or a ``VecSignal``);
+    - :meth:`channel` — a scalar view of one value channel (by name if the dataset was
+      built with ``channels=``, else by index);
+    - :meth:`sample` — poll at an explicit progression ``u`` → ``(coords, {channel: value})``.
+    """
+
+    def __init__(self, curve, field, u=None, *, closed: Optional[bool] = None) -> None:
+        if isinstance(curve, PointPath):
+            if u is None:
+                raise ValueError("FieldCurve over a PointPath needs a progression u")
+            self.position = LoopCurve(curve, u, closed=closed)
+        elif isinstance(curve, VecSignal):
+            self.position = curve                       # a ready position signal
+        else:
+            raise TypeError("curve must be a PointPath or a VecSignal position")
+        if not callable(field):
+            raise TypeError(
+                "field must be a builder callable(query_vecsignal) -> field node")
+        self._build = field
+        self.value = field(self.position)               # DAG-facing sampled value
+        self.is_vector = isinstance(self.value, VecSignal)
+        # discover channel names from the underlying dataset, if any.
+        ds = getattr(self.value, "grid", None)
+        if ds is None:
+            ds = getattr(self.value, "scatter", None)
+        self.channel_names: Optional[Tuple[str, ...]] = (
+            tuple(ds.channels) if (ds is not None and getattr(ds, "channels", None)) else None)
+        # a separate probe field over a mutable query, for explicit-u polling.
+        self._poke = _MutableVec(self.position.dim)
+        self._probe = field(self._poke)
+
+    # ---- DAG accessors ------------------------------------------------------
+    @property
+    def coords(self) -> VecSignal:
+        return self.position
+
+    def channel(self, channel) -> Signal:
+        if isinstance(self.value, VecSignal):
+            if hasattr(self.value, "channel"):
+                return self.value.channel(channel)      # named/indexed view
+            return self.value.components[int(channel)]
+        if channel in (0, None):
+            return self.value                           # scalar field
+        raise KeyError(f"scalar field has no channel {channel!r}")
+
+    def channels(self) -> Optional[Tuple[str, ...]]:
+        return self.channel_names
+
+    # ---- polling ------------------------------------------------------------
+    def _value_map(self, v) -> dict:
+        if isinstance(v, tuple):
+            if self.channel_names:
+                return dict(zip(self.channel_names, v))
+            return {i: x for i, x in enumerate(v)}
+        return {self.channel_names[0] if self.channel_names else 0: v}
+
+    def sample(self, u_value: float, clock: Clock, cache: Optional[Cache] = None):
+        """Poll at progression ``u_value``: returns ``(coords_tuple, {channel: value})``.
+
+        ``coords`` are the curve's spatial coordinates at ``u_value``; the value map is
+        the field sampled at those coordinates.  Requires a curve that supports explicit
+        parameter sampling (a ``LoopCurve``, i.e. built from a ``PointPath``)."""
+        if not hasattr(self.position, "sample"):
+            raise TypeError("FieldCurve.sample needs a LoopCurve position "
+                            "(build the FieldCurve from a PointPath)")
+        coords = self.position.sample(u_value, clock, cache)
+        self._poke.set(coords)
+        v = self._probe.at(clock, None)     # uncached: reflect the just-set poke
+        return coords, self._value_map(v)

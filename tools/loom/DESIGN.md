@@ -190,6 +190,14 @@ And, over a `TrackedPath`, one multi-curve sampler:
    maps a uniform travel param `s` to a `u` that *dwells* where the density track is
    large (the distinguishing behavior of a camera-curve speed curve).
 
+And one **field-routed** curve:
+
+5. **`FieldCurve`** — a curve routed **through a field**. `FieldCurve(curve, field_builder, u)`
+   pairs a position curve with a field built over that curve's point (`field_builder` is a
+   callable `q -> field`, so any grid/scatter field composes in). `.position`, `.value` and
+   `.channel(name|idx)` are DAG nodes that can drive scene variables; `.sample(u, clock)`
+   polls at an explicit progression index → `(coords, {channel: value})`.
+
 Because interpolators are `Signal`s, you can: feed a modulator into a control point;
 *or* feed an N-D value into an interpolator to read a value out and pass it onward;
 *or* chain modulators through interpolators arbitrarily. All one DAG, all cycle-checked.

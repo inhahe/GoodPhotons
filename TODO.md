@@ -924,8 +924,14 @@ question — *should grid/scatter points be multi-valued?* — with **YES**.
       values. Rebuilt at most once per frame (`_RbfEngine`). **Not offered:** Wendland (scipy's
       RBFInterpolator has no compact-support kernel) — use `neighbors=` for large sets instead. 8 new
       tests (`tests/test_rbf.py`, skip if scipy absent).
-- [ ] **H4 — field-sampled curve.** A curve through a field; polling at a progression index returns
-      (N spatial coords, `{channel: value}`). Wire into the DAG so its outputs can drive scene variables.
+- [x] **H4 — field-sampled curve.** ✅ 2026-07-19. `FieldCurve(curve, field_builder, u)` routes a loom
+      curve through any field. `field_builder` is a callable `q -> field node` (e.g.
+      `lambda q: VecGridField(grid, q, interp="cubic")`), so it composes with H1–H3 freely. `.position`
+      (the spatial coords `VecSignal`), `.value` (the sampled field), and `.channel(name|idx)` are real
+      DAG nodes that can drive scene variables; `.sample(u, clock)` polls at an explicit progression index
+      returning `(coords, {channel: value})` (channel keys are dataset names if present, else indices).
+      Explicit polling uses a private probe field over a mutable query so it doesn't disturb the bound
+      DAG. 8 new tests (`tests/test_fieldcurve.py`). **§H complete.**
 
 ---
 
@@ -1147,3 +1153,13 @@ stereo.
   sets. 8 new tests (`tests/test_rbf.py`); 589 loom tests green. Perf caveat logged in known-issues
   (per-frame refactor can't be reused across frames via scipy's API). Next in §H: H4 (field-sampled
   curve) — closes §H.
+- 2026-07-19: **H4 done — §H complete.** `FieldCurve` bundles a curve + a field so a single object gives
+  both the spatial coordinates and the interpolated `{channel: value}` at a progression index. It takes a
+  `PointPath` (built into a `LoopCurve` over `u`) or a ready position `VecSignal`, plus a *field builder*
+  callable `q -> field` — so any H1–H3 field (scalar/vector, linear/cubic grid, Shepard/RBF scatter)
+  drops in. `.position`, `.value`, and `.channel(name|idx)` are DAG nodes (drive scene variables, walked
+  by cycle detection through the dataset + path); `.sample(u, clock)` polls at an explicit u via a private
+  probe field over a `_MutableVec` query (uncached so the mutated query is honored), returning `(coords,
+  {channel: value})` with channel names from the dataset when present. This is the object §E2 (curve
+  vars → scene vars) and §F6 (viewer inspection) build on. 8 new tests (`tests/test_fieldcurve.py`); 597
+  loom tests green. §H (multi-valued fields + interpolation + field-sampled curve) is now fully done.
