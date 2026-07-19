@@ -397,10 +397,18 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       *Done 2026-07-18:* `--raster-iso N` CLI flag → `make_video` → `_render_frame` appends
       `-raster-iso N` on the raster path. Verified end-to-end (2-frame render at res 40 → coarse
       gyroid) and all 268 loom tests green.
-- [ ] **G2** GPU deterministic primary-ray isosurface **preview kernel** in `raster_cuda` (sibling to
-      `renderFrame`): per-pixel cast primary ray → existing `intersectImplicit` + `dFieldGradient` +
-      shading, **no tessellation**. Wire a mode (e.g. `-raster-gpu`); route `gyroid_nd` video frames
-      through it.
+- [x] **G2** GPU deterministic primary-ray isosurface **preview kernel** — per-pixel cast primary ray
+      → existing `closestHit` (which sphere-traces implicits via `intersectImplicit`) + `dFieldGradient`
+      shading, **no tessellation**. Wired as `-raster-gpu`; `gyroid_nd` frames route through it.
+      *Done 2026-07-18:* kernel `kIsoPreview` lives in `render_cuda.cu` (where `closestHit`/`DScene`/
+      `buildUpload` already are — a device twin of `raster::renderFrame`'s shading: flat per-material
+      albedo, ambient + Σ weighted N·L keys + headlight fill), downloads linear-RGB + depth/emitter
+      masks and calls the **shared** host `raster::exposeAndEncode` so output matches `-raster` and
+      honours a camera_path's locked auto-exposure anchor. `-raster-gpu` (main.cpp) falls back to the
+      CPU rasterizer when the GPU can't handle the config (no CUDA device, `-see-through`/clarity, or a
+      physical mesh-lens camera). `gyroid_nd --raster-gpu` swaps the per-frame flag (`--raster-iso` moot
+      — no marching cubes). Validated on `scenes/implicit.ftsl` (metaballs + CSG + torus render
+      identically to `-raster`, cleaner surfaces) and a 3-frame gyroid video.
 - [ ] **G3** `PatOp::MatMulAdd` intrinsic (matrix·vec + offset) so per-frame affine transforms bake
       cleanly instead of a dozen scalar mul/adds. Five standard PatOp touch-points.
 - [ ] **G4 (deferred, export-only)** GPU marching cubes — *only* to accelerate mesh export, not the
@@ -736,3 +744,12 @@ real 1 s 220+660 Hz WAV.
   pipeline; zero GPU changes). `src/ftsl.h` `addTexture` `rgb`-branch + `compilePatternExpr`/`patternEval`
   bake; loom `ProcTexture`/`func_skin`; `scenes/procskin.ftsl` render-validated (all orientation checks
   pass). 5 new loom tests, 550 loom green. Next: G3 (PatOp::MatMulAdd matrix intrinsic).
+- 2026-07-18: **C8 done.** FBX mesh import via vendored ufbx (single-file, confined to `fbx_load.cpp`);
+  `mesh { file "*.fbx" }` triangulates + bakes world positions; no unit conversion (raw cm coords, size
+  via `scale`). `scenes/fbxcube.ftsl` validated in raster + forward mode B. Geometry-only (no FBX
+  materials/skins/anim) — logged in known-issues. Committed 3d6dd65.
+- 2026-07-18: **G2 done.** `-raster-gpu`: GPU deterministic primary-ray isosurface preview (`kIsoPreview`
+  in `render_cuda.cu`, reusing `closestHit`/`buildUpload` + shared `raster::exposeAndEncode`); no
+  tessellation. main.cpp falls back to CPU raster on unsupported configs; `gyroid_nd --raster-gpu` routes
+  video frames through it. Fixed a vertical-flip bug (dGenRay py=0 is image bottom, accum row 0 is top).
+  Validated on `scenes/implicit.ftsl` + a gyroid video. Next: G3 (PatOp::MatMulAdd — needs a design call).

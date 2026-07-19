@@ -3313,7 +3313,7 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
                   noise: Optional[float] = None, time_budget: Optional[float] = None,
                   spp: Optional[int] = None,
                   see_through: bool = False, clarity: Optional[float] = None,
-                  raster_iso: Optional[int] = None,
+                  raster_iso: Optional[int] = None, raster_gpu: bool = False,
                   pump: Optional["Callable[[], None]"] = None) -> None:
     """Render one frame ``.ftsl`` -> ``.png``, headless and non-blocking.
 
@@ -3339,6 +3339,14 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     A lower value cuts the per-frame CPU tessellation cost (the raster-path bottleneck) at
     the price of a coarser surface; ``None`` leaves ftrace's default.
 
+    ``raster_gpu`` (raster only) swaps ftrace ``-raster`` for ``-raster-gpu`` — the GPU
+    primary-ray isosurface preview, which casts one ray per pixel straight at the implicit
+    surface (NO marching-cubes tessellation, so ``raster_iso`` no longer applies and the
+    per-frame CPU tessellation bottleneck disappears entirely).  ftrace falls back to the
+    CPU rasterizer automatically when the GPU path can't handle the config (no CUDA device,
+    see-through/clarity requested, or a physical mesh-lens camera), so this is always safe
+    to pass.
+
     ``pump`` is an optional callback invoked repeatedly *while* ftrace runs (used to
     keep the preview window's event loop serviced — otherwise it would freeze for the
     whole render, since a path-traced frame can take seconds).  With it the child is
@@ -3347,9 +3355,10 @@ def _render_frame(ftrace: Path, root: Path, fp: Path, png: Path, *,
     import subprocess
     w, h = size
     if raster:
-        cmd = [str(ftrace), "-in", str(fp), "-o", str(png), "-raster",
+        cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
+               "-raster-gpu" if raster_gpu else "-raster",
                "-r", str(w), str(h)]
-        if raster_iso is not None:
+        if raster_iso is not None and not raster_gpu:   # GPU path does no tessellation
             cmd += ["-raster-iso", str(raster_iso)]
         if clarity is not None:
             cmd += ["-glass-clarity", f"{clarity:g}"]   # implies -see-through
@@ -3437,6 +3446,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
                env_file: Optional[str] = None,
                transform: str = "drift", material: str = "gold",
                clarity: Optional[float] = None, raster_iso: Optional[int] = None,
+               raster_gpu: bool = False,
                preview: Optional["_PreviewWindow"] = None,
                video_dir: Optional[Path] = None, shell: bool = False) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
@@ -3474,6 +3484,7 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         _render_frame(ftrace, root, fp, png, size=size, raster=raster, noise=noise,
                       time_budget=time_budget, spp=spp,
                       see_through=clear, clarity=frame_clarity, raster_iso=raster_iso,
+                      raster_gpu=raster_gpu,
                       pump=(preview.pump if preview is not None else None))
         pngs.append(png)
         if preview is not None:
@@ -3793,6 +3804,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "tessellate isosurfaces each frame (ftrace default 96). Lower = "
                         "faster per frame (less CPU tessellation, the raster-path bottleneck) "
                         "but a coarser surface. Ignored under --no-raster.")
+    g.add_argument("--raster-gpu", action="store_true",
+                   help="rasterizer only: render each frame with ftrace -raster-gpu, the GPU "
+                        "primary-ray isosurface preview (one ray per pixel straight at the "
+                        "implicit surface, NO marching-cubes tessellation — so --raster-iso is "
+                        "moot and the CPU tessellation bottleneck disappears). Falls back to the "
+                        "CPU rasterizer automatically when the GPU can't handle the config (no "
+                        "CUDA device, see-through/clear glass, or a physical lens camera). "
+                        "Ignored under --no-raster.")
     g.add_argument("--preview", action="store_true",
                    help="show each frame as it is rendered in one reusable preview window "
                         "whose title tracks the current gyroid / values / frame")
@@ -3990,7 +4009,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                spp=args.render_spp, fmt=args.format,
                                env_file=env_file, transform=args.transform,
                                material=args.material, clarity=args.glass_clarity,
-                               raster_iso=args.raster_iso,
+                               raster_iso=args.raster_iso, raster_gpu=args.raster_gpu,
                                preview=preview, video_dir=video_outdir, shell=args.shell)
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")

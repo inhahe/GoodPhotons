@@ -5,6 +5,18 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)
+The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
+wired as `-raster-gpu`) casts one ray/pixel with the shared `closestHit` and shades
+each hit with a **flat per-material solid colour** (`raster::materialColor` baked into
+`matCol[]`). Unlike the *triangle* GPU rasterizer (`-device gpu`), it does **not** sample
+per-vertex-UV or triplanar `reflect texture:<name>` **image skins** — a textured mesh
+previews as flat colour. That's fine for its target use (implicit-isosurface video, which
+uses solid materials), but a textured scene loses its skin under `-raster-gpu`. Proper fix:
+port the raster texture sampling into `kIsoPreview` (the device already has `DHit.u/v`/`p`
+and the baked texture tables the forward path uploads), matching the triangle GPU path.
+Until then, prefer `-device gpu` (tessellated) for textured previews.
+
 ### TECH DEBT (2026-07-18): FBX import (C8) consumes geometry only — no materials/skinning/animation
 The new FBX loader (`src/fbx_load.cpp`, vendored `ufbx`) imports **baked triangle
 geometry + generated-if-missing normals + the first UV set**, applying every mesh

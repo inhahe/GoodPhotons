@@ -204,6 +204,22 @@ paths they can capture at all**.
 > preview it can't accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
+> **No-tessellation GPU isosurface preview — `-raster-gpu`.** The `-device gpu`
+> preview above still *tessellates* the world (marching cubes) first, then rasterizes
+> the triangles — so isosurface-heavy scenes pay a growing CPU tessellation cost every
+> frame. `-raster-gpu` skips tessellation entirely: it casts **one primary ray per
+> pixel** on the device and finds the nearest surface with the shared `closestHit`,
+> which **sphere-traces implicit isosurfaces directly** (no mesh). It shades with the
+> same solid preview model (flat per-material albedo, ambient + weighted N·L keys +
+> a headlight fill) and runs the **same** shared auto-exposure + sRGB tone map on the
+> host, so the image matches `-raster` (surfaces are actually *cleaner* — no marching-
+> cubes faceting) and an exposure-locked flyby still shares one anchor. It falls back
+> to the CPU rasterizer automatically when the GPU can't handle the config (no CUDA
+> device, `-see-through`/`-glass-clarity`, or a physical mesh-lens camera). Ideal for
+> morphing-isosurface video (the `gyroid_nd` loom example routes frames through it with
+> `--raster-gpu`). Example:
+> `ftrace -in scenes/implicit.ftsl -raster-gpu -window -o png/preview.png`.
+>
 > **See-through clear objects — `-see-through`.** By default a clear material
 > (dielectric / thin-film / filter / diffuse-transmit) previews as a solid pale
 > ghost. Pass **`-see-through`** (aliases `-seethrough`, `-glass`) to instead render

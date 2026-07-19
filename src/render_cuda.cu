@@ -57,6 +57,7 @@
 #include "render_progress.h"
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
+#include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 
 // Abort-loud wrapper for CUDA API calls. Every cudaMalloc/cudaMemcpy/cudaMemset and
 // every kernel launch/sync return code MUST be checked: under GPU contention (a second
@@ -3927,6 +3928,86 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
     }
 }
 
+// ---- G2: deterministic primary-ray isosurface PREVIEW kernel -----------------
+// A GPU sibling of the CPU solid rasterizer (raster.h) that renders implicit
+// isosurfaces (and any other bakeable geometry) WITHOUT tessellation: it casts one
+// deterministic pixel-centre primary ray per pixel through the pinhole/fisheye
+// camera, finds the nearest surface with the shared closestHit (which sphere-traces
+// implicits via intersectImplicit), and shades it once with the SAME preview model
+// the CPU raster uses — flat per-material albedo lit by `ambient + keyScale·Σ(w·N·L·
+// atten·cone) + fill·N·V`. The linear-RGB result + depth/emitter masks are downloaded
+// and run through raster::exposeAndEncode on the host, so the tone map and a
+// camera_path's shared auto-exposure anchor are bit-identical to the CPU preview.
+struct DPLight {
+    DVec3  pos, dir;
+    int    spot;
+    double cosInner, cosOuter, weight, falloff2;
+};
+struct DPreviewLight {
+    const DPLight* lights; int nLights;
+    double ambient, keyScale, fill;
+};
+// Device twin of scene.h spotFalloff (smoothstep penumbra between the cone cosines).
+__device__ static inline double dSpotFalloff(double ct, double cosInner, double cosOuter) {
+    if (ct >= cosInner) return 1.0;
+    if (ct <= cosOuter) return 0.0;
+    double t = (ct - cosOuter) / (cosInner - cosOuter);
+    return t * t * (3.0 - 2.0 * t);
+}
+__global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
+                            const DVec3* matCol, const int* matEmit, int nMats,
+                            double* accum, float* zbuf, unsigned char* emis,
+                            int W, int H, DVec3 bg, double emisBoost) {
+    int total = W * H;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += gridDim.x * blockDim.x) {
+        int px = idx % W, py = idx / W;
+        // accum row 0 is the image TOP (raster::exposeAndEncode convention), but dGenRay
+        // maps py=0 to sy=-1 (the image BOTTOM), so flip the camera row to match.
+        int camPy = H - 1 - py;
+        DVec3 ro, rd;
+        dGenRay(cam, px, camPy, (Real)0.5, (Real)0.5, ro, rd);   // pixel-centre primary ray
+        DHit h = closestHit(sc, ro, rd);
+        size_t o = (size_t)idx * 3;
+        if (!h.valid) {
+            accum[o + 0] = bg.x; accum[o + 1] = bg.y; accum[o + 2] = bg.z;
+            zbuf[idx] = 0.0f; emis[idx] = 0;
+            continue;
+        }
+        DVec3 col = (h.matId >= 0 && h.matId < nMats) ? matCol[h.matId] : DVec3(0.6, 0.6, 0.6);
+        int   em  = (h.matId >= 0 && h.matId < nMats) ? matEmit[h.matId] : 0;
+        zbuf[idx] = (float)h.t;
+        if (em) {   // emitter: raw tinted glow, boosted so it clips to white (matches CPU)
+            accum[o + 0] = col.x * emisBoost;
+            accum[o + 1] = col.y * emisBoost;
+            accum[o + 2] = col.z * emisBoost;
+            emis[idx] = 1;
+            continue;
+        }
+        emis[idx] = 0;
+        DVec3 N = normalize(h.n);
+        DVec3 V = normalize(cam.eye - h.p);
+        if (dot(N, V) < 0) N = -N;                            // two-sided preview
+        double lit = 0.0;
+        for (int k = 0; k < pl.nLights; ++k) {
+            const DPLight& lp = pl.lights[k];
+            DVec3 d = lp.pos - h.p;
+            double dist2 = dot(d, d);
+            DVec3 Ld = (dist2 > 1e-12) ? d * (Real)(1.0 / sqrt(dist2)) : V;
+            double ndl = fmax(0.0, (double)dot(N, Ld));
+            if (ndl <= 0.0) continue;
+            double atten = 1.0;
+            if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
+            double cone = 1.0;
+            if (lp.spot) cone = dSpotFalloff((double)dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
+            lit += lp.weight * ndl * atten * cone;
+        }
+        double head = fmax(0.0, (double)dot(N, V));           // camera headlight fill
+        double kk = pl.ambient + pl.keyScale * lit + pl.fill * head;
+        accum[o + 0] = col.x * kk; accum[o + 1] = col.y * kk; accum[o + 2] = col.z * kk;
+    }
+}
+
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
 // until a miss/absorption/maxDepth. Direct port of bdpt.h randomWalk.
 // `importance` marks the LIGHT (particle) subpath: only then is the Veach adjoint
@@ -5656,6 +5737,98 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits);
     return out;
+}
+
+// --------------------- G2 iso preview (GPU raster) host ----------------------
+
+bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam) {
+    // The preview only needs closestHit (geometry traversal) + a per-material solid
+    // colour, so it reuses buildUpload's POD scene bake. Gate on the forward-bake
+    // support (buildUploadScene must produce a valid device scene) and a non-physical
+    // camera (dGenRay covers pinhole + fisheye/panoramic; a mesh-lens camera stays on
+    // the CPU raster). Fluorescence etc. never reach the shading here, but the bake path
+    // is shared, so we conservatively require cudaForwardSupported.
+    if (!cudaAvailable()) return false;
+    if (cam.hasLens()) return false;
+    return cudaForwardSupported(scene);
+}
+
+std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
+                                          int W, int H, int nThreads, double exposure,
+                                          bool autoExpose, double* lockAnchor) {
+    using namespace gpu;
+    if (!cudaIsoPreviewSupported(scene, cam)) return {};   // caller falls back to CPU raster
+    if (W <= 0 || H <= 0) return {};
+
+    DUpload up;
+    buildUpload(scene, cam, W, H, up);
+
+    // Distil the scene's lights into preview keys (host deriveLight) and upload them.
+    raster::PreviewLight plHost = raster::deriveLight(scene);
+    std::vector<DPLight> hLights(plHost.lights.size());
+    for (size_t i = 0; i < plHost.lights.size(); ++i) {
+        const raster::PLight& s = plHost.lights[i];
+        DPLight d;
+        d.pos = DVec3(s.pos.x, s.pos.y, s.pos.z);
+        d.dir = DVec3(s.dir.x, s.dir.y, s.dir.z);
+        d.spot = s.spot ? 1 : 0;
+        d.cosInner = s.cosInner; d.cosOuter = s.cosOuter;
+        d.weight = s.weight; d.falloff2 = s.falloff2;
+        hLights[i] = d;
+    }
+    DPreviewLight dpl;
+    dpl.nLights = (int)hLights.size();
+    dpl.lights  = hLights.empty() ? nullptr : (const DPLight*)up.keep(uploadVec(hLights));
+    dpl.ambient = plHost.ambient; dpl.keyScale = plHost.keyScale; dpl.fill = plHost.fill;
+
+    // One solid preview colour + emissive flag per material (host materialColor).
+    std::vector<DVec3> hCol(scene.mats.size());
+    std::vector<int>   hEmit(scene.mats.size());
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        bool em = false;
+        Vec3 c = raster::materialColor(scene.mats[i], em);
+        hCol[i]  = DVec3(c.x, c.y, c.z);
+        hEmit[i] = em ? 1 : 0;
+    }
+    const DVec3* dCol  = hCol.empty()  ? nullptr : (const DVec3*)up.keep(uploadVec(hCol));
+    const int*   dEmit = hEmit.empty() ? nullptr : (const int*)up.keep(uploadVec(hEmit));
+
+    const size_t npix = (size_t)W * H;
+    double*        d_accum = nullptr; CUDA_CHECK(cudaMalloc(&d_accum, npix * 3 * sizeof(double)));
+    float*         d_z     = nullptr; CUDA_CHECK(cudaMalloc(&d_z, npix * sizeof(float)));
+    unsigned char* d_emis  = nullptr; CUDA_CHECK(cudaMalloc(&d_emis, npix * sizeof(unsigned char)));
+
+    const double EMIS_BOOST = 4.0;                       // matches raster.h renderFrame
+    const DVec3  bg(0.06, 0.07, 0.09);                   // background tint (raster.h bg)
+    int block = 128;
+    int grid  = (int)((npix + block - 1) / block);
+    if (grid < 1) grid = 1;
+    if (grid > 65535) grid = 65535;
+    kIsoPreview<<<grid, block>>>(up.sc, up.dc, dpl, dCol, dEmit, (int)scene.mats.size(),
+                                 d_accum, d_z, d_emis, W, H, bg, EMIS_BOOST);
+    cudaCheckKernel("iso-preview");
+
+    std::vector<double>        accD(npix * 3);
+    std::vector<float>         zf(npix);
+    std::vector<unsigned char> ef(npix);
+    CUDA_CHECK(cudaMemcpy(accD.data(), d_accum, accD.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(zf.data(),   d_z,     npix * sizeof(float),         cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ef.data(),   d_emis,  npix * sizeof(unsigned char), cudaMemcpyDeviceToHost));
+    cudaFree(d_accum); cudaFree(d_z); cudaFree(d_emis);
+    freeUpload(up);
+
+    // Shared host tail: exact same auto-exposure + sRGB tone map as the CPU rasterizer,
+    // so `-raster-gpu` frames match `-raster` and a camera_path's locked anchor carries.
+    std::vector<Vec3>    accum(npix);
+    std::vector<uint8_t> emis(npix);
+    for (size_t i = 0; i < npix; ++i) {
+        accum[i] = Vec3(accD[i * 3 + 0], accD[i * 3 + 1], accD[i * 3 + 2]);
+        emis[i]  = ef[i];
+    }
+    const double expComp = (exposure > 0.0) ? exposure : 1.0;
+    const Vec3 kMilkColor{0.52, 0.55, 0.60};             // unused (seeThrough=false)
+    return raster::exposeAndEncode(accum, zf, emis, W, H, nThreads, expComp, autoExpose,
+                                   lockAnchor, /*seeThrough=*/false, {}, {}, kMilkColor);
 }
 
 // --------------------- photon map (mode M) host ------------------------------

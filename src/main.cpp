@@ -3185,6 +3185,7 @@ static int run(int argc, char** argv) {
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
@@ -3349,6 +3350,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
+        else if (!std::strcmp(argv[i], "-raster-gpu")) { doRaster = true; rasterGpu = true; }
         else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
             // Interactive fly-through: start at the first selected camera frame and let
             // the user explore with the raster viewer instead of rendering every frame.
@@ -4115,7 +4117,25 @@ static int run(int argc, char** argv) {
     // selection / -window live view as the real renderer.
     // -----------------------------------------------------------------------------
     if (doRaster) {
-        std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
+        // -raster-gpu (G2): render implicit isosurfaces by casting a deterministic primary
+        // ray per pixel on the GPU (renderIsoPreviewCuda) instead of marching-cubes
+        // tessellation. Requires CUDA + a POD-bakeable scene; see-through mode and a
+        // physical-lens camera aren't covered, so those fall back to CPU tessellation.
+#ifdef HAVE_CUDA
+        bool useGpuIso = rasterGpu && !rasterSeeThrough && cudaAvailable() && cudaForwardSupported(scene);
+        if (rasterGpu && !useGpuIso) {
+            if (rasterSeeThrough)      std::fprintf(stderr, "[raster] -raster-gpu doesn't support see-through; using CPU tessellation\n");
+            else if (!cudaAvailable()) std::fprintf(stderr, "[raster] -raster-gpu: no CUDA device; using CPU tessellation\n");
+            else                       std::fprintf(stderr, "[raster] -raster-gpu: scene not GPU-bakeable; using CPU tessellation\n");
+        }
+#else
+        const bool useGpuIso = false;
+        if (rasterGpu) std::fprintf(stderr, "[raster] -raster-gpu needs a CUDA build; using CPU tessellation\n");
+#endif
+        if (useGpuIso)
+            std::printf("[raster] GPU iso preview: primary-ray isosurface render on the GPU (no tessellation)\n");
+        else
+            std::printf("[raster] solid-shaded preview: tessellating scene (iso res %d) ...\n", rasterIso);
         if (rasterSeeThrough)
             std::printf("[raster] see-through: clear objects dim/haze what's behind them (clarity %.2f, no refraction)\n", rasterClarity);
         std::fflush(stdout);
@@ -4133,38 +4153,58 @@ static int run(int argc, char** argv) {
             }
             g_liveWin = std::make_unique<LiveWindow>(pw, ph, g_windowTitle.c_str());
             g_liveWin->update(pw, ph, placeholder);
-            const size_t nImp = scene.implicits.size();
-            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
-                                (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
+            if (useGpuIso) {
+                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  GPU iso preview\xE2\x80\xA6");
+            } else {
+                const size_t nImp = scene.implicits.size();
+                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
+                                    (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
+            }
         }
 
-        auto rt0 = std::chrono::steady_clock::now();
-        // Progress callback: update the window title (and a periodic stdout line) as the
-        // heavy isosurface/CSG implicits are marched one by one.
-        auto lastTick = std::chrono::steady_clock::now();
-        auto tessProgress = [&](int done, int total) {
-            if (total <= 0) return;
-            int pct = (int)std::lround(100.0 * done / total);
-            if (g_liveWin && !g_liveWin->closed()) {
-                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
-                                    std::to_string(done) + "/" + std::to_string(total) +
-                                    ", " + std::to_string(pct) + "%)");
-            }
-            auto now = std::chrono::steady_clock::now();
-            if (done == 0 || done == total ||
-                std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
-                std::printf("[raster] tessellating implicit %d/%d (%d%%)\n", done, total, pct);
-                std::fflush(stdout);
-                lastTick = now;
-            }
-        };
-        std::vector<raster::PTri> prims = raster::tessellate(scene, rasterIso, tessProgress);
         raster::PreviewLight plight = raster::deriveLight(scene);
-        auto rt1 = std::chrono::steady_clock::now();
-        std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
-                    prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
-                    toRender.size(), nThreads, g_showWindow ? " — live window" : "");
-        std::fflush(stdout);
+        std::vector<raster::PTri> prims;   // tessellated lazily (empty in pure GPU-iso mode)
+        bool tessellated = false;
+        // Tessellate on demand: the CPU / GPU-triangle path calls this immediately; the GPU
+        // iso path skips it entirely and only tessellates if a frame must fall back (e.g. a
+        // physical-lens camera the primary-ray kernel can't handle).
+        auto ensurePrims = [&]() {
+            if (tessellated) return;
+            tessellated = true;
+            auto rt0 = std::chrono::steady_clock::now();
+            // Progress callback: update the window title (and a periodic stdout line) as the
+            // heavy isosurface/CSG implicits are marched one by one.
+            auto lastTick = std::chrono::steady_clock::now();
+            auto tessProgress = [&](int done, int total) {
+                if (total <= 0) return;
+                int pct = (int)std::lround(100.0 * done / total);
+                if (g_liveWin && !g_liveWin->closed()) {
+                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
+                                        std::to_string(done) + "/" + std::to_string(total) +
+                                        ", " + std::to_string(pct) + "%)");
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (done == 0 || done == total ||
+                    std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
+                    std::printf("[raster] tessellating implicit %d/%d (%d%%)\n", done, total, pct);
+                    std::fflush(stdout);
+                    lastTick = now;
+                }
+            };
+            prims = raster::tessellate(scene, rasterIso, tessProgress);
+            auto rt1 = std::chrono::steady_clock::now();
+            std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
+                        prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
+                        toRender.size(), nThreads, g_showWindow ? " — live window" : "");
+            std::fflush(stdout);
+        };
+        if (!useGpuIso) {
+            ensurePrims();
+        } else {
+            std::printf("[raster] rendering %zu camera(s) on the GPU (primary-ray iso)%s\n",
+                        toRender.size(), g_showWindow ? " — live window" : "");
+            std::fflush(stdout);
+        }
 
         // GPU preview rasterizer (-device gpu|auto). Bake the world triangles + image skins
         // to the device ONCE (reused for every camera / flyby frame), then each frame runs the
@@ -4178,7 +4218,7 @@ static int run(int argc, char** argv) {
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && raster_cuda::available()) {
+            if (!useGpuIso && (wantGpu || wantAuto) && raster_cuda::available()) {
                 gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
                 if (gpuRaster)
                     std::printf("[raster] GPU rasterizer: frames on the GPU "
@@ -4196,6 +4236,14 @@ static int run(int argc, char** argv) {
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
+            // G2: cast primary rays straight at the implicit on the GPU (no tessellation).
+            // A physical-lens camera isn't covered by the pinhole/fisheye ray-gen, so it
+            // falls through to the tessellated path (built lazily on first need).
+            if (useGpuIso && !cam.hasLens()) {
+                std::vector<uint8_t> img =
+                    renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock);
+                if (!img.empty()) return img;
+            }
             if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
@@ -4203,6 +4251,7 @@ static int run(int argc, char** argv) {
                 if (!img.empty()) return img;
             }
 #endif
+            ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
                                        rasterSeeThrough, rasterClarity, &scene.textures);
         };

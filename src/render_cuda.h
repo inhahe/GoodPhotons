@@ -170,3 +170,23 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr);
+
+// True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
+// (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),
+// and a non-physical camera (dGenRay handles pinhole + fisheye/panoramic; a mesh-lens
+// camera falls back to the CPU raster). When false the caller must use raster::renderFrame.
+bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam);
+
+// GPU deterministic primary-ray isosurface PREVIEW (G2). Casts one pixel-centre primary
+// ray per pixel, finds the nearest surface with the shared closestHit (which sphere-traces
+// implicit isosurfaces directly — NO tessellation), and shades it once with the same solid
+// preview model as raster::renderFrame (flat per-material albedo, ambient + Σ weighted N·L
+// keys + a headlight fill). Returns W*H*3 RGB8 (row 0 = image top), tone-mapped by the
+// SHARED raster::exposeAndEncode so it matches the CPU `-raster` output and honours a
+// camera_path's locked auto-exposure anchor. Returns an EMPTY vector on any device failure
+// or unsupported config so the caller can fall back to the CPU rasterizer.
+#include <vector>
+#include <cstdint>
+std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
+                                          int W, int H, int nThreads, double exposure = 1.0,
+                                          bool autoExpose = true, double* lockAnchor = nullptr);
