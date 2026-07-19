@@ -10,6 +10,22 @@ Origin tags point at the authoritative design text for each item.
 
 ---
 
+## 0. Parametric records — FTSL data structure  *(design locked; full spec in `ROADMAP_records.md`)*
+
+A named record over a scalar domain whose channels are named after real material slots,
+sampled by a per-hit driver expression, with nearest/linear/smooth interpolation and
+ordered last-write-wins `from` composition. **See [`ROADMAP_records.md`](ROADMAP_records.md)
+for the authoritative spec and the 6-stage build plan.**
+
+- [ ] **Stage 1** — tokenizer `[` `]` + `NAME = range LO-HI [ … ]` declaration parse & data model.
+- [ ] **Stage 2** — channel eval (nearest/linear/smooth + expr stops + spectrum RGB-lerp→Jakob–Hanika) → slots.
+- [ ] **Stage 3** — driver binding + inline `material NAME(driver)` in geometry.
+- [ ] **Stage 4** — `material "m" { from R(d) … slot=expr/channel }` ordered last-write-wins + selectors.
+- [ ] **Stage 5** — all-scope value sites.
+- [ ] **Stage 6** — GPU parity (bake like `ProcTexture`).
+
+---
+
 ## A. Camera-curve bridge + orientation axes  *(design locked in conversation; NOT previously written to any file — captured here so it isn't lost)*
 
 **Context.** loom's `Camera` (`tools/loom/loom/scene.py` `Camera.emit`, ~line 396) currently
