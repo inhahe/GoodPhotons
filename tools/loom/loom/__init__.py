@@ -36,6 +36,7 @@ from .material import (
     waves, checker, rings, blobs,
 )
 from .record import Record, RecordChannel, RecordStop
+from .ladder import parse_ladder, emit_ladder, shape as ladder_shape
 from .sweep import (
     rmf_frames, tangents, sweep_rings, skin_rings, circle_profile, line_profile,
     write_obj,
@@ -86,6 +87,7 @@ __all__ = [
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
     "waves", "checker", "rings", "blobs",
     "Record", "RecordChannel", "RecordStop",
+    "parse_ladder", "emit_ladder", "ladder_shape",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
     "mesh_field",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",

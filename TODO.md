@@ -1075,8 +1075,9 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with a **delimiter
          precedence ladder** (whitespace binds like `×`, comma like `+`, brackets = parens), so structure is
          recoverable from the delimiters alone and the channel's arity only *validates*: `tint [rgb 0 0 0,
-         0 1 0, 1 1 1]` ≡ `tint rgb (0 0 0) (0 1 0) (1 1 1)`; position pins (`.2:0 0 0`) are an orthogonal
-         `POS:` prefix. **NB: current FTSL cannot parse this** — its tokenizer isn't comma-aware and every
+         0 1 0, 1 1 1]` ≡ `tint rgb [0 0 0] [0 1 0] [1 1 1]` (the three ladder delimiters are `[ ]` / `,` /
+         whitespace — parens are reserved for expressions + the §3.2 application surface); position pins
+         (`.2:0 0 0`) are an orthogonal `POS:` prefix. **NB: current FTSL cannot parse this** — its tokenizer isn't comma-aware and every
          whitespace-word is a separate stop, so today an rgb curve is `reflect spectrum:steel spectrum:gold …`
          (one `:`-ref per stop). loom's J3a parser mirrors *that* (whitespace-split single tokens); the
          ladder/inline-tuple form is this J3b superset.
@@ -1099,6 +1100,16 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **J3b started — delimiter-precedence-ladder parser (`loom/ladder.py`, item 2).** Built the pure
+  parser for the generalized stop grammar locked in §3.1: `parse_ladder(str)` → nested `list`/`str` tree with
+  whitespace = `×` (juxtaposition/vector), comma = `+` (outer level), brackets = parens; single-level groups
+  unwrap (`[1 1 1]` ≡ `1 1 1`) and sum-of-products ≡ product-of-groups (`1 1 1, 2 2 2` ≡ `[1 1 1] [2 2 2]`).
+  Parens `( )` are opaque atoms (not a delimiter), so `clamp(x,0,1)` stays one leaf. Plus `emit_ladder`
+  (round-trips) and `shape` (rectangular dims, raises on ragged). 22 tests (`tests/test_ladder.py`), 649 loom
+  green. Exported (`parse_ladder`/`emit_ladder`/`ladder_shape`); DESIGN.md §8a. **Fixed a spec slip**: §3.1/
+  TODO had used parens for explicit grouping (`rgb (0 0 0)`) — corrected to brackets (`rgb [0 0 0]`), since
+  `()` is reserved for expressions + the §3.2 application surface. Next J3b step: wire this into `Record` for
+  arbitrary-arity channels (item 1).
 - 2026-07-19: **Locked the generalized grammar's delimiter + binding model (§3.1/§3.2).** Design converged
   with the user on two points. (1) **Delimiter precedence ladder** replaces the earlier "interchangeable in
   any order" framing: whitespace binds like `×`, comma like `+`, brackets are parens — so `1 1 1, 2 2 2`

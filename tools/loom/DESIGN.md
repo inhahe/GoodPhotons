@@ -262,6 +262,19 @@ redistribute evenly between anchors exactly as ftrace does.
   deferred to the full-scene parser, J3c). Higher channel arities are the loom-only
   superset (J3b).
 
+**Ladder parser (`ladder.py`, J3b item 2).** The generalized stop grammar
+(`ROADMAP_records.md` §3.1) authors arbitrary-arity nested values with a delimiter
+*precedence ladder* — **whitespace binds like `×`, comma like `+`, brackets are parens**
+— so `1 1 1, 2 2 2` parses like `(1·1·1)+(2·2·2)` and structure is recoverable from the
+delimiters alone. `parse_ladder(str)` → nested `list`/`str` tree (leaves are raw tokens);
+`emit_ladder(v)` renders it back canonically (space-join a flat vector, comma-join with
+bracket-wrapped multi-level children — round-trips); `shape(v)` reports rectangular dims.
+Parens `( )` are **not** a ladder delimiter (reserved for expressions / the §3.2
+application surface) — a parenthesised run is an opaque atom, so `clamp(x,0,1)` is one
+leaf. This is loom-only authoring; current ftrace's tokenizer is not comma-aware and
+cannot parse it. *Not yet wired into `Record` — the next J3b step is arbitrary-arity
+channels built on this parser.*
+
 ---
 
 ## 9. Layer 6 — Drivers / IO
@@ -299,6 +312,7 @@ tools/loom/
     iso.py                  isosurface + N-D slicer emit (new)
     material.py             function-driven material emit (new)
     record.py               parametric record twin: emit + parse + sample (J3a)
+    ladder.py               delimiter-precedence-ladder parser (J3b item 2)
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)

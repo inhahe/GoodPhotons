@@ -200,8 +200,13 @@ with no delimiters). All of these equivalences fall straight out of the ladder:
 1 1 1                 ≡  [1 1 1]                         # 3-vector; bracketing one level is idempotent
 1 1 1, 2 2 2, 3 3 3   ≡  [1 1 1] [2 2 2] [3 3 3]         # 3 stops of 3 components each
 tint  [rgb 0 0 0, 0 1 0, 1 1 1]                          # tagged rgb channel, 3 stops
-tint  rgb (0 0 0) (0 1 0) (1 1 1)                        # same, explicit per-stop parens
+tint  rgb [0 0 0] [0 1 0] [1 1 1]                        # same, explicit per-stop brackets
 ```
+
+The three ladder delimiters are exactly **`[ ]`, comma, and whitespace** — *parens `( )`
+are not a grouping delimiter here*; they are reserved for expression grouping and the
+function-application / rebinding surface of §3.2 (`prop(2)`, `gold.color(u=x)`,
+`sin(v)`).
 
 The subtlety that keeps it consistent: **whitespace separates *siblings* at the current
 level** — when the siblings are scalars you get a vector; when they are already-bracketed
