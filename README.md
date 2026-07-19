@@ -100,6 +100,9 @@ Useful CMake options:
 ## Quick start
 
 ```sh
+# List the common flags, grouped by task, and exit
+ftrace -h            # or --help
+
 # Built-in Cornell box, forward pinhole splat (mode B), 512²
 ftrace -scene cornell -n 200000000 -r 512 -o cornell.png
 
@@ -112,6 +115,11 @@ ftrace -in scenes/realcam.ftsl -n 6000000 -o realcam.png
 # Render until a wall-clock budget with a live preview
 ftrace -in scenes/group.ftsl -time 120 -preview -o group.png
 ```
+
+Run `ftrace -h` (or `--help`) for a grouped summary of the common flags. An
+unrecognized `-flag` (e.g. a typo) is a hard error — ftrace prints
+`unknown option '…'` and exits non-zero rather than silently falling back to the
+default demo render.
 
 ---
 
