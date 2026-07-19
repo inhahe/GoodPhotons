@@ -5,16 +5,41 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN BUG (2026-07-19): `gallery_settled.ftsl` — several objects mis-positioned (e.g. resting through the floor)
-User reports that in `gallery_settled.ftsl` several objects sit in the wrong place — notably some
-appear on / sunk into the floor rather than where they belong. Not yet root-caused. Candidates to
-check: (a) the "settle" bake (if positions were produced by a physics/relaxation pass, an off-by-one
-frame or a stale bake), (b) a loom emit vs ftrace-parse mismatch on transform/center ordering for
-whatever primitives are involved, (c) a floor plane at the wrong height. **Repro:** render
-`gallery_settled.ftsl` and compare object placement to intent. **Next step:** diff the emitted
-positions against the authoring script, and render a single-frame `-window` still to see which
-objects are off. (Distinct from the separate OPEN mode-D GPU-BDPT launch-failure on the same scene,
-logged 2026-07-15.)
+### RESOLVED (2026-07-19): `gallery_settled.ftsl` — several objects mis-positioned (resting on the floor)
+**Root cause:** the free-settle physics bake tumble, not a transform/collider/floor bug. Three of the
+five settled pieces landed correctly; klein (COM y≈0.37) and heart (y≈0.14) had tipped, rolled past
+the rim of their NARROW museum pedestals, and fallen to the floor. Verified by recovering each piece's
+settled COM height from the baked `group` delta (`pos_sim = R·c_auth + t`; see
+`scraps/check_settle_heights.py`) — confirming the transform math and colliders were correct and only
+the two tippy shapes had walked off their caps. **Fix:** added a during-sim horizontal restoring
+spring to `tools/settle_scene.py` (`--tether [k]`, default k=150) applied AT each body's COM every
+step, pulling it back toward its authored XZ. Because it acts at the COM it exerts **zero torque**, so
+a piece is still free to tip/rotate onto its cap but cannot walk off it sideways — the result is a
+genuine physics rest pose that stayed home. At k=150 all five pieces settle onto their stands in one
+pass (klein rescued 0.37→1.38, heart 0.14→1.12). The committed `gallery_settled.ftsl` was repaired by
+swapping the five tumbled `group` deltas for the tether-settled values. (Distinct from the separate
+OPEN mode-D GPU-BDPT launch-failure on the same scene, logged 2026-07-15.)
+
+### TECH DEBT (2026-07-19): `scenes/gallery_settled.ftsl` has diverged from its authored source `scenes/gallery.ftsl`
+The generated settled file was hand-edited by three later commits (4c86261 prefer{}/else{} camera
+mode-D/B fallback, f0786d6 flyby `frames 600`, bc9d664 scene-level `default_mode` + fps hint) that were
+**never back-ported** to the authored `scenes/gallery.ftsl` (still plain `camera mode D`, `frames 144`).
+So the "generated" file is now the de-facto source of truth for those features, and re-running
+`tools/settle_scene.py --scene scenes/gallery.ftsl` would silently REGRESS them. That is why the
+2026-07-19 floor-bug fix above patched the five `group` deltas in place instead of regenerating. **Proper
+fix:** reconcile the two — back-port the camera/frames/default_mode authoring into `gallery.ftsl` so the
+settled file is fully regeneratable from source, then regenerate with `--tether`. Blocked on confirming
+authoring intent (is `frames 600` or `144` canonical? is the prefer/else wrapper wanted in source?).
+
+### TECH DEBT (2026-07-19): settle sim slow — non-manifold stand colliders won't decimate below ~150–390k tris
+`tools/settle_scene.py` decimates static concave colliders to `STATIC_TRI_CAP` (4000) via
+`trimesh.simplify_quadric_decimation`, but the marching-cubes museum-stand meshes are multi-shell /
+non-manifold (unions of boxes), so quadric edge-collapse gives up early and only reduces them ~65%
+(e.g. stand meshes 500k–1M → 150k–390k tris), keeping per-step collision cost high. Clean closed meshes
+(gyroid, lamp) hit 4000 fine. Worked around by validating at `--mesh-res 64`. **Proper fix candidates:**
+(a) VHACD-decompose the static stands into convex compounds too (fast convex-vs-convex collision), or
+(b) vertex-clustering / voxel-remesh decimation that ignores topology, or (c) approximate each stand
+with authored box/cylinder primitive colliders instead of the polygonised isosurface.
 
 ### FEATURE REQUEST (2026-07-19): cache ftrace's per-scene preprocessing before rasterizing
 Add an option to **cache the scene-derived data ftrace computes at load** (tessellation / BVH /
