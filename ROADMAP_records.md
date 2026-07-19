@@ -202,8 +202,17 @@ struct Record {
      Forward-only: `cudaForwardSupported` accepts reflect records; `cudaBdptSupported`
      rejects *all* record bindings because the BDPT connection BSDF (`dBsdfF`) has no
      per-hit `DHit` to evaluate a driver. Validated on `scenes/_record_bind.ftsl`.
-   - **6b — scalar slot (roughness).** Upload scalar-channel stop programs + driver,
-     device `recSampleScalar` twin, route `dMatRoughness`, relax the roughness rejection.
+   - **6b — scalar slot (roughness) (DONE).** Scalar stops evaluate per-hit (they may
+     reference hit vars), so they are NOT baked to a LUT: each stop's compiled `expr`
+     program uploads via `DScene::recScalarStops` (`DRecScalarStop{pos,exprOff,exprN}`)
+     + the shared `recDrivers` program pool, and `dRecSampleScalar` mirrors `recSampleScalar`
+     exactly (recLocate → nearest/linear/monotone-cubic Fritsch–Carlson, evaluating each
+     bounding stop at the hit first). `DMaterial.recRoughMode` (−1/0/1/2) routes
+     `dMatRoughness` → `dRecordRoughness`; `cudaForwardSupported` now accepts roughness
+     records. Validated on `scenes/_record_rough.ftsl` (driven `rough(u)`/`rough(noise)`)
+     and `scenes/_record_override.ftsl` (mode-0 direct-expr roughness). This change also
+     completed 6a's routing in the backward-reference megakernel (mirror/grating/
+     halfmirror/glossy reflect reads → `dReflectSlot`). BDPT still CPU-only.
 
 Each stage: build (`cmake --build build_cuda2 --config Release --target ftrace`, then
 `cp build_cuda2/bin/ftrace.exe ftrace.exe`), add tests, validate with a windowed

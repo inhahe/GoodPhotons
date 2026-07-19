@@ -265,6 +265,19 @@ struct DMaterial {
     int    recReflOff;
     int    recReflDrvOff, recReflDrvN;
     float  recReflLo, recReflHi;
+    // Parametric-record ROUGHNESS binding (scalar slot — §records stage 6b, device twin of
+    // the CPU materialRoughness record path). recRoughMode: -1 none; 0 direct scalar
+    // expression (recordIndex<0; program recDrivers[recRoughDrvOff .. +recRoughDrvN));
+    // 1 constant selStop (one stop expr recScalarStops[recRoughStopOff], evaluated per-hit);
+    // 2 per-hit driven (driver recDrivers[recRoughDrvOff..) picks a position over the stop
+    // range, then recScalarStops[recRoughStopOff .. +recRoughStopN) are evaluated per-hit
+    // and interpolated by recRoughInterp — exactly recSampleScalar). Result clamped [0,1];
+    // consulted first by dMatRoughness. BDPT rejects record materials to CPU.
+    int    recRoughMode;
+    int    recRoughDrvOff, recRoughDrvN;
+    int    recRoughStopOff, recRoughStopN;
+    int    recRoughInterp;
+    float  recRoughLo, recRoughHi;
 };
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
 #define D_NO_PRIORITY (-2147483647 - 1)
@@ -511,6 +524,10 @@ struct DEnvMap {
     const double* condFuncInt = nullptr;  // h
 };
 
+// One scalar-record stop on the device (§records stage 6b): its domain position + a slice
+// of the shared recDrivers PatNode pool holding the stop's per-hit expression program.
+struct DRecScalarStop { double pos; int exprOff; int exprN; };
+
 struct DScene {
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
@@ -545,6 +562,10 @@ struct DScene {
     // (Constant selStop bindings are baked into DMaterial::reflect[] and use neither pool.)
     const double*    recCoeff;
     const PatNode*   recDrivers;
+    // Parametric-record ROUGHNESS scalar-stop table (§records stage 6b): each driven /
+    // constant-selStop roughness binding's stops (pos + expr slice into recDrivers),
+    // sliced by DMaterial::recRoughStopOff/recRoughStopN. Null when no scalar record is bound.
+    const DRecScalarStop* recScalarStops;
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
@@ -2888,10 +2909,90 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
                         h.n.x, h.n.y, h.n.z, r, h.u, h.v);
 }
 
+// Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
+__device__ static double dRecFCTangent(const double* pos, const double* sec, int n, int k) {
+    if (k == 0)     return sec[0];
+    if (k == n - 1) return sec[n - 2];
+    double s0 = sec[k - 1], s1 = sec[k];
+    if (s0 * s1 <= 0.0) return 0.0;
+    double h0 = pos[k]     - pos[k - 1];
+    double h1 = pos[k + 1] - pos[k];
+    double w0 = 2.0 * h1 + h0, w1 = h1 + 2.0 * h0;
+    return (w0 + w1) / (w0 / s0 + w1 / s1);
+}
+// Evaluate one scalar-record stop's per-hit expression program at the hit.
+__device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, const DHit& h) {
+    if (s.exprN <= 0) return 0.0;
+    double px = h.p.x, py = h.p.y, pz = h.p.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+}
+// Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
+// evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
+__device__ static double dRecSampleScalar(const DScene& sc, const DRecScalarStop* stops,
+                                          int n, int interp, const DHit& h, double d) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return dRecStopVal(sc, stops[0], h);
+    double lo = stops[0].pos, hi = stops[n - 1].pos;
+    if (d < lo) d = lo; else if (d > hi) d = hi;
+    int i = 0;                                             // recLocate
+    while (i < n - 2 && d > stops[i + 1].pos) ++i;
+    double p0 = stops[i].pos, p1 = stops[i + 1].pos;
+    double span = p1 - p0;
+    double t = (span > 1e-12) ? (d - p0) / span : 0.0;
+    if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+    if (interp == (int)RecInterp::Nearest)
+        return dRecStopVal(sc, stops[t < 0.5 ? i : i + 1], h);
+    double v0 = dRecStopVal(sc, stops[i], h), v1 = dRecStopVal(sc, stops[i + 1], h);
+    if (interp == (int)RecInterp::Linear) return v0 + (v1 - v0) * t;
+    // Smooth: monotone cubic Hermite (evaluate all stop values + secants once).
+    double vs[64], ps[64], sec[64];
+    int m = n < 64 ? n : 64;
+    for (int k = 0; k < m; ++k) { vs[k] = dRecStopVal(sc, stops[k], h); ps[k] = stops[k].pos; }
+    for (int k = 0; k < m - 1; ++k) {
+        double hh = ps[k + 1] - ps[k];
+        sec[k] = (hh > 1e-12) ? (vs[k + 1] - vs[k]) / hh : 0.0;
+    }
+    if (i > m - 2) i = m - 2;
+    double mk  = dRecFCTangent(ps, sec, m, i);
+    double mk1 = dRecFCTangent(ps, sec, m, i + 1);
+    double hh  = ps[i + 1] - ps[i];
+    double t2 = t * t, t3 = t2 * t;
+    double h00 =  2 * t3 - 3 * t2 + 1;
+    double h10 =      t3 - 2 * t2 + t;
+    double h01 = -2 * t3 + 3 * t2;
+    double h11 =      t3 -     t2;
+    return h00 * vs[i] + h10 * hh * mk + h01 * vs[i + 1] + h11 * hh * mk1;
+}
+// Per-hit roughness from a bound scalar record, if the material binds one (device twin of
+// the record branch of materialRoughness). Returns true + sets `out` (clamped [0,1]).
+__device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, const DHit& h, Real& out) {
+    if (m.recRoughMode < 0) return false;
+    double v;
+    if (m.recRoughMode == 0) {                             // direct scalar expression
+        double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
+        v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+    } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
+        v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
+    } else {                                               // per-hit driven
+        double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
+        double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+        v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
+                             m.recRoughInterp, h, d);
+    }
+    out = (Real)(v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v));
+    return true;
+}
+
 // Per-hit glossy roughness / thin-film thickness (device twins of materialRoughness
-// / materialFilmThickness): a bound pattern (highest priority) or scalar map's value
-// at the hit, else the constant.
+// / materialFilmThickness): a bound record (highest priority), then a bound pattern or
+// scalar map's value at the hit, else the constant.
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    Real rr;
+    if (dRecordRoughness(sc, m, h, rr)) return rr;
     if (m.roughnessPat >= 0) {
         double r = dPatternScalarAt(sc, m.roughnessPat, h);
         return (Real)(r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r));
@@ -3927,19 +4028,19 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_MIRROR: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() >= r) return L;       // RR absorb
                 ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
             }
             case D_GRATING: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() >= r) return L;
                 DVec3 nro, nrd;
                 if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return L;
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_HALFMIRROR: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
                 else                   { ro = h.p + rd * RAY_EPS; }
                 specularArrival = true; break;
@@ -3952,7 +4053,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 specularArrival = true; break;
             }
             case D_GLOSSY: {
-                Real r = clamp01(specLookup(mp->reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
                 if (rng.uniform() >= r) return L;
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                 if (dot(o, h.n) <= 0) return L;
@@ -4888,15 +4989,23 @@ bool cudaForwardSupported(const Scene& scene) {
     // fallback here. (The GPU BDPT kernel still can't MIS either — cudaBdptSupported gates
     // both.) Implicit surfaces (isosurface) are gated separately below.
     // Parametric records (§records) drive a material's slots from a per-hit driver
-    // sampling a named LUT bank. Stage 6a put the REFLECT slot on the device: a constant
-    // selStop reflect binding bakes straight into reflect[] at upload, and a per-hit
-    // *driven* reflect binding samples the uploaded recCoeff LUT via recDrivers
-    // (dRecordReflect / dReflectSlot / dDiffuseRho). Only the SCALAR (roughness) slot has
-    // no device path yet (stage 6b), so a roughness record binding still forces the CPU
-    // forward/backward tracer — otherwise the slot keeps its unset constant.
+    // sampling a named LUT bank. Stages 6a/6b put BOTH slots on the device forward +
+    // backward-reference tracers: REFLECT (constant selStop baked into reflect[], driven
+    // via recCoeff LUT + recDrivers → dRecordReflect / dReflectSlot / dDiffuseRho) and the
+    // SCALAR roughness slot (direct expr / constant selStop / driven stops evaluated
+    // per-hit → dRecordRoughness / dMatRoughness). The only remaining CPU-only case is a
+    // per-hit *driven* scalar channel with >64 stops, which overflows the device interp
+    // arrays (dRecSampleScalar vs[64]) — vanishingly rare, kept on CPU for safety.
     auto usesRecord = [&](int matId) {
-        return matId >= 0 && matId < (int)scene.mats.size() &&
-               scene.mats[matId].recBindingFor(REC_SLOT_ROUGHNESS) != nullptr;
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const RecBinding* rb = scene.mats[matId].recBindingFor(REC_SLOT_ROUGHNESS);
+        if (!rb) return false;
+        if (rb->recordIndex >= 0 && rb->recordIndex < (int)scene.records.size() && rb->selStop < 0) {
+            const Record& rec = scene.records[rb->recordIndex];
+            if (rb->channel >= 0 && rb->channel < (int)rec.channels.size() &&
+                (int)rec.channels[rb->channel].stops.size() > 64) return true;
+        }
+        return false;
     };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
@@ -5143,6 +5252,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // recCoeffPool and copies its driver program into recDrvPool; DMaterial slices both.
     std::vector<double>  recCoeffPool;
     std::vector<PatNode> recDrvPool;
+    // Scalar (roughness) record stops: each stop's domain position + its per-hit expression
+    // program (appended to recDrvPool). DMaterial::recRoughStopOff/N slice this (stage 6b).
+    std::vector<DRecScalarStop> recStopPool;
     for (size_t i = 0; i < scene.mats.size(); ++i) {
         const Material& m = scene.mats[i]; DMaterial& d = mats[i];
         d.type = (int)m.type;
@@ -5216,6 +5328,50 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 }
             }
         }
+        // --- parametric-record ROUGHNESS binding (scalar slot — §records stage 6b) ---
+        // Device twin of the record branch of materialRoughness. Scalar stops evaluate
+        // per-hit (they can reference hit vars), so — unlike the reflect coeff LUT — nothing
+        // bakes to a table: each stop's expression program is copied verbatim and evaluated
+        // on-device. `appendProg` copies a PatNode program into the shared recDrvPool.
+        auto appendProg = [&](const std::vector<PatNode>& prog, int& off, int& n) {
+            off = (int)recDrvPool.size();
+            n   = (int)prog.size();
+            recDrvPool.insert(recDrvPool.end(), prog.begin(), prog.end());
+        };
+        d.recRoughMode = -1;
+        d.recRoughDrvOff = 0; d.recRoughDrvN = 0;
+        d.recRoughStopOff = 0; d.recRoughStopN = 0;
+        d.recRoughInterp = (int)RecInterp::Linear;
+        d.recRoughLo = 0.0f; d.recRoughHi = 1.0f;
+        if (const RecBinding* rb = m.recBindingFor(REC_SLOT_ROUGHNESS)) {
+            if (rb->recordIndex < 0) {                                   // direct scalar expr
+                d.recRoughMode = 0;
+                appendProg(rb->driver, d.recRoughDrvOff, d.recRoughDrvN);
+            } else if (rb->recordIndex < (int)scene.records.size()) {
+                const Record& rec = scene.records[rb->recordIndex];
+                const RecChannel& ch = rec.channels[rb->channel];
+                auto pushStop = [&](const RecStop& s) {
+                    DRecScalarStop ds; ds.pos = s.pos;
+                    appendProg(s.expr, ds.exprOff, ds.exprN);
+                    recStopPool.push_back(ds);
+                };
+                if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+                    d.recRoughMode = 1;                                  // constant selStop
+                    d.recRoughStopOff = (int)recStopPool.size();
+                    d.recRoughStopN   = 1;
+                    pushStop(ch.stops[rb->selStop]);
+                } else if ((int)ch.stops.size() <= 64) {                 // per-hit driven
+                    d.recRoughMode = 2;
+                    appendProg(rb->driver, d.recRoughDrvOff, d.recRoughDrvN);
+                    d.recRoughStopOff = (int)recStopPool.size();
+                    d.recRoughStopN   = (int)ch.stops.size();
+                    for (const RecStop& s : ch.stops) pushStop(s);
+                    d.recRoughInterp = (int)rec.interp;
+                    d.recRoughLo = (float)rec.lo; d.recRoughHi = (float)rec.hi;
+                }
+                // (>64 stops: recRoughMode stays -1; cudaForwardSupported gates it to CPU.)
+            }
+        }
     }
 
     // --- upload geometry/materials ---
@@ -5235,9 +5391,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DTri*       d_blasT  = blasTris.empty()  ? nullptr : (DTri*)keep(uploadVec(blasTris));
     PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
     DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
-    // Parametric-record reflect pools (§records stage 6a).
+    // Parametric-record reflect pools (§records stage 6a) + scalar-stop pool (stage 6b).
     double*     d_recCoeff = recCoeffPool.empty() ? nullptr : (double*)keep(uploadVec(recCoeffPool));
     PatNode*    d_recDrv   = recDrvPool.empty()   ? nullptr : (PatNode*)keep(uploadVec(recDrvPool));
+    DRecScalarStop* d_recStops = recStopPool.empty() ? nullptr : (DRecScalarStop*)keep(uploadVec(recStopPool));
 
     // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
@@ -5353,7 +5510,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
-    sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv;
+    sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;

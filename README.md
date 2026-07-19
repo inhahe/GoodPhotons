@@ -587,10 +587,11 @@ stay non-resumable.
   material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
   reproduce. **Parametric records** (a material's slots driven by a per-hit driver
   sampling a named LUT bank — see *Parametric records* below) run on the **GPU forward
-  and backward tracers for the reflect/albedo slot** (constant stop selectors bake into
-  the device material; per-hit driven reflect uploads the record's LUT + driver program
-  and samples it on-device). A record driving a **scalar** slot (roughness) still forces
-  the CPU tracer, and **any** record-bound scene falls back on GPU **BDPT** (mode `D`) —
+  and backward tracers for both the reflect/albedo and roughness slots** (constant stop
+  selectors bake into the device material; per-hit driven reflect uploads the record's
+  baked LUT + driver program, and a driven scalar/roughness slot uploads each stop's
+  compiled expression + driver — both sampled on-device by exact twins of the CPU
+  sampler). **Any** record-bound scene still falls back on GPU **BDPT** (mode `D`) —
   its MIS connection BSDF has no per-hit surface point to evaluate the driver. The
   fallback is automatic. `cpu` is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
@@ -810,10 +811,10 @@ sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled 
 
 Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
 is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
-A record driving the **reflect/albedo** slot runs on the **GPU** forward and backward
-tracers (the LUT + driver program upload to the device); a record driving a **scalar**
-slot (roughness) still forces the CPU tracer, and any record-bound scene falls back on
-**GPU BDPT** (mode `D`). Fallback is automatic. See FTSL.md §7.5 for the full grammar.
+A record driving the **reflect/albedo** *or* **roughness** slot runs on the **GPU**
+forward and backward tracers (the LUT/stop programs + driver upload to the device and
+are sampled by device twins of the CPU sampler); any record-bound scene still falls back
+on **GPU BDPT** (mode `D`). Fallback is automatic. See FTSL.md §7.5 for the full grammar.
 
 ---
 

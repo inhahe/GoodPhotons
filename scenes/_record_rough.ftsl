@@ -1,0 +1,28 @@
+scene { units meters }
+spectrum "steel" = rgb 0.62 0.64 0.68
+
+# scalar record: roughness ramps 0.02 -> 0.9 across the driver domain
+rough = range 0-1 [
+    roughness  0.02  0.9
+    interp     smooth
+]
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+# Stage-6b validation: glossy base, roughness DRIVEN by a scalar record per hit
+# (mode-2 device path — dRecSampleScalar). Verifies CPU/GPU driven-roughness parity.
+material "sweep" { type glossy  from rough(u) }
+material "mott"  { type glossy  from rough(noise(6*x,6*y,6*z)) }
+
+quad { origin 0 0 0  u 1 0 0  v 0 0 1  material white }
+quad { origin 0 1 0  u 0 0 1  v 1 0 0  material white }
+quad { origin 0 0 0  u 1 0 0  v 0 1 0  material white }
+quad { origin 0 0 0  u 0 0 1  v 0 1 0  material red }
+quad { origin 1 0 0  u 0 1 0  v 0 0 1  material green }
+
+sphere { center 0.32 0.24 0.52  radius 0.21  material sweep }
+sphere { center 0.72 0.24 0.46  radius 0.19  material mott }
+
+light area { origin 0.35 0.999 0.35  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  spd preset:bb6500 }
+camera "cam" { eye 0.5 0.5 2.4  look_at 0.5 0.30 0.5  up 0 1 0  fov_y 42  mode R  film { res 200 200 } }
