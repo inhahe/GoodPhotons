@@ -24,19 +24,26 @@ Model (matching the generalized spec, ``ROADMAP_records.md`` §3):
   pinned domain position (author ``p:<pos>`` prefix).  Unpinned stops are spread evenly
   between their pinned/anchor neighbours exactly as ftrace does.
 
-Two grammars, kept separate:
+One backward-compatible ladder grammar (:meth:`Record.emit` / :meth:`Record.parse`
+/ :meth:`parse_all`) that is a strict **additive superset** of current FTSL — not a
+breaking change.  Each channel line is dispatched on the presence of a top-level
+comma (:meth:`_split_top_commas`):
 
-* **current FTSL (J3a)** — :meth:`Record.emit` / :meth:`Record.parse` / :meth:`parse_all`.
-  ftrace's record body parser makes every *whitespace*-word its own stop and counts a
-  stop as colour only when its single token contains ``':'``; its tokenizer is not
-  comma-aware, so inline ``rgb r g b`` triples are not parseable.  This path mirrors that
-  exactly and round-trips every real ``scenes/_record_*.ftsl``.  ``emit`` rejects a
-  vector channel (not representable here).
-* **generalized ladder grammar (J3b)** — :meth:`Record.emit_generalized` /
-  :meth:`parse_generalized` (``ROADMAP_records.md`` §3.1).  Stops are *comma*-separated
-  and vector components *space*-separated (``tint  0 0 0, 1 1 1`` is a 2-stop arity-3
-  channel), using the delimiter precedence ladder (:mod:`loom.ladder`).  This is the
-  loom authoring superset; **current ftrace cannot parse it**.
+* **no top-level comma → whitespace stops** (the current-FTSL path).  Every
+  *whitespace*-word is its own stop and a stop is colour only when its token
+  contains ``':'`` — so ``reflect  spectrum:steel spectrum:gold`` is two colour
+  stops and ``rough  0 0 0`` is three scalar stops, exactly as ftrace reads them.
+  Every real ``scenes/_record_*.ftsl`` round-trips through this path unchanged.
+* **top-level comma present → comma stops** (the J3b generalized superset,
+  ``ROADMAP_records.md`` §3.1).  Stops are *comma*-separated and vector components
+  *space*-separated (``tint  0 0 0, 1 1 1`` is a 2-stop arity-3 channel), parsed via
+  the delimiter precedence ladder (:mod:`loom.ladder`).  A *lone* vector stop is
+  written with a trailing comma (``tint  0 0 0,``) so it can't be misread as N
+  scalar stops.  ftrace's own tokenizer is not comma-aware, so a record that
+  actually uses comma lines is loom-only until ftrace's parser is upgraded (J3c).
+
+:meth:`emit` picks the right form per channel automatically: scalar/colour channels
+emit as whitespace lines, vector channels as comma lines.
 
 What this module also does **not** do (deferred to J3c's full pattern VM): evaluate
 *expression* stops.  The numeric :meth:`Record.sample` sampler works on all-numeric
@@ -420,50 +427,44 @@ class Record(Element):
         return f"{fmt(self.lo)} {fmt(self.hi)}"
 
     def emit(self, ctx: Optional[EmitCtx] = None) -> str:
-        """Emit the current-FTSL ``NAME = range LO-HI [ … ]`` block (J3a grammar:
-        whitespace-separated stops).  A vector channel is not representable in this
-        grammar — call :meth:`emit_generalized` instead."""
-        if self.has_vector_channel:
-            raise TypeError(
-                f"record {self.name!r} has a vector channel — not representable in the "
-                "current-FTSL (whitespace-stop) grammar; use emit_generalized()")
+        """Emit the ``NAME = range LO-HI [ … ]`` block in the one backward-compatible
+        ladder grammar.  Each channel picks its form automatically: a scalar/colour
+        channel emits whitespace-separated stops (identical to current FTSL), a vector
+        channel emits comma-separated stops with space-separated components (a lone
+        vector stop gets a trailing comma so it can't be misread as N scalar stops).
+        Round-trips through :meth:`parse`."""
         dom = self._domain_str()
         # pad channel names (+ the interp keyword) to a common width for tidy columns
         names = [ch.name for ch in self.channels]
         width = max([len(n) for n in names] + [len("interp")])
         lines = [f"{self.name} = range {dom} ["]
         for ch in self.channels:
-            toks: List[str] = []
-            for s in ch.stops:
-                if s.pinned:
-                    toks.append(f"p:{fmt(s.pos)}")
-                toks.append(s.token)
-            lines.append(f"    {ch.name.ljust(width)}  " + "  ".join(toks))
+            lines.append(f"    {ch.name.ljust(width)}  " + self._emit_channel_body(ch))
         if self.interp != "linear":
             lines.append(f"    {'interp'.ljust(width)}  {self.interp}")
         lines.append("]")
         return "\n".join(lines)
 
-    def emit_generalized(self) -> str:
-        """Emit using the **generalized ladder grammar** (J3b, ``ROADMAP_records.md``
-        §3.1): stops are comma-separated and vector components space-separated, so a
-        vector channel round-trips.  **Not parseable by current ftrace** (its tokenizer
-        is not comma-aware) — this is the loom-only authoring superset.  Round-trips
-        through :meth:`parse_generalized`."""
-        dom = self._domain_str()
-        names = [ch.name for ch in self.channels]
-        width = max([len(n) for n in names] + [len("interp")])
-        lines = [f"{self.name} = range {dom} ["]
-        for ch in self.channels:
+    @staticmethod
+    def _emit_channel_body(ch: RecordChannel) -> str:
+        """The stop list of one channel line (whitespace form for scalar/colour,
+        comma form for a vector channel)."""
+        if ch.kind == "vector":
             stop_strs: List[str] = []
             for s in ch.stops:
                 comp = " ".join(s.components)          # a flat vector (space-joined)
                 stop_strs.append(f"p:{fmt(s.pos)} {comp}" if s.pinned else comp)
-            lines.append(f"    {ch.name.ljust(width)}  " + ", ".join(stop_strs))
-        if self.interp != "linear":
-            lines.append(f"    {'interp'.ljust(width)}  {self.interp}")
-        lines.append("]")
-        return "\n".join(lines)
+            body = ", ".join(stop_strs)
+            if len(ch.stops) == 1:
+                body += ","          # disambiguate a lone vector stop from N scalars
+            return body
+        # scalar / colour channel: whitespace-separated tokens (current-FTSL form)
+        toks: List[str] = []
+        for s in ch.stops:
+            if s.pinned:
+                toks.append(f"p:{fmt(s.pos)}")
+            toks.append(s.token)
+        return "  ".join(toks)
 
     # -- parse ---------------------------------------------------------------
 
@@ -499,7 +500,13 @@ class Record(Element):
 
     @classmethod
     def parse(cls, text: str) -> "Record":
-        """Parse a single ``NAME = range LO-HI [ … ]`` block back into a Record."""
+        """Parse a single ``NAME = range LO-HI [ … ]`` block back into a Record.
+
+        One backward-compatible ladder grammar: each channel line is dispatched on
+        whether it contains a top-level comma.  A comma-free line uses the current-FTSL
+        whitespace-stop path (``rough  0 0 0`` = three scalar stops); a comma line uses
+        the generalized ladder path (``tint  0 0 0, 1 1 1`` = two arity-3 vector stops),
+        with a trailing comma marking a lone vector stop (``tint  0 0 0,``)."""
         text = cls._strip_comments(text)
         m = cls._HEADER.search(text)
         if not m:
@@ -520,33 +527,80 @@ class Record(Element):
             line = raw_line.split("#", 1)[0].strip()
             if not line:
                 continue
-            words = line.split()
-            key, rest = words[0], words[1:]
+            parts = line.split(None, 1)
+            key = parts[0]
+            value_text = parts[1].strip() if len(parts) > 1 else ""
             if key == "interp":
-                if not rest or rest[0] not in _INTERP:
+                if value_text not in _INTERP:
                     raise ValueError(
                         f"record {name!r}: interp must be one of {_INTERP}")
-                interp = rest[0]
+                interp = value_text
                 continue
-            stops: List[RecordStop] = []
-            pin: Optional[float] = None
-            for w in rest:
-                if w.startswith("p:"):
-                    pv = w[2:]
-                    if not _is_number(pv):
-                        raise ValueError(
-                            f"record {name!r} channel {key!r}: bad p:<pos> {w!r}")
-                    pin = float(pv)
-                    continue
-                stops.append(RecordStop(w, pin))
-                pin = None
-            if pin is not None:
-                raise ValueError(
-                    f"record {name!r} channel {key!r}: trailing p:<pos> with no value")
-            if not stops:
+            if not value_text:
                 raise ValueError(f"record {name!r} channel {key!r}: has no stops")
+            comma_parts = cls._split_top_commas(value_text)
+            # a trailing top-level comma forces the comma path (its empty tail is the
+            # disambiguator for a lone vector stop) — drop that empty tail.
+            trailing = len(comma_parts) > 1 and comma_parts[-1] == ""
+            if trailing:
+                comma_parts = comma_parts[:-1]
+            if len(comma_parts) > 1 or trailing:
+                stops = cls._parse_comma_stops(name, key, comma_parts)
+            else:
+                stops = cls._parse_ws_stops(name, key, value_text)
             chans.append(RecordChannel(key, stops))
         return cls(name, lo, hi, chans, interp=interp)
+
+    @staticmethod
+    def _parse_ws_stops(name: str, key: str, value_text: str) -> List[RecordStop]:
+        """Current-FTSL whitespace path: every word is a scalar stop; a ``p:<pos>``
+        word pins the stop that follows it."""
+        stops: List[RecordStop] = []
+        pin: Optional[float] = None
+        for w in value_text.split():
+            if w.startswith("p:"):
+                pv = w[2:]
+                if not _is_number(pv):
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: bad p:<pos> {w!r}")
+                pin = float(pv)
+                continue
+            stops.append(RecordStop(w, pin))
+            pin = None
+        if pin is not None:
+            raise ValueError(
+                f"record {name!r} channel {key!r}: trailing p:<pos> with no value")
+        if not stops:
+            raise ValueError(f"record {name!r} channel {key!r}: has no stops")
+        return stops
+
+    @classmethod
+    def _parse_comma_stops(cls, name: str, key: str,
+                           chunks: Sequence[str]) -> List[RecordStop]:
+        """Generalized comma path: each chunk is one stop (a leading ``p:<pos>`` pins
+        it), ladder-parsed into a scalar or a flat vector (:mod:`loom.ladder`)."""
+        stops: List[RecordStop] = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                raise ValueError(
+                    f"record {name!r} channel {key!r}: empty stop (stray comma?)")
+            pin: Optional[float] = None
+            words = chunk.split(maxsplit=1)
+            if words and words[0].startswith("p:"):
+                pv = words[0][2:]
+                if not _is_number(pv):
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: bad p:<pos> {words[0]!r}")
+                pin = float(pv)
+                chunk = words[1] if len(words) > 1 else ""
+                if not chunk.strip():
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: p:<pos> with no value")
+            stops.append(cls._stop_from_ladder(parse_ladder(chunk), pin))
+        if not stops:
+            raise ValueError(f"record {name!r} channel {key!r}: has no stops")
+        return stops
 
     @staticmethod
     def _split_top_commas(s: str) -> List[str]:
@@ -577,65 +631,8 @@ class Record(Element):
         if all(isinstance(c, str) for c in v):
             return RecordStop(list(v), pin)
         raise ValueError(
-            "parse_generalized: a single stop must be a scalar or a flat vector "
+            "record stop: a single stop must be a scalar or a flat vector "
             f"(nested stop value {v!r} not supported)")
-
-    @classmethod
-    def parse_generalized(cls, text: str) -> "Record":
-        """Parse one record block written in the **generalized ladder grammar** (J3b,
-        ``ROADMAP_records.md`` §3.1): stops are comma-separated and vector components
-        space-separated (so ``tint  0 0 0, 1 1 1`` is a 2-stop arity-3 channel).
-
-        This is a *different* grammar from :meth:`parse` (current-FTSL, where whitespace
-        separates stops); it round-trips :meth:`emit_generalized`.  A leading
-        ``p:<pos>`` on a stop pins it.
-        """
-        text = cls._strip_comments(text)
-        m = cls._HEADER.search(text)
-        if not m:
-            raise ValueError("not a record declaration (expected `NAME = range LO-HI [`)")
-        name = m.group("name")
-        lo, hi = cls._parse_domain(m.group("dom").split())
-        close = text.find("]", m.end())
-        if close < 0:
-            raise ValueError(f"record {name!r}: missing closing ']'")
-        body = text[m.end():close]
-
-        interp = "linear"
-        chans: List[RecordChannel] = []
-        for raw_line in body.splitlines():
-            line = raw_line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            key, _, value_text = line.partition(" ")
-            value_text = value_text.strip()
-            if key == "interp":
-                if value_text not in _INTERP:
-                    raise ValueError(f"record {name!r}: interp must be one of {_INTERP}")
-                interp = value_text
-                continue
-            stops: List[RecordStop] = []
-            for chunk in cls._split_top_commas(value_text):
-                if not chunk:
-                    raise ValueError(
-                        f"record {name!r} channel {key!r}: empty stop (stray comma?)")
-                pin: Optional[float] = None
-                words = chunk.split(maxsplit=1)
-                if words and words[0].startswith("p:"):
-                    pv = words[0][2:]
-                    if not _is_number(pv):
-                        raise ValueError(
-                            f"record {name!r} channel {key!r}: bad p:<pos> {words[0]!r}")
-                    pin = float(pv)
-                    chunk = words[1] if len(words) > 1 else ""
-                    if not chunk.strip():
-                        raise ValueError(
-                            f"record {name!r} channel {key!r}: p:<pos> with no value")
-                stops.append(cls._stop_from_ladder(parse_ladder(chunk), pin))
-            if not stops:
-                raise ValueError(f"record {name!r} channel {key!r}: has no stops")
-            chans.append(RecordChannel(key, stops))
-        return cls(name, lo, hi, chans, interp=interp)
 
     @classmethod
     def parse_all(cls, text: str) -> List["Record"]:

@@ -1079,8 +1079,11 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          whitespace — parens are reserved for expressions + the §3.2 application surface); position pins
          (`.2:0 0 0`) are an orthogonal `POS:` prefix. **NB: current FTSL cannot parse this** — its tokenizer isn't comma-aware and every
          whitespace-word is a separate stop, so today an rgb curve is `reflect spectrum:steel spectrum:gold …`
-         (one `:`-ref per stop). loom's J3a parser mirrors *that* (whitespace-split single tokens); the
-         ladder/inline-tuple form is this J3b superset.
+         (one `:`-ref per stop). loom now implements this as **one backward-compatible grammar** (`loom/record.py`,
+         a single `parse`/`emit` pair): each channel line is dispatched on the presence of a top-level comma, so a
+         comma-free line keeps the exact J3a whitespace meaning and only a comma line opts into the ladder
+         (`tint 0 0 0, 1 1 1` = two arity-3 stops; a lone vector stop takes a trailing comma). It's an *additive
+         superset*, not a breaking change — no existing record reparses differently.
       3. **Uniform named-input binding / rebinding** (`ROADMAP_records.md` §3.2) — a property is an expression
          over named inputs (system-provided-with-default like `a`/`u`/`v`, or unbound). Access is *continuous
          only* (no discrete `[i]` — a constant index is just a constant argument `prop(2)`); any input is
@@ -1125,13 +1128,24 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
   `.as_vector()` the vector view) — J3a scalar/colour paths unchanged (`.token` back-compat). `RecordChannel.kind`
   now returns `scalar` (arity 1) / `colour` (`:`-refs) / **`vector`** (arity `D` ≥ 2, homogeneous; ragged
   arity rejected), with a `.arity`. `Record.sample_vec(name, d)` interpolates per-component (scalar `sample`
-  still returns a float and rejects vector channels). Because current-FTSL separates stops by *whitespace*
-  but the ladder uses whitespace for *components*, the grammars stay separate: `emit`/`parse` remain J3a
-  (whitespace stops; `emit` now rejects a vector channel), and new `emit_generalized`/`parse_generalized` use
-  the ladder (comma-separated stops, `p:` pins) so vector channels round-trip. `from_channels` accepts vector
-  stops (lists) + `(value, pos)` pins. 7 new record tests (30 total), 656 loom green; DESIGN.md §8a updated.
+  still returns a float and rejects vector channels). Initially the grammars were kept separate (`emit`/`parse`
+  whitespace vs `emit_generalized`/`parse_generalized` ladder); this was later refolded into one grammar (see
+  the 2026-07-19 refold entry below). `from_channels` accepts vector stops (lists) + `(value, pos)` pins.
   **Remaining J3b item 1:** inline-`rgb` colour channels + lowering to synthesized `spectrum` decls; then
   item 3 (binding/application surface) + item 4 (N-D input domain).
+- 2026-07-19: **Refolded the record parser into ONE backward-compatible ladder grammar (J3b item 2).** Collapsed
+  the two parallel APIs (`parse`/`emit` whitespace + `emit_generalized`/`parse_generalized` ladder) into a single
+  `parse`/`emit` pair in `loom/record.py` that dispatches **per channel line** on the presence of a top-level
+  comma (`_split_top_commas`): a comma-free line is the exact current-FTSL whitespace form (`metal steel gold
+  copper` = three scalar stops), while a line with a top-level comma is the ladder form (`tint 0 0 0, 1 1 1` =
+  two arity-3 vector stops). A **lone vector stop** is written/read with a trailing comma (`tint 0 0 0,`) to
+  disambiguate it from N scalar stops. `emit` now picks the form per channel automatically (whitespace for
+  scalar/colour, comma for vector) instead of rejecting vector channels — records with no vector channel emit
+  byte-identically to before. This fixes the old `parse_generalized` "outermost axis = stops" bug (it split on
+  commas first, so `steel gold copper` collapsed to one 3-vector stop instead of three scalar stops). Grammar is
+  a **strict additive superset**, not a breaking change. Updated `test_record.py` (renamed the two `*_generalized`
+  tests; added whitespace-vs-comma dispatch, lone-vector-stop, and stray-comma coverage — 34 record tests),
+  DESIGN.md §8a, and `ROADMAP_records.md` §3.1 ("additive superset, not a breaking change"). 660 loom green.
 - 2026-07-19: **Extended the binding model — materials-as-bundles + optional names (§3.3).** Two more locked
   grammar points from the user. (1) A **material is a parameterized bundle**: its free-input set is the union
   of its properties' free inputs, and applying it binds them across the whole bundle at the use site —

@@ -289,17 +289,23 @@ a tag the arity is whatever the delimiters produced.
 recognised as a prefix on a comma-group *before* the `+`/`×` split, so the colon never
 competes with whitespace/comma/bracket.
 
-**Not implemented in ftrace today, and a real grammar change when it is.** ftrace's
-current tokenizer (`src/ftsl.h`) does *not* treat `,` as a delimiter (a comma accretes
-into the preceding bareword), and the record body parser makes **every whitespace-word
-its own stop**, with a stop counted as colour *only* when its single token contains
-`:` (a `spectrum:<name>` ref). So today an rgb curve inside a record is written as
-`reflect spectrum:steel spectrum:gold spectrum:copper` (one `:`-ref per stop), **never**
-as inline `rgb r g b` triples. Supporting the generalized grammar above requires (a) a
-comma-aware tokenizer pass and (b) arity-grouped stop parsing — a deliberate future
-extension. Until then it lives in **loom** (the authoring superset, §J3b in `TODO.md`),
-which may parse/emit the flexible form and lower a `D=3` channel down to the
-`spectrum:`-ref form ftrace understands (synthesising the backing `spectrum` decls).
+**An additive superset, not a breaking change — and not yet in ftrace.** The generalized
+ladder grammar is a *strict backward-compatible superset* of the current whitespace form:
+a channel line is dispatched on whether it contains a top-level comma, so every existing
+comma-free line keeps its exact current meaning (`reflect spectrum:steel spectrum:gold
+spectrum:copper` = three colour stops, `rough 0 0 0` = three scalar stops), and only a
+line that *introduces* a top-level comma opts into ladder parsing (`tint 0 0 0, 1 1 1` =
+two arity-3 vector stops; a lone vector stop takes a trailing comma, `tint 0 0 0,`). No
+existing record reparses differently. ftrace's *own* tokenizer (`src/ftsl.h`) still does
+*not* treat `,` as a delimiter (a comma accretes into the preceding bareword) and makes
+**every whitespace-word its own stop**, so today an rgb curve inside a record is written
+as `reflect spectrum:steel spectrum:gold spectrum:copper` (one `:`-ref per stop), **never**
+as inline `rgb r g b` triples. Teaching ftrace the superset requires only (a) a
+comma-aware tokenizer pass and (b) the per-line comma dispatch above — purely additive.
+Until then it lives in **loom** (the authoring superset, §J3b in `TODO.md`), which
+parses/emits the unified grammar (`loom/record.py` — one `parse`/`emit` pair, comma
+dispatch) and can lower a `D=3` channel down to the `spectrum:`-ref form ftrace
+understands (synthesising the backing `spectrum` decls).
 
 ### 3.2 Binding, access, and override — *target, not v1*
 

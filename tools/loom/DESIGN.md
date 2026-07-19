@@ -279,10 +279,17 @@ cannot parse it.
 stop, `.arity`/`.as_vector()` the vector view), so a `RecordChannel.kind` is `scalar`
 (arity 1) / `colour` (`:`-refs) / **`vector`** (arity `D` ≥ 2, homogeneous). `Record`
 gains `sample_vec(name, d)` (per-component interpolation; scalar `sample` still returns a
-float). Because current-FTSL uses *whitespace* to separate stops but the ladder uses it
-for *components*, the two grammars stay separate: `emit`/`parse` remain the J3a
-whitespace form (and `emit` rejects a vector channel), while `emit_generalized` /
-`parse_generalized` use the ladder (comma-separated stops) so vector channels round-trip.
+float). Current-FTSL uses *whitespace* to separate stops but the ladder uses it for
+*components*, so `emit`/`parse` are **one backward-compatible ladder grammar** (an
+*additive superset*, not a breaking change) that dispatches per channel line on the
+presence of a top-level comma: a comma-free line is the J3a whitespace form (every word
+a scalar stop — `metal steel gold copper` = three stops), while a line with a top-level
+comma is the ladder form (comma-separated stops, space-separated components — `tint 0 0
+0, 1 1 1` = two arity-3 vector stops). A *lone* vector stop is written with a trailing
+comma (`tint 0 0 0,`) so it can't be misread as N scalar stops. `emit` picks the form
+per channel automatically (whitespace for scalar/colour, comma for vector); records with
+no vector channel emit byte-identically to before. ftrace's own tokenizer is still not
+comma-aware, so a record that actually uses comma lines stays loom-only until J3c.
 Inline-`rgb` colour channels + their lowering to synthesized `spectrum` decls are the
 remaining J3b piece (not yet built).
 

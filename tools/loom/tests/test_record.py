@@ -264,30 +264,62 @@ def test_sample_rejects_vector_scalar_api():
         rec.sample("tint", 0.5)          # scalar API on a vector channel
 
 
-def test_emit_rejects_vector_but_generalized_roundtrips():
+def test_emit_vector_channel_roundtrips():
+    # one unified grammar: a vector channel emits as a comma line and round-trips
+    # through the same parse() that reads scalar/colour whitespace lines.
     rec = Record.from_channels(
         "grad", 0, 1,
         [("tint", [["0", "0", "0"], (["1", "0", "0"], 0.7), ["1", "1", "1"]]),
          ("rough", ["0.0", "0.5", "1.0"])],
         interp="smooth")
-    with pytest.raises(TypeError):
-        rec.emit()                       # vector channel: not current-FTSL representable
-    text = rec.emit_generalized()
-    assert "0 0 0, p:0.7 1 0 0, 1 1 1" in text
-    reparsed = Record.parse_generalized(text)
+    text = rec.emit()
+    assert "0 0 0, p:0.7 1 0 0, 1 1 1" in text   # vector channel -> comma line
+    assert "rough" in text and "0.0  0.5  1.0" in text  # scalar channel -> whitespace
+    reparsed = Record.parse(text)
     assert _canon_gen(rec) == _canon_gen(reparsed)
 
 
-def test_generalized_roundtrip_scalar_and_colour():
-    # generalized emit/parse must also round-trip plain scalar + colour-ref channels
+def test_unified_roundtrip_scalar_and_colour():
+    # emit/parse must round-trip plain scalar + colour-ref channels (whitespace form)
     rec = Record.from_channels(
         "m", 0, 1,
         [("reflect", ["spectrum:steel", "spectrum:gold"]),
          ("rough", ["0.0", ("0.4", 0.7), "1.0"])],
         interp="linear")
-    reparsed = Record.parse_generalized(rec.emit_generalized())
+    reparsed = Record.parse(rec.emit())
     assert _canon_gen(rec) == _canon_gen(reparsed)
     assert reparsed.channel("reflect").kind == "colour"
+
+
+def test_whitespace_line_is_scalar_stops_not_one_vector():
+    # backward-compatible dispatch: no top-level comma -> each word is its own stop
+    rec = Record.parse("m = range 0-1 [ metal  steel gold copper ]")
+    ch = rec.channel("metal")
+    assert ch.arity == 1
+    assert [s.token for s in ch.stops] == ["steel", "gold", "copper"]
+
+
+def test_comma_line_is_vector_stops():
+    rec = Record.parse("g = range 0-1 [ tint  0 0 0, 1 1 1 ]")
+    ch = rec.channel("tint")
+    assert ch.kind == "vector" and ch.arity == 3
+    assert [s.components for s in ch.stops] == [["0", "0", "0"], ["1", "1", "1"]]
+
+
+def test_lone_vector_stop_needs_trailing_comma():
+    # trailing comma disambiguates a single arity-3 vector stop from 3 scalar stops
+    rec = Record.parse("g = range 0-1 [ tint  0 0 0, ]")
+    ch = rec.channel("tint")
+    assert ch.kind == "vector" and ch.arity == 3
+    assert len(ch.stops) == 1 and ch.stops[0].components == ["0", "0", "0"]
+    # emit round-trips the trailing-comma form
+    assert "0 0 0," in rec.emit()
+    assert _canon_gen(rec) == _canon_gen(Record.parse(rec.emit()))
+
+
+def test_stray_comma_rejected():
+    with pytest.raises(ValueError):
+        Record.parse("g = range 0-1 [ tint  0 0 0,, 1 1 1 ]")
 
 
 if __name__ == "__main__":
