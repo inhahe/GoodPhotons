@@ -5,6 +5,23 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
+**Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)
+can *reference* an existing NanoVDB grid via `density="vdb:<path>"`, but loom has no way to
+*generate* a `.nvdb` from a Python field or to wrap OpenVDB's tooling.
+
+- **What it would be.** A `loom` helper that bakes a loom `SpatialExpr` / `Grid` density field
+  into a NanoVDB `FloatGrid` on disk (dense or sparse), so a procedural cloud authored in loom
+  could ship as a real sparse asset instead of an inline `density "<expr>"`. Optionally a thin
+  wrapper over OpenVDB's `nanovdb_convert` for `.vdb → .nvdb`.
+- **Why we skip it now.** The procedural path already covers loom's sweet spot: an animated
+  density formula emits straight into `medium { density "<expr>" }` and renders unbiased on CPU
+  and GPU (validated by `scraps/_volume_test.py`). Baking to voxels only helps when a field is
+  too costly to evaluate per-sample or must interop with external VDB assets — neither is a
+  current need. The engine already imports `.nvdb` (`scraps/make_nvdb.cpp` makes test assets).
+- **When to revisit.** When a loom scene needs a genuinely sparse, prebaked cloud (huge extent,
+  expensive field, or sharing an asset with a DCC pipeline).
+
 ### DEFERRED (2026-07-18): `PatOp::MatMulAdd` — a fused matrix·vec+offset pattern opcode (future optimization)
 **Status: intentionally not built. This is an optimization of an already-working path, not a
 missing capability.** Why we may want it someday, and why we don't need it now:

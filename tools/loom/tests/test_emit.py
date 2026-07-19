@@ -13,9 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loom import (  # noqa: E402
     Clock, Cache, Const, Sine, LoopNoise, vec, PointPath, LoopCurve,
-    Scene, Material, Sphere, Beads, Light, Camera, Raw,
+    Scene, Material, Sphere, Beads, Light, Camera, Raw, Volume,
     SignalCycleError, RefSignal,
 )
+from loom.spatial import X, Y, Z, sin as ssin  # noqa: E402
+from loom.ftsl_emit import EmitCtx  # noqa: E402
 
 
 def _mk_scene(res=(64, 64)) -> Scene:
@@ -85,6 +87,58 @@ def test_beads_from_pointpath():
     from loom.ftsl_emit import EmitCtx
     txt = b.emit(EmitCtx(clock=Clock(t=0.0), cache=Cache()))
     assert txt.count("sphere {") == 8
+
+
+def _vol_emit(v: Volume, t: float = 0.0) -> str:
+    return v.emit(EmitCtx(clock=Clock(t=t), cache=Cache()))
+
+
+def test_volume_homogeneous():
+    txt = _vol_emit(Volume(sigma_t=2.0, albedo=0.9, g=0.3))
+    assert txt.startswith("medium {")
+    assert txt.count("{") == txt.count("}")
+    assert "sigma_t 2" in txt and "albedo 0.9" in txt and "g 0.3" in txt
+    assert "bounds" not in txt and "density" not in txt
+
+
+def test_volume_bounds_variants():
+    box = _vol_emit(Volume(box=((0, 0, 0), (1, 1, 1))))
+    assert "bounds { min 0 0 0  max 1 1 1 }" in box
+    sph = _vol_emit(Volume(sphere=((0.5, 0.45, 0.5), 0.32)))
+    assert "bounds { center 0.5 0.45 0.5  radius 0.32 }" in sph
+    obj = _vol_emit(Volume(obj="orb"))
+    assert 'bounds { object "orb" }' in obj
+
+
+def test_volume_procedural_density_and_max():
+    field = 0.6 + 0.4 * ssin(8.0 * X) * ssin(8.0 * Y) * ssin(8.0 * Z)
+    txt = _vol_emit(Volume(sigma_t=8.0, density=field,
+                           sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2))
+    assert 'density "' in txt and "sin(" in txt
+    assert "density_max 1.2" in txt
+
+
+def test_volume_density_string_forms():
+    assert "density pattern:noise" in _vol_emit(Volume(density="pattern:noise", obj="o"))
+    assert "density vdb:clouds/c.nvdb" in _vol_emit(Volume(density="vdb:clouds/c.nvdb"))
+    # a bare string is a raw ftsl expr -> quoted
+    assert 'density "x*x+y*y"' in _vol_emit(Volume(density="x*x+y*y", box=((0, 0, 0), (1, 1, 1))))
+
+
+def test_volume_animatable_sigma_t():
+    v = Volume(sigma_t=Const(1.0) + Sine(cycles=1, amp=0.5), sphere=((0, 0, 0), 1.0))
+    a = _vol_emit(v, t=0.0)
+    b = _vol_emit(v, t=0.25)
+    assert a != b, "animatable sigma_t should differ across the loop"
+
+
+def test_volume_rayleigh_and_bound_guard():
+    assert "rayleigh true" in _vol_emit(Volume(rayleigh=True))
+    try:
+        Volume(box=((0, 0, 0), (1, 1, 1)), sphere=((0, 0, 0), 1.0))
+    except ValueError:
+        return
+    raise AssertionError("Volume must reject more than one bound")
 
 
 def _run_all():

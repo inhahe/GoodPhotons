@@ -1484,6 +1484,16 @@ rays** — the forward modes (A/B/C), BDPT `D`, and all GPU paths still trace th
 straight (they ignore `ior`), so render a GRIN scene with `-mode R -device cpu` for now.
 Wiring the Eikonal march through the other tracers/GPU is tracked in `known-issues.md`.
 
+**Authoring media procedurally (loom).** The [loom toolkit](tools/loom/README.md) emits
+these `medium {}` blocks from a `loom.Volume(...)`: `sigma_t` / `albedo` / `g` are
+animatable `Signal`s, and a `density` is any loom `SpatialExpr` field (the same
+`X Y Z T` DSL that drives its isosurfaces), so an animated procedural cloud/fog is emitted
+as an inline `density "<expr>"`. Bound it with `box=` / `sphere=` / `obj=`, cap the majorant
+with `density_max=`, or point `density="vdb:<path>"` at an existing NanoVDB grid (loom
+references sparse volumes but doesn't generate them). E.g. a sphere-bounded procedural fog
+blob: `Volume(sigma_t=8.0, albedo=0.9, g=0.4, density=0.6 + 0.4*sin(8*X)*sin(8*Y)*sin(8*Z),
+sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2)`.
+
 ---
 
 ## Scene language (FTSL)

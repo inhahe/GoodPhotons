@@ -411,6 +411,109 @@ def fan(spine, *, width: float = 0.4, material: str = "default", count: int = 64
 
 
 # ---------------------------------------------------------------------------
+# Participating media / volumes
+# ---------------------------------------------------------------------------
+
+class Volume(Element):
+    """A participating-medium region emitted as ftrace's ``medium { … }`` block.
+
+    ftrace already renders volumes richly — homogeneous fog, bounded
+    heterogeneous blobs whose density is a formula, and imported NanoVDB grids.
+    loom's strength is the *procedural* case: a ``density`` field is loom's bread
+    and butter (it's how :class:`~loom.iso.Isosurface` works), so a ``Volume``
+    lets you animate clouds/fog with the same signal machinery as everything
+    else — the scattering coefficients and the density formula are all
+    :class:`~loom.signals.core.Signal`-valued.
+
+    ``sigma_t`` (extinction), ``albedo`` (single-scatter albedo) and ``g``
+    (Henyey–Greenstein anisotropy) are animatable scalars; ``rayleigh`` swaps the
+    HG phase for a Rayleigh one.
+
+    ``density`` shapes a *heterogeneous* medium (``None`` = uniform):
+
+    * a :class:`~loom.spatial.SpatialExpr` — the natural loom field, emitted as an
+      inline ``density "<expr>"`` over world ``x y z r`` (animatable, seamless);
+    * a ``str`` — either ``"pattern:<name>"`` (bind a named pattern) or a raw ftsl
+      expression;
+    * ``"vdb:<path>"`` — reference an existing NanoVDB grid (loom doesn't *generate*
+      sparse voxels, but it can point at one).
+
+    The region is bounded by exactly one of ``box=(min, max)``, ``sphere=(center,
+    radius)`` or ``obj="name"`` (fill a named scene object's interior).  A
+    heterogeneous medium needs a finite region for the delta-tracking majorant, so
+    give a bound *or* an explicit ``density_max``; ``density_max`` overrides the
+    engine's grid estimate when set.
+    """
+
+    def __init__(self, *, sigma_t=1.0, albedo: Union[Signal, float] = 0.8,
+                 g: Union[Signal, float] = 0.0, rayleigh: bool = False,
+                 density=None, density_max=None,
+                 box: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
+                 sphere: Optional[Tuple[Sequence[float], float]] = None,
+                 obj: Optional[str] = None, name: str = "volume") -> None:
+        n_bounds = sum(x is not None for x in (box, sphere, obj))
+        if n_bounds > 1:
+            raise ValueError("Volume: give at most one of box=, sphere=, obj=")
+        self.sigma_t = sigma_t
+        self.albedo = albedo
+        self.g = g
+        self.rayleigh = bool(rayleigh)
+        self.density = density
+        self.density_max = density_max
+        self.box = (tuple(float(c) for c in box[0]),
+                    tuple(float(c) for c in box[1])) if box is not None else None
+        self.sphere = ((tuple(float(c) for c in sphere[0]), float(sphere[1]))
+                       if sphere is not None else None)
+        self.obj = obj
+        self.name = name
+
+    def roots(self) -> List:
+        out: List = []
+        for v in (self.sigma_t, self.albedo, self.g, self.density_max):
+            if isinstance(v, (Signal, VecSignal)):
+                out.append(v)
+        # A SpatialExpr density exposes its temporal coefficients for cycle checking.
+        if hasattr(self.density, "param_signals"):
+            out.extend(self.density.param_signals())
+        return out
+
+    def _density_token(self, ctx: EmitCtx) -> Optional[str]:
+        d = self.density
+        if d is None:
+            return None
+        if hasattr(d, "emit"):                       # a loom SpatialExpr field
+            return 'density "' + d.emit(("x", "y", "z"), ctx) + '"'
+        s = str(d)
+        if s.startswith("pattern:") or s.startswith("vdb:"):
+            return f"density {s}"
+        return f'density "{s}"'                       # raw ftsl expression
+
+    def emit(self, ctx: EmitCtx) -> str:
+        clock, cache = ctx.clock, ctx.cache
+        parts = [f"sigma_t {fmt(num(self.sigma_t, clock, cache))}",
+                 f"albedo {fmt(num(self.albedo, clock, cache))}",
+                 f"g {fmt(num(self.g, clock, cache))}"]
+        if self.rayleigh:
+            parts.append("rayleigh true")
+        lines = ["medium {", "    " + "  ".join(parts)]
+        if self.box is not None:
+            mn, mx = self.box
+            lines.append(f"    bounds {{ min {fmt3(mn)}  max {fmt3(mx)} }}")
+        elif self.sphere is not None:
+            c, rad = self.sphere
+            lines.append(f"    bounds {{ center {fmt3(c)}  radius {fmt(rad)} }}")
+        elif self.obj is not None:
+            lines.append(f'    bounds {{ object "{self.obj}" }}')
+        dtok = self._density_token(ctx)
+        if dtok is not None:
+            lines.append("    " + dtok)
+        if self.density_max is not None:
+            lines.append(f"    density_max {fmt(num(self.density_max, clock, cache))}")
+        lines.append("}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Lights
 # ---------------------------------------------------------------------------
 
