@@ -1069,16 +1069,24 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       stops are re-emitted faithfully but not evaluated (needs the pattern VM → J3c). Round-trips every
       `scenes/_record_*.ftsl` fixture. 23 tests (`tests/test_record.py`); 627 loom green. (ftrace only
       materializes `D∈{1,3}`; non-{1,3} arities are the loom superset / J3b.)
-- [ ] **J3b — loom N-D / generalized-grammar superset** (loom-only authoring). Three related generalizations
+- [ ] **J3b — loom N-D / generalized-grammar superset** (loom-only authoring). Four related generalizations
       beyond the current-FTSL mirror J3a implements:
       1. **Arbitrary channel arity** — a `D`-tuple-valued channel, not just scalar `D=1` / colour `D=3`.
-      2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with **interchangeable
-         `[ ]` / `,` / whitespace delimiters** descending the channel → stops → components hierarchy, e.g.
-         `tint [rgb 0 0 0, 0 1 0, 1 1 1]` ≡ `tint rgb 0 0 0 0 1 0 1 1 1`. **NB: current FTSL cannot parse this**
-         — its tokenizer isn't comma-aware and every whitespace-word is a separate stop, so today an rgb curve
-         is `reflect spectrum:steel spectrum:gold …` (one `:`-ref per stop). loom's J3a parser mirrors *that*
-         (whitespace-split single tokens); the flexible-delimiter/inline-tuple form is this J3b superset.
-      3. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
+      2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with a **delimiter
+         precedence ladder** (whitespace binds like `×`, comma like `+`, brackets = parens), so structure is
+         recoverable from the delimiters alone and the channel's arity only *validates*: `tint [rgb 0 0 0,
+         0 1 0, 1 1 1]` ≡ `tint rgb (0 0 0) (0 1 0) (1 1 1)`; position pins (`.2:0 0 0`) are an orthogonal
+         `POS:` prefix. **NB: current FTSL cannot parse this** — its tokenizer isn't comma-aware and every
+         whitespace-word is a separate stop, so today an rgb curve is `reflect spectrum:steel spectrum:gold …`
+         (one `:`-ref per stop). loom's J3a parser mirrors *that* (whitespace-split single tokens); the
+         ladder/inline-tuple form is this J3b superset.
+      3. **Uniform named-input binding / rebinding** (`ROADMAP_records.md` §3.2) — a property is an expression
+         over named inputs (system-provided-with-default like `a`/`u`/`v`, or unbound). Access is *continuous
+         only* (no discrete `[i]` — a constant index is just a constant argument `prop(2)`); any input is
+         rebindable at the use site (`gold.color(u=x)` ≡ `gold.reflect(a=x)`); `[…](u)` seals the array inside
+         a function of `u` (reachable via `u=x`) whereas bare `[…]` leaves the driver for the consumer. loom
+         authors this surface; shipped ftrace keeps the two constant accessors + fixed scope model.
+      4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
 - [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
@@ -1091,6 +1099,19 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **Locked the generalized grammar's delimiter + binding model (§3.1/§3.2).** Design converged
+  with the user on two points. (1) **Delimiter precedence ladder** replaces the earlier "interchangeable in
+  any order" framing: whitespace binds like `×`, comma like `+`, brackets are parens — so `1 1 1, 2 2 2`
+  parses as `(1·1·1)+(2·2·2)` and **structure is recoverable from delimiters alone**; the channel arity only
+  *validates*. Position pins (`.2:0 0 0`) are an orthogonal `POS:` prefix. (2) **Uniform named-input binding**:
+  a property is an expression over named inputs; system inputs (`a`,`u`,`v`,…) carry shading-point defaults;
+  **nothing is closed** — any input is rebindable at the use site (`gold.reflect(a=x)` ≡ `gold.color(u=x)`),
+  correcting the earlier "`.5*a` is closed" claim. Access is **continuous-only** (dropped the discrete `[i]`
+  selector — a constant index is just a constant argument `prop(2)`, subsuming shipped `R.chan[i]`); `[…](u)`
+  seals the array inside a function of `u` (purist reading) whereas bare `[…]` leaves the driver for the
+  consumer. Written into `ROADMAP_records.md` §3.1 (ladder) + new §3.2 (binding/access/override) + §5, and
+  TODO §J3b (now four generalizations). Target/loom-side; shipped ftrace keeps the two Stage-5a constant
+  accessors + fixed per-hit/`t` scope model.
 - 2026-07-19: **Captured the generalized stop grammar (§3.1).** User flagged that a generalized record lets
   a `D`-tuple channel (e.g. rgb) be authored with **interchangeable `[ ]` / `,` / whitespace** delimiters
   down the channel → stops → components hierarchy (`tint [rgb 0 0 0, 0 1 0, 1 1 1]`). Verified against the

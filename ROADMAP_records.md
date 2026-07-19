@@ -184,19 +184,36 @@ a non-{1,3} arity appears, widen `ChanKind` toward the general `struct` above.
 Once a channel outputs an arbitrary-arity `D`-tuple (§3), each **stop** is itself a
 `D`-tuple of components, and the channel is a *list* of stops — a small nested-array
 structure. The general grammar descends that hierarchy (channel → stops → components)
-with **any of three interchangeable delimiters — `[ ]` grouping, `,`, or whitespace** —
-so an rgb (`D=3`) channel may be authored, equivalently, as e.g.:
+with three delimiters that form a **precedence ladder**, not a free-order set:
+
+> **whitespace binds like `×` (tightest), comma binds like `+` (looser), brackets
+> `[ ]` are parentheses (explicit override).**
+
+So `1 1 1, 2 2 2` parses exactly like `(1·1·1) + (2·2·2)` → two groups of three. At
+every level, the *weakest separator present* defines that level's split, and the next
+level down uses the next-weakest; brackets force an explicit level anywhere. This makes
+**structure fully recoverable from the delimiters alone** — the channel's declared arity
+is used only to *validate* the parsed shape (and to allow the bare-scalar `D=1` case
+with no delimiters). All of these equivalences fall straight out of the ladder:
 
 ```
-tint  [rgb 0 0 0, 0 1 0, 1 1 1]     # bracket-grouped, comma-separated stops, space components
-tint  rgb 0 0 0  0 1 0  1 1 1        # whitespace only (stop boundaries by arity: every 3 numbers)
-tint  rgb (0 0 0) (0 1 0) (1 1 1)    # explicit per-stop grouping
+1 1 1                 ≡  [1 1 1]                         # 3-vector; bracketing one level is idempotent
+1 1 1, 2 2 2, 3 3 3   ≡  [1 1 1] [2 2 2] [3 3 3]         # 3 stops of 3 components each
+tint  [rgb 0 0 0, 0 1 0, 1 1 1]                          # tagged rgb channel, 3 stops
+tint  rgb (0 0 0) (0 1 0) (1 1 1)                        # same, explicit per-stop parens
 ```
 
-An optional leading tag (`rgb`/`spectrum`/…) fixes the channel's arity + colour space;
-otherwise arity is inferred from the group shape. This is the fully-general form the
-user asked for — "going down the hierarchy of sub-arrays/elements can happen through
-either `[]`, comma, or space."
+The subtlety that keeps it consistent: **whitespace separates *siblings* at the current
+level** — when the siblings are scalars you get a vector; when they are already-bracketed
+groups, whitespace concatenates them as a list of groups. Comma is just a *weaker*
+sibling separator that opens a new outer level. An optional leading tag
+(`rgb`/`spectrum`/…) fixes the channel's colour space and arity for validation; without
+a tag the arity is whatever the delimiters produced.
+
+**Position pins stay orthogonal to the ladder.** A stop may carry a leading
+`POS:` prefix (`.2:0 0 0` = the group `0 0 0` pinned at driver position 0.2). `POS:` is
+recognised as a prefix on a comma-group *before* the `+`/`×` split, so the colon never
+competes with whitespace/comma/bracket.
 
 **Not implemented in ftrace today, and a real grammar change when it is.** ftrace's
 current tokenizer (`src/ftsl.h`) does *not* treat `,` as a delimiter (a comma accretes
@@ -209,6 +226,54 @@ comma-aware tokenizer pass and (b) arity-grouped stop parsing — a deliberate f
 extension. Until then it lives in **loom** (the authoring superset, §J3b in `TODO.md`),
 which may parse/emit the flexible form and lower a `D=3` channel down to the
 `spectrum:`-ref form ftrace understands (synthesising the backing `spectrum` decls).
+
+### 3.2 Binding, access, and override — *target, not v1*
+
+A material property is an **expression over named inputs**, and access is *always
+continuous* — there is no separate discrete stop-selector operator. (An array
+`[0 0 0, 1 1 1]`, a pinned array `[0 0 0, .5:1 1 1]`, and a formula `a*.5` are all just
+expressions that resolve to a value over the driver domain; a constant "index" is simply
+a constant argument, `color(2)`, so the shipped discrete `R.chan[i]` form is subsumed.)
+
+An **input** is one of:
+
+- **system-provided, with a default at the shading point** — `a` (albedo), `u`/`v`
+  (surface coords), the per-hit intrinsics, etc.; or
+- **unbound** — no default; the consumer must supply it at access time.
+
+**Nothing is ever closed.** Any named input can be rebound where the property is used —
+`gold.reflectance(a=x)` rebinds a *system* input exactly the way `gold.color(u=x)`
+rebinds an author-named one. The only difference between the property forms is **whether
+the driver is bound to a defaultable input or left for the consumer**:
+
+```
+spectrum "color"   = [0 0 0, 1 1 1]      # driver UNBOUND. `gold.color` alone is underdetermined;
+                                          #   consumer must drive it: gold.color(x)
+spectrum "color"   = [0 0 0, 1 1 1](u)   # bound to u (defaults from geometry).
+                                          #   gold.color works; gold.color(u=x) rebinds
+reflect "reflect"  = .5*a                 # bound to a (defaults from albedo).
+                                          #   gold.reflect works; gold.reflect(a=x) rebinds
+```
+
+The last two are the **same mechanism** — a different bound input and an array-vs-formula
+body. Access is uniform:
+
+- `gold.prop` — evaluate with every referenced input at its default *(valid only if all
+  referenced inputs have defaults; a property with an unbound driver requires an
+  argument)*.
+- `gold.prop(x)` — bind the property's driver positionally.
+- `gold.prop(name=x)` — rebind a specific named input.
+
+**Purity note.** Writing `(u)` seals the array *inside* a function of `u`: the array is a
+black box reachable only through the input, so `[…](u)` is genuinely a different object
+from the bare `[…]`, not "data with a default binding." To let the consumer reach the
+array you omit `(u)` (they drive it with `gold.color(x)`); to give a default *and* still
+allow indexing you include `(u)` and they reach it via `gold.color(u=x)`.
+
+*(This whole section is the loom/J3b authoring superset. Shipped ftrace exposes the two
+constant accessors `R.chan[i]` / `R(const)` from Stage 5a and drives records by the fixed
+per-hit/`t` scope model; the uniform named-input rebinding surface above is the
+generalized target, not v1.)*
 
 ---
 
@@ -315,4 +380,12 @@ render, commit at green. Update `FTSL.md` (grammar), `README.md` (feature), and
   inside a record aren't parseable — colour stops must be `spectrum:<name>` refs.
   Enabling the general grammar is a real tokenizer + parser change; until then it lives
   in loom (§J3b), which may author the flexible form and lower `D=3` channels to the
-  `spectrum:`-ref form ftrace understands.
+  `spectrum:`-ref form ftrace understands. The delimiter **precedence ladder**
+  (whitespace `×` < comma `+` < brackets = parens) that makes stop structure recoverable
+  from delimiters alone is specified in §3.1.
+- **Uniform named-input binding / rebinding surface** (§3.2) — properties as expressions
+  over named inputs (system-provided-with-default like `a`/`u`/`v`, or unbound),
+  continuous-only access (`prop`, `prop(x)`, `prop(name=x)`), any input rebindable at the
+  use site — *deferred, loom-side (§J3b).* Shipped ftrace exposes only the two constant
+  accessors `R.chan[i]` / `R(const)` (Stage 5a) under the fixed per-hit / camera-`t`
+  scope model; the generalized rebinding surface is the target, not v1.
