@@ -115,25 +115,40 @@ sphere { center 0 0 0  radius 1  material m }
 ## 3. Data model (C++)
 
 A record compiles to a POD-friendly bank of per-channel LUTs, GPU-portable like
-`pattern`/`ProcTexture`:
+`pattern`/`ProcTexture`.
+
+**General model (the spec).** A record is a driver domain `[LO,HI]` crossed with a
+list of named **channels**; each channel outputs a value of arbitrary **arity**
+`D≥1`, so a single record freely mixes per-row output dimensionality — an arity-1
+roughness curve and an arity-3 rgb curve live side by side, each named, each
+interpolated along the shared driver. A stop is therefore a `D`-tuple of component
+programs, and interpolation (Nearest/Linear/Smooth) runs **per-component**. The
+current `scalar` and `spectrum`/`rgb` channels are just the `D==1` and `D==3`
+instances of this one thing; a `spectrum`/`rgb` channel is the `D==3` case tagged
+for **colour-space** interpolation (linear-RGB lerp + Jakob–Hanika upsample) instead
+of raw per-component lerp.
 
 ```
 enum class RecInterp { Nearest, Linear, Smooth };
-enum class ChanKind  { Scalar, Spectrum };          // scalar LUT vs colour LUT
+enum class RecSpace  { Linear, Colour };  // per-component lerp vs colour-correct(3)
 
 struct RecStop {
-    double pos;                     // domain position in [LO,HI] after redistribution
-    // scalar stop: a compiled pattern program (constant or expression)
-    std::vector<PatNode> expr;      // evaluated per-hit; a constant compiles to one Const node
-    // colour stop: index into the scene spectrum table (or an upsampled rgb)
+    double pos;                            // domain position in [LO,HI] after redistribution
+    // D component programs (constant or expression), one per output dimension;
+    // each is evaluated per-hit, then components interpolate independently.
+    std::vector<std::vector<PatNode>> comp;
+    // colour fast-path: a stop authored `spectrum:<name>` / `rgb r g b` caches its
+    // scene spectrum-table index (or an upsampled rgb); -1 = plain component stop.
     int    spectrum = -1;
 };
 struct RecChannel {
-    std::string name;               // arbitrary; matched to a slot keyword at bind time
-    ChanKind    kind;
-    std::vector<RecStop> stops;     // sorted by pos
-    // precomputed monotone-cubic tangents (Fritsch–Carlson) when interp==Smooth
-    std::vector<double> mTangent;   // scalar channels only
+    std::string name;                      // arbitrary; matched to a slot keyword at bind time
+    int         arity;                     // D: output dimensionality (1 scalar, 3 rgb/spectrum, …)
+    RecSpace    space;                     // Linear (raw lerp) or Colour (D==3 colour-correct)
+    std::vector<RecStop> stops;            // sorted by pos
+    // precomputed monotone-cubic tangents (Fritsch–Carlson) when interp==Smooth,
+    // one tangent series per component.
+    std::vector<std::vector<double>> mTangent;
 };
 struct Record {
     std::string name;
@@ -143,11 +158,23 @@ struct Record {
 };
 ```
 
+**What ftrace materializes today.** ftrace implements exactly two arities — the
+scalar channel (`arity==1`, `space==Linear`) and the colour channel
+(`arity==3`, `space==Colour`) — which is why the shipped C++ carries the narrower
+`enum ChanKind { Scalar, Spectrum }` with a single `expr` / `int spectrum` per stop.
+That is the concrete v1 realisation of the general model above, not a different
+model: `Scalar` ≡ `(arity 1, Linear)`, `Spectrum` ≡ `(arity 3, Colour)`. Other
+arities (a 2-vector, a 4-tuple) are valid in the spec and are where **loom** — the
+authoring superset — carries the fully-general form (loom channels already hold
+scalar-or-vector-of-any-dim values; see §J3 in `TODO.md`). If a real ftrace need for
+a non-{1,3} arity appears, widen `ChanKind` toward the general `struct` above.
+
 - Stored in `Scene` alongside `patterns` (a `std::vector<Record>` + name→index map).
 - A **channel sample** at driver value `d`: clamp `d` to `[lo,hi]`, locate the stop
-  interval, then Nearest/Linear/Smooth-interpolate. Scalar stops evaluate their
-  `expr` against the per-hit `PatCtx` first, then interpolate the resulting scalars.
-  Spectrum stops interpolate in linear RGB then Jakob–Hanika upsample.
+  interval, then Nearest/Linear/Smooth-interpolate **per component**. Component
+  programs evaluate against the per-hit `PatCtx` first, then interpolate. A
+  `Colour`-space (rgb/spectrum) channel interpolates in linear RGB then Jakob–Hanika
+  upsamples the result.
 - A **material driven by a record** carries: the record index, the compiled driver
   program (`std::vector<PatNode>`), and a slot→channel binding table (built by
   name-match, overridable). At shade time each bound slot = channel-sample(driver).
@@ -241,6 +268,12 @@ render, commit at green. Update `FTSL.md` (grammar), `README.md` (feature), and
 
 - Using channel names directly inside expressions (so an expression could reference
   another channel's sampled value) — desired "in the future", not v1.
-- Non-scalar drivers / multi-dimensional records (a single array of any
-  dimensionality with several named driver axes) — the general form the user floated;
-  v1 is 1-D (one `range` domain, one driver). Revisit if a real need appears.
+- **Multi-dimensional *input* domain** (non-scalar drivers — a single array
+  addressed by several named driver *axes*, not one `range` scalar) — still deferred;
+  ftrace v1 keeps one `range` domain / one driver. This is the loom-side superset
+  (§J3b in `TODO.md`); revisit for ftrace only if a real need appears.
+  - *Note — distinct from output arity, which is NOT deferred:* per-channel output
+    dimensionality is fully general in the spec (§3) — each channel outputs an
+    arbitrary-arity `D`-tuple, and records already mix arities (scalar curve beside
+    rgb curve). ftrace materializes `D∈{1,3}` today; loom carries all arities. The
+    only thing still 1-D is the driver *input* domain above.

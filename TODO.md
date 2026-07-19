@@ -1049,13 +1049,24 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
   NOT push back into FTSL.
 - **Round-trip = semantic re-emit**, not byte-faithful: parse `.ftsl` → loom `Element` tree → re-emit in
   loom's canonical style (equivalent scene, not identical formatting/ordering).
+- **Per-channel output arity is fully general (spec updated 2026-07-19).** A record already mixes per-row
+  output dimensionality — a `scalar` roughness curve (arity 1) sits beside an `rgb`/`spectrum` curve
+  (arity 3) in the same record. So the record model is: *driver domain × named channels, where each channel
+  outputs an arbitrary-arity `D`-tuple and interpolation runs per-component.* ftrace's `Scalar`/`Spectrum`
+  kinds are just the `D=1` (Linear) and `D=3` (Colour) instances; `ROADMAP_records.md` §3 now states the
+  general form and §5 clarifies this output-arity generality is **not** deferred (only the N-D *input* domain
+  is). This maps cleanly onto loom, whose `Signal`/`VecSignal` + `Grid`/`Scatter` already carry
+  scalar-or-vector-of-any-dim values — so the loom record twin (J3a) is arbitrary-arity by construction.
 
-- [ ] **J3a — loom record type mirroring the 1-D FTSL record exactly.** Named channels, positioned
-      (`p:`-pinned) stops with even redistribution, per-record `interp nearest|linear|smooth`
-      (monotone-cubic = Fritsch–Carlson), expression stops, spectrum stops (linear-RGB lerp → JH). A
-      `Signal`/`VecSignal`-valued node. Emit the `NAME = range LO-HI [ … ]` block **and** parse one back;
-      round-trip test against `scenes/_record_*.ftsl`.
-- [ ] **J3b — loom N-D superset** (loom-only authoring; emits down to the J3a form or a documented construct).
+- [ ] **J3a — loom record type mirroring the FTSL record.** Named channels, each an **arbitrary-arity**
+      curve (scalar or `D`-vector; `Signal`/`VecSignal`-valued), positioned (`p:`-pinned) stops with even
+      redistribution, per-record `interp nearest|linear|smooth` (monotone-cubic = Fritsch–Carlson),
+      expression stops, colour/spectrum stops (linear-RGB lerp → JH on the `D=3` Colour channels). Emit the
+      `NAME = range LO-HI [ … ]` block **and** parse one back; round-trip test against
+      `scenes/_record_*.ftsl`. (ftrace only materializes `D∈{1,3}`; loom carries all arities — emitting a
+      non-{1,3} channel is a loom-superset / J3b concern.)
+- [ ] **J3b — loom N-D superset** (loom-only authoring: N-D *input* domain and/or non-{1,3} channel arities;
+      emits down to the J3a form or a documented construct).
 - [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
       complement the emitters so a whole scene round-trips (semantic re-emit). Audit every `Element.emit`
       against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
@@ -1066,6 +1077,13 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **Generalized the record output-arity spec.** User observed `.ftsl` records already carry
+  arbitrary per-row output dimensionality (an `rgb` channel is a series of 3-tuples living alongside a
+  scalar reflectance/roughness curve). Formalized in `ROADMAP_records.md` §3: a channel outputs an
+  arbitrary-arity `D`-tuple, each stop is `D` component programs, interpolation is per-component; the
+  shipped `ChanKind{Scalar,Spectrum}` is the `D=1 (Linear)` / `D=3 (Colour)` realisation. §5 now separates
+  the **not-deferred** output-arity generality from the still-deferred N-D *input* domain (loom-side, §J3b).
+  Updated §J3 locked decisions + J3a/J3b accordingly (loom record twin is arbitrary-arity by construction).
 - 2026-07-19: **§J1 done.** Grid out-of-domain policy `on_outside` = `clamp` (default, byte-identical) /
   `raise` / `wrap` (periodic, linear + cubic) added to `GridField`/`VecGridField` and the shared
   `_cell_base_frac`/`_catmull_rom_axis`/`_grid_weights`; FieldCurve now re-raises a dim-mismatch with its
