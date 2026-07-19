@@ -100,7 +100,7 @@ inline Spectrum glassOrDefault(const char* name, double fallbackN) {
 // ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
-enum class Tok { Word, String, LBrace, RBrace, Newline, End };
+enum class Tok { Word, String, LBrace, RBrace, LBracket, RBracket, Newline, End };
 struct Token { Tok kind; std::string text; int line; };
 
 inline std::vector<Token> tokenize(const std::string& src) {
@@ -114,6 +114,8 @@ inline std::vector<Token> tokenize(const std::string& src) {
         if (c == '#') { while (i < n && src[i] != '\n') ++i; continue; }
         if (c == '{') { out.push_back({Tok::LBrace, "{", line}); ++i; continue; }
         if (c == '}') { out.push_back({Tok::RBrace, "}", line}); ++i; continue; }
+        if (c == '[') { out.push_back({Tok::LBracket, "[", line}); ++i; continue; }
+        if (c == ']') { out.push_back({Tok::RBracket, "]", line}); ++i; continue; }
         if (c == '"') {
             ++i; std::string s;
             while (i < n && src[i] != '"') { if (src[i] == '\n') ++line; s += src[i++]; }
@@ -126,7 +128,7 @@ inline std::vector<Token> tokenize(const std::string& src) {
         while (i < n) {
             char d = src[i];
             if (d == ' ' || d == '\t' || d == '\r' || d == '\n' ||
-                d == '{' || d == '}' || d == '#' || d == '"') break;
+                d == '{' || d == '}' || d == '[' || d == ']' || d == '#' || d == '"') break;
             w += d; ++i;
         }
         out.push_back({Tok::Word, w, line});
@@ -228,12 +230,58 @@ struct Parser {
         else fail("unterminated '{'");
     }
 
+    // Parse a record body `[ <lines> ]` into stmts (one per non-empty line: a channel
+    // name key + its stop tokens). Unlike a brace body, NEWLINES delimit statements and
+    // a value holds many barewords (the stops), so this does NOT use parseValue. Assumes
+    // cur() == LBracket.
+    void parseRecordBody(Block& b) {
+        adv();  // consume '['
+        while (!is(Tok::RBracket) && !is(Tok::End)) {
+            if (is(Tok::Newline)) { adv(); continue; }
+            if (!is(Tok::Word)) { fail("record line must start with a channel name"); return; }
+            Stmt s; s.line = cur().line;
+            s.key = cur().text; adv();
+            while (is(Tok::Word) || is(Tok::String)) { s.val.words.push_back(cur().text); adv(); }
+            b.stmts.push_back(std::move(s));
+        }
+        if (is(Tok::RBracket)) adv();
+        else fail("unterminated '[' in record");
+    }
+
+    // Parse `NAME = range LO-HI [ ... ]` (the leading `NAME = range` already consumed;
+    // `name` is NAME). Stores the domain as a stmt `range <tokens>` plus one stmt per
+    // channel line, all under a Block of type "record".
+    bool parseRecord(Block& b, const std::string& name) {
+        b.type = "record";
+        b.name = name;
+        Stmt dom; dom.key = "range"; dom.line = cur().line;
+        while (is(Tok::Word)) { dom.val.words.push_back(cur().text); adv(); }
+        b.stmts.push_back(std::move(dom));
+        skipNewlines();
+        if (!is(Tok::LBracket)) { fail("record '" + name + "' needs '[ ... ]' after `range LO-HI`"); return false; }
+        parseRecordBody(b);
+        return err.empty();
+    }
+
     // Parse ONE top-level block (or a `prefer { } else { }` construct) starting at
     // cur() (which must be a Word). Fills `b`; returns false on a parse error.
     bool parseOneTopBlock(Block& b) {
         if (!is(Tok::Word)) { fail("expected a block type"); return false; }
         b.type = cur().text; adv();
         if (b.type == "prefer") return parsePrefer(b);
+        // Parametric record: `NAME = range LO-HI [ ... ]` (ROADMAP_records.md). Detected
+        // by a bare first word immediately followed by '=' then `range` — spectrum uses
+        // a *quoted* name before '=', so there is no collision.
+        if (is(Tok::Word) && cur().text == "=") {
+            std::string name = b.type;
+            adv();  // consume '='
+            if (is(Tok::Word) && cur().text == "range") {
+                adv();  // consume 'range'
+                return parseRecord(b, name);
+            }
+            fail("unknown '=' declaration '" + name + "' (expected `= range`)");
+            return false;
+        }
         if (is(Tok::String)) { b.name = cur().text; adv(); }
         // Optional bareword subtype (light area / light collimated), but not '='.
         if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
@@ -642,6 +690,12 @@ public:
             if (!addPattern(b, L)) return false;
         }
 
+        // Pass 1d: parametric records (must exist before materials that reference them).
+        for (const auto& b : blocks) {
+            if (b.type != "record") continue;
+            if (!addRecord(b, L)) return false;
+        }
+
         // Pass 2: materials (must exist before geometry references them).
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
@@ -693,7 +747,8 @@ public:
             else if (b.type == "camera_curve") { if (!addCameraCurve(b, L)) return false; }
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
-                     b.type == "texture" || b.type == "pattern" || b.type == "mesh_asset") { /* handled */ }
+                     b.type == "texture" || b.type == "pattern" || b.type == "record" ||
+                     b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
@@ -717,6 +772,7 @@ private:
     std::unordered_map<std::string, int> matIndex_;
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
+    std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
 
     // Named-object registries for `medium { bounds { object "name" } }` resolution.
@@ -1068,6 +1124,132 @@ private:
         int id = (int)L.scene.patterns.size();
         L.scene.patterns.push_back(std::move(pat));
         patternIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- parametric records (§records) ----
+    // Parse a record domain: either one hyphen-joined token "LO-HI" (the common form,
+    // e.g. `range 0-1`) or two number tokens (`range 0 1`). Requires HI > LO.
+    static bool parseRecordDomain(const std::vector<std::string>& w, double& lo, double& hi) {
+        if (w.size() == 2 && isNumber(w[0]) && isNumber(w[1])) {
+            lo = num(w[0]); hi = num(w[1]); return hi > lo;
+        }
+        if (w.size() == 1) {
+            const std::string& s = w[0];
+            // Split at a '-' that yields two numbers, skipping a leading sign and any
+            // exponent marker (so "1e-3-2", "-1-1", "0.5-2.5" all parse).
+            for (size_t k = 1; k < s.size(); ++k) {
+                if (s[k] != '-') continue;
+                char p = s[k - 1];
+                if (p == 'e' || p == 'E' || p == '+' || p == '-') continue;
+                std::string a = s.substr(0, k), b = s.substr(k + 1);
+                if (isNumber(a) && isNumber(b)) { lo = num(a); hi = num(b); return hi > lo; }
+            }
+        }
+        return false;
+    }
+
+    // Assign domain positions to a channel's stops: an author `p:<pos>` pins a stop;
+    // the first/last unpinned stops anchor to lo/hi; each interior run of unpinned
+    // stops spreads evenly between its fixed neighbours.
+    static void redistributeStops(RecChannel& ch, double lo, double hi) {
+        const int n = (int)ch.stops.size();
+        std::vector<char> fixed(n, 0);
+        for (int i = 0; i < n; ++i) fixed[i] = ch.stops[i].pinned ? 1 : 0;
+        if (n == 1) { if (!fixed[0]) ch.stops[0].pos = lo; return; }
+        if (!fixed[0])     { ch.stops[0].pos = lo;     fixed[0] = 1; }
+        if (!fixed[n - 1]) { ch.stops[n - 1].pos = hi; fixed[n - 1] = 1; }
+        int a = 0;
+        while (a < n) {
+            if (!fixed[a]) { ++a; continue; }
+            int b = a + 1;
+            while (b < n && !fixed[b]) ++b;
+            if (b < n && b > a + 1) {
+                double pa = ch.stops[a].pos, pb = ch.stops[b].pos;
+                int gaps = b - a;
+                for (int j = a + 1; j < b; ++j)
+                    ch.stops[j].pos = pa + (pb - pa) * double(j - a) / double(gaps);
+            }
+            a = b;
+        }
+    }
+
+    // Build one Record from a `NAME = range LO-HI [ ... ]` block. STAGE 1: structural
+    // only — parse the domain, interp, channels and stops; redistribute positions.
+    // Compiling stop tokens (expressions / colours) and sampling land in later stages.
+    bool addRecord(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("record needs a name"); return false; }
+        if (recordIndex_.count(b.name)) { fail("duplicate record name '" + b.name + "'"); return false; }
+        Record rec;
+        rec.name = b.name;
+        bool haveRange = false;
+        for (const auto& s : b.stmts) {
+            if (s.key == "range") {
+                if (!parseRecordDomain(s.val.words, rec.lo, rec.hi)) {
+                    fail("record '" + rec.name + "': bad `range` (need LO-HI or LO HI with HI>LO)");
+                    return false;
+                }
+                haveRange = true;
+                continue;
+            }
+            if (s.key == "interp") {
+                const std::string& m = s.val.words.empty() ? std::string() : s.val.words[0];
+                if      (m == "nearest") rec.interp = RecInterp::Nearest;
+                else if (m == "linear")  rec.interp = RecInterp::Linear;
+                else if (m == "smooth")  rec.interp = RecInterp::Smooth;
+                else { fail("record '" + rec.name + "': interp must be nearest|linear|smooth"); return false; }
+                continue;
+            }
+            // Otherwise: a channel line. Its words are the stops, with optional `p:<pos>`
+            // prefixes pinning the position of the following value.
+            RecChannel ch;
+            ch.name = s.key;
+            bool havePin = false; double pinPos = 0.0;
+            for (const auto& w : s.val.words) {
+                if (w.rfind("p:", 0) == 0) {
+                    if (!isNumber(w.substr(2))) {
+                        fail("record '" + rec.name + "' channel '" + ch.name + "': bad p:<pos> '" + w + "'");
+                        return false;
+                    }
+                    havePin = true; pinPos = num(w.substr(2));
+                    continue;
+                }
+                RecStop st; st.token = w;
+                if (havePin) { st.pinned = true; st.pos = pinPos; havePin = false; }
+                ch.stops.push_back(std::move(st));
+            }
+            if (havePin) {
+                fail("record '" + rec.name + "' channel '" + ch.name + "': trailing p:<pos> with no value");
+                return false;
+            }
+            if (ch.stops.empty()) {
+                fail("record '" + rec.name + "' channel '" + ch.name + "' has no stops");
+                return false;
+            }
+            redistributeStops(ch, rec.lo, rec.hi);
+            rec.channels.push_back(std::move(ch));
+        }
+        if (!haveRange) { fail("record '" + rec.name + "' has no `range LO-HI`"); return false; }
+        if (rec.channels.empty()) { fail("record '" + rec.name + "' has no channels"); return false; }
+        // Validate: pinned positions in [lo,hi] and non-decreasing per channel.
+        for (const auto& ch : rec.channels) {
+            for (const auto& st : ch.stops) {
+                if (st.pos < rec.lo - 1e-9 || st.pos > rec.hi + 1e-9) {
+                    fail("record '" + rec.name + "' channel '" + ch.name + "': stop position " +
+                         std::to_string(st.pos) + " is outside the domain");
+                    return false;
+                }
+            }
+            for (size_t i = 1; i < ch.stops.size(); ++i) {
+                if (ch.stops[i].pos < ch.stops[i - 1].pos - 1e-12) {
+                    fail("record '" + rec.name + "' channel '" + ch.name + "': stop positions must be non-decreasing");
+                    return false;
+                }
+            }
+        }
+        int id = (int)L.scene.records.size();
+        recordIndex_[rec.name] = id;
+        L.scene.records.push_back(std::move(rec));
         return true;
     }
 

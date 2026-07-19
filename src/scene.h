@@ -14,6 +14,7 @@
 #include "envmap.h"
 #include "vdbgrid.h"
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
+#include "record.h"      // parametric records (§records): named per-channel LUTs
 
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter };
 
@@ -686,6 +687,7 @@ struct Scene {
     std::vector<Material> mats;
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
+    std::vector<Record>  records;    // parametric records: named per-channel LUTs (§records)
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
