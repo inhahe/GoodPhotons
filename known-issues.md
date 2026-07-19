@@ -5,6 +5,42 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DEFERRED (2026-07-18): `PatOp::MatMulAdd` — a fused matrix·vec+offset pattern opcode (future optimization)
+**Status: intentionally not built. This is an optimization of an already-working path, not a
+missing capability.** Why we may want it someday, and why we don't need it now:
+
+- **The need it *seems* to fill is already met.** loom's N-D isosurfaces (`gyroid_nd`) rotate the
+  lattice in higher dimensions by an affine map `A·(x,y,z) + c` fed into the field — and that matrix
+  multiply **must** live inside the isosurface function ftrace evaluates. It already does: `_arg_expr()`
+  (and `_pov_nd_coords`/`_pov_affine_coords`) in `tools/loom/examples/gyroid_nd.py` emit each matrix row
+  as a plain scalar expression `(coeff*((a)*x+(b)*y+(c)*z)+phase)`. ftrace's pattern parser
+  (`src/pattern.h`) compiles that straight into `Const/VarX/VarY/VarZ/Mul/Add` postfix bytecode and
+  evaluates it directly on both CPU and GPU (the `-raster-gpu` iso preview ray-marches D=8 tumble gyroids
+  today with the matrix baked in). So there is **no field ftrace currently fails to render** for lack of
+  a matrix op.
+- **What MatMulAdd would actually buy.** Purely a more compact *encoding*: one fused opcode replacing the
+  ~6 scalar ops per emitted matrix row (`Const, VarX, Mul, VarY, Mul, Add, …`). Same math, bit-identical
+  result — fewer `PatNode`s in the compiled program and a slightly cheaper inner eval. It is **not** a new
+  capability.
+- **Why we skip it now.** Per-frame pattern evaluation is not the bottleneck (the sin/cos/`PovFn` terms
+  and the sphere-march dominate the field eval), and the postfix programs are well within any practical
+  size. The payoff is marginal; the cleanest correct implementation still isn't free (see below).
+- **When to revisit.** If a real workload ever makes pattern-eval node count or throughput a measured
+  problem — e.g. very high-D fields with many coupling edges producing enormous postfix programs, or a
+  profile showing the linear ops as a hot fraction of field eval.
+- **How to build it (the design fork), if revisited.** The pattern VM is a single-scalar-stack machine:
+  every `PatNode` is a POD `{PatOp op; double a;}` that pops N and pushes **exactly one** scalar. A
+  matrix·vec+offset is 12 coefficients in → a **3-vector** out, which doesn't fit that contract. Two ways:
+  - **Option A — single-output "matrow" + coefficient pool (preferred).** Add a `MatRow` op computing one
+    output component `m0·x + m1·y + m2·z + off`; emit 3 per point. Preserves the one-push-per-node
+    invariant and the POD/GPU-uploadable node, but needs `PatNode` to gain a side-array index (the single
+    `double a` can't hold 4 coeffs). Contained; the five standard PatOp touch-points (opcode enum
+    `pattern.h:29`, CPU eval switch `pattern.h:112`, device eval switch `render_cuda.cu` ~2754, the
+    parser, and PatNode storage) plus the coefficient pool.
+  - **Option B — true multi-output (invasive, not recommended for an ergonomics gain).** Give the stack
+    vector semantics so a node can push 3 values. Cleanest for "transform a point," but rewrites the VM's
+    fundamental one-scalar-out contract across CPU eval, device eval, arity accounting, and every consumer.
+
 ### TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)
 The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
 wired as `-raster-gpu`) casts one ray/pixel with the shared `closestHit` and shades

@@ -409,8 +409,15 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       physical mesh-lens camera). `gyroid_nd --raster-gpu` swaps the per-frame flag (`--raster-iso` moot
       — no marching cubes). Validated on `scenes/implicit.ftsl` (metaballs + CSG + torus render
       identically to `-raster`, cleaner surfaces) and a 3-frame gyroid video.
-- [ ] **G3** `PatOp::MatMulAdd` intrinsic (matrix·vec + offset) so per-frame affine transforms bake
-      cleanly instead of a dozen scalar mul/adds. Five standard PatOp touch-points.
+- [ ] **G3 (deferred — optimization only, not an enabler)** `PatOp::MatMulAdd` intrinsic (matrix·vec +
+      offset). *Decided 2026-07-18: skip for now.* The N-D rotation loom bakes into each isosurface
+      **already renders correctly** via existing scalar ops — `_arg_expr()` emits each matrix row as
+      `(a)*x+(b)*y+(c)*z`, which ftrace compiles straight to `Const/VarX/Mul/Add` bytecode and evaluates
+      directly (including on the GPU: `-raster-gpu` ray-marches D=8 tumble gyroids today). So MatMulAdd
+      only *compresses* the encoding (one fused opcode vs ~6 scalar ops per row) — a compactness /
+      marginal-speed win, **not** a new capability. Revisit only if per-frame pattern eval becomes a
+      real bottleneck (it isn't — sin/cos/PovFn + the sphere-march dominate). See known-issues.md
+      "Deferred: `PatOp::MatMulAdd`". Prefer the contained single-output "matrow" form (Option A) if so.
 - [ ] **G4 (deferred, export-only)** GPU marching cubes — *only* to accelerate mesh export, not the
       video path. Build only if mesh-export throughput becomes a pain point.
 
