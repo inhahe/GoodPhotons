@@ -446,6 +446,18 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       "Deferred: `PatOp::MatMulAdd`". Prefer the contained single-output "matrow" form (Option A) if so.
 - [ ] **G4 (deferred, export-only)** GPU marching cubes — *only* to accelerate mesh export, not the
       video path. Build only if mesh-export throughput becomes a pain point.
+- [ ] **G5 — `-raster-gpu` / `kIsoPreview` textured shading** *(user-requested 2026-07-19; also logged
+      in known-issues.md).* Today the GPU isosurface preview shades **flat** — per-material albedo +
+      ambient + weighted N·L keys + headlight fill, with **no texture lookup**. Make it sample and shade
+      textures — both **image** (`Texture`/`skin`) and **formula** (`ProcTexture`/`func_skin`, the E1
+      procedural-skin path) — so previewed isosurfaces/meshes carry their authored surface detail. Scope
+      (from known-issues.md): **port the raster texture-sampling path into `kIsoPreview`** — the device
+      already carries `DHit.u/v/p`, so the UVs and hit point needed for both image sampling and formula
+      evaluation are in hand; wire the material's texture reference and evaluate it on-device in the
+      shading step instead of using the flat material albedo. Prerequisite for **F4/F7** (the loom viewer
+      showing SweptMesh/isosurface textures via `-raster-gpu`). Verify the textured GPU preview matches
+      the CPU `-raster` textured output on `scenes/implicit.ftsl` + a func_skin scene, and keep the flat
+      path bit-identical when a material has no texture.
 
 ---
 
@@ -774,6 +786,140 @@ explicit reduction node and the video node sit in that taxonomy.
 
 ---
 
+## F. loom native viewer  *(loom + ftrace; LARGE, design-captured 2026-07-19; the concrete realization of §E2)*
+**Idea.** A **native viewer** for loom scenes, built on ftrace's own renderer (C++), not a WebGL/browser
+app. It enumerates the objects a loom file defines, lets the user select and inspect them, and shows
+N-D curves / SweptMeshes / isosurfaces / scatter+grid fields / the modulator DAG in one live UI.
+
+**Architecture (locked in conversation 2026-07-19):**
+- **Native, on ftrace's renderer — not WebGL.** The user's primary interest is *fast isosurface
+  modification*, and ftrace's **`-raster-gpu` / `kIsoPreview`** already sphere-traces implicit
+  isosurfaces per-pixel on device with **no tessellation** and **exact field-eval parity** with the full
+  render. WebGL would need a GLSL transpiler for every field, shader recompiles on structural field edits,
+  and would still not beat the CUDA sphere-tracer for *re-evaluating a changed isosurface*. So: native
+  viewer = ftrace's `-raster-gpu` for the 3-D pane + **Dear ImGui** (panels/sliders/input/picking) +
+  **ImPlot** (scroll-locked strip charts) + **imnodes** (the modulator DAG). Disadvantages accepted:
+  more C++/CUDA plumbing than a browser app, must ship/build the ImGui stack, no zero-install share link.
+- **loom→viewer data flow: export/sidecar + the existing `.ftsl`/`-serve` path** (loom is Python, the
+  viewer is C++, so no in-process sharing). loom writes a JSON sidecar of curves/fields/DAG for the
+  viewer to introspect, and drives frames over the existing `PreviewServer`↔`ftrace -serve` stdio pipe
+  (same precedent as §E2 Q3). Anything WebGL could do without a Python round-trip, the native viewer can
+  do too.
+- **Load contract: a `build(clock=…, **params) -> Scene` function, NOT a module-level `scene` object.**
+  `build()` lets the viewer re-evaluate the scene live (re-tessellate, change a param, scrub time) with
+  no import-time side effects. The viewer calls `build()` with the current clock/params to get a fresh
+  `Scene` whenever it needs to re-derive geometry.
+
+**Tasks:**
+- [ ] **F1 — scene/object enumeration + `build()` load contract.** Load a loom file, call its
+      `build(clock, **params)`, walk the resulting `Scene`, and present a selectable list of objects
+      (curves, SweptMeshes, isosurfaces, scatter/grid fields). Selecting one drives the panes below.
+      Define + document the `build()` contract (signature, that it must be side-effect-free at import,
+      how params are surfaced to the UI).
+- [ ] **F2 — N-D curve 3-D view.** Show an N-D curve by picking **3 of N** dims to display. **Rotating
+      the displayed dims = a view-only transform** (no recompute); **rotating into other dims = recompute
+      the projection.** Index markers along the curve show curve progression. **Stereoscopic viewing:**
+      wall-eyed (L|R) and cross-eyed (R|L) side-by-side, plus **red-cyan anaglyph** — using the §I
+      off-axis stereo machinery (shared with the renderer's still/movie stereo).
+- [ ] **F3 — scroll-locked strip charts (ImPlot).** Below the 3-D pane, one strip chart **per curve
+      dimension** and one **per tacked-on channel** (TrackedCurve). Shared index markers along the bottom
+      cross-reference the 3-D index dot. **All charts scroll left/right together (scroll-locked, never
+      individually)** to page through the whole curve. Hover/click on a chart cross-highlights the 3-D
+      index dot and vice-versa.
+- [ ] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** Tessellate the
+      SweptMesh and show it in the 3-D pane with **any texture it defines (image *or* formula** — needs
+      **G5**). **Rotation rule:** rotating an isometry of the 3 displayed spatial dims = **view-only**
+      transform (just spin the existing mesh, no re-tessellate); rotating **into a parameter/extra
+      dimension** = **re-tessellate off the UI thread** via a **latest-wins job queue** (drop stale bakes
+      during a slider drag so the UI stays responsive). If loom couldn't define textures this would add
+      it — but loom already has `Texture`/`skin` (image) and `ProcTexture`/`func_skin` (formula, E1 DONE),
+      so this consumes them.
+- [ ] **F5 — modulator-DAG panel (imnodes).** Introspect the signal DAG via loom's `walk()` and lay it
+      out well. Each node shows the **op/function that modulates it** and a **stable identifier**; each
+      **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
+      function refers to which upstream node.
+- [ ] **F6 — scatter + grid field display & inspection.** **Scatter:** show the actual defined points
+      (no volume fill) using the same 3-D-view/stereo mechanism, colored by a **channel selector
+      (default)** or channels 0/1/2 → RGB; **click any point to inspect its location + all channel
+      values**; glyphs later. **Grid:** show a **3-D slice** with **sliders for the extra dims**; same
+      click-to-inspect. Coloring must handle **multi-valued** points (hence the channel selector, not a
+      single fixed mapping).
+- [ ] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** Show a loom
+      isosurface in the 3-D pane by **raymarching it through `-raster-gpu`** (primary path — the whole
+      reason for the native viewer; lets the user *modify* the isosurface and see it re-evaluated fast
+      with no re-tessellation). Keep the existing marching-cubes mesh (`mcubes.mesh_field` / `IsoMesh`)
+      only as an **optional static-rotate fallback**. Textures via **G5**.
+
+---
+
+## H. loom multi-valued fields + interpolation + field-sampled curve  *(loom; medium–large, design-captured 2026-07-19)*
+**Idea.** Make loom's `GridField` / `ScatterField` **multi-valued** and add a **curve that samples a
+field** (the piece §F6's inspection and §E2's curve-drive both want). Answers the user's explicit
+question — *should grid/scatter points be multi-valued?* — with **YES**.
+
+**Decisions (locked 2026-07-19):**
+- **Fields are vector-valued / named-channel**, mirroring the FTSL `record` channel model (§0). Keep
+  **domain coordinates** (where a point sits) distinct from **value channels** (what it carries). Why
+  multi-valued rather than "make a separate field per value": (1) **interpolation-weight correctness** —
+  the weights depend only on the domain coords, so all channels share one weight computation; (2) **perf**
+  — compute the neighbor/RBF weights **once**, apply to every channel (a multi-RHS solve for scatter);
+  (3) **consistency** with records' channel model; (4) it **subsumes** the single-valued case (one
+  channel). A single-valued field is just the 1-channel special case.
+- **Grid interpolation:** **multilinear by default**, optional **tricubic / Catmull-Rom**.
+- **Scatter interpolation: RBF** (radial basis functions) — works in any N-D, is **exact at the data
+  points**, smooth, and needs **no meshing**. **Default kernel = thin-plate / polyharmonic spline**
+  (parameter-free); options **multiquadric** / **Gaussian** (shape param ε) and **Wendland** compactly-
+  supported for large point sets. Use `scipy.interpolate.RBFInterpolator` (its **multi-RHS solve** does
+  one kernel factorization for *all* channels — reinforcing the multi-valued perf win). **Explicitly not
+  simple linear interpolation between points.** **Caveat:** RBF **extrapolates/overshoots outside the
+  convex hull** → the field must **clamp or flag** out-of-hull queries.
+- **Field-sampled curve:** a loom **curve routed through a grid/scatter field**. You *use* it by **polling
+  at a curve-progression index**, which returns **N spatial coordinates** *and* **`{channel: value}`** —
+  the interpolated field value(s) at those coordinates. This is the object §E2's "curve variables drive
+  scene variables" and §F6's inspection both build on.
+
+**Tasks:**
+- [ ] **H1 — vector-valued `GridField`/`ScatterField`.** Add named/indexed **value channels** to both
+      field types; keep domain coords separate from value channels; single-valued stays the 1-channel case.
+- [ ] **H2 — grid interpolation.** Multilinear default; optional tricubic / Catmull-Rom. Compute domain
+      weights once, apply across all channels.
+- [ ] **H3 — RBF scatter interpolation.** `scipy.interpolate.RBFInterpolator`; thin-plate default,
+      multiquadric/Gaussian/Wendland options; one factorization → multi-RHS across channels; clamp/flag
+      out-of-convex-hull queries.
+- [ ] **H4 — field-sampled curve.** A curve through a field; polling at a progression index returns
+      (N spatial coords, `{channel: value}`). Wire into the DAG so its outputs can drive scene variables.
+
+---
+
+## I. ftrace stereoscopic / anaglyph output  *(ftrace renderer; medium, design-captured 2026-07-19)*
+**Idea.** 3-D stereoscopic output for **both stills and movies** — side-by-side (wall-eyed and
+cross-eyed) and **red-cyan anaglyph** glasses. Also the shared machinery §F2 uses for the viewer's curve
+stereo.
+
+**Decisions (locked 2026-07-19):**
+- **Off-axis (asymmetric-frustum, parallel cameras) stereo — NOT toe-in.** Toe-in (rotating the two eyes
+  to converge) introduces **vertical parallax** that causes eye strain; the correct method is two
+  **parallel** cameras with **asymmetric (sheared) frusta** sharing a convergence plane.
+- **Anaglyph default = Dubois matrix** (least-squares optimal color mixing — far less ghosting/retinal
+  rivalry than naïve channel-split). **Red-cyan default**, **green-magenta** an option.
+- **Physically-correct baseline from viewing geometry.** CLI supplies **viewing distance**, **interocular
+  distance** (both with sensible defaults), and **DPI** (default: attempt auto-detect); from these compute
+  the correct stereo **baseline + convergence**. Reuse the **M13-derived camera right axis** as the
+  interocular baseline direction.
+
+**Tasks:**
+- [ ] **I1 — off-axis stereo core.** Render the scene twice from two parallel, asymmetric-frustum eyes
+      offset along the camera right axis; share the auto-exposure anchor across the pair (as camera_path
+      does) so L/R tone-map identically. Works for stills and per-frame in movies.
+- [ ] **I2 — output modes.** Side-by-side **wall-eyed (L|R)** and **cross-eyed (R|L)**; **anaglyph**
+      compositing via the **Dubois matrix** (red-cyan default, green-magenta option). One CLI switch to
+      pick the mode.
+- [ ] **I3 — CLI + physical geometry.** `-stereo <mode>`, `-eye-sep <m>` (interocular), `-view-dist <m>`,
+      `-dpi <n>` (auto-detect default); compute baseline + convergence from viewing distance / interocular
+      / DPI. Document in README (stills + movies).
+
+---
+
 ## Progress log
 - 2026-07-18: file created; consolidated undone items from DESIGN.md, OSCILLATE_GRAMMAR.md, ROADMAP.md,
   ROADMAP_heroroom.md, and the just-designed camera-curve bridge (§A). Starting on item G1
@@ -898,3 +1044,24 @@ explicit reduction node and the video node sit in that taxonomy.
   tessellation. main.cpp falls back to CPU raster on unsupported configs; `gyroid_nd --raster-gpu` routes
   video frames through it. Fixed a vertical-flip bug (dGenRay py=0 is image bottom, accum row 0 is top).
   Validated on `scenes/implicit.ftsl` + a gyroid video. Next: G3 (PatOp::MatMulAdd — needs a design call).
+- 2026-07-19: **§A / M13 done + committed (2c2ae94)** — camera-curve two-axis orientation (ftrace
+  `fwd_at`/`up_at`/`frame`/`fwd_frame`/`up_frame` + RMF double-reflection twist; back-compat bit-identical)
+  and loom `CameraCurve` element (6 new emit tests). Docs updated (README, FTSL.md §15.3, DESIGN.md M13).
+- 2026-07-19: **Design-captured a large batch of user-brainstormed features into new TODO sections**
+  (no code yet — all design, awaiting scheduling/priority). **§F loom native viewer** (F1–F7): native
+  on ftrace's `-raster-gpu` (not WebGL — chosen because the goal is fast isosurface *modification*, which
+  the device sphere-tracer already does with no tessellation + exact field parity) + ImGui/ImPlot/imnodes;
+  `build(clock, **params)->Scene` load contract (not a module `scene`); N-D curve 3-D view w/ view-vs-
+  recompute rotation semantics + off-axis stereo (wall/cross-eyed + anaglyph); scroll-locked per-dim +
+  tracked-channel strip charts; SweptMesh tessellated view w/ textures + decoupled latest-wins re-tess;
+  modulator-DAG panel (`walk()` + edge param labels); scatter/grid inspect w/ channel-selector coloring;
+  isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback. Concrete realization of §E2.
+  **§H loom multi-valued fields** (H1–H4): vector-valued Grid/ScatterField (record channel model — user's
+  question answered YES); grid multilinear/tricubic; **RBF scatter interpolation** (thin-plate default,
+  multiquadric/Gaussian/Wendland options, `scipy.RBFInterpolator` multi-RHS, convex-hull-overshoot caveat);
+  field-sampled curve returning (coords, {channel:value}). **§I ftrace stereoscopic output** (I1–I3):
+  off-axis (asymmetric-frustum, parallel) stereo — not toe-in; wall/cross-eyed side-by-side + **Dubois**
+  anaglyph (red-cyan default, green-magenta option); `-stereo`/`-eye-sep`/`-view-dist`/`-dpi` (auto-detect)
+  → physical baseline+convergence; reuses M13 right axis; stills + movies. **§B/G5** added: make
+  `-raster-gpu`/`kIsoPreview` shade textures (image + formula) — port raster texture sampling into the
+  device kernel (already has `DHit.u/v/p`); user-requested, also in known-issues.md; prereq for F4/F7.
