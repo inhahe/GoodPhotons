@@ -147,6 +147,19 @@ def _unquote(s: str) -> str:
     return s[1:-1] if len(s) >= 2 and s[0] == '"' and s[-1] == '"' else s
 
 
+def _binder_name(node) -> Optional[str]:
+    """The bound NAME of a `NAME = KIND { … }` header, or None if anonymous.
+
+    The unified element header carries its name in an optional `binder` node
+    (`binder = NAME '='`); an anonymous `KIND { … }` has no binder.
+    """
+    b = _kid(node, "binder")
+    if b is None:
+        return None
+    nm = _kid(b, "NAME")
+    return nm.value if nm is not None else None
+
+
 def _props(node):
     """A material/texture body -> ordered list of (key, [raw token, …])."""
     out = []
@@ -159,7 +172,7 @@ def _props(node):
 
 
 def _build_material(node) -> Material:
-    name = _unquote(_kid(node, "STRING").value)
+    name = _binder_name(node)
     mtype = "diffuse"
     props = {}
     for key, toks in _props(_kid(node, "mbody")):
@@ -173,7 +186,7 @@ def _build_material(node) -> Material:
 
 
 def _build_texture(node):
-    name = _unquote(_kid(node, "STRING").value)
+    name = _binder_name(node)
     fields = {k: [_unquote(t) for t in toks] for k, toks in _props(_kid(node, "mbody"))}
     if "rgb" in fields:                     # procedural (function) skin -> ProcTexture
         from ..scene import ProcTexture
@@ -206,12 +219,16 @@ def _build_sphere(node):
 
 def _build_light(node):
     from ..scene import Light
-    # the `light` keyword tokenizes as a NAME node too (it matches NAME), so the
-    # bareword kind is the *second* top-level NAME child.
-    kind = _kids(node, "NAME")[1].value
+    # Unified header `[NAME =] light { kind <subtype>  … }`: the subtype rides a
+    # `kind` property in the body rather than a bareword after the KIND.
+    kind = None
     props = {}
     for key, toks in _props(_kid(node, "mbody")):
-        props[key] = " ".join(_unquote(t) for t in toks)
+        val = " ".join(_unquote(t) for t in toks)
+        if key == "kind":
+            kind = val
+        else:
+            props[key] = val
     return Light(kind, **props)
 
 
@@ -222,7 +239,7 @@ def _vec3n(node):
 
 def _build_camera(node):
     from ..scene import Camera
-    name = _unquote(_kid(node, "STRING").value)
+    name = _binder_name(node)
     view = _kid(node, "cam_view")
     eye, look_at, up = (_vec3n(v) for v in _kids(view, "vec3n"))
     fov_y = float(_kid(view, "NUMBER").value)

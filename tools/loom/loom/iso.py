@@ -173,7 +173,7 @@ class Isosurface(Element):
                       else self.field(cx, cy, cz))
         expr = f"{field_expr}-({fmt(thr)})"
 
-        lines = [f'isosurface "{self.name}" {{']
+        lines = [f'{self.name} = isosurface {{']
         lines.append(f'    material "{self.material}"')
         lines.append(f'    function {{ expr "{expr}" }}')
         if self.container == "sphere":

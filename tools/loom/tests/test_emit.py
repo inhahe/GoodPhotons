@@ -45,10 +45,10 @@ def test_emit_is_wellformed():
     assert text.startswith("scene {")
     # balanced braces
     assert text.count("{") == text.count("}"), (text.count("{"), text.count("}"))
-    assert 'camera "cam"' in text
+    assert 'cam = camera' in text
     assert text.count("sphere {") == 24 + 1   # beads + one explicit sphere
-    assert 'material "wire"' in text
-    assert "light area" in text
+    assert 'wire = material' in text
+    assert "kind area" in text
 
 
 def test_emit_is_seamless():
@@ -151,7 +151,7 @@ def test_camera_curve_minimal_golden():
                      res=(320, 240), name="fly")
     txt = _cc_emit(cc)
     assert txt.count("{") == txt.count("}")
-    assert txt.startswith('camera_curve "fly" {')
+    assert txt.startswith('fly = camera_curve {')
     assert txt.count("point ") == 3
     assert "look_at 0 0 0" in txt
     assert "fov_y 40" in txt and "mode R" in txt
@@ -223,7 +223,7 @@ def test_camera_curve_in_scene():
           Light("area", origin="0 1.5 0", u="0.5 0 0", v="0 0 0.5",
                 normal="0 -1 0", spd="preset:bb6500"))
     text = s.emit(Clock(t=0.0, frame=0, frames=8))
-    assert 'camera_curve "cam"' in text
+    assert 'cam = camera_curve' in text
     assert text.count("{") == text.count("}")
 
 

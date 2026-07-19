@@ -112,7 +112,7 @@ class FuncPattern(Pattern):
         return self.template(cx, cy, cz)
 
     def emit(self, ctx: EmitCtx) -> str:
-        return f'pattern "{self.name}" {{ expr "{self._body(ctx)}" }}'
+        return f'{self.name} = pattern {{ expr "{self._body(ctx)}" }}'
 
 
 class MixMaterial(Material):
@@ -135,7 +135,7 @@ class MixMaterial(Material):
         return []
 
     def emit(self, ctx: EmitCtx) -> str:
-        lines = [f'material "{self.name}" {{', '    type mix']
+        lines = [f'{self.name} = material {{', '    type mix']
         for n, w in self.layers:
             lines.append(f'    layer "{n}" {fmt(w)}')
         if self.weight_map is not None:

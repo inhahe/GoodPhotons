@@ -12,8 +12,8 @@ Origin tags point at the authoritative design text for each item.
 
 ## NEXT UP — unify element headers to `name = KIND { … }` (do before the ftrace grammar port)
 
-- [~] **Switch the whole scene grammar + loom emitters to `name = KIND { … }` (and anonymous `KIND { … }`).**
-      *(User-approved 2026-07-19; in progress.)* Replace the inconsistent `KIND "name" { … }` headers
+- [x] **Switch the whole scene grammar + loom emitters to `name = KIND { … }` (and anonymous `KIND { … }`).**
+      *(User-approved 2026-07-19; DONE.)* Replace the inconsistent `KIND "name" { … }` headers
       (`camera "cam" {…}`, `material "gold" {…}`, `texture "hide" {…}`, `light … {…}`) with a single binding
       shape: **`hero = camera { … }`**, **`gold = material { … }`**, **`hide = texture { … }`**, with the
       **anonymous** form just dropping `name =` (`camera { … }`, a nameless light, etc.). Records already use this
@@ -32,13 +32,18 @@ Origin tags point at the authoritative design text for each item.
       (`KIND "name" {…}` and `name = KIND {…}`); loom + the shared grammar hard-switch to the new form; old-form C++
       support is dropped once the shared grammar is ported into ftrace's front-end. This keeps the pipeline green at
       every commit.
-      **Progress (2026-07-19, v0.9.1):** *Increment 1 — ftrace C++ accept-both — DONE & verified.* `parseOneTopBlock`
-      now parses `NAME = KIND { … }` alongside `NAME = range …` and legacy `KIND "name" {…}`; the light subtype falls
-      back to a `kind` property when no bareword subtype is present (`sun = light { kind sphere … }`), at both the
-      top-level and group-nested dispatch sites. Validated by rendering both `scraps/newform_test.ftsl` and
-      `scraps/oldform_test.ftsl`. *Remaining — Increment 2:* flip loom emitters (`scene.py`/`iso.py`/`material.py`),
-      the shared `ftsl.epeg` + `reader.py` builders (light kind as a property), and the `test_grammar_*`
-      samples/fixtures, then run the loom suite green.
+      **Done (2026-07-19, v0.9.1):**
+      *Increment 1 — ftrace C++ accept-both.* `parseOneTopBlock` now parses `NAME = KIND { … }` alongside
+      `NAME = range …` and legacy `KIND "name" {…}`; the light subtype falls back to a `kind` property when no bareword
+      subtype is present (`sun = light { kind sphere … }`), at both the top-level and group-nested dispatch sites.
+      *Increment 2 — loom + shared grammar hard-switch to the new form.* Flipped every loom emitter to
+      `NAME = KIND { … }` / anonymous `light { kind … }` (`scene.py` texture/material/proctexture/light/camera/
+      camera_curve, `iso.py` isosurface, `material.py` pattern + mix material); updated the shared `ftsl.epeg`
+      (`binder = NAME '='`; `binder?` prefix on material/texture/light/camera; light `kind` as a body property) and the
+      `reader.py` builders (`_binder_name`, light kind from a property). Updated the emit/header assertions across the
+      loom test suite. **Verified:** loom suite 734 passed; a loom-emitted new-form scene (`scraps/loom_emit_test.ftsl`)
+      renders in ftrace; both `scraps/newform_test.ftsl` and legacy `scraps/oldform_test.ftsl` parse. Old-form C++
+      support stays until the shared grammar is ported into ftrace's front-end.
 
 - [ ] **DECISION — color-vector / array syntax (locked in conversation 2026-07-19).** How numbers, commas,
       brackets, and colorspace keywords (`rgb`/`hsl`/`hsv`) group into colors and lists of colors. Settled model,

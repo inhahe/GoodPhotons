@@ -87,7 +87,7 @@ class Texture(Element):
         return []
 
     def emit(self, ctx: EmitCtx) -> str:
-        return (f'texture "{self.name}" {{ file "{self.file}"  '
+        return (f'{self.name} = texture {{ file "{self.file}"  '
                 f'encoding {self.encoding}  filter {self.filter}  '
                 f'wrap {self.wrap} }}')
 
@@ -105,7 +105,7 @@ class Material(Element):
         parts = [f"type {self.mtype}"]
         for k, v in self.props.items():
             parts.append(f"{k} {value_token(v, ctx.clock, ctx.cache)}")
-        return f'material "{self.name}" {{ ' + "  ".join(parts) + " }"
+        return f'{self.name} = material {{ ' + "  ".join(parts) + " }"
 
 
 class ProcTexture(Element):
@@ -145,7 +145,7 @@ class ProcTexture(Element):
         return []
 
     def emit(self, ctx: EmitCtx) -> str:
-        return (f'texture "{self.name}" {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
+        return (f'{self.name} = texture {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
                 f'res {self.res}  filter {self.filter}  wrap {self.wrap} }}')
 
 
@@ -529,9 +529,12 @@ class Light(Element):
         return [v for v in self.props.values() if isinstance(v, (Signal, VecSignal))]
 
     def emit(self, ctx: EmitCtx) -> str:
-        parts = [f"{k} {value_token(v, ctx.clock, ctx.cache)}"
-                 for k, v in self.props.items()]
-        return f"light {self.kind} {{ " + "  ".join(parts) + " }"
+        # Unified header: anonymous light with the subtype carried as a `kind`
+        # property (`light { kind point  ... }`) rather than a bareword after KIND.
+        parts = [f"kind {self.kind}"]
+        parts += [f"{k} {value_token(v, ctx.clock, ctx.cache)}"
+                  for k, v in self.props.items()]
+        return "light { " + "  ".join(parts) + " }"
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +564,7 @@ class Camera(Element):
         la = vec3(self.look_at, ctx.clock, ctx.cache)
         up = vec3(self.up, ctx.clock, ctx.cache)
         fov = num(self.fov_y, ctx.clock, ctx.cache)
-        return (f'camera "{self.name}" {{\n'
+        return (f'{self.name} = camera {{\n'
                 f'    eye {fmt3(e)}  look_at {fmt3(la)}  up {fmt3(up)}  fov_y {fmt(fov)}\n'
                 f'    mode {self.mode}\n'
                 f'    film {{ res {self.res[0]} {self.res[1]} }}\n'
@@ -670,7 +673,7 @@ class CameraCurve(Element):
         return []   # a camera_curve is a static authored flight (no per-frame signals)
 
     def emit(self, ctx: EmitCtx) -> str:
-        L = [f'camera_curve "{self.name}" {{']
+        L = [f'{self.name} = camera_curve {{']
         for p in self.points:
             L.append(f"    point {fmt3(p)}")
         if self.look_points:

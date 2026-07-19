@@ -107,7 +107,7 @@ def test_pov_in_isosurface_emits_block():
     iso = Isosurface(pov("f_sphere", 1.2), container="sphere", radius=1.6,
                      name="ball", material="skin")
     txt = _emit(iso, Clock(t=0.0))
-    assert txt.startswith('isosurface "ball" {')
+    assert txt.startswith('ball = isosurface {')
     assert "f_sphere(" in txt
     assert "1.2" in txt
     assert txt.count("{") == txt.count("}")
