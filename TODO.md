@@ -1141,11 +1141,17 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
       `uv planar axis=`, `type mix layer … weight_map pattern:…`, record `from`/dot-override blocks).
       **PARSER: use the user's GraphParser (GPDA) — `D:\visual studio projects\GraphParser`.** Write ONE shared
-      EPEG `.ftsl` grammar (unified EPEG: regex terminals, `@skip`/`@mode`/`@longest`/`@left`/`@right`, actions);
-      use the **scannerless** variant for the comma-aware ladder (§3.1) since it needs context-aware skip sets.
-      Vendor a pinned `gpda.py` (or `gpda_scannerless.py`) into loom for the Python-side `.ftsl → Element` parse;
-      later reuse the *same grammar* to upgrade ftrace's C++ parser (leaning full-replacement — the C++
-      non-scannerless GPDA is nearly BISON-speed).
+      EPEG `.ftsl` grammar (unified EPEG: regex terminals, `@skip`/`@mode`/`@longest`/`@left`/`@right`, actions).
+      **DONE (foundation + record block, 2026-07-19):** vendored the pinned tokenized `gpda.py` as
+      `loom/grammar/_gpda.py` (commit 1ac4cbf, self-contained), shared grammar `loom/grammar/ftsl.epeg`
+      (start=`record`, grows toward `scene`), reader `loom/grammar/reader.py` (`parse_record` → structural parity
+      with the hand-written `Record.parse` oracle across every channel form; emit is a fixed point). **KEY FINDING
+      — the record ladder does NOT need scannerless.** The whitespace-form vs comma-form (§3.1) distinction is
+      recoverable purely from explicit COMMA / NEWLINE tokens via a *"comma-form requires a comma"* ordered choice,
+      with inter-token whitespace always `@skip`ped — so the **tokenized** flavour handles it (faster, and matches
+      the near-BISON C++ path we want for ftrace). Scannerless would only be needed if whitespace were significant
+      in one grammatical context but not another, which the record does not require. Later reuse the *same grammar*
+      to upgrade ftrace's C++ parser (leaning full-replacement — the C++ tokenized GPDA is nearly BISON-speed).
       **SEQUENCING DECISION (2026-07-19) — option (a), grammar + ftrace front-end FIRST.** The moment loom starts
       emitting `gold(u=v)` / bundle-binding syntax (J3b item 3), those `.ftsl` files are un-renderable by shipped
       ftrace until the GraphParser front-end lands. To keep "everything loom emits is renderable" true at every
@@ -1177,6 +1183,18 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **J3c started (option-a) — GPDA vendored + shared grammar reads the record block.** Stood up
+  `loom/grammar/`: vendored the pinned tokenized `gpda.py` as `_gpda.py` (GraphParser commit 1ac4cbf,
+  self-contained — only `import re`) with a provenance header; the shared EPEG grammar `ftsl.epeg` (start=`record`,
+  `#`-commented, will grow to `scene`); and `reader.py`'s `parse_record`, which walks the GPDA `ParseNode` tree
+  into a `Record`. Round-trips to **structural parity with the hand-written `Record.parse` oracle** across every
+  channel form (whitespace scalar / `spectrum:`-ref colour, vector + lone-vector trailing comma, inline
+  `rgb`/`hsv`/`hsl`, position pins, all interp modes, both `LO-HI`/`-1-2`/`LO HI` domain spellings, compact
+  single-line body); emit → parse → emit is a fixed point. **Corrected the earlier "ladder needs scannerless"
+  assumption:** the tokenized parser handles the comma-vs-whitespace distinction via a "comma-form requires a
+  comma" ordered choice (whitespace `@skip`ped, structure from explicit COMMA/NEWLINE) — no context-aware skip
+  needed, keeping the fast tokenized path that also suits ftrace's C++ front-end. 20 new tests (`test_grammar.py`
+  smoke + `test_grammar_record.py` round-trip), 697 loom green.
 - 2026-07-19: **`t` unified as a first-class input + future retime/4D node scoped (design, no code).** Decided `t`
   is not a magic ambient parameter but one named input among `{t,x,y,z,u,v,a}`, rebindable by the same
   substitution as `u/v/a` — so Signal (temporal) and Surface (spatial) unify at the grammar level and "a Surface

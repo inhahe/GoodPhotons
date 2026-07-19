@@ -1,0 +1,55 @@
+# =====================================================================
+# Shared .ftsl grammar (GPDA / EPEG, *tokenized* flavour)
+# =====================================================================
+# The single source of truth for parsing .ftsl, consumed by loom's Python
+# reader today (loom/grammar/reader.py) and, later, ftrace's C++ front-end
+# (J3c, option-a).  Tokenized — not scannerless: terminals are 'literals',
+# /regex/, or token NAMEs (bare [..] char-classes are scannerless-only and
+# live inside /regex/).  The record ladder does NOT need scannerless: the
+# whitespace-form vs comma-form distinction is recovered purely from
+# explicit COMMA / NEWLINE tokens via a "comma-form requires a comma"
+# ordered choice, with inter-token whitespace always skipped.
+#
+# Scope today: the parametric `record` block.  Grows toward a full scene
+# grammar (start rule will become `scene`); `record` stays a sub-rule.
+# =====================================================================
+
+start record
+
+# ---- skips + terminals ----------------------------------------------
+WS      = /[ \t]+/ @skip           # inter-token whitespace, always invisible
+COMMENT = /#[^\r\n]*/ @skip        # `# …` to end of line
+NEWLINE = /\r?\n/                  # significant: delimits channel lines
+
+# A compact `LO-HI` domain (incl. `-1-2`): matched whole so its inner dash
+# isn't mistaken for `LO` then a negative `HI`.  Longest-match beats NUMBER.
+DOMAIN  = /-?[0-9]+(\.[0-9]+)?-[0-9]+(\.[0-9]+)?/
+NUMBER  = /-?[0-9]+(\.[0-9]+)?([eE][+\-]?[0-9]+)?/
+PIN     = /p:-?[0-9]+(\.[0-9]+)?/          # `p:<pos>` position pin prefix
+REF     = /[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]+/   # e.g. spectrum:steel, metal:gold
+NAME    = /[A-Za-z_][A-Za-z0-9_]*/
+
+# ---- record block ---------------------------------------------------
+# NEWLINE stays significant (one channel line = one channel), but the newlines
+# *around* the line list are optional so a compact single-line body parses too:
+#   `a = range 0 1 [ x 0 1 ]`   as well as the multi-line emit form.
+record   = nl? NAME '=' 'range' domain '[' nl? lines nl? ']' nl?
+domain   = DOMAIN | NUMBER NUMBER
+nl       = NEWLINE+
+lines    = line (nl line)*
+line     = interp_line | channel
+
+interp_line = 'interp' interp_mode
+interp_mode = 'nearest' | 'linear' | 'smooth'
+
+# A channel picks its stop form: comma-form (vector / inline-colour) requires
+# a comma, so a comma-free line falls through to the whitespace-stop form.
+channel    = NAME (comma_body | ws_stops)
+
+comma_body = colour_tag? vstop (',' vstop)+ ','?    # >= 2 stops, optional trailing comma
+           | colour_tag? vstop ','                  # lone vector/colour stop (trailing comma)
+colour_tag = 'rgb' | 'hsv' | 'hsl'
+vstop      = PIN? NUMBER+                            # space-separated components
+
+ws_stops   = ws_stop+
+ws_stop    = PIN? (NUMBER | REF)                     # one whitespace word = one stop
