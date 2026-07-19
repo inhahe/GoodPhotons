@@ -476,5 +476,22 @@ tools/loom/
   window keeps the first frame's resolution for the session. Those remain the real future
   speedup; `-serve` is the bounded, correct increment they build on.
 
+- **M13 — `CameraCurve` element + two-axis orientation.** ✅ done (`loom/scene.py`
+  `CameraCurve`). loom gained a genuine ftrace `camera_curve` element: unlike `Camera`
+  (re-baked to a static `camera` block every frame by loom's clock), a `CameraCurve` is
+  emitted **once** and *ftrace* expands the N flyby frames — pass it in place of the camera
+  (`Scene(camera=CameraCurve(...))`). It mirrors ftrace's grammar 1:1: `points` spline,
+  `frames`/`density`/`density_at` speed, `look_at`/`look_points` aim, and the animatable
+  lens/orientation tracks. The orientation half also required the underlying ftrace feature
+  (`src/ftsl.h` `addCameraCurve`): a **two-axis** model where forward (`fwd_at`, else
+  `look_at`/tangent) and up (`up_at`, else `roll`, else reference up) are authored and
+  `right` is derived, each read in a `world` or `travel` **reference frame**. `travel` is a
+  rotation-minimizing frame (RMF) built by double-reflection parallel transport (`Vec3Track`
+  + the RMF pre-pass) with closed-loop holonomy distributed for a seamless loop, so shots
+  bank into turns. Authoring no orientation keywords is byte-identical to the legacy world-up
+  framing. Tests: `tests/test_emit.py` (`test_camera_curve_*` — golden emit, orientation
+  axes, scalar tracks, validation, in-scene); ftrace-side validation scene
+  `scenes/_camA_travel.ftsl`.
+
 Each milestone: keep `known-issues.md` current, commit at green checkpoints, never
 `git push`. Update this doc if the plan changes.

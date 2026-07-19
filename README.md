@@ -1656,6 +1656,20 @@ extension), which ffmpeg concatenates into a video. Any flyby block may carry an
   frame-for-frame. (The driver sees **only** `t` here — surface variables like `u`/`x` are
   out of scope and error.)
 
+- **Two-axis camera orientation — `fwd_at` / `up_at` / `frame` / `fwd_frame` / `up_frame`.**
+  The camera basis is set by a **forward** axis and an **up** axis (`right` is always
+  derived, never authored). Each axis is read in a **reference frame** — `frame world|travel`
+  sets the default for both and `fwd_frame`/`up_frame` override it per axis. `world` is the
+  fixed world axes (classic behavior); `travel` is the curve's **rotation-minimizing frame**
+  (RMF), a twist-free moving basis parallel-transported along the path (double-reflection
+  method, *not* the flip-prone Frenet frame) so the shot **banks into turns** — and on a
+  `closed` loop the residual twist is distributed so the frame closes seamlessly. Forward
+  (2 DOF) comes from `fwd_at <t> <x y z>` direction keyframes, else `look_at`/`look curve`,
+  else the tangent; up (1 DOF) comes from `up_at <t> <x y z>`, else `roll`/`roll_at`, else the
+  reference up. A `fwd_at`/`up_at` vector is read **in its axis's frame**: under `travel` its
+  components are `(right, up, forward)` in the RMF basis, under `world` a plain world
+  direction. Authoring none of these keywords reproduces the legacy world-up framing exactly.
+
 **`exposure_lock` — one shared auto-exposure across a whole path.** On any
 `camera_path`/`camera_orbit`/`camera_curve`, `exposure_lock` freezes a single
 auto-exposure anchor and applies it to *every* frame of that path, so a fly-through

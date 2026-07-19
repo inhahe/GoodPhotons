@@ -546,6 +546,30 @@ struct ScalarTrack {
     }
 };
 
+// A piecewise-linear 3-vector animation track over t in [0,1] (the Vec3 analogue of
+// ScalarTrack), flat-clamped at the ends. Used by `camera_curve`'s orientation axes
+// (`fwd_at`/`up_at`): a per-keyframe forward direction or up vector, interpolated
+// component-wise (the caller normalizes / re-orthogonalizes the result).
+struct Vec3Track {
+    struct Key { double t; Vec3 v; };
+    std::vector<Key> keys;
+    bool active() const { return !keys.empty(); }
+    void sort() { std::sort(keys.begin(), keys.end(),
+                            [](const Key& a, const Key& b){ return a.t < b.t; }); }
+    Vec3 sample(double t) const {
+        if (keys.empty()) return Vec3{0, 0, 0};
+        if (t <= keys.front().t) return keys.front().v;
+        if (t >= keys.back().t)  return keys.back().v;
+        for (size_t j = 0; j + 1 < keys.size(); ++j)
+            if (t >= keys[j].t && t <= keys[j + 1].t) {
+                double sp = keys[j + 1].t - keys[j].t;
+                double f = (sp > 1e-12) ? (t - keys[j].t) / sp : 0.0;
+                return keys[j].v * (1.0 - f) + keys[j + 1].v * f;
+            }
+        return keys.back().v;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -3880,6 +3904,60 @@ private:
             return recSampleScalar(rec, rec.channels[(size_t)rt.chanIdx], d, c);
         };
 
+        // ---- Orientation axes (camera_curve bridge, milestone M13) ------------------
+        // Full 3-DOF camera rotation is authored as two independent axes; the third is
+        // derived by the camera basis (`Camera::lookAt`: right = forward x up, then up is
+        // re-orthogonalized). So here we only produce, per frame, a FORWARD direction (into
+        // `cs.look = eye + forward`) and a reference UP (into `cs.up`).
+        //   * forward (2 DOF): `fwd_at <t> x y z` direction track  >  aim-point
+        //     (`look_at`/`look_curve`)  >  path tangent (today's default).
+        //   * up (1 DOF): `up_at <t> x y z` vector track  >  reference up + `roll`.
+        // Each axis has an optional reference `frame world|travel`: `world` uses fixed world
+        // axes (today's behavior); `travel` uses the curve's rotation-minimizing frame (RMF,
+        // parallel-transported — banks into turns, no torsion flips; closed loops distribute
+        // the holonomy twist for a seamless seam). A `fwd_at`/`up_at` vector is interpreted
+        // in that frame's basis (x=right, y=up, z=forward) when `travel`, else as a world
+        // direction. Curve-level `frame` sets the default for both; `fwd_frame`/`up_frame`
+        // override per axis. With none of these authored the block is byte-identical to the
+        // legacy tangent-look + world-up + `roll_at` path.
+        bool vecTrkOk = true;
+        auto readVecTrack = [&](const char* atKey) -> Vec3Track {
+            Vec3Track tk;
+            for (const auto& s : b.stmts) {
+                if (s.key != atKey) continue;
+                if (s.val.words.size() < 4) {
+                    fail("camera_curve '" + base + "' " + atKey + " needs: <t> <x> <y> <z>");
+                    vecTrkOk = false; continue;
+                }
+                tk.keys.push_back({num(s.val.words[0]),
+                                   Vec3{num(s.val.words[1]), num(s.val.words[2]), num(s.val.words[3])}});
+            }
+            tk.sort();
+            return tk;
+        };
+        Vec3Track fwdTrk = readVecTrack("fwd_at");
+        Vec3Track upTrk  = readVecTrack("up_at");
+        if (!vecTrkOk) return false;
+
+        auto parseFrameKw = [&](const char* key, bool def, bool& out) -> bool {
+            const Stmt* s = find(b, key);
+            if (!s) { out = def; return true; }
+            const std::string& v = s->val.words.empty() ? std::string() : s->val.words[0];
+            if      (v == "world")  out = false;
+            else if (v == "travel") out = true;
+            else { fail("camera_curve '" + base + "' " + key + " must be world|travel"); return false; }
+            return true;
+        };
+        bool defTravel = false, fwdFrameTravel = false, upFrameTravel = false;
+        if (!parseFrameKw("frame",     false,     defTravel))     return false;
+        if (!parseFrameKw("fwd_frame", defTravel, fwdFrameTravel)) return false;
+        if (!parseFrameKw("up_frame",  defTravel, upFrameTravel))  return false;
+        // The RMF is only needed when some axis actually references the travel frame: a
+        // `fwd_at`/`up_at` vector *in* travel mode, or an up axis whose reference (the
+        // default up when no `up_at`) is the travel frame. `fwd_at world` / `up_at world`
+        // never touch it, so a legacy curve skips the whole precompute.
+        bool needRMF = (fwdTrk.active() && fwdFrameTravel) || upFrameTravel;
+
         // Base (constant) values a track falls back to and that the whole-flight optics
         // were derived from. Captured from the same keywords readFilmExposure consumed so
         // per-frame re-derivation starts from the authored baseline (never double-applies).
@@ -3961,6 +4039,72 @@ private:
             }
         }
 
+        // ---- Rotation-minimizing frame (RMF) pre-pass ------------------------------
+        // Parallel-transport an "up" reference along the curve so the travel frame twists
+        // as little as possible (Bishop/RMF, not Frenet — no torsion flips). Built with the
+        // double-reflection method (Wang, Jüttler, Zheng & Liu 2008), which is exact to
+        // second order and robust at inflections. For a CLOSED loop the transported frame
+        // generally does not return to itself (holonomy); the residual twist is measured and
+        // distributed linearly along the loop so the seam is seamless (same idea as the
+        // sweep engine's closed-spine frame, DESIGN.md §7a). Frames align with the same `fr`
+        // sampling as the render loop. rmfRight[i] = tangent x rmfUp is filled for basis use.
+        std::vector<Vec3> rmfTan, rmfUp, rmfRight;
+        if (needRMF) {
+            rmfTan.resize((size_t)N); rmfUp.resize((size_t)N); rmfRight.resize((size_t)N);
+            auto frAt   = [&](int i){ return closed ? ((double)i / N) : (N == 1 ? 0.5 : (double)i / (N - 1)); };
+            auto tanAtG = [&](double g) -> Vec3 {
+                double eps = (nSeg > 0) ? (double)nSeg / (M * 2.0) : 1e-3;
+                Vec3 a = catmullRomAt(pts, closed, closed ? g - eps : std::max(0.0, g - eps), splineAlpha);
+                Vec3 c = catmullRomAt(pts, closed, closed ? g + eps : std::min((double)nSeg, g + eps), splineAlpha);
+                Vec3 d = c - a;
+                return (length(d) > 1e-12) ? normalize(d) : Vec3{0, 0, -1};
+            };
+            std::vector<Vec3> eyeAt((size_t)N);
+            for (int i = 0; i < N; ++i) {
+                double g = invertC(frAt(i) * Cmax);
+                eyeAt[(size_t)i] = catmullRomAt(pts, closed, g, splineAlpha);
+                rmfTan[(size_t)i] = tanAtG(g);
+            }
+            // Seed: project the world reference up perpendicular to the first tangent; if the
+            // path starts dead-vertical (up ~parallel to tangent), fall back to a world axis.
+            auto perp = [&](const Vec3& ref, const Vec3& t) -> Vec3 {
+                Vec3 r = ref - t * dot(ref, t);
+                if (length(r) < 1e-9) { Vec3 alt = (std::fabs(t.x) < 0.9) ? Vec3{1,0,0} : Vec3{0,1,0};
+                                        r = alt - t * dot(alt, t); }
+                return normalize(r);
+            };
+            rmfUp[0] = perp(shared.up, rmfTan[0]);
+            // Double-reflection transport of the reference vector r along the samples.
+            auto transport = [&](const Vec3& r_i, const Vec3& x_i, const Vec3& t_i,
+                                 const Vec3& x_j, const Vec3& t_j) -> Vec3 {
+                Vec3 v1 = x_j - x_i; double c1 = dot(v1, v1);
+                if (c1 < 1e-24) return r_i;                       // coincident samples: no rotation
+                Vec3 rL = r_i - v1 * (2.0 / c1 * dot(v1, r_i));
+                Vec3 tL = t_i - v1 * (2.0 / c1 * dot(v1, t_i));
+                Vec3 v2 = t_j - tL; double c2 = dot(v2, v2);
+                if (c2 < 1e-24) return rL;
+                return rL - v2 * (2.0 / c2 * dot(v2, rL));
+            };
+            for (int i = 1; i < N; ++i)
+                rmfUp[(size_t)i] = normalize(transport(rmfUp[(size_t)i-1],
+                                    eyeAt[(size_t)i-1], rmfTan[(size_t)i-1],
+                                    eyeAt[(size_t)i],   rmfTan[(size_t)i]));
+            if (closed && N >= 2) {
+                // Transport once more from the last frame back onto frame 0's tangent to read
+                // the holonomy angle between the wrapped-around up and the seed up.
+                Vec3 wrap = normalize(transport(rmfUp[(size_t)N-1], eyeAt[(size_t)N-1], rmfTan[(size_t)N-1],
+                                                 eyeAt[0], rmfTan[0]));
+                Vec3 t0 = rmfTan[0], u0 = rmfUp[0], r0 = cross(t0, u0);
+                double ang = std::atan2(dot(wrap, r0), dot(wrap, u0));   // signed twist about t0
+                // Distribute -ang * (i/N) so frame N would land exactly on the seed.
+                for (int i = 0; i < N; ++i)
+                    rmfUp[(size_t)i] = normalize(rotateAboutAxis(rmfUp[(size_t)i], rmfTan[(size_t)i],
+                                                                 -ang * ((double)i / N)));
+            }
+            for (int i = 0; i < N; ++i)
+                rmfRight[(size_t)i] = normalize(cross(rmfTan[(size_t)i], rmfUp[(size_t)i]));
+        }
+
         // ---- Round-trip capture: record this curve's CONTROL POINTS for the editor ----
         // The in-viewer camera_curve editor seeds its `editPts` from this so an existing
         // curve can be loaded and edited in place (rather than starting from an empty
@@ -4010,6 +4154,8 @@ private:
             double g = invertC(fr * Cmax);
             CamSpec cs = shared;
             cs.eye = catmullRomAt(pts, closed, g, splineAlpha);
+            // Forward axis: default aim (look_curve / look_at / tangent), then an optional
+            // `fwd_at` direction override (world vector, or travel-frame components).
             if (lookCurve) {
                 cs.look = catmullRomAt(lookPts, closed, fr * lookSeg, splineAlpha);
             } else if (lookFixed) {
@@ -4021,6 +4167,13 @@ private:
                 // path" motion. Direction (plus the fold-robust min_reach / look_smooth
                 // treatment) is precomputed in tangentDirs above.
                 cs.look = cs.eye + tangentDirs[(size_t)i];
+            }
+            if (fwdTrk.active()) {
+                Vec3 fv = fwdTrk.sample(fr);
+                Vec3 fwd = fwdFrameTravel
+                    ? (rmfRight[(size_t)i] * fv.x + rmfUp[(size_t)i] * fv.y + rmfTan[(size_t)i] * fv.z)
+                    : fv;
+                if (length(fwd) > 1e-12) cs.look = cs.eye + normalize(fwd);
             }
             // Per-frame lens: re-derive optics from the animated fov/zoom/f-stop/focus.
             // cs starts as `shared`, so restore its aperture before re-deriving in case a
@@ -4037,13 +4190,29 @@ private:
                 cs.focus    = fo;
                 deriveCameraOptics(cs, fov, baseLensMM, zm, fs, hmm, fo);
             }
-            // Per-frame roll: bank `up` about the view direction (Rodrigues). Applied after
-            // look so the axis is the final view ray; starts from the authored `up`.
-            if (haveRoll) {
-                double rollDeg = rollRec.active() ? recSample(rollRec, fr) : rollTrk.sample(fr, rollConst);
+            // Up axis: an explicit `up_at` vector wins; otherwise the reference up (world
+            // `up`, or the travel-frame RMF up) with `roll` banked on top about the view
+            // ray. camera.h re-orthogonalizes this reference against forward, so it need not
+            // be exactly perpendicular. Byte-identical to the legacy roll path when no
+            // `up_at`/travel frame is authored (reference up == shared.up).
+            {
                 Vec3 w = cs.look - cs.eye;
-                if (length(w) > 1e-12)
-                    cs.up = rotateAboutAxis(shared.up, normalize(w), rollDeg * DEG);
+                bool wok = length(w) > 1e-12;
+                if (upTrk.active()) {
+                    Vec3 uv = upTrk.sample(fr);
+                    Vec3 up = upFrameTravel
+                        ? (rmfRight[(size_t)i] * uv.x + rmfUp[(size_t)i] * uv.y + rmfTan[(size_t)i] * uv.z)
+                        : uv;
+                    if (length(up) > 1e-12) cs.up = up;
+                } else {
+                    Vec3 refUp = upFrameTravel ? rmfUp[(size_t)i] : shared.up;
+                    if (haveRoll && wok) {
+                        double rollDeg = rollRec.active() ? recSample(rollRec, fr) : rollTrk.sample(fr, rollConst);
+                        cs.up = rotateAboutAxis(refUp, normalize(w), rollDeg * DEG);
+                    } else {
+                        cs.up = refUp;
+                    }
+                }
             }
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;

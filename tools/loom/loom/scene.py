@@ -568,6 +568,161 @@ class Camera(Element):
                 f'}}')
 
 
+class CameraCurve(Element):
+    """A genuine ftrace ``camera_curve`` flypath (milestone M13).
+
+    The eye rides a Catmull-Rom spline through ``points`` with arc-length (or
+    ``density``-shaped) speed, animatable lens/orientation tracks, and ftrace's
+    two-axis orientation model.  Unlike :class:`Camera` — which loom re-bakes to a
+    static ``camera`` block every frame — a ``camera_curve`` is emitted **once** and
+    *ftrace itself* expands the N frames.  So pass it in place of the camera
+    (``Scene(camera=CameraCurve(...))``) and render the single emitted ``.ftsl`` with
+    ftrace to get the whole flyby; loom's per-frame clock does not drive it.
+
+    Orientation mirrors ftrace's grammar 1:1 (nothing here loom can't emit):
+
+    * **forward** (pick one, else the path tangent): ``look_at=(x,y,z)`` fixed target,
+      ``look_points=[(x,y,z), …]`` a second aim spline, or ``fwd_at=[(t,x,y,z), …]``
+      direction keyframes.
+    * **up**: ``up_at=[(t,x,y,z), …]`` vector keyframes, or ``roll``/``roll_at`` an
+      angle (degrees) about the reference up.
+    * **reference frame**: ``frame`` sets the default for both axes and
+      ``fwd_frame`` / ``up_frame`` override per axis — each ``"world"`` (fixed world
+      axes, the classic behavior) or ``"travel"`` (the curve's rotation-minimizing
+      frame, so the shot banks into turns; closed loops close seamlessly).  A
+      ``fwd_at``/``up_at`` vector is read in the travel basis (x=right, y=up,
+      z=forward) when its axis is ``"travel"``, else as a world direction.
+
+    Scalar tracks (``roll_at``/``fov_at``/``zoom_at``/``fstop_at``/``focus_at``) are
+    ``[(t, value), …]``; vector tracks (``fwd_at``/``up_at``) are ``[(t, x, y, z), …]``,
+    with ``t`` the normalized timeline in ``[0, 1]``.
+    """
+
+    _FRAMES = ("world", "travel")
+
+    def __init__(self, points, *, up=(0, 1, 0), fov_y=40.0, mode: str = "R",
+                 res: Tuple[int, int] = (480, 480), frames: Optional[int] = None,
+                 density=None, density_at=None, closed: bool = False,
+                 spline: Optional[str] = None, look_at=None, look_points=None,
+                 roll=None, roll_at=None, fov_at=None, zoom_at=None, fstop_at=None,
+                 focus_at=None, fwd_at=None, up_at=None, frame: Optional[str] = None,
+                 fwd_frame: Optional[str] = None, up_frame: Optional[str] = None,
+                 min_reach=None, look_smooth=None, exposure_lock: bool = False,
+                 fps=None, name: str = "curve") -> None:
+        pts = [tuple(float(c) for c in p) for p in points]
+        if len(pts) < 2:
+            raise ValueError("CameraCurve needs >= 2 control `points`")
+        if frames is None and density is None and density_at is None:
+            raise ValueError("CameraCurve needs `frames=` or a `density=`/`density_at=`")
+        if look_at is not None and look_points is not None:
+            raise ValueError("CameraCurve: give at most one of look_at= / look_points=")
+        for label, fv in (("frame", frame), ("fwd_frame", fwd_frame), ("up_frame", up_frame)):
+            if fv is not None and fv not in self._FRAMES:
+                raise ValueError(f'CameraCurve {label} must be "world" or "travel"')
+        self.points = pts
+        self.up = tuple(float(c) for c in up)
+        self.fov_y = float(fov_y)
+        self.mode = mode
+        self.res = (int(res[0]), int(res[1]))
+        self.frames = None if frames is None else int(frames)
+        self.density = None if density is None else float(density)
+        self.density_at = None if density_at is None else [(float(t), float(r)) for t, r in density_at]
+        self.closed = bool(closed)
+        self.spline = spline
+        self.look_at = None if look_at is None else tuple(float(c) for c in look_at)
+        self.look_points = (None if look_points is None
+                            else [tuple(float(c) for c in p) for p in look_points])
+        self.roll = None if roll is None else float(roll)
+        self._scalar_tracks = {
+            "roll_at": self._norm_scalar(roll_at), "fov_at": self._norm_scalar(fov_at),
+            "zoom_at": self._norm_scalar(zoom_at), "fstop_at": self._norm_scalar(fstop_at),
+            "focus_at": self._norm_scalar(focus_at),
+        }
+        self._vector_tracks = {
+            "fwd_at": self._norm_vector(fwd_at), "up_at": self._norm_vector(up_at),
+        }
+        self.frame = frame
+        self.fwd_frame = fwd_frame
+        self.up_frame = up_frame
+        self.min_reach = None if min_reach is None else float(min_reach)
+        self.look_smooth = None if look_smooth is None else float(look_smooth)
+        self.exposure_lock = bool(exposure_lock)
+        self.fps = None if fps is None else float(fps)
+        self.name = name
+
+    @staticmethod
+    def _norm_scalar(track):
+        if track is None:
+            return None
+        return [(float(t), float(v)) for t, v in track]
+
+    @staticmethod
+    def _norm_vector(track):
+        if track is None:
+            return None
+        out = []
+        for kf in track:
+            t, x, y, z = kf
+            out.append((float(t), float(x), float(y), float(z)))
+        return out
+
+    def roots(self) -> List:
+        return []   # a camera_curve is a static authored flight (no per-frame signals)
+
+    def emit(self, ctx: EmitCtx) -> str:
+        L = [f'camera_curve "{self.name}" {{']
+        for p in self.points:
+            L.append(f"    point {fmt3(p)}")
+        if self.look_points:
+            L.append(f"    look curve")
+            for p in self.look_points:
+                L.append(f"    look_point {fmt3(p)}")
+        elif self.look_at is not None:
+            L.append(f"    look_at {fmt3(self.look_at)}")
+        L.append(f"    up {fmt3(self.up)}   fov_y {fmt(self.fov_y)}   mode {self.mode}")
+        if self.spline is not None:
+            L.append(f"    spline {self.spline}")
+        if self.frames is not None:
+            L.append(f"    frames {self.frames}")
+        if self.density is not None:
+            L.append(f"    density {fmt(self.density)}")
+        if self.density_at:
+            for t, r in self.density_at:
+                L.append(f"    density_at {fmt(t)} {fmt(r)}")
+        if self.closed:
+            L.append(f"    closed")
+        # Reference-frame keywords (only when set; absence == world == legacy behavior).
+        if self.frame is not None:
+            L.append(f"    frame {self.frame}")
+        if self.fwd_frame is not None:
+            L.append(f"    fwd_frame {self.fwd_frame}")
+        if self.up_frame is not None:
+            L.append(f"    up_frame {self.up_frame}")
+        # Orientation vector tracks.
+        for key, track in self._vector_tracks.items():
+            if track:
+                for t, x, y, z in track:
+                    L.append(f"    {key} {fmt(t)} {fmt3((x, y, z))}")
+        # Scalar constant + tracks.
+        if self.roll is not None:
+            L.append(f"    roll {fmt(self.roll)}")
+        for key, track in self._scalar_tracks.items():
+            if track:
+                for t, v in track:
+                    L.append(f"    {key} {fmt(t)} {fmt(v)}")
+        if self.min_reach is not None:
+            L.append(f"    min_reach {fmt(self.min_reach)}")
+        if self.look_smooth is not None:
+            L.append(f"    look_smooth {fmt(self.look_smooth)}")
+        if self.exposure_lock:
+            L.append(f"    exposure_lock")
+        if self.fps is not None:
+            L.append(f"    fps {fmt(self.fps)}")
+        L.append(f"    film {{ res {self.res[0]} {self.res[1]} }}")
+        L.append("}")
+        return "\n".join(L)
+
+
 # ---------------------------------------------------------------------------
 # Scene
 # ---------------------------------------------------------------------------

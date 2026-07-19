@@ -84,26 +84,32 @@ frame so the shot still banks into turns*. It costs ftrace's parser one optional
 instead of per block. loom exposes the same per-axis `frame` and emits it into each track.
 
 ### Tasks
-- [ ] **ftrace: `fwd_at` vector track** on `camera_curve` — parse + store a per-keyframe 3-vector
+- [x] **ftrace: `fwd_at` vector track** on `camera_curve` — parse + store a per-keyframe 3-vector
       forward direction; sample on the same `u` as position; normalize; fall back to tangent/aim
-      when absent.
-- [ ] **ftrace: `up_at` vector track** — parse + store a per-keyframe 3-vector up; re-orthogonalize
-      against forward; fall back to reference up (`roll_at` still composes on top).
-- [ ] **ftrace: per-axis `frame travel|world`** keyword — `fwd_at` and `up_at` each select world
+      when absent.  *(`Vec3Track fwdTrk`; sets `cs.look = eye + normalize(fwd)`.)*
+- [x] **ftrace: `up_at` vector track** — parse + store a per-keyframe 3-vector up; re-orthogonalize
+      against forward; fall back to reference up (`roll_at` still composes on top).  *(`Vec3Track upTrk`;
+      camera `lookAt` re-orthogonalizes `u=cross(w,up)`, `v=cross(u,w)`.)*
+- [x] **ftrace: per-axis `frame travel|world`** keyword — `fwd_at` and `up_at` each select world
       axes vs RMF reference independently (curve-level default); global frame = both set the same.
-- [ ] **ftrace: RMF construction** (double-reflection parallel transport) + **closed-loop twist
-      distribution** for seamless closed curves.
-- [ ] **ftrace: `right = forward × up` derivation** + up re-orthogonalization, roll composed on top.
-- [ ] **ftrace: back-compat** — with no `fwd_at`/`up_at`/`frame` authored, behaves **bit-identically**
-      to today (tangent look + world up + `roll_at`).
-- [ ] **loom: `CameraCurve` scene element** — emit a real `camera_curve` from a `TrackedCurve`/points:
+      *(`frame` default + `fwd_frame`/`up_frame` overrides.)*
+- [x] **ftrace: RMF construction** (double-reflection parallel transport) + **closed-loop twist
+      distribution** for seamless closed curves.  *(`needRMF` pre-pass builds `rmfTan/rmfUp/rmfRight`;
+      closed loops measure the wrap holonomy and distribute `-ang*(i/N)`.)*
+- [x] **ftrace: `right = forward × up` derivation** + up re-orthogonalization, roll composed on top.
+      *(Only forward→`cs.look` and reference-up→`cs.up` are produced; camera derives right.)*
+- [x] **ftrace: back-compat** — with no `fwd_at`/`up_at`/`frame` authored, behaves **bit-identically**
+      to today (tangent look + world up + `roll_at`).  *(Verified 0.000% frame-identical.)*
+- [x] **loom: `CameraCurve` scene element** — emit a real `camera_curve` from a `TrackedCurve`/points:
       position → `point`, speed/density track → `density_at`, roll track → `roll_at`, orientation
       tracks → `fwd_at`/`up_at`, per-axis `frame`. Mirrors ftrace's grammar 1:1 (no orientation
-      semantics loom can't emit).
-- [ ] **Docs** — README (ftrace camera_curve grammar) + loom docstrings; update `DESIGN.md` with a
-      milestone (M13) once landed.
-- [ ] **Tests** — loom `CameraCurve` emit golden; ftrace parse of `fwd_at`/`up_at`/`frame`; RMF +
-      closed-loop seam; bit-compat when no axes authored.
+      semantics loom can't emit).  *(`loom.CameraCurve`, `Scene(camera=CameraCurve(...))`.)*
+- [x] **Docs** — README (ftrace camera_curve grammar) + loom docstrings; update `DESIGN.md` with a
+      milestone (M13) once landed.  *(FTSL.md §15.3 two-axis section, README camera_curve bullet,
+      loom `DESIGN.md` M13.)*
+- [x] **Tests** — loom `CameraCurve` emit golden; ftrace parse of `fwd_at`/`up_at`/`frame`; RMF +
+      closed-loop seam; bit-compat when no axes authored.  *(`tests/test_emit.py` `test_camera_curve_*`;
+      `scenes/_camA_travel.ftsl` closed travel-frame validation.)*
 
 ---
 

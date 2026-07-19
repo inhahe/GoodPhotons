@@ -979,6 +979,7 @@ camera_curve "fly" {
     density 20                  # OR: cameras per unit length (constant)
     density_at 0 6   density_at 0.5 30   density_at 1 6    # OR: variable density
     look_at 0.8 0.3 0.6         # orientation: fixed target
+    up_frame travel             # optional: bank the up axis into the curve's RMF
     closed                      # optional: loop the curve seamlessly
     exposure_lock               # optional
     film { res 900 600 }
@@ -1007,6 +1008,32 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
 `closed` loops the curve (wrap-around Catmull-Rom, sampled i/N so frame N == frame 0);
 an open curve spans both endpoints via i/(N−1). All frames share
 up/mode/film; `exposure_lock` shares the frame-0 exposure anchor.
+
+**Two-axis orientation (forward + up).** The camera basis is fixed by two authored
+axes; `right` is always derived from them, so you never set it. Each axis can be read
+in one of two **reference frames**:
+
+- **`frame world|travel`** — default for *both* axes. `world` = the fixed world axes
+  (the classic behavior). `travel` = the curve's **rotation-minimizing frame** (RMF), a
+  twist-free moving basis carried along the path by parallel transport (double-reflection
+  method), so the shot banks naturally into turns instead of the Frenet frame's abrupt
+  flips. On a `closed` loop the RMF's residual holonomy is distributed evenly so the
+  frame closes seamlessly (frame N == frame 0).
+- **`fwd_frame world|travel`** / **`up_frame world|travel`** — override the reference
+  frame for the forward and up axes independently (each defaults to `frame`).
+
+The **forward** axis (2 DOF — where the camera points) is, in precedence order:
+`fwd_at <t> <x y z>` direction keyframes (piecewise-linear, `t ∈ [0,1]`), else
+`look_at`/`look curve` aim, else the path tangent. The **up** axis (1 DOF — roll about
+forward) is `up_at <t> <x y z>` vector keyframes, else `roll`/`roll_at` an angle
+(degrees) about the reference up, else the reference up itself.
+
+A `fwd_at`/`up_at` vector is interpreted **in the reference frame of its axis**: under
+`travel` its components are `(x=right, y=up, z=forward)` in the RMF basis (so a constant
+`up_at 0 0 1 0 … up_at 1 0 0 1` tips the camera from RMF-up toward RMF-forward relative
+to the moving path); under `world` it is a plain world-space direction. Omitting all of
+`fwd_at`/`up_at`/`frame`/`fwd_frame`/`up_frame` reproduces the legacy world-up behavior
+byte-for-byte.
 
 **Animated camera scalars.** `fov`, `roll`, `zoom`, `fstop` and `focus` may vary along
 the flyby as a function of the normalized timeline `t ∈ [0,1]` (`t=0` at the first
