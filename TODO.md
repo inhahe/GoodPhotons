@@ -83,9 +83,19 @@ Origin tags point at the authoritative design text for each item.
     `parse_value` (normalizer resolving the comma-role rule, RLE colorspace tags, and the `[X] ≡ X` bracket identity)
     + per-field shape validators `as_scalar` / `as_vector` / `as_color` / `as_color_list` (raising `ShapeError` with
     "expected …, got …" messages, distinct from syntax `ValueError`s). `tests/test_grammar_values.py` pins every
-    example in this decision (23 cases; loom suite 757 passed). *Remaining:* wire the validators into the actual
-    field readers (material/light props, records — which still use their own bespoke stop/vector parsing) so authored
-    values flow through this one path; then mirror the `value` grammar into ftrace's C++ front-end at the J3c port.
+    example in this decision (23 cases; loom suite 757 passed).
+  - **Progress (2026-07-19): first real consumer wired — the colour round-trip.** `loom.color` now has
+    `Color.parse` / `parse_color` / `parse_color_list` (exported from the package), the inverse of `Color.token`:
+    they read a `.ftsl` colour token / flat palette back into animatable `Color` objects through
+    `values.as_color` / `as_color_list`, so every locked spelling (bare/bracketed triple, comma or bracket-sibling
+    lists, inline RLE `rgb`/`hsl`/`hsv` tags, the `[X] ≡ X` identity) is accepted and the shape rules are enforced
+    (a 6-vector or a colour *list* handed to the single-colour reader → `ShapeError`; an unbalanced bracket →
+    `ValueError`). `tests/test_color_parse.py` (19 cases) pins the round-trip and the errors; full loom suite 776
+    passed. *Remaining:* wire the validators into the **material/light** field readers — but note those fields
+    accept richer **spectrum expressions** (`blackbody 6500`, `spectrum:gold`, record refs `R.chan[i]`), of which
+    the colour-vector grammar is only a subset, so that step wants the fuller value/spectrum grammar first rather
+    than validating those props strictly as colours (which would reject valid scenes); records still use their own
+    PIN-carrying stop parsing. Then mirror the `value` grammar into ftrace's C++ front-end at the J3c port.
 
 ---
 
