@@ -423,8 +423,9 @@ is read*, not just inside an override block, as long as the reference resolves t
 
 ```
 spectrum "cu" = palette.reflect[2]              # top-level spectrum = the 3rd reflect stop
-material "pick" { type diffuse reflect palette.reflect[2] }   # slot value = a stop, verbatim
-material "samp" { type diffuse reflect palette.reflect(0.0) } # slot value = sample at driver 0.0
+material "pick" { type diffuse reflect palette.reflect[2] }   # colour slot = a stop, verbatim
+material "samp" { type diffuse reflect palette.reflect(0.0) } # colour slot = sample at driver 0.0
+material "frost" { type glossy reflect steel roughness palette.gloss(0.5) }  # scalar slot = sample
 ```
 
 - **`RECORD.channel[i]`** — the channel's `i`-th stop (0-based), used verbatim.

@@ -983,6 +983,85 @@ private:
         return true;
     }
 
+    // Records stage 5a (scalar sibling of recordConstSpectrumRef): resolve a record
+    // channel reference used as a CONSTANT scalar value — `RECORD.channel[i]` (the
+    // channel's i-th stop value) or `RECORD.channel(c)` (sample the scalar channel at a
+    // constant driver `c`). Returns true if `tok` names a known record (recognised — `out`
+    // filled or `fail` set) and false if it isn't a record ref (caller falls through to
+    // numeric parse). Same free-variable scope rule as the spectrum path: the `(c)` driver
+    // must be constant, and a stop whose expression carries per-hit variables is not a
+    // constant here, so it is rejected rather than silently evaluated at a zero context.
+    bool recordConstScalarRef(const std::string& tok, double& out) {
+        size_t dot = tok.find('.');
+        if (dot == std::string::npos) return false;
+        std::string head = tok.substr(0, dot);
+        auto rit = recordIndex_.find(head);
+        if (rit == recordIndex_.end()) return false;                 // not a record -> not our form
+        if (!records_ || rit->second >= (int)records_->size()) return false;
+        const Record& rec = (*records_)[rit->second];
+        std::string rest = tok.substr(dot + 1);                      // channel[i] | channel(c) | channel
+        out = 0.0;
+        auto scalarChannel = [&](const std::string& chan, int& ci) -> bool {
+            ci = rec.channelIndex(chan);
+            if (ci < 0) { fail("record ref '" + tok + "': record '" + head + "' has no channel '" + chan + "'"); return false; }
+            if (rec.channels[ci].kind != ChanKind::Scalar) {
+                fail("record ref '" + tok + "': channel '" + chan + "' is a colour channel, not scalar"); return false;
+            }
+            return true;
+        };
+        auto stopIsConst = [&](const RecStop& st) { return !patternHasFreeVars(st.expr); };
+        // Stop selector: `channel[i]`.
+        size_t lb = rest.find('[');
+        if (lb != std::string::npos) {
+            size_t rb = rest.rfind(']');
+            std::string idxs = (rb != std::string::npos && rb > lb) ? rest.substr(lb + 1, rb - lb - 1) : "";
+            if (idxs.empty() || !isNumber(idxs)) { fail("record ref '" + tok + "': bad stop selector"); return true; }
+            int ci; if (!scalarChannel(rest.substr(0, lb), ci)) return true;
+            const RecChannel& ch = rec.channels[ci];
+            int i = (int)num(idxs);
+            if (i < 0 || i >= (int)ch.stops.size()) {
+                fail("record ref '" + tok + "': stop index " + idxs + " out of range (0.." +
+                     std::to_string((int)ch.stops.size() - 1) + ")"); return true;
+            }
+            if (!stopIsConst(ch.stops[i])) {
+                fail("record ref '" + tok + "': stop " + idxs + " is an expression with per-hit "
+                     "variables — not a constant at this value site"); return true;
+            }
+            PatCtx zero{};
+            const std::vector<PatNode>& e = ch.stops[i].expr;
+            out = e.empty() ? 0.0 : patternEval(e.data(), (int)e.size(), zero);
+            return true;
+        }
+        // Sample form: `channel(c)` with a constant driver c.
+        size_t lp = rest.find('(');
+        if (lp != std::string::npos) {
+            size_t rp = rest.rfind(')');
+            if (rp == std::string::npos || rp <= lp) { fail("record ref '" + tok + "': malformed `channel(constant)`"); return true; }
+            std::string cexpr = rest.substr(lp + 1, rp - lp - 1);
+            int ci; if (!scalarChannel(rest.substr(0, lp), ci)) return true;
+            const RecChannel& ch = rec.channels[ci];
+            std::vector<PatNode> drv; std::string cerr;
+            if (!compilePatternExpr(cexpr, drv, cerr)) { fail("record ref '" + tok + "' driver '" + cexpr + "': " + cerr); return true; }
+            if (patternHasFreeVars(drv)) {
+                fail("record ref '" + tok + "': driver must be a constant here — no per-hit variables "
+                     "(x/y/z/u/v/…) are in scope at this value site"); return true;
+            }
+            for (const RecStop& st : ch.stops) {
+                if (!stopIsConst(st)) {
+                    fail("record ref '" + tok + "': channel '" + ch.name + "' has expression stops with "
+                         "per-hit variables — not a constant curve at this value site"); return true;
+                }
+            }
+            PatCtx zero{};
+            double c = drv.empty() ? 0.0 : patternEval(drv.data(), (int)drv.size(), zero);
+            out = recSampleScalar(rec, ch, c, zero);
+            return true;
+        }
+        // Bare `RECORD.channel` with no selector/sample: ambiguous at a constant site.
+        fail("record ref '" + tok + "': use `RECORD.channel[i]` (a stop) or `RECORD.channel(constant)` at a value site");
+        return true;
+    }
+
     // ---- spectrum evaluation ----
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
         if (depth > 16) { fail("spectrum reference cycle"); return constantSpectrum(0); }
@@ -1112,6 +1191,23 @@ private:
         const Stmt* s = find(b, key);
         if (!s) return dflt;
         return evalSpectrum(s->val);
+    }
+
+    // Records stage 5a: scalar-slot reader that also accepts a constant record channel
+    // ref (`RECORD.channel[i]` / `RECORD.channel(const)`) — the scalar analogue of
+    // spectrumParam. Absent key -> default; a plain number -> that number; a token whose
+    // head names a record -> recordConstScalarRef (which fills the value or sets fail).
+    // This is the chokepoint that gives material scalar slots (roughness, film_ior, …)
+    // record-ref support without each call site knowing about records.
+    double dblParam(const Block& b, const char* key, double dflt) {
+        const Stmt* s = find(b, key);
+        if (!s || s->val.words.empty()) return dflt;
+        const std::string& w0 = s->val.words[0];
+        if (w0.find('.') != std::string::npos && !isNumber(w0)) {
+            double rv;
+            if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
+        }
+        return num(w0);
     }
 
     // ---- textures ----
@@ -1662,10 +1758,10 @@ private:
             if (find(b, "roughness")) {
                 if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
                     !bindScalarTexture(b, "roughness", m.roughnessTex))
-                    m.roughness = dblOf(b, "roughness", m.roughness);
+                    m.roughness = dblParam(b, "roughness", m.roughness);
             }
-            if (find(b, "film_ior"))       m.filmIor       = dblOf(b, "film_ior", m.filmIor);
-            if (find(b, "film_thickness")) m.filmThickness = dblOf(b, "film_thickness", m.filmThickness);
+            if (find(b, "film_ior"))       m.filmIor       = dblParam(b, "film_ior", m.filmIor);
+            if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
@@ -1697,7 +1793,7 @@ private:
             // `roughness pattern:<name>` (§4) or `texture:<name>` binds a per-hit map.
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
-            else m.roughness = dblOf(b, "roughness", 0.0);
+            else m.roughness = dblParam(b, "roughness", 0.0);
             // Interior absorption sigma_a(lambda) per metre travelled inside the glass
             // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb 3 0.5 0.3`
             // (per-channel, upsampled) gives green-tinted glass.
@@ -1724,14 +1820,14 @@ private:
             // roughness map (grayscale = roughness directly, both 0..1); else a constant.
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
-            else m.roughness = dblOf(b, "roughness", 0.2);
+            else m.roughness = dblParam(b, "roughness", 0.2);
         } else if (type == "thinfilm") {
             m.type = MatType::ThinFilm;
             m.ior = spectrumParam(b, "ior", iorConstant(1.5));
-            m.filmIor = dblOf(b, "film_ior", 1.30);
+            m.filmIor = dblParam(b, "film_ior", 1.30);
             // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
             // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
-            m.filmThickness = dblOf(b, "film_thickness", 300.0);
+            m.filmThickness = dblParam(b, "film_thickness", 300.0);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             // Substrate extinction kappa (spectral): 0 = transparent dielectric
@@ -1742,15 +1838,15 @@ private:
         } else if (type == "grating") {
             m.type = MatType::Grating;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
-            m.grooveSpacing = dblOf(b, "groove_spacing", 1000.0);
+            m.grooveSpacing = dblParam(b, "groove_spacing", 1000.0);
             Vec3 gd{0, 1, 0}; vec3Of(b, "groove_dir", gd); m.grooveDir = gd;
-            m.gratingMaxOrder = (int)dblOf(b, "max_order", 3);
+            m.gratingMaxOrder = (int)dblParam(b, "max_order", 3);
         } else if (type == "fluorescent") {
             m.type = MatType::Fluorescent;
             m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.1));
             m.fluoAbsorb = spectrumParam(b, "absorb", shortPass(490.0, 0.15, 1.0));
             m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
-            m.fluoYield = dblOf(b, "yield", 1.0);
+            m.fluoYield = dblParam(b, "yield", 1.0);
             m.fluoEmitSampler.build(m.fluoEmit, 1.0);
         } else if (type == "multilayer") {
             // Multilayer thin-film stack (Bragg / dichroic). Substrate index/kappa
