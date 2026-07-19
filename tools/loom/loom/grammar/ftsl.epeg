@@ -94,3 +94,21 @@ cam_view = 'eye' vec3n 'look_at' vec3n 'up' vec3n 'fov_y' NUMBER
 vec3n    = NUMBER NUMBER NUMBER
 cam_mode = NAME
 cam_film = 'film' '{' 'res' NUMBER NUMBER '}'
+
+# ---- generic value tree (color-vector / array syntax) ---------------
+# Context-free value grammar (design locked 2026-07-19; TODO "DECISION —
+# color-vector / array syntax").  Whitespace only joins scalars *inside* one
+# vector (`vnums = (NUMBER|REF)+` greedily eats a whitespace run); commas,
+# brackets and colorspace tags (`rgb`/`hsl`/`hsv`, reusing `colour_tag`) mark
+# array boundaries.  The parse tree is generic — the comma-role rule (lone
+# scalars merge into one vector; space-grouped groups form a list), the RLE
+# colorspace tags and the `[X] ≡ X` bracket identity are resolved by the
+# normalizer, and each field then shape-checks the canonical tree
+# (loom/grammar/values.py).  Parsed via a `value` start-rule override; it is
+# intentionally NOT reachable from `element` yet (fields still parse values
+# their own way until this is wired in).
+value    = vrun (',' vrun)*
+vrun     = vpiece+
+vpiece   = colour_tag | vbracket | vnums
+vbracket = '[' value ']'
+vnums    = (NUMBER | REF)+

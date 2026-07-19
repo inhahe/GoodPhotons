@@ -45,7 +45,7 @@ Origin tags point at the authoritative design text for each item.
       renders in ftrace; both `scraps/newform_test.ftsl` and legacy `scraps/oldform_test.ftsl` parse. Old-form C++
       support stays until the shared grammar is ported into ftrace's front-end.
 
-- [ ] **DECISION — color-vector / array syntax (locked in conversation 2026-07-19).** How numbers, commas,
+- [~] **DECISION — color-vector / array syntax (locked in conversation 2026-07-19).** How numbers, commas,
       brackets, and colorspace keywords (`rgb`/`hsl`/`hsv`) group into colors and lists of colors. Settled model,
       to bake into the shared grammar + per-field shape validation at the same time as the header switch:
   - **Whitespace only joins scalars *inside* one vector; it never crosses an array boundary and never starts a
@@ -77,6 +77,15 @@ Origin tags point at the authoritative design text for each item.
     **well-formed syntax, wrong shape** → a shape error, not a parse error. It's field-relative: the same tree is
     valid for a field that wants a list of palettes. Implement as generic parse + per-field schema validation with
     good "expected flat list of colors, got list-of-lists" messages.
+  - **Progress (2026-07-19): reference implementation landed in the shared grammar.** Added a context-free `value`
+    rule to `ftsl.epeg` (`value = vrun (',' vrun)*`; `vnums = (NUMBER|REF)+` for a whitespace vector; brackets nest;
+    `colour_tag` = `rgb`/`hsl`/`hsv`). New `loom/grammar/values.py`: canonical `Vec`/`Arr`/`Ref` tree +
+    `parse_value` (normalizer resolving the comma-role rule, RLE colorspace tags, and the `[X] ≡ X` bracket identity)
+    + per-field shape validators `as_scalar` / `as_vector` / `as_color` / `as_color_list` (raising `ShapeError` with
+    "expected …, got …" messages, distinct from syntax `ValueError`s). `tests/test_grammar_values.py` pins every
+    example in this decision (23 cases; loom suite 757 passed). *Remaining:* wire the validators into the actual
+    field readers (material/light props, records — which still use their own bespoke stop/vector parsing) so authored
+    values flow through this one path; then mirror the `value` grammar into ftrace's C++ front-end at the J3c port.
 
 ---
 
