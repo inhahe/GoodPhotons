@@ -215,6 +215,18 @@ struct Parser {
             }
             v.words.push_back(cur().text); adv();
         }
+        // Records stage 5a: a trailing `[i]` stop selector on a record-channel ref
+        // (`RECORD.channel[i]`) at an ordinary value site — fold the bracket tokens back
+        // into the preceding word so they don't leak into the brace-body statement stream
+        // (the `=` override path above already does this). Only when the preceding word
+        // looks like a dotted reference, so a stray `[` elsewhere still surfaces as an error.
+        if (is(Tok::LBracket) && !v.words.empty() && v.words.back().find('.') != std::string::npos) {
+            adv();
+            std::string idx;
+            while (is(Tok::Word)) { idx += cur().text; adv(); }
+            if (is(Tok::RBracket)) adv(); else fail("record selector missing ']'");
+            v.words.back() += "[" + idx + "]";
+        }
         if (is(Tok::LBrace)) {
             std::string btype = key, bname;
             if (!v.words.empty()) {
@@ -659,6 +671,7 @@ public:
     std::string err;
 
     bool build(const std::vector<Block>& blocks, Loaded& L) {
+        records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
         // Pass 0: global scene settings — the length unit and spectral range. All
         // authored lengths are scaled to the internal unit (metres) at load time,
         // so a scene authored in cm and one in m render identically.
@@ -791,6 +804,7 @@ private:
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
     std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
+    const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
 
     // Named-object registries for `medium { bounds { object "name" } }` resolution.
@@ -903,6 +917,72 @@ private:
         return it->second;
     }
 
+    // Records stage 5a: resolve a record channel reference used as a CONSTANT spectrum
+    // value — `RECORD.channel[i]` (the channel's i-th stop colour) or `RECORD.channel(c)`
+    // (sample the colour channel at a constant driver `c`). Accepted anywhere a spectrum
+    // is read (light `spd`, top-level `spectrum`, material `reflect`/`transmit`/…).
+    // Returns true if `tok` names a known record — the form was recognised, so `out` is
+    // filled or `fail` is set — and false if `tok` isn't a record ref (the caller then
+    // falls through to the other spectrum forms). The `(c)` driver must be a load-time
+    // constant: a per-hit driver like `R.chan(u)` is a scope error at a value site (a
+    // constant site publishes no per-hit variables), matching the 5a free-variable rule.
+    bool recordConstSpectrumRef(const std::string& tok, Spectrum& out) {
+        size_t dot = tok.find('.');
+        if (dot == std::string::npos) return false;
+        std::string head = tok.substr(0, dot);
+        auto rit = recordIndex_.find(head);
+        if (rit == recordIndex_.end()) return false;                 // not a record -> not our form
+        if (!records_ || rit->second >= (int)records_->size()) return false;
+        const Record& rec = (*records_)[rit->second];
+        std::string rest = tok.substr(dot + 1);                      // channel[i] | channel(c) | channel
+        out = constantSpectrum(0);
+        auto colourChannel = [&](const std::string& chan, int& ci) -> bool {
+            ci = rec.channelIndex(chan);
+            if (ci < 0) { fail("record ref '" + tok + "': record '" + head + "' has no channel '" + chan + "'"); return false; }
+            if (rec.channels[ci].kind != ChanKind::Spectrum) {
+                fail("record ref '" + tok + "': channel '" + chan + "' is scalar, not a colour channel"); return false;
+            }
+            return true;
+        };
+        // Stop selector: `channel[i]`.
+        size_t lb = rest.find('[');
+        if (lb != std::string::npos) {
+            size_t rb = rest.rfind(']');
+            std::string idxs = (rb != std::string::npos && rb > lb) ? rest.substr(lb + 1, rb - lb - 1) : "";
+            if (idxs.empty() || !isNumber(idxs)) { fail("record ref '" + tok + "': bad stop selector"); return true; }
+            int ci; if (!colourChannel(rest.substr(0, lb), ci)) return true;
+            const RecChannel& ch = rec.channels[ci];
+            int i = (int)num(idxs);
+            if (i < 0 || i >= (int)ch.stops.size()) {
+                fail("record ref '" + tok + "': stop index " + idxs + " out of range (0.." +
+                     std::to_string((int)ch.stops.size() - 1) + ")"); return true;
+            }
+            out = ch.stops[i].color;
+            return true;
+        }
+        // Sample form: `channel(c)` with a constant driver c.
+        size_t lp = rest.find('(');
+        if (lp != std::string::npos) {
+            size_t rp = rest.rfind(')');
+            if (rp == std::string::npos || rp <= lp) { fail("record ref '" + tok + "': malformed `channel(constant)`"); return true; }
+            std::string cexpr = rest.substr(lp + 1, rp - lp - 1);
+            int ci; if (!colourChannel(rest.substr(0, lp), ci)) return true;
+            std::vector<PatNode> drv; std::string cerr;
+            if (!compilePatternExpr(cexpr, drv, cerr)) { fail("record ref '" + tok + "' driver '" + cexpr + "': " + cerr); return true; }
+            if (patternHasFreeVars(drv)) {
+                fail("record ref '" + tok + "': driver must be a constant here — no per-hit variables "
+                     "(x/y/z/u/v/…) are in scope at this value site"); return true;
+            }
+            PatCtx zero{};
+            double c = drv.empty() ? 0.0 : patternEval(drv.data(), (int)drv.size(), zero);
+            out = recSampleSpectrum(rec, rec.channels[ci], c);
+            return true;
+        }
+        // Bare `RECORD.channel` with no selector/sample: ambiguous at a constant site.
+        fail("record ref '" + tok + "': use `RECORD.channel[i]` (a stop) or `RECORD.channel(constant)` at a value site");
+        return true;
+    }
+
     // ---- spectrum evaluation ----
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
         if (depth > 16) { fail("spectrum reference cycle"); return constantSpectrum(0); }
@@ -921,6 +1001,14 @@ private:
         const std::string& h = w[0];
 
         if (isNumber(h) && w.size() == 1) return constantSpectrum(num(h));
+
+        // Records stage 5a: a record colour channel used as a constant value —
+        // `RECORD.channel[i]` / `RECORD.channel(const)`. Fires only when h's head names
+        // a known record; otherwise falls through to the ordinary spectrum forms below.
+        if (w.size() == 1) {
+            Spectrum rs;
+            if (recordConstSpectrumRef(h, rs)) return rs;
+        }
 
         if (h == "blackbody")  return blackbody(w.size() > 1 ? num(w[1]) : 6500.0);
         if (h == "ior")        return iorConstant(w.size() > 1 ? num(w[1]) : 1.5);

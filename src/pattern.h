@@ -391,6 +391,16 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
     return true;
 }
 
+// True if a compiled pattern program references any per-hit surface intrinsic
+// (x y z f nx ny nz r u v). Used by value sites that must be load-time constant
+// (records stage 5a scope check): a constant site has no per-hit context, so it
+// admits only var-free (constant) drivers — a `R.chan(u)` there is a scope error.
+inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
+    for (const PatNode& nd : prog)
+        if (nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // (A) Built-in generators -> postfix. Each returns a ready pattern program.
 // These are thin sugar over the expression VM so both front-ends share evaluation.

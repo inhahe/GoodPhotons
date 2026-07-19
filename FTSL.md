@@ -417,6 +417,35 @@ A later `from` re-imports and its driver wins for the slots it covers. Type rule
 still apply: `reflect` needs a colour channel, `roughness` a scalar; assigning a
 scalar expression to `reflect` is an error.
 
+**Record refs as plain values** — a record channel can also be read *anywhere a value
+is read*, not just inside an override block, as long as the reference resolves to a
+**constant** (a record is a curve, so a value site needs one point on it). Two forms:
+
+```
+spectrum "cu" = palette.reflect[2]              # top-level spectrum = the 3rd reflect stop
+material "pick" { type diffuse reflect palette.reflect[2] }   # slot value = a stop, verbatim
+material "samp" { type diffuse reflect palette.reflect(0.0) } # slot value = sample at driver 0.0
+```
+
+- **`RECORD.channel[i]`** — the channel's `i`-th stop (0-based), used verbatim.
+- **`RECORD.channel(c)`** — the channel sampled at a **constant** driver `c`
+  (interpolated per the record's `interp`). The channel must be explicit here — the
+  bare-`RECORD(c)` shorthand only exists inside a material where the destination slot
+  names the channel.
+
+A colour site (a `spectrum`, a `reflect`/`transmit`/`emit` slot) needs a **spectrum**
+channel; a scalar site needs a **scalar** channel — a type mismatch is an error, as is
+a stop index out of range.
+
+**Scope check.** The driver in `RECORD.channel(c)` is an ordinary pattern expression,
+but a value site only permits the driver *variables that are in scope there*. A material
+slot is a per-hit surface site, so surface intrinsics (`x y z nx ny nz r u v f`) are in
+scope — but a **standalone value** (a top-level `spectrum`, a light SPD, a camera scalar)
+is evaluated once at load time, so **no** per-hit variable is in scope. Writing
+`palette.reflect(u)` at such a site is a **scope error** (`u` has no meaning there); only
+a constant driver like `palette.reflect(0.3)` is allowed. This is the general rule behind
+"can a light carry a `from`?" — yes, but only a constant one.
+
 > **GPU note:** record-driven materials currently render on the **CPU only** — a scene
 > that binds a record falls back from the GPU forward/backward tracer automatically
 > (`[device] … -> CPU (…parametric record…)`). GPU parity is a later stage.
