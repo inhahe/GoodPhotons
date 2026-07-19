@@ -914,9 +914,16 @@ question — *should grid/scatter points be multi-valued?* — with **YES**.
       the vector field still computes the taps **once** and blends every channel with them. Boundary
       phantoms are **linearly extrapolated** (not edge-clamped) so cubic reproduces linear ramps exactly
       to the edge; axes with < 3 samples fall back to linear. 8 new tests (`tests/test_gridinterp.py`).
-- [ ] **H3 — RBF scatter interpolation.** `scipy.interpolate.RBFInterpolator`; thin-plate default,
-      multiquadric/Gaussian/Wendland options; one factorization → multi-RHS across channels; clamp/flag
-      out-of-convex-hull queries.
+- [x] **H3 — RBF scatter interpolation.** ✅ 2026-07-19. `RbfScatterField` / `VecRbfScatterField` wrap
+      `scipy.interpolate.RBFInterpolator` (lazy import; scipy is an optional dep). Default kernel =
+      parameter-free **thin_plate_spline**; scipy's `multiquadric`/`gaussian`/`inverse_*`/`cubic`/`quintic`
+      /`linear` also selectable (ε-kernels take `epsilon`). A vector scatter is **one** interpolator with a
+      multi-column RHS → one factorization across all channels (`.channel(name|idx)` views). Convex-hull
+      extrapolation is guarded by `on_outside="clamp"` (default; clips to per-channel data range),
+      `"raise"`, or `"extrapolate"` — **no `"nan"` flag** because loom's Signal contract forbids non-finite
+      values. Rebuilt at most once per frame (`_RbfEngine`). **Not offered:** Wendland (scipy's
+      RBFInterpolator has no compact-support kernel) — use `neighbors=` for large sets instead. 8 new
+      tests (`tests/test_rbf.py`, skip if scipy absent).
 - [ ] **H4 — field-sampled curve.** A curve through a field; polling at a progression index returns
       (N spatial coords, `{channel: value}`). Wire into the DAG so its outputs can drive scene variables.
 
@@ -1126,3 +1133,17 @@ stereo.
   cubic reproducing linear ramps exactly right up to the boundary (verified); thin axes (< 3 samples)
   fall back to linear. 8 new tests (`tests/test_gridinterp.py`); 581 loom tests green. Next in §H: H3
   (RBF scatter — needs scipy) then H4 (field-sampled curve).
+- 2026-07-19: **H3 done.** scatter fields gained a radial-basis-function backend beside Shepard.
+  `RbfScatterField` (scalar) and `VecRbfScatterField` (vector) wrap `scipy.interpolate.RBFInterpolator`
+  behind a lazy import (`_require_scipy` — scipy stays an *optional* loom dep, clear error if absent). A
+  per-field `_RbfEngine` rebuilds the interpolator at most once per frame (positions/values are
+  animatable, so the kernel factorization is frame-dependent) and evaluates the query; a vector scatter
+  is a single interpolator with a multi-column RHS, so all channels come from one factorization. Default
+  kernel is the parameter-free thin_plate_spline (reproduces linear + exact at samples with smoothing=0);
+  scipy's other kernels are selectable. Out-of-convex-hull queries are guarded by
+  `on_outside="clamp"|"raise"|"extrapolate"` (hull via scipy Delaunay, 1-D/bbox fallbacks) — dropped the
+  planned "nan" flag mode because loom's Signal.at() forbids non-finite values (proper fix: honor the
+  invariant, "flag" == raise). Wendland isn't offered (not a scipy kernel); `neighbors=` covers large
+  sets. 8 new tests (`tests/test_rbf.py`); 589 loom tests green. Perf caveat logged in known-issues
+  (per-frame refactor can't be reused across frames via scipy's API). Next in §H: H4 (field-sampled
+  curve) — closes §H.

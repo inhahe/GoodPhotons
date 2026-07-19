@@ -165,15 +165,20 @@ output can feed another modulator — "it's just another function"):
    `interp="linear"` (default, N-linear) or `interp="cubic"` (separable Catmull-Rom
    / tricubic; smoother C1, may overshoot). Boundary phantoms are linearly
    extrapolated so cubic reproduces linear ramps to the edge.
-3. **`ScatterField`** — smooth interpolation of scatter values (inverse-distance /
-   RBF; **quality/speed tradeoff is an open tuning item**, see §11).
+3. **`ScatterField`** — Shepard inverse-distance interpolation of scatter values
+   (robust, C0, flattens toward the mean far from samples).
+3b. **`RbfScatterField`** — radial-basis interpolation (`scipy.interpolate.RBFInterpolator`,
+   an *optional* dep, lazily imported). Smooth, exact at samples, meshless, any N-D.
+   Default kernel `thin_plate_spline` (parameter-free); `on_outside="clamp"` guards the
+   convex-hull extrapolation. Rebuilt once per frame (positions/values animate).
 
 Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
-with named `channels=`). `VecGridField` / `VecScatterField` interpolate those as a
-`VecSignal`: the **domain weights are computed once** (shared kernels with the scalar
-fields) and applied to every channel, so a vector field's `.channel(name|idx)` equals
-the scalar field over that channel bit-for-bit, and the single-valued field is just the
-one-channel case.
+with named `channels=`). `VecGridField` / `VecScatterField` / `VecRbfScatterField`
+interpolate those as a `VecSignal`: the **domain weights (or RBF factorization) are
+computed once** and applied to every channel (RBF uses a multi-column RHS — one solve
+for all channels), so a vector field's `.channel(name|idx)` equals the scalar field over
+that channel, and the single-valued field is just the one-channel case. Grid fields also
+take `interp="linear"|"cubic"` (see §2 above).
 
 And, over a `TrackedPath`, one multi-curve sampler:
 

@@ -574,3 +574,197 @@ class VecScatterField(VecSignal):
         if cache is not None:
             cache.set(self._id, clock.frame, out)
         return out
+
+
+# ---------------------------------------------------------------------------
+# 3b. RBF scatter interpolation — radial basis functions (scipy-backed)
+# ---------------------------------------------------------------------------
+#
+# Shepard is robust but low-order (only C0, and it flattens toward the mean far
+# from samples).  Radial-basis interpolation is smooth, **exact at the data points**
+# (smoothing=0), works in any N-D with no meshing, and — via a single kernel
+# factorization with a **multi-RHS** solve — interpolates all channels of a vector
+# scatter for the price of one.  We defer to ``scipy.interpolate.RBFInterpolator``.
+#
+# Caveat baked into the API: an RBF **extrapolates (and overshoots) outside the
+# convex hull** of the samples.  ``on_outside`` controls that — ``"clamp"`` (default)
+# clips an out-of-hull result to the per-channel data range, ``"raise"`` errors,
+# ``"extrapolate"`` returns the raw RBF value.  (No NaN-flag mode: loom's Signal
+# contract forbids non-finite values, so "flag" is a hard ``raise``.)
+
+_RBF_KERNELS = frozenset((
+    "linear", "thin_plate_spline", "cubic", "quintic",
+    "multiquadric", "inverse_multiquadric", "inverse_quadratic", "gaussian",
+))
+_RBF_OUTSIDE = frozenset(("clamp", "raise", "extrapolate"))
+
+
+def _require_scipy():
+    try:
+        import numpy as np  # noqa: F401
+        from scipy.interpolate import RBFInterpolator  # noqa: F401
+    except Exception as exc:  # pragma: no cover - only when scipy missing
+        raise ImportError(
+            "RBF scatter fields need numpy + scipy "
+            "(pip install scipy) — not available: " + str(exc)) from exc
+
+
+def _make_hull(P):
+    """A cheap point-in-hull tester for the sample positions ``P`` (M x dim)."""
+    import numpy as np
+    dim = P.shape[1]
+    if dim == 1:
+        return ("1d", float(P[:, 0].min()), float(P[:, 0].max()))
+    try:
+        from scipy.spatial import Delaunay
+        return ("delaunay", Delaunay(P))
+    except Exception:
+        # degenerate (collinear / coplanar / too few points) — fall back to bbox.
+        return ("bbox", P.min(axis=0), P.max(axis=0))
+
+
+def _inside_hull(hull, q, tol: float = 1e-9) -> bool:
+    kind = hull[0]
+    if kind == "1d":
+        return hull[1] - tol <= float(q[0]) <= hull[2] + tol
+    if kind == "delaunay":
+        return bool(hull[1].find_simplex(q) >= 0)
+    lo, hi = hull[1], hull[2]
+    return bool((q >= lo - tol).all() and (q <= hi + tol).all())
+
+
+class _RbfEngine:
+    """Per-field RBF builder + evaluator, rebuilt at most **once per frame**.
+
+    The kernel factorization depends on the (animatable) sample positions and the
+    values are its right-hand side, so we rebuild when the frame changes.  A whole
+    vector scatter is one ``RBFInterpolator`` with a multi-column ``d`` (multi-RHS),
+    which is why scalar and vector fields share this engine.
+    """
+
+    def __init__(self, scatter: Scatter, kernel: str, epsilon, smoothing,
+                 degree, neighbors, on_outside: str) -> None:
+        if kernel not in _RBF_KERNELS:
+            raise ValueError(f"unknown RBF kernel {kernel!r}; "
+                             f"choose from {sorted(_RBF_KERNELS)}")
+        if on_outside not in _RBF_OUTSIDE:
+            raise ValueError(f"unknown on_outside {on_outside!r}; "
+                             f"choose from {sorted(_RBF_OUTSIDE)}")
+        _require_scipy()
+        self.scatter = scatter
+        self.kernel = kernel
+        self.epsilon = epsilon
+        self.smoothing = float(smoothing)
+        self.degree = degree
+        self.neighbors = neighbors
+        self.on_outside = on_outside
+        self._frame: Optional[int] = None
+        self._state = None
+
+    def _build(self, clock: Clock, cache: Optional[Cache]) -> None:
+        import numpy as np
+        from scipy.interpolate import RBFInterpolator
+        sc = self.scatter
+        P = np.asarray([pos.at(clock, cache) for pos in sc.positions], dtype=float)
+        D = np.asarray([val.at(clock, cache) for val in sc.values], dtype=float)
+        rbf = RBFInterpolator(P, D, kernel=self.kernel, epsilon=self.epsilon,
+                              smoothing=self.smoothing, degree=self.degree,
+                              neighbors=self.neighbors)
+        dmin = np.atleast_1d(D.min(axis=0))
+        dmax = np.atleast_1d(D.max(axis=0))
+        hull = None if self.on_outside == "extrapolate" else _make_hull(P)
+        self._state = (rbf, dmin, dmax, hull)
+
+    def evaluate(self, q: Tuple[float, ...], clock: Clock, cache: Optional[Cache]):
+        import numpy as np
+        if self._frame != clock.frame or self._state is None:
+            self._build(clock, cache)
+            self._frame = clock.frame
+        rbf, dmin, dmax, hull = self._state
+        qa = np.asarray(q, dtype=float).reshape(1, -1)
+        out = np.atleast_1d(np.asarray(rbf(qa)[0], dtype=float))
+        if hull is not None and not _inside_hull(hull, qa[0]):
+            if self.on_outside == "clamp":
+                out = np.minimum(np.maximum(out, dmin), dmax)
+            elif self.on_outside == "raise":
+                raise ValueError(f"RBF query {q} is outside the sample convex hull")
+        return out
+
+
+class RbfScatterField(Signal):
+    """Scalar RBF interpolation of a :class:`Scatter` at ``query`` (scipy-backed).
+
+    Smooth, exact at the samples (``smoothing=0``), meshless, works in any N-D.
+    ``kernel`` defaults to the parameter-free ``"thin_plate_spline"``; other scipy
+    kernels (``multiquadric``/``gaussian``/… need ``epsilon``).  ``on_outside`` guards
+    the convex-hull extrapolation (``"clamp"`` default; ``"raise"`` / ``"extrapolate"``).
+    For vector samples use
+    :class:`VecRbfScatterField`.
+    """
+
+    def __init__(self, scatter: Scatter, query: Vecish, *,
+                 kernel: str = "thin_plate_spline", epsilon=None,
+                 smoothing: float = 0.0, degree=None, neighbors=None,
+                 on_outside: str = "clamp") -> None:
+        super().__init__()
+        self.scatter = scatter
+        self.q = VecSignal.of(query)
+        if self.q.dim != scatter.dim:
+            raise ValueError(f"query dim {self.q.dim} != scatter dim {scatter.dim}")
+        if scatter.is_vector:
+            raise TypeError("RbfScatterField requires scalar values; "
+                            "use VecRbfScatterField for a vector-valued Scatter")
+        self._eng = _RbfEngine(scatter, kernel, epsilon, smoothing,
+                               degree, neighbors, on_outside)
+
+    def children(self):
+        return tuple(self.q.components) + (self.scatter,)
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        q = self.q.at(clock, cache)
+        return float(self._eng.evaluate(q, clock, cache)[0])
+
+
+class VecRbfScatterField(VecSignal):
+    """Vector RBF interpolation of a vector-valued :class:`Scatter`.
+
+    One ``RBFInterpolator`` with a multi-column right-hand side interpolates every
+    channel from a single kernel factorization (the multi-RHS win).
+    ``.channel(name_or_index)`` returns a scalar view of one channel.  See
+    :class:`RbfScatterField` for the kernel / ``on_outside`` options.
+    """
+
+    def __init__(self, scatter: Scatter, query: Vecish, *,
+                 kernel: str = "thin_plate_spline", epsilon=None,
+                 smoothing: float = 0.0, degree=None, neighbors=None,
+                 on_outside: str = "clamp") -> None:
+        self.scatter = scatter
+        self.q = VecSignal.of(query)
+        if self.q.dim != scatter.dim:
+            raise ValueError(f"query dim {self.q.dim} != scatter dim {scatter.dim}")
+        if not scatter.is_vector:
+            raise TypeError("VecRbfScatterField requires a vector-valued Scatter; "
+                            "use RbfScatterField for scalar values")
+        self._eng = _RbfEngine(scatter, kernel, epsilon, smoothing,
+                               degree, neighbors, on_outside)
+        self._vdim = scatter.value_dim
+        self._id = alloc_id()
+        self.components: List[Signal] = [
+            _VecFieldComponent(self, a) for a in range(self._vdim)]
+
+    def children(self):
+        return tuple(self.q.components) + (self.scatter,)
+
+    def channel(self, channel) -> Signal:
+        return self.components[self.scatter.channel_index(channel)]
+
+    def at(self, clock: Clock, cache: Optional[Cache] = None) -> Tuple[float, ...]:
+        if cache is not None:
+            hit = cache.get(self._id, clock.frame)
+            if hit is not None:
+                return hit  # type: ignore[return-value]
+        q = self.q.at(clock, cache)
+        out = tuple(float(x) for x in self._eng.evaluate(q, clock, cache))
+        if cache is not None:
+            cache.set(self._id, clock.frame, out)
+        return out

@@ -5,6 +5,20 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-19): loom RBF scatter field rebuilds the interpolator every frame
+`RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) rebuild the
+`scipy.interpolate.RBFInterpolator` once per frame because sample positions/values are
+animatable (Signals), so the kernel factorization is frame-dependent. When positions are
+**static** (the common case) the O(M³) kernel factorization only depends on positions and
+could be reused across frames, re-solving only for changed values — but scipy's
+`RBFInterpolator` bakes values at construction and exposes no "refactor with new RHS" API.
+Proper fix: detect static positions (all-`Const` position components) and, for that case,
+cache the factorization across frames — either by dropping to scipy's lower-level linear
+solve (build the kernel matrix + polynomial tail once, LU-factor, re-solve per frame) or by
+keeping the `RBFInterpolator` alive when values are also static. Until then, per-frame
+rebuild is correct but wasteful for long animations with many samples. `neighbors=` (local
+k-NN RBF) mitigates the cost for large point sets.
+
 ### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
 **Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)
 can *reference* an existing NanoVDB grid via `density="vdb:<path>"`, but loom has no way to
