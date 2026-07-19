@@ -811,6 +811,26 @@ in that site's axis set). **Open q (defer to scheduling):** the concrete `Animat
 how axis-set inference/annotation is represented in the loom struct + the on-disk projection; where the
 explicit reduction node and the video node sit in that taxonomy.
 
+### E6 — Quick OBJ viewer: a CLI flag to open a mesh in a ready-lit scene  *(ftrace; small, self-contained; user-proposed 2026-07-19)*
+**Idea.** A command-line option that takes an `.obj` file and renders/opens it directly in a viewable
+scene with **sufficient built-in lighting** — no hand-authored `.ftsl` required. Point ftrace at a bare
+mesh (e.g. `ftrace -view foo.obj` / `-obj foo.obj`) and get an immediately watchable, well-lit result:
+auto-frame the camera to the mesh bounds, drop in a default key/fill/ambient (or an environment light) so
+the surface reads clearly, apply a neutral default material, and bring up the live `-window` preview.
+Purpose: a fast "just let me look at this mesh" path for inspecting exported/staged OBJs (the settle
+pipeline's `scraps/*_staged.obj`, decimation results, etc.) without writing a scene each time. **Scope
+sketch:** (1) a CLI flag that loads the OBJ as the sole geometry; (2) auto-fit camera from the mesh AABB
+(distance/fov to frame it, sensible default orientation); (3) a canned three-point or env-map lighting
+rig + default material; (4) reuse the normal render/preview path (`-window`/`-keepwindow`, checkpoints).
+**Accepts every mesh format ftrace already loads,** not just OBJ — the loader dispatches on extension in
+`src/ftsl.h`, so the viewer flag should transparently open **Wavefront OBJ (`.obj`)**, **glTF (`.gltf` /
+`.glb`)** (via the glTF loader, which also imports pbrMetallicRoughness materials), and **FBX (`.fbx`)**
+(via the ufbx bridge). Reuse the same extension dispatch so any file the scene parser can `mesh { file … }`
+can also be `-view`ed directly. (glTF/FBX carry their own materials — for those, prefer the file's baked
+material over the neutral default; fall back to the default only for OBJ or when a mesh has no material.)
+Open q: default material for materialless meshes (matte grey vs a light clay/AO look), and lighting preset
+(studio three-point vs a built-in HDRI/env).
+
 ---
 
 ## F. loom native viewer  *(loom + ftrace; LARGE, design-captured 2026-07-19; the concrete realization of §E2)*

@@ -339,6 +339,7 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0):
             p.changeDynamics(body, -1, lateralFriction=friction, spinningFriction=0.02,
                              rollingFriction=0.02, restitution=0.0)
             dyn[name] = (body, c)
+            print(f'[settle_scene] spawn "{name}" COM = ({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})')
         else:
             # static concave collider at its authored world pose (mesh already world-space).
             # Isosurface stands come out of `ftrace -export-mesh` at the polygonisation res
