@@ -901,8 +901,13 @@ question — *should grid/scatter points be multi-valued?* — with **YES**.
   scene variables" and §F6's inspection both build on.
 
 **Tasks:**
-- [ ] **H1 — vector-valued `GridField`/`ScatterField`.** Add named/indexed **value channels** to both
-      field types; keep domain coords separate from value channels; single-valued stays the 1-channel case.
+- [x] **H1 — vector-valued `GridField`/`ScatterField`.** ✅ 2026-07-19. `Grid`/`Scatter` now infer a
+      value model (`value_dim`/`is_vector`) and take optional `channels=` names (validated, resolved by
+      `channel_index(name|idx)`). New `VecGridField`/`VecScatterField` (VecSignals) compute the shared
+      **domain weights once** and blend every channel with them (weight kernels `_grid_weights` /
+      `_shepard_weights` are shared with the scalar fields, so scalar == vector-channel bit-for-bit).
+      Scalar `GridField`/`ScatterField` stay the 1-channel case and now reject vector datasets with a
+      pointer to the Vec* class. 11 new tests; 573 loom tests green.
 - [ ] **H2 — grid interpolation.** Multilinear default; optional tricubic / Catmull-Rom. Compute domain
       weights once, apply across all channels.
 - [ ] **H3 — RBF scatter interpolation.** `scipy.interpolate.RBFInterpolator`; thin-plate default,
@@ -1098,3 +1103,14 @@ stereo.
   procskin.ftsl (formula, red rises left→right = r=u), textured.ftsl (image checker), triplanar.ftsl
   (mean channel diff ~0.03/255, ~1033 shared box-edge px); flat implicit.ftsl unchanged; back-wall
   spatial variance confirms the skins actually sample. Resolves the known-issues tech-debt entry.
+- 2026-07-19: **H1 done.** loom fields generalized to vector values. `Grid`/`Scatter` infer
+  `value_dim`/`is_vector` from their stored values (all-scalar vs all-vector, mixing rejected) and take an
+  optional `channels=` name list (validated for length/uniqueness, resolved by `channel_index(name|idx)`
+  incl. negative indices). New `VecGridField`/`VecScatterField` (both `VecSignal`s, LoopCurve-style
+  `_VecFieldComponent` views) interpolate every channel with the **same domain weights**, computed once
+  per frame. The weight kernels `_grid_weights` (N-linear corners) and `_shepard_weights` (inverse-
+  distance) are factored out and shared with the scalar `GridField`/`ScatterField`, so a vector field's
+  `.channel(c)` is bit-for-bit the scalar field over that channel. Scalar fields stay the 1-channel case
+  and now reject a vector dataset (pointing at the Vec* class). 11 new tests (`tests/test_vecfields.py`);
+  573 loom tests green. Next in §H: H2 (tricubic/Catmull-Rom grid option) then H3 (RBF scatter, needs
+  scipy).

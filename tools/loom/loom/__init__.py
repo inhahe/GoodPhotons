@@ -20,7 +20,8 @@ from .color import (
     Color, rgb, hsv, hsl, hsv_to_rgb, rgb_to_hsv, hsl_to_rgb, rgb_to_hsl,
 )
 from .interp import (
-    LoopCurve, TrackedCurve, Reparam, GridField, ScatterField, eval_curve,
+    LoopCurve, TrackedCurve, Reparam, GridField, ScatterField,
+    VecGridField, VecScatterField, eval_curve,
 )
 from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
@@ -73,7 +74,8 @@ __all__ = [
     "PointPath", "TrackedPath", "Grid", "Scatter",
     "Color", "rgb", "hsv", "hsl",
     "hsv_to_rgb", "rgb_to_hsv", "hsl_to_rgb", "rgb_to_hsl",
-    "LoopCurve", "TrackedCurve", "Reparam", "GridField", "ScatterField", "eval_curve",
+    "LoopCurve", "TrackedCurve", "Reparam", "GridField", "ScatterField",
+    "VecGridField", "VecScatterField", "eval_curve",
     "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
     "Scene", "Material", "Texture", "skin", "ProcTexture", "func_skin",
     "Sphere", "Beads", "Raw", "Light",

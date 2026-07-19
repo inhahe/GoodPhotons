@@ -166,6 +166,13 @@ output can feed another modulator — "it's just another function"):
 3. **`ScatterField`** — smooth interpolation of scatter values (inverse-distance /
    RBF; **quality/speed tradeoff is an open tuning item**, see §11).
 
+Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
+with named `channels=`). `VecGridField` / `VecScatterField` interpolate those as a
+`VecSignal`: the **domain weights are computed once** (shared kernels with the scalar
+fields) and applied to every channel, so a vector field's `.channel(name|idx)` equals
+the scalar field over that channel bit-for-bit, and the single-valued field is just the
+one-channel case.
+
 And, over a `TrackedPath`, one multi-curve sampler:
 
 4. **`TrackedCurve`** — samples a `TrackedPath`'s position **and every track** on
