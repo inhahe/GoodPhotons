@@ -215,9 +215,27 @@ def _build_light(node):
     return Light(kind, **props)
 
 
+def _vec3n(node):
+    """A ``vec3n`` (three space-separated NUMBERs) -> (x, y, z) floats."""
+    return tuple(float(c.value) for c in node.children if c.name == "NUMBER")
+
+
+def _build_camera(node):
+    from ..scene import Camera
+    name = _unquote(_kid(node, "STRING").value)
+    view = _kid(node, "cam_view")
+    eye, look_at, up = (_vec3n(v) for v in _kids(view, "vec3n"))
+    fov_y = float(_kid(view, "NUMBER").value)
+    mode = _kid(node, "cam_mode").value
+    film = _kid(node, "cam_film")
+    w, h = (int(float(c.value)) for c in film.children if c.name == "NUMBER")
+    return Camera(eye, look_at, up=up, fov_y=fov_y, mode=mode, res=(w, h), name=name)
+
+
 _BUILDERS = {
     "record": _build_record, "material": _build_material,
     "texture": _build_texture, "sphere": _build_sphere, "light": _build_light,
+    "camera": _build_camera,
 }
 
 

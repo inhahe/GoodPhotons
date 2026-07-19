@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-from loom import Clock, Cache, Light  # noqa: E402
+from loom import Clock, Cache, Light, Camera  # noqa: E402
 from loom.scene import Sphere  # noqa: E402
 from loom.ftsl_emit import EmitCtx  # noqa: E402
 from loom.grammar.reader import parse_element  # noqa: E402
@@ -34,6 +34,9 @@ _SAMPLES = [
     Light("point", position="0 5 0", spd="preset:bb6500", power="40"),
     Light("area", color="0.9 0.8 0.7", size="2 2"),
     Light("sky", turbidity="3"),
+    Camera((0, 2, 5), (0, 0, 0)),
+    Camera((3.0, -1.5, 2.25), (0, 1, 0), up=(0, 0, 1), fov_y=55.0,
+           mode="A", res=(1920, 1080), name="hero"),
 ]
 
 
@@ -67,6 +70,17 @@ def test_light_fields_roundtrip():
     assert back.props["position"] == "0 5 0"
     assert back.props["spd"] == "preset:bb6500"
     assert back.props["power"] == "40"
+
+
+def test_camera_fields_roundtrip():
+    cam = Camera((3.0, -1.5, 2.25), (0, 1, 0), up=(0, 0, 1), fov_y=55.0,
+                 mode="A", res=(1920, 1080), name="hero")
+    back = parse_element(cam.emit(_ctx()))
+    assert isinstance(back, Camera)
+    assert back.name == "hero"
+    assert back.mode == "A"
+    assert back.res == (1920, 1080)
+    assert back.emit(_ctx()) == cam.emit(_ctx())
 
 
 if __name__ == "__main__":

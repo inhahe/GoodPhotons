@@ -1144,17 +1144,19 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       EPEG `.ftsl` grammar (unified EPEG: regex terminals, `@skip`/`@mode`/`@longest`/`@left`/`@right`, actions).
       **DONE (foundation + record + material/texture + sphere/light blocks, 2026-07-19):** vendored the pinned
       tokenized `gpda.py` as `loom/grammar/_gpda.py` (commit 1ac4cbf, self-contained), shared grammar
-      `loom/grammar/ftsl.epeg` (start=`element` = `record | material | texture | sphere | light`, grows toward
-      `scene`), reader `loom/grammar/reader.py`
+      `loom/grammar/ftsl.epeg` (start=`element` = `record | material | texture | sphere | light | camera`, grows
+      toward `scene`), reader `loom/grammar/reader.py`
       (`parse_record` → structural parity with the hand-written `Record.parse` oracle across every channel form;
       `parse_element` → `record`/`material`/`texture` blocks). Records prove parity vs the oracle; materials/textures
       (no `.parse` oracle) prove **emit is a fixed point** (emit → parse_element → re-emit byte-identical) + rebuilt
       kind/field round-trip, across image `Texture`, procedural `ProcTexture` (rgb-function), and scalar / vector /
       spectrum-ref / texture-ref material props over all material types (`tests/test_grammar_material.py`, 20 tests).
-      Geometry `sphere` (fixed `center/radius/material` block) and `light <kind> { … }` (material-shaped body) added
-      the same way (`tests/test_grammar_scene.py`, 12 tests). *(Gotcha: a keyword literal that also matches the NAME
-      regex — `light`, `material` — tokenizes as a NAME node, so `light`'s bareword kind is the **second** top-level
-      NAME child, not the first.)*
+      Geometry `sphere` (fixed `center/radius/material` block), `light <kind> { … }` (material-shaped body), and the
+      multi-line `camera "name" { … film { res W H } }` block added the same way (`tests/test_grammar_scene.py`,
+      17 tests). *(Gotcha: a keyword literal that also matches the NAME regex — `light`, `material`, `eye`, `mode`,
+      `film`… — tokenizes as a NAME node, so positional NAME extraction is brittle; `light`'s bareword kind is the
+      **second** top-level NAME child, and `camera` names its parts via `cam_view`/`cam_mode`/`cam_film` sub-rules so
+      the builder reads them by rule name instead of counting NAMEs.)*
       *(Gotcha fixed en route: GPDA collapses a single-terminal rule's value onto the rule node **and** keeps the child
       leaf, so the flat-`_terminals` walk must only take `node.value` on true leaves, else prop values duplicate.)*
       **KEY FINDING

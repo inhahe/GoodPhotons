@@ -32,7 +32,7 @@ STRING  = /"[^"]*"/                                 # quoted name / path / expre
 NAME    = /[A-Za-z_][A-Za-z0-9_]*/
 
 # ---- top-level element ----------------------------------------------
-element = record | material | texture | sphere | light
+element = record | material | texture | sphere | light | camera
 
 # ---- record block ---------------------------------------------------
 # NEWLINE stays significant (one channel line = one channel), but the newlines
@@ -78,3 +78,14 @@ sphere = nl? 'sphere' '{' nl? 'center' NUMBER NUMBER NUMBER nl? 'radius' NUMBER 
 # `light <kind> { <prop>* }` — a bareword kind then the same key/value body as
 # a material (its props round-trip through value_token exactly like a material's).
 light = nl? 'light' NAME '{' mbody '}' nl?
+
+# ---- camera ---------------------------------------------------------
+# The static per-frame camera block loom bakes.  Sub-rules (cam_view / cam_mode /
+# cam_film) give the reader clean handles — the bareword keywords `eye`/`look_at`/
+# `up`/`fov_y`/`mode`/`film`/`res` all match NAME too, so positional extraction
+# would be brittle; naming the parts keeps the builder robust.
+camera   = nl? 'camera' STRING '{' nl? cam_view nl? 'mode' cam_mode nl? cam_film nl? '}' nl?
+cam_view = 'eye' vec3n 'look_at' vec3n 'up' vec3n 'fov_y' NUMBER
+vec3n    = NUMBER NUMBER NUMBER
+cam_mode = NAME
+cam_film = 'film' '{' 'res' NUMBER NUMBER '}'
