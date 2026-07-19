@@ -791,6 +791,22 @@ explicit reduction node and the video node sit in that taxonomy.
 app. It enumerates the objects a loom file defines, lets the user select and inspect them, and shows
 N-D curves / SweptMeshes / isosurfaces / scatter+grid fields / the modulator DAG in one live UI.
 
+**Decision — native, not WebGPU/WebGL (revisited 2026-07-19, reaffirmed).** Considered replacing our
+rasterizer/preview with WebGPU (browser or wgpu-native). **Verdict: build §F native.** Decisive reasons:
+(1) a browser can't call CUDA, so a web viewer must either *reimplement* the isosurface sphere-trace in
+WGSL — a permanent second field evaluator, parity tax vs. the C++ render, FP32-only, recompile-on-
+*structural*-edit — or degrade to pixel-streaming from the C++ renderer; both are strictly worse for the
+*interactive isosurface-modification* goal, whereas native links `-raster-gpu` in-process and blits its GPU
+output straight to the viewport. (2) §F's UI (sliders, scroll-locked strip charts, node DAG, click-to-
+inspect viewport overlays) is exactly ImGui/ImPlot/imnodes's sweet spot, so web's richer-GUI edge doesn't
+apply. (3) The Python↔viewer bridge is needed either way (loom is Python); web only *adds* a second
+boundary (browser↔renderer). (4) Mature CUDA↔graphics interop exists for the native ImGui backends
+(D3D11/OpenGL/Vulkan) but not for WebGPU, so keeping the trace on-GPU and zero-copy presenting it is clean
+native, awkward via WebGPU. Accepted native costs: slower UI iteration than web hot-reload; ImGui/window/
+interop build plumbing; a native exe not a URL. **Revisit WebGPU only if the goal changes to zero-install
+browser sharing or getting off CUDA — and even then as an additive share/embed front-end, never a
+replacement for the renderer or the primary editing tool.**
+
 **Architecture (locked in conversation 2026-07-19):**
 - **Native, on ftrace's renderer — not WebGL.** The user's primary interest is *fast isosurface
   modification*, and ftrace's **`-raster-gpu` / `kIsoPreview`** already sphere-traces implicit
