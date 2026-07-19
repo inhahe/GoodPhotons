@@ -65,6 +65,31 @@ struct Record {
     }
 };
 
+// The material slots a record channel can fill (name-matched at bind time). Kept as a
+// small enum so a Material's per-slot binding table (RecBinding, below) is compact and
+// GPU-portable. Extend as more slots gain per-hit record support.
+enum RecSlot { REC_SLOT_REFLECT = 0, REC_SLOT_ROUGHNESS = 1 };
+
+// One resolved record→slot binding on a Material. A material block's ordered `from R(d)`
+// imports and explicit `slot = …` assignments collapse (last-write-wins) into at most
+// one binding per slot at load, so shading just looks up the slot's binding and samples.
+//
+//   recordIndex >= 0, selStop <  0 : sample channel `channel` of record `recordIndex`
+//                                     at the per-hit driver `driver` (the common case).
+//   recordIndex >= 0, selStop >= 0 : CONSTANT selector — the channel's `selStop`-th stop
+//                                     (a fixed colour, or a scalar stop expr); `driver`
+//                                     is ignored.
+//   recordIndex <  0               : `driver` is a direct scalar pattern expression
+//                                     driving the slot (scalar slots only, e.g.
+//                                     `roughness = sin(v*3.14159)`).
+struct RecBinding {
+    int slot        = REC_SLOT_REFLECT;   // RecSlot
+    int recordIndex = -1;
+    int channel     = -1;
+    int selStop     = -1;
+    std::vector<PatNode> driver;
+};
+
 // ---- sampling ---------------------------------------------------------------
 // Locate the interval [i, i+1] of `ch.stops` bracketing driver `d` (already clamped
 // to the stop-position range). Returns the left index i in [0, n-2] and the local

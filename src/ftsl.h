@@ -178,6 +178,24 @@ struct Parser {
     // begins the next statement's key. A trailing `{` opens a nested brace block
     // (table/film/…) whose type is the preceding word, or the statement key.
     void parseValue(const std::string& key, Value& v) {
+        // Record-override assignment: `slot = <rhs>` (used inside a `material "m" { … }`
+        // record block, §records stage 4). A standalone `=` first token never begins a
+        // normal statement value, so this is unambiguous. The RHS is a single token
+        // (an expression, a channel name, or `REC.chan`), optionally followed by a
+        // `[i]` stop selector — which we fold back into the RHS token (`REC.chan[i]`) so
+        // the bracket tokens don't leak into the generic brace-body statement stream.
+        if (is(Tok::Word) && cur().text == "=") {
+            v.words.push_back("="); adv();
+            if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
+            if (is(Tok::LBracket)) {
+                adv();
+                std::string idx;
+                while (is(Tok::Word)) { idx += cur().text; adv(); }
+                if (is(Tok::RBracket)) adv(); else fail("record-override selector missing ']'");
+                if (!v.words.empty()) v.words.back() += "[" + idx + "]";
+            }
+            return;
+        }
         bool firstWasString = false;
         if (is(Tok::Word) || is(Tok::String)) {
             firstWasString = is(Tok::String);
@@ -701,7 +719,7 @@ public:
             if (b.type != "material") continue;
             if (b.name.empty()) { fail("material needs a \"name\""); return false; }
             int id = (int)L.scene.mats.size();
-            Material m = buildMaterial(b);
+            Material m = buildMaterial(b, L);
             if (!err.empty()) return false;
             L.scene.mats.push_back(m);
             matIndex_[b.name] = id;
@@ -798,24 +816,55 @@ private:
         return it->second;
     }
 
+    // Map a slot keyword to its RecSlot id, or -1 if it isn't a record-fillable slot.
+    static int recSlotId(const std::string& name) {
+        if (name == "reflect")   return REC_SLOT_REFLECT;
+        if (name == "roughness") return REC_SLOT_ROUGHNESS;
+        return -1;
+    }
+
+    // Install one slot binding, applying last-write-wins: drop any existing binding for
+    // the same slot first (so a later `from`/assignment overrides an earlier one).
+    static void setBinding(Material& m, const RecBinding& rb) {
+        auto& v = m.recBindings;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [&](const RecBinding& e) { return e.slot == rb.slot; }),
+                v.end());
+        v.push_back(rb);
+    }
+
+    // Apply `from R(drv)`: bind every slot whose name matches a channel of record
+    // `recIdx` (the kind must match the slot — reflect wants a Spectrum channel,
+    // roughness a Scalar channel), each sampled at the shared driver `drv`. Lenient:
+    // an unmatched channel is ignored, an unfilled slot keeps its constant.
+    static void applyFrom(Material& m, int recIdx, const std::vector<PatNode>& drv,
+                          const Record& rec) {
+        int ci = rec.channelIndex("reflect");
+        if (ci >= 0 && rec.channels[ci].kind == ChanKind::Spectrum) {
+            RecBinding rb; rb.slot = REC_SLOT_REFLECT; rb.recordIndex = recIdx;
+            rb.channel = ci; rb.driver = drv; setBinding(m, rb);
+        }
+        int ri = rec.channelIndex("roughness");
+        if (ri >= 0 && rec.channels[ri].kind == ChanKind::Scalar) {
+            RecBinding rb; rb.slot = REC_SLOT_ROUGHNESS; rb.recordIndex = recIdx;
+            rb.channel = ri; rb.driver = drv; setBinding(m, rb);
+        }
+    }
+
     // Synthesize a record-driven material (§records §2.2): a default (diffuse) material
-    // whose slots are filled per-hit by record `recIdx` sampled at driver `driverExpr`.
-    // Channels are auto-bound to slots by exact name-match (lenient: an unmatched
-    // channel is ignored, an unfilled slot keeps its constant). Returns the new
-    // material's index in Scene::mats, or -1 on error.
+    // whose slots are filled per-hit by record `recIdx` sampled at driver `driverExpr`
+    // (the inline `material R(driver)` form — equivalent to a lone `from R(driver)`).
+    // Returns the new material's index in Scene::mats, or -1 on error.
     int buildRecordMaterial(int recIdx, const std::string& driverExpr, Loaded& L) {
         Material m;   // default type: diffuse
+        m.reflect = constantSpectrum(0.75);
+        std::vector<PatNode> drv;
         std::string cerr;
-        if (!compilePatternExpr(driverExpr, m.recordDriver, cerr)) {
+        if (!compilePatternExpr(driverExpr, drv, cerr)) {
             fail("record material driver '" + driverExpr + "': " + cerr);
             return -1;
         }
-        m.recordIndex = recIdx;
-        const Record& rec = L.scene.records[recIdx];
-        int ci = rec.channelIndex("reflect");
-        if (ci >= 0 && rec.channels[ci].kind == ChanKind::Spectrum) m.recReflectChan = ci;
-        int ri = rec.channelIndex("roughness");
-        if (ri >= 0 && rec.channels[ri].kind == ChanKind::Scalar) m.recRoughChan = ri;
+        applyFrom(m, recIdx, drv, L.scene.records[recIdx]);
         int id = (int)L.scene.mats.size();
         L.scene.mats.push_back(std::move(m));
         return id;
@@ -1341,7 +1390,180 @@ private:
     }
 
     // ---- materials ----
-    Material buildMaterial(const Block& b) {
+    // True if a material block is a §records override block: it either bulk-imports a
+    // record (`from R(d)`) or assigns a slot from a record/expression (`slot = …`, whose
+    // parsed value begins with a lone `=` token). Such blocks are built by
+    // buildRecordOverrideMaterial instead of the ordinary key→value path.
+    static bool isRecordOverrideBlock(const Block& b) {
+        for (const auto& s : b.stmts) {
+            if (s.key == "from") return true;
+            if (!s.val.words.empty() && s.val.words[0] == "=") return true;
+        }
+        return false;
+    }
+
+    // Build a material from a §records override block (stage 4): an ordered list of
+    // `type <kind>`, `from R(driver)`, and `slot = <rhs>` statements. Statements are
+    // processed top→bottom and each write to a slot overrides earlier ones (last-write-
+    // wins). RHS forms: a scalar expression (scalar slots), a bare imported-channel
+    // name, `REC.chan` (driven by the most recent `from REC(...)`), or a constant
+    // selector `REC.chan[i]` / `self.chan[i]` (the channel's i-th stop).
+    Material buildRecordOverrideMaterial(const Block& b, Loaded& L) {
+        Material m;                          // default type: diffuse
+        m.reflect = constantSpectrum(0.75);
+        // Base type (optional) — lets a record drive e.g. a glossy base.
+        if (find(b, "type")) {
+            std::string type = strOf(b, "type", "diffuse");
+            if      (type == "diffuse")   m.type = MatType::Diffuse;
+            else if (type == "glossy")  { m.type = MatType::Glossy; m.reflect = constantSpectrum(0.75); }
+            else { fail("record-override material: unsupported base `type " + type +
+                        "` (only diffuse/glossy)"); return m; }
+        }
+        // Channels imported by a `from` (name -> its source), for `slot = channel` and
+        // `slot = self.chan[i]` lookups; plus each record's most-recent `from` driver
+        // (for a bare `slot = REC.chan` that needs a driver).
+        struct ImportedChan { int recIdx, chanIdx; std::vector<PatNode> driver; };
+        std::unordered_map<std::string, ImportedChan> imported;
+        std::unordered_map<std::string, std::pair<int, std::vector<PatNode>>> fromDriver;  // recName -> (idx,drv)
+
+        for (const auto& s : b.stmts) {
+            if (s.key == "type") continue;                       // already handled
+            if (s.key == "from") {
+                if (s.val.words.empty()) { fail("`from` needs RECORD(driver)"); return m; }
+                std::string raw = s.val.words[0];
+                for (size_t k = 1; k < s.val.words.size(); ++k) raw += " " + s.val.words[k];
+                size_t lp = raw.find('('), rp = raw.rfind(')');
+                if (lp == std::string::npos || rp == std::string::npos || rp <= lp) {
+                    fail("`from " + raw + "`: expected RECORD(driver)"); return m;
+                }
+                std::string rname = raw.substr(0, lp);
+                std::string dexpr = raw.substr(lp + 1, rp - lp - 1);
+                auto rit = recordIndex_.find(rname);
+                if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
+                std::vector<PatNode> drv; std::string cerr;
+                if (!compilePatternExpr(dexpr, drv, cerr)) {
+                    fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
+                }
+                const Record& rec = L.scene.records[rit->second];
+                applyFrom(m, rit->second, drv, rec);
+                for (int c = 0; c < (int)rec.channels.size(); ++c)
+                    imported[rec.channels[c].name] = { rit->second, c, drv };
+                fromDriver[rname] = { rit->second, drv };
+                continue;
+            }
+            // Otherwise: a `slot = <rhs>` assignment. val.words == ["=", rhs?].
+            const std::string& slot = s.key;
+            int slotId = recSlotId(slot);
+            if (slotId < 0) { fail("record-override material: '" + slot +
+                                   "' is not a record-fillable slot (reflect|roughness)"); return m; }
+            if (s.val.words.size() < 2 || s.val.words[0] != "=") {
+                fail("record-override material: `" + slot + " = <value>` needs a right-hand side"); return m;
+            }
+            const std::string& rhs = s.val.words[1];
+            bool ok = true;
+
+            // Split a trailing `[i]` stop selector, if any: `REC.chan[i]` / `self.chan[i]`.
+            std::string base = rhs; int selStop = -1;
+            size_t lb = rhs.find('[');
+            if (lb != std::string::npos) {
+                size_t rb = rhs.rfind(']');
+                if (rb == std::string::npos || rb <= lb || !isNumber(rhs.substr(lb + 1, rb - lb - 1))) {
+                    fail("record-override `" + slot + " = " + rhs + "`: bad stop selector"); return m;
+                }
+                selStop = (int)num(rhs.substr(lb + 1, rb - lb - 1));
+                base = rhs.substr(0, lb);
+            }
+
+            // A channel reference (`REC.chan`, `self.chan`, or a bare imported-channel
+            // name) is a *simple* token — identifier chars plus a single dotted qualifier
+            // — never a numeric literal or an expression (which carries parens/operators
+            // or a decimal point). This keeps `roughness = sin(v*3.14159)` an expression
+            // rather than mis-reading `3.14159`'s dot as `REC.chan`. A `[i]` selector was
+            // already stripped, so its presence forces the reference interpretation.
+            auto isSimpleRef = [](const std::string& s) {
+                if (s.empty()) return false;
+                for (char c : s)
+                    if (!(std::isalnum((unsigned char)c) || c == '_' || c == '.')) return false;
+                return true;
+            };
+            bool refForm = selStop >= 0 || (isSimpleRef(base) && !isNumber(base));
+
+            // Resolve the base reference to (recordIndex, channelIndex, driver). A dotted
+            // `REC.chan` names a record channel directly; `self.chan` / a bare name looks
+            // up an imported channel. A bare name that is not an imported channel falls
+            // through to a scalar expression (scalar slots only).
+            int recIdx = -1, chanIdx = -1; std::vector<PatNode> drv; bool haveSrc = false;
+            size_t dot = base.find('.');
+            if (refForm && dot != std::string::npos) {
+                std::string head = base.substr(0, dot), chan = base.substr(dot + 1);
+                if (head == "self") {
+                    auto ic = imported.find(chan);
+                    if (ic == imported.end()) { fail("record-override `self." + chan +
+                        "`: no channel '" + chan + "' imported by a preceding `from`"); return m; }
+                    recIdx = ic->second.recIdx; chanIdx = ic->second.chanIdx; drv = ic->second.driver;
+                } else {
+                    auto rit = recordIndex_.find(head);
+                    if (rit == recordIndex_.end()) { fail("record-override: unknown record '" + head + "'"); return m; }
+                    recIdx = rit->second;
+                    chanIdx = L.scene.records[recIdx].channelIndex(chan);
+                    if (chanIdx < 0) { fail("record-override: record '" + head +
+                        "' has no channel '" + chan + "'"); return m; }
+                    // Driver: reuse the most recent `from head(...)` in this block. Not
+                    // needed for a constant stop selector.
+                    auto fd = fromDriver.find(head);
+                    if (fd != fromDriver.end()) drv = fd->second.second;
+                    else if (selStop < 0) { fail("record-override `" + base +
+                        "`: needs a driver — add `from " + head + "(<driver>)` first"); return m; }
+                }
+                haveSrc = true;
+            } else if (refForm) {
+                // A bare simple reference: an imported-channel name.
+                auto ic = imported.find(base);
+                if (ic != imported.end()) {
+                    recIdx = ic->second.recIdx; chanIdx = ic->second.chanIdx; drv = ic->second.driver;
+                    haveSrc = true;
+                } else if (selStop >= 0) {
+                    fail("record-override `" + rhs + "`: no channel '" + base +
+                         "' imported by a preceding `from`"); return m;
+                }
+                // else: an unqualified identifier that is not an imported channel — let it
+                // fall through to the expression compiler (e.g. a bare intrinsic like `u`).
+            }
+
+            RecBinding rb; rb.slot = slotId; rb.selStop = selStop;
+            if (haveSrc) {
+                const RecChannel& ch = L.scene.records[recIdx].channels[chanIdx];
+                if (slotId == REC_SLOT_REFLECT && ch.kind != ChanKind::Spectrum) {
+                    fail("record-override `reflect = " + rhs + "`: channel '" + ch.name +
+                         "' is scalar, not a colour channel"); return m;
+                }
+                if (slotId == REC_SLOT_ROUGHNESS && ch.kind != ChanKind::Scalar) {
+                    fail("record-override `roughness = " + rhs + "`: channel '" + ch.name +
+                         "' is a colour channel, not scalar"); return m;
+                }
+                rb.recordIndex = recIdx; rb.channel = chanIdx; rb.driver = std::move(drv);
+            } else {
+                // Not a channel reference: a direct scalar expression (scalar slots only).
+                if (slotId == REC_SLOT_REFLECT) {
+                    fail("record-override `reflect = " + rhs + "`: expected a colour channel "
+                         "(a spectrum channel of a record), not an expression"); return m;
+                }
+                if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
+                    "`: a stop selector needs a record channel"); return m; }
+                std::string cerr;
+                if (!compilePatternExpr(rhs, rb.driver, cerr)) {
+                    fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
+                }
+                rb.recordIndex = -1;
+            }
+            setBinding(m, rb);
+            (void)ok;
+        }
+        return m;
+    }
+
+    Material buildMaterial(const Block& b, Loaded& L) {
+        if (isRecordOverrideBlock(b)) return buildRecordOverrideMaterial(b, L);
         Material m;
         // Built-in whole-material recipe: `preset <name>` fills a complete material
         // (metal / glass / iridescent film). A few common knobs may still be

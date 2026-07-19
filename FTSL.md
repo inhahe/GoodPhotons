@@ -385,6 +385,38 @@ sphere { center 0 0 0  radius 1  material grad(u) }              # sweep along u
 sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled by noise
 ```
 
+**Override blocks** — a named `material "m" { … }` block can *import* a record in
+bulk with `from R(driver)` and then override individual slots. Statements resolve in
+written order, **last-write-wins** per slot:
+
+```
+material "swept" {
+    from palette(u)                     # bulk import: every matching channel binds,
+}                                        #   all driven by u
+material "mixed" {
+    type glossy
+    from palette(noise(7*x,7*y,7*z))    # record drives reflect (mottled by noise)…
+    roughness = 0.5*(1+sin(v*12.56))    # …but roughness comes from a direct expression
+}
+material "picked" {
+    from palette(u)
+    reflect = palette.reflect[2]        # constant stop selector: pin to the 3rd stop
+}
+```
+
+A slot RHS after `=` may be:
+- a **math expression** (scalar slots only) — `roughness = 0.5*(1+sin(v*12.56))`;
+- a **bare imported channel name** — binds that channel using the driver it was
+  imported with;
+- **`RECORD.channel`** — the channel of a record, driven by the `from RECORD(…)`
+  driver in the same block (error if that record was never imported);
+- **`RECORD.channel[i]`** (or **`self.channel[i]`**) — a **constant stop selector**
+  that pins the slot to the channel's `i`-th stop (0-based), ignoring the driver.
+
+A later `from` re-imports and its driver wins for the slots it covers. Type rules
+still apply: `reflect` needs a colour channel, `roughness` a scalar; assigning a
+scalar expression to `reflect` is an error.
+
 > **GPU note:** record-driven materials currently render on the **CPU only** — a scene
 > that binds a record falls back from the GPU forward/backward tracer automatically
 > (`[device] … -> CPU (…parametric record…)`). GPU parity is a later stage.

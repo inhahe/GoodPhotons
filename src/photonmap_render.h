@@ -161,12 +161,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 return L;
             }
             case MatType::Mirror: {
-                thr *= clamp01(m.reflect(lambda));
+                thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }
             case MatType::Glossy: {
-                thr *= clamp01(m.reflect(lambda));
+                thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
                 ray = Ray{h.p + h.n * 1e-6, o};
@@ -217,7 +217,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::HalfMirror: {
-                double r = clamp01(m.reflect(lambda));
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
                 if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
@@ -228,7 +228,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
-                thr *= clamp01(m.reflect(lambda));
+                thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }
@@ -336,13 +336,13 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 return L;
             }
             case MatType::Mirror: {
-                double r = clamp01(m.reflect(lambda));
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }
             case MatType::Glossy: {
-                double r = clamp01(m.reflect(lambda));
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
@@ -394,7 +394,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 break;
             }
             case MatType::HalfMirror: {
-                double r = clamp01(m.reflect(lambda));
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
                 if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
@@ -406,7 +406,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
-                double r = clamp01(m.reflect(lambda));
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;

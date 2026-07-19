@@ -100,7 +100,8 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
         }
         case MatType::Glossy: {
             if (cosWi <= 0 || cosWo <= 0) return 0.0;
-            double r = clamp01(m.reflect(lambda));
+            double r = hitForTex ? clamp01(reflectSlot(scene, m, *hitForTex, lambda))
+                                 : clamp01(m.reflect(lambda));
             double e = glossyExponent(hitForTex ? materialRoughness(scene, m, *hitForTex)
                                                 : m.roughness);
             // Mirror direction of the outgoing ray about ns, as render.h forms it:
@@ -492,7 +493,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 Vec3 mdir = reflect(ray.d, cur.ns);   // ray.d == -wo (incoming dir)
                 wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
-                double r = clamp01(mp->reflect(lambda));
+                double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = r;                       // f*cos/pdf = r
@@ -517,7 +518,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Mirror: {
-                double r = clamp01(mp->reflect(lambda));
+                double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 wi = reflect(ray.d, cur.ns);
                 betaFactor = r; delta = true;
                 if (r <= 0) terminate = true;
@@ -569,7 +570,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::HalfMirror: {
-                double r = clamp01(mp->reflect(lambda));
+                double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 if (rng.uniform() < r) wi = reflect(ray.d, cur.ns);
                 else                   wi = ray.d;    // transmit straight
                 betaFactor = 1.0; delta = true;
@@ -595,7 +596,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Grating: {
-                double r = clamp01(mp->reflect(lambda));
+                double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 if (r <= 0) { terminate = true; break; }
                 bool absorbedG; Ray nr = mats.gratingDiffract(*mp, h, ray.d, lambda, rng, absorbedG);
                 if (absorbedG) { terminate = true; break; }

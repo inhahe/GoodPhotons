@@ -1267,7 +1267,7 @@ struct Renderer {
                     continue;                       // lossless on survival; beta unchanged
                 }
                 case MatType::Mirror: {
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     // Russian roulette: absorb with prob (1-r), else reflect with
                     // beta unchanged. Unbiased and caps path length naturally.
                     if (rng.uniform() >= r) { e.absorbed += beta; return; }
@@ -1280,7 +1280,7 @@ struct Renderer {
                     // deflect into one stochastically-chosen order (exact grating
                     // equation). Specular per order -> no camera connect (mode P /
                     // the caustic on diffuse walls makes it visible).
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     if (rng.uniform() >= r) { e.absorbed += beta; return; }
                     bool absorbedG;
                     Ray nr = gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
@@ -1289,7 +1289,7 @@ struct Renderer {
                     continue;                       // beta unchanged on the chosen order
                 }
                 case MatType::HalfMirror: {
-                    double r = clamp01(m.reflect(lambda)); // reflect probability
+                    double r = clamp01(reflectSlot(scene, m, h, lambda)); // reflect probability
                     if (rng.uniform() < r) {
                         Vec3 o = reflect(ray.d, h.n);
                         ray = Ray{h.p + h.n * 1e-6, o};
@@ -1312,7 +1312,7 @@ struct Renderer {
                     continue;
                 }
                 case MatType::Glossy: {
-                    double r = clamp01(m.reflect(lambda));
+                    double r = clamp01(reflectSlot(scene, m, h, lambda));
                     // Russian roulette on reflectance (see Mirror).
                     if (rng.uniform() >= r) { e.absorbed += beta; return; }
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);

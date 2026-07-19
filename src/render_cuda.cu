@@ -4824,7 +4824,7 @@ bool cudaForwardSupported(const Scene& scene) {
     // forward/backward tracer — otherwise the slot keeps its unset constant (black).
     auto usesRecord = [&](int matId) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
-               scene.mats[matId].recordIndex >= 0;
+               scene.mats[matId].hasRecordBinding();
     };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;

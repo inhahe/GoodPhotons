@@ -92,15 +92,18 @@ struct Material {
     int mixWeightPat = -1;   // drives child-0 selection prob of a 2-child Mix (see mixResolveChild)
 
     // --- Parametric-record drive (§records) ---------------------------------
-    // When recordIndex >= 0 this material's slots are driven by a record (a named
-    // per-channel LUT bank, Scene::records) sampled at a per-hit DRIVER scalar.
-    // recordDriver is the compiled driver expression, evaluated in the hit's PatCtx.
-    // Each rec*Chan is the record channel bound to a slot by name-match at load
-    // (-1 = the record has no such channel, so the slot keeps its constant value).
-    int recordIndex    = -1;
-    std::vector<PatNode> recordDriver;
-    int recReflectChan = -1;   // spectrum channel -> diffuse reflect albedo
-    int recRoughChan   = -1;   // scalar channel   -> glossy roughness
+    // A material's slots can be driven by parametric records (Scene::records). Each
+    // RecBinding fills ONE slot from a per-hit source (a record channel sampled at a
+    // driver, a constant stop selector, or a direct scalar expression). The inline
+    // `material R(driver)` form and a `material "m" { from R(d) … slot = … }` block's
+    // ordered statements both collapse (last-write-wins) into at most one binding per
+    // slot here. Empty => no record drive (the material uses its constant slots).
+    std::vector<RecBinding> recBindings;
+    bool hasRecordBinding() const { return !recBindings.empty(); }
+    const RecBinding* recBindingFor(int slot) const {
+        for (const auto& rb : recBindings) if (rb.slot == slot) return &rb;
+        return nullptr;
+    }
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
@@ -1078,18 +1081,47 @@ struct Scene {
 // implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
 inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
 
-// Diffuse albedo at a hit: the material's spatially-varying texture reflectance if
-// one is bound (Phase 3b), else its constant `reflect` spectrum. Shared by the
-// forward tracer and the backward reference so both see identical albedo.
+// Reflect-slot reflectance from a bound parametric record, if the material has a
+// REC_SLOT_REFLECT binding. Returns true and sets `out` (constant-stop selector, or
+// the driven sample at this hit); false when no record drives the reflect slot. The
+// single point of truth so diffuse albedo AND specular tint (mirror/glossy/…) see
+// identical record-driven reflectance.
+inline bool recordReflectBound(const Scene& scene, const Material& m,
+                               const Hit& h, double lambda, double& out) {
+    const RecBinding* rb = m.recBindingFor(REC_SLOT_REFLECT);
+    if (!rb || rb->recordIndex < 0 || rb->recordIndex >= (int)scene.records.size())
+        return false;
+    const Record& rec = scene.records[rb->recordIndex];
+    const RecChannel& ch = rec.channels[rb->channel];
+    if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+        out = ch.stops[rb->selStop].color(lambda);            // constant stop selector
+    } else {
+        double d = patternEval(rb->driver.data(), (int)rb->driver.size(),
+                               patCtxFromHit(h));
+        out = recReflectanceAt(rec, ch, d, lambda);
+    }
+    return true;
+}
+
+// Reflect-slot reflectance for the SPECULAR families (Mirror / Glossy / Grating /
+// HalfMirror) whose tint reads the reflect slot directly: a bound record if present,
+// else the constant `reflect` spectrum. (These types never bind a reflect texture,
+// so — unlike diffuseReflectance — there is no texture path.)
+inline double reflectSlot(const Scene& scene, const Material& m,
+                          const Hit& h, double lambda) {
+    double v;
+    if (recordReflectBound(scene, m, h, lambda, v)) return v;
+    return m.reflect(lambda);
+}
+
+// Diffuse albedo at a hit: a bound parametric record (highest priority), else the
+// material's spatially-varying texture reflectance if one is bound (Phase 3b), else
+// its constant `reflect` spectrum. Shared by the forward tracer and the backward
+// reference so both see identical albedo.
 inline double diffuseReflectance(const Scene& scene, const Material& m,
                                  const Hit& h, double lambda) {
-    if (m.recordIndex >= 0 && m.recReflectChan >= 0 &&
-        m.recordIndex < (int)scene.records.size()) {
-        const Record& rec = scene.records[m.recordIndex];
-        double d = patternEval(m.recordDriver.data(), (int)m.recordDriver.size(),
-                               patCtxFromHit(h));
-        return recReflectanceAt(rec, rec.channels[m.recReflectChan], d, lambda);
-    }
+    double rv;
+    if (recordReflectBound(scene, m, h, lambda, rv)) return rv;
     if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
         const Texture& tx = scene.textures[m.reflectTex];
         if (m.triplanarScale > 0.0)
@@ -1112,12 +1144,23 @@ inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double 
 // constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf see the
 // SAME roughness at a hit — otherwise the density and the sample diverge.
 inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
-    if (m.recordIndex >= 0 && m.recRoughChan >= 0 &&
-        m.recordIndex < (int)scene.records.size()) {
-        const Record& rec = scene.records[m.recordIndex];
+    if (const RecBinding* rb = m.recBindingFor(REC_SLOT_ROUGHNESS)) {
         PatCtx c = patCtxFromHit(h);
-        double d = patternEval(m.recordDriver.data(), (int)m.recordDriver.size(), c);
-        double r = recSampleScalar(rec, rec.channels[m.recRoughChan], d, c);
+        double r = 0.0;
+        if (rb->recordIndex < 0) {
+            // direct scalar expression, e.g. `roughness = sin(v*3.14159)`
+            r = patternEval(rb->driver.data(), (int)rb->driver.size(), c);
+        } else if (rb->recordIndex < (int)scene.records.size()) {
+            const Record& rec = scene.records[rb->recordIndex];
+            const RecChannel& ch = rec.channels[rb->channel];
+            if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+                const std::vector<PatNode>& e = ch.stops[rb->selStop].expr;   // constant stop selector
+                r = e.empty() ? 0.0 : patternEval(e.data(), (int)e.size(), c);
+            } else {
+                double d = patternEval(rb->driver.data(), (int)rb->driver.size(), c);
+                r = recSampleScalar(rec, ch, d, c);
+            }
+        }
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
     }
     if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
