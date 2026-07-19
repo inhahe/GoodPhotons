@@ -17,11 +17,13 @@ sampled by a per-hit driver expression, with nearest/linear/smooth interpolation
 ordered last-write-wins `from` composition. **See [`ROADMAP_records.md`](ROADMAP_records.md)
 for the authoritative spec and the 6-stage build plan.**
 
-- [ ] **Stage 1** — tokenizer `[` `]` + `NAME = range LO-HI [ … ]` declaration parse & data model.
-- [ ] **Stage 2** — channel eval (nearest/linear/smooth + expr stops + spectrum RGB-lerp→Jakob–Hanika) → slots.
-- [ ] **Stage 3** — driver binding + inline `material NAME(driver)` in geometry.
-- [ ] **Stage 4** — `material "m" { from R(d) … slot=expr/channel }` ordered last-write-wins + selectors.
-- [ ] **Stage 5** — all-scope value sites.
+- [x] **Stage 1** — tokenizer `[` `]` + `NAME = range LO-HI [ … ]` declaration parse & data model. *(committed 0e24f07-precursor)*
+- [x] **Stage 2** — channel eval (nearest/linear/smooth + expr stops + spectrum RGB-lerp→Jakob–Hanika) → slots. *(0e24f07)*
+- [x] **Stage 3** — driver binding + inline `material NAME(driver)` in geometry. *(b3f42ce)*
+- [x] **Stage 4** — `material "m" { from R(d) … slot=expr/channel }` ordered last-write-wins + selectors + record-aware specular reflect. *(989f21f)*
+- [ ] **Stage 5 — all-scope value sites** *(in progress; split in `ROADMAP_records.md §4`)*:
+  - [ ] **5a** — record refs as *constant* values (`R.chan[i]`, `R(const)`) at any spectrum/scalar value site, + a free-variable scope check that errors on out-of-scope drivers (each site publishes its in-scope driver axes; a load-time constant site publishes ∅).
+  - [ ] **5b** *(optional; gated on user go-ahead)* — camera-curve `t`-driver: publish flyby param `t` as an in-scope axis so a record can drive fov/roll/zoom/fstop/focus along a `camera_curve`.
 - [ ] **Stage 6** — GPU parity (bake like `ProcTexture`).
 
 ---
@@ -666,6 +668,101 @@ default-on for 16-bit) → clip → PCM-encode → WAV (16/24-bit, stdlib `wave`
 `tests/test_audio.py` (round-trip WAV verify for 16/24-bit mono+stereo, dither determinism,
 normalize, cursor≡add equivalence, seamless-loop signal render); 545 loom green. Smoke-validated a
 real 1 s 220+660 Hz WAV.
+
+### E4 — loom volume transforms: read and write as independent capabilities  *(loom; medium; design-captured 2026-07-18)*
+**Idea / decision (user changed their mind 2026-07-18).** loom should be able to **transform volumes** —
+both **sparse** (NanoVDB-style / scatter) and **dense** (regular lattice) grids. Originally the user was
+wary of loom being able to *output a volume on its own* (i.e. author a grid from nothing and serialize
+it), preferring only the coupled form "use an existing volume as a **basis**, transform it, then emit the
+result." **Reversed:** forcing that coupling — requiring every volume *write* to be fed by a volume *read*
+— is actually **more** machinery than leaving them orthogonal, so the two stay **independent, freely
+composable capabilities**:
+- **Read** a volume (sparse or dense) as an input field — sample it, feed it into the signal/field DAG,
+  use it as a basis for a transform, drive geometry/materials from it, etc.
+- **Write / output** a volume (sparse or dense) — serialize a field to a grid on disk — **without
+  requiring** that field to have originated from a volume read. The source can be anything the DAG can
+  produce (an isosurface function, a procedural field, an expression, a transformed read of *another*
+  volume, …).
+- Because reading and writing are decoupled, all four combinations are valid: read-only (sample a volume
+  into the scene), write-only (bake a procedural/function field to a grid), read→transform→write
+  (the "basis" workflow that motivated this), and neither.
+
+**Transforms in scope:** the same field-domain operations the "keep everything as functions; discretize
+last" principle already implies (see `loom.txt` claude-analysis) — N-D rotate-and-slice of the domain,
+warps/remaps, per-voxel value ops, resampling between sparse↔dense, and modulation by other DAG signals.
+Sparse and dense are two storage backings of the *same* logical field type, so a transform is authored
+once against the field abstraction and the read/write ends pick the backing (a dense read can emit sparse
+and vice-versa). **Open q (defer to scheduling):** on-disk formats for the write end (`.nvdb` to match
+ftrace's ingest; dense raw/`.vdb`?), and whether sparse-write goes through an OpenVDB/NanoVDB dependency
+or a loom-native sparse encoder.
+
+### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
+**Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
+and does t-influencing-t break?" question collapses into **one** model: every value-producing node in the
+loom signal DAG is **a function of a named set of axes** (its free variables) — e.g. a purely spatial
+curve depends on `{s}` (arclength/param), a time-curve on `{t}`, an animated spatial curve on `{s,t}`, a
+surface field on `{u,v}`, an N-D grid on `{a,b,c,…}`. "A influences B" = **evaluate A at the point where B
+is being evaluated**, and the axis sets alone decide how:
+
+- **Broadcast** on axes A lacks: A:`{t}` driving B:`{s,t}` contributes `A(t)`, identical for every `s`
+  (⇒ "a time-curve shifts the whole elevation of a spatial curve over time"). Free, pure.
+- **Pointwise** on axes A and B share: two things both depending on `t` combine at the *same* t. This is
+  the "lockstep" constraint — but it is **not a rule to detect/enforce**; a function-of-t simply *cannot*
+  see any t but the current one, so the illegal "run over the whole of B across time" op is
+  **inexpressible**, not caught-after-the-fact. **⇒ Do NOT build a t-influences-t detector, and do NOT
+  split signals into separate spatial-vs-temporal data types** (that duplicates every op, can't type the
+  mixed `{s,t}` / `{u,v,t}` cases, and forbids the legal broadcast). The single axis-set-typed signal
+  (the `Animatable<T>` DAG, refined so each node carries *which axes it depends on*) subsumes all of them;
+  it's the tensor/shader-broadcast / Houdini-CHOPs model.
+
+**The real (and only) expensive line — pointwise-at-P vs. cross-index-along-an-axis.** Output at eval
+point P is **free/pure/streaming** iff it depends only on inputs *at P* (same `s`, same `t`). This
+includes `t` (or a t-varying value) appearing inside *each point's own formula* — e.g.
+`B.y(s) = f(s, some_curve(t))` reshapes the *whole* of B over time yet is still evaluated pointwise in `s`
+and emits exactly **one whole spatial `.ftsl` per tick**; nothing is materialized (you pass a *scalar at
+the current t*, not "the whole curve"). It also includes a spatial rotation `R(t)·p` (mixes x/y/z but at
+fixed t, independent per point). The **only** cases that need materialization / caching are genuine
+**cross-index** ops, where output-at-P reads inputs at *other* points along an axis:
+- **Reduce over `s`** — arc length, centroid, an integral, "all of B's points at once as a set." Needs B
+  materialized over all `s`. Must be an **explicit reduction node** (never smuggled in implicitly).
+- **A transform mixing a spatial axis *with* `t`** — output frame t then reads input across a *range* of
+  t′ ⇒ time-caching / two passes. **This is exactly the existing 4-D space-time "video node"** (`loom.txt`
+  ~line 61). The test that separates it from the free case is one question: *does output-t read any t but
+  the current one?* No ⇒ free (t-in-each-formula). Yes ⇒ it's the video node, pay the caching cost knowingly.
+
+**Two orthogonal edge attributes.** A DAG edge carries `(combine-mode) × (broadcast, implied by axis sets)`:
+- **combine-mode = `pin` | `mod`** — `pin` replaces (last-write-wins); `mod` accumulates toward the
+  **target's identity element**, which depends on the target's quantity type: neutral **0** + `y += gain·x`
+  for additive/unbounded quantities (position, elevation), neutral **1** + `y *= x` for gains/scales,
+  **½-centered** `y = clamp((y−½)+gain·(x−½), 0,1)` for bipolar-[0,1] quantities. So "mod" is *one mode*
+  at the authoring surface but resolves to the domain-correct operator; the edge carries `mode` + a
+  **gain**, and the **target** declares its neutral/normalization (don't hardcode the ½/[0,1] assumption).
+- Broadcast/pointwise is *not* an author choice — it falls out of the axis sets (above). mode and axes
+  compose without interacting: axes decide *where* combining happens, mode decides *how* it combines there.
+
+**One sample/select grammar everywhere (records, curves, grids, scatters).** A serial structure is
+**sampled** with `(...)` (continuous, interpolated) and **indexed** with `[...]` (discrete constant
+selector); `.name` picks a named component/channel. This is the *same* grammar records already set
+(`R(driver)` sample, `R.chan[i]` stop-select, `R.chan` channel):
+```
+some_curve(t)          # sample the curve at parameter t (interpolated between control points)
+some_curve(t).y        # …take its y component
+some_curve.y(t)        # component-first spelling of the same
+some_curve.dim[3](t)   # dim 3 as a discrete channel pick, then sampled at t
+```
+Deliberately **avoid `some_curve[t]`** for the temporal index — brackets already mean "pick a fixed
+discrete stop" in records, so `[t]` would overload them; `(t)` reads as "sample here, interpolate," which
+is the intended semantics. Because `some_curve(t)` yields a scalar/fixed-vector *at the current t*, it
+broadcasts across the target's other axes ⇒ lands on the free side by construction.
+
+**The unifying one-liner (shared with records-5a's free-variable scope check).** *Everything that produces
+a value declares the axes it depends on. Composition broadcasts on unshared axes and combines (pin/mod)
+pointwise on shared ones. Crossing an axis you don't own requires an explicit reduction (over `s`) or is
+the cached space-time video node (over `t`).* Records-5a is the same mechanism seen at a value site: a
+driver's free variables must be ⊆ the axes in scope there (`R(u)` errors in a light SPD because `u` isn't
+in that site's axis set). **Open q (defer to scheduling):** the concrete `Animatable<T>` node taxonomy and
+how axis-set inference/annotation is represented in the loom struct + the on-disk projection; where the
+explicit reduction node and the video node sit in that taxonomy.
 
 ---
 

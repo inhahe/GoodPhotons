@@ -170,7 +170,28 @@ struct Record {
 4. **`from` / override block.** Parse the ordered statement list in `material "m" { … }`
    (`from R(d)`, `slot = expr/channelref`, selectors `R.chan[i]`), apply last-write-wins.
 5. **All-scope value sites.** Allow record-driven values anywhere a value is read
-   (not just material slots) where it makes sense.
+   (not just material slots) where it makes sense. Split into two sub-stages:
+   - **5a — record refs as values (scope-checked).** Accept record references
+     anywhere the value parser reads a spectrum or a scalar, in two *constant* forms:
+     `R.chan[i]` (i-th stop selector) and `R(const)` (sample at a constant driver).
+     Plus a **free-variable scope check**: every value site publishes the set of
+     driver variables that are *in scope* there (a per-hit surface site publishes
+     `x y z nx ny nz r u v f`; a load-time constant site — a light SPD, a camera
+     scalar, a top-level spectrum — publishes the empty set). A driver expression is
+     validated against that set and it is an **error** to reference an out-of-scope
+     variable (e.g. `R(u)` in a light's SPD, where `u` has no meaning). This is the
+     general rule that answers "can a light have a `from`?" — a light *may* carry a
+     record ref, but only a constant one; a per-hit driver there is rejected because
+     its variables aren't in scope, not because lights are special-cased.
+   - **5b — camera-curve `t`-driver (optional, gated on user go-ahead).** A second
+     varying context besides per-hit surface intrinsics: a `camera_curve` /
+     `camera_path` sweeps a flyby parameter `t`∈[0,1] as it expands into discrete
+     `CamSpec` frames at load time (paralleling the existing `ScalarTrack` keyframe
+     mechanism for roll/fov/zoom/fstop/focus). 5b would publish `t` as the in-scope
+     driver variable for camera-scalar sites so a record can drive fov/roll/zoom/
+     fstop/focus along the flyby (records-as-keyframe-tracks). Everything outside
+     these two varying contexts (per-hit surface; per-frame curve `t`) is load-time
+     constant and admits only the constant record forms from 5a.
 6. **GPU parity.** Upload the record LUTs + driver programs; device channel-sample
    mirroring the CPU path (bake like `ProcTexture`). Verify CPU/GPU bit/visual parity.
 
