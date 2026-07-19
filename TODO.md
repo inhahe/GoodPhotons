@@ -29,6 +29,39 @@ Origin tags point at the authoritative design text for each item.
       moment. *(Design detail also mirrored in the J3c "PROPOSAL" bullet below; this NEXT-UP entry is the actionable
       one.)*
 
+- [ ] **DECISION — color-vector / array syntax (locked in conversation 2026-07-19).** How numbers, commas,
+      brackets, and colorspace keywords (`rgb`/`hsl`/`hsv`) group into colors and lists of colors. Settled model,
+      to bake into the shared grammar + per-field shape validation at the same time as the header switch:
+  - **Whitespace only joins scalars *inside* one vector; it never crosses an array boundary and never starts a
+    new array.** So `2 0 0 3 0 0` is a **single 6-number vector** — invalid as a color (a color is exactly 3),
+    and *not* two colors. There is **no** "chunk-a-bare-run-into-triples" rule.
+  - **Array boundaries must be marked** — by a **comma**, by **brackets**, or by a **keyword** (`hsl`, a field
+    name, …). The valid spellings of the two colors 2 0 0 and 3 0 0 are exactly: `2 0 0, 3 0 0` · `[2 0 0] [3 0 0]`
+    · `[2 0 0], [3 0 0]` · `[2, 0, 0], [3, 0, 0]`.
+  - **Comma vs whitespace.** At a *given* level they're interchangeable (inside one vector `2 0 0` ≡ `2, 0, 0`;
+    between two *already-closed* siblings `[a] [b]` ≡ `[a], [b]`). The one thing only a comma can do (a space
+    can't) is **close a bare, un-bracketed run and open a sibling**. A `]` or a keyword closes a run the same way.
+  - **Comma's role is decided by its operands.** Between **lone scalars** it's a component separator → one vector
+    (`1, 0, 0` = the single color (1,0,0), same as `1 0 0`). Between **space-grouped multi-number groups** it's an
+    array separator → a list of vectors (`2 0 0, 3 0 0` = two colors). Corner that falls out: `1, 0, 0, 2, 0, 0`
+    (all lone scalars) is a **single 6-vector → invalid**, not two colors; to get two colors the triples must be
+    space-grouped or bracketed.
+  - **`rgb`/`hsl`/`hsv` are inline *modal RLE-style tags*, not array-openers.** They sit *between* elements and set
+    the colorspace for the *run* of colors that follows, until the next keyword. So
+    `rgb 1 0 0, 2 0 0, 3 0 0, hsl 4 0 0, 5 0 0, 6 0 0` is **one flat array of 6 colors** (first 3 decoded rgb, last
+    3 hsl) — depth-1. A single flat palette can therefore mix source colorspaces with no brackets.
+  - **`[X] ≡ X` is a whole-value identity only.** A *lone* top-level bracket is transparent (`rgb [1 0 0]` =
+    `rgb 1 0 0`; `rgb [c,c,c]` = `rgb c,c,c`). The instant `[X]` has a **sibling**, the brackets are load-bearing —
+    they *are* the separate arrays and can't be dropped (`[2 0 0] [3 0 0]` ≠ `2 0 0 3 0 0`). Brackets scope their
+    inner commas and close their run; that's their whole job.
+  - **Only brackets nest.** `rgb [1 0 0, 2 0 0, 3 0 0], hsl [1 0 0, 2 0 0, 3 0 0]` is two sibling bracketed arrays
+    → depth-2 `[[c,c,c],[c,c,c]]`, whereas the comma/keyword flat form above is depth-1.
+  - **Syntax vs shape stays split.** The grammar is context-free and accepts any nested value-tree; each field then
+    **shape-checks** it. Handing the depth-2 `[[c,c,c],[c,c,c]]` to a field that wants a *flat* color list is
+    **well-formed syntax, wrong shape** → a shape error, not a parse error. It's field-relative: the same tree is
+    valid for a field that wants a list of palettes. Implement as generic parse + per-field schema validation with
+    good "expected flat list of colors, got list-of-lists" messages.
+
 ---
 
 ## 0. Parametric records — FTSL data structure  *(design locked; full spec in `ROADMAP_records.md`)*
