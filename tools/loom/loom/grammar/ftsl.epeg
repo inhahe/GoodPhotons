@@ -32,7 +32,7 @@ STRING  = /"[^"]*"/                                 # quoted name / path / expre
 NAME    = /[A-Za-z_][A-Za-z0-9_]*/
 
 # ---- top-level element ----------------------------------------------
-element = record | material | texture
+element = record | material | texture | sphere | light
 
 # ---- record block ---------------------------------------------------
 # NEWLINE stays significant (one channel line = one channel), but the newlines
@@ -69,3 +69,12 @@ texture  = nl? 'texture'  STRING '{' mbody '}' nl?
 mbody    = (nl? prop)* nl?
 prop     = NAME pvalue
 pvalue   = REF | STRING+ | NUMBER+ | NAME            # ref / quoted / vector-or-scalar / enum
+
+# ---- geometry primitives --------------------------------------------
+# A sphere is a fixed-shape block: `sphere { center X Y Z  radius R  material "n" }`.
+sphere = nl? 'sphere' '{' nl? 'center' NUMBER NUMBER NUMBER nl? 'radius' NUMBER nl? 'material' STRING nl? '}' nl?
+
+# ---- lights ---------------------------------------------------------
+# `light <kind> { <prop>* }` — a bareword kind then the same key/value body as
+# a material (its props round-trip through value_token exactly like a material's).
+light = nl? 'light' NAME '{' mbody '}' nl?

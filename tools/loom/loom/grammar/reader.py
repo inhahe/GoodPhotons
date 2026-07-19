@@ -196,7 +196,29 @@ def _build_texture(node):
     return Texture(name, fields["file"][0], **kw)
 
 
-_BUILDERS = {"record": _build_record, "material": _build_material, "texture": _build_texture}
+def _build_sphere(node):
+    from ..scene import Sphere
+    nums = [c.value for c in node.children if c.name == "NUMBER"]
+    cx, cy, cz, r = (float(v) for v in nums[:4])
+    mat = _unquote(_kid(node, "STRING").value)
+    return Sphere((cx, cy, cz), r, mat)
+
+
+def _build_light(node):
+    from ..scene import Light
+    # the `light` keyword tokenizes as a NAME node too (it matches NAME), so the
+    # bareword kind is the *second* top-level NAME child.
+    kind = _kids(node, "NAME")[1].value
+    props = {}
+    for key, toks in _props(_kid(node, "mbody")):
+        props[key] = " ".join(_unquote(t) for t in toks)
+    return Light(kind, **props)
+
+
+_BUILDERS = {
+    "record": _build_record, "material": _build_material,
+    "texture": _build_texture, "sphere": _build_sphere, "light": _build_light,
+}
 
 
 def parse_element(text: str):
