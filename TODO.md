@@ -1099,6 +1099,40 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          to system defaults; positional `gold(v)` only when there's a single free input). And **property names
          are optional** — the leading type/slot keyword identifies the property; the quoted name is only an
          external dot-handle (`spectrum = …` anonymous vs `spectrum "color" = …` for `gold.color`).
+         **SETTLED SCOPE (2026-07-19):** item 3 lives entirely on the existing `SpatialExpr` tier
+         (`loom/spatial.py`), not a new expression system — no VM, no `Clock.env`, no lowering to shipped
+         ftrace. Concretely: (a) rename/re-expose `_Coord` as a public **`Surface`** leaf family with bare
+         singletons `X Y Z` (existing), `U V A` (**new, emit-only** — no `eval_np` numpy twin, exactly as noise
+         is already emit-only; ftrace evaluates `u/v/a` at each ray hit, which is precisely ftrace's
+         "surface = function of u/v/a" mode, so this is bit-for-bit the same feature, not an approximation),
+         and `T` (existing loop-phase); (b) add an **`Image("path")` leaf** — image-as-a-term-inside-a-function
+         (multiply a procedural `SpatialExpr` by a sampled image, feed an image into the u/v function); emits
+         ftrace's texture-sample call, numpy twin loads+bilinear-samples where coordinates permit. *(NB: the
+         plain "import a jpg as a surface skin" arm already exists — `loom.scene.Texture` /`skin()`; the gap is
+         only image-as-a-function-term.)*; (c) binding/rebinding **by substitution** — `gold(u=v)` replaces the
+         `U` leaf with the consumer's expression at emit; (d) materials-as-bundles — a material's free-input set
+         is the union of its properties' input sets. **Function-name parity is already an invariant**: every name
+         `spatial.py` emits (`sin`/`sign`/`clamp`/…) must exist in `src/pattern.h` (only divergence: `abs`
+         exposed as `sabs` in Python to dodge the builtin shadow, but it *emits* `abs`), so loom's function
+         vocabulary is a subset of ftrace's by construction — which is why export is clean and J3c's shared
+         grammar can be the single enforcement point.
+         **`t` IS A FIRST-CLASS REBINDABLE INPUT (2026-07-19).** Don't treat `t` (clock time) as a magic ambient
+         parameter — make it just one named input among `{t, x, y, z, u, v, a}`, rebindable by the same
+         substitution as `u`/`v`/`a`. This unifies the Signal (temporal) and Surface (spatial) tiers *at the
+         grammar level*: "evaluate as a temporal Signal" = bind `t`, leave nothing else free; "evaluate as a
+         Surface" = bind `t` to the current frame's value, leave `x/y/z/u/v/a` free (symbolic on the emit path,
+         numeric on `eval_np`). So **"a Surface is the expression with `t` frozen at the current frame"** falls
+         out for free as a partial binding — no separate mechanism, no `t=0` memory (grid/scatter/RBF fields are
+         already spatial samplers whose positions/values are Signals baked at the current frame). *Rationale /
+         corrections that led here:* a Signal is a **pure, stateless function of a Clock** — loom can evaluate it
+         at ANY `t` (it just reads whatever the clock carries); it is NOT true that "loom can't know the value at
+         a different `t`." The only thing that assumes one-`t`-per-node-per-frame is the **cache** (`Cache` keys on
+         `(node_id, frame)`, `signals/core.py`), and a future off-current-`t` sampler must fix the *cache key*
+         (widen to the continuous sample point, or scope a nested cache in the retime node) — NOT forbid the
+         capability. And "future `t` → loop" is unfounded for today's acyclic pure-function DAG (direction of `t`
+         is irrelevant; a cycle needs a *recurrent/stateful* node, which loom has none of). **Caveat:** unifying
+         the *grammar* (one node type, `t` an input) is clean, but the two *executors* stay distinct strategies on
+         that node — scalar-per-frame (frame-keyed cache) vs numpy-array-over-space — don't pretend they're one call.
       4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
@@ -1106,12 +1140,57 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       complement the emitters so a whole scene round-trips (semantic re-emit). Audit every `Element.emit`
       against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
       `uv planar axis=`, `type mix layer … weight_map pattern:…`, record `from`/dot-override blocks).
+      **PARSER: use the user's GraphParser (GPDA) — `D:\visual studio projects\GraphParser`.** Write ONE shared
+      EPEG `.ftsl` grammar (unified EPEG: regex terminals, `@skip`/`@mode`/`@longest`/`@left`/`@right`, actions);
+      use the **scannerless** variant for the comma-aware ladder (§3.1) since it needs context-aware skip sets.
+      Vendor a pinned `gpda.py` (or `gpda_scannerless.py`) into loom for the Python-side `.ftsl → Element` parse;
+      later reuse the *same grammar* to upgrade ftrace's C++ parser (leaning full-replacement — the C++
+      non-scannerless GPDA is nearly BISON-speed).
+      **SEQUENCING DECISION (2026-07-19) — option (a), grammar + ftrace front-end FIRST.** The moment loom starts
+      emitting `gold(u=v)` / bundle-binding syntax (J3b item 3), those `.ftsl` files are un-renderable by shipped
+      ftrace until the GraphParser front-end lands. To keep "everything loom emits is renderable" true at every
+      commit, build the shared EPEG grammar + ftrace GraphParser front-end **before/in lockstep with** J3b item 3,
+      not after. This front-loads the C++ parser work but never leaves an un-renderable emission window.
 - **Dependency note:** the FTSL record itself (§0) is fully implemented (Stages 1–6 + GPU parity DONE), so
   this is a loom-side mirror + parser effort, not blocked on ftrace.
+- [ ] **FUTURE — loom retime / 4D time-shear node** (deferred; unlocked once `t` is a first-class input, J3b item 3).
+  Once `t` is a passable *value* (not just the ambient clock), add a node that samples a subgraph at a
+  **shifted / warped / per-point** time. Because a Signal is a pure stateless function of a Clock, sampling at
+  an arbitrary `t` is well-defined and cheap (build a Clock at that `t`, evaluate). Capabilities this unlocks,
+  none expressible under the current single-ambient-`t` model: **freeze** `sig(t=0)`, **echo/delay** `sig(t−dt)`,
+  **time-warp** `sig(g(t))`, and the headline one — **4D time-shear**: sample a field at a *spatially varying*
+  time, e.g. a wave whose phase lags with distance `field.at(t = T − X/c)`. Two things to get right when building
+  it: (1) **cache** — `Cache` keys on `(node_id, frame)` and assumes one-`t`-per-node-per-frame; a retime node
+  must key its child's memo on the actual (continuous) sample point, or scope a nested cache — do NOT restrict
+  off-current-`t` sampling (that would defeat the feature). (2) **cycles** — pure-function DAGs are acyclic so
+  any `t` (past OR future) is safe today; the acyclicity guard only becomes necessary if/when a *recurrent/stateful*
+  node exists (integrator, feedback delay, physics step), and then it's a **cycle check on the recurrence**, not a
+  blanket "no future `t`" rule.
 
 ---
 
 ## Progress log
+- 2026-07-19: **`t` unified as a first-class input + future retime/4D node scoped (design, no code).** Decided `t`
+  is not a magic ambient parameter but one named input among `{t,x,y,z,u,v,a}`, rebindable by the same
+  substitution as `u/v/a` — so Signal (temporal) and Surface (spatial) unify at the grammar level and "a Surface
+  is the expression with `t` frozen at the current frame" is just a partial binding. Corrected three
+  misconceptions in the process: a Signal is a *pure stateless function of a Clock* so loom CAN evaluate at any
+  `t` (the constraint is the `(node_id, frame)` cache, not the math); "future `t` → loop" is unfounded for an
+  acyclic pure-function DAG (a cycle needs a recurrent node, which loom has none of); the fix for off-current-`t`
+  sampling is a wider cache key, never forbidding the capability. Logged the `t`-input note under J3b item 3 and
+  a new deferred **retime / 4D time-shear** TODO (freeze/echo/time-warp + spatially-varying-time `field.at(t=T−X/c)`).
+- 2026-07-19: **J3b item 3 / J3c design settled (no code yet).** (1) Item 3 lives on the existing `SpatialExpr`
+  tier (`loom/spatial.py`) — no VM, no `Clock.env`, no lowering. Leaf set: public **`Surface`** family
+  (`X Y Z` existing, `U V A` new **emit-only**, `T` loop-phase) + new **`Image("path")`** leaf (image as a
+  function-term; the plain jpg-skin arm already exists via `loom.scene.Texture`/`skin()`). Binding is
+  substitution (`gold(u=v)` swaps the `U` leaf at emit); materials-as-bundles (free-input = union). `u/v/a`
+  emit-only because those coords exist only at a 3-D ray hit, not on loom's flat preview canvas — but the
+  **emit path carries them straight to ftrace**, matching ftrace's "surface = function of u/v/a" mode
+  bit-for-bit, so export parity is unaffected (the limitation only bites loom's own `eval_np` numpy preview).
+  Function-name parity with `src/pattern.h` is already an invariant (`sabs` emits `abs`). (2) J3c parser =
+  the user's GraphParser (GPDA), one shared EPEG grammar, scannerless variant for the comma-aware ladder.
+  **Sequencing: option (a)** — stand up the shared grammar + ftrace GraphParser front-end *first/in lockstep*
+  with J3b item 3, so loom never emits un-renderable `.ftsl`. TODO J3b item 3 + J3c updated with settled scope.
 - 2026-07-19: **J3b item 1 complete — inline `rgb`/`hsv`/`hsl` colour channels + lowering to spectra.** A record
   colour channel can now be authored *inline* with a leading colour-space **tag** (`reflect  rgb 0.55 0.57 0.60,
   0.90 0.75 0.30`) instead of a chain of `spectrum:<name>` refs. `RecordChannel` gained a `space` field
