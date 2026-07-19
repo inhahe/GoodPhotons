@@ -21,7 +21,17 @@ Model (matching the generalized spec, ``ROADMAP_records.md`` §3):
   an optional pinned domain position (author ``p:<pos>`` prefix).  Unpinned stops are
   spread evenly between their pinned/anchor neighbours exactly as ftrace does.
 
-What this module does **not** do (deferred to J3c's full pattern VM): evaluate
+Scope (mirrors **current** FTSL, not the generalized target): ftrace's record body
+parser makes every whitespace-word its own stop and counts a stop as *colour* only
+when its single token contains ``':'`` (a ``spectrum:<name>`` ref) — its tokenizer is
+not comma-aware and inline ``rgb r g b`` triples inside a record are **not** parseable
+today.  So this parser splits stops on whitespace and treats ``':'`` tokens as colour,
+exactly matching what a real ``.ftsl`` record can contain.  The **generalized stop
+grammar** (arbitrary-arity ``D``-tuple stops with interchangeable ``[ ]`` / ``,`` /
+whitespace delimiters — ``ROADMAP_records.md`` §3.1) is the loom superset (§J3b) and is
+deliberately *not* handled here.
+
+What this module also does **not** do (deferred to J3c's full pattern VM): evaluate
 *expression* stops.  The numeric :meth:`Record.sample` sampler works on all-numeric
 scalar channels; colour and expression channels are represented and re-emitted
 faithfully but not evaluated.

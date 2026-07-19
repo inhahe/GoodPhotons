@@ -179,6 +179,37 @@ a non-{1,3} arity appears, widen `ChanKind` toward the general `struct` above.
   program (`std::vector<PatNode>`), and a slot→channel binding table (built by
   name-match, overridable). At shade time each bound slot = channel-sample(driver).
 
+### 3.1 Generalized stop grammar (arbitrary-arity, flexible delimiters) — *target, not v1*
+
+Once a channel outputs an arbitrary-arity `D`-tuple (§3), each **stop** is itself a
+`D`-tuple of components, and the channel is a *list* of stops — a small nested-array
+structure. The general grammar descends that hierarchy (channel → stops → components)
+with **any of three interchangeable delimiters — `[ ]` grouping, `,`, or whitespace** —
+so an rgb (`D=3`) channel may be authored, equivalently, as e.g.:
+
+```
+tint  [rgb 0 0 0, 0 1 0, 1 1 1]     # bracket-grouped, comma-separated stops, space components
+tint  rgb 0 0 0  0 1 0  1 1 1        # whitespace only (stop boundaries by arity: every 3 numbers)
+tint  rgb (0 0 0) (0 1 0) (1 1 1)    # explicit per-stop grouping
+```
+
+An optional leading tag (`rgb`/`spectrum`/…) fixes the channel's arity + colour space;
+otherwise arity is inferred from the group shape. This is the fully-general form the
+user asked for — "going down the hierarchy of sub-arrays/elements can happen through
+either `[]`, comma, or space."
+
+**Not implemented in ftrace today, and a real grammar change when it is.** ftrace's
+current tokenizer (`src/ftsl.h`) does *not* treat `,` as a delimiter (a comma accretes
+into the preceding bareword), and the record body parser makes **every whitespace-word
+its own stop**, with a stop counted as colour *only* when its single token contains
+`:` (a `spectrum:<name>` ref). So today an rgb curve inside a record is written as
+`reflect spectrum:steel spectrum:gold spectrum:copper` (one `:`-ref per stop), **never**
+as inline `rgb r g b` triples. Supporting the generalized grammar above requires (a) a
+comma-aware tokenizer pass and (b) arity-grouped stop parsing — a deliberate future
+extension. Until then it lives in **loom** (the authoring superset, §J3b in `TODO.md`),
+which may parse/emit the flexible form and lower a `D=3` channel down to the
+`spectrum:`-ref form ftrace understands (synthesising the backing `spectrum` decls).
+
 ---
 
 ## 4. Build stages
@@ -277,3 +308,11 @@ render, commit at green. Update `FTSL.md` (grammar), `README.md` (feature), and
     arbitrary-arity `D`-tuple, and records already mix arities (scalar curve beside
     rgb curve). ftrace materializes `D∈{1,3}` today; loom carries all arities. The
     only thing still 1-D is the driver *input* domain above.
+- **Generalized stop grammar** (arbitrary-arity `D`-tuple stops with interchangeable
+  `[ ]` / `,` / whitespace delimiters down the channel → stops → components hierarchy;
+  §3.1) — *the spec's target form, deferred in ftrace.* Today ftrace's tokenizer isn't
+  comma-aware and every whitespace-word is its own stop, so inline `rgb r g b` triples
+  inside a record aren't parseable — colour stops must be `spectrum:<name>` refs.
+  Enabling the general grammar is a real tokenizer + parser change; until then it lives
+  in loom (§J3b), which may author the flexible form and lower `D=3` channels to the
+  `spectrum:`-ref form ftrace understands.

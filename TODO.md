@@ -1069,8 +1069,18 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       stops are re-emitted faithfully but not evaluated (needs the pattern VM → J3c). Round-trips every
       `scenes/_record_*.ftsl` fixture. 23 tests (`tests/test_record.py`); 627 loom green. (ftrace only
       materializes `D∈{1,3}`; non-{1,3} arities are the loom superset / J3b.)
-- [ ] **J3b — loom N-D superset** (loom-only authoring: N-D *input* domain and/or non-{1,3} channel arities;
-      emits down to the J3a form or a documented construct).
+- [ ] **J3b — loom N-D / generalized-grammar superset** (loom-only authoring). Three related generalizations
+      beyond the current-FTSL mirror J3a implements:
+      1. **Arbitrary channel arity** — a `D`-tuple-valued channel, not just scalar `D=1` / colour `D=3`.
+      2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with **interchangeable
+         `[ ]` / `,` / whitespace delimiters** descending the channel → stops → components hierarchy, e.g.
+         `tint [rgb 0 0 0, 0 1 0, 1 1 1]` ≡ `tint rgb 0 0 0 0 1 0 1 1 1`. **NB: current FTSL cannot parse this**
+         — its tokenizer isn't comma-aware and every whitespace-word is a separate stop, so today an rgb curve
+         is `reflect spectrum:steel spectrum:gold …` (one `:`-ref per stop). loom's J3a parser mirrors *that*
+         (whitespace-split single tokens); the flexible-delimiter/inline-tuple form is this J3b superset.
+      3. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
+      Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
+      synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
 - [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
       complement the emitters so a whole scene round-trips (semantic re-emit). Audit every `Element.emit`
       against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
@@ -1081,6 +1091,14 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **Captured the generalized stop grammar (§3.1).** User flagged that a generalized record lets
+  a `D`-tuple channel (e.g. rgb) be authored with **interchangeable `[ ]` / `,` / whitespace** delimiters
+  down the channel → stops → components hierarchy (`tint [rgb 0 0 0, 0 1 0, 1 1 1]`). Verified against the
+  real tokenizer/parser: **current FTSL does NOT support this** — its tokenizer isn't comma-aware (a comma
+  accretes into the preceding bareword) and the record parser makes every whitespace-word its own stop, so
+  an rgb curve today is `spectrum:`-refs (one per stop), never inline triples. Documented the general form
+  as the spec target in `ROADMAP_records.md` §3.1 + §5, folded it into TODO §J3b (item 2), and noted the
+  scope boundary in `loom/record.py` (J3a mirrors current FTSL; the flexible grammar is J3b superset).
 - 2026-07-19: **§J3a done.** Built `loom/record.py` — a loom twin of the FTSL parametric record
   (`Record`/`RecordChannel`/`RecordStop`). Emits the `NAME = range LO-HI [ … ]` block (wired into `Scene`
   before materials), parses one/every block back (`parse`/`parse_all`, comment-stripped), redistributes
