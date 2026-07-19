@@ -161,8 +161,10 @@ output can feed another modulator — "it's just another function"):
    produces an arc from `mid(A,B)` through `B` to `mid(B,C)`; wrap with modulo for a
    **seamless closed** curve (no seam angle to choose). Verified to generalize to any
    dimension (the construction is per-component). Open/closed both supported.
-2. **`GridField`** — N-linear interpolation of grid values → a value anywhere in the
-   volume.
+2. **`GridField`** — grid interpolation → a value anywhere in the volume.
+   `interp="linear"` (default, N-linear) or `interp="cubic"` (separable Catmull-Rom
+   / tricubic; smoother C1, may overshoot). Boundary phantoms are linearly
+   extrapolated so cubic reproduces linear ramps to the edge.
 3. **`ScatterField`** — smooth interpolation of scatter values (inverse-distance /
    RBF; **quality/speed tradeoff is an open tuning item**, see §11).
 

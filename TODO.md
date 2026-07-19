@@ -908,8 +908,12 @@ question — *should grid/scatter points be multi-valued?* — with **YES**.
       `_shepard_weights` are shared with the scalar fields, so scalar == vector-channel bit-for-bit).
       Scalar `GridField`/`ScatterField` stay the 1-channel case and now reject vector datasets with a
       pointer to the Vec* class. 11 new tests; 573 loom tests green.
-- [ ] **H2 — grid interpolation.** Multilinear default; optional tricubic / Catmull-Rom. Compute domain
-      weights once, apply across all channels.
+- [x] **H2 — grid interpolation.** ✅ 2026-07-19. `GridField`/`VecGridField` take `interp="linear"`
+      (default, N-linear) or `interp="cubic"` (separable **Catmull-Rom** / tricubic). `_grid_weights`
+      gained a `cubic` flag; cubic is a tensor product of per-axis `_catmull_rom_axis` contributions, so
+      the vector field still computes the taps **once** and blends every channel with them. Boundary
+      phantoms are **linearly extrapolated** (not edge-clamped) so cubic reproduces linear ramps exactly
+      to the edge; axes with < 3 samples fall back to linear. 8 new tests (`tests/test_gridinterp.py`).
 - [ ] **H3 — RBF scatter interpolation.** `scipy.interpolate.RBFInterpolator`; thin-plate default,
       multiquadric/Gaussian/Wendland options; one factorization → multi-RHS across channels; clamp/flag
       out-of-convex-hull queries.
@@ -1114,3 +1118,11 @@ stereo.
   and now reject a vector dataset (pointing at the Vec* class). 11 new tests (`tests/test_vecfields.py`);
   573 loom tests green. Next in §H: H2 (tricubic/Catmull-Rom grid option) then H3 (RBF scatter, needs
   scipy).
+- 2026-07-19: **H2 done.** grid fields gained an `interp=` kernel selector. `interp="linear"` (default)
+  is unchanged N-linear; `interp="cubic"` is separable **Catmull-Rom** (tricubic in 3-D), built as a
+  tensor product of per-axis `_catmull_rom_axis` contributions via a new `cubic` flag on `_grid_weights`
+  — so `VecGridField` cubic still computes the geometric taps once and blends every channel. Boundary
+  phantom points are **linearly extrapolated** (`p[-1]=2p0−p1`) rather than edge-clamped, which keeps
+  cubic reproducing linear ramps exactly right up to the boundary (verified); thin axes (< 3 samples)
+  fall back to linear. 8 new tests (`tests/test_gridinterp.py`); 581 loom tests green. Next in §H: H3
+  (RBF scatter — needs scipy) then H4 (field-sampled curve).

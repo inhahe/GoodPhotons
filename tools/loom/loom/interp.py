@@ -266,40 +266,90 @@ class TrackedCurve:
 # vector field pays for the domain math exactly once per frame, then reuses the
 # weights across every channel.
 
-def _grid_weights(grid: Grid, coords: Tuple[float, ...]) -> List[Tuple[int, float]]:
-    """N-linear corner weights for ``coords``: a list of ``(flat_index, weight)``.
+def _cell_base_frac(grid: Grid, axis: int, coord: float) -> Tuple[int, float]:
+    """Lower cell index ``i`` and in-cell fraction ``f in [0,1]`` for ``coord`` on
+    ``axis``.  Out-of-domain coords clamp to the boundary cell (edge-extend)."""
+    n = grid.shape[axis]
+    lo, hi = grid.lo[axis], grid.hi[axis]
+    p = (coord - lo) / (hi - lo) * (n - 1) if hi != lo else 0.0
+    if p <= 0.0:
+        return 0, 0.0
+    if p >= n - 1:
+        return n - 2, 1.0
+    i = int(math.floor(p))
+    return i, p - i
 
-    Out-of-domain queries clamp to the boundary cell (edge-extend).  Zero-weight
-    corners are dropped so the caller only touches contributing samples.
-    """
-    base: List[int] = []
-    fracs: List[float] = []
-    for axis in range(grid.ndim):
-        n = grid.shape[axis]
-        lo, hi = grid.lo[axis], grid.hi[axis]
-        p = (coords[axis] - lo) / (hi - lo) * (n - 1) if hi != lo else 0.0
-        if p <= 0.0:
-            base.append(0)
-            fracs.append(0.0)
-        elif p >= n - 1:
-            base.append(n - 2)
-            fracs.append(1.0)
-        else:
-            i = int(math.floor(p))
-            base.append(i)
-            fracs.append(p - i)
-    out: List[Tuple[int, float]] = []
-    for corner in range(1 << grid.ndim):
-        w = 1.0
-        idx: List[int] = []
-        for axis in range(grid.ndim):
-            bit = (corner >> axis) & 1
-            idx.append(base[axis] + bit)
-            w *= fracs[axis] if bit else (1.0 - fracs[axis])
-        if w == 0.0:
+
+def _catmull_rom_axis(grid: Grid, axis: int, coord: float) -> List[Tuple[int, float]]:
+    """1-D Catmull-Rom contributions ``(sample_index, weight)`` on one axis.
+
+    Four samples at offsets ``-1,0,+1,+2`` around the cell.  Weights sum to 1 but may
+    be negative (the overshoot that gives cubic its snap).  A phantom point off the
+    end of the axis is **linearly extrapolated** (``p[-1] = 2·p0 − p1``), folding its
+    weight back onto the two edge samples — this keeps the boundary reproducing linear
+    ramps exactly, unlike a plain edge-clamp.  Axes with < 3 samples fall back to
+    linear (can't form the 4-point stencil)."""
+    n = grid.shape[axis]
+    i, f = _cell_base_frac(grid, axis, coord)
+    if n < 3:
+        return [(i, 1.0 - f), (i + 1, f)]
+    f2 = f * f
+    f3 = f2 * f
+    w = (0.5 * (-f3 + 2.0 * f2 - f),
+         0.5 * (3.0 * f3 - 5.0 * f2 + 2.0),
+         0.5 * (-3.0 * f3 + 4.0 * f2 + f),
+         0.5 * (f3 - f2))
+    acc: dict = {}
+    for off, wj in zip((-1, 0, 1, 2), w):
+        if wj == 0.0:
             continue
-        out.append((grid.flat_index(idx), w))
-    return out
+        idx = i + off
+        if idx < 0:                     # phantom below 0: 2·p0 − p1
+            acc[0] = acc.get(0, 0.0) + 2.0 * wj
+            acc[1] = acc.get(1, 0.0) - wj
+        elif idx > n - 1:               # phantom above n-1: 2·p_{n-1} − p_{n-2}
+            acc[n - 1] = acc.get(n - 1, 0.0) + 2.0 * wj
+            acc[n - 2] = acc.get(n - 2, 0.0) - wj
+        else:
+            acc[idx] = acc.get(idx, 0.0) + wj
+    return [(k, v) for k, v in acc.items() if v != 0.0]
+
+
+def _grid_weights(grid: Grid, coords: Tuple[float, ...],
+                  cubic: bool = False) -> List[Tuple[int, float]]:
+    """Separable interpolation weights for ``coords``: ``(flat_index, weight)`` list.
+
+    ``cubic=False`` (default) is N-linear (2^ndim corners); ``cubic=True`` is
+    separable **Catmull-Rom** (up to 4^ndim taps, weights may be negative).  Both
+    edge-extend outside the domain and drop zero-weight taps.
+    """
+    if not cubic:
+        # fast N-linear path (kept dedicated for the common default).
+        base: List[int] = []
+        fracs: List[float] = []
+        for axis in range(grid.ndim):
+            i, f = _cell_base_frac(grid, axis, coords[axis])
+            base.append(i)
+            fracs.append(f)
+        out: List[Tuple[int, float]] = []
+        for corner in range(1 << grid.ndim):
+            w = 1.0
+            idx: List[int] = []
+            for axis in range(grid.ndim):
+                bit = (corner >> axis) & 1
+                idx.append(base[axis] + bit)
+                w *= fracs[axis] if bit else (1.0 - fracs[axis])
+            if w == 0.0:
+                continue
+            out.append((grid.flat_index(idx), w))
+        return out
+    # cubic: tensor product of per-axis Catmull-Rom contributions.
+    combos: List[Tuple[List[int], float]] = [([], 1.0)]
+    for axis in range(grid.ndim):
+        contrib = _catmull_rom_axis(grid, axis, coords[axis])
+        combos = [(idxs + [ci], w * cw)
+                  for idxs, w in combos for ci, cw in contrib]
+    return [(grid.flat_index(idxs), w) for idxs, w in combos if w != 0.0]
 
 
 def _shepard_weights(scatter: Scatter, q: Tuple[float, ...], half: float, eps: float,
@@ -323,6 +373,16 @@ def _shepard_weights(scatter: Scatter, q: Tuple[float, ...], half: float, eps: f
     return None, out
 
 
+def _parse_grid_interp(interp: str) -> bool:
+    """Map a grid ``interp`` name to the ``cubic`` flag ``_grid_weights`` takes."""
+    key = str(interp).lower()
+    if key in ("linear", "multilinear", "nlinear"):
+        return False
+    if key in ("cubic", "tricubic", "catmull", "catmull-rom", "catmull_rom"):
+        return True
+    raise ValueError(f"unknown grid interp {interp!r} (use 'linear' or 'cubic')")
+
+
 class _VecFieldComponent(Signal):
     """Scalar view of one channel of a vector field (mirrors ``_CurveComponent``)."""
 
@@ -339,14 +399,16 @@ class _VecFieldComponent(Signal):
 
 
 class GridField(Signal):
-    """Scalar N-linear interpolation of a :class:`Grid` at ``query`` (a VecSignal).
+    """Scalar grid interpolation of a :class:`Grid` at ``query`` (a VecSignal).
 
-    Query rank must equal the grid's ndim.  Out-of-domain queries are clamped to
-    the boundary cell (edge-extend).  For a vector-valued grid use
+    Query rank must equal the grid's ndim.  ``interp`` selects the kernel:
+    ``"linear"`` (default, separable N-linear) or ``"cubic"`` (separable
+    Catmull-Rom / tricubic — smoother, C1, may overshoot).  Out-of-domain queries
+    are clamped to the boundary cell (edge-extend).  For a vector-valued grid use
     :class:`VecGridField`.
     """
 
-    def __init__(self, grid: Grid, query: Vecish) -> None:
+    def __init__(self, grid: Grid, query: Vecish, *, interp: str = "linear") -> None:
         super().__init__()
         self.grid = grid
         self.q = VecSignal.of(query)
@@ -355,6 +417,7 @@ class GridField(Signal):
         if grid.is_vector:
             raise TypeError("GridField requires scalar grid values; "
                             "use VecGridField for a vector-valued Grid")
+        self._cubic = _parse_grid_interp(interp)
 
     def children(self):
         return tuple(self.q.components) + (self.grid,)
@@ -363,19 +426,20 @@ class GridField(Signal):
         g = self.grid
         coords = self.q.at(clock, cache)
         return math.fsum(w * g.values[fi].at(clock, cache)  # type: ignore[union-attr]
-                         for fi, w in _grid_weights(g, coords))
+                         for fi, w in _grid_weights(g, coords, self._cubic))
 
 
 class VecGridField(VecSignal):
-    """Vector N-linear interpolation of a vector-valued :class:`Grid`.
+    """Vector grid interpolation of a vector-valued :class:`Grid`.
 
-    Every channel is blended with the *same* N-linear corner weights (computed once
+    Every channel is blended with the *same* interpolation weights (computed once
     per frame), so this is a true vector field — not N independent scalar fields
-    recomputing the domain math.  ``.channel(name_or_index)`` returns a scalar view
-    of one channel (by name if the grid was built with ``channels=``, else by index).
+    recomputing the domain math.  ``interp`` is ``"linear"`` (default) or ``"cubic"``
+    (Catmull-Rom / tricubic).  ``.channel(name_or_index)`` returns a scalar view of
+    one channel (by name if the grid was built with ``channels=``, else by index).
     """
 
-    def __init__(self, grid: Grid, query: Vecish) -> None:
+    def __init__(self, grid: Grid, query: Vecish, *, interp: str = "linear") -> None:
         # like LoopCurve: synthesize component views, override at()/children().
         self.grid = grid
         self.q = VecSignal.of(query)
@@ -384,6 +448,7 @@ class VecGridField(VecSignal):
         if not grid.is_vector:
             raise TypeError("VecGridField requires a vector-valued Grid; "
                             "use GridField for a scalar Grid")
+        self._cubic = _parse_grid_interp(interp)
         self._vdim = grid.value_dim
         self._id = alloc_id()
         self.components: List[Signal] = [
@@ -403,7 +468,7 @@ class VecGridField(VecSignal):
         g = self.grid
         coords = self.q.at(clock, cache)
         acc = [0.0] * self._vdim
-        for fi, w in _grid_weights(g, coords):
+        for fi, w in _grid_weights(g, coords, self._cubic):
             vv = g.values[fi].at(clock, cache)  # tuple (VecSignal value)
             for a in range(self._vdim):
                 acc[a] += w * vv[a]
