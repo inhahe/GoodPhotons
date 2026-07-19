@@ -1106,6 +1106,20 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **Locked the type lattice — values · channels · records (§3.0).** Resolved a multi-turn design
+  thread on how the pieces are typed and named. Three **value** kinds: `number` (a real type, *not* a
+  degenerate spectrum — roughness/IOR/weights are inherently scalar), `vector` (bare `1 1 1`, no colour
+  meaning), `spectrum` (a colour = a curve over **wavelength λ**, no driver). Two **containers**: `channel`
+  (a mapping from a driver input to *any* type — value, another channel giving multi-input by currying, or a
+  record; deliberately the same word as `RecChannel`) and `record` (a bundle of **co-driven** channels sharing
+  one driver). **One-way promotions** make the simple form typecheck in the richer slot: `number`→`spectrum`
+  (grey SPD; reverse never holds — a spectrum can't be a roughness), any value→constant `channel`, single
+  `channel`→one-channel `record`; `vector`→`spectrum` only via an explicit `rgb`/`hsv` keyword. Also nailed
+  **slot-type vs value-expression**: the LHS slot keyword declares the output type, the RHS is *always* an
+  expression over named inputs (constant / open array / applied channel / formula are one tier); a bare `[…]`
+  is **driver-*open*, not implicitly-`u`**; `spectrum = u*.5` and `spectrum = a*.5` are *both* legal (the
+  intended "nothing is closed"); a standalone array is polymorphic data the assignment pins to a slot. Written
+  into `ROADMAP_records.md` new §3.0 (canonical vocabulary for the rest of §3).
 - 2026-07-19: **J3b item 1 (core) — arbitrary-arity vector channels in `Record`.** Generalized `RecordStop`
   to hold `.components` (a `D`-tuple; `.token` = the single component of an arity-1 stop, `.arity` /
   `.as_vector()` the vector view) — J3a scalar/colour paths unchanged (`.token` back-compat). `RecordChannel.kind`

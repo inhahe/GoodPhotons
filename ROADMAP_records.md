@@ -179,6 +179,75 @@ a non-{1,3} arity appears, widen `ChanKind` toward the general `struct` above.
   program (`std::vector<PatNode>`), and a slot→channel binding table (built by
   name-match, overridable). At shade time each bound slot = channel-sample(driver).
 
+### 3.0 The type lattice (values · channels · records) — *target, not v1*
+
+The whole authoring model reduces to **three value kinds and two containers**, with
+one-way promotions between adjacent levels. This is the canonical vocabulary the rest
+of §3 uses; the C++ `Record`/`RecChannel`/`RecStop` above are its concrete v1 slice.
+
+**Values** (a value has no driver — it's a fixed quantity):
+
+- **`number`** — a scalar. Its own type, *not* a degenerate spectrum: most quantities
+  (roughness, IOR magnitude, blend weights, exponents, the `.5`/`a` in `.5*a`) are
+  inherently scalar and would be meaningless as a colour.
+- **`vector`** — a fixed-arity tuple of numbers (`1 1 1` = a position/scale/normal).
+  Just numbers; **no** colour meaning on its own.
+- **`spectrum`** — a colour: a curve over **wavelength λ**. `rgb .5 .5 .6`,
+  `blackbody 6500`, `preset:D65`, `file:steel.csv` are all just ways of *writing one*.
+  A spectrum has **no driver** — it is a value, not a mapping. (`rgb .5 .5 .6` is
+  already "an array over λ"; that internal λ-axis is orthogonal to any driver axis and
+  is never flattened into it.)
+
+**Containers:**
+
+- **`channel`** — a mapping **from a driver input to any type in the system**: a value
+  (number/vector/spectrum), *or another channel*, *or a record*. A channel→channel
+  (`u → (v → spectrum)`) is exactly a **multi-input** function by currying, so
+  "several named inputs" (§3.2) is not a separate feature — it falls out of a channel
+  containing a channel. The only fixed part is "it maps *from* a driver"; the result
+  is unrestricted. (This is the same "channel" as `RecChannel` above — a record column
+  *is* a driver→value mapping; the name is deliberately shared.)
+- **`record`** — a bundle of **co-driven** channels: one declared `range`/driver
+  sweeps every channel at once. The shared driver is the point of bundling (one `u`
+  walks colour, roughness and displacement together), so a record is not "any channels
+  in a bag" but "channels over a common input."
+
+**Promotions are one-way, adjacent-level, and are what make the simple form typecheck
+in the richer slot:**
+
+- `number` → `spectrum`: a scalar in a colour slot lifts to a flat grey SPD, so
+  `reflect = .5` is legal. The reverse never holds — a `spectrum` is **not** a
+  `number` and can't fill a roughness slot. (A `vector` lifts to a `spectrum` only via
+  an explicit colour keyword: `rgb 1 1 1` / `hsv …` — bare `1 1 1` stays a vector.)
+- any value → **constant `channel`**: a value in a channel slot lifts to the
+  zero-variation channel that ignores its driver (the §3.2 "bare constant is the
+  degenerate curve").
+- a single `channel` → **one-channel `record`**.
+
+So every simpler thing is the degenerate/constant member of the next container up,
+which is precisely why you can write the plain form and have it validate where the
+richer one was expected.
+
+**Slot-type vs value-expression are distinct.** A material property has two separable
+parts: the **slot** (named by the leading type/slot keyword — `reflect`, `spectrum`,
+`roughness`) declares *what type must come out*; the **value** is an **expression over
+named inputs** that produces it. The value is *always* an expression — a constant
+(`rgb …`), an open array (`[…]`), an applied channel (`[…](u)`), or a formula
+(`a*.5`) are all one tier, never distinct "kinds" of property. Consequences:
+
+- A bare array `[…]` is **driver-*open*, not implicitly-`u`**: its driver is unbound,
+  filled by the slot's default input or by the consumer (§3.2). Sealing it as
+  `[…](u)` is a *different* object (a function of `u`); leaving it bare hands the
+  driver to the consumer. There is no hidden default driver.
+- Because the value is just an expression over named inputs, both `spectrum = u*.5`
+  and `spectrum = a*.5` are legal and mean different, sensible things (half the
+  surface-`u` coord vs half the albedo). Allowing one *does* imply allowing the other
+  — and that's the intended §3.2 "nothing is closed," not a problem to forbid.
+- The value never needs to self-describe its destination: the **LHS slot keyword**
+  names the output (`reflect = […]` vs `color = […]`). A standalone array is therefore
+  **polymorphic data** — a bare list of stops — that the *assignment* pins to a slot,
+  so the same array is reusable across colour/scalar/displacement slots.
+
 ### 3.1 Generalized stop grammar (arbitrary-arity, flexible delimiters) — *target, not v1*
 
 Once a channel outputs an arbitrary-arity `D`-tuple (§3), each **stop** is itself a
