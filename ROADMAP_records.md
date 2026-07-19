@@ -304,8 +304,11 @@ as inline `rgb r g b` triples. Teaching ftrace the superset requires only (a) a
 comma-aware tokenizer pass and (b) the per-line comma dispatch above — purely additive.
 Until then it lives in **loom** (the authoring superset, §J3b in `TODO.md`), which
 parses/emits the unified grammar (`loom/record.py` — one `parse`/`emit` pair, comma
-dispatch) and can lower a `D=3` channel down to the `spectrum:`-ref form ftrace
-understands (synthesising the backing `spectrum` decls).
+dispatch). Inline-colour channels are authored with a leading `rgb`/`hsv`/`hsl` **tag**
+(`reflect  rgb 0.55 0.57 0.60, 0.90 0.75 0.30`), and `Record.lower_colours()` /
+`lower_ftsl()` **lower** them down to the `spectrum:`-ref form ftrace understands —
+synthesising one deduped `spectrum "<name>" = rgb r g b` decl per unique colour
+(`hsv`/`hsl` converted to rgb) and rewriting the channel to `spectrum:<name>` refs.
 
 ### 3.2 Binding, access, and override — *target, not v1*
 

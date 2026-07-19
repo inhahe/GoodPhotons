@@ -1072,6 +1072,9 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 - [ ] **J3b — loom N-D / generalized-grammar superset** (loom-only authoring). Four related generalizations
       beyond the current-FTSL mirror J3a implements:
       1. **Arbitrary channel arity** — a `D`-tuple-valued channel, not just scalar `D=1` / colour `D=3`.
+         *(DONE — vector channels + inline `rgb`/`hsv`/`hsl` colour channels with a channel-level tag, plus
+         `Record.lower_colours()`/`lower_ftsl()` lowering inline colour to synthesized `spectrum "<name>" = rgb …`
+         decls + `spectrum:<name>` refs ftrace can parse.)*
       2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with a **delimiter
          precedence ladder** (whitespace binds like `×`, comma like `+`, brackets = parens), so structure is
          recoverable from the delimiters alone and the channel's arity only *validates*: `tint [rgb 0 0 0,
@@ -1109,6 +1112,20 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 ---
 
 ## Progress log
+- 2026-07-19: **J3b item 1 complete — inline `rgb`/`hsv`/`hsl` colour channels + lowering to spectra.** A record
+  colour channel can now be authored *inline* with a leading colour-space **tag** (`reflect  rgb 0.55 0.57 0.60,
+  0.90 0.75 0.30`) instead of a chain of `spectrum:<name>` refs. `RecordChannel` gained a `space` field
+  (`rgb`/`hsv`/`hsl`, else `None`); the tag fixes arity 3 so each comma-group is one colour stop and a lone
+  tagged stop (`reflect  rgb .5 .5 .5`) needs no trailing comma. `parse` detects the leading tag, `emit` emits it
+  back (round-trips, pins preserved), and `sample_vec` numerically samples an `rgb` channel (per-component =
+  ftrace's linear-RGB colour interp) while `hsv`/`hsl` reject sampling until lowered. New `Record.lower_colours()`
+  returns `(decls, lowered_record)` — synthesizing one deduped `spectrum "<name>" = rgb r g b` decl per unique
+  colour (`hsv`/`hsl` converted to rgb via loom's own hue maths in `color.py`, single source of truth) and
+  rewriting inline-colour channels to `spectrum:<name>` refs; `lower_ftsl()` returns the whole thing as one
+  self-contained ftrace-parseable block. Scalar/vector/`spectrum:`-ref channels pass through unchanged;
+  expression-valued colour stops raise (need the pattern VM, J3c). 10 new record tests (44 total), 670 loom green;
+  DESIGN.md §8a + ROADMAP_records.md §3.1 updated; TODO J3b item 1 marked DONE. **Remaining J3b:** item 3
+  (binding/application surface, §3.2/§3.3) + item 4 (N-D input domain).
 - 2026-07-19: **Locked the type lattice — values · channels · records (§3.0).** Resolved a multi-turn design
   thread on how the pieces are typed and named. Three **value** kinds: `number` (a real type, *not* a
   degenerate spectrum — roughness/IOR/weights are inherently scalar), `vector` (bare `1 1 1`, no colour

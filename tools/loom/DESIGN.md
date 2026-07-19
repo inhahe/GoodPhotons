@@ -290,8 +290,21 @@ comma (`tint 0 0 0,`) so it can't be misread as N scalar stops. `emit` picks the
 per channel automatically (whitespace for scalar/colour, comma for vector); records with
 no vector channel emit byte-identically to before. ftrace's own tokenizer is still not
 comma-aware, so a record that actually uses comma lines stays loom-only until J3c.
-Inline-`rgb` colour channels + their lowering to synthesized `spectrum` decls are the
-remaining J3b piece (not yet built).
+
+**Inline-colour channels + lowering (J3b item 1, done).** A colour channel can be
+authored *inline* with a leading `rgb`/`hsv`/`hsl` **tag** word instead of a chain of
+`spectrum:<name>` refs — `reflect  rgb 0.55 0.57 0.60, 0.90 0.75 0.30` is a two-stop rgb
+colour channel (`RecordChannel.space` carries the tag; `.kind == "colour"`, `.arity == 3`).
+The tag fixes arity 3, so each comma-group is one colour stop and a lone tagged stop
+(`reflect  rgb .5 .5 .5`) needs no trailing comma. An `rgb` channel is numerically
+sampleable (`sample_vec` interpolates the components = ftrace's linear-RGB colour interp);
+`hsv`/`hsl` channels reject sampling until lowered. `Record.lower_colours()` rewrites every
+inline-colour channel to the ftrace-native form: it returns `(decls, lowered_record)` where
+`decls` are synthesized `spectrum "<name>" = rgb r g b` declarations (one per **unique**
+colour, deduped across the record; `hsv`/`hsl` converted to rgb via loom's own hue maths)
+and the channels now hold `spectrum:<name>` refs (pins preserved). `lower_ftsl()` returns
+the decls + record as one self-contained parseable block. The remaining J3b item-1 piece
+is wiring these synthesized spectra into a full-scene emit path (part of J3c).
 
 ---
 
