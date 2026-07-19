@@ -252,6 +252,19 @@ struct DMaterial {
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
     int    priority;
+    // Parametric-record REFLECT binding (§records stage 6a — device twin of the CPU
+    // recordReflectBound path). recReflDriven==0 means no record drives reflect per-hit
+    // (a *constant* selStop binding is instead baked straight into reflect[] at upload,
+    // needing no device branch). recReflDriven==1 means per-hit driven: sample the coeff
+    // LUT recCoeff[recReflOff .. +3*REC_LUT_N) at driver position
+    // d = dPatternEval(recDrivers[recReflDrvOff .. +recReflDrvN)) over the
+    // [recReflLo,recReflHi] domain, then evaluate the JH sigmoid (dRecReflAt). Consulted
+    // by dDiffuseRho / dReflectSlot; BDPT (no per-hit Hit in dBsdfF) rejects driven-record
+    // materials to CPU.
+    int    recReflDriven;
+    int    recReflOff;
+    int    recReflDrvOff, recReflDrvN;
+    float  recReflLo, recReflHi;
 };
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
 #define D_NO_PRIORITY (-2147483647 - 1)
@@ -525,6 +538,13 @@ struct DScene {
     // A material's roughnessPat/filmThicknessPat/mixWeightPat index `patterns`.
     const PatNode*   patNodes;
     const DPattern*  patterns; int nPatterns;
+    // Parametric-record reflect binding (§records stage 6a). recCoeff: each driven reflect
+    // channel's baked JH coeff LUT (REC_LUT_N*3 doubles per channel, sliced by
+    // DMaterial::recReflOff); recDrivers: flat driver-program PatNode pool (sliced by
+    // recReflDrvOff/recReflDrvN). Null when no material drives reflect per-hit off a record.
+    // (Constant selStop bindings are baked into DMaterial::reflect[] and use neither pool.)
+    const double*    recCoeff;
+    const PatNode*   recDrivers;
     const DEmitter*  emitters; int nEmitters;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
@@ -2903,9 +2923,58 @@ __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, con
     return -1;
 }
 
-// Diffuse reflectance at a hit: texture-sampled when the material binds one, else
-// the constant baked reflect spectrum (mirrors host diffuseReflectance).
+// Per-hit reflectance of a baked driven record channel at driver `d` and wavelength
+// `lambda` (device twin of recReflectanceAt): map d -> LUT position over [lo,hi], lerp
+// the neighbouring bins' JH sigmoid coeffs, evaluate the sigmoid. `coeff` points at the
+// channel's REC_LUT_N*3-double slice (recCoeff + recReflOff).
+__device__ static Real dRecReflAt(const double* coeff, int N, double lo, double hi,
+                                  double d, Real lambda) {
+    if (N <= 0) return (Real)0;
+    if (N == 1) return dReflAt(coeff, lambda);
+    double t = (hi > lo) ? (d - lo) / (hi - lo) : 0.0;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    double fidx = t * (N - 1);
+    int i = (int)fidx; if (i > N - 2) i = N - 2;
+    double f = fidx - i;
+    const double* a = coeff + 3 * i;
+    const double* b = coeff + 3 * (i + 1);
+    double c[3] = { a[0] + (b[0] - a[0]) * f,
+                    a[1] + (b[1] - a[1]) * f,
+                    a[2] + (b[2] - a[2]) * f };
+    return dReflAt(c, lambda);
+}
+
+// Reflect-slot reflectance from a per-hit driven parametric record, if the material
+// binds one (device twin of the driven branch of recordReflectBound). Returns true and
+// sets `out`; false when no record drives reflect per-hit (constant selStop bindings are
+// pre-baked into m.reflect, so they take the ordinary specLookup path). The single point
+// of truth so diffuse albedo AND specular tint see identical driven reflectance.
+__device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
+                                      const DHit& h, Real lambda, Real& out) {
+    if (m.recReflDriven != 1) return false;
+    double px = h.p.x, py = h.p.y, pz = h.p.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+    out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
+                     (double)m.recReflLo, (double)m.recReflHi, d, lambda);
+    return true;
+}
+
+// Reflect-slot reflectance for the SPECULAR families (mirror / glossy / grating /
+// halfmirror): a driven record if present, else the constant baked reflect spectrum
+// (device twin of host reflectSlot; these types never bind a reflect texture).
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real v;
+    if (dRecordReflect(sc, m, h, lambda, v)) return v;
+    return specLookup(m.reflect, lambda);
+}
+
+// Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
+// bound texture, else the constant baked reflect spectrum (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real rv;
+    if (dRecordReflect(sc, m, h, lambda, rv)) return clamp01(rv);
     if (m.reflectTex >= 0) {
         const DTexture& tx = sc.textures[m.reflectTex];
         if (m.triplanarScale > 0.0)
@@ -3153,17 +3222,17 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_MIRROR) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; return WF_CONTINUE;
     } else if (m.type == D_GRATING) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 nro, nrd;
         if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_HALFMIRROR) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o; }
         else { ro = h.p + rd * RAY_EPS; }
         return WF_CONTINUE;
@@ -3176,7 +3245,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
         return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
-        Real r = clamp01(specLookup(m.reflect, lambda));
+        Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -4653,11 +4722,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
-                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
             }
             case D_GLOSSY: {
-                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
                 ro = h.p + h.n * RAY_EPS; rd = o; break;
@@ -4667,7 +4736,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
-                Real r = clamp01(specLookup(m.reflect, lambda));
+                Real r = clamp01(dReflectSlot(sc, m, h, lambda));
                 if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
                 else                   { ro = h.p + rd * RAY_EPS; }
                 break;
@@ -4677,7 +4746,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
-                thr *= (double)clamp01(specLookup(m.reflect, lambda));
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
             }
         }
@@ -4819,12 +4888,15 @@ bool cudaForwardSupported(const Scene& scene) {
     // fallback here. (The GPU BDPT kernel still can't MIS either — cudaBdptSupported gates
     // both.) Implicit surfaces (isosurface) are gated separately below.
     // Parametric records (§records) drive a material's slots from a per-hit driver
-    // sampling a named LUT bank. The device shading path has no record support yet
-    // (GPU parity is a later stage), so any record-bound material forces the CPU
-    // forward/backward tracer — otherwise the slot keeps its unset constant (black).
+    // sampling a named LUT bank. Stage 6a put the REFLECT slot on the device: a constant
+    // selStop reflect binding bakes straight into reflect[] at upload, and a per-hit
+    // *driven* reflect binding samples the uploaded recCoeff LUT via recDrivers
+    // (dRecordReflect / dReflectSlot / dDiffuseRho). Only the SCALAR (roughness) slot has
+    // no device path yet (stage 6b), so a roughness record binding still forces the CPU
+    // forward/backward tracer — otherwise the slot keeps its unset constant.
     auto usesRecord = [&](int matId) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
-               scene.mats[matId].hasRecordBinding();
+               scene.mats[matId].recBindingFor(REC_SLOT_ROUGHNESS) != nullptr;
     };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
@@ -4839,7 +4911,7 @@ bool cudaForwardSupported(const Scene& scene) {
             scene.mats[matId].type == MatType::Mix) {
             const Material& mx = scene.mats[matId];
             if ((int)mx.mixChildren.size() > D_MIXMAX) return true;
-            for (int c : mx.mixChildren) if (oversizedMultilayer(c)) return true;
+            for (int c : mx.mixChildren) if (oversizedMultilayer(c) || usesRecord(c)) return true;
         }
         return false;
     };
@@ -5066,6 +5138,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
     std::vector<DMaterial> mats(scene.mats.size());
     std::vector<double> fluoCdfAll;
+    // Parametric-record reflect pools (§records stage 6a): each per-hit driven reflect
+    // binding flattens its channel's baked JH coeff LUT (REC_LUT_N*3 doubles) into
+    // recCoeffPool and copies its driver program into recDrvPool; DMaterial slices both.
+    std::vector<double>  recCoeffPool;
+    std::vector<PatNode> recDrvPool;
     for (size_t i = 0; i < scene.mats.size(); ++i) {
         const Material& m = scene.mats[i]; DMaterial& d = mats[i];
         d.type = (int)m.type;
@@ -5109,6 +5186,36 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
+        // --- parametric-record REFLECT binding (§records stage 6a) ---
+        // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
+        // colour straight into reflect[] (so the plain specLookup path is exact, no device
+        // branch). A per-hit driven binding flattens the channel's baked coeff LUT + copies
+        // its driver program, and dRecordReflect samples them. Scalar (roughness) record
+        // bindings are gated to CPU (stage 6b) — cudaForwardSupported rejects them.
+        d.recReflDriven = 0; d.recReflOff = 0;
+        d.recReflDrvOff = 0; d.recReflDrvN = 0;
+        d.recReflLo = 0.0f;  d.recReflHi = 1.0f;
+        if (const RecBinding* rb = m.recBindingFor(REC_SLOT_REFLECT)) {
+            if (rb->recordIndex >= 0 && rb->recordIndex < (int)scene.records.size()) {
+                const Record& rec = scene.records[rb->recordIndex];
+                const RecChannel& ch = rec.channels[rb->channel];
+                if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
+                    bakeSpec(ch.stops[rb->selStop].color, d.reflect);   // constant stop → bake
+                } else if ((int)ch.coeff.size() == REC_LUT_N) {
+                    d.recReflDriven = 1;
+                    d.recReflOff = (int)recCoeffPool.size();
+                    for (const auto& c : ch.coeff) {                    // REC_LUT_N * 3 doubles
+                        recCoeffPool.push_back(c[0]);
+                        recCoeffPool.push_back(c[1]);
+                        recCoeffPool.push_back(c[2]);
+                    }
+                    d.recReflDrvOff = (int)recDrvPool.size();
+                    d.recReflDrvN   = (int)rb->driver.size();
+                    recDrvPool.insert(recDrvPool.end(), rb->driver.begin(), rb->driver.end());
+                    d.recReflLo = (float)rec.lo; d.recReflHi = (float)rec.hi;
+                }
+            }
+        }
     }
 
     // --- upload geometry/materials ---
@@ -5128,6 +5235,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DTri*       d_blasT  = blasTris.empty()  ? nullptr : (DTri*)keep(uploadVec(blasTris));
     PatNode*    d_pnodes = patNodes.empty()   ? nullptr : (PatNode*)keep(uploadVec(patNodes));
     DPattern*   d_pat    = dpat.empty()       ? nullptr : (DPattern*)keep(uploadVec(dpat));
+    // Parametric-record reflect pools (§records stage 6a).
+    double*     d_recCoeff = recCoeffPool.empty() ? nullptr : (double*)keep(uploadVec(recCoeffPool));
+    PatNode*    d_recDrv   = recDrvPool.empty()   ? nullptr : (PatNode*)keep(uploadVec(recDrvPool));
 
     // Emitters: DEmitter array + flattened wavelength-CDF buffer + power selection CDF.
     std::vector<DEmitter> dems;
@@ -5243,6 +5353,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
+    sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
@@ -5613,6 +5724,13 @@ bool cudaBdptSupported(const Scene& scene) {
         // Procedural patterns drive the same per-hit params; the GPU BDPT kernel's
         // pdf/eval use the constants, so a pattern would bias MIS — use CPU BDPT.
         if (m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0) return true;
+        // Parametric records drive slots from a per-hit driver, but the BDPT connection
+        // BSDF (dBsdfF / dBsdfPdf) has no Hit in scope — it can't sample the driver, so a
+        // record-bound vertex would bias MIS. Forward records run on-device (stage 6a),
+        // but any record binding forces the CPU BDPT here (both driven reflect AND the
+        // constant selStop case, since even the baked reflect would MIS against a driver-
+        // less pdf inconsistently for driven neighbours). Keep BDPT record scenes on CPU.
+        if (m.hasRecordBinding()) return true;
         // Mix blend mask: the GPU BDPT mix-pick uses constant weights; use CPU BDPT.
         if (m.mixWeightTex >= 0) return true;
         if (m.type == MatType::Mix)
@@ -5623,7 +5741,7 @@ bool cudaBdptSupported(const Scene& scene) {
                      scene.mats[c].type == MatType::DiffuseTransmit ||
                      scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
                      scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
-                     scene.mats[c].mixWeightPat >= 0))
+                     scene.mats[c].mixWeightPat >= 0 || scene.mats[c].hasRecordBinding()))
                     return true;
         return false;
     };

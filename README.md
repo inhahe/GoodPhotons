@@ -586,9 +586,13 @@ stay non-resumable.
   and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
   material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
   reproduce. **Parametric records** (a material's slots driven by a per-hit driver
-  sampling a named LUT bank — see *Parametric records* below) are **CPU-only** for now:
-  a scene that binds a record falls back from the GPU forward/backward tracer
-  automatically. `cpu` is fully deterministic and is used for reference/validation baselines.
+  sampling a named LUT bank — see *Parametric records* below) run on the **GPU forward
+  and backward tracers for the reflect/albedo slot** (constant stop selectors bake into
+  the device material; per-hit driven reflect uploads the record's LUT + driver program
+  and samples it on-device). A record driving a **scalar** slot (roughness) still forces
+  the CPU tracer, and **any** record-bound scene falls back on GPU **BDPT** (mode `D`) —
+  its MIS connection BSDF has no per-hit surface point to evaluate the driver. The
+  fallback is automatic. `cpu` is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -806,8 +810,10 @@ sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled 
 
 Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
 is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
-Records are **CPU-only** for now — a scene that binds one falls back from the GPU
-tracer automatically. See FTSL.md §7.5 for the full grammar.
+A record driving the **reflect/albedo** slot runs on the **GPU** forward and backward
+tracers (the LUT + driver program upload to the device); a record driving a **scalar**
+slot (roughness) still forces the CPU tracer, and any record-bound scene falls back on
+**GPU BDPT** (mode `D`). Fallback is automatic. See FTSL.md §7.5 for the full grammar.
 
 ---
 

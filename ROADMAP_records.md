@@ -194,6 +194,16 @@ struct Record {
      constant and admits only the constant record forms from 5a.
 6. **GPU parity.** Upload the record LUTs + driver programs; device channel-sample
    mirroring the CPU path (bake like `ProcTexture`). Verify CPU/GPU bit/visual parity.
+   Split into 6a/6b mirroring the 5a reflect/scalar split:
+   - **6a — reflect slot (DONE).** Constant `selStop` bindings bake into the device
+     material's `reflect[]`; per-hit driven bindings upload the baked JH coeff LUT
+     (`DScene::recCoeff`) + driver program (`DScene::recDrivers`) and sample on-device
+     via `dRecordReflect`/`dReflectSlot`/`dDiffuseRho` (twins of `recordReflectBound`).
+     Forward-only: `cudaForwardSupported` accepts reflect records; `cudaBdptSupported`
+     rejects *all* record bindings because the BDPT connection BSDF (`dBsdfF`) has no
+     per-hit `DHit` to evaluate a driver. Validated on `scenes/_record_bind.ftsl`.
+   - **6b — scalar slot (roughness).** Upload scalar-channel stop programs + driver,
+     device `recSampleScalar` twin, route `dMatRoughness`, relax the roughness rejection.
 
 Each stage: build (`cmake --build build_cuda2 --config Release --target ftrace`, then
 `cp build_cuda2/bin/ftrace.exe ftrace.exe`), add tests, validate with a windowed
