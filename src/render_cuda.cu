@@ -4167,8 +4167,65 @@ __device__ static inline double dSpotFalloff(double ct, double cosInner, double 
     double t = (ct - cosOuter) / (cosInner - cosOuter);
     return t * t * (3.0 - 2.0 * t);
 }
+// ---- image-skin (linear-RGB) sampling for the iso preview -----------------
+// Device twins of raster.h's Texture::sampleRgb / sampleRgbTriplanar (the CPU
+// rasterizer's textured-preview path). All bound skins' texels are flattened into
+// one shared linear-RGB array; each texture's DPTex gives dims/filter/wrap and its
+// first-texel offset. Procedural (formula) skins bake to `rgb` at load (E1), so this
+// one path covers both image and formula skins. Kept a private twin of raster_cuda.cu's
+// dSampleRgb because that sampler lives in a separate translation unit.
+struct DPTex { int w, h, filter, wrap, offset, valid; };
+
+__device__ static inline int dSkinWrap(int i, int n, int wrap) {
+    if (wrap == 1) return (i < 0) ? 0 : (i >= n ? n - 1 : i);        // clamp
+    if (wrap == 2) {                                                 // mirror
+        int period = 2 * n;
+        int m = ((i % period) + period) % period;
+        return (m < n) ? m : (period - 1 - m);
+    }
+    int m = i % n; return (m < 0) ? m + n : m;                       // repeat
+}
+
+__device__ static DVec3 dSkinRgb(const DPTex* meta, const DVec3* texels, int ti,
+                                 double u, double v) {
+    const DPTex& t = meta[ti];
+    if (!t.valid) return DVec3(0.5, 0.5, 0.5);
+    const DVec3* px = texels + t.offset;
+    if (t.filter == 0) {   // nearest
+        int x = dSkinWrap((int)floor(u * t.w), t.w, t.wrap);
+        int y = dSkinWrap((int)floor((1.0 - v) * t.h), t.h, t.wrap);
+        return px[(size_t)y * t.w + x];
+    }
+    double tu = u * t.w - 0.5, tv = (1.0 - v) * t.h - 0.5;
+    double flx = floor(tu), fly = floor(tv);
+    double fx = tu - flx, fy = tv - fly;
+    int x0 = dSkinWrap((int)flx, t.w, t.wrap), x1 = dSkinWrap((int)flx + 1, t.w, t.wrap);
+    int y0 = dSkinWrap((int)fly, t.h, t.wrap), y1 = dSkinWrap((int)fly + 1, t.h, t.wrap);
+    DVec3 c00 = px[(size_t)y0 * t.w + x0], c10 = px[(size_t)y0 * t.w + x1];
+    DVec3 c01 = px[(size_t)y1 * t.w + x0], c11 = px[(size_t)y1 * t.w + x1];
+    DVec3 a = c00 * (1.0 - fx) + c10 * fx;
+    DVec3 b = c01 * (1.0 - fx) + c11 * fx;
+    return a * (1.0 - fy) + b * fy;
+}
+
+__device__ static DVec3 dSkinTri(const DPTex* meta, const DVec3* texels, int ti,
+                                 const DVec3& p, const DVec3& n, double scale) {
+    double ax = fabs(n.x), ay = fabs(n.y), az = fabs(n.z);
+    double wx = ax*ax*ax*ax, wy = ay*ay*ay*ay, wz = az*az*az*az;
+    double s = wx + wy + wz;
+    if (s <= 0.0) return dSkinRgb(meta, texels, ti, p.x * scale, p.y * scale);
+    wx /= s; wy /= s; wz /= s;
+    DVec3 c(0, 0, 0);
+    if (wx > 0.0) c = c + dSkinRgb(meta, texels, ti, p.z * scale, p.y * scale) * wx;
+    if (wy > 0.0) c = c + dSkinRgb(meta, texels, ti, p.x * scale, p.z * scale) * wy;
+    if (wz > 0.0) c = c + dSkinRgb(meta, texels, ti, p.x * scale, p.y * scale) * wz;
+    return c;
+}
+
 __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
                             const DVec3* matCol, const int* matEmit, int nMats,
+                            const DPTex* texMeta, const DVec3* texels,
+                            const int* matTex, const double* matTri,
                             double* accum, float* zbuf, unsigned char* emis,
                             int W, int H, DVec3 bg, double emisBoost) {
     int total = W * H;
@@ -4198,6 +4255,15 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
             continue;
         }
         emis[idx] = 0;
+        // Image/formula skin: replace the flat material albedo with the texture's linear
+        // RGB, sampled at the interpolated (u,v) or by world triplanar (device twin of
+        // raster.h's textured-preview path; matTex encodes raster.h's binding rule).
+        int ti = (matTex && h.matId >= 0 && h.matId < nMats) ? matTex[h.matId] : -1;
+        if (ti >= 0) {
+            double tri = matTri[h.matId];
+            col = (tri > 0.0) ? dSkinTri(texMeta, texels, ti, h.p, h.n, tri)
+                              : dSkinRgb(texMeta, texels, ti, h.u, h.v);
+        }
         DVec3 N = normalize(h.n);
         DVec3 V = normalize(cam.eye - h.p);
         if (dot(N, V) < 0) N = -N;                            // two-sided preview
@@ -6120,6 +6186,38 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
     const DVec3* dCol  = hCol.empty()  ? nullptr : (const DVec3*)up.keep(uploadVec(hCol));
     const int*   dEmit = hEmit.empty() ? nullptr : (const int*)up.keep(uploadVec(hEmit));
 
+    // Image/formula-skin tables: one shared linear-RGB texel array (device twin of
+    // Texture::sampleRgb) + per-material binding (reflectTex index / triplanar scale),
+    // mirroring raster.h buildScene's matTex/matTri rule exactly. Procedural skins bake
+    // to `rgb` at load, so image and formula skins share this one path.
+    std::vector<DPTex> hTexMeta(scene.textures.size());
+    std::vector<DVec3> hTexels;
+    for (size_t i = 0; i < scene.textures.size(); ++i) {
+        const Texture& tx = scene.textures[i];
+        DPTex& m = hTexMeta[i];
+        m.w = tx.w; m.h = tx.h;
+        m.filter = (tx.filter == TexFilter::Nearest) ? 0 : 1;
+        m.wrap   = (tx.wrap == TexWrap::Clamp) ? 1 : (tx.wrap == TexWrap::Mirror ? 2 : 0);
+        m.offset = (int)hTexels.size();
+        m.valid  = tx.valid() ? 1 : 0;
+        if (m.valid)
+            for (const Vec3& c : tx.rgb) hTexels.push_back(DVec3(c.x, c.y, c.z));
+    }
+    std::vector<int>    hMatTex(scene.mats.size(), -1);
+    std::vector<double> hMatTri(scene.mats.size(), 0.0);
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        int rt = scene.mats[i].reflectTex;
+        if (!scene.mats[i].isLight && rt >= 0 && rt < (int)scene.textures.size() &&
+            scene.textures[rt].valid() && !scene.textures[rt].hasPalette()) {
+            hMatTex[i] = rt;
+            hMatTri[i] = scene.mats[i].triplanarScale;
+        }
+    }
+    const DPTex*  dTexMeta = hTexMeta.empty() ? nullptr : (const DPTex*)up.keep(uploadVec(hTexMeta));
+    const DVec3*  dTexels  = hTexels.empty()  ? nullptr : (const DVec3*)up.keep(uploadVec(hTexels));
+    const int*    dMatTex  = hMatTex.empty()  ? nullptr : (const int*)up.keep(uploadVec(hMatTex));
+    const double* dMatTri  = hMatTri.empty()  ? nullptr : (const double*)up.keep(uploadVec(hMatTri));
+
     const size_t npix = (size_t)W * H;
     double*        d_accum = nullptr; CUDA_CHECK(cudaMalloc(&d_accum, npix * 3 * sizeof(double)));
     float*         d_z     = nullptr; CUDA_CHECK(cudaMalloc(&d_z, npix * sizeof(float)));
@@ -6132,6 +6230,7 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
     if (grid < 1) grid = 1;
     if (grid > 65535) grid = 65535;
     kIsoPreview<<<grid, block>>>(up.sc, up.dc, dpl, dCol, dEmit, (int)scene.mats.size(),
+                                 dTexMeta, dTexels, dMatTex, dMatTri,
                                  d_accum, d_z, d_emis, W, H, bg, EMIS_BOOST);
     cudaCheckKernel("iso-preview");
 

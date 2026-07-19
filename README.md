@@ -210,7 +210,8 @@ paths they can capture at all**.
 > frame. `-raster-gpu` skips tessellation entirely: it casts **one primary ray per
 > pixel** on the device and finds the nearest surface with the shared `closestHit`,
 > which **sphere-traces implicit isosurfaces directly** (no mesh). It shades with the
-> same solid preview model (flat per-material albedo, ambient + weighted N·L keys +
+> same preview model (per-material albedo — or a sampled **image/procedural skin**, at
+> the hit UV or by world triplanar — plus ambient + weighted N·L keys +
 > a headlight fill) and runs the **same** shared auto-exposure + sRGB tone map on the
 > host, so the image matches `-raster` (surfaces are actually *cleaner* — no marching-
 > cubes faceting) and an exposure-locked flyby still shares one anchor. It falls back

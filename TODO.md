@@ -446,8 +446,14 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       "Deferred: `PatOp::MatMulAdd`". Prefer the contained single-output "matrow" form (Option A) if so.
 - [ ] **G4 (deferred, export-only)** GPU marching cubes — *only* to accelerate mesh export, not the
       video path. Build only if mesh-export throughput becomes a pain point.
-- [ ] **G5 — `-raster-gpu` / `kIsoPreview` textured shading** *(user-requested 2026-07-19; also logged
-      in known-issues.md).* Today the GPU isosurface preview shades **flat** — per-material albedo +
+- [x] **G5 — `-raster-gpu` / `kIsoPreview` textured shading** *(user-requested 2026-07-19; also logged
+      in known-issues.md).* **DONE 2026-07-19.** Ported the CPU rasterizer's textured-preview path
+      (`Texture::sampleRgb`/`sampleRgbTriplanar`) into `kIsoPreview`: a shared flattened linear-RGB texel
+      array + per-texture `DPTex` meta + per-material `matTex`/`matTri` binding (mirroring `raster.h`
+      buildScene's rule) upload alongside `matCol`; the kernel samples the hit `(u,v)` or world triplanar
+      and replaces the flat albedo for non-emitter hits. One path covers **image** and (E1 formula-baked
+      to `rgb`) **formula** skins; flat hits unchanged (`matTex==-1`). Validated vs CPU `-raster` on
+      procskin/textured/triplanar (mean diff ~0.03/255) + flat implicit unchanged. Original scope:* Today the GPU isosurface preview shades **flat** — per-material albedo +
       ambient + weighted N·L keys + headlight fill, with **no texture lookup**. Make it sample and shade
       textures — both **image** (`Texture`/`skin`) and **formula** (`ProcTexture`/`func_skin`, the E1
       procedural-skin path) — so previewed isosurfaces/meshes carry their authored surface detail. Scope
@@ -1081,3 +1087,14 @@ stereo.
   → physical baseline+convergence; reuses M13 right axis; stills + movies. **§B/G5** added: make
   `-raster-gpu`/`kIsoPreview` shade textures (image + formula) — port raster texture sampling into the
   device kernel (already has `DHit.u/v/p`); user-requested, also in known-issues.md; prereq for F4/F7.
+- 2026-07-19: **G5 done.** `-raster-gpu`/`kIsoPreview` now shades **textures** (was flat per-material
+  albedo). Ported the CPU rasterizer's textured-preview path (`Texture::sampleRgb`/`sampleRgbTriplanar`)
+  into the kernel: a shared flattened linear-RGB texel array + per-texture `DPTex` meta + per-material
+  `matTex`/`matTri` binding (mirroring `raster.h` buildScene's rule) upload alongside `matCol`; the kernel
+  samples the hit `(u,v)` or world triplanar and replaces the flat albedo for non-emitter hits. One path
+  covers **image** skins and E1 **formula** skins (they bake to `rgb` at load); flat/no-texture hits are
+  byte-unchanged (`matTex==-1` skips the sampler). Device sampler is a private twin of `raster_cuda.cu`'s
+  (separate TU). Validated: `-raster-gpu` matches CPU `-raster` within edge-coverage tolerance on
+  procskin.ftsl (formula, red rises left→right = r=u), textured.ftsl (image checker), triplanar.ftsl
+  (mean channel diff ~0.03/255, ~1033 shared box-edge px); flat implicit.ftsl unchanged; back-wall
+  spatial variance confirms the skins actually sample. Resolves the known-issues tech-debt entry.

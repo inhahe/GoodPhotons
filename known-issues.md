@@ -58,17 +58,23 @@ missing capability.** Why we may want it someday, and why we don't need it now:
     vector semantics so a node can push 3 values. Cleanest for "transform a point," but rewrites the VM's
     fundamental one-scalar-out contract across CPU eval, device eval, arity accounting, and every consumer.
 
-### TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)
+### ~~TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)~~ — FIXED 2026-07-19 (G5)
 The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
-wired as `-raster-gpu`) casts one ray/pixel with the shared `closestHit` and shades
+wired as `-raster-gpu`) cast one ray/pixel with the shared `closestHit` and shaded
 each hit with a **flat per-material solid colour** (`raster::materialColor` baked into
-`matCol[]`). Unlike the *triangle* GPU rasterizer (`-device gpu`), it does **not** sample
-per-vertex-UV or triplanar `reflect texture:<name>` **image skins** — a textured mesh
-previews as flat colour. That's fine for its target use (implicit-isosurface video, which
-uses solid materials), but a textured scene loses its skin under `-raster-gpu`. Proper fix:
-port the raster texture sampling into `kIsoPreview` (the device already has `DHit.u/v`/`p`
-and the baked texture tables the forward path uploads), matching the triangle GPU path.
-Until then, prefer `-device gpu` (tessellated) for textured previews.
+`matCol[]`), unlike the *triangle* GPU rasterizer — so a textured mesh previewed as flat
+colour. **FIXED 2026-07-19 (TODO G5):** ported the CPU rasterizer's textured-preview path
+(`Texture::sampleRgb`/`sampleRgbTriplanar`) into `kIsoPreview`. A shared flattened
+linear-RGB texel array + per-texture `DPTex` meta + per-material `matTex`/`matTri` binding
+(mirroring `raster.h` buildScene's rule exactly) are uploaded alongside `matCol`; the
+kernel samples the hit `(u,v)` (or world triplanar) and replaces the flat albedo for
+non-emitter hits. Covers **image** skins and, because E1 procedural (formula) skins bake
+to `rgb` at load, **formula** skins too — one path. Flat (no-texture) hits are unchanged
+(`matTex==-1` skips the sampler). Validated: `-raster-gpu` matches CPU `-raster` within
+edge-coverage tolerance on `procskin.ftsl` (formula), `textured.ftsl` (image UV) and
+`triplanar.ftsl` (mean channel diff ~0.03/255, ~1033 shared box-edge px); flat
+`implicit.ftsl` unchanged. The device sampler is a private twin of `raster_cuda.cu`'s
+(separate translation unit).
 
 ### TECH DEBT (2026-07-18): FBX import (C8) consumes geometry only — no materials/skinning/animation
 The new FBX loader (`src/fbx_load.cpp`, vendored `ufbx`) imports **baked triangle
