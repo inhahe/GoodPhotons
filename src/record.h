@@ -16,6 +16,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <array>
 #include <cmath>
 #include "pattern.h"    // PatNode / PatCtx / patternEval — scalar stop programs
 #include "spectrum.h"   // Spectrum + Vec3 (via color.h) — colour stops
@@ -23,6 +24,12 @@
 
 enum class RecInterp { Nearest, Linear, Smooth };
 enum class ChanKind  { Scalar, Spectrum };   // a scalar LUT vs a colour LUT
+
+// Resolution of the baked colour-channel LUT (Jakob-Hanika sigmoid coefficients over
+// the driver domain). Colour interpolation happens once per bin at BAKE time (linear
+// RGB then a JH fit), so a per-hit spectrum sample is a cheap coeff-lerp + one sigmoid
+// eval — never a Gauss-Newton refit in the shading hot loop.
+static constexpr int REC_LUT_N = 65;
 
 // One stop in a channel LUT.
 struct RecStop {
@@ -40,6 +47,9 @@ struct RecChannel {
     std::string          name;
     ChanKind             kind = ChanKind::Scalar;
     std::vector<RecStop> stops;  // author order == ascending pos after redistribution
+    // Spectrum channels only: baked JH sigmoid coeffs over the driver domain (filled
+    // by recBakeSpectrumChannels). Empty for scalar channels (they evaluate live).
+    std::vector<std::array<double, 3>> coeff;
 };
 
 struct Record {
@@ -129,25 +139,74 @@ inline double recSampleScalar(const Record& rec, const RecChannel& ch,
     return h00 * vs[i] + h10 * h * mk + h01 * vs[i + 1] + h11 * h * mk1;
 }
 
-// Sample a Spectrum channel at driver `d`: interpolate the stops' precomputed linear
-// RGB, then Jakob-Hanika upsample the result back to a reflectance spectrum. Nearest
-// returns the picked stop's spectrum verbatim (no re-upsample round-trip).
+// Interpolate a Spectrum channel's stops in linear RGB at driver `d` per the interp
+// mode. (Nearest picks a stop; linear/smooth lerp the two neighbours' precomputed RGB.)
+inline Vec3 recRGBAt(const RecChannel& ch, RecInterp interp, double d) {
+    const int n = (int)ch.stops.size();
+    if (n == 0) return Vec3{0, 0, 0};
+    if (n == 1) return ch.stops[0].rgb;
+    double lo = ch.stops[0].pos, hi = ch.stops[n - 1].pos;
+    if (d < lo) d = lo; else if (d > hi) d = hi;
+    double t; int i = recLocate(ch, d, t);
+    if (interp == RecInterp::Nearest) return ch.stops[t < 0.5 ? i : i + 1].rgb;
+    double w = (interp == RecInterp::Smooth) ? t * t * (3.0 - 2.0 * t) : t;
+    const Vec3& a = ch.stops[i].rgb;
+    const Vec3& b = ch.stops[i + 1].rgb;
+    return { a.x + (b.x - a.x) * w, a.y + (b.y - a.y) * w, a.z + (b.z - a.z) * w };
+}
+
+// Sample a Spectrum channel at driver `d`: interpolate the stops' linear RGB, then
+// Jakob-Hanika upsample back to a reflectance spectrum. Nearest returns the picked
+// stop's spectrum verbatim (no round-trip). Convenience form (builds a Spectrum
+// object) — the shading hot path uses the baked recReflectanceAt instead.
 inline Spectrum recSampleSpectrum(const Record& rec, const RecChannel& ch, double d) {
     const int n = (int)ch.stops.size();
     if (n == 0) return constantSpectrum(0.0);
     if (n == 1) return ch.stops[0].color;
-    double lo = ch.stops[0].pos, hi = ch.stops[n - 1].pos;
-    if (d < lo) d = lo; else if (d > hi) d = hi;
-
     if (rec.interp == RecInterp::Nearest) {
+        double lo = ch.stops[0].pos, hi = ch.stops[n - 1].pos;
+        if (d < lo) d = lo; else if (d > hi) d = hi;
         double t; int i = recLocate(ch, d, t);
         return ch.stops[t < 0.5 ? i : i + 1].color;
     }
-    double t; int i = recLocate(ch, d, t);
-    const Vec3& a = ch.stops[i].rgb;
-    const Vec3& b = ch.stops[i + 1].rgb;
-    double w = t;
-    if (rec.interp == RecInterp::Smooth) w = t * t * (3.0 - 2.0 * t);   // smoothstep on RGB
-    Vec3 c{ a.x + (b.x - a.x) * w, a.y + (b.y - a.y) * w, a.z + (b.z - a.z) * w };
+    Vec3 c = recRGBAt(ch, rec.interp, d);
     return rgbToReflectanceJH(c.x, c.y, c.z);
+}
+
+// Bake every Spectrum channel's colour LUT: sample the RGB interpolation at REC_LUT_N
+// evenly-spaced driver values across [lo,hi] and fit JH sigmoid coeffs once per bin.
+inline void recBakeSpectrumChannels(Record& rec) {
+    for (auto& ch : rec.channels) {
+        if (ch.kind != ChanKind::Spectrum) continue;
+        ch.coeff.resize(REC_LUT_N);
+        for (int i = 0; i < REC_LUT_N; ++i) {
+            double d = rec.lo + (rec.hi - rec.lo) * (double)i / (REC_LUT_N - 1);
+            Vec3 c = recRGBAt(ch, rec.interp, d);
+            double r = c.x < 0 ? 0 : (c.x > 1 ? 1 : c.x);
+            double g = c.y < 0 ? 0 : (c.y > 1 ? 1 : c.y);
+            double b = c.z < 0 ? 0 : (c.z > 1 ? 1 : c.z);
+            ch.coeff[i] = upsample::fit(r, g, b);
+        }
+    }
+}
+
+// Per-hit reflectance of a baked Spectrum channel at driver `d` and wavelength
+// `lambda`: map d -> LUT position, lerp the neighbouring bins' sigmoid coeffs, and
+// evaluate the sigmoid. Cheap enough for the shading inner loop.
+inline double recReflectanceAt(const Record& rec, const RecChannel& ch,
+                               double d, double lambda) {
+    const int N = (int)ch.coeff.size();
+    if (N == 0) return 0.0;
+    if (N == 1) return upsample::reflAt(ch.coeff[0], lambda);
+    double t = (rec.hi > rec.lo) ? (d - rec.lo) / (rec.hi - rec.lo) : 0.0;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    double fidx = t * (N - 1);
+    int i = (int)fidx; if (i > N - 2) i = N - 2;
+    double f = fidx - i;
+    const std::array<double, 3>& a = ch.coeff[i];
+    const std::array<double, 3>& b = ch.coeff[i + 1];
+    std::array<double, 3> c = { a[0] + (b[0] - a[0]) * f,
+                                a[1] + (b[1] - a[1]) * f,
+                                a[2] + (b[2] - a[2]) * f };
+    return upsample::reflAt(c, lambda);
 }

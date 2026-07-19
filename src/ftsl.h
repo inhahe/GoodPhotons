@@ -798,6 +798,62 @@ private:
         return it->second;
     }
 
+    // Synthesize a record-driven material (§records §2.2): a default (diffuse) material
+    // whose slots are filled per-hit by record `recIdx` sampled at driver `driverExpr`.
+    // Channels are auto-bound to slots by exact name-match (lenient: an unmatched
+    // channel is ignored, an unfilled slot keeps its constant). Returns the new
+    // material's index in Scene::mats, or -1 on error.
+    int buildRecordMaterial(int recIdx, const std::string& driverExpr, Loaded& L) {
+        Material m;   // default type: diffuse
+        std::string cerr;
+        if (!compilePatternExpr(driverExpr, m.recordDriver, cerr)) {
+            fail("record material driver '" + driverExpr + "': " + cerr);
+            return -1;
+        }
+        m.recordIndex = recIdx;
+        const Record& rec = L.scene.records[recIdx];
+        int ci = rec.channelIndex("reflect");
+        if (ci >= 0 && rec.channels[ci].kind == ChanKind::Spectrum) m.recReflectChan = ci;
+        int ri = rec.channelIndex("roughness");
+        if (ri >= 0 && rec.channels[ri].kind == ChanKind::Scalar) m.recRoughChan = ri;
+        int id = (int)L.scene.mats.size();
+        L.scene.mats.push_back(std::move(m));
+        return id;
+    }
+
+    // Resolve a geometry block's `material` field to a Scene::mats index. Accepts both
+    // a plain material name and the inline record form `RECORD(driver)` (§2.2). Sets
+    // `err` (via fail) and returns -1 on any problem; if the field is absent, fails
+    // with "<geom> needs a material". `optional` suppresses the absent-field error and
+    // returns -1 silently (for an optional per-instance override).
+    int matFieldId(const Block& b, Loaded& L, const char* geom, bool optional = false) {
+        const Stmt* s = find(b, "material");
+        if (!s || s->val.words.empty()) {
+            if (!optional) fail(std::string(geom) + " needs a material");
+            return -1;
+        }
+        // Reconstruct the raw field text (a spaced driver expression spans >1 token).
+        std::string raw = s->val.words[0];
+        for (size_t k = 1; k < s->val.words.size(); ++k) raw += " " + s->val.words[k];
+        size_t lp = raw.find('(');
+        if (lp != std::string::npos) {
+            std::string name = raw.substr(0, lp);
+            auto rit = recordIndex_.find(name);
+            if (rit != recordIndex_.end()) {
+                size_t rp = raw.rfind(')');
+                if (rp == std::string::npos || rp <= lp) {
+                    fail("record material '" + raw + "': missing ')'");
+                    return -1;
+                }
+                std::string driver = raw.substr(lp + 1, rp - lp - 1);
+                return buildRecordMaterial(rit->second, driver, L);
+            }
+        }
+        auto it = matIndex_.find(raw);
+        if (it == matIndex_.end()) { fail("unknown material '" + raw + "'"); return -1; }
+        return it->second;
+    }
+
     // ---- spectrum evaluation ----
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
         if (depth > 16) { fail("spectrum reference cycle"); return constantSpectrum(0); }
@@ -1277,6 +1333,7 @@ private:
                 }
             }
         }
+        recBakeSpectrumChannels(rec);   // colour channels -> per-domain JH coeff LUT
         int id = (int)L.scene.records.size();
         recordIndex_[rec.name] = id;
         L.scene.records.push_back(std::move(rec));
@@ -1495,9 +1552,7 @@ private:
     bool addSphere(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
         double r = dblOf(b, "radius", 1.0);
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("sphere needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "sphere"); if (id < 0) return false;
         // A sphere stays a sphere only under translate + rotation + UNIFORM scale;
         // a non-uniform scale would make it an ellipsoid the analytic primitive
         // cannot represent (see known-issues.md — true instancing/quadrics).
@@ -1512,9 +1567,7 @@ private:
     bool addQuad(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 o{0, 0, 0}, u{1, 0, 0}, v{0, 0, 1};
         vec3Of(b, "origin", o); vec3Of(b, "u", u); vec3Of(b, "v", v);
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("quad needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "quad"); if (id < 0) return false;
         Vec3 a = P(xf.apply(o)), bb = P(xf.apply(o + u)),
              cc = P(xf.apply(o + u + v)), dd = P(xf.apply(o + v));
         // UVs span the parallelogram: origin=(0,0), +u=(1,0), +v=(0,1). The two
@@ -1531,18 +1584,14 @@ private:
     bool addTriangle(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 v0{0, 0, 0}, v1{1, 0, 0}, v2{0, 1, 0};
         vec3Of(b, "v0", v0); vec3Of(b, "v1", v1); vec3Of(b, "v2", v2);
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("triangle needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "triangle"); if (id < 0) return false;
         L.scene.tris.push_back(Tri{P(xf.apply(v0)), P(xf.apply(v1)), P(xf.apply(v2)), id, -1, {}});
         return true;
     }
     bool addMesh(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh needs a file"); return false; }
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("mesh needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "mesh"); if (id < 0) return false;
         MeshXform mx;
         vec3Of(b, "translate", mx.translate);
         vec3Of(b, "rotate", mx.rotDeg);
@@ -1690,9 +1739,7 @@ private:
         if (blasIndex_.count(b.name)) { fail("duplicate mesh_asset name '" + b.name + "'"); return false; }
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh_asset '" + b.name + "' needs a file"); return false; }
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("mesh_asset '" + b.name + "' needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "mesh_asset"); if (id < 0) return false;
 
         bool loadUV = (strOf(b, "uv") == "use_mesh");
         bool useNames = (strOf(b, "usemtl") == "use_names");
@@ -1775,8 +1822,10 @@ private:
         xf.t = xf.t * L_;
 
         int matOverride = -1;
-        std::string mat = strOf(b, "material");
-        if (!mat.empty()) { matOverride = matId(mat); if (!err.empty()) return false; }
+        if (find(b, "material")) {
+            matOverride = matFieldId(b, L, "instance", /*optional=*/true);
+            if (matOverride < 0 && !err.empty()) return false;
+        }
 
         MeshInstance inst;
         inst.blasId = it->second;
@@ -1984,9 +2033,7 @@ private:
     }
 
     bool addIsosurface(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
-        std::string mat = strOf(b, "material");
-        if (mat.empty()) { fail("isosurface needs a material"); return false; }
-        int id = matId(mat); if (!err.empty()) return false;
+        int id = matFieldId(b, L, "isosurface"); if (id < 0) return false;
         // The enclosing group's transform (identity at top level) composes OUTSIDE the
         // isosurface's own translate/rotate/scale, so a settled `group { translate ..
         // rotate .. <isosurface> }` rest pose bakes into the field's local->world map.

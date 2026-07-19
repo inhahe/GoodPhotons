@@ -91,6 +91,17 @@ struct Material {
     int filmThicknessPat = -1;
     int mixWeightPat = -1;   // drives child-0 selection prob of a 2-child Mix (see mixResolveChild)
 
+    // --- Parametric-record drive (§records) ---------------------------------
+    // When recordIndex >= 0 this material's slots are driven by a record (a named
+    // per-channel LUT bank, Scene::records) sampled at a per-hit DRIVER scalar.
+    // recordDriver is the compiled driver expression, evaluated in the hit's PatCtx.
+    // Each rec*Chan is the record channel bound to a slot by name-match at load
+    // (-1 = the record has no such channel, so the slot keeps its constant value).
+    int recordIndex    = -1;
+    std::vector<PatNode> recordDriver;
+    int recReflectChan = -1;   // spectrum channel -> diffuse reflect albedo
+    int recRoughChan   = -1;   // scalar channel   -> glossy roughness
+
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
     // A thin dielectric coating of index filmIor and thickness filmThickness (in
     // nanometres) over a substrate whose index is `ior`. Interference between the
@@ -1063,11 +1074,22 @@ struct Scene {
     }
 };
 
+// Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
+// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
+inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
+
 // Diffuse albedo at a hit: the material's spatially-varying texture reflectance if
 // one is bound (Phase 3b), else its constant `reflect` spectrum. Shared by the
 // forward tracer and the backward reference so both see identical albedo.
 inline double diffuseReflectance(const Scene& scene, const Material& m,
                                  const Hit& h, double lambda) {
+    if (m.recordIndex >= 0 && m.recReflectChan >= 0 &&
+        m.recordIndex < (int)scene.records.size()) {
+        const Record& rec = scene.records[m.recordIndex];
+        double d = patternEval(m.recordDriver.data(), (int)m.recordDriver.size(),
+                               patCtxFromHit(h));
+        return recReflectanceAt(rec, rec.channels[m.recReflectChan], d, lambda);
+    }
     if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
         const Texture& tx = scene.textures[m.reflectTex];
         if (m.triplanarScale > 0.0)
@@ -1076,10 +1098,6 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
     }
     return m.reflect(lambda);
 }
-
-// Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
-// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
-inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern
 // value, or `dflt` if `pat` is out of range.
@@ -1094,6 +1112,14 @@ inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double 
 // constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf see the
 // SAME roughness at a hit — otherwise the density and the sample diverge.
 inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.recordIndex >= 0 && m.recRoughChan >= 0 &&
+        m.recordIndex < (int)scene.records.size()) {
+        const Record& rec = scene.records[m.recordIndex];
+        PatCtx c = patCtxFromHit(h);
+        double d = patternEval(m.recordDriver.data(), (int)m.recordDriver.size(), c);
+        double r = recSampleScalar(rec, rec.channels[m.recRoughChan], d, c);
+        return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
+    }
     if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
         double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(h));
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);

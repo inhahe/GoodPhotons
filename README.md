@@ -585,7 +585,10 @@ stay non-resumable.
   same pattern VM, and threads the interior-absorption medium through both the forward
   and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
   material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
-  reproduce. `cpu` is fully deterministic and is used for reference/validation baselines.
+  reproduce. **Parametric records** (a material's slots driven by a per-hit driver
+  sampling a named LUT bank — see *Parametric records* below) are **CPU-only** for now:
+  a scene that binds a record falls back from the GPU forward/backward tracer
+  automatically. `cpu` is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -781,6 +784,30 @@ isosurfaces alike — isosurface overlap is detected conservatively by comparing
 material "water" { type dielectric ior 1.33  priority 1 }
 material "glass" { type dielectric ior 1.52  priority 2 }   # wins where it overlaps water
 ```
+
+**Parametric records.** A **record** is a named bank of per-channel look-up tables over
+a shared scalar domain `[lo,hi]`. A single per-hit **driver** scalar samples every
+channel at once, and each channel whose name matches a material slot fills that slot at
+the driven value — so one expression coordinates a sweep across a material's slots
+(`reflect` → diffuse albedo, `roughness` → glossy roughness). Colour channels list
+prefixed spectrum refs and interpolate in linear RGB (then upsample back to a
+reflectance); scalar channels list pattern expressions (the same math VM as procedural
+patterns). `interp nearest|linear|smooth` selects the sampling mode — `smooth` is a
+monotone Fritsch–Carlson cubic (no overshoot).
+
+```
+grad = range 0-1 [
+    reflect  spectrum:steel  spectrum:gold  spectrum:copper   # steel -> gold -> copper
+    interp   smooth
+]
+sphere { center 0 0 0  radius 1  material grad(u) }                   # sweep along u
+sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled by noise
+```
+
+Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
+is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
+Records are **CPU-only** for now — a scene that binds one falls back from the GPU
+tracer automatically. See FTSL.md §7.5 for the full grammar.
 
 ---
 

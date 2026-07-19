@@ -343,6 +343,52 @@ material "carpaint" {
 }
 ```
 
+### 7.5 `record` — parametric slot LUTs
+
+A **record** is a named bank of per-channel look-up tables over a shared scalar
+domain `[lo,hi]`. A per-hit **driver** scalar samples every channel at once; each
+channel whose name matches a real material slot fills that slot at the driven value.
+This turns a single expression into a coordinated sweep across a material's slots.
+
+```
+# palette that ramps a diffuse albedo steel -> gold -> copper across the domain 0..1
+grad = range 0-1 [
+    reflect   spectrum:steel  spectrum:gold  spectrum:copper
+    roughness 0.05  p:0.7 0.4  0.6
+    interp    smooth
+]
+```
+
+- **Declaration:** `NAME = range LO-HI [ … ]` (top-level, like `spectrum`/`pattern`).
+  The domain is `LO-HI` or `LO HI` with `HI > LO`.
+- **Channels** are one line each, `name stop stop …`. The channel **name is matched
+  to a material slot by destination** — `reflect` drives the diffuse albedo,
+  `roughness` drives the glossy roughness. A name that matches no slot is simply not
+  auto-bound (reserved for later stages); a slot with no channel keeps its constant.
+- **Stops** are laid out evenly across the domain. Prefix any stop with `p:<pos>` to
+  **pin** it to an explicit domain position; unpinned runs redistribute between the
+  pinned anchors. Positions must stay in `[lo,hi]` and be non-decreasing.
+- A channel is a **colour** LUT iff its stops are prefixed spectrum refs (they contain
+  `:`, e.g. `spectrum:steel`, `metal:copper`); otherwise it is a **scalar** LUT whose
+  stops are pattern expressions (a literal, or math over `x y z nx ny nz r u v f` and
+  functions like `noise(…)` — the §6.1 language). A channel may not mix the two.
+- **`interp nearest|linear|smooth`** selects the sampling mode (default `linear`).
+  `smooth` is a monotone (Fritsch–Carlson) cubic — no overshoot. Colour channels
+  interpolate in linear RGB, then upsample back to a reflectance spectrum.
+
+**Binding a record to geometry** uses the inline `material NAME(driver)` form in any
+primitive's `material` field, where `driver` is a pattern expression evaluated per
+hit:
+
+```
+sphere { center 0 0 0  radius 1  material grad(u) }              # sweep along u
+sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled by noise
+```
+
+> **GPU note:** record-driven materials currently render on the **CPU only** — a scene
+> that binds a record falls back from the GPU forward/backward tracer automatically
+> (`[device] … -> CPU (…parametric record…)`). GPU parity is a later stage.
+
 ---
 
 ## 8. Geometry primitives

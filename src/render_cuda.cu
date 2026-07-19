@@ -4818,9 +4818,18 @@ bool cudaForwardSupported(const Scene& scene) {
     // frosted/colored glass nor a roughness/film/mix-weight pattern forces a CPU forward
     // fallback here. (The GPU BDPT kernel still can't MIS either — cudaBdptSupported gates
     // both.) Implicit surfaces (isosurface) are gated separately below.
+    // Parametric records (§records) drive a material's slots from a per-hit driver
+    // sampling a named LUT bank. The device shading path has no record support yet
+    // (GPU parity is a later stage), so any record-bound material forces the CPU
+    // forward/backward tracer — otherwise the slot keeps its unset constant (black).
+    auto usesRecord = [&](int matId) {
+        return matId >= 0 && matId < (int)scene.mats.size() &&
+               scene.mats[matId].recordIndex >= 0;
+    };
     auto unsupported = [&](int matId) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
+        if (usesRecord(matId)) return true;
         // The physical layered stack (coat interface over a weighted body) is CPU-only;
         // the device shadeStep has no Layered branch, so any Layered material forces a
         // CPU forward/backward fallback (like indexed palettes).
