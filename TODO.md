@@ -1171,6 +1171,32 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       ftrace until the GraphParser front-end lands. To keep "everything loom emits is renderable" true at every
       commit, build the shared EPEG grammar + ftrace GraphParser front-end **before/in lockstep with** J3b item 3,
       not after. This front-loads the C++ parser work but never leaves an un-renderable emission window.
+      **SCOPE CALL (2026-07-19) — stop the loom reader at "grammar proven", do NOT grind it breadth-first.** The
+      load-bearing deliverable is the *grammar* (→ ftrace's C++ front-end); loom's Python reader is the proving
+      ground. Once enough element shapes are covered to validate the grammar (record / material / texture / sphere /
+      light / camera — DONE), stop extending the loom reader and pivot to (i) porting the grammar into ftrace and
+      (ii) J3b item 3. Remaining loom-reader breadth (mesh-ref, `medium`, `pattern`, whole-`scene` wrapper + a
+      `Scene` builder) is deferred — see next bullet.
+- [ ] **FUTURE — loom full `.ftsl` read support** (deferred out of J3c above). Give loom a complete `.ftsl` → `Scene`
+      reader (not just per-element round-trip): the whole-file `scene { … }` wrapper rule + a `Scene` builder that
+      reassembles textures/patterns/records/materials/geometry/lights/camera into a live `Scene`, plus the lossy
+      cases (`mesh { file … }` → a new lightweight `MeshRef` element that re-emits the same block; `medium`, `pattern`,
+      `camera_curve`). **Motivating consumer: an editor/GUI** (load an existing `.ftsl`, manipulate in loom's object
+      model, re-emit) and possibly the raster preview loading authored scenes. Not on any current critical path — the
+      grammar's real job is ftrace's parser — so this waits until a concrete editor need exists.
+- [ ] **PROPOSAL — unify element headers to `name = KIND { … }` (and anonymous `KIND { … }`).** Today elements
+      spell their name inconsistently: records already use `NAME = range LO-HI [ … ]` (a `name = kind …` binding),
+      but materials/textures/cameras use `KIND "name" { … }`. The cleaner, more programmatic form (per user, 2026-07-19)
+      is to make *every* named element a binding — `hero = camera { … }`, `gold = material { … }`, `hide = texture
+      { … }` — with the **anonymous** variety just dropping the `name =` (`camera { … }`, a nameless light, etc.).
+      This unifies the whole scene grammar under one `binding = (NAME '=')? KIND block` shape (records fold in as the
+      `range` kind), reads like assignment, and makes anonymity natural. Touches both loom's emitters (§ scene.py
+      `emit`) and the shared grammar in lockstep; do it **before** the grammar ossifies into ftrace's C++ front-end so
+      both sides adopt the new header at once. Decide alongside item 3 / the ftrace port.
+- [ ] **SHIP — bundle GPDA with the ftrace release.** The GraphParser (GPDA) is becoming ftrace's scene front-end,
+      so the shipped product now depends on it. Ensure `release.bat` / the release artifact carries the GPDA parser
+      (vendored into ftrace's build, like loom vendored `_gpda.py`) and that a clean checkout builds/ships without an
+      external GraphParser checkout. (Reminder logged 2026-07-19.)
 - **Dependency note:** the FTSL record itself (§0) is fully implemented (Stages 1–6 + GPU parity DONE), so
   this is a loom-side mirror + parser effort, not blocked on ftrace.
 - [ ] **FUTURE — loom retime / 4D time-shear node** (deferred; unlocked once `t` is a first-class input, J3b item 3).

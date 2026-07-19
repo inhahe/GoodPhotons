@@ -5,6 +5,46 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN BUG (2026-07-19): `gallery_settled.ftsl` — several objects mis-positioned (e.g. resting through the floor)
+User reports that in `gallery_settled.ftsl` several objects sit in the wrong place — notably some
+appear on / sunk into the floor rather than where they belong. Not yet root-caused. Candidates to
+check: (a) the "settle" bake (if positions were produced by a physics/relaxation pass, an off-by-one
+frame or a stale bake), (b) a loom emit vs ftrace-parse mismatch on transform/center ordering for
+whatever primitives are involved, (c) a floor plane at the wrong height. **Repro:** render
+`gallery_settled.ftsl` and compare object placement to intent. **Next step:** diff the emitted
+positions against the authoring script, and render a single-frame `-window` still to see which
+objects are off. (Distinct from the separate OPEN mode-D GPU-BDPT launch-failure on the same scene,
+logged 2026-07-15.)
+
+### FEATURE REQUEST (2026-07-19): cache ftrace's per-scene preprocessing before rasterizing
+Add an option to **cache the scene-derived data ftrace computes at load** (tessellation / BVH /
+material+texture bake / whatever the rasterizer consumes) to disk, keyed on the scene (hash of the
+`.ftsl` + referenced assets), so re-opening the same scene in the raster preview skips the rebuild.
+Motivation: interactive raster/preview startup on a heavy scene repeats expensive preprocessing every
+launch. Design notes: invalidate on any input change (scene text, mesh/texture/vdb asset mtimes,
+relevant CLI flags that affect the baked data); store next to the scene or in a sidecar cache dir;
+make it opt-in (`-scene-cache` or similar) at first. Overlaps conceptually with the `.ftbuf`
+checkpoint sidecar but is about *input* preprocessing, not *output* accumulation.
+
+### PERF (2026-07-19): preview rasterizer much slower than an equivalent WebGL renderer
+Our software/CUDA preview rasterizer is far slower than a WebGL rendition of a comparable scene.
+Needs profiling before any fix. Likely factors to measure: (a) we rasterize on the CPU in double
+precision by default (GPU path is opt-in via `-device gpu|auto`), where WebGL is GPU float hardware
+with fixed-function raster; (b) per-frame host readback + p99 auto-exposure on the host each frame
+(known-issues "Per-frame readback"); (c) we re-tessellate / rebuild scene data per launch (see the
+scene-cache request above); (d) no persistent GPU-resident vertex buffers / we may re-upload. **Next
+step:** profile a representative scene (CPU vs `-raster-gpu`) to find the actual bottleneck rather
+than guessing; compare against what a trivial WebGL draw of the same triangle count costs. This is a
+"why is it slow" investigation, not a confirmed single bug.
+
+### FEATURE REQUEST (2026-07-19): option for curve-editor curve to be occluded by geometry in front of it
+The camera-path / curve overlay shown in the curve editor currently draws over everything (an
+always-on-top helper). Add an **option** to instead depth-test the curve against the scene so objects
+in front of it occlude it (more spatially truthful), while keeping the always-visible mode available
+(often you *want* to see the whole path through geometry). Implementation: test the curve fragments'
+depth against the opaque z-buffer the rasterizer already produces; expose as a toggle (CLI flag +/or
+editor control). Low risk — the z-buffer is already there.
+
 ### DONE (2026-07-19): loom RBF scatter field rebuilt the interpolator every frame
 `RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) used to rebuild the
 `scipy.interpolate.RBFInterpolator` once per frame, gated only on the frame number, even when
