@@ -231,9 +231,17 @@ which may parse/emit the flexible form and lower a `D=3` channel down to the
 
 A material property is an **expression over named inputs**, and access is *always
 continuous* — there is no separate discrete stop-selector operator. (An array
-`[0 0 0, 1 1 1]`, a pinned array `[0 0 0, .5:1 1 1]`, and a formula `a*.5` are all just
-expressions that resolve to a value over the driver domain; a constant "index" is simply
-a constant argument, `color(2)`, so the shipped discrete `R.chan[i]` form is subsumed.)
+`[0 0 0, 1 1 1]`, a pinned array `[0 0 0, .5:1 1 1]`, a formula `a*.5`, and a bare
+constant `.5` are all just expressions that resolve to a value over the driver domain; a
+constant "index" is simply a constant argument, `color(2)`, so the shipped discrete
+`R.chan[i]` form is subsumed.)
+
+A **bare constant is the degenerate curve** — a zero-variation function over the whole
+domain: `reflect "reflect" = .5` ≡ `[.5]` ≡ `[.5 .5]`, so `gold.reflect(u)` is legal and
+returns `.5` for every `u` (it simply ignores its driver). The consequence: **sampling
+never fails on type grounds** — a consumer may always write `gold.prop(x)` without knowing
+whether the author wrote a constant, an array, or a formula. "Constant vs array vs
+function" is purely an *authoring* convenience, never a *usage* wall.
 
 An **input** is one of:
 
