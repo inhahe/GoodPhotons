@@ -1226,8 +1226,13 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     std::vector<EnergyReport> reports(nThreads);
     for (auto& f : films) { f.resX = resX; f.resY = resY; f.alloc(); }
 
+    // Hero-wavelength sampling: on when C>1 and the scene has no participating media /
+    // GRIN (dispersive interfaces de-hero mid-path). Forward modes A/B/C all qualify —
+    // the finite-lens pupil is achromatic, so the C wavelengths share the connection.
+    const bool heroOn = (hero::kHeroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
+        r.useHero = heroOn;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
                             (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
@@ -1277,8 +1282,10 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     for (int t = 0; t < nThreads; ++t)
         for (int c = 0; c < nc; ++c) { films[t][c].resX = resX[c]; films[t][c].resY = resY[c]; films[t][c].alloc(); }
 
+    const bool heroOn = (hero::kHeroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
+        r.useHero = heroOn;
         // Identical seeding to renderForward. For model B this makes each camera's shared
         // film bit-identical to its standalone single-camera render (at seedBase 0); for
         // model A the aperture draws perturb the stream, so it matches in distribution.

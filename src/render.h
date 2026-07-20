@@ -23,6 +23,7 @@
 #include "photonmap.h"
 #include "medium_stack.h"
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
+#include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -263,6 +264,11 @@ struct Renderer {
                                  // pupil (physical camera with depth of field).
     bool diffraction = true;     // when false, MatType::Grating collapses to its m=0
                                  // (specular) order — a plain mirror (CLI -diffraction).
+    bool useHero      = false;   // hero-wavelength sampling: each photon carries C
+                                 // wavelengths (hero + C-1 stratified secondaries) down
+                                 // one shared BVH walk, cutting chromatic noise. Gated ON
+                                 // by the driver only when kHeroC>1 and the scene has no
+                                 // media / GRIN (dispersive events de-hero mid-path).
 
     // Photon-map deposit (ROADMAP item 1 / mode M). When non-null, every diffuse-family
     // surface vertex ALSO appends a Photon record here (view-independent radiance cache).
@@ -387,6 +393,47 @@ struct Renderer {
         return Tr;
     }
 
+    // Wavelength-INDEPENDENT part of the mode-B pinhole connection: project the surface
+    // vertex to the film, reject/soften across the horizons, and occlusion-test the
+    // shadow ray. On success returns true and fills `g` with the pixel and the geometry
+    // factors, from which the caller forms the per-λ contribution as
+    //   beta * (rho/PI) * cosSurf * corr / denom * stG  (× media transmittance).
+    // Sharing this across the C hero wavelengths (one BVH occlusion test, one projection)
+    // is the whole point of hero splatting; the scalar connect() below reuses it too so
+    // its float ordering — and thus mode B — stays bit-identical.
+    struct ConnGeom {
+        int px = 0, py = 0;
+        double cosSurf = 0, corr = 0, denom = 0, stG = 0, dist = 0;
+        Vec3 wdir;
+    };
+    bool connectGeom(const Scene& scene, const Camera& cam, const Vec3& p, const Vec3& n,
+                     const Vec3& ng, const Vec3& wi, ConnGeom& g) const {
+        Vec3 toCam = cam.eye - p;
+        g.dist = length(toCam);
+        g.wdir = toCam / g.dist;
+        g.cosSurf = dot(n, g.wdir);
+        // Reject connections below the shading horizon; soften across the GEOMETRIC
+        // horizon (`ng` is the geometric normal on the shading side). A smoothed shading
+        // normal must not splat a vertex whose true geometry faces away from the camera,
+        // but a hard cutoff there carves facet slivers at the terminator, so ramp it
+        // smoothly (Chiang 2019). No-op for flat tris / analytic spheres, where ng == n
+        // (stG == 1), so those scenes stay bit-identical.
+        if (g.cosSurf <= 0) return false;               // camera behind shading surface
+        g.stG = shadowTerminatorG(g.wdir, n, ng);
+        if (g.stG <= 0.0) return false;                 // camera behind true geometry: hard cutoff
+        double cosCam, dist2;
+        if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
+        if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6)) return false;
+        double omega = cam.pixelSolidAngle(cosCam);
+        // Veach shading-normal adjoint correction for this particle connection
+        // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
+        // cosSurf * corr = cos(wo,Ng)*cos(wi,Ns)/cos(wi,Ng), so the grazing cosSurf
+        // cancels analytically and this stays bounded. Exactly 1 when Ns == Ng.
+        g.corr = shadingAdjointCorr(wi, g.wdir, n, ng);
+        g.denom = dist2 * omega;
+        return true;
+    }
+
     // Model B: connect a surface vertex to the pinhole and splat onto the film.
     // f = rho/pi (Lambertian). The measurement contribution of a surface patch into
     // one pixel is  beta * f * cosSurf / (dist^2 * Omega_pix), where Omega_pix is the
@@ -396,36 +443,33 @@ struct Renderer {
     void connect(const Scene& scene, const Camera& cam, Film& film,
                  const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                  double lambda, double beta, double rho, Pcg32& rng) const {
-        Vec3 toCam = cam.eye - p;
-        double dist = length(toCam);
-        Vec3 wdir = toCam / dist;
-        double cosSurf = dot(n, wdir);
-        // Reject connections below the shading horizon; soften across the GEOMETRIC
-        // horizon (`ng` is the geometric normal on the shading side). A smoothed shading
-        // normal must not splat a vertex whose true geometry faces away from the camera,
-        // but a hard cutoff there carves facet slivers at the terminator, so ramp it
-        // smoothly (Chiang 2019). No-op for flat tris / analytic spheres, where ng == n
-        // (stG == 1), so those scenes stay bit-identical.
-        if (cosSurf <= 0) return;                       // camera behind shading surface
-        double stG = shadowTerminatorG(wdir, n, ng);
-        if (stG <= 0.0) return;                         // camera behind true geometry: hard cutoff
-        int px, py; double cosCam, dist2;
-        if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
-
+        ConnGeom g;
+        if (!connectGeom(scene, cam, p, n, ng, wi, g)) return;
         double f = rho / PI;
-        double omega = cam.pixelSolidAngle(cosCam);
-        // Veach shading-normal adjoint correction for this particle connection
-        // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
-        // cosSurf * corr = cos(wo,Ng)*cos(wi,Ns)/cos(wi,Ng), so the grazing cosSurf
-        // cancels analytically and this stays bounded. Exactly 1 when Ns == Ng.
-        double corr = shadingAdjointCorr(wi, wdir, n, ng);
-        double contrib = beta * f * cosSurf * corr / (dist2 * omega) * stG;
+        double contrib = beta * f * g.cosSurf * g.corr / g.denom * g.stG;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
-        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+            contrib *= mediaTransmittance(scene.media, p, g.wdir, g.dist, lambda, rng);
+        film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Hero-wavelength mode-B connection: one shared connectGeom, then splat each of the
+    // `nUp` live wavelengths with its own throughput beta[i] and reflectance rho[i]. The
+    // per-λ contribution uses the SAME float ordering as connect() above.
+    void connectHero(const Scene& scene, const Camera& cam, Film& film,
+                     const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                     const double* lam, const double* beta, const double* rho, int nUp,
+                     Pcg32& rng) const {
+        ConnGeom g;
+        if (!connectGeom(scene, cam, p, n, ng, wi, g)) return;
+        for (int i = 0; i < nUp; ++i) {
+            double f = rho[i] / PI;
+            double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom * g.stG;
+            if (!scene.media.empty())
+                contrib *= mediaTransmittance(scene.media, p, g.wdir, g.dist, lam[i], rng);
+            film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
+        }
     }
 
     // Model B for a VOLUME scattering vertex: connect the collision point to the
@@ -512,6 +556,44 @@ struct Renderer {
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
+    // Hero-wavelength model-A splat: one shared aperture sample (drawn once, so the RNG
+    // stream is identical whatever C is) and a single lens/occlusion geometry, then splat
+    // each of the `nUp` live wavelengths with its own beta[i]/rho[i]. The finite-lens
+    // pupil is achromatic (thin-lens geometry, no per-λ dispersion), so C wavelengths
+    // legitimately share the connection — same as mode B. Per-λ ordering matches
+    // connectLens() above.
+    void connectLensHero(const Scene& scene, const Camera& cam, Film& film,
+                         const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                         const double* lam, const double* beta, const double* rho, int nUp,
+                         Pcg32& rng) const {
+        double R = cam.apertureR;
+        double rr = R * std::sqrt(rng.uniform());
+        double a  = 2.0 * PI * rng.uniform();
+        Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        Vec3 toA = A - p;
+        double dist = length(toA);
+        if (dist < 1e-9) return;
+        Vec3 wdir = toA / dist;
+        double cosSurf = dot(n, wdir);
+        if (cosSurf <= 0) return;                        // pupil behind the shading surface
+        double stG = shadowTerminatorG(wdir, n, ng);
+        if (stG <= 0.0) return;                          // pupil behind true geometry
+        double cosLens = -dot(wdir, cam.w);
+        if (cosLens <= 1e-6) return;                     // not heading toward the film
+        int px, py;
+        if (!cam.lensImage(A, wdir, px, py)) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6)) return;
+        double corr = shadingAdjointCorr(wi, wdir, n, ng);
+        double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+        for (int i = 0; i < nUp; ++i) {
+            double contrib = beta[i] * rho[i] * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+            contrib *= cellNorm;
+            if (!scene.media.empty())
+                contrib *= mediaTransmittance(scene.media, p, wdir, dist, lam[i], rng);
+            film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
+        }
+    }
+
     // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
     // surface BRDF*cosSurf is replaced by albedo*phase; the phase function carries no
     // 1/pi, so the pupil pdf's pi R^2 stays. wIn is the photon's incoming direction.
@@ -561,6 +643,23 @@ struct Renderer {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
                 camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng);
+    }
+
+    // Hero-wavelength routing (mode A finite lens or mode B pinhole), splatting all `nUp`
+    // live wavelengths through one shared connection. Mode B draws no RNG (RNG-neutral
+    // over the camera loop); mode A draws its single aperture sample once per camera.
+    void camSplatHero(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
+                      const Vec3& n, const Vec3& ng, const Vec3& wi, const double* lam,
+                      const double* beta, const double* rho, int nUp, Pcg32& rng) const {
+        if (lensMode) connectLensHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng);
+        else          connectHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng);
+    }
+    void camSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+                         const Vec3& n, const Vec3& ng, const Vec3& wi, const double* lam,
+                         const double* beta, const double* rho, int nUp, Pcg32& rng) const {
+        for (int c = 0; c < nCam; ++c)
+            if (cams[c].cam && cams[c].film)
+                camSplatHero(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lam, beta, rho, nUp, rng);
     }
 
     // ===================================================================
@@ -962,6 +1061,19 @@ struct Renderer {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
     }
+    // Hero variant: the sphere refraction is DISPERSIVE (glass IOR varies per λ), so it
+    // cannot share one geometry — each wavelength traces its own refracted image, which
+    // is exactly what makes the glass-sphere caustic-image chromatically dispersed. Draws
+    // no RNG (mode B), so looping λ leaves the stream untouched.
+    void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam,
+                                 const Vec3& p, const Vec3& n, const double* lam,
+                                 const double* beta, const double* rho, int nUp,
+                                 Pcg32& rng) const {
+        for (int i = 0; i < nUp; ++i) {
+            SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho[i];
+            camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lam[i], beta[i], rng);
+        }
+    }
     // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
     // glowing haze itself bends through the glass the camera flies through.
     void camSpecularSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
@@ -984,6 +1096,167 @@ struct Renderer {
             }
     }
 
+    // Specular / wavelength-switching material interaction for the forward photon tracer:
+    // the nine families that are NOT Diffuse / DiffuseTransmit (Dielectric, ThinFilm,
+    // Multilayer, Mirror, Grating, HalfMirror, Filter, Glossy, Fluorescent). Mutates
+    // `ray`, `beta`, `lambda` (Fluorescent Stokes shift) and the dielectric priority
+    // `stk`; on absorption/termination it books the loss into `e` and returns false.
+    // Returns true to keep bouncing. Shared verbatim by the scalar tracePhoton and, after
+    // de-hero, by tracePhotonHero — so there is a single source of truth for these lobes.
+    bool interactPhotonSpecular(const Scene& scene, const CamTarget* cams, int nCam,
+                                const Material& m, const Hit& h, Ray& ray, double& beta,
+                                double& lambda, MediumStack& stk, Pcg32& rng,
+                                EnergyReport& e) const {
+        switch (m.type) {
+            case MatType::Dielectric: {
+                // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): the
+                // exterior IOR is the medium the photon is currently inside (the
+                // highest-priority stack entry), not a hardcoded 1.0, so glass inside
+                // water refracts 1.33<->1.52. Where dielectrics overlap the higher
+                // `priority` wins and the lower one's boundary is suppressed (the
+                // photon passes straight through). SAFE FALLBACK: the priority rule
+                // applies only when BOTH sides carry an explicit priority (air always
+                // counts, IOR 1.0); otherwise this degrades to the old flat
+                // air<->glass model so priority-free scenes are bit-identical.
+                bool entering = dot(ray.d, h.ng) < 0.0;
+                const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
+                const int pr = m.priority;               // INT_MIN if unset
+
+                if (entering) {
+                    const int outMat = stk.topMat();     // -1 == air
+                    const int outPri = stk.topPri();     // INT_MIN == air
+                    const bool ranked = m.hasPriority() &&
+                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
+                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
+                        stk.push(mi, pr);
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                        return true;
+                    }
+                    const double extIor = (ranked && outMat >= 0)
+                        ? scene.mats[outMat].ior(lambda) : 1.0;
+                    bool transmitted = false;
+                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                    if (transmitted) stk.push(mi, pr);
+                    return true;                 // lossless (absorption applied per-segment)
+                } else {
+                    MediumStack after = stk;
+                    after.popMat(mi);
+                    const int newMat = after.topMat();   // -1 == air underneath
+                    const int newPri = after.topPri();
+                    const bool ranked = m.hasPriority() &&
+                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
+                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
+                        stk.popMat(mi);
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                        return true;
+                    }
+                    const double extIor = (ranked && newMat >= 0)
+                        ? scene.mats[newMat].ior(lambda) : 1.0;
+                    bool transmitted = false;
+                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                    if (transmitted) stk.popMat(mi);      // TIR stays inside mi
+                    return true;                 // lossless (absorption applied per-segment)
+                }
+            }
+            case MatType::ThinFilm: {
+                // Iridescent coated interface: specular reflect-or-refract with a
+                // thin-film interference reflectance (structural colour). With an
+                // absorbing substrate the transmitted fraction is absorbed here.
+                Ray nr;
+                if (!thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return false; }
+                ray = nr;
+                return true;                     // lossless on survival; beta unchanged
+            }
+            case MatType::Multilayer: {
+                // Multilayer (Bragg / dichroic) stack: specular reflect-or-
+                // refract with the Abeles full-stack reflectance. Absorbing
+                // stacks/substrates absorb the transmitted fraction here.
+                Ray nr;
+                if (!multilayerInterface(m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return false; }
+                ray = nr;
+                return true;                     // lossless on survival; beta unchanged
+            }
+            case MatType::Mirror: {
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
+                // Russian roulette: absorb with prob (1-r), else reflect with
+                // beta unchanged. Unbiased and caps path length naturally.
+                if (rng.uniform() >= r) { e.absorbed += beta; return false; }
+                Vec3 o = reflect(ray.d, h.n);
+                ray = Ray{h.p + h.n * 1e-6, o};
+                return true;
+            }
+            case MatType::Grating: {
+                // Diffraction grating: RR on the overall reflectivity, then
+                // deflect into one stochastically-chosen order (exact grating
+                // equation). Specular per order -> no camera connect (mode P /
+                // the caustic on diffuse walls makes it visible).
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
+                if (rng.uniform() >= r) { e.absorbed += beta; return false; }
+                bool absorbedG;
+                Ray nr = gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
+                if (absorbedG) { e.absorbed += beta; return false; }
+                ray = nr;
+                return true;                     // beta unchanged on the chosen order
+            }
+            case MatType::HalfMirror: {
+                double r = clamp01(reflectSlot(scene, m, h, lambda)); // reflect probability
+                if (rng.uniform() < r) {
+                    Vec3 o = reflect(ray.d, h.n);
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                } else {
+                    ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight
+                }
+                return true;                     // lossless split
+            }
+            case MatType::Filter: {
+                // Colored gel / Wratten filter: a thin non-scattering absorber.
+                // The photon passes straight through (direction unchanged) and
+                // survives with probability T(lambda), else is absorbed. Russian
+                // roulette on the transmittance keeps beta unchanged and unbiased —
+                // the wavelength-dependent survival IS the colored transmission.
+                // Specular straight-through, so no camera connect (like clear glass):
+                // you see the filter's effect on whatever lies behind it.
+                double t = clamp01(m.transmit(lambda));
+                if (rng.uniform() >= t) { e.absorbed += beta; return false; }
+                ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
+                return true;
+            }
+            case MatType::Glossy: {
+                double r = clamp01(reflectSlot(scene, m, h, lambda));
+                // Russian roulette on reflectance (see Mirror).
+                if (rng.uniform() >= r) { e.absorbed += beta; return false; }
+                Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                if (dot(o, h.n) <= 0) { e.absorbed += beta; return false; } // below surface
+                ray = Ray{h.p + h.n * 1e-6, o};
+                return true;
+            }
+            case MatType::Fluorescent: {
+                double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
+                Vec3 ngo = orientedGeoN(h);
+                Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
+                // Model-B connections: the elastic channel splats at the
+                // incoming lambda; the fluorescent channel samples one
+                // lambda' ~ M and splats the glow (albedo aEff*Q) with the
+                // camera-response evaluated at lambda' (Stokes-shifted colour).
+                if (nCam > 0 && !forwardCatch) {
+                    camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
+                    if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
+                        double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
+                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lp, beta, aEff * m.fluoYield, rng);
+                    }
+                }
+                FluoroResult fr = fluoroInteract(m, lambda, rng);
+                if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return false; }
+                lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
+                Vec3 wo = cosineHemisphere(h.n, rng);
+                beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                ray = Ray{h.p + h.n * 1e-6, wo};
+                return true;                        // beta otherwise unchanged (see above)
+            }
+            default: return true;                   // unreachable (diffuse handled by callers)
+        }
+    }
+
     // Back-compat single-camera entry point (sensorFilm XOR cam+camFilm, as before).
     void tracePhoton(const Scene& scene, const Camera* cam, Film* sensorFilm,
                      Film* camFilm, Pcg32& rng, EnergyReport& e) const {
@@ -998,6 +1271,7 @@ struct Renderer {
     // multi-camera shared pass is model B only. The caller supplies per-thread films.
     void tracePhoton(const Scene& scene, const CamTarget* cams, int nCam,
                      Film* sensorFilm, Pcg32& rng, EnergyReport& e) const {
+        if (useHero) { tracePhotonHero(scene, cams, nCam, sensorFilm, rng, e); return; }
         // --- Emission ---
         // Power-weighted emitter selection: photon selects emitter k with prob
         // power_k/totalPower and carries beta = totalPower, so E[beta over the
@@ -1198,150 +1472,20 @@ struct Renderer {
             // Specular/glossy vertices skip the camera connection (delta or
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
-                case MatType::Dielectric: {
-                    // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): the
-                    // exterior IOR is the medium the photon is currently inside (the
-                    // highest-priority stack entry), not a hardcoded 1.0, so glass inside
-                    // water refracts 1.33<->1.52. Where dielectrics overlap the higher
-                    // `priority` wins and the lower one's boundary is suppressed (the
-                    // photon passes straight through). SAFE FALLBACK: the priority rule
-                    // applies only when BOTH sides carry an explicit priority (air always
-                    // counts, IOR 1.0); otherwise this degrades to the old flat
-                    // air<->glass model so priority-free scenes are bit-identical.
-                    bool entering = dot(ray.d, h.ng) < 0.0;
-                    const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
-                    const int pr = m.priority;               // INT_MIN if unset
-
-                    if (entering) {
-                        const int outMat = stk.topMat();     // -1 == air
-                        const int outPri = stk.topPri();     // INT_MIN == air
-                        const bool ranked = m.hasPriority() &&
-                            (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
-                        if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
-                            stk.push(mi, pr);
-                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                            continue;
-                        }
-                        const double extIor = (ranked && outMat >= 0)
-                            ? scene.mats[outMat].ior(lambda) : 1.0;
-                        bool transmitted = false;
-                        ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
-                        if (transmitted) stk.push(mi, pr);
-                        continue;                   // lossless (absorption applied per-segment)
-                    } else {
-                        MediumStack after = stk;
-                        after.popMat(mi);
-                        const int newMat = after.topMat();   // -1 == air underneath
-                        const int newPri = after.topPri();
-                        const bool ranked = m.hasPriority() &&
-                            (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
-                        if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
-                            stk.popMat(mi);
-                            ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                            continue;
-                        }
-                        const double extIor = (ranked && newMat >= 0)
-                            ? scene.mats[newMat].ior(lambda) : 1.0;
-                        bool transmitted = false;
-                        ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
-                        if (transmitted) stk.popMat(mi);      // TIR stays inside mi
-                        continue;                   // lossless (absorption applied per-segment)
-                    }
-                }
-                case MatType::ThinFilm: {
-                    // Iridescent coated interface: specular reflect-or-refract with a
-                    // thin-film interference reflectance (structural colour). With an
-                    // absorbing substrate the transmitted fraction is absorbed here.
-                    Ray nr;
-                    if (!thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return; }
-                    ray = nr;
-                    continue;                       // lossless on survival; beta unchanged
-                }
-                case MatType::Multilayer: {
-                    // Multilayer (Bragg / dichroic) stack: specular reflect-or-
-                    // refract with the Abeles full-stack reflectance. Absorbing
-                    // stacks/substrates absorb the transmitted fraction here.
-                    Ray nr;
-                    if (!multilayerInterface(m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return; }
-                    ray = nr;
-                    continue;                       // lossless on survival; beta unchanged
-                }
-                case MatType::Mirror: {
-                    double r = clamp01(reflectSlot(scene, m, h, lambda));
-                    // Russian roulette: absorb with prob (1-r), else reflect with
-                    // beta unchanged. Unbiased and caps path length naturally.
-                    if (rng.uniform() >= r) { e.absorbed += beta; return; }
-                    Vec3 o = reflect(ray.d, h.n);
-                    ray = Ray{h.p + h.n * 1e-6, o};
-                    continue;
-                }
-                case MatType::Grating: {
-                    // Diffraction grating: RR on the overall reflectivity, then
-                    // deflect into one stochastically-chosen order (exact grating
-                    // equation). Specular per order -> no camera connect (mode P /
-                    // the caustic on diffuse walls makes it visible).
-                    double r = clamp01(reflectSlot(scene, m, h, lambda));
-                    if (rng.uniform() >= r) { e.absorbed += beta; return; }
-                    bool absorbedG;
-                    Ray nr = gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
-                    if (absorbedG) { e.absorbed += beta; return; }
-                    ray = nr;
-                    continue;                       // beta unchanged on the chosen order
-                }
-                case MatType::HalfMirror: {
-                    double r = clamp01(reflectSlot(scene, m, h, lambda)); // reflect probability
-                    if (rng.uniform() < r) {
-                        Vec3 o = reflect(ray.d, h.n);
-                        ray = Ray{h.p + h.n * 1e-6, o};
-                    } else {
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight
-                    }
-                    continue;                       // lossless split
-                }
-                case MatType::Filter: {
-                    // Colored gel / Wratten filter: a thin non-scattering absorber.
-                    // The photon passes straight through (direction unchanged) and
-                    // survives with probability T(lambda), else is absorbed. Russian
-                    // roulette on the transmittance keeps beta unchanged and unbiased —
-                    // the wavelength-dependent survival IS the colored transmission.
-                    // Specular straight-through, so no camera connect (like clear glass):
-                    // you see the filter's effect on whatever lies behind it.
-                    double t = clamp01(m.transmit(lambda));
-                    if (rng.uniform() >= t) { e.absorbed += beta; return; }
-                    ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
-                    continue;
-                }
-                case MatType::Glossy: {
-                    double r = clamp01(reflectSlot(scene, m, h, lambda));
-                    // Russian roulette on reflectance (see Mirror).
-                    if (rng.uniform() >= r) { e.absorbed += beta; return; }
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
-                    if (dot(o, h.n) <= 0) { e.absorbed += beta; return; } // below surface
-                    ray = Ray{h.p + h.n * 1e-6, o};
-                    continue;
-                }
+                case MatType::Dielectric:
+                case MatType::ThinFilm:
+                case MatType::Multilayer:
+                case MatType::Mirror:
+                case MatType::Grating:
+                case MatType::HalfMirror:
+                case MatType::Filter:
+                case MatType::Glossy:
                 case MatType::Fluorescent: {
-                    double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
-                    Vec3 ngo = orientedGeoN(h);
-                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
-                    // Model-B connections: the elastic channel splats at the
-                    // incoming lambda; the fluorescent channel samples one
-                    // lambda' ~ M and splats the glow (albedo aEff*Q) with the
-                    // camera-response evaluated at lambda' (Stokes-shifted colour).
-                    if (nCam > 0 && !forwardCatch) {
-                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
-                        if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
-                            double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
-                            camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lp, beta, aEff * m.fluoYield, rng);
-                        }
-                    }
-                    FluoroResult fr = fluoroInteract(m, lambda, rng);
-                    if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return; }
-                    lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
-                    Vec3 wo = cosineHemisphere(h.n, rng);
-                    beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
-                    ray = Ray{h.p + h.n * 1e-6, wo};
-                    continue;                           // beta otherwise unchanged (see above)
+                    // Specular / wavelength-switching lobes, all handled by the shared
+                    // helper (single source of truth with tracePhotonHero).
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
+                        return;
+                    continue;
                 }
                 case MatType::DiffuseTransmit: {
                     // Two-lobe Lambertian: reflect albedo into the front hemisphere
@@ -1406,6 +1550,245 @@ struct Renderer {
             }
         }
         e.residual += beta;
+    }
+
+    // Hero-wavelength forward photon tracer. Mirrors tracePhoton() but carries C
+    // wavelengths (hero index 0 + C-1 stratified secondaries) down ONE shared BVH walk.
+    // The hero drives every sampling decision with the same rng stream a single-λ photon
+    // would; the secondaries ride the identical geometry, each accumulating its own
+    // per-λ throughput beta[i]. Emission splits the power C ways (beta_i = base/C), so
+    // the C-wavelength average is unbiased; at a dispersive / wavelength-switching lobe
+    // (anything but Diffuse / DiffuseTransmit) the secondaries de-hero — terminate — and
+    // the hero is boosted ×C so it alone carries a full-weight single-λ estimate onward
+    // (PBRT-v4's TerminateSecondary convention; total power conserved exactly). The
+    // caller gates this to scenes WITHOUT media / GRIN, so those branches are absent.
+    void tracePhotonHero(const Scene& scene, const CamTarget* cams, int nCam,
+                         Film* sensorFilm, Pcg32& rng, EnergyReport& e) const {
+        if (scene.emitters.empty()) return;
+        const int C = hero::kHeroC;
+        // --- Emission (geometry identical to the scalar tracer; λ-independent) ---
+        int ei = scene.selectEmitter(rng);
+        const Emitter& em = scene.emitters[ei];
+        double u1 = rng.uniform(), u2 = rng.uniform();
+        Vec3 origin, emitN, dir;
+        double spotW = 1.0;
+        double envPdfW = 0.0;
+        if (em.shape == EmitterShape::Spot) {
+            origin = em.origin;
+            double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
+            double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+            double phi = 2.0 * PI * u2;
+            Vec3 t, b; onb(em.beamDir, t, b);
+            dir = t * (st * std::cos(phi)) + b * (st * std::sin(phi)) + em.beamDir * ct;
+            emitN = em.beamDir;
+            double omegaOuter = 2.0 * PI * (1.0 - em.spotCosOuter);
+            spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
+        } else if (em.shape == EmitterShape::Env) {
+            if (scene.envMap) {
+                dir = scene.envMap->sample(u1, u2, envPdfW);
+            } else {
+                double z = 1.0 - 2.0 * u1;
+                double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
+                double phi = 2.0 * PI * u2;
+                dir = Vec3{sr * std::cos(phi), sr * std::sin(phi), z};
+            }
+            Vec3 t, b; onb(dir, t, b);
+            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double pd = 2.0 * PI * rng.uniform();
+            Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
+            origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
+            emitN = dir;
+        } else {
+            em.samplePoint(u1, u2, origin, emitN);
+            dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        }
+
+        // Hero + stratified secondary wavelengths from this emitter's SPD (one base draw,
+        // C-1 wrapped strata). The hero must have a valid pdf; a dead secondary carries
+        // beta 0 and simply splats nothing.
+        double lam[hero::kHeroC];
+        double u = rng.uniform();
+        double pdf0 = 0.0;
+        lam[0] = em.spd.sampleAt(u, pdf0);
+        if (pdf0 <= 0) return;
+        for (int i = 1; i < C; ++i) {
+            double uu = u + (double)i / C;
+            if (uu >= 1.0) uu -= 1.0;                 // wrap into [0,1)
+            double pdfi = 0.0;
+            lam[i] = em.spd.sampleAt(uu, pdfi);
+        }
+        // Per-λ throughput: base power split C ways. Image-env reweights each λ by the
+        // directional radiance estimator (no-op for a constant env).
+        double base = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
+        base *= spotW;
+        double beta[hero::kHeroC];
+        for (int i = 0; i < C; ++i) beta[i] = base / C;
+        if (em.shape == EmitterShape::Env && scene.envMap) {
+            for (int i = 0; i < C; ++i) {
+                double denom = 4.0 * PI * envPdfW * em.spdFn(lam[i]);
+                beta[i] = (denom > 0.0) ? beta[i] * (scene.envMap->radiance(dir, lam[i]) / denom) : 0.0;
+            }
+        }
+
+        bool secAlive = (C > 1);
+        auto activeSum = [&]() { double s = 0.0; int n = secAlive ? C : 1;
+                                 for (int i = 0; i < n; ++i) s += beta[i]; return s; };
+        auto deHero = [&]() { if (!secAlive) return; beta[0] *= (double)C; secAlive = false; };
+        e.emitted += activeSum();
+
+        // Direct light -> camera (area/quad emitters only; matches the scalar tracer).
+        if (nCam > 0 && !forwardCatch &&
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
+            double rhoOne[hero::kHeroC]; for (int i = 0; i < C; ++i) rhoOne[i] = 1.0;
+            camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng);
+            camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng);
+        }
+
+        Ray ray{origin + dir * 1e-6, dir};
+        MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
+
+        for (int bounce = 0; bounce < maxBounce; ++bounce) {
+            int nUp = secAlive ? C : 1;
+            Hit h = scene.closestHit(ray);
+            double dEvent = h.valid ? h.t : 1e30;
+
+            // Model C aperture catch: the photon physically threads the pupil.
+            if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
+                int px, py;
+                if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
+                    const Camera& cc = *cams[0].cam;
+                    double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
+                    for (int i = 0; i < nUp; ++i)
+                        cams[0].film->add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i]))
+                                                  * (beta[i] * cCell));
+                    e.sensor += activeSum();
+                    return;
+                }
+            }
+
+            // Beer-Lambert over the free path just travelled inside glass. A non-empty
+            // stack implies we've already de-hero'd (dielectric entry de-heros), so
+            // nUp == 1 whenever this is non-zero; the loop handles the general case.
+            {
+                int mi = stk.topMat();
+                if (mi >= 0)
+                    for (int i = 0; i < nUp; ++i) {
+                        double a = scene.mats[mi].absorb(lam[i]);
+                        if (a > 0.0) beta[i] *= std::exp(-a * dEvent);
+                    }
+            }
+
+            if (!h.valid) { e.escaped += activeSum(); return; }
+
+            if (h.sensorId >= 0) {
+                if (sensorFilm)
+                    for (int i = 0; i < nUp; ++i)
+                        deposit(scene.sensor, *sensorFilm, h.p, lam[i], beta[i]);
+                e.sensor += activeSum();
+                return;
+            }
+
+            const Material* matp = &scene.mats[h.matId];
+            // Layered coat: wavelength-dependent Fresnel -> de-hero, run scalar coat on hero.
+            if (matp->type == MatType::Layered) {
+                deHero(); nUp = 1;
+                const Material& cm = *matp;
+                double R = layeredCoatReflectance(scene, cm, h, ray.d, lam[0]);
+                if (rng.uniform() < R) {
+                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    if (dot(o, h.n) <= 0) { e.absorbed += beta[0]; return; }
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    continue;
+                }
+                int child = mixPickChild(cm, rng.uniform());
+                if (child < 0) { e.absorbed += beta[0]; return; }
+                matp = &scene.mats[child];
+            }
+            // Stochastic mix: resolve the child by the hero rng; secondaries ride along
+            // the hero's chosen child (accepted approximation, see known-issues).
+            if (matp->type == MatType::Mix) {
+                int child = mixResolveChild(scene, *matp, h, rng.uniform());
+                if (child < 0) { e.absorbed += activeSum(); return; }
+                matp = &scene.mats[child];
+            }
+            const Material& m = *matp;
+
+            switch (m.type) {
+                case MatType::DiffuseTransmit: {
+                    double rhoR[hero::kHeroC], rhoT[hero::kHeroC];
+                    for (int i = 0; i < nUp; ++i) {
+                        double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
+                        double rt = clamp01(m.transmit(lam[i]));
+                        double s = rr + rt;
+                        if (s > 1.0) { rr /= s; rt /= s; }        // per-λ energy guard
+                        rhoR[i] = rr; rhoT[i] = rt;
+                    }
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};
+                    depositPhoton(h.p, ray.d, h.n, lam[0], beta[0]);
+                    if (nCam > 0 && !forwardCatch) {
+                        camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
+                        camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
+                        camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n, lam, beta, rhoR, nUp, rng);
+                        camSpecularSplatAllHero(scene, cams, nCam, h.p, -h.n, lam, beta, rhoT, nUp, rng);
+                    }
+                    double sumHero = rhoR[0] + rhoT[0];
+                    double uu = rng.uniform();
+                    if (uu < rhoR[0]) {                           // reflect (front)
+                        for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+                        Vec3 wo = cosineHemisphere(h.n, rng);
+                        double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
+                        for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+                        ray = Ray{h.p + h.n * 1e-6, wo}; continue;
+                    } else if (uu < sumHero) {                    // transmit (back)
+                        for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+                        Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
+                        double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
+                        for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+                        ray = Ray{h.p - h.n * 1e-6, wo}; continue;
+                    }
+                    e.absorbed += activeSum(); return;
+                }
+                case MatType::Dielectric:
+                case MatType::ThinFilm:
+                case MatType::Multilayer:
+                case MatType::Mirror:
+                case MatType::Grating:
+                case MatType::HalfMirror:
+                case MatType::Filter:
+                case MatType::Glossy:
+                case MatType::Fluorescent: {
+                    // Dispersive / wavelength-switching: terminate secondaries, then run
+                    // the shared scalar interaction on the (boosted) hero channel.
+                    deHero();
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e))
+                        return;
+                    continue;
+                }
+                case MatType::Diffuse:
+                default: {
+                    double rho[hero::kHeroC];
+                    for (int i = 0; i < nUp; ++i)
+                        rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
+                    Vec3 ngo = orientedGeoN(h);
+                    Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};
+                    depositPhoton(h.p, ray.d, h.n, lam[0], beta[0]);
+                    if (nCam > 0 && !forwardCatch) {
+                        camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
+                        camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);
+                    }
+                    double rhoHero = rho[0];
+                    if (rng.uniform() >= rhoHero) { e.absorbed += activeSum(); return; }  // hero RR absorb
+                    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;            // secondary reweight
+                    Vec3 wo = cosineHemisphere(h.n, rng);
+                    double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
+                    for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+                    ray = Ray{h.p + h.n * 1e-6, wo};
+                    continue;
+                }
+            }
+        }
+        e.residual += activeSum();
     }
 
     // Dielectric interface: Fresnel-weighted stochastic choice of specular

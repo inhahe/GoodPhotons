@@ -1590,8 +1590,22 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
       a different angle, so the secondaries must "de-hero" (collapse to the single hero λ, weight renormalized) past
       the first dispersive bounce — standard hero-wavelength practice; verify dispersion (`-scene prism`) is unchanged
       and single-scatter media / thin-film still integrate correctly.
-    - [ ] **A/B/C (forward light tracers)** — a photon carries 4 stratified λ; splat all four (MIS-weighted) each
-          deposit. Mirror the change in both the CPU tracer and the wavefront/megakernel GPU path.
+    - [x] **A/B/C (forward light tracers) — CPU DONE.** `tracePhotonHero()` in `src/render.h` carries a hero λ + 3
+          stratified secondaries (`hero.h`, `kHeroC=4`) along one shared BVH walk, with per-λ throughput `beta[C]`.
+          Camera contribution splats all live λ each vertex via `camSplatAllHero`/`connectHero` (mode B),
+          `connectLensHero` (mode A finite-lens pupil, achromatic thin-lens geometry shared across λ), the forwardCatch
+          multi-λ deposit (mode C), and the dispersive glass-sphere caustic `camSpecularSplatAllHero` (per-λ root
+          solve). No code duplication: `connect()` was split into a λ-independent `connectGeom()` reused by the scalar
+          and hero paths, and the 9 specular lobes were extracted into a shared `interactPhotonSpecular()` driven by
+          both `tracePhoton` and de-hero. De-hero at any dispersive/wavelength-switching interface (dielectric,
+          thin-film, multilayer, mirror, grating, half-mirror, filter, glossy, fluorescent) boosts the hero ×C —
+          PBRT-v4 `TerminateSecondary` convention, exactly energy-preserving at the switch. Gated by the driver
+          (`main.cpp` `renderForward`/`renderForwardShared`) on `kHeroC>1 && scene.media.empty() && !sceneHasGrin`
+          (media/GRIN stay scalar; C=1 is bit-identical to the classic tracer). Validated on `cornell` mode B at
+          n=1e8, 300² vs a 1e9 GPU single-λ reference: converged image + glass-sphere dispersion intact, energy
+          conserved (`sum/emitted≈1.0025`), **luma noise flat (0.97×), chroma noise down (0.77×)** at equal photons.
+          **Still TODO:** the GPU forward wavefront/megakernel path — modes A/B/C on GPU are still single-λ; and the
+          dedicated photon-mapping modes M/S/U (see known-issues) still trace single-λ photons.
     - [x] **R (backward) — CPU DONE.** `radianceHero()` in `src/backward.h` samples a hero λ + 3 stratified
           secondaries (`hero.h`, `kHeroC=4`), rides them along one shared BVH walk, evaluates materials/NEE per-λ
           (`neeLightHero`/`neeEnvHero`, shared `interactMaterial`/`emitterGeom`/`envGeom` helpers) and splats 4
