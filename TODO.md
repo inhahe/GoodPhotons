@@ -77,6 +77,33 @@ Origin tags point at the authoritative design text for each item.
     **well-formed syntax, wrong shape** → a shape error, not a parse error. It's field-relative: the same tree is
     valid for a field that wants a list of palettes. Implement as generic parse + per-field schema validation with
     good "expected flat list of colors, got list-of-lists" messages.
+  - **ADDENDUM — axis-labelled arrays + N-D grid/scatter datatypes (design intent, 2026-07-20; user).** For the
+    language overhaul, an array literal may carry a **trailing axis-label tuple** naming its domain axes:
+    `[0 1](u)` (1-D over axis `u`), `[[0,1,2][3,4,5][6,7,8]](u,v)` (2-D over `u,v`), `(x, y, z)` for 3-D, etc.
+    The labels name the *independent* coordinate axes the samples are indexed by, so e.g. a **material reflectance**
+    can be authored as `reflect [0 1](u)` (reflectance sampled along `u`). Design points to bake in:
+    * **The N-D grid and N-D scatterpoint grammars must accept the same `(x,y,z)`-style axis-label tuple** as the
+      plain multi-dim array literal — one shared trailing-labels production, reused by array / grid / scatter.
+    * **`[[0,1,2][3,4,5][6,7,8]]` is a *hybrid* of the grid and scatter datatypes** — lockstep (regular) in one
+      dimension, dynamic (ragged / irregular) in the other. So the value tree must permit ragged inner rows and a
+      per-row/per-element **domain range** on a sample (e.g. the `[6 .2:6.2 8]` row, where `.2:6.2` is a range
+      element). A fully-ragged case is a **scatterpoint**, not a rigid grid → it should use loom's *scatter*
+      interpolant (`loom/interp.py` scatter path), not the regular-grid curve; a fully-regular case uses the grid
+      curve. The hybrid picks per-axis.
+    * **`rgb`/`hsl`/`hsv` colour tags must be accepted anywhere an N-by-3 array is accepted** (not just the
+      purely-spectral sites) — i.e. wherever a value is shaped as a list/array of 3-vectors, the inline modal
+      colour tag applies to the run exactly as in the flat-palette rule above.
+    * These land with **N-D scatterpoint + N-D grid datatypes ported into ftrace** (mirroring loom's `data.Grid` /
+      scatter + `interp.py` curves) — see the loom→ftrace data-port item. Grammar first (shared `.epeg`), then the
+      C++ front-end at the J3c port, then the runtime sampler.
+  - **ADDENDUM — case-insensitive *keywords* (future intent, 2026-07-20; user).** The user wants FTSL keywords to
+    (maybe, later) be **case-insensitive** — but **only keywords** (block kinds, property names, enum/mode values,
+    spectrum/colour heads like `rgb`/`blackbody`/`gaussian`), **never custom identifiers** (record/material/light
+    names, and library-ref *names* like the `Gold` in `metal:Gold`). Today everything is case-sensitive (heads are
+    matched literally in `evalSpectrum`; only colour-*names*, presets, and file extensions get `tolower`). Doing it
+    right is a front-end-wide audit (fold keyword tokens to lower at the lexer/dispatch layer while leaving identifier
+    tokens untouched), best done as part of the J3c C++ grammar port rather than piecemeal. Not scheduled — captured
+    so it isn't lost.
   - **Progress (2026-07-19): reference implementation landed in the shared grammar.** Added a context-free `value`
     rule to `ftsl.epeg` (`value = vrun (',' vrun)*`; `vnums = (NUMBER|REF)+` for a whitespace vector; brackets nest;
     `colour_tag` = `rgb`/`hsl`/`hsv`). New `loom/grammar/values.py`: canonical `Vec`/`Arr`/`Ref` tree +
@@ -1466,6 +1493,72 @@ ftrace's own language). Two follow-ups were captured:
       documents it. **Grammar shim verified clean:** `-validate-grammar` on a `rgbline` scene
       (`scraps/line_blue_only.ftsl`) reports no mismatch — the head-keyword form parses as an ordinary head+numbers
       value under the shared `.epeg` grammar, so no grammar change or shim-graph regen was needed.
+
+## L. Native backward (camera-first) ray tracer mode  *(ftrace renderer; LARGE, design-captured 2026-07-20 — greenlit by user)*
+
+ftrace today is a **forward / light-first** engine: modes A/B/C shoot photons *from the lights* and accumulate on
+the film (with a bidirectional connect in `bdpt.h`). This is ideal for caustics, participating media, and the
+spectral effects the project cares about, but it converges slowly on directly-lit, low-caustic scenes where a
+plain **backward / camera-first** path tracer (shoot rays *from the eye*, next-event-estimate to lights) is far
+more efficient. The ask: add a native backward path-tracer mode as a first-class render mode alongside A/B/C —
+**not** by exporting the scene to an external renderer.
+
+### Why native, not an external renderer (answers the user's "lose spectral fidelity" question)
+
+- **External renderers are RGB (tristimulus) at the core.** PBRT-v4 is spectral, but the common exchange path
+  (glTF/USD/OBJ+MTL → Cycles, Embree-based tracers, OptiX samples, Mitsuba's RGB mode) carries **RGB material
+  parameters**. Exporting ftrace's scene means collapsing every `Spectrum` (measured reflectance, Jakob-Hanika
+  upsample, `rgbline` dominant-λ emitter, metal Fresnel curves, water Cauchy dispersion) down to three numbers at
+  export time. Everything that depends on *the wavelength itself* is then gone:
+  - **Dispersion / refraction fanning** (glass prism, the rainbow machine, water caustics) — needs per-λ IOR.
+  - **Thin-film / iridescence** (soap film, oil, beetle shells) — interference is a function of λ.
+  - **Jakob-Hanika round-trip & metamerism** — an RGB export can't reproduce two spectra that match under D65 but
+    diverge under another illuminant.
+  - **`rgbline` / narrow-line emitters and any measured SPD** — become a broadband RGB blob.
+  So an external backward tracer would be *faster to bolt on* but would silently drop the exact features that make
+  ftrace worth using. That is the "lose spectral fidelity" cost.
+
+- **How WE keep spectral fidelity in a backward tracer (answers "how would we possibly").** The same
+  **hero-wavelength Monte-Carlo** machinery the forward modes already use. A backward path is traced for a sampled
+  wavelength λ (a "hero" λ plus optional stratified secondary λ's per path): at each bounce evaluate the material's
+  reflectance/BSDF **at λ** (`mat.spdReflect(λ)`, IOR `n(λ)`, Fresnel at λ), do next-event estimation to a light
+  and evaluate its emission `em.spdfn(λ)` (exactly the term `bdpt.h`/`backward.h` already computes), weight by
+  `1/pdf(λ)`, and splat the resulting monochromatic radiance into the XYZ/spectral film accumulator via the CIE
+  CMFs — the identical `color.h` path the forward modes use. Refraction uses the *per-λ* IOR so a single hero-λ
+  path bends by the right amount and dispersion falls out for free. Nothing here is RGB; the film is spectral/XYZ
+  and only tone-maps to sRGB at the end, same as A/B/C.
+
+- **Is it significantly slower than an RGB backward tracer? No — essentially the same cost.** A backward path
+  tracer's expense is ray traversal + BSDF sampling + NEE, which is *identical* whether the BSDF returns an RGB
+  triple or a scalar-at-λ. Per-wavelength MC evaluates the BSDF at **one** wavelength per path (a scalar), which is
+  actually *cheaper per-bounce* than an RGB tracer's 3-channel evaluation; the trade is slightly higher variance
+  (colour noise) per sample because each path only carries one λ, needing modestly more samples for equally smooth
+  colour. Hero-wavelength sampling (carry ~4 stratified λ's per path, MIS-combined — Wilkie et al. 2014) recovers
+  most of that at ~unchanged traversal cost. Net: same order of magnitude as any spectral backward tracer, and the
+  same order as an RGB one — *not* "significantly slower." The genuinely slow-to-converge cases (caustics, dense
+  media) are exactly where you'd keep using the forward/bidirectional modes, so the two are complementary.
+
+### Design sketch (to refine before coding)
+
+- [ ] **L1 — Mode selection + entry point.** Add a backward mode letter (candidate: `mode E` for "eye", since
+      A/B/C/D are taken; confirm the letter) parsed in `main.cpp` alongside the existing mode switch; new
+      `src/backward_pt.h` (distinct from the existing `backward.h` connect helper) with the camera-first integrator.
+      Reuse the camera model (finite-lens mode-A camera), the BVH/intersection, the material BSDF interface, and the
+      spectral film. Respect `-window`/`-keepwindow`/`-interval`/`-checkpoint`/`-noise`/`-time` progressive controls
+      (a backward tracer chunks by sample-per-pixel passes — natural progressive output).
+- [ ] **L2 — Spectral hero-wavelength core.** Per camera path: sample hero λ (uniform or importance over the visible
+      band), optionally 3 stratified secondaries; evaluate BSDF/IOR/Fresnel at each λ; NEE to lights via
+      `em.spdfn(λ)`; MIS between BSDF-sampling and light-sampling; splat monochromatic radiance to the XYZ film with
+      the `color.h` CMFs. Russian-roulette path termination. Verify a diffuse/area-light test scene matches the
+      forward modes' converged image (same tone-map) within noise.
+- [ ] **L3 — Dispersion validation.** A glass-prism / water scene must produce the correct spectral fan in backward
+      mode (per-λ IOR), matching the forward render. This is the acceptance test that proves spectral fidelity was
+      preserved.
+- [ ] **L4 — Docs + version.** README render-modes list gains the backward mode; VERSION minor bump; note in
+      known-issues if any effect (e.g. caustics) is intentionally weaker in backward mode and should stay on A/B/C.
+
+Sequencing note: this is a large renderer feature. Confirm scope/mode-letter with the user before writing the
+integrator; the answers above (why native, how spectral, cost) are settled.
 
 ---
 
