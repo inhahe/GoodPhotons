@@ -5,20 +5,37 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG (2026-07-19): `scenes/gallery_settled.ftsl` OOMs at default resolution (`std::bad_alloc`)
-Rendering `scenes/gallery_settled.ftsl` at the default resolution aborts with
-`error: bad allocation` (exit 1) — reproduced **both** with and without
-`-validate-grammar`, so it is unrelated to the grammar shim; it is a plain
-render-time out-of-memory. The scene is heavy: `scraps/klein_staged.obj`
-(634 076 tris) plus several lamp meshes (`assets/lamp/*.obj`, ~430k tris total)
-and an environment map, so the BVH / mesh / film allocations exceed available
-memory at full res. Lowering `-res` (e.g. `-res 64`) gets past the load/BVH build
-but the run still exits non-zero, so the ceiling is low. **Proper fix:** profile
-peak allocation for this scene (mesh dedup, BVH node footprint, film/accumulator
-sizing) and either reduce it or fail gracefully with a clear
-"scene needs ~N GB at this resolution" message instead of an opaque `bad_alloc`.
-Not blocking — it's one oversized showcase scene — but it means
-`gallery_settled.ftsl` can't be rendered at default settings on this machine.
+### BUG (2026-07-19; root-caused 2026-07-20): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
+`error: bad allocation` (exit 1) rendering `scenes/gallery_settled.ftsl`.
+**Root-caused 2026-07-20 — it is NOT a generic "scene too heavy" OOM.** With 26 GB
+free on a 64-bit build, ~1.5 M scene tris and a 1280×720 film cannot exhaust
+memory; the `bad_alloc` is a single *pathological* allocation that scales with the
+**number of selected cameras**, and the scene defines a `camera_curve "fly"` of
+**600 frames**. Reproduction matrix (all on this machine, after the 2026-07-20
+Klein→gyroid-lite swap):
+- `-camera cam` (single still)  → **works** in every path: mode D GPU render
+  (1280×720, 5.4 s), CPU `-raster -seethrough` (1440×810, 5.08 M tessellated tris),
+  and the interactive `-explore -seethrough` fly viewer.
+- no `-camera` (selects `cam` + all 600 `fly` frames) → `bad_alloc` right after
+  `[selftest]`.
+- `-camera fly` (the 600-frame flyby alone) → `bad_alloc` right after
+  `[camera] path 'fly' -> 600 frames`.
+So the old "OOMs at default resolution" claim was misleading: the *still camera*
+renders fine at default res; only pulling the whole flyby into one selection blows
+up. The allocation is proportional to the frame count (each selected camera gets
+its own `Film` accumulator — see `renderForwardShared`, `main.cpp` ~1240/5590, and
+the "~3 GB of films" note at ~5845), so 600 simultaneous films (or a similar
+per-camera structure built during camera expansion) overflow.
+**Workaround (works today):** always pass a single camera, e.g.
+`ftrace -in scenes/gallery_settled.ftsl -camera cam -explore -seethrough`, or
+`-camera fly` **with** a frame selector so only a handful of frames are live at
+once. **Proper fix (deferred):** chunk the multi-camera / flyby film allocation so
+a long `camera_curve` renders in bounded-size batches (render K frames per photon
+flight, recycle the film buffers) instead of allocating one film per frame up
+front — mirror the "one-frame of host RAM" strategy already noted at ~5845 for the
+budgeted path. Not blocking (the still camera renders the showcase fine); the
+flyby just needs the batching fix before it can render all 600 frames in one
+invocation on this machine.
 
 ### RESOLVED (2026-07-19): stale `absorb 3 0.5 0.3` example in `src/ftsl.h` — untagged spectrum triples don't parse
 The comment above the `dielectric` `absorb` handling (`src/ftsl.h` ~1838) read

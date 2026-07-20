@@ -193,15 +193,17 @@ isosurface "gyroid_gem" {
 # The flyby dives straight THROUGH it. Native sphere for exact analytic refraction.
 sphere { center 6.2 1.40 3.5   radius 0.5   material glass }
 
-# --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
-group {  # settled by tools/settle_scene.py
-    translate 0.0288262 -0.184602 -0.124994
-    rotate    5.48009 -0.113015 1.20434
-    mesh "klein" {
-        file "scraps/klein_staged.obj"
-        translate 5.9 1.70 2.6   rotate 8 40 0   scale 1.4
-        material glass
-    }
+# --- GYROID SPHERE in glass (clear, intricate transparent piece; analytic rest) --------
+# Swapped in for the old hunyuan Klein bottle (user request 2026-07-20). This is the
+# triply-periodic minimal surface trimmed to a ball, lite decimation (~53 MB). Raw mesh
+# is centered at origin spanning +/-10 (size ~20); scale 0.025 -> ~0.5 across to fit the
+# stand cap (~0.52); translate y = 1.00 (cap top) + 0.25 (half-height) = 1.25 so it rests
+# on the stand. Analytic rest -> no settle group needed. (Object still named "klein" for
+# the stand/settle wiring.)
+mesh "klein" {
+    file "meshes/klein_a120_b060_c30_d127_lite.obj"
+    translate 5.9 1.25 2.6   rotate 0 40 0   scale 0.025
+    material glass
 }
 
 # --- BRASS DUMBBELL-ring (gallery pick 09): two spheres joined by a fused bar + ring,
