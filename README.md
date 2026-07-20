@@ -273,7 +273,7 @@ paths they can capture at all**.
 > | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
-> | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
+> | **resize the window** | change the preview resolution: the raster renders at the window's **actual pixel dimensions**, so the picture **fills the window (no letterbox bars)** and **shrinking it renders fewer pixels (faster on a heavy scene) while growing it renders more (crisper)**, up to the authored longest edge. The horizontal field of view widens/narrows with the window (like a game viewport — `fov_y` stays fixed, pixels stay square), so a wider window simply reveals more to the sides |
 >
 > **Motion is feedback-locked, not wall-clock-based.** Each held-key frame (and each
 > wheel notch) moves the eye exactly one fixed `step`, and *one frame is rendered per

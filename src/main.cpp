@@ -4779,21 +4779,31 @@ static int run(int argc, char** argv) {
                 }
                 return pos;
             };
-            // Interactive render resolution FOLLOWS THE LIVE WINDOW: fit the authored
-            // W:H aspect into the current client area so the raster renders at (roughly)
-            // one pixel per displayed pixel. Shrinking the window renders fewer pixels
-            // (faster while navigating a heavy scene); growing it renders more (crisper),
-            // up to the authored resolution. The aspect ratio is preserved, so the camera
-            // projection is unchanged, and the eye/look_at readout + world-scaled crosshair
-            // are resolution-independent. Recomputed every loop so a live resize retunes it.
+            // Interactive render resolution IS the live window: the raster renders at the
+            // image area's OWN pixel dimensions, so the preview always FILLS the window with
+            // no letterbox bars, and resizing in ANY direction changes the pixel count (drag
+            // smaller for a faster nav on a heavy scene, larger for a crisper view). The
+            // camera's horizontal FOV follows the window aspect while fov_y stays fixed
+            // (lookAt derives tanHalfX = tanHalfY * VW/VH), exactly like a game viewport:
+            // a wider window simply reveals more to the sides, with square pixels (no stretch).
+            // Two guards: never render past the authored longest edge (growing the window
+            // beyond the film res would only supersample the preview, not add real detail),
+            // and never shrink the long edge below kMinLong. The eye/look_at readout and the
+            // world-scaled crosshair stay resolution-independent. Recomputed every loop so a
+            // live resize retunes it.
             auto fitRes = [&](int& outW, int& outH) {
                 int cw = 0, ch = 0;
                 if (!g_liveWin->clientSize(cw, ch)) { outW = W; outH = H; return; }
-                double s = std::min(std::min((double)cw / W, (double)ch / H), 1.0);  // never supersample
-                int vw = std::max(1, (int)std::lround(W * s));
-                int vh = std::max(1, (int)std::lround(H * s));
-                const int kMinLong = 160;   // guard against an absurdly tiny render
+                int vw = std::max(1, cw), vh = std::max(1, ch);   // fill the window (its aspect)
+                const int kMaxLong = std::max(W, H);   // cap at authored detail (no supersampling)
                 int lo = std::max(vw, vh);
+                if (lo > kMaxLong) {
+                    double s = (double)kMaxLong / lo;
+                    vw = std::max(1, (int)std::lround(vw * s));
+                    vh = std::max(1, (int)std::lround(vh * s));
+                }
+                const int kMinLong = 160;   // guard against an absurdly tiny render
+                lo = std::max(vw, vh);
                 if (lo < kMinLong) {
                     double up = (double)kMinLong / lo;
                     vw = std::max(1, (int)std::lround(vw * up));
@@ -5122,7 +5132,7 @@ static int run(int argc, char** argv) {
               "                 Ins inserts at the scrub point; Del removes the nearest point; Save writes a camera_curve block\n"
               "         paint:  Paint (path mode) — wheel paints local speed (density) at the scrub point, mouse steers orientation; Flat resets speed\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
-              "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
+              "         resize the window to change the preview resolution — the render fills the window (no bars): smaller = faster on a heavy scene, larger = crisper; the horizontal view widens/narrows with the window (fov_y fixed)\n",
               step, collideName(collide),
               pathCount >= 2 ? "; timeline + Play/Pause + Path-lock + cams/upd | cams/s speed switch"
                              : "");
