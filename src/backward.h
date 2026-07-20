@@ -52,6 +52,8 @@
 struct BackwardRenderer {
     int maxBounce = 32;
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
+    int  heroC = hero::kHeroC;  // wavelengths bundled per camera path when hero is on
+                                // (runtime -heroc N, clamped to [1, kHeroMax]; 1 = single-λ)
 
     // Next-event estimation: connect a surface vertex to each area emitter (the
     // integral splits by light, summed unbiasedly). `invPdfLambda` = emitG/g(lambda)
@@ -659,7 +661,7 @@ struct BackwardRenderer {
     // lens, so those branches are absent here. Fills Lout[0..C).
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng) const {
-        double lam[hero::kHeroC], invPdf[hero::kHeroC], thr[hero::kHeroC], L[hero::kHeroC];
+        double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
         for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; L[i] = 0.0; }
         bool secAlive = (C > 1);
         bool specularArrival = true;
@@ -740,7 +742,7 @@ struct BackwardRenderer {
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
-                    double rhoR[hero::kHeroC], rhoT[hero::kHeroC];
+                    double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) {
                         double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                         double rt = clamp01(m.transmit(lam[i]));
@@ -790,7 +792,7 @@ struct BackwardRenderer {
                 }
                 case MatType::Diffuse:
                 default: {
-                    double rho[hero::kHeroC];
+                    double rho[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                     neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
@@ -816,7 +818,8 @@ struct BackwardRenderer {
     // (C wavelengths per camera path); otherwise the single-wavelength radiance().
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
                     int y0, int y1, long long spp, Pcg32& rng) const {
-        const bool useHero = (hero::kHeroC > 1) && !scene.backwardMedium().enabled &&
+        const int C = heroC;
+        const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
@@ -826,24 +829,24 @@ struct BackwardRenderer {
                         // all from the emission CDF. The hero (index 0) must have a
                         // valid pdf; dead secondaries (pdf 0) carry invPdf 0 and splat 0.
                         double u = rng.uniform();
-                        double lamA[hero::kHeroC], invA[hero::kHeroC];
+                        double lamA[hero::kHeroMax], invA[hero::kHeroMax];
                         double pdf0 = 0.0;
                         lamA[0] = scene.emitSampler.sampleAt(u, pdf0);
                         if (pdf0 <= 0) continue;
                         invA[0] = scene.invPdfLambda(lamA[0]);
-                        for (int i = 1; i < hero::kHeroC; ++i) {
-                            double uu = u + (double)i / hero::kHeroC;
+                        for (int i = 1; i < C; ++i) {
+                            double uu = u + (double)i / C;
                             if (uu >= 1.0) uu -= 1.0;            // wrap into [0,1)
                             double pdfi = 0.0;
                             lamA[i] = scene.emitSampler.sampleAt(uu, pdfi);
                             invA[i] = (pdfi > 0.0) ? scene.invPdfLambda(lamA[i]) : 0.0;
                         }
                         Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
-                        double Lh[hero::kHeroC];
-                        radianceHero(scene, ray, lamA, invA, hero::kHeroC, Lh, rng);
-                        for (int i = 0; i < hero::kHeroC; ++i)
+                        double Lh[hero::kHeroMax];
+                        radianceHero(scene, ray, lamA, invA, C, Lh, rng);
+                        for (int i = 0; i < C; ++i)
                             film.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
-                                             * (Lh[i] / hero::kHeroC));
+                                             * (Lh[i] / C));
                         continue;
                     }
                     // Sample lambda from the combined emission distribution g(lambda).

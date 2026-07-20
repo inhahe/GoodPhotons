@@ -1630,8 +1630,16 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           because the gather already averages many photons.) Modes S (SPPM) inherits it via `tracePhotonPass`.
           **Still TODO:** mode U (VCM/UPS) — its BDPT-style light-subpath tracing (`src/vcm.h`) is the same
           complexity class as BDPT-D below; and all GPU photon-mapping paths.
-    - [ ] **U (VCM/UPS)** — carry the 4 λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
-    - [ ] **D (BDPT)** — carry the 4 λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
+    - [x] **Runtime `-heroc N` flag — DONE.** The bundle size is now a runtime CLI knob (`hero.h`: `kHeroC=4`
+          default, new `kHeroMax=8` compile-time cap for the fixed stack arrays). `main.cpp` parses `-heroc N`
+          (clamped 1..kHeroMax) into `g_heroC` and threads it to every CPU hero path: `Renderer::heroC`
+          (modes A/B/C + photon-map M/S via `tracePhotonPass`), `BackwardRenderer::heroC` (mode R), and
+          `sppmPass` (mode S). All `[kHeroC]` stack arrays in `render.h`/`backward.h` became `[kHeroMax]`; the
+          hero gate is now `heroC>1`. Verified on `cornell` mode M: `-heroc 1` is bit-identical to a `kHeroC=1`
+          rebuild (2.80M photons, auto-exposure 1.11e-13), `-heroc 4` matches the default (9.09M, 1.11e-13),
+          `-heroc 2`/`8` interpolate and run clean; mode B `-heroc 1` gives `sum/emitted=1.000000`.
+    - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
+    - [ ] **D (BDPT)** — carry the N λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
           rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same

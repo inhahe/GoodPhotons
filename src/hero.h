@@ -19,8 +19,12 @@
 #pragma once
 
 namespace hero {
-// Number of wavelengths carried per path (hero + C-1 secondaries). C == 1 reduces
-// the estimator bit-identically to the classic single-wavelength tracer, so this is
-// the single knob that turns hero sampling on. 4 is the usual sweet spot.
+// DEFAULT number of wavelengths carried per path (hero + C-1 secondaries). C == 1
+// reduces the estimator bit-identically to the classic single-wavelength tracer.
+// 4 is the usual sweet spot; the runtime `-heroc N` flag overrides it per render.
 constexpr int kHeroC = 4;
+// COMPILE-TIME upper bound for the runtime count, so the per-path throughput/λ arrays
+// can live on the stack as fixed `[kHeroMax]` buffers regardless of the `-heroc` value.
+// `-heroc N` is clamped to [1, kHeroMax]. Bump this if a larger bundle is ever wanted.
+constexpr int kHeroMax = 8;
 }

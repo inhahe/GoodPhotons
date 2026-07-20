@@ -1084,6 +1084,12 @@ static double g_sppmAlpha = 0.7;
 // SmallVCM default. Initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls.
 static double g_vcmAlpha = 0.75;
 
+// Hero-wavelength bundle size (CLI -heroc N). Number of wavelengths carried per path
+// (hero + N-1 stratified secondaries) on the CPU hero tracers (modes A/B/C, R, M/S).
+// Set once at arg-parse; clamped to [1, hero::kHeroMax]. N==1 turns hero off (bit-identical
+// single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
+static int g_heroC = hero::kHeroC;
+
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
 static void enableAnsiTerminal() {
@@ -1229,10 +1235,10 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // Hero-wavelength sampling: on when C>1 and the scene has no participating media /
     // GRIN (dispersive interfaces de-hero mid-path). Forward modes A/B/C all qualify —
     // the finite-lens pupil is achromatic, so the C wavelengths share the connection.
-    const bool heroOn = (hero::kHeroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
+    const bool heroOn = (g_heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
-        r.useHero = heroOn;
+        r.useHero = heroOn; r.heroC = g_heroC;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
                             (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
@@ -1282,10 +1288,10 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     for (int t = 0; t < nThreads; ++t)
         for (int c = 0; c < nc; ++c) { films[t][c].resX = resX[c]; films[t][c].resY = resY[c]; films[t][c].alloc(); }
 
-    const bool heroOn = (hero::kHeroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
+    const bool heroOn = (g_heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
-        r.useHero = heroOn;
+        r.useHero = heroOn; r.heroC = g_heroC;
         // Identical seeding to renderForward. For model B this makes each camera's shared
         // film bit-identical to its standalone single-camera render (at seedBase 0); for
         // model A the aperture draws perturb the stream, so it matches in distribution.
@@ -1326,7 +1332,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
                            unsigned long long seedOffset = 0) {
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
-        BackwardRenderer br; br.diffraction = diffraction;
+        BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7,
                             0xD1B54A32D192ED03ULL ^ (uint64_t)tid
                               ^ (seedOffset * 0x9E3779B97F4A7C15ULL));
@@ -2613,7 +2619,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         "(density query one bounce away)\n", g_pmFinalGather);
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
         pm.build(radius);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
@@ -2653,7 +2659,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
             for (long long pass = 0; pass < passTarget; ++pass) {
                 sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
-                         /*maxBounce*/32, (uint64_t)(pass + 1));
+                         /*maxBounce*/32, (uint64_t)(pass + 1), g_heroC);
                 disp = sppmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
@@ -3517,6 +3523,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-heroc") && i + 1 < argc) {
+            g_heroC = std::atoi(argv[++i]);
+            if (g_heroC < 1) g_heroC = 1;
+            if (g_heroC > hero::kHeroMax) g_heroC = hero::kHeroMax;
+        }
         else if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc) exposureCli = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
@@ -5493,7 +5504,7 @@ static int run(int argc, char** argv) {
                 if (!meterPmapBuilt) {
                     double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                                           : scene.sceneRadius * g_pmRadiusFactor;
-                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap);
+                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC);
                     meterPmap.build(radius);
                     meterPmapBuilt = true;
                 }
@@ -5915,7 +5926,7 @@ static int run(int argc, char** argv) {
                     g_pmFinalGather > 0 ? " [final gather]" : "");
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
         pm.build(radius);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "

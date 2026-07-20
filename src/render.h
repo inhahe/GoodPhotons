@@ -267,8 +267,12 @@ struct Renderer {
     bool useHero      = false;   // hero-wavelength sampling: each photon carries C
                                  // wavelengths (hero + C-1 stratified secondaries) down
                                  // one shared BVH walk, cutting chromatic noise. Gated ON
-                                 // by the driver only when kHeroC>1 and the scene has no
+                                 // by the driver only when heroC>1 and the scene has no
                                  // media / GRIN (dispersive events de-hero mid-path).
+    int  heroC        = hero::kHeroC; // number of wavelengths bundled per path when
+                                 // useHero is on (hero + heroC-1 secondaries). Runtime-
+                                 // configurable via -heroc N, clamped to [1, kHeroMax];
+                                 // defaults to kHeroC. C==1 collapses to single-λ.
 
     // Photon-map deposit (ROADMAP item 1 / mode M). When non-null, every diffuse-family
     // surface vertex ALSO appends a Photon record here (view-independent radiance cache).
@@ -1565,7 +1569,7 @@ struct Renderer {
     void tracePhotonHero(const Scene& scene, const CamTarget* cams, int nCam,
                          Film* sensorFilm, Pcg32& rng, EnergyReport& e) const {
         if (scene.emitters.empty()) return;
-        const int C = hero::kHeroC;
+        const int C = heroC;
         // --- Emission (geometry identical to the scalar tracer; λ-independent) ---
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
@@ -1606,7 +1610,7 @@ struct Renderer {
         // Hero + stratified secondary wavelengths from this emitter's SPD (one base draw,
         // C-1 wrapped strata). The hero must have a valid pdf; a dead secondary carries
         // beta 0 and simply splats nothing.
-        double lam[hero::kHeroC];
+        double lam[hero::kHeroMax];
         double u = rng.uniform();
         double pdf0 = 0.0;
         lam[0] = em.spd.sampleAt(u, pdf0);
@@ -1621,7 +1625,7 @@ struct Renderer {
         // directional radiance estimator (no-op for a constant env).
         double base = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
         base *= spotW;
-        double beta[hero::kHeroC];
+        double beta[hero::kHeroMax];
         for (int i = 0; i < C; ++i) beta[i] = base / C;
         if (em.shape == EmitterShape::Env && scene.envMap) {
             for (int i = 0; i < C; ++i) {
@@ -1639,7 +1643,7 @@ struct Renderer {
         // Direct light -> camera (area/quad emitters only; matches the scalar tracer).
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
-            double rhoOne[hero::kHeroC]; for (int i = 0; i < C; ++i) rhoOne[i] = 1.0;
+            double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = 1.0;
             camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng);
             camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng);
         }
@@ -1715,7 +1719,7 @@ struct Renderer {
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
-                    double rhoR[hero::kHeroC], rhoT[hero::kHeroC];
+                    double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) {
                         double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                         double rt = clamp01(m.transmit(lam[i]));
@@ -1772,7 +1776,7 @@ struct Renderer {
                 }
                 case MatType::Diffuse:
                 default: {
-                    double rho[hero::kHeroC];
+                    double rho[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                     Vec3 ngo = orientedGeoN(h);

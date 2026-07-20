@@ -950,8 +950,9 @@ second:**
   caustic splitting (below) rather than trading it away. Still single-λ **by design or
   pending work**: the **GPU** megakernels (all modes), **BDPT (`-mode D`)**, and
   **VCM/UPS (`-mode U`)** — these carry one λ per photon for now (hero for U is planned;
-  see `known-issues.md`). Setting `hero.h`'s `kHeroC=1` turns hero off, reducing every
-  CPU tracer bit-identically to the classic single-λ estimator.
+  see `known-issues.md`). The bundle size is runtime-configurable with **`-heroc N`**
+  (default 4, range 1–8); `-heroc 1` turns hero off, reducing every CPU tracer
+  bit-identically to the classic single-λ estimator.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.
@@ -1964,6 +1965,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
+| `-heroc <N>` | Hero-wavelength bundle size on the **CPU** spectral tracers (modes `A`/`B`/`C`, `R`, and photon-map `M`/`S`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). GPU / BDPT (`D`) / VCM (`U`) ignore it (still single-λ) |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
