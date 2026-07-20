@@ -855,6 +855,16 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 - **`hsl h s l`** — an HSL colour on the same wrapping hue wheel, but `l` is
   *lightness* (`l=0.5` is the pure hue, `l→1` white, `l→0` black; matches CSS);
   `s`/`l` in `[0,1]`. Converted to RGB and upsampled exactly like `rgb`.
+- **`rgb r g b line [sigma]`** (also `hsv … line`, `hsl … line`) — the
+  *dominant-wavelength* form: instead of a broadband reflectance, map the colour to a
+  single dominant wavelength (the standard spectral-locus construction — a ray from the
+  D65 white point through the colour's chromaticity to the spectral horseshoe) and emit
+  a **narrow Gaussian line** there. A near-monochromatic source, so glass disperses it
+  correctly. Line width defaults to the colour's saturation (a vivid colour → tight
+  spike; a pale one → a broad band tending back to white) or is forced by an explicit
+  `sigma` in nm. Purples/magentas (no real dominant wavelength) become a two-line
+  violet+red mix. Meant for **lights** (`spd rgb 0 0 1 line`); a reflectance has no
+  single wavelength, but the form is accepted anywhere a spectrum is.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an

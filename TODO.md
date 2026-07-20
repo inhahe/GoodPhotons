@@ -1431,7 +1431,7 @@ ftrace's own language). Two follow-ups were captured:
       folded into reconciliation work. Bundles naturally with K1's illuminant upsample (the sky model wants proper
       emission spectra).
 
-- [ ] **K3 — RGB→wavelength map for lights (single dominant λ).** Distinct from K1's *upsampling* (RGB → a full
+- [x] **K3 — RGB→wavelength map for lights (single dominant λ).** *(DONE 2026-07-20, v0.10.0.)* Distinct from K1's *upsampling* (RGB → a full
       spectral power distribution): this maps an (r,g,b) colour to **one dominant wavelength** — a monochromatic /
       narrow-line emission, so a coloured light behaves like a near-laser spike at λ(colour) rather than a broadband
       curve. Useful for pure spectral sources and for driving dispersion/refraction (a real λ so glass fans it out
@@ -1444,6 +1444,17 @@ ftrace's own language). Two follow-ups were captured:
       routed through a new `upsample.h` helper `rgbToDominantWavelength(r,g,b)` returning a λ (nm) that then builds a
       narrow Gaussian / delta `Spectrum`. Lights-only (a *reflectance* has no meaningful single λ, so materials keep
       the K1 upsample). Mirror the form in loom's spectrum grammar. Observable → README + VERSION bump when it lands.
+    - **Landed (2026-07-20, v0.10.0).** Added `upsample::rgbToDominantWavelength` + `rgbToLineEmission` in
+      `src/upsample.h`: builds the CIE-1931 spectral-locus polygon once (400–700 nm at 1 nm, closed by the line of
+      purples), casts the white→sample ray, and returns the crossing wavelength + excitation purity (or, for the
+      purple edge, a violet↔red blend). `rgbToLineEmission` turns that into a `gaussianBand` whose width is
+      `5 + 125·(1−purity)` nm by default or a forced `sigma`; purples become a two-lobe violet+red sum. Wired the
+      trailing-`line [sigma]` modifier into `evalSpectrum`'s unified `rgb`/`hsv`/`hsl` handler (`src/ftsl.h` ~1160), so
+      `spd rgb 0 0 1 line` / `… line 6` parse. Validated: `scraps/line_light_test.ftsl` renders three primary line
+      lights → correct red/green/blue near-monochromatic illumination (`png/line_light_test.png`). README's spectrum-
+      forms list documents it. **Still TODO:** mirror the `line` modifier in loom's spectrum grammar
+      (`tools/loom/loom/grammar/spectrum.py` + the shared `.epeg`), and teach the GPDA shared grammar's spectrum
+      word-run to accept a trailing bareword so `-validate-grammar` stays clean on `line` scenes.
 
 ---
 

@@ -1157,22 +1157,23 @@ private:
             }
             return (h == "gaussian") ? gaussianBand(a, b, c) : shortPass(a, b, c);
         }
-        if (h == "rgb") {
-            if (w.size() < 4) { fail("rgb needs 3 components"); return constantSpectrum(0); }
-            return rgbToReflectanceJH(num(w[1]), num(w[2]), num(w[3]));
-        }
-        if (h == "hsv") {
-            // `hsv h s v` — hue in [0,1] (turns, wraps), s/v in [0,1]. Converted to
-            // RGB then to a smooth reflectance via the same Jakob-Hanika fit as `rgb`.
-            if (w.size() < 4) { fail("hsv needs 3 components (h s v)"); return constantSpectrum(0); }
-            Vec3 c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
-            return rgbToReflectanceJH(c.x, c.y, c.z);
-        }
-        if (h == "hsl") {
-            // `hsl h s l` — hue in [0,1] (turns, wraps), s/l in [0,1] (l = lightness).
-            // Converted to RGB then upsampled to reflectance like `rgb`/`hsv`.
-            if (w.size() < 4) { fail("hsl needs 3 components (h s l)"); return constantSpectrum(0); }
-            Vec3 c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
+        // `rgb r g b` / `hsv h s v` / `hsl h s l` — a colour, upsampled to a smooth
+        // reflectance via the Jakob-Hanika fit. hue in [0,1] (turns, wraps); s/v/l in
+        // [0,1] (l = lightness). An optional trailing `line [sigma]` switches to the
+        // K3 dominant-wavelength *emission* form instead: a narrow band at the colour's
+        // dominant wavelength (near-monochromatic, so glass disperses it), width set by
+        // saturation or by the explicit `sigma` (nm). Meant for lights (`spd rgb … line`);
+        // a reflectance has no single wavelength, but the form is accepted anywhere.
+        if (h == "rgb" || h == "hsv" || h == "hsl") {
+            if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
+            Vec3 c;
+            if      (h == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
+            else if (h == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
+            else                 c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
+            if (w.size() > 4 && w[4] == "line") {
+                double sigma = (w.size() > 5 && isNumber(w[5])) ? num(w[5]) : -1.0;
+                return rgbToLineEmission(c.x, c.y, c.z, sigma);
+            }
             return rgbToReflectanceJH(c.x, c.y, c.z);
         }
         if (h.rfind("glass:", 0) == 0) {
