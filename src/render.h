@@ -1725,7 +1725,12 @@ struct Renderer {
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};
-                    depositPhoton(h.p, ray.d, h.n, lam[0], beta[0]);
+                    // Photon-map deposit: store EVERY live wavelength as its own per-λ
+                    // photon record (the gather keys off each photon's own λ). C records
+                    // of base/C sum to base, and nEmitted counts PATHS, so the estimator
+                    // stays energy-consistent with the scalar single-λ deposit.
+                    for (int i = 0; i < nUp; ++i)
+                        depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
@@ -1772,7 +1777,12 @@ struct Renderer {
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};
-                    depositPhoton(h.p, ray.d, h.n, lam[0], beta[0]);
+                    // Photon-map deposit: store EVERY live wavelength as its own per-λ
+                    // photon record (the gather keys off each photon's own λ). C records
+                    // of base/C sum to base, and nEmitted counts PATHS, so the estimator
+                    // stays energy-consistent with the scalar single-λ deposit.
+                    for (int i = 0; i < nUp; ++i)
+                        depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);

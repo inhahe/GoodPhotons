@@ -1604,8 +1604,7 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           (media/GRIN stay scalar; C=1 is bit-identical to the classic tracer). Validated on `cornell` mode B at
           n=1e8, 300² vs a 1e9 GPU single-λ reference: converged image + glass-sphere dispersion intact, energy
           conserved (`sum/emitted≈1.0025`), **luma noise flat (0.97×), chroma noise down (0.77×)** at equal photons.
-          **Still TODO:** the GPU forward wavefront/megakernel path — modes A/B/C on GPU are still single-λ; and the
-          dedicated photon-mapping modes M/S/U (see known-issues) still trace single-λ photons.
+          **Still TODO:** the GPU forward wavefront/megakernel path — modes A/B/C on GPU are still single-λ.
     - [x] **R (backward) — CPU DONE.** `radianceHero()` in `src/backward.h` samples a hero λ + 3 stratified
           secondaries (`hero.h`, `kHeroC=4`), rides them along one shared BVH walk, evaluates materials/NEE per-λ
           (`neeLightHero`/`neeEnvHero`, shared `interactMaterial`/`emitterGeom`/`envGeom` helpers) and splats 4
@@ -1615,6 +1614,23 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           on `cornell.ftsl`: converged image unchanged, glass-sphere dispersion intact, **luma noise flat (1.03×),
           chroma noise down (0.89× overall, 0.74× in spectral-dominated neutral regions)** at equal spp.
           **Still TODO:** the GPU backward megakernel (`renderBackwardCuda`) — mode R on GPU is still single-λ.
+    - [x] **M (photon map) + S (SPPM) — CPU DONE.** The shared forward photon pass (`tracePhotonPass` in
+          `src/photonmap_render.h`, used by both modes M and S) now sets `r.useHero` under the same gate as the
+          forward tracers (`kHeroC>1 && scene.media.empty() && !sceneHasGrin`), so each traced path runs
+          `tracePhotonHero` (`src/render.h`) with `nCam==0` (deposit-only, no camera splat). The key fix: the
+          photon-map **deposit** now stores EVERY live wavelength as its own per-λ `Photon` record (a loop over
+          `nUp`), because the stored map is the product here — a scalar single-λ deposit would discard `(C-1)/C`
+          of the spectral energy. C records of `base/C` sum to `base`, and `nEmitted` still counts PATHS, so the
+          density estimate is energy-identical to the single-λ deposit; the gather already keys off each photon's
+          own λ, so a heterogeneous-λ map (diffuse bounces carry C wavelengths, post-de-hero specular bounces
+          carry 1) gathers correctly. De-hero at any dispersive interface terminates the secondaries exactly as
+          in the forward tracers. Validated on `cornell` mode M (`-n 2e6`, 200²) vs a C=1 rebuild: **energy
+          conserved exactly** (auto-exposure identical, 1.11e-13, hero 9.09M vs single 2.80M photons), **chroma
+          noise down 0.87×**, luma flat, against a 1.5e7 single-λ reference. (Milder chroma win than A/B/C's 0.77×
+          because the gather already averages many photons.) Modes S (SPPM) inherits it via `tracePhotonPass`.
+          **Still TODO:** mode U (VCM/UPS) — its BDPT-style light-subpath tracing (`src/vcm.h`) is the same
+          complexity class as BDPT-D below; and all GPU photon-mapping paths.
+    - [ ] **U (VCM/UPS)** — carry the 4 λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
     - [ ] **D (BDPT)** — carry the 4 λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy

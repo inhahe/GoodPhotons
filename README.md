@@ -937,17 +937,19 @@ second:**
   full-spectrum renderer below is as accurate here as ftrace, and the hero-wavelength
   ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
   per path. **We claim no edge on this axis** — and ftrace now closes the noise gap on
-  its **CPU** tracers: both the **backward reference tracer (`-mode R`)** and the
-  **forward light tracers (`-mode A/B/C`)** use hero-wavelength sampling (a hero λ plus
-  3 stratified secondaries riding one shared BVH walk, secondaries de-hero'd at the
-  first dispersive interface — Wilkie et al. 2014 / PBRT-v4 `TerminateSecondary`), so
-  they reach a given colour-noise level in fewer samples (measured ~0.77× chroma-noise
-  RMS at equal photons, luma unchanged) while dispersion stays bit-for-bit intact.
-  Hero collapses to a single continuous wavelength the instant dispersion matters, so
-  it *keeps* the forward photon map's true caustic splitting (below) rather than
-  trading it away. Still single-λ **by design or pending work**: the **GPU** megakernels
-  (all modes), **BDPT (`-mode D`)**, and the dedicated **photon-mapping modes
-  (`-mode M/S/U`)** — these carry one λ per photon for now (hero for M/S/U is planned;
+  its **CPU** tracers: the **backward reference tracer (`-mode R`)**, the
+  **forward light tracers (`-mode A/B/C`)**, and the **photon-mapping modes (`-mode M/S`)**
+  all use hero-wavelength sampling (a hero λ plus 3 stratified secondaries riding one
+  shared BVH walk, secondaries de-hero'd at the first dispersive interface — Wilkie et
+  al. 2014 / PBRT-v4 `TerminateSecondary`), so they reach a given colour-noise level in
+  fewer samples (measured ~0.77× chroma-noise RMS at equal photons in the light tracers,
+  ~0.87× in the photon map, luma unchanged) while dispersion stays bit-for-bit intact.
+  For photon mapping each traced path deposits all its live wavelengths as per-λ photon
+  records, so total stored energy is unchanged. Hero collapses to a single continuous
+  wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
+  caustic splitting (below) rather than trading it away. Still single-λ **by design or
+  pending work**: the **GPU** megakernels (all modes), **BDPT (`-mode D`)**, and
+  **VCM/UPS (`-mode U`)** — these carry one λ per photon for now (hero for U is planned;
   see `known-issues.md`). Setting `hero.h`'s `kHeroC=1` turns hero off, reducing every
   CPU tracer bit-identically to the classic single-λ estimator.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
@@ -959,7 +961,7 @@ see sources below):
 
 | Renderer (engine) | Default colour | Spectral mode | Per-path/photon carrier |
 |---|---|---|---|
-| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C & R); 1 λ on GPU / BDPT / photon-map M-S-U** — true dispersive caustics either way |
+| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C, R & photon-map M/S); 1 λ on GPU / BDPT / VCM (U)** — true dispersive caustics either way |
 | PBRT-v3 (SPPM photon map) | RGB | compile-time (`SampledSpectrum`, ~30 bins @ 10 nm) | **co-sampled: all bins on one photon** — no split |
 | Mitsuba 0.x (`ptracer`/`ppm`/`sppm`) | RGB | compile-time (`SPECTRUM_SAMPLES`, e.g. 15–30) | **co-sampled: all bins per sample** — no split |
 | PBRT-v4 | spectral | always | hero wavelength, 4 λ/path (default, recompilable) |

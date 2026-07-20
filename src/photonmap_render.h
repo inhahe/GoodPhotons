@@ -45,8 +45,15 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     std::vector<std::vector<Photon>> banks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
 
+    // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths
+    // as per-λ photon records via tracePhotonHero (render.h). nEmitted still counts PATHS
+    // (below), so the density estimate is energy-identical to single-λ but with far lower
+    // chroma noise. Same gate as the forward tracers: no media / no GRIN (those stay C=1).
+    const bool heroOn = (hero::kHeroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
+
     auto worker = [&](int tid) {
         Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
+        r.useHero = heroOn;
         Pcg32 rng; rng.seed((uint64_t)tid * 2 + 31,
                             0xD1B54A32D192ED03ULL ^ (uint64_t)tid);
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;

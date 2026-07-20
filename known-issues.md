@@ -5,26 +5,27 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C) — GPU megakernels, BDPT (D), and photon-mapping modes (M/S/U) still single-λ
+### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S photon mapping) — GPU megakernels, BDPT (D), and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
-`tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** hero-wavelength
-spectral sampling (hero λ + 3 stratified secondaries, `hero.h` `kHeroC=4`). Validated: mode R on `cornell.ftsl`
-(chroma 0.89× overall / 0.74× spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×,
-luma 0.97×, energy `sum/emitted≈1.0025`, dispersion intact). The remaining §L-HERO sub-items are **not yet done**
-and are the tracked next work:
+`tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
+**CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
+secondaries, `hero.h` `kHeroC=4`). Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
+spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
+`sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
+chroma 0.87×, luma flat). The remaining §L-HERO sub-items are **not yet done** and are the tracked next work:
 - **GPU backward megakernel** (`renderBackwardCuda`) — mode R on GPU is still single-λ, so `-mode R -device gpu`
   does *not* get the colour-noise reduction. (The `-device auto` default picks GPU on this machine, so hero only
   kicks in with `-device cpu`.)
 - **GPU forward wavefront/megakernel** (`render_cuda.cu`) and **BDPT (D)** — still 1 λ/photon.
   Propagate the same shared wavelength-sampling + de-hero policy rather than copying the logic per mode.
-- **Photon-mapping modes M (photon map), S (SPPM), U (VCM)** — still trace single-λ photons. These do *not* splat;
-  their product is the **stored photon map**, and `tracePhotonHero`'s map deposit (`render.h:1775` / `:1728`)
-  currently writes only the **hero** wavelength (`lam[0]/beta[0]`), so naively enabling hero here would drop the
-  C−1 secondaries' energy. The correct fix: in `tracePhotonHero` deposit **all `nUp` live wavelengths** as
-  per-λ photon records — `for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);` — (the gather side already
-  keys off each photon's own λ, `photonmap_render.h:245`), then set `r.useHero` in the M/S/U drivers with the same
-  `kHeroC>1 && scene.media.empty() && !sceneHasGrin` gate. Cost: up to C× more stored photons from one shared BVH
-  walk (that's the intended chroma-noise win); no normalization change (each record keeps its `base/C` power).
+- **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
+  **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
+  beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets
+  `r.useHero` under the `kHeroC>1 && scene.media.empty() && !sceneHasGrin` gate. The gather keys off each photon's
+  own λ (`photonmap_render.h:245`), so the heterogeneous-λ map gathers correctly; C records of `base/C` sum to
+  `base` and `nEmitted` counts PATHS, so the estimate is energy-identical to single-λ. Cost: up to C× more stored
+  photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
+  BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
 - **Two known approximations in the CPU hero path** (both minor, documented for when they're revisited):
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
