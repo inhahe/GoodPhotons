@@ -1431,6 +1431,20 @@ ftrace's own language). Two follow-ups were captured:
       folded into reconciliation work. Bundles naturally with K1's illuminant upsample (the sky model wants proper
       emission spectra).
 
+- [ ] **K3 — RGB→wavelength map for lights (single dominant λ).** Distinct from K1's *upsampling* (RGB → a full
+      spectral power distribution): this maps an (r,g,b) colour to **one dominant wavelength** — a monochromatic /
+      narrow-line emission, so a coloured light behaves like a near-laser spike at λ(colour) rather than a broadband
+      curve. Useful for pure spectral sources and for driving dispersion/refraction (a real λ so glass fans it out
+      correctly), where a broadband upsample would wash the effect out. **The map:** convert the linear-sRGB colour to
+      xy chromaticity, find the **dominant-wavelength** intersection on the spectral locus (the standard colorimetric
+      construction: ray from the white point D65 through the sample's chromaticity to where it hits the horseshoe;
+      purples between the line-of-purples endpoints have a *complementary* dominant λ and need a fallback — e.g. clamp
+      to the nearest locus end or emit a two-line mix). Saturation → line narrowness / how peaked; value → intensity.
+      Author it as an emission form on lights, e.g. `spd rgb r g b line` (or a dedicated `spd wavelength-of r g b`),
+      routed through a new `upsample.h` helper `rgbToDominantWavelength(r,g,b)` returning a λ (nm) that then builds a
+      narrow Gaussian / delta `Spectrum`. Lights-only (a *reflectance* has no meaningful single λ, so materials keep
+      the K1 upsample). Mirror the form in loom's spectrum grammar. Observable → README + VERSION bump when it lands.
+
 ---
 
 ## Progress log
