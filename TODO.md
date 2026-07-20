@@ -1444,17 +1444,28 @@ ftrace's own language). Two follow-ups were captured:
       routed through a new `upsample.h` helper `rgbToDominantWavelength(r,g,b)` returning a λ (nm) that then builds a
       narrow Gaussian / delta `Spectrum`. Lights-only (a *reflectance* has no meaningful single λ, so materials keep
       the K1 upsample). Mirror the form in loom's spectrum grammar. Observable → README + VERSION bump when it lands.
-    - **Landed (2026-07-20, v0.10.0).** Added `upsample::rgbToDominantWavelength` + `rgbToLineEmission` in
+    - **Landed (2026-07-20, v0.10.1).** Added `upsample::rgbToDominantWavelength` + `rgbToLineEmission` in
       `src/upsample.h`: builds the CIE-1931 spectral-locus polygon once (400–700 nm at 1 nm, closed by the line of
       purples), casts the white→sample ray, and returns the crossing wavelength + excitation purity (or, for the
       purple edge, a violet↔red blend). `rgbToLineEmission` turns that into a `gaussianBand` whose width is
-      `5 + 125·(1−purity)` nm by default or a forced `sigma`; purples become a two-lobe violet+red sum. Wired the
-      trailing-`line [sigma]` modifier into `evalSpectrum`'s unified `rgb`/`hsv`/`hsl` handler (`src/ftsl.h` ~1160), so
-      `spd rgb 0 0 1 line` / `… line 6` parse. Validated: `scraps/line_light_test.ftsl` renders three primary line
-      lights → correct red/green/blue near-monochromatic illumination (`png/line_light_test.png`). README's spectrum-
-      forms list documents it. **Still TODO:** mirror the `line` modifier in loom's spectrum grammar
-      (`tools/loom/loom/grammar/spectrum.py` + the shared `.epeg`), and teach the GPDA shared grammar's spectrum
-      word-run to accept a trailing bareword so `-validate-grammar` stays clean on `line` scenes.
+      `5 + 125·(1−purity)` nm by default or a forced `sigma`; purples become a two-lobe violet+red sum.
+      **Syntax is a head keyword — `rgbline r g b [sigma]` / `hsvline …` / `hslline …`** — NOT a trailing `rgb r g b
+      line` modifier: ftrace's `parseValue` (`src/ftsl.h` ~211) ends a property value at the next *bareword* (only
+      numbers / `key=val` continue), so a trailing `line` word is silently dropped as a separate empty property. The
+      first attempt used the trailing form and rendered plain reflectance (the `line` never engaged) — caught on
+      re-verification. Wired the `…line` heads into `evalSpectrum`'s unified colour handler (`src/ftsl.h` ~1160).
+      Validated A/B: `scraps/line_light_test.ftsl` (line) vs `scraps/line_light_ref.ftsl` (plain `rgb`) render
+      *visibly different* illumination — the near-monochromatic lines are markedly more saturated (red +0.21 sat,
+      green +0.26 sat). The blue sphere in the *combined* scene reads greenish, but that is **not a bug**: a deep-blue
+      463 nm line has very low photopic luminance (round-trip Y≈1 vs green's Y≈71), so it is swamped by green spill
+      from the brighter neighbour. The isolated `scraps/line_blue_only.ftsl` (single blue line, no spill) renders a
+      **pure saturated blue** (mean RGB ≈ 0,0.6,160), confirming the full FTSL→spectral→display path is correct — the
+      C++ CMFs/matrices are byte-identical to the `scraps/dbg_domwl.py` / `scraps/dbg_roundtrip.py` ports, which give
+      blue=463 nm → display (0,0,1). Mirrored in loom's
+      spectrum grammar (`tools/loom/loom/grammar/spectrum.py`: `LineSpec`, `_LINE_HEADS`). README's spectrum-forms list
+      documents it. **Grammar shim verified clean:** `-validate-grammar` on a `rgbline` scene
+      (`scraps/line_blue_only.ftsl`) reports no mismatch — the head-keyword form parses as an ordinary head+numbers
+      value under the shared `.epeg` grammar, so no grammar change or shim-graph regen was needed.
 
 ---
 

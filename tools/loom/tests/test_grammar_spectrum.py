@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from loom.grammar.spectrum import (  # noqa: E402
-    Band, Blackbody, ColorSpec, Const, Ior, LibRef, NamedWall, RecordRef,
-    WhiteWall, as_spectrum, parse_spectrum,
+    Band, Blackbody, ColorSpec, Const, Ior, LibRef, LineSpec, NamedWall,
+    RecordRef, WhiteWall, as_spectrum, parse_spectrum,
 )
 from loom.grammar.values import ShapeError  # noqa: E402
 
@@ -87,6 +87,24 @@ def test_bracketed_colour_still_parses():
 def test_colour_wrong_arity_is_shape_error():
     with pytest.raises(ShapeError):
         parse_spectrum("rgb 0.8 0.8")          # a colour needs 3 components
+
+
+# ---- dominant-wavelength emission heads (K3) -------------------------------
+
+def test_line_heads_parse():
+    # `rgbline r g b` (and hsvline/hslline) → LineSpec, sigma optional
+    assert parse_spectrum("rgbline 1 0 0") == LineSpec("rgb", (1.0, 0.0, 0.0), None)
+    assert parse_spectrum("hsvline 0.6 0.8 0.9") == LineSpec("hsv", (0.6, 0.8, 0.9), None)
+    assert parse_spectrum("hslline 0.6 0.7 0.5") == LineSpec("hsl", (0.6, 0.7, 0.5), None)
+
+
+def test_line_head_explicit_sigma():
+    assert parse_spectrum("rgbline 0 0 1 6") == LineSpec("rgb", (0.0, 0.0, 1.0), 6.0)
+
+
+def test_line_head_wrong_arity_is_shape_error():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgbline 0 1")          # needs 3 components
 
 
 # ---- untagged bare colour is NOT a spectrum (matches ftrace) ---------------

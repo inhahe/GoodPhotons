@@ -20,6 +20,9 @@ The accepted forms — exactly ftrace's ``evalSpectrum`` (``src/ftsl.h`` ~1106) 
   optional);
 * a **colour** — **`rgb r g b`** / **`hsv h s v`** / **`hsl h s l`** (delegated to
   :func:`loom.grammar.values.as_color`, so a bracketed / comma colour also parses);
+* the dominant-wavelength emission heads **`rgbline r g b [sigma]`** /
+  **`hsvline …`** / **`hslline …`** → a narrow spectral line at the colour's dominant
+  wavelength (:class:`LineSpec`);
 * a library **reference** — ``glass:`` / ``metal:`` / ``reflectance:`` / ``filter:``
   / ``preset:`` / ``file:`` / ``spectrum:`` followed by a name / path;
 * a **record channel reference** used as a constant — ``RECORD.channel[i]`` or
@@ -42,6 +45,8 @@ from .values import ShapeError, as_color
 
 # The colorspace-tag heads and library-reference prefixes ftrace recognizes.
 _COLOR_HEADS = ("rgb", "hsv", "hsl")
+# The dominant-wavelength emission heads (K3): `rgbline r g b [sigma]`, etc.
+_LINE_HEADS = {"rgbline": "rgb", "hsvline": "hsv", "hslline": "hsl"}
 _LIB_PREFIXES = ("glass:", "metal:", "reflectance:", "filter:", "preset:",
                  "file:", "spectrum:")
 
@@ -97,6 +102,19 @@ class ColorSpec:
     """A tagged colour ``rgb`` / ``hsv`` / ``hsl`` upsampled to a reflectance."""
     space: str
     comps: Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class LineSpec:
+    """The dominant-wavelength *emission* form ``rgbline r g b [sigma]`` (and
+    ``hsvline``/``hslline``): a narrow Gaussian at the colour's dominant wavelength
+    (ftrace's ``rgbToLineEmission`` / K3).  ``sigma`` (nm) is the optional forced line
+    width; ``None`` = derive it from the colour's saturation.  A *head keyword* (not a
+    trailing ``line`` modifier) because ftrace's parser ends a value at the next
+    bareword, so a trailing word would be dropped."""
+    space: str
+    comps: Tuple[float, float, float]
+    sigma: float | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +202,16 @@ def parse_spectrum(text: str):
         return NamedWall("greenwall")
     if head in ("gaussian", "shortpass"):
         return _band(head, words[1:])
+    if head in _LINE_HEADS:
+        # `rgbline r g b [sigma]` (hsvline/hslline) → dominant-wavelength emission.
+        # The 3 colour components (+ optional sigma) follow as plain numbers.
+        space = _LINE_HEADS[head]
+        nums = [w for w in words[1:] if _is_number(w)]
+        if len(nums) < 3:
+            raise ShapeError(f"{head} needs 3 components")
+        _sp, comps = as_color(space + " " + " ".join(nums[:3]), default_space=space)
+        sigma = _num(nums[3]) if len(nums) > 3 else None
+        return LineSpec(space, comps, sigma)
     if head in _COLOR_HEADS:
         space, comps = as_color(text, default_space=head)
         return ColorSpec(space, comps)

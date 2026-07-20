@@ -1159,22 +1159,28 @@ private:
         }
         // `rgb r g b` / `hsv h s v` / `hsl h s l` — a colour, upsampled to a smooth
         // reflectance via the Jakob-Hanika fit. hue in [0,1] (turns, wraps); s/v/l in
-        // [0,1] (l = lightness). An optional trailing `line [sigma]` switches to the
-        // K3 dominant-wavelength *emission* form instead: a narrow band at the colour's
-        // dominant wavelength (near-monochromatic, so glass disperses it), width set by
-        // saturation or by the explicit `sigma` (nm). Meant for lights (`spd rgb … line`);
-        // a reflectance has no single wavelength, but the form is accepted anywhere.
-        if (h == "rgb" || h == "hsv" || h == "hsl") {
-            if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-            Vec3 c;
-            if      (h == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
-            else if (h == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
-            else                 c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
-            if (w.size() > 4 && w[4] == "line") {
-                double sigma = (w.size() > 5 && isNumber(w[5])) ? num(w[5]) : -1.0;
-                return rgbToLineEmission(c.x, c.y, c.z, sigma);
+        // [0,1] (l = lightness). The `…line` heads (`rgbline`/`hsvline`/`hslline`)
+        // instead take the K3 dominant-wavelength *emission* form: `rgbline r g b [sigma]`
+        // emits a narrow band at the colour's dominant wavelength (near-monochromatic, so
+        // glass disperses it), width from saturation or the explicit `sigma` (nm). Meant
+        // for lights (`spd rgbline 0 0 1`); a reflectance has no single wavelength, but the
+        // form is accepted anywhere a spectrum is. (A head keyword, not a trailing modifier,
+        // because the parser stops a value at the next bareword.)
+        {
+            bool isLine = (h == "rgbline" || h == "hsvline" || h == "hslline");
+            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine) {
+                if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
+                std::string space = isLine ? h.substr(0, 3) : h;
+                Vec3 c;
+                if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
+                else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
+                else                     c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
+                if (isLine) {
+                    double sigma = (w.size() > 4 && isNumber(w[4])) ? num(w[4]) : -1.0;
+                    return rgbToLineEmission(c.x, c.y, c.z, sigma);
+                }
+                return rgbToReflectanceJH(c.x, c.y, c.z);
             }
-            return rgbToReflectanceJH(c.x, c.y, c.z);
         }
         if (h.rfind("glass:", 0) == 0) {
             std::string g = h.substr(6);
