@@ -934,7 +934,13 @@ second:**
   saturated lights, fluorescence: everything RGB's three channels smear. *Every*
   full-spectrum renderer below is as accurate here as ftrace, and the hero-wavelength
   ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
-  per path instead of our one. **We claim no edge on this axis.**
+  per path. **We claim no edge on this axis** — though ftrace's **backward reference
+  tracer (`-mode R`, CPU)** now *also* uses hero-wavelength sampling (a hero λ plus 3
+  stratified secondaries riding one shared BVH walk, secondaries de-hero'd at the first
+  dispersive interface — Wilkie et al. 2014 / PBRT-v4 `TerminateSecondary`), so it
+  matches that lower colour-noise there too. The forward photon tracers (`-mode A/B/C`)
+  and BDPT/GPU paths still carry **one λ per photon** by design — that single-λ carrier
+  is exactly what lets the *forward photon map* split dispersive caustics (below).
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.

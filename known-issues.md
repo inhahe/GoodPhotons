@@ -5,6 +5,26 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT (2026-07-20): hero-wavelength sampling is in mode R (CPU) only — A/B/C, D, and all GPU megakernels still single-λ
+`radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** hero-wavelength
+spectral sampling (hero λ + 3 stratified secondaries, `hero.h` `kHeroC=4`), validated on `cornell.ftsl`
+(image unchanged, dispersion intact, chroma noise 0.89× overall / 0.74× in spectral-dominated regions, luma
+flat). The remaining §L-HERO sub-items are **not yet done** and are the tracked next work:
+- **GPU backward megakernel** (`renderBackwardCuda`) — mode R on GPU is still single-λ, so `-mode R -device gpu`
+  does *not* get the colour-noise reduction. (The `-device auto` default picks GPU on this machine, so hero only
+  kicks in with `-device cpu`.)
+- **Forward light tracers A/B/C** (CPU + wavefront/megakernel GPU) and **BDPT (D)** — all still 1 λ/photon.
+  Propagate the same shared wavelength-sampling + de-hero policy (ideally via a small `HeroLambda` struct) rather
+  than copying `radianceHero`'s logic four times.
+- **Two known approximations in the CPU hero path** (both minor, documented for when they're revisited):
+  - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
+    varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
+    weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.
+  - **Equal-*time* benefit is geometry-dependent.** Hero shares one BVH walk across C wavelengths, so its win grows
+    with scene complexity. On trivial geometry (Cornell: a few quads + 2 spheres) traversal is nearly free and the
+    4× per-λ shading makes hero ~1.6× slower per spp, so at *equal time* single-λ can edge it there. On heavy
+    geometry the shared traversal amortizes and hero wins outright. This is expected hero behaviour, not a bug.
+
 ### TECH-DEBT (2026-07-20): forward mode B barely converges the water-droplet rainbow (`scraps/rainbow_test.ftsl`); mode D works well
 The Airy rainbow phase model (`src/rainbow.h`) is **verified correct** — `ftrace -rainbow-selftest`
 reports textbook geometry (primary 40.7°–42.5° antisolar, secondary 50.1°–53.4° with reversed

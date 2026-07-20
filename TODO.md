@@ -1592,9 +1592,15 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
       and single-scatter media / thin-film still integrate correctly.
     - [ ] **A/B/C (forward light tracers)** — a photon carries 4 stratified λ; splat all four (MIS-weighted) each
           deposit. Mirror the change in both the CPU tracer and the wavefront/megakernel GPU path.
-    - [ ] **R (backward)** — the natural first target: sample 4 stratified λ per camera path in `radiance()`,
-          evaluate materials/NEE at each, splat the 4 CMF-weighted contributions. Do the CPU tracer *and* the GPU
-          backward megakernel (`renderBackwardCuda`).
+    - [x] **R (backward) — CPU DONE.** `radianceHero()` in `src/backward.h` samples a hero λ + 3 stratified
+          secondaries (`hero.h`, `kHeroC=4`), rides them along one shared BVH walk, evaluates materials/NEE per-λ
+          (`neeLightHero`/`neeEnvHero`, shared `interactMaterial`/`emitterGeom`/`envGeom` helpers) and splats 4
+          CMF-weighted contributions (÷C). De-hero at any dispersive/wavelength-switching interface (dielectric,
+          thin-film, multilayer, grating, filter, fluorescent) boosts the hero ×C — PBRT-v4 `TerminateSecondary`
+          convention. Gated on: `kHeroC>1 && no fog/GRIN/lens` (those stay scalar, C=1 is bit-identical). Validated
+          on `cornell.ftsl`: converged image unchanged, glass-sphere dispersion intact, **luma noise flat (1.03×),
+          chroma noise down (0.89× overall, 0.74× in spectral-dominated neutral regions)** at equal spp.
+          **Still TODO:** the GPU backward megakernel (`renderBackwardCuda`) — mode R on GPU is still single-λ.
     - [ ] **D (BDPT)** — carry the 4 λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
