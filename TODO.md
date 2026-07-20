@@ -1398,6 +1398,41 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
 
 ---
 
+## K. Light colour, RGB→spectral options, and an analytic physical sky  *(ftrace + loom; design-captured 2026-07-19 — this conversation)*
+
+Fallout from the loom↔ftrace light-schema reconciliation (known-issues "RESOLVED: loom `Light(color=…)`…").
+loom's `color=` now emits `spd rgb …` and `size`/`turbidity` were dropped from loom (a light is authored in
+ftrace's own language). Two follow-ups were captured:
+
+- [ ] **K1 — Multiple RGB→spectral upsampling methods (incl. a user-supplied mapping).** Today there is exactly
+      **one** RGB→spectrum path, shared by *materials and lights alike*: `rgb r g b` → `rgbToReflectanceJH`
+      (`src/upsample.h`), the Jakob-Hanika 2019 sigmoid-of-quadratic **reflectance** fit — coefficients solved by
+      Gauss-Newton so the spectrum, viewed **under D65 through the CIE observer**, reproduces the target linear-sRGB
+      colour. It always lands in (0,1) (a physical reflectance) and round-trips sRGB. **The gap:** using a
+      *reflectance* fit for an **emitter** (`spd rgb`) is not principled — Jakob-Hanika also defines an *illuminant*
+      upsample (no D65 pre-weighting, unbounded, so a bright/saturated emitter is representable), and other classic
+      methods exist (Smits 1999, Meng 2015, a plain 3-lobe/box). Proposal: make the mapping *selectable* via a tag on
+      the colour form — e.g. `rgb r g b` (default, reflectance) vs `rgb r g b illuminant` / a distinct `emit_rgb …`
+      for the illuminant fit — and, further out, allow a **named user mapping**: a function `(r,g,b) -> spectrum`
+      registered in the spectral-envelope store and referenced by name, so a scene can plug in its own upsampler.
+      Materials would keep the reflectance default; lights would default to (or at least be able to opt into) the
+      illuminant fit. Scope: an `upsample.h` illuminant variant + wire a tag through `evalSpectrum`'s `rgb`/`hsv`/
+      `hsl` handlers; mirror in loom's spectrum grammar. Observable → README + VERSION bump when it lands.
+
+- [ ] **K2 — Analytic physical sky (`turbidity`).** ftrace has **no** procedural sky: environment lighting is only
+      an image-based env map (`env { file … }`) or a constant-radiance env. `turbidity` (atmospheric haze: ~2 = clear
+      deep-blue sky, ~10 = milky/hazy) only means something inside a physically-based **sky+sun** model
+      (Preetham 2002 or Hošek-Wilkie 2012), which *generates directional radiance from a sun position* — i.e. it is
+      genuinely **about how the scene is rendered**, not merely a spectral envelope, so it warrants a real construct
+      (a `sky` / `sun` light kind, or `env { kind hosek  turbidity t  sun_dir …  ground_albedo … }`), NOT just a name
+      in the spectral-envelope store. Decision recorded (per user): a construct that only *names a spectral envelope*
+      belongs in the generic spectral store; a construct that *drives the render* (like an analytic sky) is a
+      first-class feature. This is the latter. Deferred as its own feature to greenlight on its own merits, not to be
+      folded into reconciliation work. Bundles naturally with K1's illuminant upsample (the sky model wants proper
+      emission spectra).
+
+---
+
 ## Progress log
 - 2026-07-19: **J3c started (option-a) — GPDA vendored + shared grammar reads the record block.** Stood up
   `loom/grammar/`: vendored the pinned tokenized `gpda.py` as `_gpda.py` (GraphParser commit 1ac4cbf,

@@ -519,7 +519,12 @@ class Volume(Element):
 
 class Light(Element):
     """Generic ``light <kind> { ...props... }``.  Props are animatable or strings
-    (e.g. ``spd="preset:bb6500"``)."""
+    and must use ftrace's real light schema (``spd`` for emission, plus per-kind
+    geometry: ``origin``/``u``/``v`` for an area light, ``center``/``radius`` for a
+    sphere, etc. — see ftrace's ``addLight``).  loom does not invent light fields;
+    the one convenience is ``color=(r, g, b)``, which is emitted as an ``spd rgb …``
+    emission spectrum, since ftrace lights are spectral and have no ``color`` field.
+    """
 
     def __init__(self, kind: str, **props) -> None:
         self.kind = kind
@@ -532,8 +537,15 @@ class Light(Element):
         # Unified header: anonymous light with the subtype carried as a `kind`
         # property (`light { kind point  ... }`) rather than a bareword after KIND.
         parts = [f"kind {self.kind}"]
-        parts += [f"{k} {value_token(v, ctx.clock, ctx.cache)}"
-                  for k, v in self.props.items()]
+        for k, v in self.props.items():
+            tok = value_token(v, ctx.clock, ctx.cache)
+            if k == "color":
+                # ftrace lights carry their emission in a spectral `spd`; there is no
+                # `color` field. Author an RGB colour, emit it as `spd rgb r g b` (the
+                # Jakob-Hanika upsample turns the triple into an emission spectrum).
+                parts.append(f"spd rgb {tok}")
+            else:
+                parts.append(f"{k} {tok}")
         return "light { " + "  ".join(parts) + " }"
 
 

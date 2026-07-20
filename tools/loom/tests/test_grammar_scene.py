@@ -32,8 +32,10 @@ _SAMPLES = [
     Sphere((0.0, 1.5, -2.0), 0.75, "gold"),
     Sphere((-1, 0, 0), 1, "glass"),
     Light("point", position="0 5 0", spd="preset:bb6500", power="40"),
-    Light("area", color="0.9 0.8 0.7", size="2 2"),
-    Light("sky", turbidity="3"),
+    # `color=` is loom's one convenience: it emits `spd rgb …` (ftrace lights are
+    # spectral, no `color` field). Geometry uses ftrace's real area-light `u`/`v`.
+    Light("area", color="0.9 0.8 0.7", u="1 0 0", v="0 0 1"),
+    Light("sphere", center="0 2 0", radius="0.3", spd="blackbody 5000"),
     Camera((0, 2, 5), (0, 0, 0)),
     Camera((3.0, -1.5, 2.25), (0, 1, 0), up=(0, 0, 1), fov_y=55.0,
            mode="A", res=(1920, 1080), name="hero"),
@@ -70,6 +72,16 @@ def test_light_fields_roundtrip():
     assert back.props["position"] == "0 5 0"
     assert back.props["spd"] == "preset:bb6500"
     assert back.props["power"] == "40"
+
+
+def test_light_color_emits_spd_rgb():
+    # loom's `color=` convenience maps to a spectral `spd rgb …` (ftrace lights have
+    # no `color` field); the emitted text carries no bare `color` token.
+    out = Light("area", color="0.9 0.8 0.7", u="1 0 0", v="0 0 1").emit(_ctx())
+    assert "spd rgb 0.9 0.8 0.7" in out
+    assert "color" not in out
+    # …and it round-trips: the reader sees a spectral `spd`, re-emit is byte-identical.
+    assert parse_element(out).emit(_ctx()) == out
 
 
 def test_light_spd_spectrum_forms_parse():

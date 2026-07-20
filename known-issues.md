@@ -49,14 +49,16 @@ scene-aware check). An untagged triple `reflect 0.8 0.7 0.2` is now rejected exa
 `slot = REC.chan`, ftrace's `isRecordOverrideBlock`) is a distinct block form loom does not emit, and the
 final step is mirroring the `value`/`spectrum`/binding grammar into ftrace's C++ front-end at the J3c port.
 
-### POSSIBLE MISMATCH (2026-07-19): loom `Light(color=…, size=…, turbidity=…)` emits fields ftrace's `addLight` ignores
-loom's `Light` accepts free-form props and emits them verbatim (`light { kind …  color 0.9 0.8 0.7  size 2 2 }`),
-but ftrace's `addLight` (`src/ftsl.h` ~2655) reads its emission from `spd` (a spectrum) plus per-subtype
-geometry (`origin`/`u`/`v`/`center`/`radius`/…) — it has **no** `color`, `size`, or `turbidity` field, so
-those loom props are silently dropped at render. (The loom test battery uses them only to prove the reader
-round-trips arbitrary props, not that ftrace consumes them.) **Proper fix:** decide the light authoring
-contract — either map loom's `color`→`spd` / `size`→area-quad `u`,`v` at emit, or drop the unused kwargs from
-loom's `Light` — and align it with ftrace's real light schema (ideally folded into the J3c grammar port).
+### RESOLVED (2026-07-19): loom `Light(color=…, size=…, turbidity=…)` emitted fields ftrace's `addLight` ignored
+loom's `Light` accepted free-form props and emitted them verbatim (`light { kind …  color 0.9 0.8 0.7  size 2 2 }`),
+but ftrace's `addLight` reads emission from `spd` (a spectrum) plus per-subtype geometry
+(`origin`/`u`/`v`/`center`/`radius`/…) — it has **no** `color`, `size`, or `turbidity` field, so those loom props
+were silently dropped at render. **Fixed:** loom's `Light` now maps `color=(r,g,b)` → `spd rgb r g b` (a spectral
+emission, since ftrace lights are spectral) and otherwise passes only ftrace-valid props through; the test battery
+dropped its `size`/`turbidity` fixtures and uses ftrace's real light schema (`u`/`v` area geometry,
+`center`/`radius` sphere light). `size`/`turbidity` were demo-only and are gone — if loom wants to author a light
+it uses ftrace's language. (`test_light_color_emits_spd_rgb` locks the mapping; full loom suite green, 824 passed.)
+The analytic-sky *feature* that would give `turbidity` meaning is deferred — see TODO ("Analytic physical sky").
 
 ### RESOLVED (2026-07-19): `gallery_settled.ftsl` — several objects mis-positioned (resting on the floor)
 **Root cause:** the free-settle physics bake tumble, not a transform/collider/floor bug. Three of the
