@@ -58,10 +58,15 @@ bool cudaForwardSupported(const Scene& scene);
 // wavefront scheduler keeps SIMD lanes full on divergent / deep-path scenes and small
 // GPUs, at the cost of extra memory traffic (the RNG stream — and thus the exact image
 // noise — differs, but the two agree to within Monte-Carlo noise).
+// `heroC` (>1) enables hero-wavelength spectral sampling in the forward megakernel: each
+// photon path carries C stratified wavelengths through one shared BVH walk, cutting
+// chromatic noise. It requires no participating media / GRIN (gated on the device) and
+// forces the megakernel backend (hero physics is not in the wavefront scheduler); heroC<=1
+// reproduces the original single-λ stream bit-for-bit.
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase = 0,
-                       bool wavefront = false);
+                       bool wavefront = false, int heroC = 1);
 
 // GPU multi-camera shared forward trace (models A and B — the device twin of the CPU
 // renderForwardShared). Traces ONE set of N photons and splats each vertex to ALL
@@ -79,7 +84,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase = 0,
-                                          bool wavefront = false);
+                                          bool wavefront = false, int heroC = 1);
 
 // True if this scene can be rendered by the GPU photon-map path (mode M). Requires the
 // same POD-bakeable materials as the forward path (cudaForwardSupported) and no
@@ -125,7 +130,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             bool diffraction, long long spp,
                                             const SppProgress* prog = nullptr,
                                             const std::function<bool(int, const Film&)>* onFrame = nullptr,
-                                            const char* mapLoad = nullptr, const char* mapSave = nullptr);
+                                            const char* mapLoad = nullptr, const char* mapSave = nullptr,
+                                            int heroC = 1);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

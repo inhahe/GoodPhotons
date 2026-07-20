@@ -2698,9 +2698,11 @@ __device__ static void camSpecularSplatVolumeAll(const DScene& sc, const DMedium
 
 // ============================ megakernel ============================
 
-__device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
-    // CDF search stays in double (host-baked table); the returned wavelength/pdf are Real.
-    double u = (double)rng.uniform();
+// Wavelength from an emitter's SPD CDF given an explicit uniform `u` in [0,1). Split out
+// so the hero-wavelength sampler can pass stratified strata (u + i/C wrapped) that share
+// the emitter's CDF, while the scalar sampleLambda below just draws its own u. The CDF
+// search stays in double (host-baked table); the returned wavelength/pdf are Real.
+__device__ static Real sampleLambdaU(const DScene& sc, const DEmitter& em, double u, Real& pdf) {
     const double* cdf = sc.lightCdfAll + em.cdfOffset;
     int lo = 0, hi = em.cdfN - 1;
     while (lo + 1 < hi) { int mid = (lo + hi) / 2; if (cdf[mid] <= u) lo = mid; else hi = mid; }
@@ -2708,6 +2710,9 @@ __device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& 
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
     pdf = (Real)((c1 - c0) / em.cdfStep);
     return (Real)(DLMIN + (lo + frac) * em.cdfStep);
+}
+__device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
+    return sampleLambdaU(sc, em, (double)rng.uniform(), pdf);
 }
 
 // Power-weighted emitter selection (mirrors Scene::selectEmitter). Single
@@ -3240,79 +3245,17 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     return true;
 }
 
-// Advance a photon by one bounce given its precomputed intersection `h`. Mutates
-// ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
-// when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
-// with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
-__device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
-                                int camMode, int diffraction, const DHit& h,
-                                DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
-                                double& eAbsorbed, double& eSensor, double& eEscaped,
-                                DMediumStack& stk) {
-    Real dSurf = h.valid ? h.t : BIG;
-
-    // fog free-flight; dEvent is the nearer of surface hit / volume collision.
-    bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
-    if (sc.mediaN > 0) {
-        // Superposition of all media: each does its own delta (Woodcock) tracking (or
-        // exact analytic free-flight if homogeneous); the earliest collision wins and
-        // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
-        Real tMed; int which;
-        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
-            mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
-        }
-    }
-
-    // Model C perspective catch: if the photon flies through the aperture
-    // nearer than the surface/fog event, it lands on the film. Analog physics.
-    if (camMode == CAM_C) {
-        int px, py;
-        // Model C never shares a trace (it consumes the photon), so nCam==1 here.
-        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
-            // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
-            // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
-            // scenes unaffected).
-            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
-            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
-            eSensor += beta; return WF_TERMINATE;
-        }
-    }
-
-    // Beer-Lambert attenuation over the free path just travelled inside a dielectric
-    // (colored/attenuating glass), applied before the event is processed (matches the
-    // host: attenuate over dEvent using the medium carried from the previous vertex).
-    {
-        int cm = stk.topMat();
-        Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-        if (a > 0) beta *= exp(-a * dEvent);
-    }
-
-    if (mediumEvent) {
-        const DMedium& sm = sc.media[scatterMed];
-        splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
-        camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
-        if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
-        ro = mp; rd = nd;
-        return WF_CONTINUE;
-    }
-
-    if (!h.valid) { eEscaped += beta; return WF_TERMINATE; }
-    if (h.sensorId >= 0) {
-        // Legacy contact sensor: no geometry carries a sensorId in the current
-        // camera modes, so this is inert (kept for absorption bookkeeping).
-        eSensor += beta; return WF_TERMINATE;
-    }
-
-    const DMaterial* mptr = &sc.mats[h.matId];
-    int matIndex = h.matId;
-    // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
-    if (mptr->type == D_MIX) {
-        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
-        if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        mptr = &sc.mats[child]; matIndex = child;
-    }
-    const DMaterial& m = *mptr;
+// Specular / wavelength-switching material interaction (the nine families that are NOT
+// Diffuse / DiffuseTransmit): Dielectric, ThinFilm, Multilayer, Mirror, Grating,
+// HalfMirror, Filter, Glossy, Fluorescent. Split out of shadeStep so BOTH the scalar
+// forward tracer AND the hero-wavelength tracer (after de-hero) share one source of truth
+// for these lobes — the device twin of Renderer::interactPhotonSpecular (render.h). `m` is
+// the already-resolved material (post-Mix); `matIndex` drives the dielectric priority stack.
+// Mutates ro/rd/beta/lambda (Fluorescent Stokes shift) and returns WF_CONTINUE/WF_TERMINATE.
+__device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int camMode,
+        int diffraction, const DMaterial& m, int matIndex, const DHit& h,
+        DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
+        DMediumStack& stk) {
     if (m.type == D_DIELECTRIC) {
         DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matIndex, stk, nro, nrd);
         ro = nro; rd = nrd; return WF_CONTINUE;
@@ -3391,6 +3334,89 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
           ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+    }
+    return WF_CONTINUE;   // unreachable: caller dispatches only the nine specular types
+}
+
+// Advance a photon by one bounce given its precomputed intersection `h`. Mutates
+// ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
+// when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
+// with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
+__device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
+                                int camMode, int diffraction, const DHit& h,
+                                DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
+                                double& eAbsorbed, double& eSensor, double& eEscaped,
+                                DMediumStack& stk) {
+    Real dSurf = h.valid ? h.t : BIG;
+
+    // fog free-flight; dEvent is the nearer of surface hit / volume collision.
+    bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
+    if (sc.mediaN > 0) {
+        // Superposition of all media: each does its own delta (Woodcock) tracking (or
+        // exact analytic free-flight if homogeneous); the earliest collision wins and
+        // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
+        Real tMed; int which;
+        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
+            mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
+        }
+    }
+
+    // Model C perspective catch: if the photon flies through the aperture
+    // nearer than the surface/fog event, it lands on the film. Analog physics.
+    if (camMode == CAM_C) {
+        int px, py;
+        // Model C never shares a trace (it consumes the photon), so nCam==1 here.
+        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
+            // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
+            // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
+            // scenes unaffected).
+            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
+            eSensor += beta; return WF_TERMINATE;
+        }
+    }
+
+    // Beer-Lambert attenuation over the free path just travelled inside a dielectric
+    // (colored/attenuating glass), applied before the event is processed (matches the
+    // host: attenuate over dEvent using the medium carried from the previous vertex).
+    {
+        int cm = stk.topMat();
+        Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+        if (a > 0) beta *= exp(-a * dEvent);
+    }
+
+    if (mediumEvent) {
+        const DMedium& sm = sc.media[scatterMed];
+        splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+        camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+        if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
+        ro = mp; rd = nd;
+        return WF_CONTINUE;
+    }
+
+    if (!h.valid) { eEscaped += beta; return WF_TERMINATE; }
+    if (h.sensorId >= 0) {
+        // Legacy contact sensor: no geometry carries a sensorId in the current
+        // camera modes, so this is inert (kept for absorption bookkeeping).
+        eSensor += beta; return WF_TERMINATE;
+    }
+
+    const DMaterial* mptr = &sc.mats[h.matId];
+    int matIndex = h.matId;
+    // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
+    if (mptr->type == D_MIX) {
+        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
+        if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
+        mptr = &sc.mats[child]; matIndex = child;
+    }
+    const DMaterial& m = *mptr;
+    if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
+        m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
+        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
+        // The nine specular / wavelength-switching lobes — shared with the hero tracer.
+        return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+                                ro, rd, beta, lambda, rng, eAbsorbed, stk);
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -3432,9 +3458,315 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     }
 }
 
+// ==================== hero-wavelength forward tracer (device) ================
+// Device twin of Renderer::tracePhotonHero (render.h): one path carries a HERO wavelength
+// (index 0) plus C-1 stratified SECONDARY wavelengths that SHARE a single BVH walk. The
+// geometry is driven by the hero λ; each λ carries its own throughput beta[i]. At any
+// dispersive / wavelength-switching interface the secondaries "de-hero" (terminate,
+// beta[0] *= C) and the path continues as an ordinary single-λ photon — energy is
+// preserved exactly and the estimator is unbiased. Only CHROMATIC noise is reduced (all C
+// share one geometric sample). Gated OFF when the scene has participating media or a GRIN
+// region (see launchForward), so the fog/GRIN code paths never appear here.
+
+// Mode-B pinhole connect for all `nUp` live wavelengths through ONE shared geometry
+// (draws no RNG). Per-λ ordering matches connect().
+__device__ static void connectHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+    DVec3 toCam = cam.eye - p;
+    Real dist = length(toCam);
+    DVec3 wdir = toCam / dist;
+    Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
+    int px, py; Real cosCam, dist2;
+    if (!cam.project(p, px, py, cosCam, dist2)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
+    for (int i = 0; i < nUp; ++i) {
+        Real contrib = beta[i] * (rho[i] / (Real)DPI) * geo;
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
+    }
+}
+// Model-A finite-lens splat for all `nUp` live wavelengths through ONE shared aperture
+// sample (drawn once — the thin-lens pupil is achromatic, so C wavelengths legitimately
+// share the connection, exactly like connectLensHero on the CPU). Per-λ ordering matches
+// connectLens().
+__device__ static void connectLensHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
+    Real cosLens = -dot(wdir, cam.w);
+    if (cosLens <= (Real)1e-6) return;
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
+    Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+    Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
+    for (int i = 0; i < nUp; ++i) {
+        Real contrib = beta[i] * rho[i] * geo;
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
+    }
+}
+// Splat a surface vertex to every camera, all `nUp` live wavelengths (mode A/B). No-op for
+// mode C (which consumes the photon) and for the mode-M deposit pass (nCam == 0).
+__device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, int camMode,
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+        else if (camMode == CAM_A) connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+    }
+}
+// Refract each live wavelength's Lambertian reflection through every glass sphere. Unlike
+// the achromatic camera connection this CANNOT share geometry: the sphere IOR is dispersive
+// (per-λ), so each wavelength traces its own refracted image — exactly what makes a glass-
+// sphere caustic chromatically dispersed. Draws no RNG (mode B only inside).
+__device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode,
+        const DVec3& p, const DVec3& n, const Real* lam, const Real* beta, const Real* rho,
+        int nUp, DRng& rng) {
+    for (int i = 0; i < nUp; ++i)
+        camSpecularSplatAll(sc, cs, camMode, p, n, lam[i], beta[i], rho[i], rng);
+}
+
+// Emit one hero photon: fills ro/rd and the per-λ lam[]/beta[] bundle, sets secAlive, does
+// the direct emitter->camera splat, and accrues emitted energy (sum of live betas). Returns
+// false when the hero wavelength draws a zero pdf (skip this photon). Emission geometry is
+// byte-identical to genPhoton (λ-independent); only the wavelength/throughput bundle differs.
+__device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int camMode, int C,
+        DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted) {
+    int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+    const DEmitter em = sc.emitters[ei];
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 origin, emitN, dir;
+    Real spotW = (Real)1;
+    bool envImage = false; double envPdfW = 0.0;
+    if (em.shape == 2) {
+        origin = em.origin;
+        double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
+        double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+        double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+        DVec3 t, b; onb(em.beamDir, t, b);
+        dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
+        emitN = em.beamDir;
+        double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
+        spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
+    } else if (em.shape == 3) {
+        if (sc.env.scale != nullptr) {
+            dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
+            envImage = true;
+        } else {
+            double z = 1.0 - 2.0 * (double)u1;
+            double sr = sqrt(fmax(0.0, 1.0 - z * z));
+            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+            dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        }
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
+        emitN = dir;
+    } else {
+        emitterSamplePoint(em, u1, u2, origin, emitN);
+        dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+    }
+
+    // Hero + stratified secondaries from this emitter's SPD (one base draw, C-1 wrapped
+    // strata). The hero must have a valid pdf; a dead secondary simply carries beta 0.
+    double u = (double)rng.uniform();
+    Real pdf0 = 0;
+    lam[0] = sampleLambdaU(sc, em, u, pdf0);
+    if (pdf0 <= 0) return false;
+    for (int i = 1; i < C; ++i) {
+        double uu = u + (double)i / C;
+        if (uu >= 1.0) uu -= 1.0;                     // wrap into [0,1)
+        Real pdfi;
+        lam[i] = sampleLambdaU(sc, em, uu, pdfi);
+    }
+    Real base = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
+    base *= spotW;
+    for (int i = 0; i < C; ++i) beta[i] = base / (Real)C;
+    if (envImage) {
+        int ti = dEnvTexel(sc.env, dir);
+        for (int i = 0; i < C; ++i) {
+            double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lam[i]);
+            double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lam[i]);
+            double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
+            beta[i] = (denom > 0.0) ? (Real)((double)beta[i] * rad / denom) : (Real)0;
+        }
+    }
+    secAlive = (C > 1);
+    int nUp = secAlive ? C : 1;
+    for (int i = 0; i < nUp; ++i) eEmitted += (double)beta[i];
+
+    // Direct emitter->camera connection (area/quad emitters only; spot/env have no direct
+    // term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
+    if (em.shape != 2 && em.shape != 3) {
+        Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = (Real)1;
+        splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng);
+        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng);
+    }
+
+    ro = origin + dir * RAY_EPS; rd = dir;
+    return true;
+}
+
+// One hero bounce (called only while secAlive, so nUp == C). Handles the model-C catch,
+// escape/sensor bookkeeping, and the diffuse / diffuse-transmit lobes with per-λ deposit +
+// splat + Russian-roulette on the hero (secondaries reweighted by rho[i]/rho[0]). At any of
+// the nine specular / wavelength-switching materials it DE-HEROS (beta[0] *= C, secAlive =
+// false) and delegates that same hit to the shared scalar interactSpecular — from then on
+// the caller runs the ordinary single-λ shadeStep. No fog/GRIN here (gated out upstream).
+__device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
+        int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
+        bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
+        DMediumStack& stk) {
+    const int nUp = C;
+    Real dEvent = h.valid ? h.t : BIG;
+
+    // Model C aperture catch: deposit every live wavelength that threads the pupil.
+    if (camMode == CAM_C) {
+        int px, py;
+        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
+            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            for (int i = 0; i < nUp; ++i) {
+                filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lam[i], beta[i] * cCell);
+                eSensor += (double)beta[i];
+            }
+            return WF_TERMINATE;
+        }
+    }
+    // (No Beer-Lambert while secAlive: entering a dielectric de-heros, so the stack is empty
+    // here and topMat() would be -1.)
+    if (!h.valid) { for (int i = 0; i < nUp; ++i) eEscaped += (double)beta[i]; return WF_TERMINATE; }
+    if (h.sensorId >= 0) { for (int i = 0; i < nUp; ++i) eSensor += (double)beta[i]; return WF_TERMINATE; }
+
+    const DMaterial* mptr = &sc.mats[h.matId];
+    int matIndex = h.matId;
+    if (mptr->type == D_MIX) {
+        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
+        if (child < 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+        mptr = &sc.mats[child]; matIndex = child;
+    }
+    const DMaterial& m = *mptr;
+
+    if (m.type == D_DIFFUSETRANSMIT) {
+        Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
+        for (int i = 0; i < nUp; ++i) {
+            Real rr = clamp01(dDiffuseRho(sc, m, h, lam[i]));
+            Real rt = clamp01(specLookup(m.transmit, lam[i]));
+            Real s = rr + rt; if (s > (Real)1) { rr /= s; rt /= s; }   // per-λ energy guard
+            rhoR[i] = rr; rhoT[i] = rt;
+        }
+        DVec3 nb = h.n * (Real)(-1);
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+        DVec3 wiPrev = -rd;
+        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+        if (camMode == CAM_A || camMode == CAM_B) {
+            splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
+            splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
+            camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rhoR, nUp, rng);
+            camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, lam, beta, rhoT, nUp, rng);
+        }
+        Real sumHero = rhoR[0] + rhoT[0];
+        Real uu = rng.uniform();
+        if (uu < rhoR[0]) {
+            for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+            DVec3 wo = cosineHemisphere(h.n, rng);
+            Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+            for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+            ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
+        } else if (uu < sumHero) {
+            for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+            DVec3 wo = cosineHemisphere(nb, rng);
+            Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+            for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+            ro = h.p + nb * RAY_EPS; rd = wo; return WF_CONTINUE;
+        }
+        for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
+        return WF_TERMINATE;
+    }
+
+    if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
+        m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
+        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
+        // Dispersive / wavelength-switching: terminate secondaries, boost the hero ×C, then
+        // run the shared scalar interaction on the (now single-λ) hero channel.
+        beta[0] *= (Real)C; secAlive = false;
+        return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
+    }
+
+    // Diffuse (texture-sampled reflectance when the material binds a texture).
+    Real rho[hero::kHeroMax];
+    for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
+    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 wiPrev = -rd;
+    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+    if (camMode == CAM_A || camMode == CAM_B) {
+        splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
+        camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
+    }
+    Real rhoHero = rho[0];
+    if (rng.uniform() >= rhoHero) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;   // secondary reweight
+    DVec3 wo = cosineHemisphere(h.n, rng);
+    Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+    for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+    ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
+}
+
+// Full hero photon: emit, then bounce until termination. While the secondaries are alive
+// each bounce runs shadeStepHero; once a dispersive interface de-heros the path, it falls
+// through to the ordinary single-λ shadeStep on beta[0]/lam[0].
+__device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int camMode,
+        int diffraction, int maxBounce, int C, DRng& rng,
+        double& eEmitted, double& eAbsorbed, double& eSensor, double& eEscaped, double& eResidual) {
+    Real lam[hero::kHeroMax], beta[hero::kHeroMax];
+    bool secAlive = false;
+    DVec3 ro, rd;
+    if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted)) return;
+    DMediumStack stk; stk.clear();
+    bool done = false;
+    for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
+        if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
+        DHit h = closestHit(sc, ro, rd);
+        int r;
+        if (secAlive)
+            r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
+                              eAbsorbed, eSensor, eEscaped, stk);
+        else
+            r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
+                          eAbsorbed, eSensor, eEscaped, stk);
+        if (r == WF_TERMINATE) done = true;
+    }
+    if (!done) {
+        int n = secAlive ? C : 1;
+        for (int i = 0; i < n; ++i) eResidual += (double)beta[i];
+    }
+}
+
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
-                       int camMode) {
+                       int camMode, int heroC) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seed((unsigned long long)(g * 2 + 1), seedBase ^ (unsigned long long)g);
@@ -3442,6 +3774,13 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
+        if (heroC > 1) {
+            // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
+            // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
+            traceHeroPhoton(sc, cs, camMode, diffraction, maxBounce, heroC, rng,
+                            eEmitted, eAbsorbed, eSensor, eEscaped, eResidual);
+            continue;
+        }
         DVec3 ro, rd; Real beta, lambda;
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
@@ -5783,27 +6122,35 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
-                          bool wavefront, int camModeInt) {
+                          bool wavefront, int camModeInt, int heroC) {
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream.
     unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
-    if (wavefront) {
+    // Hero-wavelength sampling shares one BVH walk across C stratified wavelengths, cutting
+    // chromatic noise. It is only physical without participating media / GRIN bending (the
+    // geometry must be wavelength-independent between dispersive events), and it lives ONLY
+    // in the megakernel — so gate on the scene and force the megakernel when hero is active.
+    int effHeroC = 1;
+    if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
+        effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
+    }
+    if (wavefront && effHeroC == 1) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
-        // maxBounce (32) and camera mode/set as the megakernel.
+        // maxBounce (32) and camera mode/set as the megakernel. (Hero forces megakernel.)
         wavefrontTrace(up, cs, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
     } else {
         int blockSize = 128;
         int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
         kTrace<<<numBlocks, blockSize>>>(up.sc, cs, d_energy, N, diffraction ? 1 : 0,
-                                         kseed, 32, camModeInt);
+                                         kseed, 32, camModeInt, effHeroC);
     }
     cudaCheckKernel("forward");
 }
 
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode, unsigned long long seedBase, bool wavefront) {
+                       char camMode, unsigned long long seedBase, bool wavefront, int heroC) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -5826,7 +6173,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     std::vector<DCamera> hc{ up.dc };
     std::vector<double*> fp{ d_film }, hp{ d_hits };
     DCamSet cs = makeCamSet(up, hc, fp, hp);
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
 
     // --- download ---
     std::vector<double> film(npix * 3);
@@ -5853,7 +6200,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase,
-                                          bool wavefront) {
+                                          bool wavefront, int heroC) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -5882,7 +6229,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
 
     int camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
     DCamSet cs = makeCamSet(up, hcams, d_films, d_hits);
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
 
     // --- download each camera's film ---
     for (int c = 0; c < nc; ++c) {
@@ -6360,7 +6707,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             bool diffraction, long long spp,
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
-                                            const char* mapLoad, const char* mapSave) {
+                                            const char* mapLoad, const char* mapSave, int heroC) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -6405,7 +6752,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
         cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
-        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B);
+        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B, heroC);
     };
 
     depositLaunch(nullptr, 0);              // count-only sizing pass

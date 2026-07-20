@@ -937,8 +937,9 @@ second:**
   full-spectrum renderer below is as accurate here as ftrace, and the hero-wavelength
   ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
   per path. **We claim no edge on this axis** — and ftrace now closes the noise gap on
-  its **CPU** tracers: the **backward reference tracer (`-mode R`)**, the
-  **forward light tracers (`-mode A/B/C`)**, and the **photon-mapping modes (`-mode M/S`)**
+  the **CPU** tracers — the **backward reference tracer (`-mode R`)**, the
+  **forward light tracers (`-mode A/B/C`)**, and the **photon-mapping modes (`-mode M/S`)** —
+  plus the **GPU forward megakernel** (modes `A/B/C` and the `M` photon-map deposit)
   all use hero-wavelength sampling (a hero λ plus 3 stratified secondaries riding one
   shared BVH walk, secondaries de-hero'd at the first dispersive interface — Wilkie et
   al. 2014 / PBRT-v4 `TerminateSecondary`), so they reach a given colour-noise level in
@@ -948,11 +949,12 @@ second:**
   records, so total stored energy is unchanged. Hero collapses to a single continuous
   wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
   caustic splitting (below) rather than trading it away. Still single-λ **by design or
-  pending work**: the **GPU** megakernels (all modes), **BDPT (`-mode D`)**, and
-  **VCM/UPS (`-mode U`)** — these carry one λ per photon for now (hero for U is planned;
-  see `known-issues.md`). The bundle size is runtime-configurable with **`-heroc N`**
-  (default 4, range 1–8); `-heroc 1` turns hero off, reducing every CPU tracer
-  bit-identically to the classic single-λ estimator.
+  pending work**: the **GPU wavefront** backend (hero forces the megakernel), the **GPU
+  backward / BDPT megakernels**, **BDPT (`-mode D`)**, and **VCM/UPS (`-mode U`)** — these
+  carry one λ per photon for now (hero for U is planned; see `known-issues.md`). The bundle
+  size is runtime-configurable with **`-heroc N`** (default 4, range 1–8); `-heroc 1` turns
+  hero off, reducing every hero tracer (CPU and the GPU forward megakernel) bit-identically
+  to the classic single-λ estimator.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.

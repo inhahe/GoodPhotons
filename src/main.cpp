@@ -1223,7 +1223,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // selects the streaming backend over the default megakernel (same physics/energy).
     if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
         char camMode = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
-        return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camMode, seedBase, wavefront);
+        return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camMode, seedBase, wavefront, g_heroC);
     }
 #else
     (void)useGpu; (void)wavefront;
@@ -5687,7 +5687,7 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             if (useGpuForward)
                 films = renderForwardSharedCuda(scene, cams, rxs, rys, batchN, e, diffraction,
-                                                groupMode, (unsigned long long)accN, wavefront);
+                                                groupMode, (unsigned long long)accN, wavefront, g_heroC);
             else
 #endif
                 films = renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
@@ -5911,7 +5911,7 @@ static int run(int argc, char** argv) {
                                           diffraction, spp,
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
-                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str());
+                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,

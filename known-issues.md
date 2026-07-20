@@ -5,18 +5,33 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S photon mapping) — GPU megakernels, BDPT (D), and VCM (U) still single-λ
+### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the GPU forward megakernel (A/B/C + M-deposit) — GPU wavefront, GPU backward/BDPT, and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
-secondaries, `hero.h` `kHeroC=4`). Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
+secondaries, `hero.h` `kHeroC=4`). Its **device twin** (`traceHeroPhoton`/`genPhotonHero`/`shadeStepHero` in
+`src/render_cuda.cu`) now gives the **GPU forward megakernel** the same thing (modes A/B/C and the mode-M photon
+deposit — see the DONE item below). Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
 spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
 `sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
-chroma 0.87×, luma flat). The remaining §L-HERO sub-items are **not yet done** and are the tracked next work:
+chroma 0.87×, luma flat); GPU mode B on `cornell` (n=5e7, 300²: `-heroc 4` and `-heroc 1` both converge to
+auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-items are **not yet done**:
+- **GPU forward megakernel (A/B/C + M-deposit) — DONE 2026-07-20.** `render_cuda.cu` grows a device twin of
+  `tracePhotonHero`: `genPhotonHero` (stratified λ via the shared `sampleLambdaU`), `shadeStepHero` (per-λ
+  deposit + camera splat via `connectHero`/`connectLensHero`/`camSpecularSplatAllHero`, hero RR with secondary
+  reweight), `traceHeroPhoton` (de-hero at a dispersive interface boosts the hero ×C and falls through to the
+  scalar `shadeStep`). No duplication: the nine specular lobes were extracted into a shared device
+  `interactSpecular()` used by both `shadeStep` and de-hero. `kTrace` branches on a new `heroC` parameter;
+  `launchForward` gates it on `mediaN==0 && !hasGrin` and **forces the megakernel** (hero is not in the wavefront
+  scheduler), threaded through `renderForwardCuda`/`renderForwardSharedCuda`/`renderPhotonMapSharedCuda` fed
+  `g_heroC`. `-heroc 1` is bit-identical to the classic single-λ device stream.
+- **GPU wavefront (streaming) backend** (`render_cuda.cu` `wavefrontTrace`) — still 1 λ/photon; `-wavefront`
+  with `-heroc>1` silently falls back to the megakernel (which does carry hero). Port the SoA pool to hold the
+  `lam[]`/`beta[]` bundle if the streaming backend ever needs the chroma win on divergent scenes.
 - **GPU backward megakernel** (`renderBackwardCuda`) — mode R on GPU is still single-λ, so `-mode R -device gpu`
   does *not* get the colour-noise reduction. (The `-device auto` default picks GPU on this machine, so hero only
   kicks in with `-device cpu`.)
-- **GPU forward wavefront/megakernel** (`render_cuda.cu`) and **BDPT (D)** — still 1 λ/photon.
+- **GPU BDPT megakernel** (`kBdpt`) and **BDPT (D)** — still 1 λ/photon.
   Propagate the same shared wavelength-sampling + de-hero policy rather than copying the logic per mode.
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
   **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],

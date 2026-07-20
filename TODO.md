@@ -1604,7 +1604,22 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           (media/GRIN stay scalar; C=1 is bit-identical to the classic tracer). Validated on `cornell` mode B at
           n=1e8, 300² vs a 1e9 GPU single-λ reference: converged image + glass-sphere dispersion intact, energy
           conserved (`sum/emitted≈1.0025`), **luma noise flat (0.97×), chroma noise down (0.77×)** at equal photons.
-          **Still TODO:** the GPU forward wavefront/megakernel path — modes A/B/C on GPU are still single-λ.
+    - [x] **A/B/C + M-deposit (GPU megakernel) — DONE.** `render_cuda.cu` gains a device twin of
+          `tracePhotonHero`: `genPhotonHero` (stratified λ via the shared `sampleLambdaU`, `beta[i]=base/C`,
+          env reweight per-λ), `shadeStepHero` (per-λ deposit + camera splat via `connectHero`/`connectLensHero`/
+          `camSpecularSplatAllHero`, hero Russian-roulette with secondary reweight `beta[i]*=rho[i]/rhoHero`), and
+          `traceHeroPhoton` (emit → bounce; de-hero at a dispersive/wavelength-switching interface boosts the hero
+          ×C and falls through to the ordinary single-λ `shadeStep`). No duplication: the nine specular lobes were
+          extracted into a shared device `interactSpecular()` driven by both the scalar `shadeStep` and de-hero.
+          `kTrace` branches on a new `heroC` parameter; `launchForward` gates it on `up.sc.mediaN==0 &&
+          !up.sc.hasGrin` and **forces the megakernel** (hero is not in the wavefront scheduler). Threaded through
+          `renderForwardCuda`, `renderForwardSharedCuda` (modes A/B/C) and `renderPhotonMapSharedCuda` (mode-M
+          deposit — each diffuse bounce deposits all C live wavelengths as per-λ records, exactly like the CPU M
+          path), all fed `g_heroC` from `main.cpp`. Validated on `cornell` mode B GPU at n=5e7, 300²: **energy
+          conserved exactly** (`-heroc 4` and `-heroc 1` both converge to auto-exposure 1.06e-13), and `-heroc 1`
+          reproduces the classic single-λ device stream bit-for-bit.
+          **Still TODO:** the GPU forward wavefront path (streaming backend) — hero forces the megakernel there;
+          and the GPU backward/BDPT megakernels (below).
     - [x] **R (backward) — CPU DONE.** `radianceHero()` in `src/backward.h` samples a hero λ + 3 stratified
           secondaries (`hero.h`, `kHeroC=4`), rides them along one shared BVH walk, evaluates materials/NEE per-λ
           (`neeLightHero`/`neeEnvHero`, shared `interactMaterial`/`emitterGeom`/`envGeom` helpers) and splats 4
