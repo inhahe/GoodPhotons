@@ -1638,6 +1638,22 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           hero gate is now `heroC>1`. Verified on `cornell` mode M: `-heroc 1` is bit-identical to a `kHeroC=1`
           rebuild (2.80M photons, auto-exposure 1.11e-13), `-heroc 4` matches the default (9.09M, 1.11e-13),
           `-heroc 2`/`8` interpolate and run clean; mode B `-heroc 1` gives `sum/emitted=1.000000`.
+    - [ ] **Optional split-at-dispersion (crisp dispersive caustics)** — an *alternative* to the default de-hero
+          policy, exposed as an opt-in flag (e.g. `-herosplit`, off by default). At a dispersive dielectric interface,
+          instead of terminating the secondaries (`beta[0] *= C; secAlive = false`), **continue all C wavelengths**,
+          each refracting along its *own* per-λ direction from that point — turning one bundle into C now-monochromatic
+          sub-paths that fan out through the glass. This is the physically-crisp option for prism / caustic / rainbow
+          shots where de-hero's single shared geometry blurs the chromatic spread. It is a legitimate, standard
+          technique (PBRT-style spectral path splitting); the honest reason it is *not* the default is cost, not
+          bias — (a) C× traversal work past the split (linear, not exponential — once monochromatic a child does not
+          re-split at further dielectrics), and (b) GPU execution divergence as the fan-out wavelengths take different
+          branches. Keep memory bounded on the forward photon map by **throttling emission** while split sub-paths are
+          live (a fixed work-pool with emission back-pressure), so peak in-flight paths — and thus GPU photon buffers —
+          stay constant regardless of split depth. Scope: forward photon map (M/S) first, since that's where crisp
+          dispersive caustics matter most; the backward tracer (R) can adopt the same flag later. Validate that with
+          the flag *off* the image is bit-identical to today, and *on* it converges to the same converged energy
+          (de-hero is unbiased; splitting is a different, also-unbiased estimator — same mean, sharper caustics, more
+          work per path). README + a `-herosplit` flag-table row; VERSION minor bump when shipped.
     - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
     - [ ] **D (BDPT)** — carry the N λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
