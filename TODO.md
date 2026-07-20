@@ -124,6 +124,25 @@ Origin tags point at the authoritative design text for each item.
     reader's scope for now; records still use their own PIN-carrying stop parsing (not routed through the shared
     value grammar). Then mirror the `value`/`spectrum`/per-field binding grammar into ftrace's C++ front-end at the
     **J3c C++ port** (where ftrace's front-end adopts the shared grammar as its single source of truth).
+  - **Progress (2026-07-19): whole-scene GPDA grammar proven against the real corpus (shim prerequisite).**
+    Before building the J3c C++ *validation shim* (run the shared grammar alongside ftrace's hand-written parser,
+    diff Block trees, warn on mismatch, then flip to full replacement), we first had to prove the GPDA engine + a
+    shared grammar can parse the **full** `.ftsl` language ftrace's parser actually accepts. Wrote
+    `loom/grammar/ftsl_scene.epeg` — a *generic* whole-scene grammar (block/stmt/value, NOT the typed six-element
+    `ftsl.epeg`) that faithfully mirrors ftrace's front-end: the trivial tokenizer (everything non-delimiter is one
+    `Word`; `\r` skipped, `\n` significant), the `parseValue` continuation rule (first token unconditional, then
+    continue only on numbers / `k=v` words / strings, stop at a plain bareword), and every `parseOneTopBlock` form
+    (`prefer`/`else`, `NAME = range … [ … ]` records, `spectrum … = value`, unified `NAME = KIND [sub] {…}`, legacy
+    `KIND ["name"] [sub] {…}`). **Coverage: 278/278 authored+scrap scenes parse** (100%; plus 129 sampled generated
+    frames earlier = 407 files). **Structure verified** (not just acceptance): a spot-check walks the ParseNode tree
+    and recovers each top-block's (type, name, subtype) + nested-block children for representative scenes covering
+    *every* special construct — prefer/else (2 branches, nested cameras), record `[…]` bodies, spectrum `=`,
+    record-override `slot = REC.chan` materials, unified assign-header, and nested CSG (isosurface/blob/difference,
+    group). Harnesses live in `scraps/` (git-ignored): `scene_grammar_coverage.py`, `scene_grammar_structure.py`.
+    *Next:* build the C++ shim — integrate the tokenized GPDA engine
+    (`D:\visual studio projects\GraphParser\cpp\tokenized.{hpp,cpp}`) into ftrace, load `ftsl_scene.epeg`, produce
+    `blocks_new`, structurally diff vs the hand-written parser's `blocks_old` behind a non-authoritative flag,
+    iterate to silence on the corpus, then replace.
 
 ---
 
