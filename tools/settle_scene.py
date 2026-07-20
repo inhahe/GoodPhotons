@@ -30,20 +30,30 @@ Object geometry:
 Requirements: numpy, trimesh, and pybullet (for the physics). VHACD (bundled with
 pybullet) convex-decomposes concave dynamic objects for a faithful collision shape.
 
-Re-seating pieces on their stands (--seat):
+Keeping pieces over their pedestals — two strategies for the same failure:
   A faithful free settle drops each piece onto NARROW pedestals, so anything wider than
   its column (or authored slightly off-centre over it) tends to tip and roll OFF onto the
-  floor. `--seat` fixes the display without faking the physics: it keeps the ORIENTATION
-  each piece came to rest in, but returns it to the exact left-right / forward-back spot
-  the author placed it BEFORE the sim, then lowers it straight down until it touches its
-  stand (the same vertical "drop" tools/settle.py uses). Pass `--seat auto` to pair each
-  settled piece with the nearest other named object (its pedestal), or explicit
-  `piece:stand,…` pairs. A piece authored off-centre over its stand will overhang its rim
-  after seating (a warning is printed); nudge its authored position to sit it squarely.
+  floor. Two ways to prevent that:
+
+  --tether [k]   (during-sim, PHYSICAL)  A horizontal restoring spring applied AT each
+    body's COM every step, pulling it back toward its authored XZ. Because it acts at the
+    COM it exerts no torque, so the piece is free to tip/rotate onto its cap while being
+    stopped from walking off it sideways. The final pose is a genuine physics rest pose —
+    just one that stayed home. Bare `--tether` = k 150 N/m; raise k for stiffer holding,
+    lower it for pieces that should be free to drift a little. This is the preferred fix
+    (settles the gallery correctly in one pass — all pieces land on their stands).
+
+  --seat         (post-hoc, GEOMETRIC)  Runs a free settle, then keeps the ORIENTATION
+    each piece came to rest in but returns it to the exact spot the author placed it and
+    lowers it straight down onto its stand. Faster but the pose can look stiff (it's the
+    orientation from wherever the piece ended up, not one settled in place). Pass
+    `--seat auto` to pair each piece with the nearest other named object (its pedestal),
+    or explicit `piece:stand,…` pairs. Overhang past the rim prints a warning.
 
 Usage:
   python tools/settle_scene.py --scene gallery.ftsl --all --out gallery_settled.ftsl
   python tools/settle_scene.py --scene s.ftsl --settle blobA,klein --floor plane:0.0 --out s2.ftsl
+  python tools/settle_scene.py --scene g.ftsl --settle klein,heart --tether --out g_tethered.ftsl
   python tools/settle_scene.py --scene g.ftsl --settle klein,heart --seat auto --out g_seated.ftsl
 """
 import argparse, math, os, re, sys, tempfile, subprocess, glob
@@ -59,6 +69,23 @@ from settle import euler_xyz_deg, drop  # euler decomp; drop = vertical rest-on-
 # resting a rigid body, so meshes above this are quadric-decimated first (needs the
 # `fast_simplification` package; falls back to the full mesh if unavailable).
 COLLISION_TRI_CAP = 40000
+
+# Cap on a STATIC concave collider's triangle count. Unlike the dynamic proxies these
+# aren't convex-decomposed (they stay concave via GEOM_FORCE_CONCAVE_TRIMESH), but their
+# tri count still sets the per-step collision cost against every settling body — an
+# un-capped res-160 isosurface stand can make each sim step take ~100 ms. Only the gross
+# resting surface matters, so decimate above this. Museum stands are simple box-unions, so
+# a few thousand tris capture the flat resting top exactly while keeping steps cheap.
+STATIC_TRI_CAP = 4000
+
+# Radius (metres) of the --tether spring's dead zone around each piece's authored XZ
+# anchor. Inside it the spring is OFF so the piece settles naturally; outside it the spring
+# engages on the excess to stop walk-off.
+TETHER_DEADBAND = 0.03
+
+# Per-step motion (metres moved + orientation change) below which a body counts as still
+# for the displacement-based settled test.
+SETTLE_STILL_EPS = 2.0e-4
 
 
 # ---------------------------------------------------------------- ftsl parsing
@@ -246,10 +273,18 @@ def parse_obj_groups(path):
 
 
 # ---------------------------------------------------------------- physics
-def settle_bodies(worlds, selected, floor_y, max_steps, friction):
+def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0):
     """worlds: {name: trimesh in world space}. selected: list of names to make dynamic.
     Returns {name: (translate xyz, R 3x3)} — the extra rigid transform each selected
-    object must be wrapped in (applied ON TOP of its authored world pose)."""
+    object must be wrapped in (applied ON TOP of its authored world pose).
+
+    `tether` (>0) enables a during-sim horizontal restoring spring: each step a force
+    `k·(anchor_xz - com_xz)` (critically damped) pulls every dynamic body's COM back
+    toward its authored XZ anchor. The force acts AT the COM, so it applies no torque —
+    the piece is free to tip/rotate onto its narrow cap while being kept from walking off
+    it sideways. This is the clean physical fix for the free-settle failure where a piece
+    wider than its pedestal tips, rolls past the rim, and tumbles onto the floor. `k` is
+    the spring stiffness in N/m (bodies have unit mass)."""
     try:
         import pybullet as p
     except ImportError:
@@ -304,26 +339,74 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction):
             p.changeDynamics(body, -1, lateralFriction=friction, spinningFriction=0.02,
                              rollingFriction=0.02, restitution=0.0)
             dyn[name] = (body, c)
+            print(f'[settle_scene] spawn "{name}" COM = ({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})')
         else:
-            # static concave collider at its authored world pose (mesh already world-space)
-            mesh.export(path)
+            # static concave collider at its authored world pose (mesh already world-space).
+            # Isosurface stands come out of `ftrace -export-mesh` at the polygonisation res
+            # (100s of k tris) — absurd for collision, where only the gross resting surface
+            # matters. Concave-trimesh collision cost scales with tri count PER STEP, so an
+            # un-decimated stand makes every one of the up-to-max_steps steps crawl. Cap it
+            # like the dynamic proxies (visual mesh in the scene is untouched).
+            smesh = mesh
+            if len(mesh.faces) > STATIC_TRI_CAP:
+                try:
+                    smesh = mesh.simplify_quadric_decimation(face_count=STATIC_TRI_CAP)
+                    print(f'[settle_scene] decimated static collider "{name}" to '
+                          f'{len(smesh.faces)} tris (from {len(mesh.faces)})')
+                except Exception as e:
+                    print(f'[settle_scene] static-collider decimation of "{name}" failed ({e}); '
+                          'using full-resolution mesh (sim may be slow)')
+            smesh.export(path)
             col = p.createCollisionShape(p.GEOM_MESH, fileName=path,
                                          flags=p.GEOM_FORCE_CONCAVE_TRIMESH)
             sb = p.createMultiBody(0, col)
             p.changeDynamics(sb, -1, lateralFriction=friction)
 
     p.setTimeStep(1.0 / 240.0)
+    tdamp = 2.0 * math.sqrt(tether) if tether > 0 else 0.0   # critical damping (unit mass)
+    # Settled test is DISPLACEMENT-based (how far each body actually moved this step), not
+    # instantaneous velocity: a tethered piece held in slight tension against friction has
+    # a tiny non-zero velocity forever (never tripping a velocity threshold) yet does not
+    # actually move, so a per-step position/orientation delta detects rest correctly and
+    # lets the sim stop early instead of always grinding through max_steps.
+    prev = {body: (np.array(p.getBasePositionAndOrientation(body)[0]),
+                   np.array(p.getBasePositionAndOrientation(body)[1]))
+            for body, _c in dyn.values()}
     still = 0
     for _ in range(max_steps):
+        if tether > 0:
+            # horizontal restoring spring per body — applied at the COM (no torque), so
+            # rotation onto the cap stays free while lateral walk-off is cancelled.
+            # A DEADBAND (TETHER_DEADBAND) leaves the spring OFF while the piece is within
+            # a small radius of its anchor: this lets it settle NATURALLY there (its COM
+            # comes to rest a little off the anchor after tipping, so a spring that was
+            # always on would hold it in permanent tension — a residual micro-jitter that
+            # never trips the velocity-based "settled" test and forces the full max_steps).
+            # The spring engages only on the EXCESS past the deadband, so it still yanks a
+            # piece back the moment it actually starts rolling off.
+            for body, c in dyn.values():
+                (px, py, pz), _ = p.getBasePositionAndOrientation(body)
+                dx, dz = float(c[0]) - px, float(c[2]) - pz
+                dist = math.hypot(dx, dz)
+                if dist <= TETHER_DEADBAND:
+                    continue                          # inside tolerance -> settle freely
+                (vx, _vy, vz), _ = p.getBaseVelocity(body)
+                excess = dist - TETHER_DEADBAND
+                ux, uz = dx / dist, dz / dist         # unit vector toward the anchor
+                fx = tether * excess * ux - tdamp * vx
+                fz = tether * excess * uz - tdamp * vz
+                p.applyExternalForce(body, -1, [fx, 0.0, fz], [px, py, pz], p.WORLD_FRAME)
         p.stepSimulation()
-        moving = False
+        moved = 0.0
         for body, _c in dyn.values():
-            lv, av = p.getBaseVelocity(body)
-            if np.linalg.norm(lv) > 1e-3 or np.linalg.norm(av) > 1e-3:
-                moving = True
-                break
-        still = 0 if moving else still + 1
-        if still > 90:                            # ~0.4s at rest -> settled
+            pos, quat = p.getBasePositionAndOrientation(body)
+            pp, pq = prev[body]
+            dp = float(np.linalg.norm(np.asarray(pos) - pp))          # metres moved
+            dq = 1.0 - abs(float(np.dot(quat, pq)))                   # 0 = same orientation
+            moved = max(moved, dp + dq)
+            prev[body] = (np.asarray(pos), np.asarray(quat))
+        still = 0 if moved > SETTLE_STILL_EPS else still + 1
+        if still > 120:                           # ~0.5s of no motion -> settled
             break
 
     result = {}
@@ -448,6 +531,12 @@ def main():
     ap.add_argument('--floor', default='plane:0.0', help='floor surface: plane:<y> (default plane:0.0)')
     ap.add_argument('--mesh-res', type=int, default=160, help='isosurface polygonisation resolution')
     ap.add_argument('--friction', type=float, default=0.8, help='lateral friction for all bodies')
+    ap.add_argument('--tether', nargs='?', type=float, const=150.0, default=0.0,
+                    help='during-sim horizontal restoring spring (N/m, unit-mass bodies) that '
+                         'keeps each settling piece over its authored XZ so it tips onto its '
+                         'narrow pedestal in place instead of rolling off onto the floor. Acts '
+                         'at the COM (no torque -> rotation stays free). Bare "--tether" = 150; '
+                         'higher = stiffer. Default off.')
     ap.add_argument('--max-steps', type=int, default=8000, help='max simulation steps')
     ap.add_argument('--seat', help='after settling, re-seat pieces squarely on their stands: '
                                    '"auto" (nearest non-settled object per piece) or explicit '
@@ -504,7 +593,9 @@ def main():
     print(f'[settle_scene] settling: {", ".join(selected)}  (others are static colliders)')
     print(f'[settle_scene] floor: y={floor_y}')
 
-    deltas = settle_bodies(worlds, set(selected), floor_y, a.max_steps, a.friction)
+    if a.tether > 0:
+        print(f'[settle_scene] tether spring: k={a.tether:g} N/m (keeps pieces over their XZ)')
+    deltas = settle_bodies(worlds, set(selected), floor_y, a.max_steps, a.friction, a.tether)
 
     for name in selected:
         t, R = deltas[name]

@@ -3208,7 +3208,84 @@ static bool stereoComposite(int mode, const std::string& left, const std::string
     return ok;
 }
 
+// Curated `-h` / `--help` usage summary. Covers the common flags grouped by task;
+// the exhaustive list (fog, thin-film, mesh export, physics diagnostics, …) lives in
+// README.md, which this points at rather than duplicating.
+static void printHelp(const char* prog) {
+    std::printf(
+"ftrace — spectral forward + backward photon raytracer\n"
+"\n"
+"Usage:\n"
+"  %s -in <scene.ftsl> [options]         render a scene file\n"
+"  %s <scene.ftsl>                       quick raster preview in a live window\n"
+"  %s [options]                          render the built-in demo scene\n"
+"  %s -topng <in.ppm|in.ftbuf> <out.png> convert an artifact to PNG (no render)\n"
+"  %s -review <base>                     play a rendered frame sequence\n"
+"\n"
+"Scene & camera:\n"
+"  -in <file>            FTSL scene file (.ftsl/.scene); a bare positional path works too\n"
+"  -scene <name>         built-in demo scene (default: cornell)\n"
+"  -light <name>         built-in light preset (default: bb6500)\n"
+"  -camera <sel>         pick FTSL camera(s): <name>|<pathbase>|all|#N|near=X,Y,Z\n"
+"  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
+"  -exposure|-ev <c>     override every camera's exposure compensation\n"
+"  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
+"\n"
+"Render mode & budget:\n"
+"  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
+"  -n <count>            photon/sample count (accepts 2e8, 1.5e9)\n"
+"  -r <W> [H]            resolution (square if H omitted)\n"
+"  -time <sec>           wall-clock budget (progressive)\n"
+"  -noise <pct>          stop at target graininess (progressive)\n"
+"  -forever              trace until Ctrl-C (progressive)\n"
+"  -spp <n>              samples/pixel for backward modes R/V\n"
+"  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
+"  -t <n>                CPU thread count\n"
+"\n"
+"Output, preview & checkpointing:\n"
+"  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
+"  -window               live OS preview window, refreshed as it converges\n"
+"  -keepwindow|-hold     like -window but hold the final image until you close it\n"
+"  -preview              live ANSI thumbnail in the terminal\n"
+"  -interval <sec>       periodic image-write / preview cadence (default: 15)\n"
+"  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
+"  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
+"\n"
+"Raster preview & interactive explore (no light transport):\n"
+"  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
+"  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
+"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter)\n"
+"  -noclip|-nocollide    start the fly viewer with wall collision off\n"
+"  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
+"\n"
+"Stereoscopic 3-D output:\n"
+"  -stereo sbs|cross|anaglyph|anaglyph-gm   stereo pair / anaglyph composite\n"
+"  -eye-sep <m>          interocular distance (default: 0.063)\n"
+"  -view-dist <m>        viewing distance (default: 0.6)\n"
+"  -dpi <n|auto>         screen pixel density; -convergence <m> = convergence-plane distance\n"
+"\n"
+"Utilities (exit after running):\n"
+"  -topng|-convert <in> <out.png>   convert .ppm/.ftbuf to PNG\n"
+"  -review <base>        play a rendered frame sequence on the live window\n"
+"  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
+"  -serve                resident loop: re-render scene paths streamed on stdin\n"
+"  -h | --help           show this help and exit\n"
+"\n"
+"See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
+        prog, prog, prog, prog, prog);
+}
+
 static int run(int argc, char** argv) {
+    // `-h` / `--help` (also `-help` / `help`) anywhere on the command line: print the
+    // usage summary and exit, before any scene setup or the default render. Scanned
+    // across all args (not just argv[1]) so `ftrace foo --help` still helps.
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help") ||
+            !std::strcmp(argv[i], "-help") || !std::strcmp(argv[i], "help")) {
+            printHelp(argv[0]);
+            return 0;
+        }
+    }
     // Standalone artifact -> PNG conversion (no rendering): `ftrace -topng <in> <out>`
     // (`-convert` is an alias). Handles .ppm (P6 8-bit) and .ftbuf (raw linear film
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
@@ -3520,6 +3597,15 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
         else if (!std::strcmp(argv[i], "-serve")) { /* resident loop; driven by main(), ignored here */ }
+        else if (!std::strcmp(argv[i], "-validate-grammar")) ftsl_shim::enabled_flag() = true;
+        else if (argv[i][0] == '-') {
+            // Any remaining dash-prefixed token is an unrecognized (or malformed, e.g.
+            // value-less) option. Fail loudly instead of silently falling through to the
+            // default demo render — a typo'd flag should never masquerade as a real run.
+            // (Non-dash positionals, e.g. a scene file, were consumed by the -in pre-scan.)
+            std::fprintf(stderr, "ftrace: unknown option '%s' (try -h / --help)\n", argv[i]);
+            return 2;
+        }
     }
     if (nThreads < 1) nThreads = 1;
 
@@ -4693,21 +4779,31 @@ static int run(int argc, char** argv) {
                 }
                 return pos;
             };
-            // Interactive render resolution FOLLOWS THE LIVE WINDOW: fit the authored
-            // W:H aspect into the current client area so the raster renders at (roughly)
-            // one pixel per displayed pixel. Shrinking the window renders fewer pixels
-            // (faster while navigating a heavy scene); growing it renders more (crisper),
-            // up to the authored resolution. The aspect ratio is preserved, so the camera
-            // projection is unchanged, and the eye/look_at readout + world-scaled crosshair
-            // are resolution-independent. Recomputed every loop so a live resize retunes it.
+            // Interactive render resolution IS the live window: the raster renders at the
+            // image area's OWN pixel dimensions, so the preview always FILLS the window with
+            // no letterbox bars, and resizing in ANY direction changes the pixel count (drag
+            // smaller for a faster nav on a heavy scene, larger for a crisper view). The
+            // camera's horizontal FOV follows the window aspect while fov_y stays fixed
+            // (lookAt derives tanHalfX = tanHalfY * VW/VH), exactly like a game viewport:
+            // a wider window simply reveals more to the sides, with square pixels (no stretch).
+            // Two guards: never render past the authored longest edge (growing the window
+            // beyond the film res would only supersample the preview, not add real detail),
+            // and never shrink the long edge below kMinLong. The eye/look_at readout and the
+            // world-scaled crosshair stay resolution-independent. Recomputed every loop so a
+            // live resize retunes it.
             auto fitRes = [&](int& outW, int& outH) {
                 int cw = 0, ch = 0;
                 if (!g_liveWin->clientSize(cw, ch)) { outW = W; outH = H; return; }
-                double s = std::min(std::min((double)cw / W, (double)ch / H), 1.0);  // never supersample
-                int vw = std::max(1, (int)std::lround(W * s));
-                int vh = std::max(1, (int)std::lround(H * s));
-                const int kMinLong = 160;   // guard against an absurdly tiny render
+                int vw = std::max(1, cw), vh = std::max(1, ch);   // fill the window (its aspect)
+                const int kMaxLong = std::max(W, H);   // cap at authored detail (no supersampling)
                 int lo = std::max(vw, vh);
+                if (lo > kMaxLong) {
+                    double s = (double)kMaxLong / lo;
+                    vw = std::max(1, (int)std::lround(vw * s));
+                    vh = std::max(1, (int)std::lround(vh * s));
+                }
+                const int kMinLong = 160;   // guard against an absurdly tiny render
+                lo = std::max(vw, vh);
                 if (lo < kMinLong) {
                     double up = (double)kMinLong / lo;
                     vw = std::max(1, (int)std::lround(vw * up));
@@ -5036,7 +5132,7 @@ static int run(int argc, char** argv) {
               "                 Ins inserts at the scrub point; Del removes the nearest point; Save writes a camera_curve block\n"
               "         paint:  Paint (path mode) — wheel paints local speed (density) at the scrub point, mouse steers orientation; Flat resets speed\n"
               "         0 = reset view    P = print camera block    (close the window to finish)\n"
-              "         resize the window to change the preview resolution (smaller = faster on a heavy scene, larger = crisper)\n",
+              "         resize the window to change the preview resolution — the render fills the window (no bars): smaller = faster on a heavy scene, larger = crisper; the horizontal view widens/narrows with the window (fov_y fixed)\n",
               step, collideName(collide),
               pathCount >= 2 ? "; timeline + Play/Pause + Path-lock + cams/upd | cams/s speed switch"
                              : "");

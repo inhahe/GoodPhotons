@@ -193,22 +193,24 @@ isosurface "gyroid_gem" {
 # The flyby dives straight THROUGH it. Native sphere for exact analytic refraction.
 sphere { center 6.2 1.40 3.5   radius 0.5   material glass }
 
-# --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
-group {  # settled by tools/settle_scene.py
-    translate 1.06309 3.89508 -0.0051743
-    rotate    -86.397 -51.4446 -68.2146
-    mesh "klein" {
-        file "scraps/klein_staged.obj"
-        translate 5.9 1.70 2.6   rotate 8 40 0   scale 1.4
-        material glass
-    }
+# --- GYROID SPHERE in glass (clear, intricate transparent piece; analytic rest) --------
+# Swapped in for the old hunyuan Klein bottle (user request 2026-07-20). This is the
+# triply-periodic minimal surface trimmed to a ball, lite decimation (~53 MB). Raw mesh
+# is centered at origin spanning +/-10 (size ~20); scale 0.025 -> ~0.5 across to fit the
+# stand cap (~0.52); translate y = 1.00 (cap top) + 0.25 (half-height) = 1.25 so it rests
+# on the stand. Analytic rest -> no settle group needed. (Object still named "klein" for
+# the stand/settle wiring.)
+mesh "klein" {
+    file "meshes/klein_a120_b060_c30_d127_lite.obj"
+    translate 5.9 1.25 2.6   rotate 0 40 0   scale 0.025
+    material glass
 }
 
 # --- BRASS DUMBBELL-ring (gallery pick 09): two spheres joined by a fused bar + ring,
 # with a small bite bored out; SETTLED. ---
 group {  # settled by tools/settle_scene.py
-    translate 0.00871237 0.535262 -0.257396
-    rotate    9.41412 -1.16782 -5.4048
+    translate -0.026508 0.253664 -0.156314
+    rotate    11.0397 0.346691 -0.760179
     isosurface "brass_dumbbell" {
         material brass
         translate 4.16 1.00 2.36   scale 0.78
@@ -232,8 +234,8 @@ group {  # settled by tools/settle_scene.py
 # --- BRASS CSG cluster (gallery pick 05): nested smooth_union of spheres+tori with two
 # spheres bored out; SETTLED. SDF leaves stay unit-Lipschitz, no max_gradient. ---
 group {  # settled by tools/settle_scene.py
-    translate 1.11317 -2.32079 -0.754347
-    rotate    49.5976 -4.28807 41.4886
+    translate 0.00222943 -1.32487 2.96472
+    rotate    1.73154 27.3705 9.59487
     isosurface "brass_cluster" {
         material brass
         translate 5.6 1.10 1.6   scale 0.8
@@ -268,8 +270,8 @@ group {  # settled by tools/settle_scene.py
 
 # --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue, tilted; SETTLED. -----
 group {  # settled by tools/settle_scene.py
-    translate 8.41218 -2.52473 6.25875
-    rotate    -13.8218 64.9453 109.351
+    translate -0.177541 2.04491 0.139737
+    rotate    23.4814 6.47122 -17.6767
     isosurface "heart" {
         material morpho
         translate 4.30 1.20 1.75   scale 0.85
@@ -285,8 +287,8 @@ group {  # settled by tools/settle_scene.py
 # --- OIL-SLICK iridescent JACK (2nd iridescent — thin-film rainbow, different structural
 # model + colour than the morpho heart): three fused orthogonal capsules; SETTLED. ------
 group {  # settled by tools/settle_scene.py
-    translate 2.16296 -2.41084 -1.8893
-    rotate    40.7811 -15.9262 45.6637
+    translate 1.75928 -2.66439 -1.1918
+    rotate    50.5395 -8.65332 48.5441
     isosurface "oiljack" {
         material oilslick
         translate 5.3 1.10 1.5   scale 0.62

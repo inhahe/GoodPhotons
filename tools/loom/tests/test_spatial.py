@@ -83,7 +83,7 @@ def test_same_expr_drives_pattern_string_and_2d_raster():
     # 3-D: emitted as an ftsl pattern string
     fp = FuncPattern("shared", expr)
     txt = fp.emit(EmitCtx(clock=Clock(t=0.0), cache=Cache()))
-    assert txt.startswith('pattern "shared"') and "sin(" in txt
+    assert txt.startswith('shared = pattern') and "sin(" in txt
     # the spatial exprs's (no) time signals fold into the pattern's DAG roots
     assert fp.roots() is not None
     # 2-D: evaluated numerically into pixels
@@ -129,7 +129,7 @@ def test_isosurface_accepts_spatial_expr():
     iso = Isosurface(surf, container="sphere", radius=2.0, name="g",
                      material="skin")
     txt = iso.emit(EmitCtx(clock=Clock(t=0.0), cache=Cache()))
-    assert txt.startswith('isosurface "g" {')
+    assert txt.startswith('g = isosurface {')
     assert "sin(" in txt and "cos(" in txt
     assert txt.count("{") == txt.count("}")
 

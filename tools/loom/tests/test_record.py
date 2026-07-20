@@ -264,30 +264,174 @@ def test_sample_rejects_vector_scalar_api():
         rec.sample("tint", 0.5)          # scalar API on a vector channel
 
 
-def test_emit_rejects_vector_but_generalized_roundtrips():
+def test_emit_vector_channel_roundtrips():
+    # one unified grammar: a vector channel emits as a comma line and round-trips
+    # through the same parse() that reads scalar/colour whitespace lines.
     rec = Record.from_channels(
         "grad", 0, 1,
         [("tint", [["0", "0", "0"], (["1", "0", "0"], 0.7), ["1", "1", "1"]]),
          ("rough", ["0.0", "0.5", "1.0"])],
         interp="smooth")
-    with pytest.raises(TypeError):
-        rec.emit()                       # vector channel: not current-FTSL representable
-    text = rec.emit_generalized()
-    assert "0 0 0, p:0.7 1 0 0, 1 1 1" in text
-    reparsed = Record.parse_generalized(text)
+    text = rec.emit()
+    assert "0 0 0, p:0.7 1 0 0, 1 1 1" in text   # vector channel -> comma line
+    assert "rough" in text and "0.0  0.5  1.0" in text  # scalar channel -> whitespace
+    reparsed = Record.parse(text)
     assert _canon_gen(rec) == _canon_gen(reparsed)
 
 
-def test_generalized_roundtrip_scalar_and_colour():
-    # generalized emit/parse must also round-trip plain scalar + colour-ref channels
+def test_unified_roundtrip_scalar_and_colour():
+    # emit/parse must round-trip plain scalar + colour-ref channels (whitespace form)
     rec = Record.from_channels(
         "m", 0, 1,
         [("reflect", ["spectrum:steel", "spectrum:gold"]),
          ("rough", ["0.0", ("0.4", 0.7), "1.0"])],
         interp="linear")
-    reparsed = Record.parse_generalized(rec.emit_generalized())
+    reparsed = Record.parse(rec.emit())
     assert _canon_gen(rec) == _canon_gen(reparsed)
     assert reparsed.channel("reflect").kind == "colour"
+
+
+def test_whitespace_line_is_scalar_stops_not_one_vector():
+    # backward-compatible dispatch: no top-level comma -> each word is its own stop
+    rec = Record.parse("m = range 0-1 [ metal  steel gold copper ]")
+    ch = rec.channel("metal")
+    assert ch.arity == 1
+    assert [s.token for s in ch.stops] == ["steel", "gold", "copper"]
+
+
+def test_comma_line_is_vector_stops():
+    rec = Record.parse("g = range 0-1 [ tint  0 0 0, 1 1 1 ]")
+    ch = rec.channel("tint")
+    assert ch.kind == "vector" and ch.arity == 3
+    assert [s.components for s in ch.stops] == [["0", "0", "0"], ["1", "1", "1"]]
+
+
+def test_lone_vector_stop_needs_trailing_comma():
+    # trailing comma disambiguates a single arity-3 vector stop from 3 scalar stops
+    rec = Record.parse("g = range 0-1 [ tint  0 0 0, ]")
+    ch = rec.channel("tint")
+    assert ch.kind == "vector" and ch.arity == 3
+    assert len(ch.stops) == 1 and ch.stops[0].components == ["0", "0", "0"]
+    # emit round-trips the trailing-comma form
+    assert "0 0 0," in rec.emit()
+    assert _canon_gen(rec) == _canon_gen(Record.parse(rec.emit()))
+
+
+def test_stray_comma_rejected():
+    with pytest.raises(ValueError):
+        Record.parse("g = range 0-1 [ tint  0 0 0,, 1 1 1 ]")
+
+
+# ---------------------------------------------------------------------------
+# J3b — inline-colour (rgb/hsv/hsl-tagged) channels + lowering to spectra
+
+def test_inline_rgb_colour_channel_parse_and_kind():
+    rec = Record.parse(
+        "m = range 0-1 [ reflect  rgb 0.55 0.57 0.60, 0.90 0.75 0.30, 0.85 0.45 0.30 ]")
+    ch = rec.channel("reflect")
+    assert ch.space == "rgb" and ch.is_inline_colour
+    assert ch.kind == "colour" and ch.arity == 3
+    assert [s.components for s in ch.stops] == \
+        [["0.55", "0.57", "0.60"], ["0.90", "0.75", "0.30"], ["0.85", "0.45", "0.30"]]
+
+
+def test_inline_colour_lone_stop_no_trailing_comma():
+    # the tag fixes arity 3, so a lone tagged stop is unambiguous without a comma
+    rec = Record.parse("m = range 0-1 [ reflect  rgb .5 .5 .5 ]")
+    ch = rec.channel("reflect")
+    assert ch.space == "rgb" and ch.arity == 3 and len(ch.stops) == 1
+    assert ch.stops[0].components == [".5", ".5", ".5"]
+
+
+def test_inline_colour_roundtrip_and_pins():
+    rec = Record.from_channels(
+        "m", 0, 1,
+        [("reflect", [["0", "0", "0"], (["1", "0", "0"], 0.7), ["1", "1", "1"]], "rgb")],
+        interp="smooth")
+    text = rec.emit()
+    assert "reflect  rgb 0 0 0, p:0.7 1 0 0, 1 1 1" in text
+    assert _canon_gen(rec) == _canon_gen(Record.parse(text))
+    assert Record.parse(text).channel("reflect").space == "rgb"
+
+
+def test_inline_rgb_sampleable_but_hsv_hsl_not():
+    rec = Record.parse("m = range 0-1 [ c  rgb 0 0 0, 1 2 4 ]")
+    assert rec.sample_vec("c", 0.0) == pytest.approx([0.0, 0.0, 0.0])
+    assert rec.sample_vec("c", 0.5) == pytest.approx([0.5, 1.0, 2.0])
+    # scalar API on a 3-component colour channel is rejected
+    with pytest.raises(TypeError):
+        rec.sample("c", 0.5)
+    # hsv/hsl channels must be lowered to rgb before numeric sampling
+    hsv = Record.parse("m = range 0-1 [ c  hsv 0 0 0, 0 0 1 ]")
+    with pytest.raises(TypeError):
+        hsv.sample_vec("c", 0.5)
+
+
+def test_inline_colour_bad_arity_and_tag_rejected():
+    with pytest.raises(ValueError):
+        Record.parse("m = range 0-1 [ c  rgb 0 0, 1 1 ]")     # arity 2, not 3
+    with pytest.raises(ValueError):
+        RecordChannel("c", [RecordStop(["0", "0", "0"])], space="cmyk")  # bad space
+    with pytest.raises(ValueError):
+        # a tagged colour channel can't hold spectrum:-refs
+        RecordChannel("c", [RecordStop("spectrum:steel")], space="rgb").kind
+
+
+def test_lower_rgb_channel_to_spectra():
+    rec = Record.parse(
+        "palette = range 0-1 [ reflect  rgb 0.55 0.57 0.60, 0.90 0.75 0.30 ]")
+    decls, low = rec.lower_colours()
+    assert decls == ['spectrum "palette_c0" = rgb 0.55 0.57 0.6',
+                     'spectrum "palette_c1" = rgb 0.9 0.75 0.3']
+    ch = low.channel("reflect")
+    assert ch.space is None and ch.kind == "colour"
+    assert [s.token for s in ch.stops] == ["spectrum:palette_c0", "spectrum:palette_c1"]
+    # the lowered record is current-FTSL (whitespace) parseable
+    assert _canon(Record.parse(low.emit())) == _canon(low)
+
+
+def test_lower_dedups_and_converts_hsv_preserving_pins():
+    # white appears twice (dedup -> one decl); hsv converts to rgb; the pin survives
+    rec = Record.parse("m = range 0-1 [ tint  hsv 0 0 1, p:0.7 0 0 0, 0 0 1 ]")
+    decls, low = rec.lower_colours()
+    assert decls == ['spectrum "m_c0" = rgb 1 1 1', 'spectrum "m_c1" = rgb 0 0 0']
+    ch = low.channel("tint")
+    assert [s.token for s in ch.stops] == \
+        ["spectrum:m_c0", "spectrum:m_c1", "spectrum:m_c0"]
+    assert ch.stops[1].pinned and abs(ch.stops[1].pos - 0.7) < 1e-12
+
+
+def test_lower_ftsl_is_self_contained_block():
+    rec = Record.parse("m = range 0-1 [ reflect  rgb 0.5 0.5 0.5 ]")
+    text = rec.lower_ftsl()
+    assert text.startswith('spectrum "m_c0" = rgb 0.5 0.5 0.5')
+    assert "reflect  spectrum:m_c0" in text
+    # scalar/vector channels + no colour -> no decls, plain emit
+    plain = Record.parse("m = range 0-1 [ rough  0 0.5 1 ]")
+    assert plain.lower_ftsl() == plain.emit()
+
+
+def test_lower_passes_scalar_and_spectrum_ref_channels_through():
+    rec = Record.parse(
+        "m = range 0-1 [\n"
+        "  reflect  rgb 1 0 0, 0 1 0\n"
+        "  rough    0.0 0.5 1.0\n"
+        "  metal    spectrum:steel spectrum:gold\n"
+        "]")
+    decls, low = rec.lower_colours()
+    assert len(decls) == 2                       # only the rgb channel synthesizes decls
+    assert low.channel("rough").kind == "scalar"
+    assert [s.token for s in low.channel("metal").stops] == \
+        ["spectrum:steel", "spectrum:gold"]
+    assert [s.token for s in low.channel("reflect").stops] == \
+        ["spectrum:m_c0", "spectrum:m_c1"]
+
+
+def test_lower_rejects_expression_colour_stops():
+    rec = Record.from_channels(
+        "m", 0, 1, [("reflect", [["sin(u)", "0", "0"], ["1", "1", "1"]], "rgb")])
+    with pytest.raises(TypeError):
+        rec.lower_colours()
 
 
 if __name__ == "__main__":

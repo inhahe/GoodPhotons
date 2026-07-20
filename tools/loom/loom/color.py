@@ -260,6 +260,22 @@ class Color(VecSignal):
         vals = self.src.at(clock, cache)
         return f"{self.mode} " + " ".join(f"{c:.6g}" for c in vals)
 
+    @classmethod
+    def parse(cls, text: str, default_space: str = "rgb") -> "Color":
+        """Read one ``.ftsl`` colour token back into a :class:`Color`.
+
+        The inverse of :meth:`token` — ``Color.parse("hsl 0.6 0.7 0.5")`` round-trips
+        an emitted token, and a bare ``"0.8 0.7 0.2"`` (or bracketed ``"[1, 0, 0]"``)
+        is read in ``default_space``.  Backed by the shared ``.ftsl`` grammar's
+        :func:`loom.grammar.values.as_color`, so it enforces the locked color-vector
+        shape rules: a syntax error raises :class:`ValueError`, and a well-formed but
+        wrong-shaped value (a 6-vector, a list of colours) raises
+        :class:`~loom.grammar.values.ShapeError`.
+        """
+        from .grammar.values import as_color   # lazy: avoids a module import cycle
+        space, comps = as_color(text, default_space)
+        return cls(comps, space)
+
 
 def rgb(r: Union[Signal, Number], g: Union[Signal, Number],
         b: Union[Signal, Number]) -> Color:
@@ -278,3 +294,23 @@ def hsl(h: Union[Signal, Number], s: Union[Signal, Number],
     """Author an HSL :class:`Color` — hue in ``[0, 1]`` wraps; ``l`` is lightness
     (0.5 = the pure hue, 1 = white, 0 = black)."""
     return Color.hsl(h, s, l)
+
+
+def parse_color(text: str, default_space: str = "rgb") -> Color:
+    """Read one ``.ftsl`` colour token (``rgb r g b`` / ``hsl h s l`` / a bare or
+    bracketed triple) into a :class:`Color`.  Alias for :meth:`Color.parse`."""
+    return Color.parse(text, default_space)
+
+
+def parse_color_list(text: str, default_space: str = "rgb") -> "list[Color]":
+    """Read a flat ``.ftsl`` colour list into a list of :class:`Color`.
+
+    Accepts every spelling the locked color-vector syntax allows for a flat palette
+    — comma-separated groups (``"2 0 0, 3 0 0"``), bracketed siblings
+    (``"[2 0 0] [3 0 0]"``) and inline RLE colorspace tags
+    (``"rgb 1 0 0, 2 0 0, hsl 4 0 0"``) — and a lone colour reads as a one-element
+    list (the ``[X] ≡ X`` identity).  A list-of-lists (depth-2 palette-of-palettes)
+    is the wrong shape here and raises :class:`~loom.grammar.values.ShapeError`.
+    """
+    from .grammar.values import as_color_list   # lazy: avoids a module import cycle
+    return [Color(comps, space) for space, comps in as_color_list(text, default_space)]

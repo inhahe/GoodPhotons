@@ -125,3 +125,18 @@ periodic-output loop.
   (e.g. mode A is the finite-lens physical camera, not the old contact-sensor wall).
 - **`known-issues.md`** tracks unsolved bugs and tech debt — log anything you can't fix
   immediately, and mark entries DONE when resolved.
+
+## Versioning & releases
+
+- **Bump the version in the repo-root `VERSION` file every time you rebuild `ftrace.exe`
+  with an observable change.** `VERSION` is a single `MAJOR.MINOR.PATCH` line and is the
+  single source of truth for the release tag. Whenever you run `build.bat` to produce a
+  new binary that changes anything observable, increment `VERSION` in the *same commit*
+  as the change — **patch** for fixes, **minor** for new features, **major** for
+  breaking changes — so every built binary maps to a distinct version. (No observable
+  change → no bump.)
+- **`release.bat` publishes a GitHub release** of the current repo-root `ftrace.exe` to
+  `inhahe/goodphotons`, tagged `v<VERSION>`, using the GitHub CLI (`gh`). It **refuses to
+  publish if a release for the current version already exists**, so the workflow is:
+  make the change → bump `VERSION` → `build.bat` → `release.bat`. Running it without
+  bumping `VERSION` is a safe no-op.

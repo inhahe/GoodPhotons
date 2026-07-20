@@ -5,19 +5,182 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH DEBT (2026-07-19): loom RBF scatter field rebuilds the interpolator every frame
-`RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) rebuild the
-`scipy.interpolate.RBFInterpolator` once per frame because sample positions/values are
-animatable (Signals), so the kernel factorization is frame-dependent. When positions are
-**static** (the common case) the O(M³) kernel factorization only depends on positions and
-could be reused across frames, re-solving only for changed values — but scipy's
-`RBFInterpolator` bakes values at construction and exposes no "refactor with new RHS" API.
-Proper fix: detect static positions (all-`Const` position components) and, for that case,
-cache the factorization across frames — either by dropping to scipy's lower-level linear
-solve (build the kernel matrix + polynomial tail once, LU-factor, re-solve per frame) or by
-keeping the `RBFInterpolator` alive when values are also static. Until then, per-frame
-rebuild is correct but wasteful for long animations with many samples. `neighbors=` (local
-k-NN RBF) mitigates the cost for large point sets.
+### TECH-DEBT (2026-07-20): forward mode B barely converges the water-droplet rainbow (`scraps/rainbow_test.ftsl`); mode D works well
+The Airy rainbow phase model (`src/rainbow.h`) is **verified correct** — `ftrace -rainbow-selftest`
+reports textbook geometry (primary 40.7°–42.5° antisolar, secondary 50.1°–53.4° with reversed
+colour order, water dispersion violet n=1.343 > red n=1.330, phase normalised 2π∫p dμ=1.000). But
+rendering the bounded rain-curtain scene `scraps/rainbow_test.ftsl` (thin fog slab + distant sun,
+camera toward the antisolar point):
+- **mode B (forward pinhole splat):** after 450 M photons / 75 s the image is essentially **black**
+  (`sensor=0.0000`, ~95 % noise, auto-exposure ~1.9e-10). The single-scatter-to-camera path over the
+  scene's hundreds-of-metres scale is too rare for the forward splat to accumulate the bow.
+- **mode D (BDPT):** converges the **full, clearly-coloured bow** in the same 75 s (~7.5 % noise) —
+  primary + secondary + Alexander's dark band all visible (`png/rainbow_rain.png`). The fogbow
+  variant (`scraps/fogbow_test.ftsl`, 10 µm droplets) likewise renders correctly as a broad,
+  supernumerary-dominated pale bow (`png/fogbow.png`).
+So this is not a physics bug — the machine and mode D are fine. It is a **forward-mode
+efficiency gap**: mode B (and likely A/C) can't practically image a thin-medium single-scatter bow
+at this scale. **Proper fix (deferred):** give the forward medium-scatter path a next-event /
+camera-connection term for participating media (so each scatter vertex connects to the camera with a
+proper importance weight, like BDPT does) instead of relying on the plain pinhole splat, or document
+that rainbow/fog-bow scenes should use mode D. Low priority — mode D covers the use case.
+
+### BUG (2026-07-19; root-caused 2026-07-20): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
+`error: bad allocation` (exit 1) rendering `scenes/gallery_settled.ftsl`.
+**Root-caused 2026-07-20 — it is NOT a generic "scene too heavy" OOM.** With 26 GB
+free on a 64-bit build, ~1.5 M scene tris and a 1280×720 film cannot exhaust
+memory; the `bad_alloc` is a single *pathological* allocation that scales with the
+**number of selected cameras**, and the scene defines a `camera_curve "fly"` of
+**600 frames**. Reproduction matrix (all on this machine, after the 2026-07-20
+Klein→gyroid-lite swap):
+- `-camera cam` (single still)  → **works** in every path: mode D GPU render
+  (1280×720, 5.4 s), CPU `-raster -seethrough` (1440×810, 5.08 M tessellated tris),
+  and the interactive `-explore -seethrough` fly viewer.
+- no `-camera` (selects `cam` + all 600 `fly` frames) → `bad_alloc` right after
+  `[selftest]`.
+- `-camera fly` (the 600-frame flyby alone) → `bad_alloc` right after
+  `[camera] path 'fly' -> 600 frames`.
+So the old "OOMs at default resolution" claim was misleading: the *still camera*
+renders fine at default res; only pulling the whole flyby into one selection blows
+up. The allocation is proportional to the frame count (each selected camera gets
+its own `Film` accumulator — see `renderForwardShared`, `main.cpp` ~1240/5590, and
+the "~3 GB of films" note at ~5845), so 600 simultaneous films (or a similar
+per-camera structure built during camera expansion) overflow.
+**Workaround (works today):** always pass a single camera, e.g.
+`ftrace -in scenes/gallery_settled.ftsl -camera cam -explore -seethrough`, or
+`-camera fly` **with** a frame selector so only a handful of frames are live at
+once. **Proper fix (deferred):** chunk the multi-camera / flyby film allocation so
+a long `camera_curve` renders in bounded-size batches (render K frames per photon
+flight, recycle the film buffers) instead of allocating one film per frame up
+front — mirror the "one-frame of host RAM" strategy already noted at ~5845 for the
+budgeted path. Not blocking (the still camera renders the showcase fine); the
+flyby just needs the batching fix before it can render all 600 frames in one
+invocation on this machine.
+
+### RESOLVED (2026-07-19): stale `absorb 3 0.5 0.3` example in `src/ftsl.h` — untagged spectrum triples don't parse
+The comment above the `dielectric` `absorb` handling (`src/ftsl.h` ~1838) read
+`e.g. `absorb 3 0.5 0.3` (per-channel, upsampled)`, implying a bare/untagged numeric triple is a valid
+spectrum expression. It is **not**: `evalSpectrum` only accepts a *single* number as a constant;
+a 3-word run with a numeric head (`3 0.5 0.3`) fell through every branch to
+`fail("unrecognized spectrum expression '3'")`. Verified empirically — a scene with `absorb 3 0.5 0.3`
+(and likewise `reflect 0.8 0.7 0.2`) errored out with `[ftsl] unrecognized spectrum expression '<head>'`.
+The valid spellings are a scalar (`absorb 0.5`), a tagged colour (`absorb rgb 3 0.5 0.3`), or a named/ref
+spectrum. **Fixed:** (1) corrected the comment to the tagged example plus an explicit "the `rgb` tag is
+required" note; (2) added a targeted parser hint — when the head is numeric and every word in the run is a
+number (`w.size() >= 3`), `evalSpectrum` now fails with `… — a bare numeric triple isn't a spectrum; tag it,
+e.g. \`rgb 3 0.5 0.3\`` instead of the opaque `unrecognized spectrum expression '3'`. (VERSION 0.9.2 → 0.9.3.)
+
+### RESOLVED (2026-07-19): loom's shared-grammar `reflect`/`roughness`/`*_map` fields are now shape-validated
+The grammar-backed reader (`tools/loom/loom/grammar/reader.py`) shape-checks *purely-spectral* fields
+(`ior`/`transmit`/`absorb`/`substrate_k`/`emit` on materials, `spd` on lights) against the shared spectrum
+grammar (`loom/grammar/spectrum.py`). The binding-union fields `reflect`, `roughness`, and any `*_map` binder
+are now validated too, via new `loom/grammar/bindings.py` — a faithful mirror of ftrace's `bindReflectTexture`
+/ `bindScalarTexture` / `bindScalarPattern` + `spectrumParam` / `dblParam` (`src/ftsl.h` `buildMaterial`):
+`as_color_binding` (`reflect` = `texture:<name>` | spectrum — reflect binds only a UV texture, never a
+`pattern:`), `as_scalar_binding` (`roughness` = `pattern:` | `texture:` | one scalar number, not a spectrum),
+and `as_map_binding` (`film_thickness_map`/`weight_map` = `pattern:` | `texture:` only). Wired into
+`_build_material` (`_validate_bindings`); shape-only (a bound name's scene membership stays a later,
+scene-aware check). An untagged triple `reflect 0.8 0.7 0.2` is now rejected exactly as ftrace rejects it.
+`tests/test_grammar_bindings.py` (10 cases) + `test_grammar_material.py` additions; loom suite 823 passed.
+**Remaining scope (not this item):** the record-driven *whole-material override* block (`from R(...)` +
+`slot = REC.chan`, ftrace's `isRecordOverrideBlock`) is a distinct block form loom does not emit, and the
+final step is mirroring the `value`/`spectrum`/binding grammar into ftrace's C++ front-end at the J3c port.
+
+### RESOLVED (2026-07-19): loom `Light(color=…, size=…, turbidity=…)` emitted fields ftrace's `addLight` ignored
+loom's `Light` accepted free-form props and emitted them verbatim (`light { kind …  color 0.9 0.8 0.7  size 2 2 }`),
+but ftrace's `addLight` reads emission from `spd` (a spectrum) plus per-subtype geometry
+(`origin`/`u`/`v`/`center`/`radius`/…) — it has **no** `color`, `size`, or `turbidity` field, so those loom props
+were silently dropped at render. **Fixed:** loom's `Light` now maps `color=(r,g,b)` → `spd rgb r g b` (a spectral
+emission, since ftrace lights are spectral) and otherwise passes only ftrace-valid props through; the test battery
+dropped its `size`/`turbidity` fixtures and uses ftrace's real light schema (`u`/`v` area geometry,
+`center`/`radius` sphere light). `size`/`turbidity` were demo-only and are gone — if loom wants to author a light
+it uses ftrace's language. (`test_light_color_emits_spd_rgb` locks the mapping; full loom suite green, 824 passed.)
+The analytic-sky *feature* that would give `turbidity` meaning is deferred — see TODO ("Analytic physical sky").
+
+### RESOLVED (2026-07-19): `gallery_settled.ftsl` — several objects mis-positioned (resting on the floor)
+**Root cause:** the free-settle physics bake tumble, not a transform/collider/floor bug. Three of the
+five settled pieces landed correctly; klein (COM y≈0.37) and heart (y≈0.14) had tipped, rolled past
+the rim of their NARROW museum pedestals, and fallen to the floor. Verified by recovering each piece's
+settled COM height from the baked `group` delta (`pos_sim = R·c_auth + t`; see
+`scraps/check_settle_heights.py`) — confirming the transform math and colliders were correct and only
+the two tippy shapes had walked off their caps. **Fix:** added a during-sim horizontal restoring
+spring to `tools/settle_scene.py` (`--tether [k]`, default k=150) applied AT each body's COM every
+step, pulling it back toward its authored XZ. Because it acts at the COM it exerts **zero torque**, so
+a piece is still free to tip/rotate onto its cap but cannot walk off it sideways — the result is a
+genuine physics rest pose that stayed home. At k=150 all five pieces settle onto their stands in one
+pass (klein rescued 0.37→1.38, heart 0.14→1.12). The committed `gallery_settled.ftsl` was repaired by
+swapping the five tumbled `group` deltas for the tether-settled values. (Distinct from the separate
+OPEN mode-D GPU-BDPT launch-failure on the same scene, logged 2026-07-15.)
+
+### TECH DEBT (2026-07-19): `scenes/gallery_settled.ftsl` has diverged from its authored source `scenes/gallery.ftsl`
+The generated settled file was hand-edited by three later commits (4c86261 prefer{}/else{} camera
+mode-D/B fallback, f0786d6 flyby `frames 600`, bc9d664 scene-level `default_mode` + fps hint) that were
+**never back-ported** to the authored `scenes/gallery.ftsl` (still plain `camera mode D`, `frames 144`).
+So the "generated" file is now the de-facto source of truth for those features, and re-running
+`tools/settle_scene.py --scene scenes/gallery.ftsl` would silently REGRESS them. That is why the
+2026-07-19 floor-bug fix above patched the five `group` deltas in place instead of regenerating. **Proper
+fix:** reconcile the two — back-port the camera/frames/default_mode authoring into `gallery.ftsl` so the
+settled file is fully regeneratable from source, then regenerate with `--tether`. Blocked on confirming
+authoring intent (is `frames 600` or `144` canonical? is the prefer/else wrapper wanted in source?).
+
+### TECH DEBT (2026-07-19): settle sim slow — non-manifold stand colliders won't decimate below ~150–390k tris
+`tools/settle_scene.py` decimates static concave colliders to `STATIC_TRI_CAP` (4000) via
+`trimesh.simplify_quadric_decimation`, but the marching-cubes museum-stand meshes are multi-shell /
+non-manifold (unions of boxes), so quadric edge-collapse gives up early and only reduces them ~65%
+(e.g. stand meshes 500k–1M → 150k–390k tris), keeping per-step collision cost high. Clean closed meshes
+(gyroid, lamp) hit 4000 fine. Worked around by validating at `--mesh-res 64`. **Proper fix candidates:**
+(a) VHACD-decompose the static stands into convex compounds too (fast convex-vs-convex collision), or
+(b) vertex-clustering / voxel-remesh decimation that ignores topology, or (c) approximate each stand
+with authored box/cylinder primitive colliders instead of the polygonised isosurface.
+
+### FEATURE REQUEST (2026-07-19): cache ftrace's per-scene preprocessing before rasterizing
+Add an option to **cache the scene-derived data ftrace computes at load** (tessellation / BVH /
+material+texture bake / whatever the rasterizer consumes) to disk, keyed on the scene (hash of the
+`.ftsl` + referenced assets), so re-opening the same scene in the raster preview skips the rebuild.
+Motivation: interactive raster/preview startup on a heavy scene repeats expensive preprocessing every
+launch. Design notes: invalidate on any input change (scene text, mesh/texture/vdb asset mtimes,
+relevant CLI flags that affect the baked data); store next to the scene or in a sidecar cache dir;
+make it opt-in (`-scene-cache` or similar) at first. Overlaps conceptually with the `.ftbuf`
+checkpoint sidecar but is about *input* preprocessing, not *output* accumulation.
+
+### PERF (2026-07-19): preview rasterizer much slower than an equivalent WebGL renderer
+Our software/CUDA preview rasterizer is far slower than a WebGL rendition of a comparable scene.
+Needs profiling before any fix. Likely factors to measure: (a) we rasterize on the CPU in double
+precision by default (GPU path is opt-in via `-device gpu|auto`), where WebGL is GPU float hardware
+with fixed-function raster; (b) per-frame host readback + p99 auto-exposure on the host each frame
+(known-issues "Per-frame readback"); (c) we re-tessellate / rebuild scene data per launch (see the
+scene-cache request above); (d) no persistent GPU-resident vertex buffers / we may re-upload. **Next
+step:** profile a representative scene (CPU vs `-raster-gpu`) to find the actual bottleneck rather
+than guessing; compare against what a trivial WebGL draw of the same triangle count costs. This is a
+"why is it slow" investigation, not a confirmed single bug.
+
+### FEATURE REQUEST (2026-07-19): option for curve-editor curve to be occluded by geometry in front of it
+The camera-path / curve overlay shown in the curve editor currently draws over everything (an
+always-on-top helper). Add an **option** to instead depth-test the curve against the scene so objects
+in front of it occlude it (more spatially truthful), while keeping the always-visible mode available
+(often you *want* to see the whole path through geometry). Implementation: test the curve fragments'
+depth against the opaque z-buffer the rasterizer already produces; expose as a toggle (CLI flag +/or
+editor control). Low risk — the z-buffer is already there.
+
+### DONE (2026-07-19): loom RBF scatter field rebuilt the interpolator every frame
+`RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) used to rebuild the
+`scipy.interpolate.RBFInterpolator` once per frame, gated only on the frame number, even when
+the sample positions and values were completely static — pure waste for the very common case
+of a fixed scatter field queried along a moving path over a long animation.
+**Fixed** by replacing the bare per-frame gate with change detection: `_RbfEngine` now caches
+the last-built interpolator together with the exact position/value arrays it was built from,
+and on a frame advance re-evaluates the sample arrays and reuses the cached interpolator
+verbatim (bit-for-bit identical output) unless the positions or values actually changed. A
+static field now builds exactly once regardless of animation length; animated values still
+rebuild per changed frame (correct, and cheap at realistic scatter sizes). Tests in
+`tests/test_rbf.py` assert build-once for static fields (scalar + vector), bit-identical reuse
+vs. a fresh rebuild, and correct rebuild-on-change for animated values.
+Deliberately **not** done: the deeper "static positions, animated values → reuse the O(M³)
+factorization, re-solve only the RHS" optimization. scipy exposes no public refactor-with-new-RHS
+API, so it would require coupling to scipy's private compiled internals
+(`_rbfinterp_np._build_system`) — a version-fragile dependency for a gain that is negligible at
+the small scatter sizes loom fields realistically use. `neighbors=` (local k-NN RBF) still
+mitigates cost for large point sets.
 
 ### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
 **Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)

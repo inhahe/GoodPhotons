@@ -25,7 +25,7 @@ def _emit(el, clock):
 def test_isosurface_emits_wellformed_block():
     iso = gyroid_surface(freq=1.5, threshold=0.0, material="m")
     txt = _emit(iso, Clock(t=0.0))
-    assert txt.startswith('isosurface "gyroid" {')
+    assert txt.startswith('gyroid = isosurface {')
     assert txt.count("{") == txt.count("}"), (txt.count("{"), txt.count("}"))
     assert 'function {' in txt and "expr" in txt
     assert "contained_by" in txt
@@ -77,7 +77,7 @@ def test_scene_check_cycles_ok():
                          drift=vec(phase_drift(2.0), 0.0, 0.0), material="m"))
     s.check_cycles()  # must not raise
     txt = s.emit(Clock.at_frame(3, 24), Cache())
-    assert 'isosurface "gyroid"' in txt
+    assert 'gyroid = isosurface' in txt
 
 
 def _run_all():

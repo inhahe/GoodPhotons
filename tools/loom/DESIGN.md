@@ -170,7 +170,9 @@ output can feed another modulator — "it's just another function"):
 3b. **`RbfScatterField`** — radial-basis interpolation (`scipy.interpolate.RBFInterpolator`,
    an *optional* dep, lazily imported). Smooth, exact at samples, meshless, any N-D.
    Default kernel `thin_plate_spline` (parameter-free); `on_outside="clamp"` guards the
-   convex-hull extrapolation. Rebuilt once per frame (positions/values animate).
+   convex-hull extrapolation. Rebuilt **only when the sampled positions/values actually
+   change** (change-detection cache in `_RbfEngine`): a static field builds once and is
+   reused verbatim across the whole animation even as the query moves.
 
 Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
 with named `channels=`). `VecGridField` / `VecScatterField` / `VecRbfScatterField`
@@ -279,12 +281,32 @@ cannot parse it.
 stop, `.arity`/`.as_vector()` the vector view), so a `RecordChannel.kind` is `scalar`
 (arity 1) / `colour` (`:`-refs) / **`vector`** (arity `D` ≥ 2, homogeneous). `Record`
 gains `sample_vec(name, d)` (per-component interpolation; scalar `sample` still returns a
-float). Because current-FTSL uses *whitespace* to separate stops but the ladder uses it
-for *components*, the two grammars stay separate: `emit`/`parse` remain the J3a
-whitespace form (and `emit` rejects a vector channel), while `emit_generalized` /
-`parse_generalized` use the ladder (comma-separated stops) so vector channels round-trip.
-Inline-`rgb` colour channels + their lowering to synthesized `spectrum` decls are the
-remaining J3b piece (not yet built).
+float). Current-FTSL uses *whitespace* to separate stops but the ladder uses it for
+*components*, so `emit`/`parse` are **one backward-compatible ladder grammar** (an
+*additive superset*, not a breaking change) that dispatches per channel line on the
+presence of a top-level comma: a comma-free line is the J3a whitespace form (every word
+a scalar stop — `metal steel gold copper` = three stops), while a line with a top-level
+comma is the ladder form (comma-separated stops, space-separated components — `tint 0 0
+0, 1 1 1` = two arity-3 vector stops). A *lone* vector stop is written with a trailing
+comma (`tint 0 0 0,`) so it can't be misread as N scalar stops. `emit` picks the form
+per channel automatically (whitespace for scalar/colour, comma for vector); records with
+no vector channel emit byte-identically to before. ftrace's own tokenizer is still not
+comma-aware, so a record that actually uses comma lines stays loom-only until J3c.
+
+**Inline-colour channels + lowering (J3b item 1, done).** A colour channel can be
+authored *inline* with a leading `rgb`/`hsv`/`hsl` **tag** word instead of a chain of
+`spectrum:<name>` refs — `reflect  rgb 0.55 0.57 0.60, 0.90 0.75 0.30` is a two-stop rgb
+colour channel (`RecordChannel.space` carries the tag; `.kind == "colour"`, `.arity == 3`).
+The tag fixes arity 3, so each comma-group is one colour stop and a lone tagged stop
+(`reflect  rgb .5 .5 .5`) needs no trailing comma. An `rgb` channel is numerically
+sampleable (`sample_vec` interpolates the components = ftrace's linear-RGB colour interp);
+`hsv`/`hsl` channels reject sampling until lowered. `Record.lower_colours()` rewrites every
+inline-colour channel to the ftrace-native form: it returns `(decls, lowered_record)` where
+`decls` are synthesized `spectrum "<name>" = rgb r g b` declarations (one per **unique**
+colour, deduped across the record; `hsv`/`hsl` converted to rgb via loom's own hue maths)
+and the channels now hold `spectrum:<name>` refs (pins preserved). `lower_ftsl()` returns
+the decls + record as one self-contained parseable block. The remaining J3b item-1 piece
+is wiring these synthesized spectra into a full-scene emit path (part of J3c).
 
 ---
 

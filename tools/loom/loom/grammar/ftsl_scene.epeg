@@ -1,0 +1,97 @@
+# =====================================================================
+# Whole-scene .ftsl grammar (GPDA / EPEG, *generic* flavour)
+# =====================================================================
+# A faithful mirror of ftrace's hand-written front-end (src/ftsl.h:
+# tokenize + Parser::parseTop / parseOneTopBlock / parseValue /
+# parseBraceBody / parseRecord / parsePrefer).  Where the sibling
+# `ftsl.epeg` is a *typed* grammar of six element kinds (loom's reader,
+# the J3c "proving ground"), THIS grammar is the generic, uniform
+# block/stmt/value structure ftrace's parser actually produces — the one
+# the C++ front-end will adopt and the validation shim will diff against.
+#
+# KEY: ftrace's tokenizer is trivial — everything that isn't
+# whitespace / a brace / a bracket / a comment / a quoted string is a
+# single `Word` (so `0.5+0.5*sin(2*pi*8*u)`, `spectrum:gold`,
+# `smooth_union`, `REC.chan` are each ONE token).  We reproduce that with
+# a catch-all WORD terminal, plus NUMWORD / KVWORD carved off the front
+# ONLY so the grammar can honour ftrace's parseValue *continuation rule*:
+# after a value's first token, a value continues on numbers and `key=val`
+# words but STOPS at a plain bareword (which begins the next statement's
+# key).  Literals (`scene` isn't one — only `range`/`prefer`/`else`/
+# `spectrum`/`=`) match by *value* against whatever token the lexer emits,
+# so keywords need no special lexing.
+# =====================================================================
+
+start scene_file
+
+# ---- skips + terminals (mirror ftrace's tokenize) -------------------
+WS      = /[ \t\r]+/ @skip          # inter-token whitespace (ftrace skips \r too)
+COMMENT = /#[^\n]*/ @skip           # `# …` to end of line
+NEWLINE = /\n/                      # significant: delimits statements / blocks
+
+STRING  = /"[^"]*"/                                 # quoted name / path / expression
+# A strtod-complete numeric literal (ftrace's isNumber): a value *continuation*.
+# `0-1` / `1-2` are NOT numbers (strtod stops at the inner dash) — longest-match
+# then makes them plain WORDs, exactly as ftrace's isNumber returns false.
+NUMWORD = /[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?/
+# A `key=value` word (`center=560`, `axis=x`): also a value continuation
+# (ftrace continues on any word containing '=').  A lone `=` has no head, so it
+# falls through to WORD and is matched by the `'='` literal — keeping the
+# `NAME = KIND` header and record-override `slot = rhs` forms unambiguous.
+KVWORD  = /[^ \t\r\n{}\[\]#"=]+=[^ \t\r\n{}\[\]#"]*/
+# The catch-all bareword: any run of non-delimiter chars.  Declared LAST so it
+# loses longest-match ties to NUMWORD / KVWORD / STRING (numbers & k=v win).
+WORD    = /[^ \t\r\n{}\[\]#"]+/
+
+# ---- file = a list of top-level blocks (newlines optional between) ---
+scene_file = item*
+item       = NEWLINE | top_block
+
+# parseOneTopBlock: prefer-construct, `NAME = range …` record, `spectrum … = v`,
+# the unified `NAME = KIND { }` header, or the legacy `KIND ["name"] [sub] { }`.
+top_block  = prefer_block | record_decl | spectrum_decl | assign_header | plain_header
+
+# ---- prefer { … } else { … } ----------------------------------------
+prefer_block = 'prefer' nlq block_list ('else' nlq block_list)*
+block_list   = '{' item* '}'
+nlq          = NEWLINE*
+
+# ---- parametric record: `NAME = range LO HI [ <lines> ]` -------------
+record_decl  = WORD '=' 'range' range_word* nlq record_body
+range_word   = NUMWORD | KVWORD | STRING | WORD
+record_body  = '[' rec_item* ']'
+rec_item     = NEWLINE | record_line
+record_line  = WORD stop_word*                 # channel name + stop tokens
+stop_word    = NUMWORD | KVWORD | STRING | WORD
+
+# ---- spectrum decl: `spectrum "name" [subtype] = <value>` -----------
+# The one block form with an `=` value instead of a brace body.
+spectrum_decl = 'spectrum' STRING? subtype? '=' value
+
+# ---- element headers -------------------------------------------------
+# Unified `NAME = KIND [subtype] { body }` and legacy `KIND ["name"] [sub] { body }`.
+assign_header = WORD '=' WORD subtype? brace_body
+plain_header  = WORD STRING? subtype? brace_body
+subtype       = WORD                           # a bareword subtype (light area / …)
+
+# ---- brace body = newline-structured statements ---------------------
+brace_body = '{' body_item* '}'
+body_item  = NEWLINE | stmt
+# ftrace takes *any* token as a statement key (`s.key = cur().text`), so a
+# `palette { 0 spectrum:navy  1 spectrum:crimson … }` flat-list body (numeric
+# "keys") parses the same as a normal `key value` line.
+stmt       = key_tok value
+key_tok    = WORD | NUMWORD | KVWORD
+
+# parseValue: the record-override `= rhs [i]` form, or a normal value — a first
+# token (any), then continuations (numbers / k=v / strings), an optional
+# `[i]` selector, and an optional trailing nested `{ … }` block.
+value       = override_val | normal_val
+override_val = '=' rhs? selector?
+rhs         = STRING | NUMWORD | KVWORD | WORD
+normal_val  = val_head? cont* selector? block?
+val_head    = STRING | NUMWORD | KVWORD | WORD
+cont        = NUMWORD | KVWORD | STRING        # NOT a plain WORD (that ends the value)
+selector    = '[' sel_word* ']'
+sel_word    = NUMWORD | KVWORD | WORD
+block       = '{' body_item* '}'

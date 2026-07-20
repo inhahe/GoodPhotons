@@ -190,10 +190,16 @@ isosurface "gyroid_gem" {
 # The flyby dives straight THROUGH it. Native sphere for exact analytic refraction.
 sphere { center 6.2 1.40 3.5   radius 0.5   material glass }
 
-# --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
+# --- GYROID SPHERE in glass (perforated triply-periodic minimal surface trimmed to a
+# ball; clear intricate transparent piece; object still named "klein" for the stand/settle
+# wiring) ------------------------------------------------------------------------------
 mesh "klein" {
-    file "scraps/klein_staged.obj"
-    translate 5.9 1.70 2.6   rotate 8 40 0   scale 1.4
+    file "meshes/klein_a120_b060_c30_d127_lite.obj"
+    # raw mesh is centered at origin spanning +/-10 in each axis (size ~20);
+    # scale 0.025 -> ~0.5 across so it fits the stand_klein cap (~0.52), and
+    # translate y = 1.00 (cap top) + 0.25 (half-height) = 1.25 so it rests on top.
+    # lite decimation (~53 MB vs 168 MB) for faster load; same bounds.
+    translate 5.9 1.25 2.6   rotate 0 40 0   scale 0.025
     material glass
 }
 

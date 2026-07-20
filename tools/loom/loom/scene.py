@@ -87,7 +87,7 @@ class Texture(Element):
         return []
 
     def emit(self, ctx: EmitCtx) -> str:
-        return (f'texture "{self.name}" {{ file "{self.file}"  '
+        return (f'{self.name} = texture {{ file "{self.file}"  '
                 f'encoding {self.encoding}  filter {self.filter}  '
                 f'wrap {self.wrap} }}')
 
@@ -105,7 +105,7 @@ class Material(Element):
         parts = [f"type {self.mtype}"]
         for k, v in self.props.items():
             parts.append(f"{k} {value_token(v, ctx.clock, ctx.cache)}")
-        return f'material "{self.name}" {{ ' + "  ".join(parts) + " }"
+        return f'{self.name} = material {{ ' + "  ".join(parts) + " }"
 
 
 class ProcTexture(Element):
@@ -145,7 +145,7 @@ class ProcTexture(Element):
         return []
 
     def emit(self, ctx: EmitCtx) -> str:
-        return (f'texture "{self.name}" {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
+        return (f'{self.name} = texture {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
                 f'res {self.res}  filter {self.filter}  wrap {self.wrap} }}')
 
 
@@ -519,7 +519,12 @@ class Volume(Element):
 
 class Light(Element):
     """Generic ``light <kind> { ...props... }``.  Props are animatable or strings
-    (e.g. ``spd="preset:bb6500"``)."""
+    and must use ftrace's real light schema (``spd`` for emission, plus per-kind
+    geometry: ``origin``/``u``/``v`` for an area light, ``center``/``radius`` for a
+    sphere, etc. — see ftrace's ``addLight``).  loom does not invent light fields;
+    the one convenience is ``color=(r, g, b)``, which is emitted as an ``spd rgb …``
+    emission spectrum, since ftrace lights are spectral and have no ``color`` field.
+    """
 
     def __init__(self, kind: str, **props) -> None:
         self.kind = kind
@@ -529,9 +534,19 @@ class Light(Element):
         return [v for v in self.props.values() if isinstance(v, (Signal, VecSignal))]
 
     def emit(self, ctx: EmitCtx) -> str:
-        parts = [f"{k} {value_token(v, ctx.clock, ctx.cache)}"
-                 for k, v in self.props.items()]
-        return f"light {self.kind} {{ " + "  ".join(parts) + " }"
+        # Unified header: anonymous light with the subtype carried as a `kind`
+        # property (`light { kind point  ... }`) rather than a bareword after KIND.
+        parts = [f"kind {self.kind}"]
+        for k, v in self.props.items():
+            tok = value_token(v, ctx.clock, ctx.cache)
+            if k == "color":
+                # ftrace lights carry their emission in a spectral `spd`; there is no
+                # `color` field. Author an RGB colour, emit it as `spd rgb r g b` (the
+                # Jakob-Hanika upsample turns the triple into an emission spectrum).
+                parts.append(f"spd rgb {tok}")
+            else:
+                parts.append(f"{k} {tok}")
+        return "light { " + "  ".join(parts) + " }"
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +576,7 @@ class Camera(Element):
         la = vec3(self.look_at, ctx.clock, ctx.cache)
         up = vec3(self.up, ctx.clock, ctx.cache)
         fov = num(self.fov_y, ctx.clock, ctx.cache)
-        return (f'camera "{self.name}" {{\n'
+        return (f'{self.name} = camera {{\n'
                 f'    eye {fmt3(e)}  look_at {fmt3(la)}  up {fmt3(up)}  fov_y {fmt(fov)}\n'
                 f'    mode {self.mode}\n'
                 f'    film {{ res {self.res[0]} {self.res[1]} }}\n'
@@ -670,7 +685,7 @@ class CameraCurve(Element):
         return []   # a camera_curve is a static authored flight (no per-frame signals)
 
     def emit(self, ctx: EmitCtx) -> str:
-        L = [f'camera_curve "{self.name}" {{']
+        L = [f'{self.name} = camera_curve {{']
         for p in self.points:
             L.append(f"    point {fmt3(p)}")
         if self.look_points:

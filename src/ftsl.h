@@ -303,13 +303,29 @@ struct Parser {
         // by a bare first word immediately followed by '=' then `range` — spectrum uses
         // a *quoted* name before '=', so there is no collision.
         if (is(Tok::Word) && cur().text == "=") {
-            std::string name = b.type;
+            std::string name = b.type;   // the leading bare word is the binding NAME
             adv();  // consume '='
             if (is(Tok::Word) && cur().text == "range") {
                 adv();  // consume 'range'
                 return parseRecord(b, name);
             }
-            fail("unknown '=' declaration '" + name + "' (expected `= range`)");
+            // Unified element header `NAME = KIND { ... }` (the loom-emitted form):
+            // the word after '=' is the block KIND (material/texture/camera/light/
+            // isosurface/pattern/geometry) and NAME is its name. Body parses exactly
+            // like the legacy `KIND "name" { ... }`. Accepted alongside the legacy
+            // spelling during the grammar transition (J3c); one spelling once ftrace's
+            // front-end is ported from the shared grammar.
+            if (is(Tok::Word)) {
+                b.type = cur().text; adv();          // KIND
+                b.name = name;
+                // Optional bareword subtype (`sun = light point { }`); the new grammar
+                // prefers a `kind` property instead, but accept both here.
+                if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
+                if (!is(Tok::LBrace)) { fail("expected '{' after `" + name + " = " + b.type + "`"); return false; }
+                parseBraceBody(b);
+                return true;
+            }
+            fail("unknown '=' declaration '" + name + "' (expected `= range` or `= KIND { ... }`)");
             return false;
         }
         if (is(Tok::String)) { b.name = cur().text; adv(); }
@@ -377,6 +393,17 @@ struct Parser {
         return blocks;
     }
 };
+
+}  // namespace ftsl  (temporarily closed so the validation shim can see
+   //                  ftsl::Block/Stmt/Value at global scope)
+
+// J3c grammar-validation shim: the shared .ftsl grammar (GPDA) run alongside the
+// hand-written Parser above.  Included here — after Block/Stmt/Value/Parser are
+// defined — so its inline reducer/differ can reference them.  Non-authoritative;
+// see the header for details.
+#include "gpda/ftsl_shim.hpp"
+
+namespace ftsl {
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -1130,23 +1157,30 @@ private:
             }
             return (h == "gaussian") ? gaussianBand(a, b, c) : shortPass(a, b, c);
         }
-        if (h == "rgb") {
-            if (w.size() < 4) { fail("rgb needs 3 components"); return constantSpectrum(0); }
-            return rgbToReflectanceJH(num(w[1]), num(w[2]), num(w[3]));
-        }
-        if (h == "hsv") {
-            // `hsv h s v` — hue in [0,1] (turns, wraps), s/v in [0,1]. Converted to
-            // RGB then to a smooth reflectance via the same Jakob-Hanika fit as `rgb`.
-            if (w.size() < 4) { fail("hsv needs 3 components (h s v)"); return constantSpectrum(0); }
-            Vec3 c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
-            return rgbToReflectanceJH(c.x, c.y, c.z);
-        }
-        if (h == "hsl") {
-            // `hsl h s l` — hue in [0,1] (turns, wraps), s/l in [0,1] (l = lightness).
-            // Converted to RGB then upsampled to reflectance like `rgb`/`hsv`.
-            if (w.size() < 4) { fail("hsl needs 3 components (h s l)"); return constantSpectrum(0); }
-            Vec3 c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
-            return rgbToReflectanceJH(c.x, c.y, c.z);
+        // `rgb r g b` / `hsv h s v` / `hsl h s l` — a colour, upsampled to a smooth
+        // reflectance via the Jakob-Hanika fit. hue in [0,1] (turns, wraps); s/v/l in
+        // [0,1] (l = lightness). The `…line` heads (`rgbline`/`hsvline`/`hslline`)
+        // instead take the K3 dominant-wavelength *emission* form: `rgbline r g b [sigma]`
+        // emits a narrow band at the colour's dominant wavelength (near-monochromatic, so
+        // glass disperses it), width from saturation or the explicit `sigma` (nm). Meant
+        // for lights (`spd rgbline 0 0 1`); a reflectance has no single wavelength, but the
+        // form is accepted anywhere a spectrum is. (A head keyword, not a trailing modifier,
+        // because the parser stops a value at the next bareword.)
+        {
+            bool isLine = (h == "rgbline" || h == "hsvline" || h == "hslline");
+            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine) {
+                if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
+                std::string space = isLine ? h.substr(0, 3) : h;
+                Vec3 c;
+                if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
+                else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
+                else                     c = hslToRgb(num(w[1]), num(w[2]), num(w[3]));
+                if (isLine) {
+                    double sigma = (w.size() > 4 && isNumber(w[4])) ? num(w[4]) : -1.0;
+                    return rgbToLineEmission(c.x, c.y, c.z, sigma);
+                }
+                return rgbToReflectanceJH(c.x, c.y, c.z);
+            }
         }
         if (h.rfind("glass:", 0) == 0) {
             std::string g = h.substr(6);
@@ -1181,6 +1215,18 @@ private:
             const Stmt* e = find(*it->second, "=");
             if (!e) { fail("spectrum '" + nm + "' has no value"); return constantSpectrum(0); }
             return evalSpectrum(e->val, depth + 1);
+        }
+        // Common authoring trap: a bare numeric run like `absorb 3 0.5 0.3` looks like
+        // a per-channel colour but isn't a spectrum expression (only a lone scalar, a
+        // tagged colour, or a named/ref spectrum parse). Point straight at the fix.
+        if (isNumber(h) && w.size() >= 3) {
+            bool allNum = true;
+            for (const auto& t : w) if (!isNumber(t)) { allNum = false; break; }
+            if (allNum) {
+                fail("unrecognized spectrum expression '" + h + "' — a bare numeric triple "
+                     "isn't a spectrum; tag it, e.g. `rgb " + w[0] + " " + w[1] + " " + w[2] + "`");
+                return constantSpectrum(0);
+            }
         }
         fail("unrecognized spectrum expression '" + h + "'");
         return constantSpectrum(0);
@@ -1819,8 +1865,11 @@ private:
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
             else m.roughness = dblParam(b, "roughness", 0.0);
             // Interior absorption sigma_a(lambda) per metre travelled inside the glass
-            // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb 3 0.5 0.3`
-            // (per-channel, upsampled) gives green-tinted glass.
+            // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb rgb 3 0.5 0.3`
+            // (a tagged RGB triple, upsampled to a spectrum) gives green-tinted glass.
+            // NOTE: the `rgb` tag is required — a bare triple (`absorb 3 0.5 0.3`) is NOT
+            // a valid spectrum expression; only a scalar, a tagged colour (`rgb`/`xyz`/…),
+            // or a named/ref spectrum parse. See evalSpectrum below.
             m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;
@@ -2298,7 +2347,7 @@ private:
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
             else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
             else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
-            else if (s.key == "light")    { if (!addLight(*cb, L, cb->type, world)) return false; haveLight = true; }
+            else if (s.key == "light")    { if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
             else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, light, group)"); return false; }
         }
@@ -2636,8 +2685,13 @@ private:
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
-    bool addLight(const Block& b, Loaded& L, const std::string& subtype,
+    bool addLight(const Block& b, Loaded& L, std::string subtype,
                   const Affine& xf = Affine::identity()) {
+        // New unified header form `NAME = light { kind <subtype>  ... }` carries the
+        // light subtype in a `kind` property rather than a bareword after the KIND.
+        // When no bareword subtype was parsed (empty), fall back to the property.
+        // Old default point/area lights have no `kind`, so they stay empty as before.
+        if (subtype.empty()) subtype = strOf(b, "kind", "");
         Spectrum spd = spectrumParam(b, "spd", blackbody(6500.0));
         // Uniform scale of the enclosing group chain (spheres/pencils scale by it;
         // a non-uniform scale is only meaningful for the flat quad/mesh emitters).
@@ -4286,6 +4340,12 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
     Parser p; p.t = tokenize(src);
     std::vector<Block> blocks = p.parseTop();
     if (!p.err.empty()) { err = p.err; return false; }
+
+    // J3c validation shim (non-authoritative): when -validate-grammar is on,
+    // parse `src` with the shared .ftsl grammar via the GPDA engine and diff its
+    // Block tree against `blocks` above, warning on any mismatch. Rendering still
+    // proceeds from ftrace's own parse. See src/gpda/ftsl_shim.hpp.
+    ftsl_shim::validate(src, blocks, path);
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;

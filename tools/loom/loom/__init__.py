@@ -18,6 +18,7 @@ from .signals import (
 from .data import PointPath, TrackedPath, Grid, Scatter
 from .color import (
     Color, rgb, hsv, hsl, hsv_to_rgb, rgb_to_hsv, hsl_to_rgb, rgb_to_hsl,
+    parse_color, parse_color_list,
 )
 from .interp import (
     LoopCurve, TrackedCurve, Reparam, GridField, ScatterField,
@@ -77,6 +78,7 @@ __all__ = [
     "PointPath", "TrackedPath", "Grid", "Scatter",
     "Color", "rgb", "hsv", "hsl",
     "hsv_to_rgb", "rgb_to_hsv", "hsl_to_rgb", "rgb_to_hsl",
+    "parse_color", "parse_color_list",
     "LoopCurve", "TrackedCurve", "Reparam", "GridField", "ScatterField",
     "VecGridField", "VecScatterField", "RbfScatterField", "VecRbfScatterField",
     "FieldCurve", "eval_curve",

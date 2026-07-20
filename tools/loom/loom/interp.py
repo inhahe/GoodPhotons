@@ -689,12 +689,23 @@ def _inside_hull(hull, q, tol: float = 1e-9) -> bool:
 
 
 class _RbfEngine:
-    """Per-field RBF builder + evaluator, rebuilt at most **once per frame**.
+    """Per-field RBF builder + evaluator that rebuilds **only when the sampled
+    positions or values actually change**.
 
     The kernel factorization depends on the (animatable) sample positions and the
-    values are its right-hand side, so we rebuild when the frame changes.  A whole
-    vector scatter is one ``RBFInterpolator`` with a multi-column ``d`` (multi-RHS),
-    which is why scalar and vector fields share this engine.
+    values are its right-hand side.  Both are Signals, so in principle they can
+    move every frame — but in practice a scatter field is usually authored with
+    *static* positions (fixed sample sites), and very often static values too, and
+    is then queried at many frames (e.g. sampled along a moving path).  Rebuilding
+    the ``O(M^3)`` interpolator once per frame in that case is pure waste.
+
+    So instead of a bare per-frame gate we cache the last built interpolator
+    together with the exact position/value arrays it was built from.  When the
+    frame advances we re-evaluate the sample arrays and, if they are bit-for-bit
+    identical to the cached ones, reuse the interpolator untouched (bit-identical
+    output).  Only a genuine change triggers a rebuild.  A whole vector scatter is
+    one ``RBFInterpolator`` with a multi-column ``d`` (multi-RHS), which is why
+    scalar and vector fields share this engine.
     """
 
     def __init__(self, scatter: Scatter, kernel: str, epsilon, smoothing,
@@ -715,13 +726,28 @@ class _RbfEngine:
         self.on_outside = on_outside
         self._frame: Optional[int] = None
         self._state = None
+        self._P = None      # position array the cached interpolator was built from
+        self._D = None      # value array the cached interpolator was built from
+        self._builds = 0    # rebuild counter (tests assert the cache is reused)
 
-    def _build(self, clock: Clock, cache: Optional[Cache]) -> None:
+    def _refresh(self, clock: Clock, cache: Optional[Cache]) -> None:
+        """Ensure ``self._state`` reflects the samples at ``clock``, rebuilding the
+        interpolator only if the position/value arrays changed since the last build."""
         import numpy as np
-        from scipy.interpolate import RBFInterpolator
         sc = self.scatter
         P = np.asarray([pos.at(clock, cache) for pos in sc.positions], dtype=float)
         D = np.asarray([val.at(clock, cache) for val in sc.values], dtype=float)
+        if (self._state is not None and self._P is not None
+                and P.shape == self._P.shape and D.shape == self._D.shape
+                and np.array_equal(P, self._P) and np.array_equal(D, self._D)):
+            return  # samples unchanged — reuse the cached factorization verbatim
+        self._build(P, D)
+        self._P = P
+        self._D = D
+
+    def _build(self, P, D) -> None:
+        import numpy as np
+        from scipy.interpolate import RBFInterpolator
         rbf = RBFInterpolator(P, D, kernel=self.kernel, epsilon=self.epsilon,
                               smoothing=self.smoothing, degree=self.degree,
                               neighbors=self.neighbors)
@@ -729,11 +755,12 @@ class _RbfEngine:
         dmax = np.atleast_1d(D.max(axis=0))
         hull = None if self.on_outside == "extrapolate" else _make_hull(P)
         self._state = (rbf, dmin, dmax, hull)
+        self._builds += 1
 
     def evaluate(self, q: Tuple[float, ...], clock: Clock, cache: Optional[Cache]):
         import numpy as np
         if self._frame != clock.frame or self._state is None:
-            self._build(clock, cache)
+            self._refresh(clock, cache)
             self._frame = clock.frame
         rbf, dmin, dmax, hull = self._state
         qa = np.asarray(q, dtype=float).reshape(1, -1)

@@ -27,8 +27,19 @@ add_executable(ftrace
     src/vdbgrid.cpp          # confines vendored NanoVDB.h to one TU; bakes .nvdb -> dense fog grid
     src/fbx_load.cpp         # FBX mesh loader (bridge over vendored ufbx); confines ufbx.h to one TU
     src/third_party/ufbx.c   # vendored single-file FBX parser (MIT / public-domain), compiled as C
+    src/gpda/tokenized.cpp        # vendored GPDA parser engine (J3c grammar-validation shim)
+    src/gpda/ftsl_scene.gen.cpp   # GENERATED (loom.grammar.emit_cpp): shared .ftsl grammar graph + lexer table
 )
-target_include_directories(ftrace PRIVATE src)
+target_include_directories(ftrace PRIVATE src src/gpda)
+
+# The vendored GPDA engine + generated grammar are third-party/generated code;
+# don't hold them to ftrace's /W4 /permissive- bar (keeps the build-warning
+# signal about our own code).
+if(MSVC)
+    set_source_files_properties(
+        src/gpda/tokenized.cpp src/gpda/ftsl_scene.gen.cpp
+        PROPERTIES COMPILE_OPTIONS "/W0")
+endif()
 
 # --- Optional CUDA backend (GPU forward light tracer, model B) ---------------
 # If a CUDA toolkit is present, compile src/render_cuda.cu (by nvcc) into ftrace

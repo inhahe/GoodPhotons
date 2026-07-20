@@ -11,32 +11,48 @@ records in a ``.ftsl`` scene (J3a — the round-trip goal).
 
 Model (matching the generalized spec, ``ROADMAP_records.md`` §3):
 
-* a **channel** outputs a value of some arity ``D``.  Three kinds are supported:
+* a **channel** outputs a value of some arity ``D``.  These kinds are supported:
   a *scalar* channel (``D==1``; every stop is a numeric literal or a pattern
-  expression), a *colour* channel (every stop is a ``spectrum:<name>`` /
-  ``metal:<name>`` / ``rgb:<…>`` ref, interpolated in linear-RGB → Jakob–Hanika), and
-  a *vector* channel (``D`` ≥ 2; every stop is an arity-``D`` numeric/expression tuple
-  — the **J3b** generalized channel).  A channel must be homogeneous (all-scalar,
-  all-colour, or all-same-arity vector).  ftrace materializes only scalar + colour
-  today; vector channels are loom-only.
+  expression), a *colour* channel — either the ftrace-native ``spectrum:<name>``-ref
+  form (every stop a ``:``-ref, interpolated in linear-RGB → Jakob–Hanika) **or** the
+  J3b *inline-colour* form (a channel-level ``rgb``/``hsv``/``hsl`` tag over arity-3
+  numeric triples; see :meth:`Record.lower_colours`) — and a *vector* channel
+  (``D`` ≥ 2; every stop is an arity-``D`` numeric/expression tuple — the **J3b**
+  generalized channel).  A channel must be homogeneous.  ftrace materializes only
+  scalar + ``spectrum:``-ref colour today; inline-colour and vector channels are
+  loom-only (inline colour *lowers* to ``spectrum:``-refs ftrace can parse).
 * a **stop** carries its raw component tokens (``.components``; ``.token`` is the single
   component of an arity-1 stop) preserved verbatim for faithful re-emit, and an optional
   pinned domain position (author ``p:<pos>`` prefix).  Unpinned stops are spread evenly
   between their pinned/anchor neighbours exactly as ftrace does.
 
-Two grammars, kept separate:
+One backward-compatible ladder grammar (:meth:`Record.emit` / :meth:`Record.parse`
+/ :meth:`parse_all`) that is a strict **additive superset** of current FTSL — not a
+breaking change.  Each channel line is dispatched on the presence of a top-level
+comma (:meth:`_split_top_commas`):
 
-* **current FTSL (J3a)** — :meth:`Record.emit` / :meth:`Record.parse` / :meth:`parse_all`.
-  ftrace's record body parser makes every *whitespace*-word its own stop and counts a
-  stop as colour only when its single token contains ``':'``; its tokenizer is not
-  comma-aware, so inline ``rgb r g b`` triples are not parseable.  This path mirrors that
-  exactly and round-trips every real ``scenes/_record_*.ftsl``.  ``emit`` rejects a
-  vector channel (not representable here).
-* **generalized ladder grammar (J3b)** — :meth:`Record.emit_generalized` /
-  :meth:`parse_generalized` (``ROADMAP_records.md`` §3.1).  Stops are *comma*-separated
-  and vector components *space*-separated (``tint  0 0 0, 1 1 1`` is a 2-stop arity-3
-  channel), using the delimiter precedence ladder (:mod:`loom.ladder`).  This is the
-  loom authoring superset; **current ftrace cannot parse it**.
+* **no top-level comma → whitespace stops** (the current-FTSL path).  Every
+  *whitespace*-word is its own stop and a stop is colour only when its token
+  contains ``':'`` — so ``reflect  spectrum:steel spectrum:gold`` is two colour
+  stops and ``rough  0 0 0`` is three scalar stops, exactly as ftrace reads them.
+  Every real ``scenes/_record_*.ftsl`` round-trips through this path unchanged.
+* **top-level comma present → comma stops** (the J3b generalized superset,
+  ``ROADMAP_records.md`` §3.1).  Stops are *comma*-separated and vector components
+  *space*-separated (``tint  0 0 0, 1 1 1`` is a 2-stop arity-3 channel), parsed via
+  the delimiter precedence ladder (:mod:`loom.ladder`).  A *lone* vector stop is
+  written with a trailing comma (``tint  0 0 0,``) so it can't be misread as N
+  scalar stops.  ftrace's own tokenizer is not comma-aware, so a record that
+  actually uses comma lines is loom-only until ftrace's parser is upgraded (J3c).
+
+An **inline-colour** channel opts in with a leading ``rgb``/``hsv``/``hsl`` tag word
+(``reflect  rgb 0 0 0, 1 1 1``): the tag fixes arity 3, so each comma-group is one
+colour stop (a lone tagged stop needs no trailing comma).  :meth:`Record.lower_colours`
+rewrites such channels to synthesized ``spectrum "<name>" = rgb …`` decls +
+``spectrum:<name>`` refs so the result is parseable by current ftrace.
+
+:meth:`emit` picks the right form per channel automatically: scalar/``spectrum:``-ref
+colour channels emit as whitespace lines, vector channels as comma lines, inline-colour
+channels as a tagged comma line.
 
 What this module also does **not** do (deferred to J3c's full pattern VM): evaluate
 *expression* stops.  The numeric :meth:`Record.sample` sampler works on all-numeric
@@ -134,24 +150,61 @@ class RecordStop:
         return [float(c) for c in self._components]
 
 
+_COLOUR_SPACES = ("rgb", "hsv", "hsl")
+
+
 @dataclass
 class RecordChannel:
-    """A named LUT: ``channelname stop stop …`` (auto-bound to a like-named slot)."""
+    """A named LUT: ``channelname stop stop …`` (auto-bound to a like-named slot).
+
+    ``space`` is an optional **colour-space tag** (``rgb`` / ``hsv`` / ``hsl``): when
+    set, the channel is an *inline colour* channel whose stops are arity-3 numeric
+    triples interpreted in that colour space (the J3b superset — authored as
+    ``reflect  rgb 0 0 0, 1 1 1`` rather than a chain of ``spectrum:<name>`` refs).
+    ``space is None`` is every other channel: scalar, vector, or a ``spectrum:``-ref
+    colour channel (the ftrace-native colour form).
+    """
 
     name: str
     stops: List[RecordStop] = field(default_factory=list)
+    space: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.space is not None and self.space not in _COLOUR_SPACES:
+            raise ValueError(
+                f"record channel {self.name!r}: colour space must be one of "
+                f"{_COLOUR_SPACES} (got {self.space!r})")
+
+    @property
+    def is_inline_colour(self) -> bool:
+        """True for an ``rgb``/``hsv``/``hsl``-tagged inline-colour channel (J3b)."""
+        return self.space is not None
 
     @property
     def kind(self) -> str:
         """Channel kind, enforcing homogeneity:
 
-        * ``"colour"`` — every stop is a colour ref (contains ``':'``); J3a.
+        * ``"colour"`` — either a ``spectrum:``-ref channel (every stop contains
+          ``':'``; the ftrace-native form) **or** an inline-colour channel tagged
+          ``rgb``/``hsv``/``hsl`` (every stop an arity-3 numeric/expression triple).
         * ``"scalar"`` — every stop is a single non-colour token (arity 1).
         * ``"vector"`` — every stop is an arity-``D`` (``D`` ≥ 2) numeric/expression
           tuple, all the same ``D`` (the J3b generalized channel).
 
         Raises on a mix of colour and non-colour stops, or ragged vector arity.
         """
+        if self.space is not None:
+            # inline colour channel: arity-3 numeric/expression triples, no :-refs
+            if any(s.is_colour for s in self.stops):
+                raise ValueError(
+                    f"record channel {self.name!r}: an {self.space} colour channel "
+                    "can't hold spectrum:<name> refs (drop the tag or the refs)")
+            arities = {s.arity for s in self.stops}
+            if arities != {3}:
+                raise ValueError(
+                    f"record channel {self.name!r}: an {self.space} colour channel "
+                    f"needs arity-3 stops, got arities {sorted(arities)}")
+            return "colour"
         colour = any(s.is_colour for s in self.stops)
         noncolour = any(not s.is_colour for s in self.stops)
         if colour and noncolour:
@@ -168,7 +221,8 @@ class RecordChannel:
 
     @property
     def arity(self) -> int:
-        """Component count ``D`` of every stop (1 for scalar/colour-ref channels)."""
+        """Component count ``D`` of every stop (1 for scalar/``spectrum:``-ref
+        channels, 3 for an inline-colour channel)."""
         arities = {s.arity for s in self.stops}
         if len(arities) != 1:
             raise ValueError(
@@ -286,10 +340,12 @@ def _sample_numeric(pos: Sequence[float], vals: Sequence[float], d: float,
 # Record element
 # ---------------------------------------------------------------------------
 
-# One channel line as authored: (name, [stop, …]) where a stop is a scalar token
-# ``str``, a vector ``List[str]`` of component tokens, or a ``(value, pos)`` pin tuple.
-ChannelSpec = Tuple[str, Sequence[Union[str, List[str],
-                                        Tuple[Union[str, List[str]], Optional[float]]]]]
+# One channel line as authored: (name, [stop, …]) or (name, [stop, …], space) where a
+# stop is a scalar token ``str``, a vector ``List[str]`` of component tokens, or a
+# ``(value, pos)`` pin tuple, and ``space`` is an optional ``rgb``/``hsv``/``hsl`` tag.
+_StopSpec = Union[str, List[str], Tuple[Union[str, List[str]], Optional[float]]]
+ChannelSpec = Union[Tuple[str, Sequence[_StopSpec]],
+                    Tuple[str, Sequence[_StopSpec], Optional[str]]]
 
 
 class Record(Element):
@@ -325,13 +381,22 @@ class Record(Element):
     def from_channels(cls, name: str, lo: float, hi: float,
                       channels: Sequence[ChannelSpec],
                       *, interp: str = "linear") -> "Record":
-        """Build from ``(chan_name, [token | (token, pos), …])`` tuples."""
+        """Build from ``(chan_name, [token | (token, pos), …])`` tuples.
+
+        A channel spec may be a 3-tuple ``(chan_name, stops, space)`` to tag an
+        inline-colour channel (``space`` ∈ ``rgb``/``hsv``/``hsl``; stops are arity-3
+        component lists)."""
         def _as_value(v) -> Union[str, List[str]]:
             # a list is a vector stop (components); a scalar str is a single token
             return [str(c) for c in v] if isinstance(v, list) else str(v)
 
         chans: List[RecordChannel] = []
-        for cname, raw in channels:
+        for spec in channels:
+            if len(spec) == 3:
+                cname, raw, space = spec
+            else:
+                cname, raw = spec
+                space = None
             stops: List[RecordStop] = []
             for item in raw:
                 if isinstance(item, tuple):        # (value, pos) pin — value str or list
@@ -340,7 +405,8 @@ class Record(Element):
                                             None if pos is None else float(pos)))
                 else:                              # bare str (scalar) or list (vector)
                     stops.append(RecordStop(_as_value(item)))
-            chans.append(RecordChannel(str(cname), stops))
+            chans.append(RecordChannel(str(cname), stops,
+                                       None if space is None else str(space)))
         return cls(name, lo, hi, chans, interp=interp)
 
     # -- validation ----------------------------------------------------------
@@ -377,21 +443,29 @@ class Record(Element):
         Raises :class:`TypeError` for colour channels, expression stops (need the
         pattern VM; J3c), or vector channels (use :meth:`sample_vec`)."""
         ch = self.channel(name)
-        if ch.kind == "vector":
+        if ch.arity != 1:
             raise TypeError(
-                f"channel {name!r} is a vector channel (arity {ch.arity}) — use sample_vec()")
+                f"channel {name!r} has arity {ch.arity} (not a scalar) — use sample_vec()")
         return self.sample_vec(name, d)[0]
 
     def sample_vec(self, name: str, d: float) -> List[float]:
         """Sample an all-numeric channel at driver ``d``, per-component.
 
-        Works for scalar (arity 1 → 1-list) and vector (arity ``D`` → ``D``-list)
-        channels; each component is interpolated independently exactly as ftrace
-        samples a scalar LUT.  Raises for colour / expression channels."""
+        Works for scalar (arity 1 → 1-list), vector (arity ``D`` → ``D``-list) and
+        **inline `rgb` colour** channels; each component is interpolated independently
+        exactly as ftrace samples a scalar LUT (per-component linear interpolation of
+        rgb == ftrace's linear-RGB colour interpolation).  Raises for `hsv`/`hsl`
+        colour channels (lower to `rgb` first), `spectrum:`-ref colour channels (need
+        the spectrum table), and expression stops."""
         ch = self.channel(name)
-        if ch.kind == "colour":
+        if ch.space in ("hsv", "hsl"):
             raise TypeError(
-                f"channel {name!r} is a colour channel — not numerically sampleable")
+                f"channel {name!r} is an {ch.space} colour channel — lower to rgb "
+                "(lower_colours) before numeric sampling")
+        if ch.kind == "colour" and ch.space is None:
+            raise TypeError(
+                f"channel {name!r} is a spectrum:-ref colour channel — "
+                "not numerically sampleable")
         if not ch.is_numeric:
             raise TypeError(
                 f"channel {name!r} has expression stops — sampling needs the pattern VM (J3c)")
@@ -420,50 +494,126 @@ class Record(Element):
         return f"{fmt(self.lo)} {fmt(self.hi)}"
 
     def emit(self, ctx: Optional[EmitCtx] = None) -> str:
-        """Emit the current-FTSL ``NAME = range LO-HI [ … ]`` block (J3a grammar:
-        whitespace-separated stops).  A vector channel is not representable in this
-        grammar — call :meth:`emit_generalized` instead."""
-        if self.has_vector_channel:
-            raise TypeError(
-                f"record {self.name!r} has a vector channel — not representable in the "
-                "current-FTSL (whitespace-stop) grammar; use emit_generalized()")
+        """Emit the ``NAME = range LO-HI [ … ]`` block in the one backward-compatible
+        ladder grammar.  Each channel picks its form automatically: a scalar or
+        ``spectrum:``-ref colour channel emits whitespace-separated stops (identical to
+        current FTSL); a vector channel emits comma-separated stops with space-separated
+        components (a lone vector stop gets a trailing comma so it can't be misread as N
+        scalar stops); an inline-colour channel emits its ``rgb``/``hsv``/``hsl`` tag
+        then comma-separated arity-3 triples.  Round-trips through :meth:`parse`."""
         dom = self._domain_str()
         # pad channel names (+ the interp keyword) to a common width for tidy columns
         names = [ch.name for ch in self.channels]
         width = max([len(n) for n in names] + [len("interp")])
         lines = [f"{self.name} = range {dom} ["]
         for ch in self.channels:
-            toks: List[str] = []
-            for s in ch.stops:
-                if s.pinned:
-                    toks.append(f"p:{fmt(s.pos)}")
-                toks.append(s.token)
-            lines.append(f"    {ch.name.ljust(width)}  " + "  ".join(toks))
+            lines.append(f"    {ch.name.ljust(width)}  " + self._emit_channel_body(ch))
         if self.interp != "linear":
             lines.append(f"    {'interp'.ljust(width)}  {self.interp}")
         lines.append("]")
         return "\n".join(lines)
 
-    def emit_generalized(self) -> str:
-        """Emit using the **generalized ladder grammar** (J3b, ``ROADMAP_records.md``
-        §3.1): stops are comma-separated and vector components space-separated, so a
-        vector channel round-trips.  **Not parseable by current ftrace** (its tokenizer
-        is not comma-aware) — this is the loom-only authoring superset.  Round-trips
-        through :meth:`parse_generalized`."""
-        dom = self._domain_str()
-        names = [ch.name for ch in self.channels]
-        width = max([len(n) for n in names] + [len("interp")])
-        lines = [f"{self.name} = range {dom} ["]
-        for ch in self.channels:
+    @staticmethod
+    def _emit_channel_body(ch: RecordChannel) -> str:
+        """The stop list of one channel line (whitespace form for scalar / ``spectrum:``
+        colour, tagged comma form for inline colour, comma form for a vector channel)."""
+        if ch.space is not None:
+            # inline colour channel: `<tag> r g b, r g b, …` (the tag fixes arity 3, so
+            # a lone stop needs no trailing comma to disambiguate)
             stop_strs: List[str] = []
+            for s in ch.stops:
+                comp = " ".join(s.components)
+                stop_strs.append(f"p:{fmt(s.pos)} {comp}" if s.pinned else comp)
+            return f"{ch.space} " + ", ".join(stop_strs)
+        if ch.kind == "vector":
+            stop_strs = []
             for s in ch.stops:
                 comp = " ".join(s.components)          # a flat vector (space-joined)
                 stop_strs.append(f"p:{fmt(s.pos)} {comp}" if s.pinned else comp)
-            lines.append(f"    {ch.name.ljust(width)}  " + ", ".join(stop_strs))
-        if self.interp != "linear":
-            lines.append(f"    {'interp'.ljust(width)}  {self.interp}")
-        lines.append("]")
-        return "\n".join(lines)
+            body = ", ".join(stop_strs)
+            if len(ch.stops) == 1:
+                body += ","          # disambiguate a lone vector stop from N scalars
+            return body
+        # scalar / spectrum:-ref colour channel: whitespace-separated tokens (current-FTSL)
+        toks: List[str] = []
+        for s in ch.stops:
+            if s.pinned:
+                toks.append(f"p:{fmt(s.pos)}")
+            toks.append(s.token)
+        return "  ".join(toks)
+
+    # -- lowering (inline colour -> spectrum:-ref, for ftrace) ----------------
+
+    @property
+    def has_inline_colour(self) -> bool:
+        """True if any channel is an inline ``rgb``/``hsv``/``hsl`` colour channel."""
+        return any(ch.is_inline_colour for ch in self.channels)
+
+    @staticmethod
+    def _to_rgb(space: str, comps: Sequence[float]) -> Tuple[float, float, float]:
+        """Convert one static arity-3 colour stop to linear RGB (via loom's own
+        conversion so there is a single source of truth for the hue maths)."""
+        r, g, b = float(comps[0]), float(comps[1]), float(comps[2])
+        if space == "rgb":
+            return (r, g, b)
+        from .color import hsv_to_rgb, hsl_to_rgb
+        from .signals.core import Clock
+        vec = (hsv_to_rgb if space == "hsv" else hsl_to_rgb)(r, g, b)
+        out = vec.at(Clock(t=0.0))
+        return (float(out[0]), float(out[1]), float(out[2]))
+
+    def lower_colours(self, *, prefix: Optional[str] = None
+                      ) -> Tuple[List[str], "Record"]:
+        """Lower every inline ``rgb``/``hsv``/``hsl`` colour channel to a
+        ``spectrum:``-ref channel ftrace can parse.
+
+        Returns ``(decls, lowered_record)``: ``decls`` is a list of top-level
+        ``spectrum "<name>" = rgb r g b`` declaration strings (one per **unique**
+        colour, deduped across the whole record; ``hsv``/``hsl`` components are
+        converted to rgb), and ``lowered_record`` is a copy whose inline-colour
+        channels now reference those spectra by name.  Scalar / vector /
+        ``spectrum:``-ref channels pass through unchanged.  Raises
+        :class:`TypeError` on an inline-colour channel with expression stops (not
+        constant-lowerable — needs the pattern VM, J3c)."""
+        base = prefix if prefix is not None else self.name
+        decls: List[str] = []
+        name_of: dict = {}                          # rgb key -> spectrum name
+        new_channels: List[RecordChannel] = []
+        for ch in self.channels:
+            if not ch.is_inline_colour:
+                new_channels.append(RecordChannel(
+                    ch.name, [RecordStop(list(s.components) if s.arity > 1
+                                         else s.components[0], s.pos)
+                              for s in ch.stops], ch.space))
+                continue
+            if not ch.is_numeric:
+                raise TypeError(
+                    f"record {self.name!r} channel {ch.name!r}: inline-colour channel "
+                    "has expression stops — can't lower to constant spectra (needs the "
+                    "pattern VM, J3c)")
+            new_stops: List[RecordStop] = []
+            for s in ch.stops:
+                rgb = self._to_rgb(ch.space, s.as_vector())
+                key = tuple(round(c, 6) for c in rgb)
+                spec_name = name_of.get(key)
+                if spec_name is None:
+                    spec_name = f"{base}_c{len(name_of)}"
+                    name_of[key] = spec_name
+                    decls.append(
+                        f'spectrum "{spec_name}" = rgb {fmt(rgb[0])} {fmt(rgb[1])} '
+                        f'{fmt(rgb[2])}')
+                new_stops.append(RecordStop(f"spectrum:{spec_name}", s.pos))
+            new_channels.append(RecordChannel(ch.name, new_stops))
+        lowered = Record(self.name, self.lo, self.hi, new_channels, interp=self.interp)
+        return decls, lowered
+
+    def lower_ftsl(self, *, prefix: Optional[str] = None) -> str:
+        """Convenience: the lowered record's ``.ftsl`` text with its synthesized
+        ``spectrum`` decls prepended (a self-contained block ftrace can parse, as long
+        as the record has no loom-only *vector* channel)."""
+        decls, lowered = self.lower_colours(prefix=prefix)
+        body = lowered.emit()
+        return ("\n".join(decls) + "\n\n" + body) if decls else body
 
     # -- parse ---------------------------------------------------------------
 
@@ -499,7 +649,16 @@ class Record(Element):
 
     @classmethod
     def parse(cls, text: str) -> "Record":
-        """Parse a single ``NAME = range LO-HI [ … ]`` block back into a Record."""
+        """Parse a single ``NAME = range LO-HI [ … ]`` block back into a Record.
+
+        One backward-compatible ladder grammar: each channel line is dispatched on
+        whether it contains a top-level comma.  A comma-free line uses the current-FTSL
+        whitespace-stop path (``rough  0 0 0`` = three scalar stops); a comma line uses
+        the generalized ladder path (``tint  0 0 0, 1 1 1`` = two arity-3 vector stops),
+        with a trailing comma marking a lone vector stop (``tint  0 0 0,``).  A leading
+        ``rgb``/``hsv``/``hsl`` word is an **inline-colour tag**: it fixes arity 3, so
+        each comma-group is one colour stop (``reflect  rgb 0 0 0, 1 1 1`` = two rgb
+        stops; a lone ``reflect  rgb .5 .5 .5`` needs no trailing comma)."""
         text = cls._strip_comments(text)
         m = cls._HEADER.search(text)
         if not m:
@@ -520,33 +679,96 @@ class Record(Element):
             line = raw_line.split("#", 1)[0].strip()
             if not line:
                 continue
-            words = line.split()
-            key, rest = words[0], words[1:]
+            parts = line.split(None, 1)
+            key = parts[0]
+            value_text = parts[1].strip() if len(parts) > 1 else ""
             if key == "interp":
-                if not rest or rest[0] not in _INTERP:
+                if value_text not in _INTERP:
                     raise ValueError(
                         f"record {name!r}: interp must be one of {_INTERP}")
-                interp = rest[0]
+                interp = value_text
                 continue
-            stops: List[RecordStop] = []
-            pin: Optional[float] = None
-            for w in rest:
-                if w.startswith("p:"):
-                    pv = w[2:]
-                    if not _is_number(pv):
-                        raise ValueError(
-                            f"record {name!r} channel {key!r}: bad p:<pos> {w!r}")
-                    pin = float(pv)
-                    continue
-                stops.append(RecordStop(w, pin))
-                pin = None
-            if pin is not None:
-                raise ValueError(
-                    f"record {name!r} channel {key!r}: trailing p:<pos> with no value")
-            if not stops:
+            if not value_text:
                 raise ValueError(f"record {name!r} channel {key!r}: has no stops")
+            # inline-colour tag: a leading rgb/hsv/hsl word fixes arity 3, so every
+            # comma-group (or the lone group) is one colour stop via the comma path.
+            space: Optional[str] = None
+            tag_split = value_text.split(None, 1)
+            if tag_split[0] in _COLOUR_SPACES:
+                space = tag_split[0]
+                value_text = tag_split[1].strip() if len(tag_split) > 1 else ""
+                if not value_text:
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: {space} tag with no stops")
+                comma_parts = cls._split_top_commas(value_text)
+                if comma_parts and comma_parts[-1] == "" and len(comma_parts) > 1:
+                    comma_parts = comma_parts[:-1]     # tolerate a trailing comma
+                stops = cls._parse_comma_stops(name, key, comma_parts)
+                chans.append(RecordChannel(key, stops, space))
+                continue
+            comma_parts = cls._split_top_commas(value_text)
+            # a trailing top-level comma forces the comma path (its empty tail is the
+            # disambiguator for a lone vector stop) — drop that empty tail.
+            trailing = len(comma_parts) > 1 and comma_parts[-1] == ""
+            if trailing:
+                comma_parts = comma_parts[:-1]
+            if len(comma_parts) > 1 or trailing:
+                stops = cls._parse_comma_stops(name, key, comma_parts)
+            else:
+                stops = cls._parse_ws_stops(name, key, value_text)
             chans.append(RecordChannel(key, stops))
         return cls(name, lo, hi, chans, interp=interp)
+
+    @staticmethod
+    def _parse_ws_stops(name: str, key: str, value_text: str) -> List[RecordStop]:
+        """Current-FTSL whitespace path: every word is a scalar stop; a ``p:<pos>``
+        word pins the stop that follows it."""
+        stops: List[RecordStop] = []
+        pin: Optional[float] = None
+        for w in value_text.split():
+            if w.startswith("p:"):
+                pv = w[2:]
+                if not _is_number(pv):
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: bad p:<pos> {w!r}")
+                pin = float(pv)
+                continue
+            stops.append(RecordStop(w, pin))
+            pin = None
+        if pin is not None:
+            raise ValueError(
+                f"record {name!r} channel {key!r}: trailing p:<pos> with no value")
+        if not stops:
+            raise ValueError(f"record {name!r} channel {key!r}: has no stops")
+        return stops
+
+    @classmethod
+    def _parse_comma_stops(cls, name: str, key: str,
+                           chunks: Sequence[str]) -> List[RecordStop]:
+        """Generalized comma path: each chunk is one stop (a leading ``p:<pos>`` pins
+        it), ladder-parsed into a scalar or a flat vector (:mod:`loom.ladder`)."""
+        stops: List[RecordStop] = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                raise ValueError(
+                    f"record {name!r} channel {key!r}: empty stop (stray comma?)")
+            pin: Optional[float] = None
+            words = chunk.split(maxsplit=1)
+            if words and words[0].startswith("p:"):
+                pv = words[0][2:]
+                if not _is_number(pv):
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: bad p:<pos> {words[0]!r}")
+                pin = float(pv)
+                chunk = words[1] if len(words) > 1 else ""
+                if not chunk.strip():
+                    raise ValueError(
+                        f"record {name!r} channel {key!r}: p:<pos> with no value")
+            stops.append(cls._stop_from_ladder(parse_ladder(chunk), pin))
+        if not stops:
+            raise ValueError(f"record {name!r} channel {key!r}: has no stops")
+        return stops
 
     @staticmethod
     def _split_top_commas(s: str) -> List[str]:
@@ -577,65 +799,8 @@ class Record(Element):
         if all(isinstance(c, str) for c in v):
             return RecordStop(list(v), pin)
         raise ValueError(
-            "parse_generalized: a single stop must be a scalar or a flat vector "
+            "record stop: a single stop must be a scalar or a flat vector "
             f"(nested stop value {v!r} not supported)")
-
-    @classmethod
-    def parse_generalized(cls, text: str) -> "Record":
-        """Parse one record block written in the **generalized ladder grammar** (J3b,
-        ``ROADMAP_records.md`` §3.1): stops are comma-separated and vector components
-        space-separated (so ``tint  0 0 0, 1 1 1`` is a 2-stop arity-3 channel).
-
-        This is a *different* grammar from :meth:`parse` (current-FTSL, where whitespace
-        separates stops); it round-trips :meth:`emit_generalized`.  A leading
-        ``p:<pos>`` on a stop pins it.
-        """
-        text = cls._strip_comments(text)
-        m = cls._HEADER.search(text)
-        if not m:
-            raise ValueError("not a record declaration (expected `NAME = range LO-HI [`)")
-        name = m.group("name")
-        lo, hi = cls._parse_domain(m.group("dom").split())
-        close = text.find("]", m.end())
-        if close < 0:
-            raise ValueError(f"record {name!r}: missing closing ']'")
-        body = text[m.end():close]
-
-        interp = "linear"
-        chans: List[RecordChannel] = []
-        for raw_line in body.splitlines():
-            line = raw_line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            key, _, value_text = line.partition(" ")
-            value_text = value_text.strip()
-            if key == "interp":
-                if value_text not in _INTERP:
-                    raise ValueError(f"record {name!r}: interp must be one of {_INTERP}")
-                interp = value_text
-                continue
-            stops: List[RecordStop] = []
-            for chunk in cls._split_top_commas(value_text):
-                if not chunk:
-                    raise ValueError(
-                        f"record {name!r} channel {key!r}: empty stop (stray comma?)")
-                pin: Optional[float] = None
-                words = chunk.split(maxsplit=1)
-                if words and words[0].startswith("p:"):
-                    pv = words[0][2:]
-                    if not _is_number(pv):
-                        raise ValueError(
-                            f"record {name!r} channel {key!r}: bad p:<pos> {words[0]!r}")
-                    pin = float(pv)
-                    chunk = words[1] if len(words) > 1 else ""
-                    if not chunk.strip():
-                        raise ValueError(
-                            f"record {name!r} channel {key!r}: p:<pos> with no value")
-                stops.append(cls._stop_from_ladder(parse_ladder(chunk), pin))
-            if not stops:
-                raise ValueError(f"record {name!r} channel {key!r}: has no stops")
-            chans.append(RecordChannel(key, stops))
-        return cls(name, lo, hi, chans, interp=interp)
 
     @classmethod
     def parse_all(cls, text: str) -> List["Record"]:

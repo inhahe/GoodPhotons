@@ -100,6 +100,9 @@ Useful CMake options:
 ## Quick start
 
 ```sh
+# List the common flags, grouped by task, and exit
+ftrace -h            # or --help
+
 # Built-in Cornell box, forward pinhole splat (mode B), 512²
 ftrace -scene cornell -n 200000000 -r 512 -o cornell.png
 
@@ -112,6 +115,11 @@ ftrace -in scenes/realcam.ftsl -n 6000000 -o realcam.png
 # Render until a wall-clock budget with a live preview
 ftrace -in scenes/group.ftsl -time 120 -preview -o group.png
 ```
+
+Run `ftrace -h` (or `--help`) for a grouped summary of the common flags. An
+unrecognized `-flag` (e.g. a typo) is a hard error — ftrace prints
+`unknown option '…'` and exits non-zero rather than silently falling back to the
+default demo render.
 
 ---
 
@@ -265,7 +273,7 @@ paths they can capture at all**.
 > | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
-> | **resize the window** | change the preview resolution: the raster renders ~one pixel per displayed pixel, so **shrinking the window renders fewer pixels (faster on a heavy scene) and growing it renders more (crisper)**, up to the authored resolution |
+> | **resize the window** | change the preview resolution: the raster renders at the window's **actual pixel dimensions**, so the picture **fills the window (no letterbox bars)** and **shrinking it renders fewer pixels (faster on a heavy scene) while growing it renders more (crisper)**, up to the authored longest edge. The horizontal field of view widens/narrows with the window (like a game viewport — `fov_y` stays fixed, pixels stay square), so a wider window simply reveals more to the sides |
 >
 > **Motion is feedback-locked, not wall-clock-based.** Each held-key frame (and each
 > wheel notch) moves the eye exactly one fixed `step`, and *one frame is rendered per
@@ -847,6 +855,16 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
 - **`hsl h s l`** — an HSL colour on the same wrapping hue wheel, but `l` is
   *lightness* (`l=0.5` is the pure hue, `l→1` white, `l→0` black; matches CSS);
   `s`/`l` in `[0,1]`. Converted to RGB and upsampled exactly like `rgb`.
+- **`rgbline r g b [sigma]`** (also `hsvline …`, `hslline …`) — the
+  *dominant-wavelength* form: instead of a broadband reflectance, map the colour to a
+  single dominant wavelength (the standard spectral-locus construction — a ray from the
+  D65 white point through the colour's chromaticity to the spectral horseshoe) and emit
+  a **narrow Gaussian line** there. A near-monochromatic source, so glass disperses it
+  correctly. Line width defaults to the colour's saturation (a vivid colour → tight
+  spike; a pale one → a broad band tending back to white) or is forced by an explicit
+  `sigma` in nm. Purples/magentas (no real dominant wavelength) become a two-line
+  violet+red mix. Meant for **lights** (`spd rgbline 0 0 1`); a reflectance has no
+  single wavelength, but the form is accepted anywhere a spectrum is.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
@@ -1859,6 +1877,21 @@ useful flags: `--resume` (skip already-rendered frames), `--start/--end/--step` 
 `--encode-only` (re-encode existing PNGs at a new `--fps` without re-rendering),
 `--no-encode`, `--keep-frames`, `--crf`/`--codec`/`--pix-fmt`, and `--dry-run`. Run with
 `--help` for the full list.
+
+### Grammar cross-check (`-validate-grammar`)
+
+FTSL has two front-ends: ftrace's authoritative hand-written parser (`src/ftsl.h`)
+and a **shared grammar** — the same `.ftsl` syntax written once as a formal grammar
+(`tools/loom/loom/grammar/ftsl_scene.epeg`, compiled to a parser graph consumed by
+loom *and* vendored into ftrace as generated C++). The `-validate-grammar` flag runs
+the shared grammar alongside the hand-written parser on the scene you load,
+structurally diffs the two block trees, and prints any disagreement to stderr as a
+`[validate-grammar] …` warning. It is **non-authoritative and off by default**:
+ftrace always renders from its own parse, so the flag adds only a diagnostic (also
+enabled by setting the `FTRACE_VALIDATE_GRAMMAR` environment variable to a non-empty,
+non-`0` value). The goal is to drive the mismatch count to zero across the whole
+scene corpus before eventually flipping the front-end over to the shared grammar as
+the single source of truth. With no flag there is zero cost.
 
 ### Importing Mitsuba scenes
 

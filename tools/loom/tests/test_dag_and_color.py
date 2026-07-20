@@ -232,11 +232,11 @@ def test_skin_emits_texture_block_and_binding():
     sc.check_cycles()
     with tempfile.TemporaryDirectory() as d:
         out = sc.emit(_clk(), Cache(), assets_dir=Path(d))
-    assert 'texture "hide" {' in out
+    assert 'hide = texture {' in out
     assert 'file "textures/cow.png"' in out
     assert "reflect texture:hide" in out
     # texture block comes before the material that binds it
-    assert out.index('texture "hide"') < out.index('material "hide"')
+    assert out.index('hide = texture') < out.index('hide = material')
 
 
 def test_skin_texture_options_stored():
@@ -273,7 +273,7 @@ def test_func_skin_emits_rgb_block_and_binding():
            Sphere((0, 0, 0), 1.0, "grad"))
     sc.check_cycles()
     out = sc.emit(_clk(), Cache())
-    assert 'texture "grad" { rgb "u" "v" "0.5"' in out
+    assert 'grad = texture { rgb "u" "v" "0.5"' in out
     assert "res 256" in out
     assert "filter nearest" in out
     assert "wrap repeat" in out
@@ -281,7 +281,7 @@ def test_func_skin_emits_rgb_block_and_binding():
     # no bitmap file for a procedural skin
     assert "file " not in out
     # texture block precedes the material that binds it
-    assert out.index('texture "grad"') < out.index('material "grad"')
+    assert out.index('grad = texture') < out.index('grad = material')
 
 
 def test_proctexture_defaults_and_no_roots():

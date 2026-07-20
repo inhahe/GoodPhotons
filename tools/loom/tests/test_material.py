@@ -26,7 +26,7 @@ def _emit(el, clock):
 def test_pattern_emits_wellformed_block():
     fp = FuncPattern("rough", "waves", freq=3.0)
     txt = _emit(fp, Clock(t=0.0))
-    assert txt.startswith('pattern "rough" {')
+    assert txt.startswith('rough = pattern {')
     assert "expr" in txt and "sin(" in txt
     assert txt.count("{") == txt.count("}")
 
@@ -81,10 +81,10 @@ def test_scene_orders_patterns_before_materials():
     )
     s.check_cycles()
     txt = s.emit(Clock.at_frame(4, 24), Cache())
-    ip = txt.index('pattern "sel"')
-    im = txt.index('material "gold"')
+    ip = txt.index('sel = pattern')
+    im = txt.index('gold = material')
     assert ip < im, "the pattern must be emitted before the material that binds it"
-    assert 'material "skin"' in txt and "type mix" in txt
+    assert 'skin = material' in txt and "type mix" in txt
 
 
 def test_material_binds_pattern_string_prop():

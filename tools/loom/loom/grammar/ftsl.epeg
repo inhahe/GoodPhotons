@@ -1,0 +1,130 @@
+# =====================================================================
+# Shared .ftsl grammar (GPDA / EPEG, *tokenized* flavour)
+# =====================================================================
+# The single source of truth for parsing .ftsl, consumed by loom's Python
+# reader today (loom/grammar/reader.py) and, later, ftrace's C++ front-end
+# (J3c, option-a).  Tokenized — not scannerless: terminals are 'literals',
+# /regex/, or token NAMEs (bare [..] char-classes are scannerless-only and
+# live inside /regex/).  The record ladder does NOT need scannerless: the
+# whitespace-form vs comma-form distinction is recovered purely from
+# explicit COMMA / NEWLINE tokens via a "comma-form requires a comma"
+# ordered choice, with inter-token whitespace always skipped.
+#
+# Scope today: a single top-level `element` — the parametric `record` block
+# and the `material` / `texture` / `sphere` / `light` / `camera` blocks, all in
+# the unified `[NAME =] KIND { … }` binding-header form.  Grows toward a full
+# scene grammar (start will become `scene`); these stay sub-rules.
+# =====================================================================
+
+start element
+
+# ---- skips + terminals ----------------------------------------------
+WS      = /[ \t]+/ @skip           # inter-token whitespace, always invisible
+COMMENT = /#[^\r\n]*/ @skip        # `# …` to end of line
+NEWLINE = /\r?\n/                  # significant: delimits channel lines
+
+# A compact `LO-HI` domain (incl. `-1-2`): matched whole so its inner dash
+# isn't mistaken for `LO` then a negative `HI`.  Longest-match beats NUMBER.
+DOMAIN  = /-?[0-9]+(\.[0-9]+)?-[0-9]+(\.[0-9]+)?/
+NUMBER  = /-?[0-9]+(\.[0-9]+)?([eE][+\-]?[0-9]+)?/
+PIN     = /p:-?[0-9]+(\.[0-9]+)?/          # `p:<pos>` position pin prefix
+REF     = /[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]+/   # e.g. spectrum:steel, metal:gold
+STRING  = /"[^"]*"/                                 # quoted name / path / expression
+# A `key=value` band parameter word (`gaussian center=560 sigma=25`), matched whole
+# like ftrace's whitespace `v.words`.  The value must start with a digit/sign so this
+# never swallows a `NAME = KIND` header's spaced-or-unspaced `=` (that stays NAME '=').
+KVWORD  = /[A-Za-z_][A-Za-z0-9_]*=-?[0-9][^ \t\r\n}]*/
+NAME    = /[A-Za-z_][A-Za-z0-9_]*/
+
+# ---- top-level element ----------------------------------------------
+element = record | material | texture | sphere | light | camera
+
+# ---- record block ---------------------------------------------------
+# NEWLINE stays significant (one channel line = one channel), but the newlines
+# *around* the line list are optional so a compact single-line body parses too:
+#   `a = range 0 1 [ x 0 1 ]`   as well as the multi-line emit form.
+record   = nl? NAME '=' 'range' domain '[' nl? lines nl? ']' nl?
+domain   = DOMAIN | NUMBER NUMBER
+nl       = NEWLINE+
+lines    = line (nl line)*
+line     = interp_line | channel
+
+interp_line = 'interp' interp_mode
+interp_mode = 'nearest' | 'linear' | 'smooth'
+
+# A channel picks its stop form: comma-form (vector / inline-colour) requires
+# a comma, so a comma-free line falls through to the whitespace-stop form.
+channel    = NAME (comma_body | ws_stops)
+
+comma_body = colour_tag? vstop (',' vstop)+ ','?    # >= 2 stops, optional trailing comma
+           | colour_tag? vstop ','                  # lone vector/colour stop (trailing comma)
+colour_tag = 'rgb' | 'hsv' | 'hsl'
+vstop      = PIN? NUMBER+                            # space-separated components
+
+ws_stops   = ws_stop+
+ws_stop    = PIN? (NUMBER | REF)                     # one whitespace word = one stop
+
+# ---- material / texture blocks --------------------------------------
+# Unified element header `NAME = KIND { <prop>* }` (the binding form), with the
+# anonymous `KIND { <prop>* }` dropping the `NAME =` binder.  Bodies are
+# newline-insensitive (loom emits single-line, but a hand-authored scene may
+# wrap).  A property value greedily takes its tokens until the next NAME key or
+# `}` — the same key/value shape used for the record's whitespace stops.
+binder   = NAME '='
+material = nl? binder? 'material' '{' mbody '}' nl?
+texture  = nl? binder? 'texture'  '{' mbody '}' nl?
+mbody    = (nl? prop)* nl?
+prop     = NAME pvalue
+# A property value is either a quoted-string list or a spectrum/value *word run*: a
+# single head word (a keyword like `rgb`/`blackbody`/`whitewall`, an enum, a `:`-ref,
+# or a bare number) followed by trailing numbers / `key=value` band words.  So
+# `reflect rgb 0.8 0.7 0.2`, `spd blackbody 6500`, `emit gaussian center=560 sigma=25`,
+# `reflect metal:gold`, `roughness 0.2` and `type diffuse` all parse.  A bare NAME can
+# only be the *head* (never trailing), so the run stops at the next NAME key or `}` —
+# `reflect blackbody 6500  roughness 0.2` splits into two props, not one long value.
+# The grammar stays permissive (an untagged triple `0.8 0.7 0.2` parses); the spectral
+# shape/semantic check (loom.grammar.spectrum) is what rejects a non-spectrum value.
+pvalue   = STRING+ | pwords
+pwords   = phead ptail*
+phead    = REF | NUMBER | NAME
+ptail    = NUMBER | KVWORD
+
+# ---- geometry primitives --------------------------------------------
+# A sphere is a fixed-shape block: `sphere { center X Y Z  radius R  material "n" }`.
+sphere = nl? 'sphere' '{' nl? 'center' NUMBER NUMBER NUMBER nl? 'radius' NUMBER nl? 'material' STRING nl? '}' nl?
+
+# ---- lights ---------------------------------------------------------
+# Unified header `[NAME =] light { kind <subtype>  <prop>* }` — the subtype now
+# rides a `kind` property inside the body (not a bareword after the KIND), and
+# the rest of the body is the same key/value shape as a material (its props
+# round-trip through value_token exactly like a material's).
+light = nl? binder? 'light' '{' mbody '}' nl?
+
+# ---- camera ---------------------------------------------------------
+# The static per-frame camera block loom bakes.  Sub-rules (cam_view / cam_mode /
+# cam_film) give the reader clean handles — the bareword keywords `eye`/`look_at`/
+# `up`/`fov_y`/`mode`/`film`/`res` all match NAME too, so positional extraction
+# would be brittle; naming the parts keeps the builder robust.
+camera   = nl? binder? 'camera' '{' nl? cam_view nl? 'mode' cam_mode nl? cam_film nl? '}' nl?
+cam_view = 'eye' vec3n 'look_at' vec3n 'up' vec3n 'fov_y' NUMBER
+vec3n    = NUMBER NUMBER NUMBER
+cam_mode = NAME
+cam_film = 'film' '{' 'res' NUMBER NUMBER '}'
+
+# ---- generic value tree (color-vector / array syntax) ---------------
+# Context-free value grammar (design locked 2026-07-19; TODO "DECISION —
+# color-vector / array syntax").  Whitespace only joins scalars *inside* one
+# vector (`vnums = (NUMBER|REF)+` greedily eats a whitespace run); commas,
+# brackets and colorspace tags (`rgb`/`hsl`/`hsv`, reusing `colour_tag`) mark
+# array boundaries.  The parse tree is generic — the comma-role rule (lone
+# scalars merge into one vector; space-grouped groups form a list), the RLE
+# colorspace tags and the `[X] ≡ X` bracket identity are resolved by the
+# normalizer, and each field then shape-checks the canonical tree
+# (loom/grammar/values.py).  Parsed via a `value` start-rule override; it is
+# intentionally NOT reachable from `element` yet (fields still parse values
+# their own way until this is wired in).
+value    = vrun (',' vrun)*
+vrun     = vpiece+
+vpiece   = colour_tag | vbracket | vnums
+vbracket = '[' value ']'
+vnums    = (NUMBER | REF)+
