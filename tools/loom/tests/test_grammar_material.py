@@ -134,13 +134,61 @@ def test_reader_rejects_bad_spectral_field():
         parse_element("m = material { type dielectric  ior wombat }")
 
 
-def test_reader_accepts_untagged_reflect_but_not_untagged_ior():
-    # `reflect` is deliberately NOT validated (it accepts texture:/pattern:/record
-    # bindings that need the fuller field grammar), so an untagged triple still parses;
-    # `ior` (purely spectral) rejects the same untagged triple.
-    parse_element("m = material { type diffuse  reflect 0.8 0.7 0.2 }")   # no raise
+def test_reader_rejects_untagged_reflect_and_ior():
+    # Both `reflect` and `ior` reject a bare (untagged) colour triple — ftrace does too
+    # (`unrecognized spectrum expression '0.8'`).  `reflect` accepts a `texture:` bind
+    # on top of a spectrum (the binding union), but an untagged triple is neither.
+    with pytest.raises(ValueError):
+        parse_element("m = material { type diffuse  reflect 0.8 0.7 0.2 }")
     with pytest.raises(ValueError):
         parse_element("m = material { type dielectric  ior 0.8 0.7 0.2 }")
+
+
+def test_reflect_accepts_texture_bind_and_spectrum():
+    # `reflect` is colour-bindable: a `texture:<name>` bind OR a spectrum expression.
+    assert parse_element("m = material { type diffuse  reflect texture:hide }") \
+        .props["reflect"] == "texture:hide"
+    assert parse_element("m = material { type diffuse  reflect rgb 0.8 0.7 0.2 }") \
+        .props["reflect"] == "rgb 0.8 0.7 0.2"
+
+
+def test_reflect_rejects_pattern_bind():
+    # `reflect` binds only a UV texture (bindReflectTexture), never a `pattern:` — a
+    # bare pattern ref would fall through to spectrumParam and be rejected.
+    with pytest.raises(ValueError):
+        parse_element("m = material { type diffuse  reflect pattern:wiggle }")
+
+
+def test_roughness_accepts_scalar_and_binds():
+    # `roughness` is scalar-bindable: a number, a `pattern:<name>` or a `texture:<name>`.
+    assert parse_element("m = material { type glossy  roughness 0.2 }") \
+        .props["roughness"] == "0.2"
+    assert parse_element("m = material { type glossy  roughness pattern:wiggle }") \
+        .props["roughness"] == "pattern:wiggle"
+    assert parse_element("m = material { type glossy  roughness texture:rough }") \
+        .props["roughness"] == "texture:rough"
+
+
+def test_roughness_rejects_spectrum_and_triple():
+    # A scalar field is one number, not a spectrum / colour — `roughness rgb 1 0 0`
+    # and an untagged triple both reject.
+    with pytest.raises(ValueError):
+        parse_element("m = material { type glossy  roughness rgb 1 0 0 }")
+    with pytest.raises(ValueError):
+        parse_element("m = material { type glossy  roughness 0.2 0.3 0.4 }")
+
+
+def test_map_field_requires_texture_or_pattern_bind():
+    # A `*_map` field (film_thickness_map / weight_map) accepts only a `pattern:` or
+    # `texture:` bind — no numeric fallback.
+    assert parse_element(
+        "m = material { type thinfilm  film_thickness_map texture:prof }") \
+        .props["film_thickness_map"] == "texture:prof"
+    assert parse_element(
+        "m = material { type thinfilm  film_thickness_map pattern:prof }") \
+        .props["film_thickness_map"] == "pattern:prof"
+    with pytest.raises(ValueError):
+        parse_element("m = material { type thinfilm  film_thickness_map 300 }")
 
 
 if __name__ == "__main__":

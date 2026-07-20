@@ -17,20 +17,21 @@ spectrum. **Proper fix:** correct the comment to a tagged example (`absorb rgb 3
 is a genuinely easy authoring trap — consider a targeted parser hint (`unrecognized spectrum expression
 '0.8' — did you mean 'rgb 0.8 …'?`) when the head and its neighbours are all numbers.
 
-### TECH DEBT (2026-07-19): loom's shared-grammar `reflect`/`roughness`/`*_map` fields are not shape-validated
-The grammar-backed reader (`tools/loom/loom/grammar/reader.py`) now shape-checks *purely-spectral* fields
+### RESOLVED (2026-07-19): loom's shared-grammar `reflect`/`roughness`/`*_map` fields are now shape-validated
+The grammar-backed reader (`tools/loom/loom/grammar/reader.py`) shape-checks *purely-spectral* fields
 (`ior`/`transmit`/`absorb`/`substrate_k`/`emit` on materials, `spd` on lights) against the shared spectrum
-grammar (`loom/grammar/spectrum.py`, a faithful mirror of ftrace's `evalSpectrum`). But `reflect`,
-`roughness`, and the `*_map` binders are **deliberately left unvalidated**, because each accepts a *union* on
-top of a spectrum — `texture:<name>`, `pattern:<name>`, and driven/selStop **record** channel bindings —
-that the spectrum validator alone would wrongly reject (e.g. valid `reflect texture:hide`). So an invalid
-`reflect` value (like an untagged triple `reflect 0.8 0.7 0.2`, which ftrace rejects) still passes loom's
-reader silently. **Proper fix:** build the fuller *per-field* value grammar — a `reflect`/`roughness` value =
-`spectrum-expr | texture:bind | pattern:bind | record-bind` — as part of the J3c port (where ftrace's C++
-front-end adopts the shared grammar), so every field validates against exactly what it accepts. Until then
-loom can still *emit* an untagged-triple `reflect` if the user hands `Material(reflect="0.8 0.7 0.2")` a raw
-string; the safe authoring path is a `Color`/`rgb(...)` object (emits a tagged `rgb r g b`) or a tagged
-string.
+grammar (`loom/grammar/spectrum.py`). The binding-union fields `reflect`, `roughness`, and any `*_map` binder
+are now validated too, via new `loom/grammar/bindings.py` — a faithful mirror of ftrace's `bindReflectTexture`
+/ `bindScalarTexture` / `bindScalarPattern` + `spectrumParam` / `dblParam` (`src/ftsl.h` `buildMaterial`):
+`as_color_binding` (`reflect` = `texture:<name>` | spectrum — reflect binds only a UV texture, never a
+`pattern:`), `as_scalar_binding` (`roughness` = `pattern:` | `texture:` | one scalar number, not a spectrum),
+and `as_map_binding` (`film_thickness_map`/`weight_map` = `pattern:` | `texture:` only). Wired into
+`_build_material` (`_validate_bindings`); shape-only (a bound name's scene membership stays a later,
+scene-aware check). An untagged triple `reflect 0.8 0.7 0.2` is now rejected exactly as ftrace rejects it.
+`tests/test_grammar_bindings.py` (10 cases) + `test_grammar_material.py` additions; loom suite 823 passed.
+**Remaining scope (not this item):** the record-driven *whole-material override* block (`from R(...)` +
+`slot = REC.chan`, ftrace's `isRecordOverrideBlock`) is a distinct block form loom does not emit, and the
+final step is mirroring the `value`/`spectrum`/binding grammar into ftrace's C++ front-end at the J3c port.
 
 ### POSSIBLE MISMATCH (2026-07-19): loom `Light(color=…, size=…, turbidity=…)` emits fields ftrace's `addLight` ignores
 loom's `Light` accepts free-form props and emits them verbatim (`light { kind …  color 0.9 0.8 0.7  size 2 2 }`),

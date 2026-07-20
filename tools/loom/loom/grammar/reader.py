@@ -173,12 +173,17 @@ def _props(node):
 
 # Material/light fields that accept ONLY a spectrum expression, so the shared
 # spectrum grammar (loom.grammar.spectrum) is their complete, correct validator.
-# `reflect` / `roughness` / `*_map` are deliberately ABSENT: they accept a binding
-# *union* (`texture:<name>` / `pattern:<name>` / a driven record channel) on top of
-# a spectrum, which needs the fuller per-field grammar mirrored at the J3c C++ port —
-# validating them as a bare spectrum here would reject valid bindings like
-# `reflect texture:hide`.
 _SPECTRAL_ONLY_FIELDS = ("ior", "transmit", "absorb", "substrate_k", "emit")
+
+# Binding-union fields: they accept more than a bare spectrum (a `texture:` /
+# `pattern:` bind, a scalar number, …) — validated by loom.grammar.bindings, a mirror
+# of ftrace's bindReflectTexture / bindScalarTexture / bindScalarPattern.  `reflect`
+# is colour-bindable (`texture:` | spectrum); `roughness` is scalar-bindable
+# (`pattern:` | `texture:` | number); any `*_map` key is a scalar map (`pattern:` |
+# `texture:`).  A record-driven override (`reflect = REC.chan`) is a *whole-block*
+# form (`isRecordOverrideBlock`) loom does not emit, so it is out of scope here.
+_COLOR_BIND_FIELDS = ("reflect",)
+_SCALAR_BIND_FIELDS = ("roughness",)
 
 
 def _validate_spectral(props, fields) -> None:
@@ -193,6 +198,25 @@ def _validate_spectral(props, fields) -> None:
             as_spectrum(props[key])
 
 
+def _validate_bindings(props) -> None:
+    """Shape-check the material binding-union fields (`reflect` / `roughness` /
+    `*_map`) against ftrace's per-field binding grammar (loom.grammar.bindings).
+
+    Like :func:`_validate_spectral`, this is non-destructive shape-only validation:
+    a bound name's scene membership is left to the renderer, but a value ftrace's
+    ``bind*`` / ``spectrumParam`` / ``dblParam`` would reject is rejected here."""
+    from .bindings import as_color_binding, as_scalar_binding, as_map_binding
+    for key in _COLOR_BIND_FIELDS:
+        if key in props:
+            as_color_binding(props[key])
+    for key in _SCALAR_BIND_FIELDS:
+        if key in props:
+            as_scalar_binding(props[key])
+    for key, val in props.items():
+        if key.endswith("_map"):
+            as_map_binding(val)
+
+
 def _build_material(node) -> Material:
     name = _binder_name(node)
     mtype = "diffuse"
@@ -205,6 +229,7 @@ def _build_material(node) -> Material:
             # emit -> parse -> emit is stable; strings keep their quotes stripped
             props[key] = " ".join(_unquote(t) for t in toks)
     _validate_spectral(props, _SPECTRAL_ONLY_FIELDS)
+    _validate_bindings(props)
     return Material(name, mtype, **props)
 
 

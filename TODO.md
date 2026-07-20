@@ -109,10 +109,21 @@ Origin tags point at the authoritative design text for each item.
     `absorb shortpass edge=… slope=…`, `emit gaussian center=… sigma=…`, `spd blackbody …` parses+renders in ftrace.
     Full loom suite **808 passed**. Two source findings logged in `known-issues.md` (stale `absorb 3 0.5 0.3` comment
     in `ftsl.h`; loom light `color`/`size`/`turbidity` props ftrace ignores).
-    *Remaining:* `reflect`/`roughness`/`*_map` stay **unvalidated** — they accept a binding *union*
-    (`texture:`/`pattern:`/driven-record) on top of a spectrum, so they need the fuller per-field value grammar
-    built at the **J3c C++ port** (where ftrace's front-end adopts the shared grammar); records still use their own
-    PIN-carrying stop parsing. Then mirror the `value`/`spectrum`/per-field grammar into ftrace's C++ front-end.
+  - **Progress (2026-07-19): binding-union fields (`reflect`/`roughness`/`*_map`) now validated.** Built
+    `loom/grammar/bindings.py` — per-field validators mirroring ftrace's `bindReflectTexture` /
+    `bindScalarTexture` / `bindScalarPattern` + `spectrumParam` / `dblParam` (`src/ftsl.h` `buildMaterial`):
+    `as_color_binding` (`reflect`: `texture:<name>` | spectrum — note reflect binds *only* a UV texture, never a
+    `pattern:`), `as_scalar_binding` (`roughness`: `pattern:` | `texture:` | one scalar number — not a spectrum),
+    `as_map_binding` (any `*_map`, i.e. `film_thickness_map`/`weight_map`: `pattern:` | `texture:` only). Wired into
+    the reader's `_build_material` (`_validate_bindings`); shape-only (a bound name's scene membership stays a later
+    check). This closes the last known gap and *corrects* a prior test that assumed `reflect` accepted an untagged
+    triple — ftrace rejects it, so loom now does too. `tests/test_grammar_bindings.py` (10 cases) +
+    `test_grammar_material.py` additions. Full loom suite **823 passed**.
+    *Remaining:* the record-driven **whole-material override** block (`from R(...)` + `slot = REC.chan`,
+    ftrace's `isRecordOverrideBlock`/`buildRecordOverrideMaterial`) — loom does not emit it, so it is out of the
+    reader's scope for now; records still use their own PIN-carrying stop parsing (not routed through the shared
+    value grammar). Then mirror the `value`/`spectrum`/per-field binding grammar into ftrace's C++ front-end at the
+    **J3c C++ port** (where ftrace's front-end adopts the shared grammar as its single source of truth).
 
 ---
 
