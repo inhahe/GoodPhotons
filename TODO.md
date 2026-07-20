@@ -1507,12 +1507,26 @@ ftrace's own language). Two follow-ups were captured:
 
 ## L. Native backward (camera-first) ray tracer mode  *(ftrace renderer; LARGE, design-captured 2026-07-20 — greenlit by user)*
 
+> **STATUS CORRECTION (2026-07-20): the backward mode this section asks for ALREADY EXISTS as `mode R`.** When this
+> section was written it assumed `src/backward.h` was only a "connect helper" and that a native camera-first
+> integrator had to be built from scratch (as a new `mode E` / `src/backward_pt.h`). That premise was stale.
+> `src/backward.h` (`BackwardRenderer`, driven by `-mode R`) is a **complete, native, camera-first, spectral
+> backward path tracer**: it traces from the eye, reuses the finite-lens mode-A camera (`cam.hasLens()` /
+> `genLensRay`, with chromatic aberration + DoF + vignetting), the BVH, the material BSDF interface, and the
+> spectral XYZ film; it does NEE to lights + env, **MIS (balance heuristic)**, Russian-roulette termination, per-λ
+> dispersion, participating media, and fluorescence; it is GPU-accelerated (its own backward megakernel) and
+> respects every progressive control (`-window`/`-keepwindow`/`-interval`/`-checkpoint`/`-noise`/`-time`/`-resume`
+> via `runSppProgressive`); and it is documented as a first-class render mode in README (§"`R` — backward reference
+> (unbiased, general)"). So **L1, L3, and L4 below are already satisfied by `mode R`** — do NOT build a duplicate
+> `mode E`. The **only** genuinely unbuilt part is L2's "3 stratified secondaries", i.e. **hero-wavelength spectral
+> sampling**, which is re-scoped below (§L-HERO) as a cross-mode upgrade, not a new mode.
+
 ftrace today is a **forward / light-first** engine: modes A/B/C shoot photons *from the lights* and accumulate on
 the film (with a bidirectional connect in `bdpt.h`). This is ideal for caustics, participating media, and the
 spectral effects the project cares about, but it converges slowly on directly-lit, low-caustic scenes where a
 plain **backward / camera-first** path tracer (shoot rays *from the eye*, next-event-estimate to lights) is far
 more efficient. The ask: add a native backward path-tracer mode as a first-class render mode alongside A/B/C —
-**not** by exporting the scene to an external renderer.
+**not** by exporting the scene to an external renderer. **(Done — this is `mode R`; see the status correction above.)**
 
 ### Why native, not an external renderer (answers the user's "lose spectral fidelity" question)
 
@@ -1551,25 +1565,47 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
 
 ### Design sketch (to refine before coding)
 
-- [ ] **L1 — Mode selection + entry point.** Add a backward mode letter (candidate: `mode E` for "eye", since
-      A/B/C/D are taken; confirm the letter) parsed in `main.cpp` alongside the existing mode switch; new
-      `src/backward_pt.h` (distinct from the existing `backward.h` connect helper) with the camera-first integrator.
-      Reuse the camera model (finite-lens mode-A camera), the BVH/intersection, the material BSDF interface, and the
-      spectral film. Respect `-window`/`-keepwindow`/`-interval`/`-checkpoint`/`-noise`/`-time` progressive controls
-      (a backward tracer chunks by sample-per-pixel passes — natural progressive output).
-- [ ] **L2 — Spectral hero-wavelength core.** Per camera path: sample hero λ (uniform or importance over the visible
-      band), optionally 3 stratified secondaries; evaluate BSDF/IOR/Fresnel at each λ; NEE to lights via
-      `em.spdfn(λ)`; MIS between BSDF-sampling and light-sampling; splat monochromatic radiance to the XYZ film with
-      the `color.h` CMFs. Russian-roulette path termination. Verify a diffuse/area-light test scene matches the
-      forward modes' converged image (same tone-map) within noise.
-- [ ] **L3 — Dispersion validation.** A glass-prism / water scene must produce the correct spectral fan in backward
-      mode (per-λ IOR), matching the forward render. This is the acceptance test that proves spectral fidelity was
-      preserved.
-- [ ] **L4 — Docs + version.** README render-modes list gains the backward mode; VERSION minor bump; note in
-      known-issues if any effect (e.g. caustics) is intentionally weaker in backward mode and should stay on A/B/C.
+- [x] **L1 — Mode selection + entry point.** *(Already satisfied by `mode R`.)* `-mode R` is parsed in `main.cpp`
+      alongside A/B/C/D; `src/backward.h`'s `BackwardRenderer` is the camera-first integrator (NOT a mere connect
+      helper). It reuses the finite-lens mode-A camera, the BVH/intersection, the material BSDF interface, and the
+      spectral film, and respects all progressive controls (`runSppProgressive`, chunked by spp passes). No new mode
+      letter / `backward_pt.h` needed.
+- [x] **L3 — Dispersion validation.** *(Already satisfied by `mode R`.)* Per-λ dielectric IOR in the backward tracer
+      already produces the correct spectral fan (`-scene prism`); `mode V` cross-validates backward (`R`) against
+      forward (`B`), which is exactly this acceptance test.
+- [x] **L4 — Docs + version.** *(Already satisfied.)* README's render-modes list documents `R` as a first-class mode
+      ("`R` — backward reference (unbiased, general)"), including its GPU scope and the known caustic-noise weakness
+      (kept on A/B/C), which is the known-issues note this item called for.
 
-Sequencing note: this is a large renderer feature. Confirm scope/mode-letter with the user before writing the
-integrator; the answers above (why native, how spectral, cost) are settled.
+### L-HERO — hero-wavelength spectral sampling *(the genuine remaining work; re-scoped from L2; applies to ALL spectral modes)*
+
+- [ ] **Hero-wavelength Monte-Carlo across every spectral render mode.** Today ftrace carries **one** wavelength per
+      path/photon **everywhere** — the forward light tracers (**A/B/C**, CPU + GPU), the backward tracer (**R**, CPU +
+      GPU megakernel), and BDPT (**D**) all sample a single λ and splat `cieX/Y/Z(λ)·L`. README §"spectral" explicitly
+      contrasts this single-λ scheme with PBRT-v4 / Mitsuba 3's 4-λ hero-wavelength. **Upgrade every mode it applies
+      to** (A, B, C, R, D — and the GPU megakernels, not just the CPU paths) to carry a **hero λ + 3 stratified
+      secondary λ's** per path, evaluate the BSDF/IOR/Fresnel at all four, and **MIS-combine across wavelengths**
+      (Wilkie et al. 2014 spectral MIS) so chromatic (colour) noise drops sharply at ~unchanged traversal cost. The
+      one subtlety per mode: a **specular/dispersive interface** (dielectric with `n(λ)`) refracts each secondary λ by
+      a different angle, so the secondaries must "de-hero" (collapse to the single hero λ, weight renormalized) past
+      the first dispersive bounce — standard hero-wavelength practice; verify dispersion (`-scene prism`) is unchanged
+      and single-scatter media / thin-film still integrate correctly.
+    - [ ] **A/B/C (forward light tracers)** — a photon carries 4 stratified λ; splat all four (MIS-weighted) each
+          deposit. Mirror the change in both the CPU tracer and the wavefront/megakernel GPU path.
+    - [ ] **R (backward)** — the natural first target: sample 4 stratified λ per camera path in `radiance()`,
+          evaluate materials/NEE at each, splat the 4 CMF-weighted contributions. Do the CPU tracer *and* the GPU
+          backward megakernel (`renderBackwardCuda`).
+    - [ ] **D (BDPT)** — carry the 4 λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
+    - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
+          through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
+          rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same
+          tone-map) but reaches a given colour-noise level in ~fewer samples; dispersion/thin-film unaffected.
+    - [ ] **Docs + version** — README §"spectral" updated (ftrace becomes hero-wavelength, 4 λ/path); VERSION minor
+          bump; note any mode where the secondaries are deliberately dropped (e.g. hard-specular chains).
+
+Sequencing note: L1/L3/L4 are done (mode R). The remaining L-HERO work is a real, cross-mode spectral-core upgrade;
+start with the backward tracer (R) as the reference, then propagate the shared `HeroLambda` plumbing to A/B/C and D
+(CPU first, then each GPU megakernel), keeping every mode bit-comparable to its single-λ baseline at convergence.
 
 ---
 
