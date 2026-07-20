@@ -394,6 +394,17 @@ struct Parser {
     }
 };
 
+}  // namespace ftsl  (temporarily closed so the validation shim can see
+   //                  ftsl::Block/Stmt/Value at global scope)
+
+// J3c grammar-validation shim: the shared .ftsl grammar (GPDA) run alongside the
+// hand-written Parser above.  Included here — after Block/Stmt/Value/Parser are
+// defined — so its inline reducer/differ can reference them.  Non-authoritative;
+// see the header for details.
+#include "gpda/ftsl_shim.hpp"
+
+namespace ftsl {
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -4307,6 +4318,12 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
     Parser p; p.t = tokenize(src);
     std::vector<Block> blocks = p.parseTop();
     if (!p.err.empty()) { err = p.err; return false; }
+
+    // J3c validation shim (non-authoritative): when -validate-grammar is on,
+    // parse `src` with the shared .ftsl grammar via the GPDA engine and diff its
+    // Block tree against `blocks` above, warning on any mismatch. Rendering still
+    // proceeds from ftrace's own parse. See src/gpda/ftsl_shim.hpp.
+    ftsl_shim::validate(src, blocks, path);
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;

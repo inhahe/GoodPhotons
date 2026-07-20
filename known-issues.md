@@ -5,6 +5,21 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG (2026-07-19): `scenes/gallery_settled.ftsl` OOMs at default resolution (`std::bad_alloc`)
+Rendering `scenes/gallery_settled.ftsl` at the default resolution aborts with
+`error: bad allocation` (exit 1) — reproduced **both** with and without
+`-validate-grammar`, so it is unrelated to the grammar shim; it is a plain
+render-time out-of-memory. The scene is heavy: `scraps/klein_staged.obj`
+(634 076 tris) plus several lamp meshes (`assets/lamp/*.obj`, ~430k tris total)
+and an environment map, so the BVH / mesh / film allocations exceed available
+memory at full res. Lowering `-res` (e.g. `-res 64`) gets past the load/BVH build
+but the run still exits non-zero, so the ceiling is low. **Proper fix:** profile
+peak allocation for this scene (mesh dedup, BVH node footprint, film/accumulator
+sizing) and either reduce it or fail gracefully with a clear
+"scene needs ~N GB at this resolution" message instead of an opaque `bad_alloc`.
+Not blocking — it's one oversized showcase scene — but it means
+`gallery_settled.ftsl` can't be rendered at default settings on this machine.
+
 ### DOC BUG (2026-07-19): stale `absorb 3 0.5 0.3` example in `src/ftsl.h` — untagged spectrum triples don't parse
 The comment above the `dielectric` `absorb` handling (`src/ftsl.h` ~1838) reads
 `e.g. `absorb 3 0.5 0.3` (per-channel, upsampled)`, implying a bare/untagged numeric triple is a valid

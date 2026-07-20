@@ -1868,6 +1868,21 @@ useful flags: `--resume` (skip already-rendered frames), `--start/--end/--step` 
 `--no-encode`, `--keep-frames`, `--crf`/`--codec`/`--pix-fmt`, and `--dry-run`. Run with
 `--help` for the full list.
 
+### Grammar cross-check (`-validate-grammar`)
+
+FTSL has two front-ends: ftrace's authoritative hand-written parser (`src/ftsl.h`)
+and a **shared grammar** — the same `.ftsl` syntax written once as a formal grammar
+(`tools/loom/loom/grammar/ftsl_scene.epeg`, compiled to a parser graph consumed by
+loom *and* vendored into ftrace as generated C++). The `-validate-grammar` flag runs
+the shared grammar alongside the hand-written parser on the scene you load,
+structurally diffs the two block trees, and prints any disagreement to stderr as a
+`[validate-grammar] …` warning. It is **non-authoritative and off by default**:
+ftrace always renders from its own parse, so the flag adds only a diagnostic (also
+enabled by setting the `FTRACE_VALIDATE_GRAMMAR` environment variable to a non-empty,
+non-`0` value). The goal is to drive the mismatch count to zero across the whole
+scene corpus before eventually flipping the front-end over to the shared grammar as
+the single source of truth. With no flag there is zero cost.
+
 ### Importing Mitsuba scenes
 
 `tools/mitsuba_to_ftsl.py` converts a Mitsuba (0.6 / 2 / 3) XML scene to FTSL:

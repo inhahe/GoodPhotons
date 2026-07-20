@@ -3597,6 +3597,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
         else if (!std::strcmp(argv[i], "-serve")) { /* resident loop; driven by main(), ignored here */ }
+        else if (!std::strcmp(argv[i], "-validate-grammar")) ftsl_shim::enabled_flag() = true;
         else if (argv[i][0] == '-') {
             // Any remaining dash-prefixed token is an unrecognized (or malformed, e.g.
             // value-less) option. Fail loudly instead of silently falling through to the

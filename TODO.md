@@ -143,6 +143,26 @@ Origin tags point at the authoritative design text for each item.
     (`D:\visual studio projects\GraphParser\cpp\tokenized.{hpp,cpp}`) into ftrace, load `ftsl_scene.epeg`, produce
     `blocks_new`, structurally diff vs the hand-written parser's `blocks_old` behind a non-authoritative flag,
     iterate to silence on the corpus, then replace.
+  - **Progress (2026-07-19): J3c C++ validation shim LANDED and wired into ftrace (non-authoritative).** Built the
+    full C++ pipeline and vendored it into `src/gpda/`: (1) `loom/grammar/emit_cpp.py` compiles the authoritative
+    `ftsl_scene.epeg` to standalone C++ that rebuilds the identical GPDA `Graph` + lexer table (`ftsl_scene.gen.cpp`
+    — 193 nodes / 29 rules / 16 lex rules; no runtime file/JSON dependency); (2) the tokenized GPDA engine
+    (`pool.hpp`, `tokenized.{hpp,cpp}`, copied verbatim from `GraphParser/cpp`); (3) a reusable regex longest-match
+    lexer (`gpda_lexer.hpp`); (4) `ftsl_reduce.hpp` — the ParseNode→`ftsl::Block` reducer + structural differ that
+    faithfully mirrors `parseValue`/`parseBraceBody` (value continuation, record-override `= REC.chan [i]`, `[i]`
+    selector folding, nested-block type/name derivation, flat `words` dump, quote-stripping); (5) `ftsl_shim.hpp` —
+    `ftsl_shim::validate(src, blocks, path)`, guarded by the `-validate-grammar` CLI flag / `FTRACE_VALIDATE_GRAMMAR`
+    env var, off by default (zero cost). `ftsl.h` includes the shim after `Block/Stmt/Value/Parser` are defined and
+    calls it in `load()`; `main.cpp` adds the flag; `CMakeLists.txt` builds the two vendored `.cpp` at `/W0`.
+    **Proof:** the standalone harness (`scraps/gpda_shim/`) diffs the GPDA parse against ftrace's *actual* parser
+    slice over the **entire corpus — MATCH 2338/2338, zero parse failures, zero mismatches**; ftrace built with the
+    shim (CUDA Release) and ran `-validate-grammar` live on feature-rich scenes (prefer/else, spectrum,
+    record-override, envmap) with **zero `[validate-grammar]` warnings**. **VERSION 0.9.1 → 0.9.2.**
+    *Next:* run `-validate-grammar` broadly as scenes are authored/rendered to keep the mismatch count at zero, then
+    flip ftrace's front-end over to the shared grammar as the single source of truth (full replacement). Deferred
+    reconciliations (logged): record-driven whole-material override block (ftrace `isRecordOverrideBlock`, not emitted
+    by loom); loom Light `color`/`size`/`turbidity` props ftrace ignores; stale `absorb 3 0.5 0.3` comment
+    (`ftsl.h` ~1838, see known-issues.md).
 
 ---
 
