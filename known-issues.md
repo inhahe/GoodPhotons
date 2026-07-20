@@ -5,6 +5,26 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT (2026-07-20): forward mode B barely converges the water-droplet rainbow (`scraps/rainbow_test.ftsl`); mode D works well
+The Airy rainbow phase model (`src/rainbow.h`) is **verified correct** — `ftrace -rainbow-selftest`
+reports textbook geometry (primary 40.7°–42.5° antisolar, secondary 50.1°–53.4° with reversed
+colour order, water dispersion violet n=1.343 > red n=1.330, phase normalised 2π∫p dμ=1.000). But
+rendering the bounded rain-curtain scene `scraps/rainbow_test.ftsl` (thin fog slab + distant sun,
+camera toward the antisolar point):
+- **mode B (forward pinhole splat):** after 450 M photons / 75 s the image is essentially **black**
+  (`sensor=0.0000`, ~95 % noise, auto-exposure ~1.9e-10). The single-scatter-to-camera path over the
+  scene's hundreds-of-metres scale is too rare for the forward splat to accumulate the bow.
+- **mode D (BDPT):** converges the **full, clearly-coloured bow** in the same 75 s (~7.5 % noise) —
+  primary + secondary + Alexander's dark band all visible (`png/rainbow_rain.png`). The fogbow
+  variant (`scraps/fogbow_test.ftsl`, 10 µm droplets) likewise renders correctly as a broad,
+  supernumerary-dominated pale bow (`png/fogbow.png`).
+So this is not a physics bug — the machine and mode D are fine. It is a **forward-mode
+efficiency gap**: mode B (and likely A/C) can't practically image a thin-medium single-scatter bow
+at this scale. **Proper fix (deferred):** give the forward medium-scatter path a next-event /
+camera-connection term for participating media (so each scatter vertex connects to the camera with a
+proper importance weight, like BDPT does) instead of relying on the plain pinhole splat, or document
+that rainbow/fog-bow scenes should use mode D. Low priority — mode D covers the use case.
+
 ### BUG (2026-07-19; root-caused 2026-07-20): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
 `error: bad allocation` (exit 1) rendering `scenes/gallery_settled.ftsl`.
 **Root-caused 2026-07-20 — it is NOT a generic "scene too heavy" OOM.** With 26 GB
