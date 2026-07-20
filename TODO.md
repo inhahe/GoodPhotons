@@ -1418,6 +1418,19 @@ ftrace's own language). Two follow-ups were captured:
       Materials would keep the reflectance default; lights would default to (or at least be able to opt into) the
       illuminant fit. Scope: an `upsample.h` illuminant variant + wire a tag through `evalSpectrum`'s `rgb`/`hsv`/
       `hsl` handlers; mirror in loom's spectrum grammar. Observable → README + VERSION bump when it lands.
+    - **Output-type constraint (per user, 2026-07-19):** a user-supplied `(r,g,b) -> spectrum` mapping must emit the
+      **same in-memory value** that everything else spectral consumes — *not* the textual `[rgb 0,0,1 .3:1,0,0 hsl 1,0,0]`
+      color-array syntax, but the compiled form that syntax lowers to. Concretely, ftrace's runtime spectral type is
+      `Spectrum` — a **callable over wavelength** (`double -> double`, a closure), not an array; the existing JH path
+      already returns exactly this (`[c](double λ){ return upsample::reflAt(c, λ); }`). A `color` **channel** array
+      (the `[ … ]` body of positioned colour stops) is a *source form* that gets **baked** into a per-domain JH
+      sigmoid-coeff LUT — `RecChannel::coeff`, a `std::vector<std::array<double,3>>` of `REC_LUT_N`=65 bins
+      (`recBakeSpectrumChannels` in `src/record.h`) — from which per-hit sampling is a coeff-lerp + sigmoid eval,
+      i.e. it *produces* a `Spectrum` at any position. So the design rule for the user mapping: its return value is a
+      `Spectrum` (or, if it wants stops/positions, the same baked-coeff `RecChannel` representation) — the identical
+      in-memory ("binary") object the `color`/spectrum machinery already yields — so it is drop-in assignable anywhere
+      a colour or spectrum is accepted (material `reflect`/`emit`, light `spd`, a record channel). The user never hands
+      back text; they hand back the compiled spectral value.
 
 - [ ] **K2 — Analytic physical sky (`turbidity`).** ftrace has **no** procedural sky: environment lighting is only
       an image-based env map (`env { file … }`) or a constant-radiance env. `turbidity` (atmospheric haze: ~2 = clear
