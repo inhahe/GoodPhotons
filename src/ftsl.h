@@ -1209,6 +1209,18 @@ private:
             if (!e) { fail("spectrum '" + nm + "' has no value"); return constantSpectrum(0); }
             return evalSpectrum(e->val, depth + 1);
         }
+        // Common authoring trap: a bare numeric run like `absorb 3 0.5 0.3` looks like
+        // a per-channel colour but isn't a spectrum expression (only a lone scalar, a
+        // tagged colour, or a named/ref spectrum parse). Point straight at the fix.
+        if (isNumber(h) && w.size() >= 3) {
+            bool allNum = true;
+            for (const auto& t : w) if (!isNumber(t)) { allNum = false; break; }
+            if (allNum) {
+                fail("unrecognized spectrum expression '" + h + "' — a bare numeric triple "
+                     "isn't a spectrum; tag it, e.g. `rgb " + w[0] + " " + w[1] + " " + w[2] + "`");
+                return constantSpectrum(0);
+            }
+        }
         fail("unrecognized spectrum expression '" + h + "'");
         return constantSpectrum(0);
     }
@@ -1846,8 +1858,11 @@ private:
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
             else m.roughness = dblParam(b, "roughness", 0.0);
             // Interior absorption sigma_a(lambda) per metre travelled inside the glass
-            // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb 3 0.5 0.3`
-            // (per-channel, upsampled) gives green-tinted glass.
+            // (Beer-Lambert tint). 0 (default) = colorless. e.g. `absorb rgb 3 0.5 0.3`
+            // (a tagged RGB triple, upsampled to a spectrum) gives green-tinted glass.
+            // NOTE: the `rgb` tag is required — a bare triple (`absorb 3 0.5 0.3`) is NOT
+            // a valid spectrum expression; only a scalar, a tagged colour (`rgb`/`xyz`/…),
+            // or a named/ref spectrum parse. See evalSpectrum below.
             m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;

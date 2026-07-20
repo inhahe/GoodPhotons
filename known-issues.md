@@ -20,17 +20,18 @@ sizing) and either reduce it or fail gracefully with a clear
 Not blocking — it's one oversized showcase scene — but it means
 `gallery_settled.ftsl` can't be rendered at default settings on this machine.
 
-### DOC BUG (2026-07-19): stale `absorb 3 0.5 0.3` example in `src/ftsl.h` — untagged spectrum triples don't parse
-The comment above the `dielectric` `absorb` handling (`src/ftsl.h` ~1838) reads
+### RESOLVED (2026-07-19): stale `absorb 3 0.5 0.3` example in `src/ftsl.h` — untagged spectrum triples don't parse
+The comment above the `dielectric` `absorb` handling (`src/ftsl.h` ~1838) read
 `e.g. `absorb 3 0.5 0.3` (per-channel, upsampled)`, implying a bare/untagged numeric triple is a valid
-spectrum expression. It is **not**: `evalSpectrum` (~1106) only accepts a *single* number as a constant;
-a 3-word run with a numeric head (`3 0.5 0.3`) falls through every branch to
+spectrum expression. It is **not**: `evalSpectrum` only accepts a *single* number as a constant;
+a 3-word run with a numeric head (`3 0.5 0.3`) fell through every branch to
 `fail("unrecognized spectrum expression '3'")`. Verified empirically — a scene with `absorb 3 0.5 0.3`
-(and likewise `reflect 0.8 0.7 0.2`) errors out with `[ftsl] unrecognized spectrum expression '<head>'`.
+(and likewise `reflect 0.8 0.7 0.2`) errored out with `[ftsl] unrecognized spectrum expression '<head>'`.
 The valid spellings are a scalar (`absorb 0.5`), a tagged colour (`absorb rgb 3 0.5 0.3`), or a named/ref
-spectrum. **Proper fix:** correct the comment to a tagged example (`absorb rgb 3 0.5 0.3`), and — since this
-is a genuinely easy authoring trap — consider a targeted parser hint (`unrecognized spectrum expression
-'0.8' — did you mean 'rgb 0.8 …'?`) when the head and its neighbours are all numbers.
+spectrum. **Fixed:** (1) corrected the comment to the tagged example plus an explicit "the `rgb` tag is
+required" note; (2) added a targeted parser hint — when the head is numeric and every word in the run is a
+number (`w.size() >= 3`), `evalSpectrum` now fails with `… — a bare numeric triple isn't a spectrum; tag it,
+e.g. \`rgb 3 0.5 0.3\`` instead of the opaque `unrecognized spectrum expression '3'`. (VERSION 0.9.2 → 0.9.3.)
 
 ### RESOLVED (2026-07-19): loom's shared-grammar `reflect`/`roughness`/`*_map` fields are now shape-validated
 The grammar-backed reader (`tools/loom/loom/grammar/reader.py`) shape-checks *purely-spectral* fields
