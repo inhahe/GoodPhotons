@@ -36,8 +36,13 @@ def _ctx() -> EmitCtx:
 _SAMPLES = [
     # scalar prop + spectrum-ref colour
     Material("gold", "diffuse", reflect="spectrum:gold", roughness="0.2"),
-    # vector (space-separated) colour + scalar ior, glass type
-    Material("m", "glass", ior="1.5", reflect="0.8 0.7 0.2"),
+    # tagged (space-separated) colour + scalar ior, glass type
+    Material("m", "glass", ior="1.5", reflect="rgb 0.8 0.7 0.2"),
+    # keyword-headed spectrum expressions in purely-spectral fields
+    Material("fl", "fluorescent", absorb="shortpass edge=490 slope=0.15 amp=1",
+             emit="gaussian center=560 sigma=25 amp=1"),
+    # blackbody / whitewall / wall spectra
+    Material("lamp", "diffuse", emit="blackbody 3200", reflect="whitewall 0.6"),
     # material bound to a texture by ref
     Material("t", "diffuse", reflect="texture:hide"),
     # metal type, no extra props beyond type
@@ -106,6 +111,36 @@ def test_proctexture_fields_roundtrip():
 def test_reader_rejects_non_element():
     with pytest.raises(ValueError):
         parse_element("this is not an element at all")
+
+
+# ---- keyword-headed spectrum expressions parse (grammar) + validate (shape) ---
+
+def test_keyword_headed_spectrum_values_parse():
+    m = parse_element("m = material { type diffuse  emit gaussian center=560 sigma=25 amp=1 }")
+    assert isinstance(m, Material)
+    assert m.props["emit"] == "gaussian center=560 sigma=25 amp=1"
+
+
+def test_word_run_stops_at_next_key():
+    # `emit blackbody 6500` must NOT swallow the following `ior 1.5` key.
+    m = parse_element("m = material { type dielectric  emit blackbody 6500  ior 1.5 }")
+    assert m.props["emit"] == "blackbody 6500"
+    assert m.props["ior"] == "1.5"
+
+
+def test_reader_rejects_bad_spectral_field():
+    # `ior` is purely spectral, so a non-spectrum value is a shape error at parse.
+    with pytest.raises(ValueError):        # ShapeError is a ValueError
+        parse_element("m = material { type dielectric  ior wombat }")
+
+
+def test_reader_accepts_untagged_reflect_but_not_untagged_ior():
+    # `reflect` is deliberately NOT validated (it accepts texture:/pattern:/record
+    # bindings that need the fuller field grammar), so an untagged triple still parses;
+    # `ior` (purely spectral) rejects the same untagged triple.
+    parse_element("m = material { type diffuse  reflect 0.8 0.7 0.2 }")   # no raise
+    with pytest.raises(ValueError):
+        parse_element("m = material { type dielectric  ior 0.8 0.7 0.2 }")
 
 
 if __name__ == "__main__":

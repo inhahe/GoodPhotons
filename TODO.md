@@ -91,11 +91,28 @@ Origin tags point at the authoritative design text for each item.
     lists, inline RLE `rgb`/`hsl`/`hsv` tags, the `[X] ≡ X` identity) is accepted and the shape rules are enforced
     (a 6-vector or a colour *list* handed to the single-colour reader → `ShapeError`; an unbalanced bracket →
     `ValueError`). `tests/test_color_parse.py` (19 cases) pins the round-trip and the errors; full loom suite 776
-    passed. *Remaining:* wire the validators into the **material/light** field readers — but note those fields
-    accept richer **spectrum expressions** (`blackbody 6500`, `spectrum:gold`, record refs `R.chan[i]`), of which
-    the colour-vector grammar is only a subset, so that step wants the fuller value/spectrum grammar first rather
-    than validating those props strictly as colours (which would reject valid scenes); records still use their own
-    PIN-carrying stop parsing. Then mirror the `value` grammar into ftrace's C++ front-end at the J3c port.
+    passed.
+  - **Progress (2026-07-19): fuller spectrum grammar + purely-spectral field validation wired.** Built the
+    spectrum-expression layer the field-wiring needed: new `loom/grammar/spectrum.py` (`parse_spectrum` /
+    `as_spectrum` → canonical `Const`/`Blackbody`/`Ior`/`WhiteWall`/`NamedWall`/`Band`/`ColorSpec`/`LibRef`/
+    `RecordRef` nodes), a faithful 1:1 mirror of ftrace's `evalSpectrum` (`src/ftsl.h` ~1106) — a bare number,
+    `blackbody`/`ior`/`whitewall` (+defaults), `redwall`/`greenwall`, `gaussian`/`shortpass` bands, tagged
+    `rgb`/`hsv`/`hsl` colours (delegating to `as_color`), `glass:`/`metal:`/`reflectance:`/`filter:`/`preset:`/
+    `file:`/`spectrum:` refs, and constant record channel refs; an *untagged* colour triple is rejected exactly as
+    ftrace rejects it (`tests/test_grammar_spectrum.py`, 22 cases). **Extended the shared `.epeg` grammar** so it
+    can actually express these: `pvalue` was `REF | STRING+ | NUMBER+ | NAME` and could NOT parse `reflect rgb r g b`
+    or `blackbody K` (which is why loom had been emitting the ftrace-*invalid* untagged triple); it is now a
+    spectrum/value **word run** `pwords = phead ptail*` (head word + trailing numbers / `key=value` band words via a
+    new `KVWORD` terminal), stopping at the next NAME key. **Wired `as_spectrum` into the reader** for the
+    *purely-spectral* fields (`ior`/`transmit`/`absorb`/`substrate_k`/`emit`, light `spd`) — non-destructive
+    shape-checks that reject exactly what ftrace would. Verified end-to-end: a scene with `reflect rgb …`,
+    `absorb shortpass edge=… slope=…`, `emit gaussian center=… sigma=…`, `spd blackbody …` parses+renders in ftrace.
+    Full loom suite **808 passed**. Two source findings logged in `known-issues.md` (stale `absorb 3 0.5 0.3` comment
+    in `ftsl.h`; loom light `color`/`size`/`turbidity` props ftrace ignores).
+    *Remaining:* `reflect`/`roughness`/`*_map` stay **unvalidated** — they accept a binding *union*
+    (`texture:`/`pattern:`/driven-record) on top of a spectrum, so they need the fuller per-field value grammar
+    built at the **J3c C++ port** (where ftrace's front-end adopts the shared grammar); records still use their own
+    PIN-carrying stop parsing. Then mirror the `value`/`spectrum`/per-field grammar into ftrace's C++ front-end.
 
 ---
 

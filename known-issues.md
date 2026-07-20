@@ -5,6 +5,42 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DOC BUG (2026-07-19): stale `absorb 3 0.5 0.3` example in `src/ftsl.h` — untagged spectrum triples don't parse
+The comment above the `dielectric` `absorb` handling (`src/ftsl.h` ~1838) reads
+`e.g. `absorb 3 0.5 0.3` (per-channel, upsampled)`, implying a bare/untagged numeric triple is a valid
+spectrum expression. It is **not**: `evalSpectrum` (~1106) only accepts a *single* number as a constant;
+a 3-word run with a numeric head (`3 0.5 0.3`) falls through every branch to
+`fail("unrecognized spectrum expression '3'")`. Verified empirically — a scene with `absorb 3 0.5 0.3`
+(and likewise `reflect 0.8 0.7 0.2`) errors out with `[ftsl] unrecognized spectrum expression '<head>'`.
+The valid spellings are a scalar (`absorb 0.5`), a tagged colour (`absorb rgb 3 0.5 0.3`), or a named/ref
+spectrum. **Proper fix:** correct the comment to a tagged example (`absorb rgb 3 0.5 0.3`), and — since this
+is a genuinely easy authoring trap — consider a targeted parser hint (`unrecognized spectrum expression
+'0.8' — did you mean 'rgb 0.8 …'?`) when the head and its neighbours are all numbers.
+
+### TECH DEBT (2026-07-19): loom's shared-grammar `reflect`/`roughness`/`*_map` fields are not shape-validated
+The grammar-backed reader (`tools/loom/loom/grammar/reader.py`) now shape-checks *purely-spectral* fields
+(`ior`/`transmit`/`absorb`/`substrate_k`/`emit` on materials, `spd` on lights) against the shared spectrum
+grammar (`loom/grammar/spectrum.py`, a faithful mirror of ftrace's `evalSpectrum`). But `reflect`,
+`roughness`, and the `*_map` binders are **deliberately left unvalidated**, because each accepts a *union* on
+top of a spectrum — `texture:<name>`, `pattern:<name>`, and driven/selStop **record** channel bindings —
+that the spectrum validator alone would wrongly reject (e.g. valid `reflect texture:hide`). So an invalid
+`reflect` value (like an untagged triple `reflect 0.8 0.7 0.2`, which ftrace rejects) still passes loom's
+reader silently. **Proper fix:** build the fuller *per-field* value grammar — a `reflect`/`roughness` value =
+`spectrum-expr | texture:bind | pattern:bind | record-bind` — as part of the J3c port (where ftrace's C++
+front-end adopts the shared grammar), so every field validates against exactly what it accepts. Until then
+loom can still *emit* an untagged-triple `reflect` if the user hands `Material(reflect="0.8 0.7 0.2")` a raw
+string; the safe authoring path is a `Color`/`rgb(...)` object (emits a tagged `rgb r g b`) or a tagged
+string.
+
+### POSSIBLE MISMATCH (2026-07-19): loom `Light(color=…, size=…, turbidity=…)` emits fields ftrace's `addLight` ignores
+loom's `Light` accepts free-form props and emits them verbatim (`light { kind …  color 0.9 0.8 0.7  size 2 2 }`),
+but ftrace's `addLight` (`src/ftsl.h` ~2655) reads its emission from `spd` (a spectrum) plus per-subtype
+geometry (`origin`/`u`/`v`/`center`/`radius`/…) — it has **no** `color`, `size`, or `turbidity` field, so
+those loom props are silently dropped at render. (The loom test battery uses them only to prove the reader
+round-trips arbitrary props, not that ftrace consumes them.) **Proper fix:** decide the light authoring
+contract — either map loom's `color`→`spd` / `size`→area-quad `u`,`v` at emit, or drop the unused kwargs from
+loom's `Light` — and align it with ftrace's real light schema (ideally folded into the J3c grammar port).
+
 ### RESOLVED (2026-07-19): `gallery_settled.ftsl` — several objects mis-positioned (resting on the floor)
 **Root cause:** the free-settle physics bake tumble, not a transform/collider/floor bug. Three of the
 five settled pieces landed correctly; klein (COM y≈0.37) and heart (y≈0.14) had tipped, rolled past

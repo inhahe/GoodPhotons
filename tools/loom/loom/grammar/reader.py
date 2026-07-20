@@ -171,6 +171,28 @@ def _props(node):
     return out
 
 
+# Material/light fields that accept ONLY a spectrum expression, so the shared
+# spectrum grammar (loom.grammar.spectrum) is their complete, correct validator.
+# `reflect` / `roughness` / `*_map` are deliberately ABSENT: they accept a binding
+# *union* (`texture:<name>` / `pattern:<name>` / a driven record channel) on top of
+# a spectrum, which needs the fuller per-field grammar mirrored at the J3c C++ port —
+# validating them as a bare spectrum here would reject valid bindings like
+# `reflect texture:hide`.
+_SPECTRAL_ONLY_FIELDS = ("ior", "transmit", "absorb", "substrate_k", "emit")
+
+
+def _validate_spectral(props, fields) -> None:
+    """Shape-check each present *purely-spectral* field's value against the shared
+    ``.ftsl`` spectrum grammar (raising :class:`ShapeError` on a bad expression).
+
+    Non-destructive — the verbatim value is left untouched so emit round-trips; this
+    only rejects a value that ftrace's ``evalSpectrum`` would also reject."""
+    from .spectrum import as_spectrum   # lazy: avoids the reader<->values import cycle
+    for key in fields:
+        if key in props:
+            as_spectrum(props[key])
+
+
 def _build_material(node) -> Material:
     name = _binder_name(node)
     mtype = "diffuse"
@@ -182,6 +204,7 @@ def _build_material(node) -> Material:
             # store the raw emitted token(s) (verbatim through value_token) so
             # emit -> parse -> emit is stable; strings keep their quotes stripped
             props[key] = " ".join(_unquote(t) for t in toks)
+    _validate_spectral(props, _SPECTRAL_ONLY_FIELDS)
     return Material(name, mtype, **props)
 
 
@@ -229,6 +252,7 @@ def _build_light(node):
             kind = val
         else:
             props[key] = val
+    _validate_spectral(props, ("spd",))     # a light's `spd` is purely spectral
     return Light(kind, **props)
 
 

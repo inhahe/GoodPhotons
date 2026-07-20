@@ -30,6 +30,10 @@ NUMBER  = /-?[0-9]+(\.[0-9]+)?([eE][+\-]?[0-9]+)?/
 PIN     = /p:-?[0-9]+(\.[0-9]+)?/          # `p:<pos>` position pin prefix
 REF     = /[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]+/   # e.g. spectrum:steel, metal:gold
 STRING  = /"[^"]*"/                                 # quoted name / path / expression
+# A `key=value` band parameter word (`gaussian center=560 sigma=25`), matched whole
+# like ftrace's whitespace `v.words`.  The value must start with a digit/sign so this
+# never swallows a `NAME = KIND` header's spaced-or-unspaced `=` (that stays NAME '=').
+KVWORD  = /[A-Za-z_][A-Za-z0-9_]*=-?[0-9][^ \t\r\n}]*/
 NAME    = /[A-Za-z_][A-Za-z0-9_]*/
 
 # ---- top-level element ----------------------------------------------
@@ -71,7 +75,19 @@ material = nl? binder? 'material' '{' mbody '}' nl?
 texture  = nl? binder? 'texture'  '{' mbody '}' nl?
 mbody    = (nl? prop)* nl?
 prop     = NAME pvalue
-pvalue   = REF | STRING+ | NUMBER+ | NAME            # ref / quoted / vector-or-scalar / enum
+# A property value is either a quoted-string list or a spectrum/value *word run*: a
+# single head word (a keyword like `rgb`/`blackbody`/`whitewall`, an enum, a `:`-ref,
+# or a bare number) followed by trailing numbers / `key=value` band words.  So
+# `reflect rgb 0.8 0.7 0.2`, `spd blackbody 6500`, `emit gaussian center=560 sigma=25`,
+# `reflect metal:gold`, `roughness 0.2` and `type diffuse` all parse.  A bare NAME can
+# only be the *head* (never trailing), so the run stops at the next NAME key or `}` —
+# `reflect blackbody 6500  roughness 0.2` splits into two props, not one long value.
+# The grammar stays permissive (an untagged triple `0.8 0.7 0.2` parses); the spectral
+# shape/semantic check (loom.grammar.spectrum) is what rejects a non-spectrum value.
+pvalue   = STRING+ | pwords
+pwords   = phead ptail*
+phead    = REF | NUMBER | NAME
+ptail    = NUMBER | KVWORD
 
 # ---- geometry primitives --------------------------------------------
 # A sphere is a fixed-shape block: `sphere { center X Y Z  radius R  material "n" }`.

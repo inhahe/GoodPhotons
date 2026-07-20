@@ -72,6 +72,17 @@ def test_light_fields_roundtrip():
     assert back.props["power"] == "40"
 
 
+def test_light_spd_spectrum_forms_parse():
+    # a light's `spd` is purely spectral, so keyword-headed spectra round-trip
+    lt = parse_element("l = light { kind point  spd blackbody 3200 }")
+    assert lt.props["spd"] == "blackbody 3200"
+
+
+def test_reader_rejects_bad_light_spd():
+    with pytest.raises(ValueError):        # ShapeError is a ValueError
+        parse_element("l = light { kind point  spd wombat }")
+
+
 def test_camera_fields_roundtrip():
     cam = Camera((3.0, -1.5, 2.25), (0, 1, 0), up=(0, 0, 1), fov_y=55.0,
                  mode="A", res=(1920, 1080), name="hero")
