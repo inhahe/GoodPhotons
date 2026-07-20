@@ -75,25 +75,28 @@ inline void linSrgbToXyz(double r, double g, double b, double& X, double& Y, dou
     Z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
 }
 
-// Fit sigmoid coefficients for a linear-sRGB colour via Gauss-Newton.
-inline std::array<double, 3> fit(double r, double g, double b) {
-    const Basis& B = basis();
-    double tX, tY, tZ; linSrgbToXyz(r, g, b, tX, tY, tZ);
+// Fit sigmoid coefficients so the modelled spectrum, integrated against the given
+// weight set (wX/Y/Z(λ)·dλ, already built), reproduces the target XYZ. Gauss-Newton
+// with a Cramer's-rule 3×3 solve. Shared by the reflectance fit (D65-weighted basis)
+// and the illuminant fit (bare-observer basis) — identical solver, different weights.
+inline std::array<double, 3> fitSigmoid(int N, const double* lam,
+                                        const double* wX, const double* wY, const double* wZ,
+                                        double tX, double tY, double tZ) {
     std::array<double, 3> c{0.0, 0.0, 0.0};   // start at S ≡ 0.5 (mid gray)
     for (int iter = 0; iter < 40; ++iter) {
         // Residual and 3×3 Jacobian dXYZ/dc.
         double X = 0, Y = 0, Z = 0;
         double J[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-        for (int i = 0; i < B.N; ++i) {
-            double t = tOf(B.lam[i]);
+        for (int i = 0; i < N; ++i) {
+            double t = tOf(lam[i]);
             double p = c[0] * t * t + c[1] * t + c[2];
             double s = sigmoid(p), ds = dSigmoid(p);
-            X += s * B.wX[i]; Y += s * B.wY[i]; Z += s * B.wZ[i];
+            X += s * wX[i]; Y += s * wY[i]; Z += s * wZ[i];
             double dc[3] = {t * t, t, 1.0};
             for (int j = 0; j < 3; ++j) {
-                J[0][j] += ds * dc[j] * B.wX[i];
-                J[1][j] += ds * dc[j] * B.wY[i];
-                J[2][j] += ds * dc[j] * B.wZ[i];
+                J[0][j] += ds * dc[j] * wX[i];
+                J[1][j] += ds * dc[j] * wY[i];
+                J[2][j] += ds * dc[j] * wZ[i];
             }
         }
         double rX = X - tX, rY = Y - tY, rZ = Z - tZ;
@@ -119,6 +122,63 @@ inline std::array<double, 3> fit(double r, double g, double b) {
         c[0] -= relax * d[0]; c[1] -= relax * d[1]; c[2] -= relax * d[2];
     }
     return c;
+}
+
+// Fit sigmoid coefficients for a linear-sRGB *reflectance* colour (D65-weighted basis).
+inline std::array<double, 3> fit(double r, double g, double b) {
+    const Basis& B = basis();
+    double tX, tY, tZ; linSrgbToXyz(r, g, b, tX, tY, tZ);
+    return fitSigmoid(B.N, B.lam, B.wX, B.wY, B.wZ, tX, tY, tZ);
+}
+
+// --- RGB -> illuminant (emission) spectrum upsampling ------------------------
+// The Jakob-Hanika *illuminant* variant. The reflectance fit above pre-multiplies
+// its integration weights by the D65 illuminant and clamps the result to a physical
+// (0,1) reflectance — right for a surface seen under a light, wrong for a light
+// itself. An emitter's own SPD is what the observer integrates *directly*, so here
+// (a) the weights are the bare CIE observer (no D65), and (b) the SPD is unbounded:
+// we model it as A·sigmoid(quadratic), where the sigmoid ∈ (0,1) carries the shape
+// (chromaticity) and the scalar A carries the magnitude, so any brightness — even a
+// saturated primary or an over-unity light — is representable. Meant for lights
+// (`spd rgbillum r g b`).
+struct IllumBasis {
+    static constexpr int N = 95;          // (830-360)/5 + 1
+    static constexpr double step = 5.0;
+    double lam[N];
+    double wX[N], wY[N], wZ[N];
+    IllumBasis() {
+        double kY = 0.0;
+        for (int i = 0; i < N; ++i) {
+            double w = LAMBDA_MIN + i * step;
+            lam[i] = w;
+            wX[i] = cieX(w) * step;       // bare observer, NO D65 pre-weighting
+            wY[i] = cieY(w) * step;
+            wZ[i] = cieZ(w) * step;
+            kY += wY[i];
+        }
+        // Normalize so a flat unit spectrum (S ≡ 1) integrates to Y = 1 — i.e. the
+        // equal-energy white E (the natural neutral for a self-luminous source).
+        double k = (kY > 0) ? 1.0 / kY : 1.0;
+        for (int i = 0; i < N; ++i) { wX[i] *= k; wY[i] *= k; wZ[i] *= k; }
+    }
+    // XYZ of a unit-amplitude sigmoid emission (multiply by A for the true SPD).
+    void integrate(const std::array<double, 3>& c, double& X, double& Y, double& Z) const {
+        X = Y = Z = 0.0;
+        for (int i = 0; i < N; ++i) {
+            double s = reflAt(c, lam[i]);
+            X += s * wX[i]; Y += s * wY[i]; Z += s * wZ[i];
+        }
+    }
+};
+
+inline const IllumBasis& illumBasis() { static IllumBasis b; return b; }
+
+// Fit sigmoid coefficients for a *normalized* emission chromaticity against the
+// bare-observer basis. The caller pre-divides the target XYZ by the amplitude A
+// (so the fitted sigmoid ∈ (0,1) reproduces the normalized target), then scales
+// the SPD back up by A. Same solver as the reflectance fit, different weights.
+inline std::array<double, 3> fitIllum(const IllumBasis& B, double tX, double tY, double tZ) {
+    return fitSigmoid(B.N, B.lam, B.wX, B.wY, B.wZ, tX, tY, tZ);
 }
 
 // --- RGB -> dominant wavelength (spectral-locus construction) ----------------
@@ -219,6 +279,21 @@ inline Spectrum rgbToReflectanceJH(double r, double g, double b) {
     r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
     std::array<double, 3> c = upsample::fit(r, g, b);
     return [c](double lambda) { return upsample::reflAt(c, lambda); };
+}
+
+// Build an *emission* Spectrum from a linear-sRGB triple (Jakob-Hanika illuminant
+// variant). Unlike rgbToReflectanceJH, the SPD is unbounded: we factor it as
+// A·sigmoid(quadratic), fitting the sigmoid shape to the chromaticity (target XYZ
+// normalized by A) and letting the scalar A = 2·max(X,Y,Z) carry the magnitude, so
+// even a saturated primary or an over-unity light is representable. Black -> zero.
+inline Spectrum rgbToIlluminantJH(double r, double g, double b) {
+    r = std::max(0.0, r); g = std::max(0.0, g); b = std::max(0.0, b);   // emitters unbounded above
+    double tX, tY, tZ; upsample::linSrgbToXyz(r, g, b, tX, tY, tZ);
+    double mx = std::max({tX, tY, tZ});
+    if (mx < 1e-9) return [](double) { return 0.0; };   // black -> no emission
+    double A = 2.0 * mx;   // headroom so the normalized target's max component is 0.5
+    std::array<double, 3> c = upsample::fitIllum(upsample::illumBasis(), tX / A, tY / A, tZ / A);
+    return [c, A](double lambda) { return A * upsample::reflAt(c, lambda); };
 }
 
 // Reduce an arbitrary reflectance Spectrum to a linear-sRGB triple by integrating

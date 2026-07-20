@@ -1162,15 +1162,19 @@ private:
         // [0,1] (l = lightness). The `…line` heads (`rgbline`/`hsvline`/`hslline`)
         // instead take the K3 dominant-wavelength *emission* form: `rgbline r g b [sigma]`
         // emits a narrow band at the colour's dominant wavelength (near-monochromatic, so
-        // glass disperses it), width from saturation or the explicit `sigma` (nm). Meant
-        // for lights (`spd rgbline 0 0 1`); a reflectance has no single wavelength, but the
-        // form is accepted anywhere a spectrum is. (A head keyword, not a trailing modifier,
-        // because the parser stops a value at the next bareword.)
+        // glass disperses it), width from saturation or the explicit `sigma` (nm). The
+        // `…illum` heads (`rgbillum`/`hsvillum`/`hslillum`) take the K1 Jakob-Hanika
+        // *illuminant* upsample: a smooth, full-spectrum *emission* SPD (A·sigmoid) whose
+        // integral under the bare CIE observer reproduces the colour — the emitter analogue
+        // of `rgb`, right for coloured lights (`spd rgbillum 1 0.6 0.2`). Meant for lights;
+        // accepted anywhere a spectrum is. (Head keywords, not trailing modifiers, because
+        // the parser stops a value at the next bareword.)
         {
-            bool isLine = (h == "rgbline" || h == "hsvline" || h == "hslline");
-            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine) {
+            bool isLine  = (h == "rgbline"  || h == "hsvline"  || h == "hslline");
+            bool isIllum = (h == "rgbillum" || h == "hsvillum" || h == "hslillum");
+            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = isLine ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum) ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1179,6 +1183,7 @@ private:
                     double sigma = (w.size() > 4 && isNumber(w[4])) ? num(w[4]) : -1.0;
                     return rgbToLineEmission(c.x, c.y, c.z, sigma);
                 }
+                if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
                 return rgbToReflectanceJH(c.x, c.y, c.z);
             }
         }

@@ -899,11 +899,35 @@ static int checkUpsample() {
     double greyErr = std::max({std::fabs(gl.x - 0.5), std::fabs(gl.y - 0.5), std::fabs(gl.z - 0.5)});
     bool passC = greyErr < 1e-4;
 
-    bool pass = passA && passB && passW && passC;
+    // (d) Illuminant (emission) upsample round-trips: build the A·sigmoid emission
+    // SPD, integrate it under the *bare* CIE observer (illumBasis, no D65), convert
+    // XYZ -> linear sRGB, and compare to the input colour. Unlike reflectance, the
+    // magnitude is unbounded (carried by A), so even saturated primaries and the
+    // 1,1,1 white round-trip accurately.
+    const upsample::IllumBasis& IB = upsample::illumBasis();
+    double illumErr = 0.0;
+    for (const C& c : tests) {
+        if (c.r == 0.0 && c.g == 0.0 && c.b == 0.0) continue;   // black -> zero SPD
+        Spectrum spd = rgbToIlluminantJH(c.r, c.g, c.b);
+        double X = 0, Y = 0, Z = 0;
+        for (int i = 0; i < IB.N; ++i) {
+            double s = spd(IB.lam[i]);
+            X += s * IB.wX[i]; Y += s * IB.wY[i]; Z += s * IB.wZ[i];
+        }
+        Vec3 lin = xyzToLinearSrgb(Vec3{X, Y, Z});
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        illumErr = std::max(illumErr, e);
+        std::printf("[checkupsample] illum %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+    bool passD = illumErr < 2e-3;
+
+    bool pass = passA && passB && passW && passC && passD;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
     std::printf("[checkupsample] mid-grey round-trip = %.6f  (%s)\n", greyErr, passC ? "ok" : "BAD");
+    std::printf("[checkupsample] illuminant round-trip max error = %.5f  (%s)\n", illumErr, passD ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

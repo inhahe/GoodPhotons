@@ -1445,6 +1445,17 @@ ftrace's own language). Two follow-ups were captured:
       Materials would keep the reflectance default; lights would default to (or at least be able to opt into) the
       illuminant fit. Scope: an `upsample.h` illuminant variant + wire a tag through `evalSpectrum`'s `rgb`/`hsv`/
       `hsl` handlers; mirror in loom's spectrum grammar. Observable → README + VERSION bump when it lands.
+    - [x] **Illuminant upsample landed** *(2026-07-20, v0.10.3).* The Jakob-Hanika *illuminant* variant is in:
+          `rgbToIlluminantJH` (`src/upsample.h`) factors the SPD as `A·sigmoid(quadratic)` against the **bare** CIE
+          observer (no D65), so the sigmoid carries chromaticity and the scalar `A = 2·max(X,Y,Z)` carries the
+          (unbounded) magnitude — round-trips every colour, incl. saturated primaries and white, to <0.001 (see
+          `-checkupsample`). Chosen surface: **head keywords** `rgbillum`/`hsvillum`/`hslillum` (parallel to the K3
+          `…line` heads, since the parser drops trailing barewords), wired through `evalSpectrum` (`src/ftsl.h`) and
+          mirrored in loom's spectrum grammar (`IllumSpec`). The Gauss-Newton solver was refactored into a shared
+          `fitSigmoid()` so reflectance and illuminant fits share bit-identical arithmetic. Validated by
+          `scraps/illum_test.ftsl` → `png/illum_test.png`.
+    - [ ] **Still open:** other upsamplers (Smits 1999, Meng 2015, plain box/3-lobe) and a **named user mapping**
+          — a `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
 
 - [ ] **K2 — Analytic physical sky (`turbidity`).** ftrace has **no** procedural sky: environment lighting is only
       an image-based env map (`env { file … }`) or a constant-radiance env. `turbidity` (atmospheric haze: ~2 = clear

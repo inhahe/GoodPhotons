@@ -865,6 +865,15 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   `sigma` in nm. Purples/magentas (no real dominant wavelength) become a two-line
   violet+red mix. Meant for **lights** (`spd rgbline 0 0 1`); a reflectance has no
   single wavelength, but the form is accepted anywhere a spectrum is.
+- **`rgbillum r g b`** (also `hsvillum …`, `hslillum …`) — the Jakob–Hanika
+  *illuminant* upsample: the **emitter analogue of `rgb`**. Where `rgb` fits a bounded
+  (0,1) reflectance under D65, `rgbillum` fits a smooth, full-spectrum **emission** SPD
+  — modelled as `A·sigmoid(quadratic)` so the magnitude is unbounded — whose integral
+  under the *bare* CIE observer reproduces the colour exactly (round-trips to <0.001 for
+  every colour, including saturated primaries and white). Unlike `rgbline` this is a
+  broadband source, not a monochromatic spike, so it reads as a natural coloured light
+  rather than a laser line. Meant for **lights** (`spd rgbillum 1 0.6 0.2`); accepted
+  anywhere a spectrum is.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an

@@ -23,6 +23,9 @@ The accepted forms — exactly ftrace's ``evalSpectrum`` (``src/ftsl.h`` ~1106) 
 * the dominant-wavelength emission heads **`rgbline r g b [sigma]`** /
   **`hsvline …`** / **`hslline …`** → a narrow spectral line at the colour's dominant
   wavelength (:class:`LineSpec`);
+* the Jakob-Hanika *illuminant* heads **`rgbillum r g b`** / **`hsvillum …`** /
+  **`hslillum …`** → a smooth full-spectrum *emission* SPD reproducing the colour under
+  the bare observer (:class:`IllumSpec`), the emitter analogue of ``rgb``;
 * a library **reference** — ``glass:`` / ``metal:`` / ``reflectance:`` / ``filter:``
   / ``preset:`` / ``file:`` / ``spectrum:`` followed by a name / path;
 * a **record channel reference** used as a constant — ``RECORD.channel[i]`` or
@@ -47,6 +50,8 @@ from .values import ShapeError, as_color
 _COLOR_HEADS = ("rgb", "hsv", "hsl")
 # The dominant-wavelength emission heads (K3): `rgbline r g b [sigma]`, etc.
 _LINE_HEADS = {"rgbline": "rgb", "hsvline": "hsv", "hslline": "hsl"}
+# The Jakob-Hanika illuminant (full-spectrum emission) heads (K1): `rgbillum r g b`, etc.
+_ILLUM_HEADS = {"rgbillum": "rgb", "hsvillum": "hsv", "hslillum": "hsl"}
 _LIB_PREFIXES = ("glass:", "metal:", "reflectance:", "filter:", "preset:",
                  "file:", "spectrum:")
 
@@ -115,6 +120,17 @@ class LineSpec:
     space: str
     comps: Tuple[float, float, float]
     sigma: float | None = None
+
+
+@dataclass(frozen=True)
+class IllumSpec:
+    """The Jakob-Hanika *illuminant* emission form ``rgbillum r g b`` (and
+    ``hsvillum``/``hslillum``): a smooth, full-spectrum emission SPD (``A·sigmoid``)
+    whose integral under the bare CIE observer reproduces the colour — ftrace's
+    ``rgbToIlluminantJH`` / K1, the emitter analogue of :class:`ColorSpec`.  A *head
+    keyword* (not a trailing modifier) for the same parser reason as :class:`LineSpec`."""
+    space: str
+    comps: Tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -212,6 +228,11 @@ def parse_spectrum(text: str):
         _sp, comps = as_color(space + " " + " ".join(nums[:3]), default_space=space)
         sigma = _num(nums[3]) if len(nums) > 3 else None
         return LineSpec(space, comps, sigma)
+    if head in _ILLUM_HEADS:
+        # `rgbillum r g b` (hsvillum/hslillum) → full-spectrum illuminant emission.
+        space = _ILLUM_HEADS[head]
+        _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
+        return IllumSpec(space, comps)
     if head in _COLOR_HEADS:
         space, comps = as_color(text, default_space=head)
         return ColorSpec(space, comps)

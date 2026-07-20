@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from loom.grammar.spectrum import (  # noqa: E402
-    Band, Blackbody, ColorSpec, Const, Ior, LibRef, LineSpec, NamedWall,
-    RecordRef, WhiteWall, as_spectrum, parse_spectrum,
+    Band, Blackbody, ColorSpec, Const, IllumSpec, Ior, LibRef, LineSpec,
+    NamedWall, RecordRef, WhiteWall, as_spectrum, parse_spectrum,
 )
 from loom.grammar.values import ShapeError  # noqa: E402
 
@@ -105,6 +105,20 @@ def test_line_head_explicit_sigma():
 def test_line_head_wrong_arity_is_shape_error():
     with pytest.raises(ShapeError):
         parse_spectrum("rgbline 0 1")          # needs 3 components
+
+
+# ---- Jakob-Hanika illuminant emission heads (K1) ---------------------------
+
+def test_illum_heads_parse():
+    # `rgbillum r g b` (and hsvillum/hslillum) → IllumSpec
+    assert parse_spectrum("rgbillum 1 0.6 0.2") == IllumSpec("rgb", (1.0, 0.6, 0.2))
+    assert parse_spectrum("hsvillum 0.1 0.8 0.9") == IllumSpec("hsv", (0.1, 0.8, 0.9))
+    assert parse_spectrum("hslillum 0.6 0.7 0.5") == IllumSpec("hsl", (0.6, 0.7, 0.5))
+
+
+def test_illum_head_wrong_arity_is_shape_error():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgbillum 0 1")         # needs 3 components
 
 
 # ---- untagged bare colour is NOT a spectrum (matches ftrace) ---------------
