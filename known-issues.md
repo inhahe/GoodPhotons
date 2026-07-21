@@ -147,6 +147,28 @@ the existing shared forward photon trace, decorrelated per camera:
   needed if a use case wants view-independent beam reuse beyond the shared-pass model). Mode M/D
   untouched.
 
+### RESOLVED (2026-07-21): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
+**FIXED 2026-07-21.** The real root cause was narrower than the per-render-target
+`Film` note below: `struct Camera` (`src/camera.h`) *embeds a full `Film film;`
+member*, and `Camera::lookAt()` called `film.alloc()` on it. Every selected camera
+(600 `toRender` RenderCams **plus** 600 `meterPlan` MeterCams for the exposure_lock
+pre-pass) therefore carried a live 960×540 film (~16.6 MB) → ~20 GB of allocations
+*before a single photon was traced*. But nothing ever reads a `Camera` instance's
+embedded `xyz`/`hits` — `project()`/`genRay()`/`pixelPlaneArea()`/`pixelSolidAngle()`/
+`genLensRay()` only read `film.resX`/`resY` metadata; every actual render path
+(`renderForward`, `renderPhotonCamera`, `renderForwardShared`'s per-thread targets,
+the backward tracer, checkpoints) owns a *separate* `Film`. Fix: drop the
+`film.alloc()` in `lookAt()`, keep only `film.resX/resY`. Each camera falls from
+~16 MB to a few hundred bytes; verified the flyby now plateaus at ~938 MB (was
+~20 GB) and renders correct, energy-conserving frames. Bit-identical to baseline
+(only an unused allocation removed). This is cleaner than the "chunk the film
+allocation in batches" workaround floated below — it fixes *all* multi-camera
+renders, not just this scene. `render_gallery_flyby.bat` drives the full 600-frame
+mode-M flyby → `png/gallery_settled_fly/gallery_settled.mp4` (cap photons at ~2M per
+the mode-M shared-build caveat elsewhere in this file).
+
+Original report follows.
+
 ### BUG (2026-07-19; root-caused 2026-07-20): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
 `error: bad allocation` (exit 1) rendering `scenes/gallery_settled.ftsl`.
 **Root-caused 2026-07-20 — it is NOT a generic "scene too heavy" OOM.** With 26 GB

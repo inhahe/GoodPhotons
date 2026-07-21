@@ -116,7 +116,16 @@ struct Camera {
         tanHalfX = tanHalfY * (double)rx / (double)ry;
         halfFovY = 0.5 * fovYDeg * 3.141592653589793 / 180.0;
         setProjection(projection);   // (re)compute rEdge for the current projection
-        film.resX = rx; film.resY = ry; film.alloc();
+        // Store ONLY the film resolution metadata — project()/genRay()/pixelPlaneArea()/
+        // pixelSolidAngle()/genLensRay() read film.resX/resY to normalise the raster, but
+        // nothing ever accumulates into THIS camera's embedded xyz/hits buffers (every
+        // render path — renderForward, renderPhotonCamera, renderForwardShared's per-thread
+        // targets, the backward tracer, checkpoints — owns a SEPARATE Film). Allocating the
+        // ~res*32-byte buffer per camera is pure waste and, for a long camera_curve, fatal:
+        // a 600-frame flyby built 600 toRender + 600 meter cameras, each carrying a live
+        // 960x540 film (~16 MB), OOMing at ~20 GB before a single photon traced. Skipping
+        // alloc() here drops each camera to a few hundred bytes.
+        film.resX = rx; film.resY = ry;
     }
 
     // Select the lens projection and cache the vertical-edge image radius. Call
