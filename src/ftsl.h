@@ -2033,15 +2033,60 @@ private:
     // chain otherwise). Authored coordinates are transformed by `xf` FIRST, then
     // P()/Len() fold in the unit scale (→ metres). With xf = identity the result
     // is bit-identical to the pre-group path.
+    // Tessellate a sphere (authored center `c`, radius `r`) baked through a
+    // non-uniform / sheared affine `xf` into a smooth-normal triangle mesh, so a
+    // squashed / skewed sphere renders as the ellipsoid (or sheared quadric) the
+    // analytic primitive can't represent. Positions go through the affine; shading
+    // normals go through its inverse-transpose (`applyNormal`) so the surface stays
+    // smooth under non-uniform scale. Only the fallback — a uniform-scaled sphere
+    // keeps the fast analytic path in addSphere().
+    void addTessellatedSphere(Loaded& L, const Affine& xf, const Vec3& c,
+                              double r, int id) {
+        const int nlat = 48;   // latitude bands  (theta 0..PI)
+        const int nlon = 96;   // longitude steps (phi   0..2PI)
+        auto dirOf = [&](int i, int j) -> Vec3 {
+            double theta = PI * (double)i / nlat;
+            double phi   = 2.0 * PI * (double)j / nlon;
+            double st = std::sin(theta), ct = std::cos(theta);
+            return Vec3{st * std::cos(phi), ct, st * std::sin(phi)};  // y-up unit dir
+        };
+        auto pos = [&](const Vec3& d) { return P(xf.apply(c + d * r)); };
+        auto nrm = [&](const Vec3& d) { return normalize(xf.applyNormal(d)); };
+        auto uv  = [&](int i, int j) { return Vec3{(double)j / nlon, (double)i / nlat, 0.0}; };
+        for (int i = 0; i < nlat; ++i) {
+            for (int j = 0; j < nlon; ++j) {
+                Vec3 d00 = dirOf(i, j),     d01 = dirOf(i, j + 1);
+                Vec3 d10 = dirOf(i + 1, j), d11 = dirOf(i + 1, j + 1);
+                if (i != 0) {                       // skip degenerate north-pole tri
+                    Tri t{pos(d00), pos(d10), pos(d11), id, -1, {}};
+                    t.n0 = nrm(d00); t.n1 = nrm(d10); t.n2 = nrm(d11);
+                    t.uv0 = uv(i, j); t.uv1 = uv(i + 1, j); t.uv2 = uv(i + 1, j + 1);
+                    L.scene.tris.push_back(t);
+                }
+                if (i != nlat - 1) {                // skip degenerate south-pole tri
+                    Tri t{pos(d00), pos(d11), pos(d01), id, -1, {}};
+                    t.n0 = nrm(d00); t.n1 = nrm(d11); t.n2 = nrm(d01);
+                    t.uv0 = uv(i, j); t.uv1 = uv(i + 1, j + 1); t.uv2 = uv(i, j + 1);
+                    L.scene.tris.push_back(t);
+                }
+            }
+        }
+    }
     bool addSphere(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
         double r = dblOf(b, "radius", 1.0);
         int id = matFieldId(b, L, "sphere"); if (id < 0) return false;
-        // A sphere stays a sphere only under translate + rotation + UNIFORM scale;
-        // a non-uniform scale would make it an ellipsoid the analytic primitive
-        // cannot represent (see known-issues.md — true instancing/quadrics).
+        // A sphere stays an analytic sphere only under translate + rotation + UNIFORM
+        // scale. A non-uniform scale (or a shear) would make it an ellipsoid / sheared
+        // quadric the analytic primitive can't represent, so tessellate it into a
+        // smooth-normal mesh baked through the affine instead of failing.
         bool nonUniform = false; double s = xf.uniformScale(nonUniform);
-        if (nonUniform) { fail("sphere under non-uniform scale would be an ellipsoid; use translate + uniform scale (or a mesh)"); return false; }
+        if (nonUniform) {
+            addTessellatedSphere(L, xf, c, r, id);
+            // (A tessellated sphere has no analytic center/radius, so it is not
+            // registered in sphereByName_ — it can't serve as an analytic fog bound.)
+            return true;
+        }
         Vec3 wc = P(xf.apply(c));
         double wr = Len(r) * s;
         L.scene.spheres.push_back(Sphere{wc, wr, id});

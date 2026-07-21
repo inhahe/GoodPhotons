@@ -259,8 +259,9 @@ several children under a `Group`); it emits an ftsl `group { translate/rotate/sc
 whose composed affine ftrace bakes into world-space prims at load. Order matches ftrace
 (`src/mesh.h` `MeshXform`, `src/ftsl.h` `addGroup`): `world = translate + Rz·Ry·Rx·(scale ⊙
 (shear · local))`. **`shear`** is a real ftsl `group` statement (added alongside
-translate/rotate/scale); skew therefore works for quad/tri/mesh/sweep geometry, but analytic
-`sphere{}` still rejects non-uniform scale/shear (it would be an ellipsoid — use a mesh).
+translate/rotate/scale); skew works for quad/tri/mesh/sweep geometry, and a `sphere{}` under a
+non-uniform scale or shear is auto-tessellated by ftrace into a smooth-normal ellipsoid /
+sheared quadric (uniform-scaled spheres keep the fast analytic path).
 The same `Transform` doubles as a **dataset placement transform** via
 `Transform.inverse_apply` (see §6): a `Grid`/`Scatter` carrying one is sampled by
 inverse-mapping the world query into the dataset's local frame.

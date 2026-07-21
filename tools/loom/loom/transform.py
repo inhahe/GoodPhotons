@@ -21,9 +21,10 @@ shear ::
     z' =         z
 
 so ``a`` skews X along Y, ``b`` skews X along Z, ``c`` skews Y along Z.  This needs
-ftrace's ``shear`` statement (added alongside translate/rotate/scale in ``group``);
-analytic ``sphere{}`` cannot be sheared (it would become an ellipsoid) — use a mesh /
-sweep for skewed geometry.
+ftrace's ``shear`` statement (added alongside translate/rotate/scale in ``group``).
+A ``sphere{}`` under a non-uniform scale or shear is auto-tessellated by ftrace into a
+smooth-normal ellipsoid / sheared quadric mesh at load (a uniform-scaled sphere keeps
+the fast analytic path), so squashed and skewed spheres just work.
 """
 
 from __future__ import annotations

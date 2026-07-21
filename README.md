@@ -1078,9 +1078,11 @@ so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap a
 isosurface CSG/implicit just as easily as a mesh. `shear <a> <b> <c>` adds a
 unit-diagonal upper-triangular skew (`x' = x + a·y + b·z`, `y' = y + c·z`) to the
 group's affine, applied in the group's local frame (innermost, before scale/rotate);
-it lets quad/tri/mesh geometry be sheared into parallelograms. (Analytic `sphere`
-still rejects non-uniform scale/shear — it would be an ellipsoid; use `ellipsoid`
-or a mesh.)
+it lets quad/tri/mesh geometry be sheared into parallelograms. A `sphere` under a
+**non-uniform scale or shear** (which the analytic ray-sphere can't represent) is
+**automatically tessellated** into a smooth-normal ellipsoid / sheared quadric mesh
+at load — so squashed and skewed spheres just work; a uniform-scaled sphere keeps
+the fast analytic path.
 
 **Instancing.** `mesh_asset "name" { file … material … }` loads a mesh once into
 its local space; `mesh_instance { of "name"  translate … rotate … scale …

@@ -8,8 +8,13 @@ settable on **any** `Element` via `.transformed(translate=, rotate=, scale=, ske
 skew all animate. It emits an ftsl `group { translate/rotate/scale/shear … }`. ftrace's
 `group` grammar gained a `shear a b c` statement (`src/ftsl.h` `addGroup`), verified
 bit-identical to hand-sheared geometry (`scenes/_shear_{a,b,c}.ftsl`; A==B mean|diff|=0,
-A≠C). **Phase C (ellipsoid/quadric analytic sphere) is still open** — analytic `sphere{}`
-still rejects non-uniform scale/shear; use a mesh/sweep for skewed geometry.
+A≠C). **Phase C is also done** — a `sphere{}` under a non-uniform scale or shear is
+auto-tessellated by ftrace (`ftsl.h` `addTessellatedSphere`) into a smooth-normal
+ellipsoid / sheared quadric mesh at load; uniform-scaled spheres keep the fast analytic
+path. Verified: `scenes/_ellipsoid_test.ftsl` renders a flattened ellipsoid + a leaning
+sheared sphere. (A *true* analytic ray-quadric ellipsoid — no tessellation, exact
+silhouette, dual-backend — remains a possible future optimization, but is not needed for
+the feature.)
 
 <details><summary>Original plan (historical)</summary>
 
