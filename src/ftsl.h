@@ -2340,7 +2340,23 @@ private:
                 double k = num(sc->val.words[0]); scl = {k, k, k};
             }
         }
-        Affine world = parentXf.compose(affineFromTRS(tr, rot, scl));
+        // `shear a b c` (all optional, default 0) is a unit-diagonal upper-triangular
+        // shear applied in the group's LOCAL frame (innermost, before scale/rotate):
+        //   x' = x + a*y + b*z    y' = y + c*z    z' = z
+        // so a shears X along Y, b shears X along Z, c shears Y along Z. It composes
+        // as world = parent ∘ TRS ∘ Shear. Analytic spheres reject any shear (they
+        // would become ellipsoids, see addSphere); meshes/quads/triangles take it.
+        Vec3 shr{0, 0, 0};
+        vec3Of(b, "shear", shr);
+        Affine localXf = affineFromTRS(tr, rot, scl);
+        if (shr.x != 0.0 || shr.y != 0.0 || shr.z != 0.0) {
+            Affine sh;                 // identity, then fill the strict-upper triangle
+            sh.m[1] = shr.x;           // x += a*y
+            sh.m[2] = shr.y;           // x += b*z
+            sh.m[5] = shr.z;           // y += c*z
+            localXf = localXf.compose(sh);   // apply shear first, then scale/rotate
+        }
+        Affine world = parentXf.compose(localXf);
         // Child primitives are nested brace blocks; the transform-only statements
         // (translate/rotate/scale) carry no block and are skipped here.
         for (const auto& s : b.stmts) {
