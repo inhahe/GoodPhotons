@@ -2,6 +2,17 @@
 
 ## Per-object Transform (size / position / rotation / x·y·z skew), signal-modulatable
 
+**✅ DONE (Phases A + B).** Loom now has a general `Transform` (`loom/transform.py`)
+settable on **any** `Element` via `.transformed(translate=, rotate=, scale=, skew=)`
+(or a whole `Group`); every field is a `Signal`/`VecSignal` so position/size/rotation/
+skew all animate. It emits an ftsl `group { translate/rotate/scale/shear … }`. ftrace's
+`group` grammar gained a `shear a b c` statement (`src/ftsl.h` `addGroup`), verified
+bit-identical to hand-sheared geometry (`scenes/_shear_{a,b,c}.ftsl`; A==B mean|diff|=0,
+A≠C). **Phase C (ellipsoid/quadric analytic sphere) is still open** — analytic `sphere{}`
+still rejects non-uniform scale/shear; use a mesh/sweep for skewed geometry.
+
+<details><summary>Original plan (historical)</summary>
+
 **Status today:** loom has **no** general per-object transform. Each geometry class
 (`Sphere`, `Beads`, `SweptMesh`, `IsoMesh`, `Raw`, `Volume`, `Light`, …) emits its own
 fixed `.ftsl` positioning; there is no size/position/skew wrapper that applies to "any
@@ -59,9 +70,23 @@ general transform.
   - **Phase C (optional):** ellipsoid/quadric sphere so non-uniform scale + skew apply to
     analytic spheres too.
 
+</details>
+
 ---
 
 ## Decouple Grid / Scatter sampling curves from the data object
+
+**✅ DONE.** `Grid` / `Scatter` now carry an optional placement `Transform` via
+`.transformed(...)` (`loom/data.py` `_Transformable`). The stored samples stay in the
+dataset's fixed *local* frame; the field inverse-maps a world-space query into that frame
+(`Transform.inverse_apply`, wired through `_local_query` in `interp.py` for all six field
+classes — Grid/Vec/Scatter/Vec + RBF scalar/vec). So a world-space sampling curve stays
+put while moving/resizing/skewing the data object changes the values it reads back. The
+inverse is exact (round-trips the ftrace forward map) and every transform param may be a
+Signal (threads into the DAG, cycle-checked). Tests: `tests/test_dataset_transform.py`.
+Note: transforms apply to 2-D or 3-D datasets (2-D uses in-plane params only).
+
+<details><summary>Original plan (historical)</summary>
 
 **Problem today:** a `FieldCurve` (`interp.py` ~line 893) queries a `GridField` /
 `ScatterField` whose query point lives in the **same coordinate frame** as the dataset
@@ -88,3 +113,5 @@ back.
 world-space curve, so the values the curve returns change — which is the intended behavior.
 (`Affine.inverse()` already exists engine-side for reference; loom needs the equivalent in
 `mathnd.py` / the `Transform` type.)
+
+</details>

@@ -28,11 +28,19 @@ sweep for skewed geometry.
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Sequence, Union
 
-from .signals.core import Signal, Number
+from .signals.core import Signal, Number, Sin, Cos, as_signal
 from .signals.vector import VecSignal
 from .ftsl_emit import EmitCtx, vec3, fmt3
+
+_D2R = math.pi / 180.0
+
+
+def _rad(angle: Signal) -> Signal:
+    """Degrees→radians as a Signal expression (angle may itself be a Signal)."""
+    return as_signal(angle) * _D2R
 
 
 def _as_vec3(v) -> VecSignal:
@@ -94,6 +102,75 @@ class Transform:
         """Every VecSignal stored on this transform (for cycle checking)."""
         return [v for v in (self.translate, self.rotate, self.scale, self.skew)
                 if v is not None]
+
+    # ---- inverse mapping (dataset sampling frame) --------------------------
+    def inverse_apply(self, query) -> VecSignal:
+        """Map a **world-space** query point back into this transform's *local* frame.
+
+        The forward map is the same one :meth:`wrap` bakes into ftrace,
+        ``world = T + Rz·Ry·Rx·(S ⊙ (Shear·local))``; this returns ``local`` as a
+        VecSignal *expression*.  It is what decouples a sampling curve from a data
+        object: a :class:`~loom.data.Grid` / :class:`~loom.data.Scatter` stores its
+        values in a fixed local frame and carries a Transform placing it in world
+        space; a curve that lives in world space is inverse-mapped through this before
+        interpolation, so **moving / resizing / skewing the data object changes which
+        local coordinate each world curve point lands on — and therefore the value it
+        reads back.**  Every transform parameter may be a :class:`Signal`, so the whole
+        remap animates and threads into the modulation DAG.
+
+        Supports 2-D and 3-D queries.  In 2-D only the in-plane parameters act
+        (``translate``/``scale`` XY, ``rotate`` about Z, ``skew`` X-along-Y); the
+        out-of-plane components are ignored.
+        """
+        q = VecSignal.of(query)
+        d = q.dim
+        if d not in (2, 3):
+            raise ValueError(
+                "Transform.inverse_apply supports only 2-D or 3-D queries "
+                f"(got dim {d})")
+        c: List[Signal] = list(q.components)
+        # Undo, outermost first: translate, then rotation, then scale, then shear.
+        if self.translate is not None:
+            t = self.translate.components
+            c = [c[i] - t[i] for i in range(d)]
+        if self.rotate is not None:
+            c = self._inv_rotate(c, d)
+        if self.scale is not None:
+            s = self.scale.components
+            c = [c[i] / s[i] for i in range(d)]
+        if self.skew is not None:
+            c = self._inv_shear(c, d)
+        return VecSignal(c)
+
+    def _inv_rotate(self, c: List[Signal], d: int) -> List[Signal]:
+        r = self.rotate.components
+        if d == 2:
+            cz, sz = Cos(_rad(r[2])), Sin(_rad(r[2]))
+            x, y = c[0], c[1]
+            return [cz * x + sz * y, cz * y - sz * x]
+        cx, sx = Cos(_rad(r[0])), Sin(_rad(r[0]))
+        cy, sy = Cos(_rad(r[1])), Sin(_rad(r[1]))
+        cz, sz = Cos(_rad(r[2])), Sin(_rad(r[2]))
+        x, y, z = c
+        # Rz^T
+        x, y = cz * x + sz * y, cz * y - sz * x
+        # Ry^T
+        x, z = cy * x - sy * z, cy * z + sy * x
+        # Rx^T
+        y, z = cx * y + sx * z, cx * z - sx * y
+        return [x, y, z]
+
+    def _inv_shear(self, c: List[Signal], d: int) -> List[Signal]:
+        sk = self.skew.components
+        a = sk[0]
+        if d == 2:
+            # forward x' = x + a*y  ->  x = x' - a*y'
+            return [c[0] - a * c[1], c[1]]
+        b, cc = sk[1], sk[2]
+        z = c[2]
+        y = c[1] - cc * z
+        x = c[0] - a * y - b * z
+        return [x, y, z]
 
     # ---- ftsl emission (geometry) ------------------------------------------
     def wrap(self, inner: str, ctx: EmitCtx) -> str:

@@ -1071,11 +1071,16 @@ Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
-`group { translate … rotate … scale … <children> }` composes transform
+`group { translate … rotate … scale … shear … <children> }` composes transform
 hierarchies (baked to world space at load). Children may be `sphere`, `quad`,
 `triangle`, `mesh`, `mesh_instance`, `isosurface`, `light`, or nested `group`s —
 so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap an
-isosurface CSG/implicit just as easily as a mesh.
+isosurface CSG/implicit just as easily as a mesh. `shear <a> <b> <c>` adds a
+unit-diagonal upper-triangular skew (`x' = x + a·y + b·z`, `y' = y + c·z`) to the
+group's affine, applied in the group's local frame (innermost, before scale/rotate);
+it lets quad/tri/mesh geometry be sheared into parallelograms. (Analytic `sphere`
+still rejects non-uniform scale/shear — it would be an ellipsoid; use `ellipsoid`
+or a mesh.)
 
 **Instancing.** `mesh_asset "name" { file … material … }` loads a mesh once into
 its local space; `mesh_instance { of "name"  translate … rotate … scale …
