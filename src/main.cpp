@@ -1090,6 +1090,15 @@ static double g_vcmAlpha = 0.75;
 // single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
 static int g_heroC = hero::kHeroC;
 
+// PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
+// the shared A/B pass has each camera resample its own medium in-scatter point per beam
+// segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
+// instead of one frozen speckle pattern, while the photon flight is still traced once.
+// Only affects groups of >1 shared camera with participating media; single stills and
+// media-free scenes are byte-for-byte unchanged. Forces the CPU forward path (the GPU
+// shared kernel doesn't implement the per-camera resample yet).
+static bool g_beamGather = false;
+
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
 static void enableAnsiTerminal() {
@@ -1279,7 +1288,8 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                                              long long N, int nThreads,
                                              EnergyReport& eOut, bool diffraction = true,
                                              bool lensMode = false,
-                                             unsigned long long seedBase = 0) {
+                                             unsigned long long seedBase = 0,
+                                             bool beamGather = false) {
     int nc = (int)cams.size();
     // Per-thread × per-camera films (each thread accumulates into its own copies to
     // avoid shared-pixel races; merged per camera at the end).
@@ -1291,7 +1301,7 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     const bool heroOn = (g_heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
-        r.useHero = heroOn; r.heroC = g_heroC;
+        r.useHero = heroOn; r.heroC = g_heroC; r.beamGather = beamGather;
         // Identical seeding to renderForward. For model B this makes each camera's shared
         // film bit-identical to its standalone single-camera render (at seedBase 0); for
         // model A the aperture draws perturb the stream, so it matches in distribution.
@@ -3590,6 +3600,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
+        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
@@ -5584,8 +5595,8 @@ static int run(int argc, char** argv) {
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
-        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
-            useGpuForward = true;
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene) && !g_beamGather)
+            useGpuForward = true;   // -beams per-camera resample is CPU-only for now
     }
 #endif
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
@@ -5691,7 +5702,7 @@ static int run(int argc, char** argv) {
             else
 #endif
                 films = renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
-                                            groupMode == 'A', (unsigned long long)accN);
+                                            groupMode == 'A', (unsigned long long)accN, g_beamGather);
             for (int c = 0; c < nc; ++c) acc[c].merge(films[c]);
             accN += batchN;
             accE.emitted += e.emitted; accE.absorbed += e.absorbed; accE.sensor += e.sensor;

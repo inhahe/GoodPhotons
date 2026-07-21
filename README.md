@@ -52,6 +52,18 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   gather every frame of a camera flythrough (or every camera of a multi-camera
   render), so an *N*-frame flyby costs roughly one render's worth of photons instead
   of *N* — far more efficient than re-tracing the scene per frame.
+- **Decorrelated volumetric flybys (`-beams`, photon beams)** — the shared forward
+  mode-`B` pass normally splats one photon realisation to every camera, so a rainbow /
+  fogbow / glory (view-dependent **single** scattering) comes out with the *same*
+  frozen speckle welded into every frame of a flyby. Adding **`-beams`** (alias
+  `-photonbeams`) switches to a single-scattering **long-beam** estimator: the photon
+  crosses the medium straight (deposited once), and **each camera independently draws
+  its own in-scatter point** toward its own eye. Result: the *same* mean bow with
+  **independent per-frame noise** — the "fast AND best" combination (≈1× photon cost
+  across the flyby, correct per-view angle, clean non-frozen grain). It deliberately
+  drops the multiple-scatter haze wash, so the bow is actually *crisper* than the
+  shared baseline. CPU-only for now; forces `-device cpu`. Rainbows/fogbows/glories are
+  single scatter, so this loses nothing that matters for them.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
@@ -1975,6 +1987,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the **CPU** spectral tracers (modes `A`/`B`/`C`, `R`, and photon-map `M`/`S`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). GPU / BDPT (`D`) / VCM (`U`) ignore it (still single-λ) |
+| `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). **CPU-only** (forces `-device cpu`); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |

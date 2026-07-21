@@ -273,6 +273,18 @@ struct Renderer {
                                  // useHero is on (hero + heroC-1 secondaries). Runtime-
                                  // configurable via -heroc N, clamped to [1, kHeroMax];
                                  // defaults to kHeroC. C==1 collapses to single-λ.
+    bool beamGather   = false;   // PHOTON-BEAMS gather for the shared multi-camera pass
+                                 // (CLI -beams). When on and nCam>1, each camera samples
+                                 // its OWN collision point along every medium beam segment
+                                 // (its own RNG) instead of all cameras splatting the one
+                                 // shared collision point. The expensive photon flight is
+                                 // still traced once (shared, 1× cost), but the per-camera
+                                 // splats are now decorrelated — so a volumetric flyby
+                                 // (rainbow/fogbow/fog) gets INDEPENDENT per-frame noise
+                                 // instead of one frozen speckle pattern baked into every
+                                 // frame. Unbiased: each camera's resampled splat has the
+                                 // same expectation as the shared point splat (the free-
+                                 // flight collision pdf's transmittance cancels either way).
 
     // Photon-map deposit (ROADMAP item 1 / mode M). When non-null, every diffuse-family
     // surface vertex ALSO appends a Photon record here (view-independent radiance cache).
@@ -1370,6 +1382,16 @@ struct Renderer {
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
         };
 
+        // PHOTON-BEAMS gather (CLI -beams, shared multi-camera pass only): a per-photon
+        // RNG used ONLY to resample an INDEPENDENT medium-collision point for each camera's
+        // volume splat (see the mediumEvent block below). Seeded from the main stream so it
+        // is unique per photon and per thread; drawing it here perturbs `rng`, so this is
+        // gated on beamGather && nCam>1 to keep every other mode bit-for-bit unchanged.
+        const bool doBeamGather = beamGather && nCam > 1 && !forwardCatch && !scene.media.empty();
+        Pcg32 crng;
+        if (doBeamGather) crng.seed(((uint64_t)rng.next() << 32) ^ rng.next(),
+                                    ((uint64_t)rng.next() << 32) ^ rng.next());
+
         // GRADIENT-INDEX (GRIN): if any medium carries an `ior` field, photons bend
         // through it via the shared Eikonal marcher (grin.h) — the same curved geometry
         // the backward/BDPT tracers use, so all transport paths agree. Gated so ordinary
@@ -1392,7 +1414,10 @@ struct Renderer {
             bool mediumEvent = false;
             int scatterMed = -1;   // which medium scattered (index into scene.media)
             Vec3 mp;
-            if (!scene.media.empty()) {
+            // In -beams (photon-beams single-scatter) mode the photon does NOT redirect in
+            // the medium — it crosses in a straight beam and each camera gathers single-
+            // scatter independently below — so skip the analog collision sampling here.
+            if (!scene.media.empty() && !doBeamGather) {
                 double tMed; int which;
                 if (sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
                     dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
@@ -1418,9 +1443,51 @@ struct Renderer {
             }
 
             // Beer-Lambert attenuation over the free path just travelled inside glass.
+            // `betaPre` is the throughput at the segment start (before this attenuation),
+            // so a beam-gather camera can re-apply glass absorption to ITS own resampled
+            // collision distance tC instead of the photon's dEvent.
+            double betaPre = beta;
             {
                 double a = curAbsorb(lambda);
                 if (a > 0.0) beta *= std::exp(-a * dEvent);
+            }
+
+            // PHOTON-BEAMS single-scatter gather (CLI -beams, shared multi-camera pass).
+            // The photon crosses the medium in a STRAIGHT beam (the analog redirect above is
+            // skipped), and each camera independently samples ONE in-scatter point along that
+            // beam [ray.o, dSurf] with its OWN RNG stream `crng`, then splats it. Because the
+            // deposit (the shared photon flight, traced ONCE for the whole flyby) is decoupled
+            // from the per-camera gather, a volumetric flyby gets INDEPENDENT per-frame noise
+            // instead of the single frozen speckle pattern that the shared point splat bakes
+            // into every frame. Unbiased for SINGLE scattering: each per-camera resample is a
+            // free-flight collision (pdf σ_t·Tr) over the crossing, and connectVolume's
+            // albedo·phase·T_cam·β has that Tr cancelled — so E[per-camera splat] equals the
+            // exact single-scatter in-scatter integral, independent of the photon's own flight.
+            // Multiple scattering (a desaturating wash) is intentionally omitted: the right
+            // trade for a crisp view-dependent bow / fogbow / glory / crepuscular-ray flyby.
+            if (doBeamGather) {
+                if (nCam > 0 && !forwardCatch) {
+                    double aC = curAbsorb(lambda);
+                    for (int c = 0; c < nCam; ++c) {
+                        if (!(cams[c].cam && cams[c].film)) continue;
+                        double tC; int whichC;
+                        if (!sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, crng, tC, whichC))
+                            continue;   // this camera saw no in-scatter along this beam
+                        Vec3 xc = ray.o + ray.d * tC;
+                        double betaC = (aC > 0.0) ? betaPre * std::exp(-aC * tC) : betaPre;
+                        const Medium& smc = scene.media[whichC];
+                        if (lensMode) connectLensVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
+                        else          connectVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
+                        camSpecularSplatVolumeAll(scene, smc, &cams[c], 1, xc, ray.d, lambda, betaC, crng);
+                    }
+                }
+                // Attenuate the photon by the medium extinction over the whole crossing
+                // (single-scatter transmission) so surfaces behind the fog get correctly
+                // dimmed direct light; the removed energy (out-scattered + absorbed) is booked
+                // as absorbed. The photon then continues STRAIGHT to the surface below.
+                double before = beta;
+                beta *= mediaTransmittance(scene.media, ray.o, ray.d, dSurf, lambda, crng);
+                e.absorbed += (before - beta);
             }
 
             if (mediumEvent) {

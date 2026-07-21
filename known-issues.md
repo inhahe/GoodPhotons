@@ -69,6 +69,83 @@ at this scale. **Proper fix (deferred):** give the forward medium-scatter path a
 camera-connection term for participating media (so each scatter vertex connects to the camera with a
 proper importance weight, like BDPT does) instead of relying on the plain pinhole splat, or document
 that rainbow/fog-bow scenes should use mode D. Low priority — mode D covers the use case.
+(Note: a compact, dense, short-range fog *does* image in mode B — see `scenes/_rainbow_test.ftsl`,
+a room-scale droplet box flooded by a wide collimated beam, which shows a full centred bow in mode B
+though noisily. The gap is specifically thin/large-scale atmospheric slabs.)
+
+### ENHANCEMENT (2026-07-21): photon beams for a CHEAP, clean rainbow/volumetric FLYBY (shared deposit + per-camera gather) — **DONE (single-scatter long-beam, CPU `-beams`)**
+**DONE 2026-07-21.** Shipped as the `-beams` (alias `-photonbeams`) CLI flag on the shared forward
+mode-B pass. The deposit/gather decoupling is implemented as an **unbiased single-scattering
+long-beam estimator** rather than the full Jarosz beam-BVH (see "How it was actually built" below);
+this is the correct trade for a crisp view-dependent bow (rainbows/fogbows/glories ARE single
+scatter). Validated on `scenes/_rainbow_beams_decorr.ftsl` (two identically-placed mode-B cameras):
+baseline shared pass → camA/camB **bit-identical** (frozen speckle, the flaw); `-beams` → camA/camB
+**decorrelated** (93.6% of pixels differ) with a **matching mean** (123.29 vs 123.28) — i.e. same
+bow, independent per-frame noise, unbiased. `[energy] sum/emitted=1.000000`. The original problem
+statement and design are kept below for reference.
+
+**Problem.** A rainbow (or any volumetric single-scatter effect: fogbow, glory, crepuscular rays)
+is **view-dependent single scattering** — the phase angle θ is measured *to the eye*, so every
+camera/frame sees a different bow. On a flyby this forces a per-frame cost with today's integrators:
+- **Forward shared multi-camera pass** (`renderForwardShared`, `main.cpp` ~1264) traces ONE photon
+  flight and splats every volume vertex to *all* cameras — 1× photon cost for the whole flyby, and
+  the bow is per-camera-correct (each connection uses that camera's angle). BUT all frames ride the
+  *same* photon realisation → one **frozen noise/speckle pattern** baked into every frame, which
+  looks wrong in a video (hence a `camera_path` with `exposure_lock` is deliberately rendered
+  UN-shared, `main.cpp` ~5579-5602).
+- **Un-shared forward / mode D (BDPT) per frame** → independent per-frame noise (good video), correct
+  bow, but **N× cost** (retrace the whole light transport every frame). Mode D is the quality route
+  today (the entry above); it is inherently per-camera and cannot share across frames.
+- **Mode M (surface photon map) is the WRONG tool** and cannot help even if volumetric scattering were
+  added to it: photon mapping's payoff is caching the **view-independent** multiple-scatter / indirect
+  solution, but the bow is view-dependent **single** scatter — there is nothing view-independent to
+  cache about it. Mode M also currently has *no* participating-media scattering at all (only the
+  nested-dielectric IOR/Beer-Lambert stack, `photonmap_render.h`), so it renders scattering fog as if
+  it weren't there.
+
+**The fix — photon beams (Jarosz et al. 2011, "progressive photon beams").** Store each photon's
+*path segment through the medium* as a BEAM (origin, direction, power, per-λ), which is **view-
+independent** — deposit the beam set ONCE and reuse it for the whole flyby. Then each camera
+ray-marches its primary rays and gathers in-scattered radiance from the nearby beams, evaluating the
+droplet phase `p(θ,λ)` (`src/rainbow.h`) toward *its own* eye. This **decouples the expensive light
+deposit (shared, 1×) from the per-camera gather (independent noise, correct per-view angle)** — i.e.
+the "fast AND best" combination: ~1× photon cost across the flyby, clean non-frozen per-frame noise,
+correct view-dependent bow. It is essentially a noise-decorrelated version of the shared forward pass.
+
+**Scope / cost.** A substantial new volumetric integrator: a beam data structure + acceleration
+(beam BVH or the standard photon-beam grid), a ray-march-and-gather estimator on the camera side, the
+spectral/hero plumbing to carry per-λ beam power, and wiring into the flyby/checkpoint machinery
+(and ideally the GPU forward path). Only worth building if rainbow/fogbow/volumetric flybys become a
+recurring need. **For a one-off showcase, use mode D per frame (best quality, works today).** Related:
+the "forward medium-scatter next-event/camera-connection" proper-fix in the entry above is a smaller
+step that would make mode B converge the bow (and ride the shared pass for 1× cost) but does NOT solve
+the frozen-noise-in-video problem — only the deposit/gather decoupling of photon beams does.
+
+**How it was actually built (2026-07-21).** Instead of a stored beam data structure + BVH, the
+implementation exploits the fact that a rainbow is *single scatter* and folds deposit-and-gather into
+the existing shared forward photon trace, decorrelated per camera:
+- **Photon crosses the medium STRAIGHT** in `-beams` mode (`tracePhoton`, `src/render.h`): the analog
+  in-medium collision sampling is skipped (`doBeamGather = beamGather && nCam>1 && !forwardCatch &&
+  !media.empty()`), so the photon carries the full light path up to the medium and is attenuated by
+  extinction (`beta *= mediaTransmittance(...)`, the loss booked to `e.absorbed` so `sum/emitted=1`).
+  No analog scatter/redirect ⇒ no correlated realisation shared across cameras.
+- **Each camera independently draws its OWN single-scatter point** along the crossing with a
+  per-photon `Pcg32 crng` (seeded from the photon's RNG): `sampleMediaCollision` over `[0,dSurf]`,
+  then splat via `connectVolume` (+ `camSpecularSplatVolumeAll`). This is unbiased for single scatter
+  because the free-flight collision pdf's `Tr` cancels `connectVolume`'s `albedo·phase·T_cam·β`, so
+  `E = I(dSurf)` = the exact single-scatter in-scatter integral, and each camera's independent RNG
+  gives independent (non-frozen) noise. `connectLensVolume` used under `-lens`.
+- **Deliberately omits multiple scattering** (the desaturating haze wash the baseline shows) — that is
+  what makes the `-beams` bow visibly *crisper* than the shared baseline, at slightly lower total
+  brightness (single-scatter only). This is the intended quality trade for a clean view-dependent bow.
+- **Wiring** (`src/main.cpp`): `static bool g_beamGather`; `-beams`/`-photonbeams` flag; `beamGather`
+  param threaded into `renderForwardShared` → `r.beamGather`. **Forced onto CPU** (the GPU forward
+  path is not wired for it): `-beams` disables the GPU-forward auto-select. Rides the existing shared
+  chunking/checkpoint/`-resume` machinery unchanged. Bonus: single-scatter photons terminate at the
+  medium so the pass is *faster* than the full analog trace.
+- **Not done / future:** GPU port, multiple-scatter beams (full Jarosz), and the stored-beam BVH (only
+  needed if a use case wants view-independent beam reuse beyond the shared-pass model). Mode M/D
+  untouched.
 
 ### BUG (2026-07-19; root-caused 2026-07-20): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
 `error: bad allocation` (exit 1) rendering `scenes/gallery_settled.ftsl`.

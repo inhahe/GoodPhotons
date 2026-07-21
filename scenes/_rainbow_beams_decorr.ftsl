@@ -1,0 +1,44 @@
+# Photon-beams decorrelation test (CLI -beams). Two IDENTICALLY-placed mode-B cameras
+# form one shared multi-camera group (renderForwardShared). The rainbow lives in a
+# scattering medium's view-dependent phase, so both cameras splat the fog.
+#
+#   * WITHOUT -beams: both cameras splat the SAME shared photon collision points, so
+#     camA and camB come out BIT-IDENTICAL (one frozen speckle realisation) — the flaw
+#     that makes a shared flyby's noise look "welded" to the world.
+#   * WITH -beams: each camera resamples its OWN in-scatter point per beam segment, so
+#     camA and camB show DIFFERENT noise realisations but the SAME mean bow — proving the
+#     deposit (shared, 1x) is decoupled from the gather (independent per-frame noise).
+scene { units meters  spectral 360 830 1 }
+
+material "floor" { type diffuse  reflect rgb 0.22 0.24 0.28 }
+material "wall"  { type diffuse  reflect rgb 0.30 0.32 0.36 }
+material "postR" { type diffuse  reflect rgb 0.70 0.15 0.15 }
+material "postB" { type diffuse  reflect rgb 0.15 0.25 0.70 }
+
+quad { origin -6 0 -8   u 16 0 0   v 0 0 14   material floor }
+quad { origin -6 0 0.6  u 16 0 0   v 0 6 0     material wall }
+
+sphere { center 1.05 0.85 4.05  radius 0.28  material postR }
+sphere { center 2.95 0.85 4.05  radius 0.28  material postB }
+
+medium {
+    sigma_t 0.6   albedo 0.98
+    bounds { min -1 0 1   max 5 4 4.2 }
+    phase rainbow { droplet_um 500 }
+}
+
+group { translate -1.75 5.75 5.6   scale 250
+    light collimated { origin 0 0 0   dir 0 0 -1   spd blackbody 5800   lumens 900000 }
+}
+
+# Two cameras at the SAME pose — the decorrelation probe.
+camera "camA" {
+    eye 3.4 1.5 5.3   look_at 3.4 1.5 1.0   up 0 1 0
+    fov_y 100   mode B
+    film { res 320 240   exposure 11 }
+}
+camera "camB" {
+    eye 3.4 1.5 5.3   look_at 3.4 1.5 1.0   up 0 1 0
+    fov_y 100   mode B
+    film { res 320 240   exposure 11 }
+}
