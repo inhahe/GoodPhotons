@@ -442,6 +442,20 @@ in front of it occlude it (more spatially truthful), while keeping the always-vi
 depth against the opaque z-buffer the rasterizer already produces; expose as a toggle (CLI flag +/or
 editor control). Low risk — the z-buffer is already there.
 
+### DONE (2026-07-22): interactive hover-look spun the view off-screen on light scenes (frame-rate-locked turn rate)
+The live-window fly viewer's hover-look turn was applied **per rendered frame**
+(`kYaw = 0.040`, `kPitch = 0.030` rad/frame in main.cpp's interactive loop), so the turn
+speed scaled with render fps. On a heavy scene that self-limited, but a light model
+(e.g. `ftrace cloud1.glb`, which raster-previews at hundreds of fps) turned hundreds of
+times faster than intended: since it's *hover*-look (the view keeps turning while the
+cursor merely sits off-centre), just having the cursor slightly off-centre after clicking
+Reset flung the model out of frame almost instantly. **Fix:** integrate the turn by the
+wall-clock frame time — `kYaw`/`kPitch` are now rad/**second** (1.6 / 1.2) multiplied by
+the loop's already-computed `dt` (clamped to 0.25 s), making steering frame-rate
+independent. Free *translation* stays feedback-locked per frame (collision safety — can't
+skip through geometry between unseen frames); rotation-in-place never moves the eye, so it
+had no reason to be frame-locked. (0.19.15; README interactive-controls note updated.)
+
 ### DONE (2026-07-19): loom RBF scatter field rebuilt the interpolator every frame
 `RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) used to rebuild the
 `scipy.interpolate.RBFInterpolator` once per frame, gated only on the frame number, even when

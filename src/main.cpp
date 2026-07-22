@@ -4950,10 +4950,15 @@ static int run(int argc, char** argv) {
             // adjustable live with Ctrl+wheel.
             double       step   = sceneR * 0.02;     // per-frame / per-notch travel, world units
             // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
-            // (nav.lookX/lookY, -1..+1) is multiplied by these to turn the view PER RENDERED
-            // FRAME. Full deflection = kYaw/kPitch radians/frame; centre dead zone = no turn.
-            const double kYaw   = 0.040;             // max yaw   per frame at full pointer deflection
-            const double kPitch = 0.030;             // max pitch per frame at full pointer deflection
+            // (nav.lookX/lookY, -1..+1) is multiplied by these AND the wall-clock frame time
+            // to turn the view. Full deflection = kYaw/kPitch radians per SECOND, integrated
+            // by dt, so the turn speed is FRAME-RATE INDEPENDENT: a light scene that raster-
+            // previews at hundreds of fps turns at the same comfortable rate as a heavy one,
+            // instead of spinning the view off-screen. (Translation stays feedback-locked
+            // per-frame below — that's the collision-safety part; rotating in place can never
+            // fling the eye through geometry, so it has no reason to be frame-locked.)
+            const double kYaw   = 1.6;               // max yaw   rad/sec at full pointer deflection
+            const double kPitch = 1.2;               // max pitch rad/sec at full pointer deflection
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
             auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
                 double c = std::cos(ang), s = std::sin(ang);
@@ -5512,8 +5517,8 @@ static int run(int argc, char** argv) {
                     // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
                     // see rather than spinning past.
                     if (nav.lookX != 0.0 || nav.lookY != 0.0) {
-                        double yaw   = -nav.lookX * kYaw;     // pointer right -> turn right
-                        double pitch = -nav.lookY * kPitch;   // pointer down  -> look down
+                        double yaw   = -nav.lookX * kYaw   * dt;   // pointer right -> turn right (rad/sec x dt)
+                        double pitch = -nav.lookY * kPitch * dt;   // pointer down  -> look down  (rad/sec x dt)
                         fwd = norml(rotAxis(fwd, worldUp, yaw));
                         Vec3 right = cross(fwd, worldUp);
                         double rl = std::sqrt(dot(right, right));

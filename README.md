@@ -420,9 +420,12 @@ paths they can capture at all**.
 > acts like a joystick whose distance from the window centre sets how fast the view
 > turns (centre = a dead zone that holds still so you can see the scene; toward an edge
 > = keep turning that way), and moving the pointer off the window (to the title bar,
-> another app, etc.) stops the turn entirely. Because the turn is applied **per rendered
-> frame** (like the fly motion), a heavy scene turns in careful steps you actually see
-> rather than spinning past. The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
+> another app, etc.) stops the turn entirely. The turn rate is **wall-clock-based**
+> (radians per second, integrated by the frame time), so steering feels the same
+> whether a scene raster-previews at 20 fps or 300 — a light model won't spin off-screen
+> at the slightest cursor offset. (Free *translation* stays feedback-locked per frame so
+> you can't fly through geometry between two frames you never saw.) The window title
+> shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
 > the live window's resolution — drag a corner to make the preview smaller (and
 > snappier) or larger (and sharper); the aspect ratio and the readout are
 > resolution-independent, so this only trades preview sharpness for speed while you
