@@ -76,11 +76,60 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`render_cuda.cu`** (~7000) — the whole GPU backend: megakernel + wavefront
   forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
-  buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). `raster_cuda.cu` = GPU raster.
+  buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). `raster_cuda.cu` = GPU raster
+  (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
 - **`record.h` / `render_progress.h`** — run records, live status line
   (`[live] … photons, ~N% noise`), noise estimation for `-noise` budgets.
+
+## GPU raster pipeline (`raster_cuda.cu`)
+
+Powers `-raster -device gpu` and the interactive explorer's per-frame redraws;
+steady-state cost (independent of launch/scene build/upload) is measured with
+`-raster-bench N`. Four device passes per frame:
+
+- **A — project** (`kProject`): one thread per slot, register-resident 8-case
+  near-plane clip. Geometry is split hot/cold: `DGeo` (36 B — screen verts, invd,
+  flags' companion) is written for every surviving slot, `DAttr` (120 B — the
+  attribute payload) only for clipped slots that needed new vertices. A dense int
+  `flags[]` (valid / clear / clipped) drives later passes.
+- **B — classify + raster** (`kClassify`, `kRasterSmall/Med/Large`): slots are
+  binned by clamped bbox pixel count (≤128 small, ≤16 384 med, else large) into
+  device lists; raster kernels merge into a 64-bit packed `(invd_bits<<32)|slot`
+  visibility buffer via `atomicMax` (order-independent ⇒ bit-identical under any
+  thread mapping). Kernels read bin counts **from device memory** (`dbinCnt`,
+  5 ints: 3 counts + med/large ticket counters), so the host never reads counts
+  back and the whole frame enqueues without a mid-frame WDDM flush. Work mapping
+  per bin: **small** = 1:1 thread↔item under an upper-bound grid (the hardware
+  block scheduler load-balances millions of variable-cost items better than any
+  grid-stride loop); **med** = warp-level ticket queue (lane 0 `atomicAdd` +
+  `__shfl_sync` broadcast, 32 lanes stride rows); **large** = block-level ticket
+  queue (shared-mem ticket, block strides rows). Heavy variable-cost bins need
+  dynamic balancing — static grid-stride created straggler warps (+0.5 ms on
+  gallery); never ticket the small bin (millions of atomics would serialize).
+- **C — shade** (`kShade`): one thread per pixel resolves `vis` → shaded float
+  RGB. Optional see-through mode then runs a fill+clear pass (`kFillF`+`kClear`);
+  its `atomicMulF` has a benign 1-px race (see known-issues).
+- **D — expose + encode**: device luminance histogram rounds give an *exact* p99
+  white point (readbacks only on the first frame; later frames reuse the cached
+  exposure unless the histogram shifts), then `kToneMap` encodes RGB8 on device;
+  one pinned-memory D2H of the final image.
+
+The frame is **sync-free**: no `cudaDeviceSynchronize` anywhere; only real data
+dependencies block (first-frame histogram readbacks, final image download). Errors
+surface through the blocking copies' return codes plus one sticky
+`cudaGetLastError()` sweep per frame. Per-pass profiling (`-raster-bench`'s
+breakdown) records CUDA events into the stream between passes and resolves them
+once after the download — zero overhead when disabled.
+
+Perf state (2026-07 campaign, opts 1–8, RTX 4090 @1600×900): cornell **1.97 ms**
+(508 fps), gallery (5.08 M tris) **~4.45 ms** (~225 fps), glassgal **5.12 ms** —
+~22–25× vs the 0.19.0 baseline. Passes sit near memory-bandwidth floors; the
+remaining ~1.1 ms is host-side (result-vector copy, WDDM submit, bench loop).
+HIP portability note: the alias block deliberately does **not** alias
+`__shfl_sync`, so a HIP build fails loudly at kRasterMed instead of silently
+mis-broadcasting on wave64 GPUs (see known-issues).
 
 ## Threading model (CPU)
 

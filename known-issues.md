@@ -48,6 +48,18 @@ harnesses, which must A/B ref-vs-new within one run (as scraps/rb_verify.sh does
 than compare hashes across sessions. Proper fix if ever needed: deterministic ordered
 reduction (sort fragments per pixel by slot index, or accumulate in fixed-point).
 
+### MINOR tech debt (2026-07-22): HIP alias block deliberately omits `__shfl_sync` (kRasterMed ticket broadcast)
+
+`kRasterMed` in src/raster_cuda.cu broadcasts its warp ticket with
+`__shfl_sync(0xffffffffu, li, 0)`. The file's HIP compatibility alias block does **not**
+alias it, on purpose: a naive `__shfl` alias would compile on ROCm but silently
+mis-broadcast on wave64 GPUs (64-lane wavefronts vs the 32-lane mask/stride the kernel
+assumes), dropping triangles. As written, a HIP build fails loudly at the call site
+instead. Proper fix when HIP is actually targeted: make the ticket queue wave-size-aware
+(`warpSize`-based lane math + the matching wave-wide shuffle/ballot intrinsics). No
+impact on CUDA builds; HIP remains untested/no-AMD-hardware anyway (see the HIP entry
+near the end of this file).
+
 ### FIXED (2026-07-21): mode D heap-use-after-free (dangling `Vertex&` across `push_back`) + per-work-unit RNG seeding makes all CPU spp/photon modes chunk- and resume-independent
 
 Two intertwined fixes, one commit (v0.18.2):
