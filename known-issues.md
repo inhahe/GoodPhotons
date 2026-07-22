@@ -3190,6 +3190,22 @@ correctly on **both** backends.
   (~16 s/frame at 400k/spp3, 960×540 → ~3–5 h for 600 frames). `render_gallery_flyby.bat`
   therefore forces `-device cpu`. Fixing the GPU host-side build is the unblock that
   would make the flyby render in minutes instead of hours.
+- **CORRECTION 2026-07-21 — the "GPU hang" above was a MISDIAGNOSIS; the real cost is
+  the mode-M CPU meter pre-pass, not the GPU photon-map build.** `gallery_settled.ftsl`
+  uses `exposure_lock` (EXPLOCK_AVERAGE), so `meterAnchor` (main.cpp ~5484) runs a
+  CPU-only metering phase BEFORE any GPU render, **regardless of `-device`**: for mode M
+  it builds a ~4M-photon **CPU** photon map once (`meterN = clamp(W·H·40, 500k, 4M)` = 4M
+  at 960×540) and then gathers up to `kMeterMax = 64` frames at `meterSpp = 16` on the
+  CPU. That front-loaded phase is 10,000+ CPU-seconds (~28+ min) during which the GPU
+  correctly sits at ~1–6 % and **zero frames are written** (meter frames aren't saved) —
+  exactly the "hang" symptom I attributed to `renderPhotonMapSharedCuda`. Killing at
+  3–8 min just killed it mid-meter, before the GPU render ever started. So: the GPU
+  shared build is NOT known to hang at 2M/960×540; it was never reached. **The real
+  proper fix is to make the mode-M meter cheap** — e.g. drop `meterN`/`meterSpp` for the
+  noise-robust p99 anchor, cap `kMeterMax` lower, or GPU-accelerate `meterAnchor` — after
+  which `-device gpu` should be re-tested on the full-res flyby before concluding anything
+  about the GPU build path. (The `-r 320 180` "2M in ~2 min" run was fast partly because
+  its meter was also tiny: `meterN` scales with `W·H`.)
 
 ## Mode-M shared render ignores `-window` — no live preview opens (2026-07-21)
 - **Symptom:** rendering the gallery `fly` curve in mode M with `-window` never opens
