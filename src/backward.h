@@ -55,6 +55,30 @@ struct BackwardRenderer {
     int  heroC = hero::kHeroC;  // wavelengths bundled per camera path when hero is on
                                 // (runtime -heroc N, clamped to [1, kHeroMax]; 1 = single-λ)
 
+    // Per-sample cache of emitter-SPD evaluations at the path's wavelengths. The
+    // wavelengths are fixed for the whole camera path, but every NEE connection
+    // used to re-evaluate em.spdFn(λ) — a std::function typically wrapping the
+    // full Planck formula (exp + pow per call) — per emitter per bounce, and
+    // Scene::invPdfLambda re-evaluated ALL emitters' SPDs per wavelength again at
+    // sample setup. Profiling mode R showed the spdFn dispatch + blackbody math
+    // at ~40% of CPU time. renderRows now evaluates spdFn once per (emitter,
+    // wavelength) per sample; NEE and the invPdf setup read the table. `lam`
+    // points at the pristine per-sample wavelength array; a fluorescent bounce
+    // can REWRITE the path's local wavelength (Stokes shift), so readers must
+    // check matches() and fall back to a live spdFn evaluation when the path's
+    // wavelengths no longer equal the cached ones. Cached values are the exact
+    // doubles spdFn returned and the consumers keep the same iteration order and
+    // arithmetic shape, so images stay bit-identical.
+    struct SpdCache {
+        const double* lam = nullptr;  // wavelengths the table was built for
+        const double* spd = nullptr;  // emitter-major: spd[e*C + i] = emitters[e].spdFn(lam[i])
+        int C = 0;
+        bool matches(const double* l, int nUp) const {
+            for (int i = 0; i < nUp; ++i) if (l[i] != lam[i]) return false;
+            return true;
+        }
+    };
+
     // Next-event estimation: connect a surface vertex to each area emitter (the
     // integral splits by light, summed unbiasedly). `invPdfLambda` = emitG/g(lambda)
     // is the reciprocal of the sampled-wavelength pdf; multiplied by an emitter's
@@ -133,7 +157,7 @@ struct BackwardRenderer {
     }
 
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
-                    double lambda, Pcg32& rng) const {
+                    double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -142,10 +166,18 @@ struct BackwardRenderer {
         // along ngo so it clears the true surface rather than the shading normal.
         const Vec3 ngo = orientedGeoN(h);
         const bool med = scene.backwardMedium().enabled;
-        for (const auto& em : scene.emitters) {
+        // The cache is keyed on wavelength slot 0, so a scalar caller inside a hero
+        // path (post-de-hero interactMaterial) reuses the hero table's i==0 column;
+        // a fluorescent λ-switch fails matches() and falls back to a live spdFn call.
+        const bool cached = spdCache && spdCache->matches(&lambda, 1);
+        const int nEm = (int)scene.emitters.size();
+        for (int e = 0; e < nEm; ++e) {
+            const Emitter& em = scene.emitters[e];
             double dist = 0.0, w = 0.0;
             if (!emitterGeom(scene, h, ngo, em, rng, dist, w)) continue;
-            double contrib = (rho / PI) * (em.spdFn(lambda) * invPdfLambda) * w;
+            double spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
+                                 : em.spdFn(lambda);
+            double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
             if (med)                                              // Beer-Lambert on the shadow ray
                 contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
             total += contrib;
@@ -159,13 +191,22 @@ struct BackwardRenderer {
     // hero fast path, so there is no medium transmittance term.
     void neeLightHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                       const double* thr, const double* lam, const double* invPdf,
-                      int nUp, Pcg32& rng) const {
+                      int nUp, Pcg32& rng, const SpdCache* spdCache) const {
         const Vec3 ngo = orientedGeoN(h);
-        for (const auto& em : scene.emitters) {
+        const bool cached = spdCache && spdCache->matches(lam, nUp);
+        const int nEm = (int)scene.emitters.size();
+        for (int e = 0; e < nEm; ++e) {
+            const Emitter& em = scene.emitters[e];
             double dist = 0.0, w = 0.0;
             if (!emitterGeom(scene, h, ngo, em, rng, dist, w)) continue;
-            for (int i = 0; i < nUp; ++i)
-                L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * w;
+            if (cached) {
+                const double* spdE = spdCache->spd + (size_t)e * (size_t)spdCache->C;
+                for (int i = 0; i < nUp; ++i)
+                    L[i] += thr[i] * (rho[i] / PI) * (spdE[i] * invPdf[i]) * w;
+            } else {
+                for (int i = 0; i < nUp; ++i)
+                    L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * w;
+            }
         }
     }
 
@@ -175,9 +216,15 @@ struct BackwardRenderer {
     // Greenstein phase function; the shadow ray carries fog transmittance. This is
     // the backward mirror of the forward tracer's connectVolume().
     double neeVolume(const Scene& scene, const Vec3& p, const Vec3& wIn,
-                     double lambda, double invPdfLambda, Pcg32& rng) const {
+                     double lambda, double invPdfLambda, Pcg32& rng,
+                     const SpdCache* spdCache = nullptr) const {
         double total = 0.0;
-        for (const auto& em : scene.emitters) {
+        const bool cached = spdCache && spdCache->matches(&lambda, 1);
+        const int nEmV = (int)scene.emitters.size();
+        for (int e = 0; e < nEmV; ++e) {
+            const Emitter& em = scene.emitters[e];
+            const double spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
+                                       : 0.0;   // live spdFn below when not cached
             if (em.collimated) continue;
             if (em.shape == EmitterShape::Spot) {
                 // Point spot at a volume vertex: no surface cosine, cone falloff only.
@@ -191,7 +238,7 @@ struct BackwardRenderer {
                 double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 double albedo = scene.backwardMedium().albedo(lambda);
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
-                double emitW = em.spdFn(lambda) * invPdfLambda;
+                double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
                 total += albedo * phase * emitW * fall / dist2 * T;
                 continue;
             }
@@ -207,7 +254,7 @@ struct BackwardRenderer {
                               em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             double albedo = scene.backwardMedium().albedo(lambda);
-            double emitW = em.spdFn(lambda) * invPdfLambda;
+            double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
             double contrib;
             if (coneSampled) {
                 if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
@@ -320,7 +367,7 @@ struct BackwardRenderer {
     bool interactMaterial(const Scene& scene, const Material& m, const Hit& h, Renderer& mats,
                           Ray& ray, double& lambda, double& invPdfLambda, double& thr, double& L,
                           bool& specularArrival, double& contBsdfPdf, MediumStack& stk,
-                          Pcg32& rng) const {
+                          Pcg32& rng, const SpdCache* spdCache = nullptr) const {
         switch (m.type) {
             case MatType::Dielectric: {
                 // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002). The
@@ -425,7 +472,7 @@ struct BackwardRenderer {
                 // fluorescent channel excites at a separately-sampled lambdaIn (Stokes
                 // shift). Both channels NEE; one stochastic continuation carries indirect.
                 double rhoEl = clamp01(m.reflect(lambda));   // elastic base at lambda(out)
-                L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng);
+                L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng, spdCache);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoEl, invPdfLambda, lambda, rng);
                 double Mint = m.fluoEmitSampler.integral;
@@ -441,7 +488,9 @@ struct BackwardRenderer {
                         fluoroWeights(m, lambdaIn, rhoIn, aEffIn);   // shared with forward
                         rhoFluo = aEffIn * m.fluoYield;              // reradiation albedo @lambdaIn
                         if (rhoFluo > 0.0) {                          // fluoro DIRECT NEE
-                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
+                            // (lambdaIn ≠ the cached wavelengths → matches() fails and
+                            // this evaluates spdFn live, exactly as before.)
+                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache);
                             if (scene.envIndex >= 0)
                                 L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
                         }
@@ -473,11 +522,11 @@ struct BackwardRenderer {
                 double rhoT = clamp01(m.transmit(lambda));
                 double sum = rhoR + rhoT;
                 if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
-                L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng);
+                L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
                 Hit hb = h; hb.n = -h.n;                 // back hemisphere for the transmit lobe
-                L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
                 double u = rng.uniform();
@@ -497,7 +546,7 @@ struct BackwardRenderer {
             case MatType::Diffuse:
             default: {
                 double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-                L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng);
+                L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache);
                 if (scene.envIndex >= 0)   // env-NEE toward the sky (MIS'd on miss)
                     L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng);
                 // Russian roulette on the albedo (throughput unchanged on survival).
@@ -515,7 +564,7 @@ struct BackwardRenderer {
     // `invPdfLambda` = emitG/g(lambda), the reciprocal of the sampled-wavelength
     // pdf; an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
     double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
-                    Pcg32& rng) const {
+                    Pcg32& rng, const SpdCache* spdCache = nullptr) const {
         double L = 0.0, thr = 1.0;
         bool specularArrival = true;   // camera ray may see the light directly
         double contBsdfPdf = 0.0;      // solid-angle pdf of the current continuation
@@ -566,7 +615,7 @@ struct BackwardRenderer {
                             double a = curAbsorb(lambda);
                             if (a > 0.0) thr *= std::exp(-a * tMed);
                         }
-                        L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
+                        L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng, spdCache);
                         if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                             L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
                         if (rng.uniform() >= scene.backwardMedium().albedo(lambda)) return L; // absorbed
@@ -644,7 +693,7 @@ struct BackwardRenderer {
                 L += thr * m.emit(lambda) * invPdfLambda;
 
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
-                                  specularArrival, contBsdfPdf, stk, rng))
+                                  specularArrival, contBsdfPdf, stk, rng, spdCache))
                 return L;                                 // path terminated in the interaction
         }
         return L;
@@ -660,7 +709,8 @@ struct BackwardRenderer {
     // caller restricts this to scenes WITHOUT participating media / GRIN / a physical
     // lens, so those branches are absent here. Fills Lout[0..C).
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
-                      const double* invPdfIn, int C, double* Lout, Pcg32& rng) const {
+                      const double* invPdfIn, int C, double* Lout, Pcg32& rng,
+                      const SpdCache* spdCache = nullptr) const {
         double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
         for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; L[i] = 0.0; }
         bool secAlive = (C > 1);
@@ -750,11 +800,11 @@ struct BackwardRenderer {
                         if (s > 1.0) { rr /= s; rt /= s; }       // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
                     }
-                    neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
+                    neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
                     Hit hb = h; hb.n = -h.n;                     // back hemisphere (transmit lobe)
-                    neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                    neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
                     double sumHero = rhoR[0] + rhoT[0];
@@ -787,7 +837,7 @@ struct BackwardRenderer {
                     // the shared scalar interaction on the (boosted) hero channel.
                     deHero();
                     if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0], L[0],
-                                          specularArrival, contBsdfPdf, stk, rng)) { finish(); return; }
+                                          specularArrival, contBsdfPdf, stk, rng, spdCache)) { finish(); return; }
                     break;
                 }
                 case MatType::Diffuse:
@@ -795,7 +845,7 @@ struct BackwardRenderer {
                     double rho[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                    neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
+                    neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
                     double rhoHero = rho[0];
@@ -828,6 +878,11 @@ struct BackwardRenderer {
         const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
+        // Per-sample emitter-SPD table (see SpdCache): nEm×C (nEm×1 on the scalar
+        // path), allocated once per renderRows call (i.e. per thread) and refilled
+        // for every sample.
+        const int nEm = (int)scene.emitters.size();
+        std::vector<double> spdBuf((size_t)nEm * (size_t)(useHero ? C : 1));
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -841,20 +896,37 @@ struct BackwardRenderer {
                         // valid pdf; dead secondaries (pdf 0) carry invPdf 0 and splat 0.
                         double u = rng.uniform();
                         double lamA[hero::kHeroMax], invA[hero::kHeroMax];
-                        double pdf0 = 0.0;
-                        lamA[0] = scene.emitSampler.sampleAt(u, pdf0);
-                        if (pdf0 <= 0) continue;
-                        invA[0] = scene.invPdfLambda(lamA[0]);
+                        double pdfA[hero::kHeroMax];
+                        pdfA[0] = 0.0;
+                        lamA[0] = scene.emitSampler.sampleAt(u, pdfA[0]);
+                        if (pdfA[0] <= 0) continue;
                         for (int i = 1; i < C; ++i) {
                             double uu = u + (double)i / C;
                             if (uu >= 1.0) uu -= 1.0;            // wrap into [0,1)
-                            double pdfi = 0.0;
-                            lamA[i] = scene.emitSampler.sampleAt(uu, pdfi);
-                            invA[i] = (pdfi > 0.0) ? scene.invPdfLambda(lamA[i]) : 0.0;
+                            pdfA[i] = 0.0;
+                            lamA[i] = scene.emitSampler.sampleAt(uu, pdfA[i]);
                         }
+                        // Fill the per-sample SPD table, then derive invA from it by
+                        // replicating Scene::invPdfLambda on the cached values (same
+                        // emitter order, same zero guard — bit-identical). The NEE
+                        // connections down the path then reuse the table instead of
+                        // re-dispatching spdFn per emitter per bounce.
+                        for (int e = 0; e < nEm; ++e) {
+                            const Emitter& em = scene.emitters[e];
+                            for (int i = 0; i < C; ++i)
+                                spdBuf[(size_t)e * C + i] = em.spdFn(lamA[i]);
+                        }
+                        for (int i = 0; i < C; ++i) {
+                            if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; continue; }
+                            double g = 0.0;
+                            for (int e = 0; e < nEm; ++e)
+                                g += scene.emitters[e].geomWeight() * spdBuf[(size_t)e * C + i];
+                            invA[i] = (g > 0.0) ? scene.emitG / g : 0.0;
+                        }
+                        SpdCache spdCache{lamA, spdBuf.data(), C};
                         Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
                         double Lh[hero::kHeroMax];
-                        radianceHero(scene, ray, lamA, invA, C, Lh, rng);
+                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache);
                         for (int i = 0; i < C; ++i)
                             film.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
                                              * (Lh[i] / C));
@@ -864,7 +936,16 @@ struct BackwardRenderer {
                     double pdf = 0.0;
                     double lambda = scene.emitSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
-                    double invPdfLambda = scene.invPdfLambda(lambda); // exact emitG/g(lambda)
+                    // Fill the per-sample SPD table (C=1) and derive invPdfLambda from
+                    // it, replicating Scene::invPdfLambda on the cached values (same
+                    // emitter order, same zero guard — bit-identical, = emitG/g(λ)).
+                    for (int e = 0; e < nEm; ++e)
+                        spdBuf[e] = scene.emitters[e].spdFn(lambda);
+                    double gSum = 0.0;
+                    for (int e = 0; e < nEm; ++e)
+                        gSum += scene.emitters[e].geomWeight() * spdBuf[e];
+                    double invPdfLambda = (gSum > 0.0) ? scene.emitG / gSum : 0.0;
+                    SpdCache spdCache{&lambda, spdBuf.data(), 1};
                     if (cam.hasLens()) {
                         // Physical multi-element lens: trace the camera ray from the
                         // film out through the real glass interfaces at this wavelength
@@ -875,12 +956,12 @@ struct BackwardRenderer {
                         Ray ray; double wLens = 0.0;
                         if (!cam.genLensRay(px, py, jx, jy, u1, u2, lambda, ray, wLens))
                             continue;                       // clipped by an element / the stop
-                        double L = radiance(scene, ray, lambda, invPdfLambda, rng);
+                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache);
                         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens));
                         continue;
                     }
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
-                    double L = radiance(scene, ray, lambda, invPdfLambda, rng);
+                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache);
                     film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * L);
                 }
             }
