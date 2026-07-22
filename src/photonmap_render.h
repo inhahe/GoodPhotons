@@ -156,13 +156,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // Density estimate at y, folding the visible-point reflectance per photon
                 // wavelength: L_o(vis) += rho(vis,l_p) * [rho(y,l_p)/pi] * Phi_p / (pi r^2 N).
                 Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double) {
+                pm.query(h.p, [&](const Photon& ph, double, int k) {
                     if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                     double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
                     double f = rhoY * (1.0 / PI);
-                    g += Vec3(cieX(ph.lambda), cieY(ph.lambda), cieZ(ph.lambda))
-                         * (f * rhoV * (double)ph.power);
+                    g += pm.cie[k] * (f * rhoV * (double)ph.power);   // == cie(lambda_p), precomputed
                 });
                 L += g * (norm * thr);
                 return L;
@@ -332,12 +331,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 //   L_r(x) = (1/N) sum_p f_r * Phi_p / (pi r^2), f_r = rho/pi (Lambertian),
                 // accumulated in XYZ per photon wavelength.
                 Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double) {
+                pm.query(h.p, [&](const Photon& ph, double, int k) {
                     if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
-                    g += Vec3(cieX(ph.lambda), cieY(ph.lambda), cieZ(ph.lambda))
-                         * (f * (double)ph.power);
+                    g += pm.cie[k] * (f * (double)ph.power);          // == cie(lambda_p), precomputed
                 });
                 L += g * (norm * thr);
                 return L;

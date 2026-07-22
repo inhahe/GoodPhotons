@@ -245,12 +245,11 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 const Material& m = scene.mats[h.matId];
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
-                pm.queryR(h.p, P.radius, [&](const Photon& ph, double) {
+                pm.queryR(h.p, P.radius, [&](const Photon& ph, double, int k) {
                     if (dot(ph.n, h.n) < 0.5) return;   // reject cross-surface leakage
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
-                    phi += Vec3(cieX(ph.lambda), cieY(ph.lambda), cieZ(ph.lambda))
-                           * (f * (double)ph.power);
+                    phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });
                 // Progressive radius / flux update (shared-statistics PPM).
