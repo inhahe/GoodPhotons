@@ -1631,11 +1631,18 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
     const DTriShear sh = makeTriShear(lrd);   // watertight shear: once per ray
     Real tMax = h.t;
     bool found = false;
-    int stack[48]; int sp = 0; stack[sp++] = 0;
+    // Children are slab-tested once at push time with tEnter recorded; the pop-time
+    // 6-plane retest is the exactly-equivalent scalar prune tEnter > tMax (boxHit
+    // seeds te with tmin only — see Bvh::traverseClosest for the derivation). A
+    // pruned pop also skips loading the node entirely.
+    int stack[48]; Real tStack[48]; int sp = 0;
+    Real tRoot;
+    if (!boxHit(N[0], lro, invD, tmin, tMax, tRoot)) return false;
+    stack[0] = 0; tStack[0] = tRoot; sp = 1;
     while (sp) {
-        const DNode& n = N[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, lro, invD, tmin, tMax, tE)) continue;
+        --sp;
+        if (tStack[sp] > tMax) continue;
+        const DNode& n = N[stack[sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
@@ -1646,10 +1653,12 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
             bool hL = boxHit(N[n.left],  lro, invD, tmin, tMax, tL);
             bool hR = boxHit(N[n.right], lro, invD, tmin, tMax, tR);
             if (hL && hR) {
-                if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
-                else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
-            } else if (hL) stack[sp++] = n.left;
-            else if (hR)   stack[sp++] = n.right;
+                if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp;
+                                stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+                else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp;
+                                stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+            } else if (hL) { stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+            else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
     return found;
@@ -1664,11 +1673,14 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
     const DTri*  T = sc.blasTris   + bl.triOff;
     DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
     const DTriShear sh = makeTriShear(lrd);
+    // maxDist never shrinks in any-hit traversal, so a child that passed its
+    // push-time slab test cannot fail the identical pop-time retest — test the
+    // root once and drop the per-pop retest entirely.
+    Real tRoot;
+    if (!boxHit(N[0], lro, invD, tmin, maxDist, tRoot)) return false;
     int stack[48]; int sp = 0; stack[sp++] = 0;
     while (sp) {
         const DNode& n = N[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, lro, invD, tmin, maxDist, tE)) continue;
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
@@ -1705,11 +1717,15 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
     const DTriShear sh = makeTriShear(rd);
     Real tMax = BIG;
-    int stack[64]; int sp = 0; stack[sp++] = 0;
+    // Push-time slab tests + pop-time scalar prune (see blasClosest).
+    int stack[64]; Real tStack[64]; int sp = 0;
+    Real tRoot;
+    if (!boxHit(sc.nodes[0], ro, invD, tmin, tMax, tRoot)) return h;
+    stack[0] = 0; tStack[0] = tRoot; sp = 1;
     while (sp) {
-        const DNode& n = sc.nodes[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, ro, invD, tmin, tMax, tE)) continue;
+        --sp;
+        if (tStack[sp] > tMax) continue;
+        const DNode& n = sc.nodes[stack[sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
@@ -1734,10 +1750,12 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
             bool hL = boxHit(sc.nodes[n.left], ro, invD, tmin, tMax, tL);
             bool hR = boxHit(sc.nodes[n.right], ro, invD, tmin, tMax, tR);
             if (hL && hR) {
-                if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
-                else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
-            } else if (hL) stack[sp++] = n.left;
-            else if (hR)   stack[sp++] = n.right;
+                if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp;
+                                stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+                else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp;
+                                stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+            } else if (hL) { stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+            else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
     return h;
@@ -1794,11 +1812,12 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
     Real tMax = maxDist - tmin;
+    // tMax is fixed for the whole walk: push-time tests suffice (see blasOccluded).
+    Real tRoot;
+    if (!boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) return false;
     int stack[64]; int sp = 0; stack[sp++] = 0;
     while (sp) {
         const DNode& n = sc.nodes[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, o, invD, tmin, tMax, tE)) continue;
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
