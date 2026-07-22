@@ -406,10 +406,11 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             if (self) self->endLook();
             return 0;
         case WM_MOUSEWHEEL:
-            // One detent (120 units) = one notch. Plain wheel DOLLIES the camera one fly-step
-            // (+ve/wheel-up = forward, -ve = back); Ctrl+wheel adjusts the STEP SIZE instead
-            // (up = bigger steps). Both are feedback-locked — each notch is one bounded, fully
-            // rendered move, so you can never overshoot into geometry between frames.
+            // One detent (120 units) = one notch. Plain wheel DOLLIES the camera a few fly-steps
+            // per notch (+ve/wheel-up = forward, -ve = back; the coarse-vs-fine split lives in
+            // main.cpp's kWheelDolly); Ctrl+wheel adjusts the STEP SIZE instead (up = bigger
+            // steps). Both are feedback-locked — each notch is one bounded, fully rendered move,
+            // so you can never overshoot into geometry between frames.
             if (self) {
                 double notches = (double)GET_WHEEL_DELTA_WPARAM(wp) / 120.0;
                 bool   ctrl    = (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) != 0;

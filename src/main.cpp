@@ -4948,7 +4948,12 @@ static int run(int argc, char** argv) {
             // (heavy scene -> careful crawl, light scene -> quick) and you can never skip past
             // geometry between two frames you didn't see. `step` is the per-move distance,
             // adjustable live with Ctrl+wheel.
-            double       step   = sceneR * 0.02;     // per-frame / per-notch travel, world units
+            double       step   = sceneR * 0.02;     // held-key per-frame travel, world units
+            // The plain wheel is a quick DOLLY, so a notch moves several fly-steps (a held
+            // key is the fine cruise; the wheel repositions in a few flicks). Still tied to
+            // `step` so Ctrl+wheel scales both together, and still collision-feedback-locked
+            // (resolveMove stops at surfaces), so a coarse notch can't punch through geometry.
+            const double kWheelDolly = 8.0;           // fly-steps travelled per plain-wheel notch
             // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
             // (nav.lookX/lookY, -1..+1) is multiplied by these AND the wall-clock frame time
             // to turn the view. Full deflection = kYaw/kPitch radians per SECOND, integrated
@@ -5351,7 +5356,7 @@ static int run(int argc, char** argv) {
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
-              "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
+              "         dolly:  mouse wheel up/down = dolly forward/back one notch (each notch renders — no overshoot; Ctrl+wheel scales it)\n"
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
@@ -5507,7 +5512,7 @@ static int run(int argc, char** argv) {
                     // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
                     // along the view ray (up = forward); held keys advance one `step`/frame.
                     Vec3 moveDelta{0, 0, 0};
-                    if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * nav.wheel);
+                    if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * kWheelDolly * nav.wheel);
                     // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
                     // centre (joystick/hover-look): each rendered frame turns by that offset x the
                     // max rate, so the view keeps turning while you hold the pointer off-centre and

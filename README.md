@@ -299,8 +299,8 @@ paths they can capture at all**.
 > | **move the mouse over the window** | **steer** (joystick/rate look) — the cursor's offset from the window centre sets a **turn rate**: rest it near the centre (a neutral dead zone) and the view holds still so you can look at the scene; push it toward an edge and the view keeps turning that way (left/right = yaw, up/down = pitch, clamped just shy of straight up/down) for as long as you hold it there, so you can look a full circle. Where you look is where you fly. The pointer stays **visible** and free; steering only happens while the cursor is inside the window and stops the moment it leaves. |
 > | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
 > | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
-> | **mouse wheel** | **dolly** one step forward (up) / back (down) per notch — a discrete, fully-rendered nudge for precise positioning (can't overshoot into geometry) |
-> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (starts at 2 % of the scene radius, clamped to a sane band) |
+> | **mouse wheel** | **dolly** forward (up) / back (down) — a discrete, fully-rendered move per notch (can't overshoot into geometry). Each notch travels several fly-steps, so it's a quick reposition; the held-key travel is the fine cruise |
+> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (held-key step starts at 2 % of the scene radius, clamped to a sane band; the wheel dolly scales with it) |
 > | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
