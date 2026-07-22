@@ -2360,6 +2360,12 @@ struct DCamSet {
     DPhoton*            depPhotons = nullptr;
     unsigned long long* depCount   = nullptr;
     unsigned long long  depCap     = 0;
+    // PHOTON-BEAMS gather (CLI -beams, shared multi-camera pass). When set (and nCam>1,
+    // a medium exists, camMode!=C) the photon crosses each medium in a STRAIGHT beam and
+    // every camera independently resamples its own single-scatter in-scatter point with a
+    // per-photon RNG stream, decoupling the deposit (shared flight) from the gather so a
+    // volumetric flyby gets independent per-frame noise instead of one frozen speckle.
+    bool beamGather = false;
 };
 
 // Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
@@ -3618,12 +3624,18 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
-                                DMediumStack& stk) {
+                                DMediumStack& stk, DRng* crng = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
+
+    // PHOTON-BEAMS gather active for THIS step: shared multi-camera pass, a medium exists,
+    // and the caller handed us an independent RNG stream. When on, the photon does NOT
+    // redirect in the medium (it crosses straight) and each camera resamples its own
+    // in-scatter point below — so skip the analog medium-collision sampling here.
+    const bool doBeam = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
     bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
-    if (sc.mediaN > 0) {
+    if (sc.mediaN > 0 && !doBeam) {
         // Superposition of all media: each does its own delta (Woodcock) tracking (or
         // exact analytic free-flight if homogeneous); the earliest collision wins and
         // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
@@ -3651,10 +3663,46 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // Beer-Lambert attenuation over the free path just travelled inside a dielectric
     // (colored/attenuating glass), applied before the event is processed (matches the
     // host: attenuate over dEvent using the medium carried from the previous vertex).
+    // `betaPre` is throughput BEFORE this attenuation, so a beam-gather camera re-applies
+    // glass absorption to ITS own resampled collision distance tC (not the photon's).
+    Real betaPre = beta;
     {
         int cm = stk.topMat();
         Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
         if (a > 0) beta *= exp(-a * dEvent);
+    }
+
+    // PHOTON-BEAMS single-scatter gather (device twin of the CPU -beams block in render.h).
+    // The photon crosses the medium in a STRAIGHT beam (analog redirect skipped above), and
+    // each camera independently samples ONE in-scatter point along [ro, dSurf] with its OWN
+    // stream `crng`, then splats it. Decoupling the shared deposit from the per-camera gather
+    // gives a volumetric flyby independent per-frame noise instead of one frozen speckle.
+    // Unbiased for SINGLE scattering (each resample is a free-flight collision pdf sigma_t*Tr,
+    // and connectVolume's albedo*phase*T_cam*beta cancels that Tr). Multiple scattering is
+    // intentionally omitted — the right trade for a crisp view-dependent bow / glory / rays.
+    if (doBeam) {
+        int cm = stk.topMat();
+        Real aC = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+        for (int c = 0; c < cs.nCam; ++c) {
+            Real tC; int whichC;
+            if (!dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng, tC, whichC))
+                continue;   // this camera saw no in-scatter along this beam
+            DVec3 xc = ro + rd * tC;
+            Real betaC = (aC > 0) ? betaPre * exp(-aC * tC) : betaPre;
+            const DMedium& smc = sc.media[whichC];
+            if (camMode == CAM_A) connectLensVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            else                  connectVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            // Per-camera specular volume splat (fog seen through a smooth sphere caustic):
+            // a 1-camera slice of the set so the "All" helper targets only camera c.
+            DCamSet cs1 = cs; cs1.nCam = 1; cs1.cams = &cs.cams[c]; cs1.films = &cs.films[c]; cs1.hits = &cs.hits[c];
+            camSpecularSplatVolumeAll(sc, smc, cs1, camMode, xc, rd, lambda, betaC, *crng);
+        }
+        // Attenuate the photon by the medium extinction over the whole crossing (single-
+        // scatter transmission) so surfaces behind the fog are correctly dimmed; the removed
+        // energy (out-scattered + absorbed) is booked as absorbed. Then continue STRAIGHT.
+        Real before = beta;
+        beta *= dMediaTransmittance(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng);
+        eAbsorbed += (double)(before - beta);
     }
 
     if (mediumEvent) {
@@ -4057,11 +4105,17 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
+        // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY to resample each camera's
+        // in-scatter point (seeded from the main stream so it is unique per photon/thread).
+        // Only drawn from inside shadeStep's doBeam branch, so non-beam renders are unchanged.
+        DRng crng;
+        if (cs.beamGather) crng.seed(((unsigned long long)rng.next() << 32) ^ rng.next(),
+                                     ((unsigned long long)rng.next() << 32) ^ rng.next());
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // bend through any GRIN region first
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped, stk) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, stk, cs.beamGather ? &crng : nullptr) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -6448,9 +6502,10 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
         effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
     }
-    if (wavefront && effHeroC == 1) {
+    if (wavefront && effHeroC == 1 && !cs.beamGather) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
-        // maxBounce (32) and camera mode/set as the megakernel. (Hero forces megakernel.)
+        // maxBounce (32) and camera mode/set as the megakernel. (Hero AND photon-beams
+        // force the megakernel — the wavefront pool carries no per-photon beam RNG stream.)
         wavefrontTrace(up, cs, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
     } else {
         int blockSize = 128;
@@ -6507,63 +6562,142 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     return out;
 }
 
+// ---- Resident shared forward session (see render_cuda.h) --------------------
+// Everything a progressive shared pass needs to keep on the device across batches:
+// the baked scene, the baked cameras, and the per-camera film/hits accumulators.
+// batch() is then a bare kernel launch; the full bake/upload/alloc/download/free
+// round trip is paid once per RENDER instead of once per ~2M-photon batch.
+struct SharedGpuSession {
+    DUpload up;
+    std::vector<gpu::DCamera> hcams;
+    std::vector<double*> d_films, d_hits;   // resident per-camera accumulators
+    std::vector<size_t>  npix;
+    double* d_energy = nullptr;             // resident 5-counter energy tally
+    gpu::DCamSet cs{};
+    int  camModeInt = 0;
+    bool wavefront = false;
+    int  heroC = 1;
+    int  nc = 0;
+};
+
+SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
+                                        const std::vector<Camera>& cams,
+                                        const std::vector<int>& resX,
+                                        const std::vector<int>& resY,
+                                        char camMode, bool wavefront, int heroC,
+                                        bool beamGather,
+                                        const std::vector<Film>* seedFilms,
+                                        const EnergyReport* seedEnergy) {
+    using namespace gpu;
+    int nc = (int)cams.size();
+    if (nc == 0 || !cudaAvailable() || !cudaForwardSupported(scene)) return nullptr;
+
+    auto* s = new SharedGpuSession;
+    s->nc = nc; s->wavefront = wavefront; s->heroC = heroC;
+    s->camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
+
+    // Bake the scene ONCE, then bake every camera against it (the win: one photon set,
+    // splat to all cameras — and with the session, ONE bake for the whole render).
+    buildUploadScene(scene, s->up);
+    s->hcams.resize(nc);
+    for (int c = 0; c < nc; ++c) s->hcams[c] = bakeCamera(scene, cams[c], resX[c], resY[c], s->up);
+
+    // Per-camera film / hits device accumulators (each camera keeps its own resolution).
+    // On -resume the checkpoint films seed them, so the device always holds the full
+    // running totals and download() is a plain replace on the host side.
+    s->d_films.assign(nc, nullptr); s->d_hits.assign(nc, nullptr); s->npix.resize(nc);
+    for (int c = 0; c < nc; ++c) {
+        s->npix[c] = (size_t)resX[c] * resY[c];
+        CUDA_CHECK(cudaMalloc(&s->d_films[c], s->npix[c] * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&s->d_hits[c],  s->npix[c] * sizeof(double)));
+        if (seedFilms && c < (int)seedFilms->size() && (*seedFilms)[c].xyz.size() == s->npix[c]) {
+            const Film& sf = (*seedFilms)[c];
+            std::vector<double> f(s->npix[c] * 3);
+            for (size_t i = 0; i < s->npix[c]; ++i) {
+                f[i * 3 + 0] = sf.xyz[i].x; f[i * 3 + 1] = sf.xyz[i].y; f[i * 3 + 2] = sf.xyz[i].z;
+            }
+            CUDA_CHECK(cudaMemcpy(s->d_films[c], f.data(), f.size() * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(s->d_hits[c], sf.hits.data(), s->npix[c] * sizeof(double), cudaMemcpyHostToDevice));
+        } else {
+            CUDA_CHECK(cudaMemset(s->d_films[c], 0, s->npix[c] * 3 * sizeof(double)));
+            CUDA_CHECK(cudaMemset(s->d_hits[c],  0, s->npix[c] * sizeof(double)));
+        }
+    }
+    CUDA_CHECK(cudaMalloc(&s->d_energy, 5 * sizeof(double)));
+    double e0[5] = {0, 0, 0, 0, 0};
+    if (seedEnergy) {
+        e0[0] = seedEnergy->emitted; e0[1] = seedEnergy->absorbed; e0[2] = seedEnergy->sensor;
+        e0[3] = seedEnergy->escaped; e0[4] = seedEnergy->residual;
+    }
+    CUDA_CHECK(cudaMemcpy(s->d_energy, e0, sizeof e0, cudaMemcpyHostToDevice));
+
+    s->cs = makeCamSet(s->up, s->hcams, s->d_films, s->d_hits);
+    // Photon-beams gather: only meaningful with several cameras sharing one flight and a
+    // participating medium present (the device gates the per-step branch on the same).
+    s->cs.beamGather = beamGather && nc > 1 && !scene.media.empty();
+    return s;
+}
+
+void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
+                           unsigned long long seedBase, bool diffraction) {
+    if (!s || N <= 0) return;
+    launchForward(s->up, s->cs, s->d_energy, N, diffraction, seedBase,
+                  s->wavefront, s->camModeInt, s->heroC);
+}
+
+void sharedForwardGpuHits0(SharedGpuSession* s, std::vector<double>& hits) {
+    if (!s || hits.size() < s->npix[0]) return;
+    CUDA_CHECK(cudaMemcpy(hits.data(), s->d_hits[0], s->npix[0] * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+}
+
+void sharedForwardGpuDownload(SharedGpuSession* s, std::vector<Film>& films,
+                              EnergyReport& e) {
+    if (!s) return;
+    for (int c = 0; c < s->nc && c < (int)films.size(); ++c) {
+        std::vector<double> f(s->npix[c] * 3);
+        CUDA_CHECK(cudaMemcpy(f.data(), s->d_films[c], f.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(films[c].hits.data(), s->d_hits[c], s->npix[c] * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < s->npix[c]; ++i)
+            films[c].xyz[i] = Vec3(f[i * 3 + 0], f[i * 3 + 1], f[i * 3 + 2]);
+    }
+    // The photon trace is shared, so energy is counted once for the whole pass. These
+    // are running TOTALS (the seed energy was uploaded at begin), so REPLACE.
+    double energy[5] = {0, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemcpy(energy, s->d_energy, sizeof energy, cudaMemcpyDeviceToHost));
+    e.emitted = energy[0]; e.absorbed = energy[1]; e.sensor = energy[2];
+    e.escaped = energy[3]; e.residual = energy[4];
+}
+
+void sharedForwardGpuEnd(SharedGpuSession* s) {
+    if (!s) return;
+    freeUpload(s->up);
+    for (int c = 0; c < s->nc; ++c) { cudaFree(s->d_films[c]); cudaFree(s->d_hits[c]); }
+    cudaFree(s->d_energy);
+    delete s;
+}
+
 std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<Camera>& cams,
                                           const std::vector<int>& resX,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase,
-                                          bool wavefront, int heroC) {
-    using namespace gpu;
+                                          bool wavefront, int heroC, bool beamGather) {
+    // One-shot wrapper over the session API (bit-compatible with the historical
+    // single-call behaviour: same bake, same launch, same seeding, energy ADDED to eOut).
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
     for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
-    if (nc == 0 || !cudaAvailable() || !cudaForwardSupported(scene)) return out;
-
-    // Bake the scene ONCE, then bake every camera against it (the win: one photon set,
-    // splat to all cameras). Shared pass is model A or B only (C consumes the photon).
-    DUpload up;
-    buildUploadScene(scene, up);
-    std::vector<DCamera> hcams(nc);
-    for (int c = 0; c < nc; ++c) hcams[c] = bakeCamera(scene, cams[c], resX[c], resY[c], up);
-
-    // Per-camera film / hits device buffers (each camera keeps its own resolution).
-    std::vector<double*> d_films(nc, nullptr), d_hits(nc, nullptr);
-    std::vector<size_t>  npix(nc);
-    for (int c = 0; c < nc; ++c) {
-        npix[c] = (size_t)resX[c] * resY[c];
-        CUDA_CHECK(cudaMalloc(&d_films[c], npix[c] * 3 * sizeof(double)));
-        CUDA_CHECK(cudaMemset(d_films[c], 0, npix[c] * 3 * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_hits[c], npix[c] * sizeof(double)));
-        CUDA_CHECK(cudaMemset(d_hits[c], 0, npix[c] * sizeof(double)));
-    }
-    double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
-    CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
-
-    int camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
-    DCamSet cs = makeCamSet(up, hcams, d_films, d_hits);
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
-
-    // --- download each camera's film ---
-    for (int c = 0; c < nc; ++c) {
-        std::vector<double> film(npix[c] * 3);
-        CUDA_CHECK(cudaMemcpy(film.data(), d_films[c], film.size() * sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits[c], npix[c] * sizeof(double), cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < npix[c]; ++i)
-            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
-    }
-    // The photon trace is shared, so energy is counted once for the whole pass.
-    double energy[5] = {0,0,0,0,0};
-    CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
-    eOut.emitted  += energy[0];
-    eOut.absorbed += energy[1];
-    eOut.sensor   += energy[2];
-    eOut.escaped  += energy[3];
-    eOut.residual += energy[4];
-
-    freeUpload(up);
-    for (int c = 0; c < nc; ++c) { cudaFree(d_films[c]); cudaFree(d_hits[c]); }
-    cudaFree(d_energy);
+    SharedGpuSession* s = sharedForwardGpuBegin(scene, cams, resX, resY, camMode,
+                                               wavefront, heroC, beamGather);
+    if (!s) return out;
+    sharedForwardGpuBatch(s, N, seedBase, diffraction);
+    EnergyReport e;
+    sharedForwardGpuDownload(s, out, e);
+    eOut.emitted += e.emitted; eOut.absorbed += e.absorbed; eOut.sensor += e.sensor;
+    eOut.escaped += e.escaped; eOut.residual += e.residual;
+    sharedForwardGpuEnd(s);
     return out;
 }
 

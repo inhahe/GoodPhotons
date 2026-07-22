@@ -1,0 +1,46 @@
+# Photon-beams decorrelation test on a GPU-SUPPORTED medium (HG phase, no rainbow).
+# Two IDENTICALLY-placed mode-B cameras form one shared multi-camera group. Because the
+# medium uses a plain Henyey-Greenstein phase (not the CPU-only spectral rainbow phase),
+# cudaForwardSupported accepts it, so `-beams -device gpu` exercises the GPU beam-gather.
+#
+#   * WITHOUT -beams: both cameras splat the SAME shared photon collision points, so
+#     camA and camB come out BIT-IDENTICAL (one frozen speckle realisation).
+#   * WITH -beams: each camera resamples its OWN in-scatter point per beam segment, so
+#     camA and camB show DIFFERENT noise realisations but the SAME mean fog — proving the
+#     deposit (shared, 1x) is decoupled from the gather (independent per-frame noise).
+scene { units meters  spectral 360 830 1 }
+
+material "floor" { type diffuse  reflect rgb 0.22 0.24 0.28 }
+material "wall"  { type diffuse  reflect rgb 0.30 0.32 0.36 }
+material "postR" { type diffuse  reflect rgb 0.70 0.15 0.15 }
+material "postB" { type diffuse  reflect rgb 0.15 0.25 0.70 }
+
+quad { origin -6 0 -8   u 16 0 0   v 0 0 14   material floor }
+quad { origin -6 0 0.6  u 16 0 0   v 0 6 0     material wall }
+
+sphere { center 1.05 0.85 4.05  radius 0.28  material postR }
+sphere { center 2.95 0.85 4.05  radius 0.28  material postB }
+
+medium {
+    sigma_t 1.2   albedo 0.9   g 0.0
+    bounds { min -1 0 1   max 5 4 4.2 }
+}
+
+# Collimated beam angled down from the upper right, lighting the fog as a clean visible
+# haze. The slight off-vertical tilt is purely aesthetic (light-from-upper-right gradient);
+# the beam footprint is centered on the aim point regardless of direction.
+group { translate 2 6.0 3.4   scale 300
+    light collimated { origin 0 0 0   dir 0.18 -1 0.14   spd blackbody 5800   lumens 3200000 }
+}
+
+# Two cameras at the SAME pose — the decorrelation probe.
+camera "camA" {
+    eye 2.0 1.6 5.6   look_at 2.0 1.1 1.0   up 0 1 0
+    fov_y 95   mode B
+    film { res 320 240   exposure 8 }
+}
+camera "camB" {
+    eye 2.0 1.6 5.6   look_at 2.0 1.1 1.0   up 0 1 0
+    fov_y 95   mode B
+    film { res 320 240   exposure 8 }
+}

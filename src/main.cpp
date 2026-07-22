@@ -3299,6 +3299,8 @@ static void printHelp(const char* prog) {
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
 "  -spp <n>              samples/pixel for backward modes R/V\n"
+"  -beams|-photonbeams   decorrelated photon-beams gather for shared multi-camera flybys\n"
+"                        (single-scatter volumetrics; CPU or GPU; kills frozen speckle)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -t <n>                CPU thread count\n"
 "\n"
@@ -3336,6 +3338,18 @@ static void printHelp(const char* prog) {
 }
 
 static int run(int argc, char** argv) {
+    // Normalize GNU-style double-dash options to the single-dash spellings the parser
+    // uses, so EVERY flag accepts either form (`--window` == `-window`, `--beams` ==
+    // `-beams`, etc.). We simply advance the pointer past one leading dash for any token
+    // that starts with "--" and has more characters (leaving a lone "--" or "-" alone).
+    // This runs before every downstream scan (help, -topng, the main parse loop, the
+    // tab-completion helper), so a double-dash flag is never mistaken for an unknown
+    // option, and genuinely unrecognized flags still fall through to the loud error at
+    // the end of the parse loop (no invalid parameter is ever silently ignored).
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] != '\0')
+            argv[i] += 1;
+    }
     // `-h` / `--help` (also `-help` / `help`) anywhere on the command line: print the
     // usage summary and exit, before any scene setup or the default render. Scanned
     // across all args (not just argv[1]) so `ftrace foo --help` still helps.
@@ -5862,8 +5876,8 @@ static int run(int argc, char** argv) {
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
-        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene) && !g_beamGather)
-            useGpuForward = true;   // -beams per-camera resample is CPU-only for now
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
+            useGpuForward = true;   // -beams per-camera resample is supported on the GPU too
     }
 #endif
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
@@ -5958,28 +5972,57 @@ static int run(int argc, char** argv) {
 #endif
             (std::to_string(nThreads) + " CPU threads");
 
+#ifdef HAVE_CUDA
+        // Resident GPU session for the whole group render: the scene and every camera are
+        // baked/uploaded ONCE and the per-camera films accumulate on the device, so each
+        // batch below is a bare kernel launch instead of a full upload/download round trip
+        // (the old per-batch renderForwardSharedCuda wrapper dominated wall-clock on
+        // multi-camera groups). Films/energy are downloaded only when the host actually
+        // needs them (syncAcc: interval writes, window refresh, final). On -resume the
+        // checkpoint films seed the device accumulators so downloads are full totals.
+        SharedGpuSession* gses = useGpuForward
+            ? sharedForwardGpuBegin(scene, cams, rxs, rys, groupMode, wavefront, g_heroC,
+                                    g_beamGather, (accN > 0) ? &acc : nullptr,
+                                    (accN > 0) ? &accE : nullptr)
+            : nullptr;
+        bool accFresh = true;   // do host acc[]/accE match the device accumulators?
+#endif
+
         // One accumulation chunk of `batchN` photons across the whole group.
         auto runBatch = [&](long long batchN) {
-            EnergyReport e;
-            std::vector<Film> films;
 #ifdef HAVE_CUDA
-            if (useGpuForward)
-                films = renderForwardSharedCuda(scene, cams, rxs, rys, batchN, e, diffraction,
-                                                groupMode, (unsigned long long)accN, wavefront, g_heroC);
-            else
+            if (gses) {
+                // Resident path: launch and go. seedBase = cumulative photon count, same
+                // stream convention as the CPU path / the old per-batch wrapper.
+                sharedForwardGpuBatch(gses, batchN, (unsigned long long)accN, diffraction);
+                accN += batchN;
+                accFresh = false;
+                return;
+            }
 #endif
-                films = renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
-                                            groupMode == 'A', (unsigned long long)accN, g_beamGather);
+            EnergyReport e;
+            std::vector<Film> films =
+                renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
+                                    groupMode == 'A', (unsigned long long)accN, g_beamGather);
             for (int c = 0; c < nc; ++c) acc[c].merge(films[c]);
             accN += batchN;
             accE.emitted += e.emitted; accE.absorbed += e.absorbed; accE.sensor += e.sensor;
             accE.escaped += e.escaped; accE.residual += e.residual;
         };
 
+        // Pull the running totals off the device into acc[]/accE (no-op on the CPU path,
+        // where runBatch merges host-side; no-op when already fresh).
+        auto syncAcc = [&] {
+#ifdef HAVE_CUDA
+            if (gses && !accFresh) { sharedForwardGpuDownload(gses, acc, accE); accFresh = true; }
+#endif
+        };
+
         // Write every camera's image (+ optional .ftbuf). `quiet` suppresses the per-file
         // announce for intermediate saves; these groups are per-frame-auto-exposed
         // (expGroup < 0) so no shared exposure anchor is involved.
         auto writeOut = [&](bool quiet) {
+            syncAcc();
             for (int c = 0; c < nc; ++c) {
                 const RenderCam& rc = toRender[idx[c]];
                 Film disp = acc[c];
@@ -6044,6 +6087,16 @@ static int run(int argc, char** argv) {
                 // single-camera path); drives the status line and the -noise stop.
                 double noisePct = 0.0, meanHits = 0.0;
                 if (noiseTarget > 0.0 || wantStatus || stopped || timeUp) {
+#ifdef HAVE_CUDA
+                    if (gses && !accFresh) {
+                        // Resident GPU path: the hit counts live on the device. A status /
+                        // stop boundary wants the films anyway, so do the full download;
+                        // a bare -noise poll between intervals fetches ONLY camera 0's
+                        // hits (npix doubles) instead of every film.
+                        if (wantStatus || stopped || timeUp) syncAcc();
+                        else sharedForwardGpuHits0(gses, acc[0].hits);
+                    }
+#endif
                     double sumHits = 0.0; long long lit = 0;
                     for (double h : acc[0].hits) if (h > 0.0) { sumHits += h; ++lit; }
                     meanHits = lit ? sumHits / (double)lit : 0.0;
@@ -6099,6 +6152,11 @@ static int run(int argc, char** argv) {
             runBatch(N);
             writeOut(/*quiet*/false);
         }
+#ifdef HAVE_CUDA
+        // Tear the resident session down. Every exit path above ends in a writeOut(),
+        // whose syncAcc() already pulled the final films/energy into acc[]/accE.
+        if (gses) { sharedForwardGpuEnd(gses); gses = nullptr; }
+#endif
 
         double tot = accE.absorbed + accE.sensor + accE.escaped + accE.residual;
         if (accE.emitted > 0.0)

@@ -5,6 +5,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-07-22): a group-scaled collimated beam lit only half its footprint (offset by half its width from the aim point)
+
+A group-scaled `light collimated { ... }` illuminated only one half of its `w×w`
+footprint, split along a hard seam through the aim point — a straight-down (`dir 0 -1 0`)
+god-ray beam over a fog box lit only `x > aim`, leaving the other half dark. Repro:
+`scraps/_fogtune2.ftsl` showed a sharp vertical brightness seam at the beam's aim x that
+did **not** move when the beam was widened (scale 250→700) and vanished when the beam was
+tilted off-axis.
+
+Root cause (NOT the ONB — `linalg.h onb()` is the robust Duff branchless construction and
+is fine for `-y`): the emitter quad is sampled **corner-anchored** — `Emitter::samplePoint`
+does `y = origin + u*u1 + v*u2` with `u1,u2 ∈ [0,1]` (`scene.h:549`), correct for ordinary
+area lights where the user gives `origin + u + v` explicitly. But `ftsl.h`'s collimated
+branch passed `xf.apply(origin)` as that corner, so the `w×w` footprint extended `+u,+v`
+from the aim point instead of straddling it. For a bare 3 cm pencil (`w = Len(0.03)*scale`)
+the ½-width offset is invisible; under `scale 250` (`w = 7.5`) the beam sat entirely on the
+`+u/+v` side, so the aim point fell on the footprint edge — the seam. Tilting changed `u/v`
+and smeared the offset diagonally, which is why it "fixed" it.
+
+**Fix:** `ftsl.h` collimated branch now anchors the quad at `xf.apply(origin) − ½(U+V)`, so
+`origin` (the aim point) is the **centre** of the beam footprint. Verified with
+`scraps/_seamtest.ftsl` (pure `dir 0 -1 0`, `scale 300`): the footprint is now symmetric
+about the aim point with no seam. Note this shifts a bare default pencil by ~1.5 cm×scale
+vs. the old corner behaviour (intended — `origin` should mean the beam centre).
+
 ### TOOLING (2026-07-22): Nsight Compute (`ncu`) blocked by ERR_NVGPUCTRPERM — GPU perf counters admin-locked in the driver
 
 `ncu` profiling of ftrace kernels fails with `ERR_NVGPUCTRPERM` (GPU performance
@@ -204,7 +229,7 @@ that rainbow/fog-bow scenes should use mode D. Low priority — mode D covers th
 a room-scale droplet box flooded by a wide collimated beam, which shows a full centred bow in mode B
 though noisily. The gap is specifically thin/large-scale atmospheric slabs.)
 
-### ENHANCEMENT (2026-07-21): photon beams for a CHEAP, clean rainbow/volumetric FLYBY (shared deposit + per-camera gather) — **DONE (single-scatter long-beam, CPU `-beams`)**
+### ENHANCEMENT (2026-07-21): photon beams for a CHEAP, clean rainbow/volumetric FLYBY (shared deposit + per-camera gather) — **DONE (single-scatter long-beam, `-beams`, CPU + GPU)**
 **DONE 2026-07-21.** Shipped as the `-beams` (alias `-photonbeams`) CLI flag on the shared forward
 mode-B pass. The deposit/gather decoupling is implemented as an **unbiased single-scattering
 long-beam estimator** rather than the full Jarosz beam-BVH (see "How it was actually built" below);
@@ -270,13 +295,27 @@ the existing shared forward photon trace, decorrelated per camera:
   what makes the `-beams` bow visibly *crisper* than the shared baseline, at slightly lower total
   brightness (single-scatter only). This is the intended quality trade for a clean view-dependent bow.
 - **Wiring** (`src/main.cpp`): `static bool g_beamGather`; `-beams`/`-photonbeams` flag; `beamGather`
-  param threaded into `renderForwardShared` → `r.beamGather`. **Forced onto CPU** (the GPU forward
-  path is not wired for it): `-beams` disables the GPU-forward auto-select. Rides the existing shared
+  param threaded into `renderForwardShared` → `r.beamGather`. Rides the existing shared
   chunking/checkpoint/`-resume` machinery unchanged. Bonus: single-scatter photons terminate at the
   medium so the pass is *faster* than the full analog trace.
-- **Not done / future:** GPU port, multiple-scatter beams (full Jarosz), and the stored-beam BVH (only
-  needed if a use case wants view-independent beam reuse beyond the shared-pass model). Mode M/D
-  untouched.
+- **GPU port — DONE 2026-07-22.** The per-camera in-scatter resample now runs in the CUDA forward
+  tracer too, so `-beams -device gpu/auto` no longer forces CPU. Wiring: `DCamSet::beamGather`;
+  `shadeStep` takes an independent per-photon `DRng* crng` and, when `beamGather && nCam>1 &&
+  camMode!=C && mediaN>0`, skips the analog medium redirect and instead loops the cameras — each
+  draws its own free-flight collision (`dMediaSampleCollision` on `crng`) and splats via
+  `connectVolume`/`connectLensVolume` + a 1-camera-slice `camSpecularSplatVolumeAll`, then the photon
+  is attenuated by `dMediaTransmittance` over the whole crossing and continues straight. `crng` is
+  seeded once per photon in `kTrace` from the main stream (so non-beam renders are bit-unchanged).
+  Beams force the megakernel (the wavefront pool carries no per-photon beam stream), like hero.
+  `renderForwardSharedCuda` gained a `beamGather` arg. Validated on `scenes/_beams_hg_decorr.ftsl`
+  (two identically-placed mode-B cameras, HG fog): GPU baseline camA==camB bit-identical (RMS 0);
+  GPU `-beams` camA≠camB (RMS 48.7) with matching means (0.06% apart) — same decorrelation magnitude
+  as CPU (RMS 48.7); GPU-vs-CPU beam means agree to 0.02% and the energy split matches (absorbed
+  0.6914 vs 0.6911). Spectral-rainbow-phase media are still CPU-tabulated (`cudaForwardSupported`
+  rejects them) so a rainbow/fogbow scene still falls back to CPU — HG/Rayleigh fog runs on GPU.
+- **Not done / future:** multiple-scatter beams (full Jarosz) and the stored-beam BVH (only needed if
+  a use case wants view-independent beam reuse beyond the shared-pass model), and the GPU wavefront
+  backend for beams (megakernel-only today). Mode M/D untouched.
 
 ### RESOLVED (2026-07-21): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
 **FIXED 2026-07-21.** The real root cause was narrower than the per-render-target

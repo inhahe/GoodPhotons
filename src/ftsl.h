@@ -1116,19 +1116,28 @@ private:
     // ---- spectrum evaluation ----
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
         if (depth > 16) { fail("spectrum reference cycle"); return constantSpectrum(0); }
-        // table { λ:v … }
+        // table { λ:v … } — an inline piecewise curve. An optional `interp=cubic`
+        // (monotone PCHIP, no overshoot) / `interp=linear` (default) flag among the
+        // entries picks the interpolant; the rest are `λ:value` control points.
         if (v.block && v.block->type == "table") {
             std::vector<std::pair<double, double>> pairs;
+            bool cubic = false;
             for (const auto& w : v.block->words) {
+                if (w.rfind("interp=", 0) == 0) { cubic = interpIsCubic(w); continue; }
                 auto p = w.find(':');
                 if (p == std::string::npos) { fail("table entry '" + w + "' not λ:value"); continue; }
                 pairs.push_back({num(w.substr(0, p)), num(w.substr(p + 1))});
             }
-            return tabulatedSpectrum(std::move(pairs));
+            return cubic ? tabulatedSpectrumMono(std::move(pairs))
+                         : tabulatedSpectrum(std::move(pairs));
         }
         const auto& w = v.words;
         if (w.empty()) { fail("empty spectrum expression"); return constantSpectrum(0); }
         const std::string& h = w[0];
+        // Optional interpolation modifier for file/table curves, e.g.
+        // `absorb file:data/red.csv interp=cubic`. Default (absent) = linear.
+        bool curveCubic = false;
+        for (const auto& t : w) if (t.rfind("interp=", 0) == 0) curveCubic = interpIsCubic(t);
 
         if (isNumber(h) && w.size() == 1) return constantSpectrum(num(h));
 
@@ -1212,7 +1221,7 @@ private:
             fail("unknown filter '" + fname + "'"); return constantSpectrum(0.5);
         }
         if (h.rfind("preset:", 0) == 0)  return resolvePreset(h.substr(7));
-        if (h.rfind("file:", 0) == 0)    return loadSpdFile(h.substr(5));
+        if (h.rfind("file:", 0) == 0)    return loadSpdFile(h.substr(5), curveCubic);
         if (h.rfind("spectrum:", 0) == 0) {
             std::string nm = h.substr(9);
             auto it = spectraBlocks_.find(nm);
@@ -1237,19 +1246,44 @@ private:
         return constantSpectrum(0);
     }
 
+    // `interp=<mode>` -> is it the monotone-cubic (PCHIP) mode? Accepts cubic / pchip /
+    // monotone as synonyms; anything else (incl. `linear`) is the piecewise-linear default.
+    static bool interpIsCubic(const std::string& tok) {
+        std::string v = (tok.rfind("interp=", 0) == 0) ? tok.substr(7) : tok;
+        return v == "cubic" || v == "pchip" || v == "monotone";
+    }
+
     // Load a measured SPD/reflectance from an external data file: `spd file:<path>`
     // (or `reflect file:<path>`). Reads the CSV/whitespace table mirrored under data/
-    // into a piecewise-linear `tabulatedSpectrum`. Paths resolve relative to the
-    // current working directory (same convention as `texture`/`mesh` file refs), and
-    // repeated references to the same path share one cached curve.
-    Spectrum loadSpdFile(const std::string& path) {
-        auto it = spdFileCache_.find(path);
+    // into a tabulated `Spectrum` — piecewise-linear by default, or monotone-cubic
+    // (no overshoot) when `cubic` is set (`… interp=cubic`). Paths resolve relative to
+    // the current working directory (same convention as `texture`/`mesh` file refs),
+    // and repeated references to the same (path, interp) share one cached curve.
+    Spectrum loadSpdFile(const std::string& path, bool cubic = false) {
+        std::string key = cubic ? path + "\x01cubic" : path;
+        auto it = spdFileCache_.find(key);
         if (it != spdFileCache_.end()) return it->second;
         std::vector<std::pair<double, double>> pairs;
         std::string ferr;
         if (!speclib::loadSpdCsv(path, pairs, ferr)) { fail(ferr); return constantSpectrum(0); }
-        Spectrum s = tabulatedSpectrum(std::move(pairs));
-        spdFileCache_[path] = s;
+        // Coverage check: warn (once per key) if the file fails to cover the
+        // perceptually significant band (~400..700 nm, where >99.9% of the CIE
+        // observer's response lives), since sampling outside the file just holds the
+        // nearest endpoint flat (deliberate — no extrapolation). Guarding the visible
+        // core rather than the full 360..830 render range keeps this high-signal:
+        // standard 380..780 / 400..700 datasets stay quiet, but a genuinely narrow
+        // file (whose clamped tails would visibly distort colour) is flagged.
+        double lo = pairs.front().first, hi = pairs.front().first;
+        for (const auto& p : pairs) { lo = std::min(lo, p.first); hi = std::max(hi, p.first); }
+        const double visLo = 400.0, visHi = 700.0, eps = 0.5;
+        if (lo > visLo + eps || hi < visHi - eps)
+            std::fprintf(stderr, "[ftsl] warning: spectrum file '%s' covers only %.0f..%.0f nm — "
+                         "it misses part of the visible band (~%.0f..%.0f nm); values outside the "
+                         "file are held flat at the nearest endpoint (no extrapolation).\n",
+                         path.c_str(), lo, hi, visLo, visHi);
+        Spectrum s = cubic ? tabulatedSpectrumMono(std::move(pairs))
+                           : tabulatedSpectrum(std::move(pairs));
+        spdFileCache_[key] = s;
         return s;
     }
 
@@ -2769,8 +2803,16 @@ private:
             Vec3 o{0.5, 0.5, 0.95}; vec3Of(b, "origin", o);
             Vec3 t, bt; onb(beam, t, bt);
             double w = Len(0.03) * s;
+            Vec3 U = t * w, V = bt * w;
+            // The emitter quad is sampled corner-anchored (origin + u*[0,1] + v*[0,1]),
+            // so pass a corner offset by -half(U+V): that makes `origin` (the aim point)
+            // the CENTRE of the beam footprint, not a corner. For a bare 3 cm pencil the
+            // offset is negligible, but a group-scaled beam (w = 0.03*scale) would
+            // otherwise sit entirely on the +u/+v side of the aim point, lighting only
+            // half the intended footprint (hard seam through the aim point).
+            Vec3 corner = P(xf.apply(o)) - U * 0.5 - V * 0.5;
             spd = absPower(b, spd, (w * w) * PI, L);
-            L.scene.addAreaLight(P(xf.apply(o)), t * w, bt * w, beam, w * w, spd, binWidth_,
+            L.scene.addAreaLight(corner, U, V, beam, w * w, spd, binWidth_,
                                  /*collimated*/true, beam);
             return true;
         }

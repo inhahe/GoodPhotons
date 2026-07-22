@@ -62,8 +62,10 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **independent per-frame noise** — the "fast AND best" combination (≈1× photon cost
   across the flyby, correct per-view angle, clean non-frozen grain). It deliberately
   drops the multiple-scatter haze wash, so the bow is actually *crisper* than the
-  shared baseline. CPU-only for now; forces `-device cpu`. Rainbows/fogbows/glories are
-  single scatter, so this loses nothing that matters for them.
+  shared baseline. Runs on **both CPU and GPU** (the per-camera in-scatter resample is
+  ported to the CUDA forward tracer; spectral-rainbow-phase media are still CPU-tabulated
+  and fall back to CPU). Rainbows/fogbows/glories are single scatter, so this loses
+  nothing that matters for them.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
@@ -908,12 +910,22 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   broadband source, not a monochromatic spike, so it reads as a natural coloured light
   rather than a laser line. Meant for **lights** (`spd rgbillum 1 0.6 0.2`); accepted
   anywhere a spectrum is.
-- **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
-  (piecewise-linear).
+- **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
+  **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
+  (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —
+  C¹-smooth yet shape-preserving, so it never overshoots (a value stays within its
+  neighbouring samples, so a reflectance/absorption can't ring negative the way a plain
+  spline would). Cubic is worth it for **sparse** control points where linear kinks
+  show; for dense data it matches linear. Outside the sampled range the value is held
+  flat at the nearest endpoint (no extrapolation).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
   external CSV/whitespace data file (`#` comments, a header row, `wavelength_nm,value`
   rows); the runtime ingestion point for the data under `data/`. E.g.
-  `spd file:data/illuminant/f2.csv` (see `scenes/measured_spd.ftsl`).
+  `spd file:data/illuminant/f2.csv` (see `scenes/measured_spd.ftsl`). Same
+  interpolation controls as `table`: append **`interp=cubic`** for monotone-cubic
+  (`absorb file:data/absorb/red.csv interp=cubic`), else piecewise-linear. If the file
+  doesn't span the render's spectral range a one-line **coverage warning** is printed
+  (the tails are held flat, not extrapolated).
 - **`glass:<name>`** — dispersive index via Sellmeier: `BK7`/crown, `SF10`/flint,
   `silica`/fused-silica, `sapphire`, `diamond`, plus Cauchy fits for `water`,
   `ice`, `acrylic`/PMMA, `polycarbonate`.
@@ -1051,7 +1063,7 @@ per-path carrier is left unqualified here.
 | `sphere` | Spherical area light | `center`, `radius`, `spd` |
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
-| `collimated` | Thin parallel pencil beam | `origin`, `dir`, `spd` |
+| `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity` |
 
 **Absolute power.** Any non-env light may author a real physical output —
@@ -2007,7 +2019,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the **CPU** spectral tracers (modes `A`/`B`/`C`, `R`, and photon-map `M`/`S`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). GPU / BDPT (`D`) / VCM (`U`) ignore it (still single-λ) |
-| `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). **CPU-only** (forces `-device cpu`); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
+| `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). Runs on **CPU and GPU** (ported to the CUDA forward tracer; spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |

@@ -84,7 +84,50 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase = 0,
-                                          bool wavefront = false, int heroC = 1);
+                                          bool wavefront = false, int heroC = 1,
+                                          bool beamGather = false);
+
+// ---- Resident shared forward session (the batched-accumulation fast path) ----
+//
+// renderForwardSharedCuda pays the full bake/upload/alloc/download/free round trip on
+// EVERY call — fine for a one-shot render, ruinous for the progressive shared loop in
+// main.cpp, which calls it ~50+ times/second in ~2M-photon batches (each batch re-baked
+// and re-uploaded the whole scene, re-baked every camera, re-allocated every film, then
+// downloaded and host-merged every film even though images are only consumed once per
+// -interval). A session makes everything RESIDENT: begin() bakes/uploads the scene and
+// cameras and allocates per-camera device films ONCE; batch() is then a bare kernel
+// launch that accumulates into the resident films/energy; download() fetches the running
+// TOTALS only when the host actually needs images (interval writes, noise checks, final);
+// end() frees. Semantics match a sequence of renderForwardSharedCuda calls with the same
+// per-batch seedBase (identical RNG streams), minus the per-batch overhead.
+//
+// Resume support: begin() can seed the device films/hits/energy from checkpoint state
+// (`seedFilms`/`seedEnergy`, both nullable), so download() always returns full running
+// totals (checkpoint + everything traced this session) and the caller can simply REPLACE
+// its accumulators instead of merging.
+struct SharedGpuSession;   // opaque; lives in render_cuda.cu
+SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
+                                        const std::vector<Camera>& cams,
+                                        const std::vector<int>& resX,
+                                        const std::vector<int>& resY,
+                                        char camMode, bool wavefront, int heroC,
+                                        bool beamGather,
+                                        const std::vector<Film>* seedFilms = nullptr,
+                                        const EnergyReport* seedEnergy = nullptr);
+// Trace N more photons into the resident films (async on the device; downloads sync).
+// seedBase must be the cumulative photon count already traced (same convention as
+// renderForwardSharedCuda) so every batch draws an independent stream.
+void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
+                           unsigned long long seedBase, bool diffraction);
+// Cheap per-batch noise poll: download ONLY camera 0's per-pixel hit counts (running
+// totals) into `hits` (must already be sized to camera 0's pixel count).
+void sharedForwardGpuHits0(SharedGpuSession* s, std::vector<double>& hits);
+// Download the running TOTAL films (xyz + hits, including any resume seed) into
+// `films[c]` (each must already be alloc'd at its camera's resolution) and REPLACE
+// `e` with the total energy report.
+void sharedForwardGpuDownload(SharedGpuSession* s, std::vector<Film>& films,
+                              EnergyReport& e);
+void sharedForwardGpuEnd(SharedGpuSession* s);
 
 // True if this scene can be rendered by the GPU photon-map path (mode M). Requires the
 // same POD-bakeable materials as the forward path (cudaForwardSupported) and no

@@ -1,3 +1,4 @@
+
 when rendering a flyby / multiple cameras, make sure the terminal shows which stages of the render are being shared between frames (or if none are) and whether grainy noise is shared between cameras, since these seem to differ according to which mode is used
 
 --
@@ -8,18 +9,6 @@ should we unify the gpu models that are internally unified in the cli/scene desc
 
 --
 
-Gallery × GPU combos are blocked by pre-existing bugs already in known-issues.md: GPU mode D has the data-dependent "unspecified launch failure" on gallery_settled, and mode M's shared deposit hangs on the 4M-photon gallery scene. That's why B_gpu_gallery is the lone gallery GPU config
-
-to Fable:
-Can you fix the above bugs, then optimize the hot paths for those two and show me the speedup percentages? make sure to commit before you change anything so you can revert if it's slower or doesn't work and you can't fix it.
-
---
-
-can we optimize raster gpu? and measure the difference by measuring the rasterization time independently of the launch time? for example, gpu raster is used for the interactive explorer and updates every time the user changes position/orientation.
-
-^ doing in Fable
-
---
 put a fog with a rainbow in our showcase video/still? make a cloud out of fog (with a believable cloud shape), and rain pouring down from it that does a rainbow. 
 maybe feed that cloud-in-the-center-of-the-room pic (the physics art project) to hyper3d? <- done. cloud1, cloud2 and cloud3.
 
