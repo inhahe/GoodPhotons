@@ -317,7 +317,7 @@ render_cuda.cu), and `addMesh` in ftsl.h.
 
 **Steps.**
 1. ✅ **DONE** — Added `Vec3 n0,n1,n2` to `Tri` (geometry.h) and `DVec3 n0,n1,n2` to `DTri`
-   (render_cuda.cu); parse OBJ `vn` in `loadObj` (index via the 3rd face field, `objNormalIndex`),
+   (render_cuda.cu); parse OBJ `vn` in `loadObj` (index via the 3rd face field),
    transform each by `Affine::applyNormal` (inverse-transpose), and fill the three `Tri` normals.
    Both `intersectTri` (CPU + GPU) interpolate `hit.n = normalize(w0*n0+u*n1+v*n2)` and orient it
    against the ray, keeping `hit.ng` geometric. `Tri::finalize()` falls absent normals back to `gn`
