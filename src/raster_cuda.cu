@@ -12,6 +12,14 @@
 //                     (fisheye/panoramic) apply the same angular projRadius() lens map the
 //                     real camera uses, reject-culling any triangle touching the rear pole
 //                     and emitting ONE sub-triangle. Written to fixed slots [2*i], [2*i+1].
+//                     The clip runs entirely in registers (the 8 in/out cases enumerate to
+//                     at most 4 named vertices — no dynamically indexed local arrays, so
+//                     nothing spills to local memory), sub-triangles that would be culled
+//                     by rasterization anyway (empty clamped bbox / degenerate area — the
+//                     exact setupSlot predicates) are dropped before ever storing a DSTri,
+//                     and validity/clear bits live in a DENSE per-slot `flags` array (bit0
+//                     kSlotValid, bit1 kSlotClear) instead of inside the 156-byte record,
+//                     so invalidation is a coalesced 4-byte store per slot.
 //
 //   Pass B  kClassify + kRasterSmall/Med/Large: bin every DSTri slot by clamped bbox
 //                     pixel count, then rasterize each bin at a matching parallel width
@@ -21,6 +29,8 @@
 //                     surface (largest 1/depth) wins per pixel, in any scheduling order,
 //                     so the binning is bit-identical to the old 1-thread-per-slot kernel
 //                     while a screen-filling quad no longer serializes on one thread.
+//                     Dead slots are skipped via the dense 4-byte `flags` probe (8 slots
+//                     per 32-byte sector) without touching the DSTri records at all.
 //
 //   Pass C  kShade    (1 thread / pixel): decode the winning slot, recompute barycentrics
 //                     at the pixel centre, interpolate world pos/normal, and shade once
@@ -120,8 +130,11 @@ struct DCam {
 };
 
 // A projected screen sub-triangle produced by the clip/project pass and consumed by the
-// raster + shade passes. `valid`=0 marks an unused slot (a triangle that clipped away, or
-// the second slot of a triangle that produced only one sub-triangle).
+// raster + shade passes. Validity and the see-through (clear) marker live OUTSIDE the
+// struct in a dense per-slot `flags` int array (bit0 = valid, bit1 = clear): the
+// classify/clear passes probe every slot each frame, and a dense 4-byte probe touches
+// 8 slots per 32B sector instead of dragging in one sector of each 156B record — and
+// kProject's per-frame slot invalidation becomes fully coalesced stores.
 struct DSTri {
     float  sx0, sy0, invd0; float3 wp0, wn0; float2 uv0;
     float  sx1, sy1, invd1; float3 wp1, wn1; float2 uv1;
@@ -130,9 +143,10 @@ struct DSTri {
     int    tex;             // skin texture index, or -1
     float  triplanarScale;  // >0: sample by world triplanar instead of UV
     int    emissive;
-    int    clear;           // see-through transmissive surface
-    int    valid;
 };
+// Per-slot flags array values (kProject writes, classify/raster/clear passes probe).
+constexpr int kSlotValid = 1;   // bit0: slot holds a projected sub-triangle
+constexpr int kSlotClear = 2;   // bit1: see-through transmissive surface
 
 // A camera-space vertex carrying the interpolated attributes (mirrors raster::VtxCS).
 struct DVtxCS { float x, y, z; float3 wpos, wn; float2 uv; };
@@ -284,61 +298,112 @@ __device__ inline void projectVtxG(const DCam& cam, const DVtxCS& v, int W, int 
 // instead rejects any triangle that reaches (nearly) behind the camera and projects the
 // three vertices straight through the angular map into a single sub-triangle. This mirrors
 // raster::projectRange's two branches exactly, so the GPU and CPU rasters agree per camera.
+//
+// The whole clip lives in REGISTERS: clipping a triangle against ONE plane yields at most
+// four vertices, so the edge walk's eight in/out cases are enumerated explicitly into
+// named locals (q0..q3) instead of dynamically-indexed staging arrays, which nvcc would
+// spill to per-thread local memory — that spill traffic, times millions of triangles, was
+// the bulk of this pass's cost. Each case emits the EXACT vertex sequence the array walk
+// produced, so every stored float is unchanged.
+
+// One projected vertex (screen x/y, 1/depth, world pos/normal, uv) — projectVtxG's
+// outputs bundled so the fan pieces can be assembled from named registers.
+struct PV { float sx, sy, invd; float3 wp, wn; float2 uv; };
+
+__device__ inline PV projectPV(const DCam& cam, const DVtxCS& v, int W, int H) {
+    PV p;
+    projectVtxG(cam, v, W, H, p.sx, p.sy, p.invd, p.wp, p.wn, p.uv);
+    return p;
+}
+
+// Near-plane crossing point of edge A->B (the old inline lerp, verbatim).
+__device__ inline DVtxCS clipNear(const DVtxCS& A, const DVtxCS& B, float zn) {
+    float s = (zn - A.z) / (B.z - A.z);
+    return lerpVtx(A, B, s);
+}
+
+// Store one fan piece into slot `idx` — unless it could never touch a pixel. The bbox
+// and degenerate-area predicates are setupSlot's EXACT arithmetic (kClear applies the
+// same two rejections), so skipping the 156-byte store for off-screen / degenerate
+// pieces is invisible to every downstream pass; the slot's flags simply stay 0.
+__device__ inline void emitSlot(DSTri* out, int* flags, int idx, const DPTri& t,
+                                int W, int H, const PV& A, const PV& B, const PV& C) {
+    float minx = floorf(fminf(A.sx, fminf(B.sx, C.sx)));
+    float maxx = ceilf (fmaxf(A.sx, fmaxf(B.sx, C.sx)));
+    float miny = floorf(fminf(A.sy, fminf(B.sy, C.sy)));
+    float maxy = ceilf (fmaxf(A.sy, fmaxf(B.sy, C.sy)));
+    int xlo = max(0, (int)minx), xhi = min(W - 1, (int)maxx);
+    int ylo = max(0, (int)miny), yhi = min(H - 1, (int)maxy);
+    if (xlo > xhi || ylo > yhi) return;
+    float area = (B.sx - A.sx) * (C.sy - A.sy) - (B.sy - A.sy) * (C.sx - A.sx);
+    if (fabsf(area) < 1e-9f) return;
+    DSTri s;
+    s.sx0 = A.sx; s.sy0 = A.sy; s.invd0 = A.invd; s.wp0 = A.wp; s.wn0 = A.wn; s.uv0 = A.uv;
+    s.sx1 = B.sx; s.sy1 = B.sy; s.invd1 = B.invd; s.wp1 = B.wp; s.wn1 = B.wn; s.uv1 = B.uv;
+    s.sx2 = C.sx; s.sy2 = C.sy; s.invd2 = C.invd; s.wp2 = C.wp; s.wn2 = C.wn; s.uv2 = C.uv;
+    s.color = t.color; s.tex = t.tex; s.triplanarScale = t.triplanarScale;
+    s.emissive = t.emissive;
+    out[idx] = s;
+    flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0);
+}
+
 __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
-                         DSTri* out) {
+                         DSTri* out, int* flags) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nTris) return;
     const DPTri& t = tris[i];
-    // Invalidate both output slots up front.
-    out[2*i].valid = 0; out[2*i+1].valid = 0;
+    // Invalidate both output slots up front (dense, coalesced — adjacent threads write
+    // adjacent flag pairs).
+    flags[2*i] = 0; flags[2*i+1] = 0;
 
     // World -> camera space.
-    DVtxCS cs[3] = { toCS(cam, t.p0, t.n0, t.uv0), toCS(cam, t.p1, t.n1, t.uv1),
-                     toCS(cam, t.p2, t.n2, t.uv2) };
+    DVtxCS c0 = toCS(cam, t.p0, t.n0, t.uv0);
+    DVtxCS c1 = toCS(cam, t.p1, t.n1, t.uv1);
+    DVtxCS c2 = toCS(cam, t.p2, t.n2, t.uv2);
 
     if (cam.projection != CAM_RECTILINEAR) {
         // Fisheye/panoramic: no near-plane clip. Reject the triangle if any vertex points
         // (nearly) backward (z <= -0.999*len), else project all three straight through the
         // angular lens map into ONE sub-triangle (slot [2*i]; [2*i+1] stays invalid).
-        for (int e = 0; e < 3; ++e) {
-            float len = sqrtf(cs[e].x*cs[e].x + cs[e].y*cs[e].y + cs[e].z*cs[e].z);
-            if (cs[e].z <= -0.999f * len) return;
-        }
-        DSTri s;
-        projectVtxG(cam, cs[0], W, H, s.sx0, s.sy0, s.invd0, s.wp0, s.wn0, s.uv0);
-        projectVtxG(cam, cs[1], W, H, s.sx1, s.sy1, s.invd1, s.wp1, s.wn1, s.uv1);
-        projectVtxG(cam, cs[2], W, H, s.sx2, s.sy2, s.invd2, s.wp2, s.wn2, s.uv2);
-        s.color = t.color; s.tex = t.tex; s.triplanarScale = t.triplanarScale;
-        s.emissive = t.emissive; s.clear = t.clear; s.valid = 1;
-        out[2*i] = s;
+        float l0 = sqrtf(c0.x*c0.x + c0.y*c0.y + c0.z*c0.z);
+        if (c0.z <= -0.999f * l0) return;
+        float l1 = sqrtf(c1.x*c1.x + c1.y*c1.y + c1.z*c1.z);
+        if (c1.z <= -0.999f * l1) return;
+        float l2 = sqrtf(c2.x*c2.x + c2.y*c2.y + c2.z*c2.z);
+        if (c2.z <= -0.999f * l2) return;
+        PV A = projectPV(cam, c0, W, H);
+        PV B = projectPV(cam, c1, W, H);
+        PV C = projectPV(cam, c2, W, H);
+        emitSlot(out, flags, 2*i, t, W, H, A, B, C);
         return;
     }
 
-    // Rectilinear: Sutherland-Hodgman clip against the near plane z=zn.
+    // Rectilinear: Sutherland-Hodgman clip against the near plane z=zn, in registers.
+    // The edge walk (e=0,1,2: emit A if inside, emit the crossing if the edge straddles)
+    // emits, per in/out mask, exactly the sequences enumerated below.
     const float zn = 1e-3f;
-    DVtxCS poly[8]; int np = 0;
-    for (int e = 0; e < 3; ++e) {
-        const DVtxCS& A = cs[e]; const DVtxCS& B = cs[(e+1)%3];
-        bool inA = A.z > zn, inB = B.z > zn;
-        if (inA && np < 8) poly[np++] = A;
-        if (inA != inB && np < 8) { float s = (zn - A.z) / (B.z - A.z); poly[np++] = lerpVtx(A, B, s); }
+    int mask = (c0.z > zn ? 1 : 0) | (c1.z > zn ? 2 : 0) | (c2.z > zn ? 4 : 0);
+    if (mask == 0) return;                       // fully behind the near plane
+    DVtxCS q0 = c0, q1 = c1, q2 = c2, q3 = c2;   // defaults; q3 only read when np == 4
+    int np = 3;
+    switch (mask) {
+        case 7:                                                                  break; // [A0 A1 A2]
+        case 1: q1 = clipNear(c0, c1, zn); q2 = clipNear(c2, c0, zn);            break; // [A0 X01 X20]
+        case 2: q0 = clipNear(c0, c1, zn); q2 = clipNear(c1, c2, zn);            break; // [X01 A1 X12]
+        case 4: q0 = clipNear(c1, c2, zn); q1 = c2; q2 = clipNear(c2, c0, zn);   break; // [X12 A2 X20]
+        case 3: q2 = clipNear(c1, c2, zn); q3 = clipNear(c2, c0, zn); np = 4;    break; // [A0 A1 X12 X20]
+        case 5: q1 = clipNear(c0, c1, zn); q2 = clipNear(c1, c2, zn); np = 4;    break; // [A0 X01 X12 A2]
+        case 6: q0 = clipNear(c0, c1, zn); q3 = clipNear(c2, c0, zn); np = 4;    break; // [X01 A1 A2 X20]
     }
-    if (np < 3) return;
 
-    // Fan the clipped polygon into (np-2) triangles; store up to the first two.
-    float sx[8], sy[8], invd[8]; float3 wp[8], wn[8]; float2 uv[8];
-    for (int k = 0; k < np; ++k)
-        projectVtxG(cam, poly[k], W, H, sx[k], sy[k], invd[k], wp[k], wn[k], uv[k]);
-
-    int slot = 0;
-    for (int k = 1; k + 1 < np && slot < 2; ++k, ++slot) {
-        DSTri s;
-        s.sx0 = sx[0];   s.sy0 = sy[0];   s.invd0 = invd[0];   s.wp0 = wp[0];   s.wn0 = wn[0];   s.uv0 = uv[0];
-        s.sx1 = sx[k];   s.sy1 = sy[k];   s.invd1 = invd[k];   s.wp1 = wp[k];   s.wn1 = wn[k];   s.uv1 = uv[k];
-        s.sx2 = sx[k+1]; s.sy2 = sy[k+1]; s.invd2 = invd[k+1]; s.wp2 = wp[k+1]; s.wn2 = wn[k+1]; s.uv2 = uv[k+1];
-        s.color = t.color; s.tex = t.tex; s.triplanarScale = t.triplanarScale;
-        s.emissive = t.emissive; s.clear = t.clear; s.valid = 1;
-        out[2*i + slot] = s;
+    // Fan: (q0,q1,q2) then, for a quad, (q0,q2,q3) — the array walk's k=1,2 pieces.
+    PV A = projectPV(cam, q0, W, H);
+    PV B = projectPV(cam, q1, W, H);
+    PV C = projectPV(cam, q2, W, H);
+    emitSlot(out, flags, 2*i + 0, t, W, H, A, B, C);
+    if (np == 4) {
+        PV D = projectPV(cam, q3, W, H);
+        emitSlot(out, flags, 2*i + 1, t, W, H, A, C, D);
     }
 }
 
@@ -351,9 +416,9 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
 // classifier and all three binned kernels compute identical values.
 struct SlotSetup { int xlo, xhi, ylo, yhi; float inv, dw0dx, dw1dx; };
 
-__device__ inline bool setupSlot(const DSTri& t, int W, int H, int seeThrough, SlotSetup& s) {
-    if (!t.valid) return false;
-    if (seeThrough && t.clear) return false;   // clear surfaces handled by the clear-accumulation pass
+__device__ inline bool setupSlot(const DSTri& t, int flg, int W, int H, int seeThrough, SlotSetup& s) {
+    if (!(flg & kSlotValid)) return false;
+    if (seeThrough && (flg & kSlotClear)) return false;   // clear surfaces handled by the clear-accumulation pass
     float minx = floorf(fminf(t.sx0, fminf(t.sx1, t.sx2)));
     float maxx = ceilf (fmaxf(t.sx0, fmaxf(t.sx1, t.sx2)));
     float miny = floorf(fminf(t.sy0, fminf(t.sy1, t.sy2)));
@@ -398,50 +463,52 @@ __device__ inline void rasterRow(const DSTri& t, int slot, int y, const SlotSetu
 constexpr long long kSmallMaxPx = 128;
 constexpr long long kMedMaxPx   = 16384;
 
-__global__ void kClassify(const DSTri* stris, int nSlots, int W, int H, int seeThrough,
-                          int* binSmall, int* binMed, int* binLarge, int* cnt) {
+__global__ void kClassify(const DSTri* stris, const int* flags, int nSlots, int W, int H,
+                          int seeThrough, int* binSmall, int* binMed, int* binLarge, int* cnt) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nSlots) return;
+    int flg = flags[idx];                       // dense 4B probe: skip dead slots without
+    if (!(flg & kSlotValid)) return;            // touching the 156B DSTri record at all
     SlotSetup s;
-    if (!setupSlot(stris[idx], W, H, seeThrough, s)) return;   // culled: nothing to raster
+    if (!setupSlot(stris[idx], flg, W, H, seeThrough, s)) return;   // culled: nothing to raster
     long long px = (long long)(s.xhi - s.xlo + 1) * (s.yhi - s.ylo + 1);
     if      (px <= kSmallMaxPx) binSmall[atomicAdd(&cnt[0], 1)] = idx;
     else if (px <= kMedMaxPx)   binMed  [atomicAdd(&cnt[1], 1)] = idx;
     else                        binLarge[atomicAdd(&cnt[2], 1)] = idx;
 }
 
-__global__ void kRasterSmall(const DSTri* stris, const int* list, int n, int W, int H,
-                             int seeThrough, unsigned long long* vis) {
+__global__ void kRasterSmall(const DSTri* stris, const int* flags, const int* list, int n,
+                             int W, int H, int seeThrough, unsigned long long* vis) {
     int li = blockIdx.x * blockDim.x + threadIdx.x;
     if (li >= n) return;
     int slot = list[li];
     const DSTri& t = stris[slot];
     SlotSetup s;
-    if (!setupSlot(t, W, H, seeThrough, s)) return;
+    if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) return;
     for (int y = s.ylo; y <= s.yhi; ++y)
         rasterRow(t, slot, y, s, W, vis);
 }
 
-__global__ void kRasterMed(const DSTri* stris, const int* list, int n, int W, int H,
-                           int seeThrough, unsigned long long* vis) {
+__global__ void kRasterMed(const DSTri* stris, const int* flags, const int* list, int n,
+                           int W, int H, int seeThrough, unsigned long long* vis) {
     int gt = blockIdx.x * blockDim.x + threadIdx.x;
     int li = gt >> 5, lane = gt & 31;
     if (li >= n) return;
     int slot = list[li];
     const DSTri& t = stris[slot];
     SlotSetup s;
-    if (!setupSlot(t, W, H, seeThrough, s)) return;
+    if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) return;
     for (int y = s.ylo + lane; y <= s.yhi; y += 32)
         rasterRow(t, slot, y, s, W, vis);
 }
 
-__global__ void kRasterLarge(const DSTri* stris, const int* list, int n, int W, int H,
-                             int seeThrough, unsigned long long* vis) {
+__global__ void kRasterLarge(const DSTri* stris, const int* flags, const int* list, int n,
+                             int W, int H, int seeThrough, unsigned long long* vis) {
     if (blockIdx.x >= (unsigned)n) return;
     int slot = list[blockIdx.x];
     const DSTri& t = stris[slot];
     SlotSetup s;
-    if (!setupSlot(t, W, H, seeThrough, s)) return;
+    if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) return;
     for (int y = s.ylo + threadIdx.x; y <= s.yhi; y += blockDim.x)
         rasterRow(t, slot, y, s, W, vis);
 }
@@ -523,13 +590,14 @@ __global__ void kShade(const DSTri* stris, const unsigned long long* vis,
 // running transmittance `clearT` by the per-surface transmittance and its milk product
 // `milkT` by (1 - per-surface milk). Order-independent (commutative product), so no sort;
 // atomicMulF makes concurrent fragments on one pixel safe. Device twin of fillTriangleClear.
-__global__ void kClear(const DSTri* stris, int nSlots, const float* zbuf, DCam cam,
-                       int W, int H, float clarity, float milkPerSurface, float rimStrength,
-                       float* clearT, float* milkT) {
+__global__ void kClear(const DSTri* stris, const int* flags, int nSlots, const float* zbuf,
+                       DCam cam, int W, int H, float clarity, float milkPerSurface,
+                       float rimStrength, float* clearT, float* milkT) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nSlots) return;
+    int flg = flags[idx];                       // dense probe before touching the record
+    if ((flg & (kSlotValid | kSlotClear)) != (kSlotValid | kSlotClear)) return;
     const DSTri& t = stris[idx];
-    if (!t.valid || !t.clear) return;
 
     float minx = floorf(fminf(t.sx0, fminf(t.sx1, t.sx2)));
     float maxx = ceilf (fmaxf(t.sx0, fmaxf(t.sx1, t.sx2)));
@@ -683,6 +751,7 @@ struct Scene {
     DPTri*   dtris   = nullptr;
     int      nTris   = 0;
     DSTri*   dstris  = nullptr;   // 2*nTris slots
+    int*     dflags  = nullptr;   // per-slot kSlotValid|kSlotClear bits (dense probe array)
     DLight*  dlights = nullptr;
     int      nLights = 0;
     float    ambient = 0.12f, keyScale = 1.15f, fill = 0.08f;
@@ -735,6 +804,7 @@ void destroy(Scene* sc) {
     if (!sc) return;
     if (sc->dtris)    cudaFree(sc->dtris);
     if (sc->dstris)   cudaFree(sc->dstris);
+    if (sc->dflags)   cudaFree(sc->dflags);
     if (sc->dlights)  cudaFree(sc->dlights);
     if (sc->dtexMeta) cudaFree(sc->dtexMeta);
     if (sc->dtexels)  cudaFree(sc->dtexels);
@@ -817,6 +887,7 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
 
     bool ok = tryMalloc((void**)&sc->dtris,  sizeof(DPTri) * tris.size())
            && tryMalloc((void**)&sc->dstris, sizeof(DSTri) * 2 * tris.size())
+           && tryMalloc((void**)&sc->dflags, sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinSmall, sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinMed,   sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinLarge, sizeof(int) * 2 * tris.size())
@@ -928,7 +999,7 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     int gPix   = (int)((N + TPB - 1) / TPB);
 
     tp = ptick();
-    kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dstris);
+    kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dstris, sc->dflags);
     if (!sync()) return empty;
     padd(g_profAcc.project_ms, tp);
     // Bin the slots by bbox size, then rasterize each bin at a matching parallel width
@@ -937,18 +1008,18 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // bit-identical while a screen-filling quad no longer serializes on one thread.
     tp = ptick();
     if (cudaMemset(sc->dbinCnt, 0, 3 * sizeof(int)) != cudaSuccess) return empty;
-    kClassify<<<gSlots, TPB>>>(sc->dstris, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
+    kClassify<<<gSlots, TPB>>>(sc->dstris, sc->dflags, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
                                sc->dbinSmall, sc->dbinMed, sc->dbinLarge, sc->dbinCnt);
     int hcnt[3] = {0, 0, 0};   // blocking copy also orders the classify before the readback
     if (cudaMemcpy(hcnt, sc->dbinCnt, 3 * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
     if (hcnt[0] > 0)
-        kRasterSmall<<<(hcnt[0] + TPB - 1) / TPB, TPB>>>(sc->dstris, sc->dbinSmall, hcnt[0],
-                                                         W, H, seeThrough ? 1 : 0, sc->vis);
+        kRasterSmall<<<(hcnt[0] + TPB - 1) / TPB, TPB>>>(sc->dstris, sc->dflags, sc->dbinSmall,
+                                                         hcnt[0], W, H, seeThrough ? 1 : 0, sc->vis);
     if (hcnt[1] > 0)
         kRasterMed<<<(int)(((long long)hcnt[1] * 32 + TPB - 1) / TPB), TPB>>>(
-            sc->dstris, sc->dbinMed, hcnt[1], W, H, seeThrough ? 1 : 0, sc->vis);
+            sc->dstris, sc->dflags, sc->dbinMed, hcnt[1], W, H, seeThrough ? 1 : 0, sc->vis);
     if (hcnt[2] > 0)
-        kRasterLarge<<<hcnt[2], TPB>>>(sc->dstris, sc->dbinLarge, hcnt[2],
+        kRasterLarge<<<hcnt[2], TPB>>>(sc->dstris, sc->dflags, sc->dbinLarge, hcnt[2],
                                        W, H, seeThrough ? 1 : 0, sc->vis);
     if (!sync()) return empty;
     padd(g_profAcc.raster_ms, tp);
@@ -967,7 +1038,7 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
         kFillF<<<gPix, TPB>>>(sc->clearT, 1.0f, N);
         kFillF<<<gPix, TPB>>>(sc->milkT,  1.0f, N);
         if (!sync()) return empty;
-        kClear<<<gSlots, TPB>>>(sc->dstris, 2 * sc->nTris, sc->zbuf, dc, W, H,
+        kClear<<<gSlots, TPB>>>(sc->dstris, sc->dflags, 2 * sc->nTris, sc->zbuf, dc, W, H,
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
                                 sc->clearT, sc->milkT);
         if (!sync()) return empty;
