@@ -3300,7 +3300,7 @@ static void printHelp(const char* prog) {
 "  -forever              trace until Ctrl-C (progressive)\n"
 "  -spp <n>              samples/pixel for backward modes R/V\n"
 "  -beams|-photonbeams   decorrelated photon-beams gather for shared multi-camera flybys\n"
-"                        (single-scatter volumetrics; CPU-only, kills frozen speckle)\n"
+"                        (single-scatter volumetrics; CPU or GPU; kills frozen speckle)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -t <n>                CPU thread count\n"
 "\n"
@@ -3338,6 +3338,18 @@ static void printHelp(const char* prog) {
 }
 
 static int run(int argc, char** argv) {
+    // Normalize GNU-style double-dash options to the single-dash spellings the parser
+    // uses, so EVERY flag accepts either form (`--window` == `-window`, `--beams` ==
+    // `-beams`, etc.). We simply advance the pointer past one leading dash for any token
+    // that starts with "--" and has more characters (leaving a lone "--" or "-" alone).
+    // This runs before every downstream scan (help, -topng, the main parse loop, the
+    // tab-completion helper), so a double-dash flag is never mistaken for an unknown
+    // option, and genuinely unrecognized flags still fall through to the loud error at
+    // the end of the parse loop (no invalid parameter is ever silently ignored).
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] != '\0')
+            argv[i] += 1;
+    }
     // `-h` / `--help` (also `-help` / `help`) anywhere on the command line: print the
     // usage summary and exit, before any scene setup or the default render. Scanned
     // across all args (not just argv[1]) so `ftrace foo --help` still helps.
@@ -3680,8 +3692,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
-        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "--beams") ||
-                 !std::strcmp(argv[i], "-photonbeams") || !std::strcmp(argv[i], "--photonbeams")) g_beamGather = true;
+        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
@@ -5865,8 +5876,8 @@ static int run(int argc, char** argv) {
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
-        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene) && !g_beamGather)
-            useGpuForward = true;   // -beams per-camera resample is CPU-only for now
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
+            useGpuForward = true;   // -beams per-camera resample is supported on the GPU too
     }
 #endif
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
@@ -5968,7 +5979,8 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             if (useGpuForward)
                 films = renderForwardSharedCuda(scene, cams, rxs, rys, batchN, e, diffraction,
-                                                groupMode, (unsigned long long)accN, wavefront, g_heroC);
+                                                groupMode, (unsigned long long)accN, wavefront, g_heroC,
+                                                g_beamGather);
             else
 #endif
                 films = renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,

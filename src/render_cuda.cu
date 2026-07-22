@@ -2360,6 +2360,12 @@ struct DCamSet {
     DPhoton*            depPhotons = nullptr;
     unsigned long long* depCount   = nullptr;
     unsigned long long  depCap     = 0;
+    // PHOTON-BEAMS gather (CLI -beams, shared multi-camera pass). When set (and nCam>1,
+    // a medium exists, camMode!=C) the photon crosses each medium in a STRAIGHT beam and
+    // every camera independently resamples its own single-scatter in-scatter point with a
+    // per-photon RNG stream, decoupling the deposit (shared flight) from the gather so a
+    // volumetric flyby gets independent per-frame noise instead of one frozen speckle.
+    bool beamGather = false;
 };
 
 // Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
@@ -3618,12 +3624,18 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int camMode, int diffraction, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
-                                DMediumStack& stk) {
+                                DMediumStack& stk, DRng* crng = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
+
+    // PHOTON-BEAMS gather active for THIS step: shared multi-camera pass, a medium exists,
+    // and the caller handed us an independent RNG stream. When on, the photon does NOT
+    // redirect in the medium (it crosses straight) and each camera resamples its own
+    // in-scatter point below — so skip the analog medium-collision sampling here.
+    const bool doBeam = cs.beamGather && crng && cs.nCam > 1 && camMode != CAM_C && sc.mediaN > 0;
 
     // fog free-flight; dEvent is the nearer of surface hit / volume collision.
     bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
-    if (sc.mediaN > 0) {
+    if (sc.mediaN > 0 && !doBeam) {
         // Superposition of all media: each does its own delta (Woodcock) tracking (or
         // exact analytic free-flight if homogeneous); the earliest collision wins and
         // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
@@ -3651,10 +3663,46 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // Beer-Lambert attenuation over the free path just travelled inside a dielectric
     // (colored/attenuating glass), applied before the event is processed (matches the
     // host: attenuate over dEvent using the medium carried from the previous vertex).
+    // `betaPre` is throughput BEFORE this attenuation, so a beam-gather camera re-applies
+    // glass absorption to ITS own resampled collision distance tC (not the photon's).
+    Real betaPre = beta;
     {
         int cm = stk.topMat();
         Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
         if (a > 0) beta *= exp(-a * dEvent);
+    }
+
+    // PHOTON-BEAMS single-scatter gather (device twin of the CPU -beams block in render.h).
+    // The photon crosses the medium in a STRAIGHT beam (analog redirect skipped above), and
+    // each camera independently samples ONE in-scatter point along [ro, dSurf] with its OWN
+    // stream `crng`, then splats it. Decoupling the shared deposit from the per-camera gather
+    // gives a volumetric flyby independent per-frame noise instead of one frozen speckle.
+    // Unbiased for SINGLE scattering (each resample is a free-flight collision pdf sigma_t*Tr,
+    // and connectVolume's albedo*phase*T_cam*beta cancels that Tr). Multiple scattering is
+    // intentionally omitted — the right trade for a crisp view-dependent bow / glory / rays.
+    if (doBeam) {
+        int cm = stk.topMat();
+        Real aC = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+        for (int c = 0; c < cs.nCam; ++c) {
+            Real tC; int whichC;
+            if (!dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng, tC, whichC))
+                continue;   // this camera saw no in-scatter along this beam
+            DVec3 xc = ro + rd * tC;
+            Real betaC = (aC > 0) ? betaPre * exp(-aC * tC) : betaPre;
+            const DMedium& smc = sc.media[whichC];
+            if (camMode == CAM_A) connectLensVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            else                  connectVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            // Per-camera specular volume splat (fog seen through a smooth sphere caustic):
+            // a 1-camera slice of the set so the "All" helper targets only camera c.
+            DCamSet cs1 = cs; cs1.nCam = 1; cs1.cams = &cs.cams[c]; cs1.films = &cs.films[c]; cs1.hits = &cs.hits[c];
+            camSpecularSplatVolumeAll(sc, smc, cs1, camMode, xc, rd, lambda, betaC, *crng);
+        }
+        // Attenuate the photon by the medium extinction over the whole crossing (single-
+        // scatter transmission) so surfaces behind the fog are correctly dimmed; the removed
+        // energy (out-scattered + absorbed) is booked as absorbed. Then continue STRAIGHT.
+        Real before = beta;
+        beta *= dMediaTransmittance(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng);
+        eAbsorbed += (double)(before - beta);
     }
 
     if (mediumEvent) {
@@ -4057,11 +4105,17 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
+        // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY to resample each camera's
+        // in-scatter point (seeded from the main stream so it is unique per photon/thread).
+        // Only drawn from inside shadeStep's doBeam branch, so non-beam renders are unchanged.
+        DRng crng;
+        if (cs.beamGather) crng.seed(((unsigned long long)rng.next() << 32) ^ rng.next(),
+                                     ((unsigned long long)rng.next() << 32) ^ rng.next());
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // bend through any GRIN region first
             DHit h = closestHit(sc, ro, rd);
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
-                          eAbsorbed, eSensor, eEscaped, stk) == WF_TERMINATE) done = true;
+                          eAbsorbed, eSensor, eEscaped, stk, cs.beamGather ? &crng : nullptr) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -6448,9 +6502,10 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
         effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
     }
-    if (wavefront && effHeroC == 1) {
+    if (wavefront && effHeroC == 1 && !cs.beamGather) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
-        // maxBounce (32) and camera mode/set as the megakernel. (Hero forces megakernel.)
+        // maxBounce (32) and camera mode/set as the megakernel. (Hero AND photon-beams
+        // force the megakernel — the wavefront pool carries no per-photon beam RNG stream.)
         wavefrontTrace(up, cs, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
     } else {
         int blockSize = 128;
@@ -6513,7 +6568,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase,
-                                          bool wavefront, int heroC) {
+                                          bool wavefront, int heroC, bool beamGather) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -6542,6 +6597,9 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
 
     int camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
     DCamSet cs = makeCamSet(up, hcams, d_films, d_hits);
+    // Photon-beams gather: only meaningful with several cameras sharing one flight and a
+    // participating medium present (the device gates the per-step branch on the same).
+    cs.beamGather = beamGather && nc > 1 && !scene.media.empty();
     launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
 
     // --- download each camera's film ---

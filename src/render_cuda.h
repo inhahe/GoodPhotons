@@ -84,7 +84,8 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase = 0,
-                                          bool wavefront = false, int heroC = 1);
+                                          bool wavefront = false, int heroC = 1,
+                                          bool beamGather = false);
 
 // True if this scene can be rendered by the GPU photon-map path (mode M). Requires the
 // same POD-bakeable materials as the forward path (cudaForwardSupported) and no

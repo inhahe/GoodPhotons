@@ -86,6 +86,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   since 0.19.14 — the committed hit is float anyway and FP64 VM ops serialize on
   consumer GPUs' 1/64-rate FP64 pipe (~2× on implicit-heavy scenes); normals
   (`dFieldGradient`) and media bound-fields stay FP64 on the original pools.
+  Photon-beams (`-beams`, since 0.19.17) run on the GPU too: `DCamSet::beamGather`
+  drives a `shadeStep` branch that (with an independent per-photon `DRng crng` seeded
+  in `kTrace`) crosses the medium straight and has each shared camera resample its own
+  single-scatter in-scatter point — decorrelated per-frame flyby noise, megakernel-only.
   `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
