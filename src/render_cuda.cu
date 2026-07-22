@@ -5163,7 +5163,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // Chunked exactly like kBackward: renders `chunkSpp` samples-per-pixel starting at
 // `sampleBase`, seeding on the global sample index (pixel*sppTotal + sampleBase + local)
 // so any chunking is bit-identical to a single sppTotal pass.
-__global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
+// __launch_bounds__(128, 3): unconstrained the kernel compiles to 254 regs -> only 2
+// blocks (256 threads) resident per SM. Capping at 3 blocks/SM (<=170 regs) trades a few
+// extra spills for +50% latency hiding; the kernel is latency-bound on spilled/local
+// state (8KB stack/thread), so occupancy wins.
+__global__ void __launch_bounds__(128, 3)
+kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase) {
