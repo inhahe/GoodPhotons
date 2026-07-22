@@ -27,9 +27,8 @@ medium {
 }
 
 # Collimated beam angled down from the upper right, lighting the fog as a clean visible
-# haze. The direction is tilted a little off pure vertical on purpose: an exactly -y
-# collimated beam hits a degenerate emitter basis and only lights half the footprint
-# (see known-issues.md), so we aim it slightly across x/z to get uniform coverage.
+# haze. The slight off-vertical tilt is purely aesthetic (light-from-upper-right gradient);
+# the beam footprint is centered on the aim point regardless of direction.
 group { translate 2 6.0 3.4   scale 300
     light collimated { origin 0 0 0   dir 0.18 -1 0.14   spd blackbody 5800   lumens 3200000 }
 }

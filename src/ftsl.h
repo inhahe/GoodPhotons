@@ -2769,8 +2769,16 @@ private:
             Vec3 o{0.5, 0.5, 0.95}; vec3Of(b, "origin", o);
             Vec3 t, bt; onb(beam, t, bt);
             double w = Len(0.03) * s;
+            Vec3 U = t * w, V = bt * w;
+            // The emitter quad is sampled corner-anchored (origin + u*[0,1] + v*[0,1]),
+            // so pass a corner offset by -half(U+V): that makes `origin` (the aim point)
+            // the CENTRE of the beam footprint, not a corner. For a bare 3 cm pencil the
+            // offset is negligible, but a group-scaled beam (w = 0.03*scale) would
+            // otherwise sit entirely on the +u/+v side of the aim point, lighting only
+            // half the intended footprint (hard seam through the aim point).
+            Vec3 corner = P(xf.apply(o)) - U * 0.5 - V * 0.5;
             spd = absPower(b, spd, (w * w) * PI, L);
-            L.scene.addAreaLight(P(xf.apply(o)), t * w, bt * w, beam, w * w, spd, binWidth_,
+            L.scene.addAreaLight(corner, U, V, beam, w * w, spd, binWidth_,
                                  /*collimated*/true, beam);
             return true;
         }

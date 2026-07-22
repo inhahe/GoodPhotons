@@ -1053,7 +1053,7 @@ per-path carrier is left unqualified here.
 | `sphere` | Spherical area light | `center`, `radius`, `spd` |
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
-| `collimated` | Thin parallel pencil beam | `origin`, `dir`, `spd` |
+| `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity` |
 
 **Absolute power.** Any non-env light may author a real physical output —

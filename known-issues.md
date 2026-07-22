@@ -5,23 +5,30 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG (2026-07-22): collimated light with an exactly axis-aligned `-y` (straight-down) direction only lights half its footprint
+### BUG — DONE (2026-07-22): a group-scaled collimated beam lit only half its footprint (offset by half its width from the aim point)
 
-A `light collimated { dir 0 -1 0 }` (pure straight-down beam) illuminates only one half
-of its `w×w` emitter footprint, split along a hard vertical seam through the beam centre —
-so a downward god-ray beam over a fog box lights, e.g., only `x > centre`, leaving the
-other half in shadow. Repro: `scraps/_fogtune2.ftsl` with `dir 0 -1 0` shows a sharp
-vertical brightness seam at the beam's x-centre that does **not** move when the beam is
-widened (scale 250→700), proving it's not a footprint-edge artifact. Tilting the beam a
-little off vertical (`dir 0.18 -1 0.14`) makes the seam vanish and the footprint light
-uniformly — so this is a degenerate emitter-basis problem when `beamDir` is (anti)parallel
-to the world-up axis used to build the quad's `u/v` frame (see `ftsl.h` collimated-light
-construction, ~line 2765: `w = Len(0.03)*scale`, `u/v` built from `beamDir`). **Proper
-fix:** when building the collimated quad's tangent basis, pick the reference up-vector
-robustly (use a different axis when `|beamDir·up|` is near 1, i.e. Duff et al.
-branchless ONB), instead of a fixed world-up that collapses for vertical beams.
-Workaround in scenes for now: aim collimated beams slightly off the vertical axis
-(as `scenes/_beams_hg_decorr.ftsl` now does).
+A group-scaled `light collimated { ... }` illuminated only one half of its `w×w`
+footprint, split along a hard seam through the aim point — a straight-down (`dir 0 -1 0`)
+god-ray beam over a fog box lit only `x > aim`, leaving the other half dark. Repro:
+`scraps/_fogtune2.ftsl` showed a sharp vertical brightness seam at the beam's aim x that
+did **not** move when the beam was widened (scale 250→700) and vanished when the beam was
+tilted off-axis.
+
+Root cause (NOT the ONB — `linalg.h onb()` is the robust Duff branchless construction and
+is fine for `-y`): the emitter quad is sampled **corner-anchored** — `Emitter::samplePoint`
+does `y = origin + u*u1 + v*u2` with `u1,u2 ∈ [0,1]` (`scene.h:549`), correct for ordinary
+area lights where the user gives `origin + u + v` explicitly. But `ftsl.h`'s collimated
+branch passed `xf.apply(origin)` as that corner, so the `w×w` footprint extended `+u,+v`
+from the aim point instead of straddling it. For a bare 3 cm pencil (`w = Len(0.03)*scale`)
+the ½-width offset is invisible; under `scale 250` (`w = 7.5`) the beam sat entirely on the
+`+u/+v` side, so the aim point fell on the footprint edge — the seam. Tilting changed `u/v`
+and smeared the offset diagonally, which is why it "fixed" it.
+
+**Fix:** `ftsl.h` collimated branch now anchors the quad at `xf.apply(origin) − ½(U+V)`, so
+`origin` (the aim point) is the **centre** of the beam footprint. Verified with
+`scraps/_seamtest.ftsl` (pure `dir 0 -1 0`, `scale 300`): the footprint is now symmetric
+about the aim point with no seam. Note this shifts a bare default pencil by ~1.5 cm×scale
+vs. the old corner behaviour (intended — `origin` should mean the beam centre).
 
 ### TOOLING (2026-07-22): Nsight Compute (`ncu`) blocked by ERR_NVGPUCTRPERM — GPU perf counters admin-locked in the driver
 
