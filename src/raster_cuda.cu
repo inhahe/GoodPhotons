@@ -27,14 +27,24 @@
 //                     (the same ambient + Σ weighted N·L + headlight model as the CPU).
 //                     Writes an HDR accum buffer + a 1/depth hit key + an emitter mask.
 //
-//   HOST  download accum/zbuf/emis, then raster::exposeAndEncode() applies the p99 auto-
-//         exposure + sRGB tone map on the HOST — the SAME code the CPU path uses, so
-//         exposure (incl. a camera_path's shared lockAnchor) and encoding are identical.
+//   Pass D  kLumHist1/2 + kToneMap: the exposure/tonemap tail, ON the device (twin of
+//                     raster::exposeAndEncodeT). The p99 auto-exposure anchor is found
+//                     EXACTLY without sorting: qualifying luminances are non-negative
+//                     floats, and non-negative IEEE floats order identically to their
+//                     bit patterns, so two 65536-bin histogram rounds (top 16 bits, then
+//                     low 16 bits within the winning bin) locate the same k-th order
+//                     statistic the host's nth_element selects. kToneMap then applies
+//                     the anchor in DOUBLE precision using explicit round-to-nearest
+//                     intrinsics (__dmul_rn/__dadd_rn/__dsub_rn — no FMA contraction)
+//                     and encodes through the shared raster::srgbLut8() table, so the
+//                     IEEE operation sequence — and therefore every output byte — is
+//                     the host tail's. Only the finished W*H*3 RGB8 image is downloaded
+//                     (~4MB) instead of the ~26MB of HDR buffers the host tail needed.
 //
-// Everything on the device runs in single precision (float): this is a solid-shaded
-// preview, float is amply accurate for the geometry/shading, and it halves the DSTri and
-// buffer memory. The exposure/tonemap tail that must match the real render frame-to-frame
-// stays in host double precision (exposeAndEncode).
+// Everything geometric on the device runs in single precision (float): this is a
+// solid-shaded preview, float is amply accurate for the geometry/shading, and it halves
+// the DSTri and buffer memory. The exposure/tonemap that must match the host tail
+// byte-for-byte runs in double precision on-device (Pass D above).
 //
 // Portable CUDA/HIP host runtime surface (mirrors render_cuda.cu): only the host runtime
 // API is vendor-specific; the device language used here (grid-stride loops, atomicMax on
@@ -61,6 +71,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <cmath>
 #include <chrono>
@@ -569,6 +580,90 @@ __global__ void kFillF(float* p, float val, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
+// Pass D: device exposure + tonemap (twin of raster::exposeAndEncodeT).
+//
+// Auto-exposure luminance of pixel i, exactly as the host computes it: hit, non-emitter
+// pixels only; v = max(r, g, b, 0). The host takes the max over the DOUBLE widenings,
+// but double(float) is exact and order-preserving, so the float max widens to the same
+// value. All qualifying v are >= 0 by the max-with-0, whose bit patterns (as unsigned)
+// order identically to the float values — the basis of the exact histogram selection.
+// The one wrinkle is -0.0f (possible only via fmaxf zero-sign ambiguity): it is the
+// SAME VALUE as +0.0f but has bit pattern 0x80000000, so it is remapped to +0's bits;
+// the selected order statistic is unchanged (equal values), matching the host, where
+// nth_element treats +-0 as equal and eAuto degenerates to 1 either way.
+__device__ inline bool lumBits(const float3* accum, const float* zbuf,
+                               const unsigned char* emis, size_t i, unsigned int& ub) {
+    if (zbuf[i] <= 0.0f || emis[i]) return false;   // skip background + emitters
+    float3 a = accum[i];
+    float v = fmaxf(fmaxf(a.x, a.y), fmaxf(a.z, 0.0f));
+    ub = __float_as_uint(v);
+    if (ub == 0x80000000u) ub = 0u;                 // -0 == +0; bin as +0
+    return true;
+}
+
+// Round 1: histogram of the TOP 16 bits of each qualifying luminance's bit pattern.
+__global__ void kLumHist1(const float3* accum, const float* zbuf, const unsigned char* emis,
+                          size_t n, unsigned int* hist) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int ub;
+    if (lumBits(accum, zbuf, emis, i, ub)) atomicAdd(&hist[ub >> 16], 1u);
+}
+
+// Round 2: among pixels whose top 16 bits equal `hi` (the bin the k-th value fell in),
+// histogram the LOW 16 bits — pinning down the exact k-th smallest bit pattern.
+__global__ void kLumHist2(const float3* accum, const float* zbuf, const unsigned char* emis,
+                          size_t n, unsigned int hi, unsigned int* hist) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int ub;
+    if (lumBits(accum, zbuf, emis, i, ub) && (ub >> 16) == hi)
+        atomicAdd(&hist[ub & 0xFFFFu], 1u);
+}
+
+// sRGB encode through the shared raster::srgbLut8() bytes — the host's encode lambda
+// verbatim (same clamps, same index rounding via explicit RN double ops).
+__device__ inline unsigned char encodeSrgb(double c, const unsigned char* lut) {
+    if (c <= 0.0) return lut[0];
+    if (c >= 1.0) return 255u;
+    return lut[(int)__dadd_rn(__dmul_rn(c, 4096.0), 0.5)];
+}
+
+// Tonemap + encode, one thread per pixel — the host tonemap loop operation-for-operation.
+// Every arithmetic op is an explicit round-to-nearest DOUBLE intrinsic so nvcc cannot
+// contract mul+add into FMA: the host build (MSVC /fp:precise, no AVX2 codegen) performs
+// plain IEEE mul/add there, and matching that sequence exactly is what keeps the output
+// bytes identical. Background pixels (zbuf<=0) keep the unexposed bg tint; the
+// see-through composite applies to ALL pixels (background included), as on the host.
+__global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
+                         double finalExp, int seeThrough,
+                         const float* clearT, const float* milkT,
+                         double milkX, double milkY, double milkZ,
+                         const unsigned char* lut, unsigned char* img) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float3 a = accum[i];
+    double cx = (double)a.x, cy = (double)a.y, cz = (double)a.z;
+    if (zbuf[i] > 0.0f) {                          // hit pixels get the exposure
+        cx = __dmul_rn(cx, finalExp);
+        cy = __dmul_rn(cy, finalExp);
+        cz = __dmul_rn(cz, finalExp);
+    }
+    if (seeThrough) {                              // composite clear glass (display-linear)
+        float T = clearT[i], mt = milkT[i];
+        if (T < 1.0f || mt < 1.0f) {
+            double m = __dsub_rn(1.0, (double)mt); // (1 - mt) evaluated once, as on host
+            cx = __dadd_rn(__dmul_rn(cx, (double)T), __dmul_rn(milkX, m));
+            cy = __dadd_rn(__dmul_rn(cy, (double)T), __dmul_rn(milkY, m));
+            cz = __dadd_rn(__dmul_rn(cz, (double)T), __dmul_rn(milkZ, m));
+        }
+    }
+    img[i * 3 + 0] = encodeSrgb(cx, lut);
+    img[i * 3 + 1] = encodeSrgb(cy, lut);
+    img[i * 3 + 2] = encodeSrgb(cz, lut);
+}
+
+// ---------------------------------------------------------------------------
 // Host side.
 
 // True if a usable CUDA device is present (cached).
@@ -608,15 +703,15 @@ struct Scene {
     int* dbinMed   = nullptr;
     int* dbinLarge = nullptr;
     int* dbinCnt   = nullptr;
-    // Pinned host staging for the per-frame downloads (grown with pixCap): a pageable
-    // std::vector target caps D2H copies at a few GB/s and costs a fresh ~26MB
-    // allocation every frame; pinned staging runs at full PCIe rate, allocated once,
-    // and the exposure/tonemap tail reads it in place.
-    float3*        h_accum  = nullptr;
-    float*         h_zbuf   = nullptr;
-    unsigned char* h_emis   = nullptr;
-    float*         h_clearT = nullptr;
-    float*         h_milkT  = nullptr;
+    // Device exposure/tonemap (Pass D): 65536-bin luminance histogram + its pinned host
+    // copy (the two exact-p99 rounds), the shared sRGB LUT bytes (uploaded once from
+    // raster::srgbLut8()), and the finished RGB8 frame + its pinned download staging
+    // (pinned = full PCIe rate; only these ~4MB cross the bus per frame).
+    unsigned int*  dhist  = nullptr;   // 65536 bins (device)
+    unsigned int*  h_hist = nullptr;   // pinned host copy of dhist
+    unsigned char* dlut   = nullptr;   // raster::srgbLut8() bytes (4097)
+    unsigned char* dimg   = nullptr;   // final W*H*3 RGB8 (device, pixCap-sized)
+    unsigned char* h_img  = nullptr;   // pinned download staging for dimg
 };
 
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
@@ -653,11 +748,11 @@ void destroy(Scene* sc) {
     if (sc->dbinMed)   cudaFree(sc->dbinMed);
     if (sc->dbinLarge) cudaFree(sc->dbinLarge);
     if (sc->dbinCnt)   cudaFree(sc->dbinCnt);
-    if (sc->h_accum)  cudaFreeHost(sc->h_accum);
-    if (sc->h_zbuf)   cudaFreeHost(sc->h_zbuf);
-    if (sc->h_emis)   cudaFreeHost(sc->h_emis);
-    if (sc->h_clearT) cudaFreeHost(sc->h_clearT);
-    if (sc->h_milkT)  cudaFreeHost(sc->h_milkT);
+    if (sc->dhist)  cudaFree(sc->dhist);
+    if (sc->dlut)   cudaFree(sc->dlut);
+    if (sc->dimg)   cudaFree(sc->dimg);
+    if (sc->h_hist) cudaFreeHost(sc->h_hist);
+    if (sc->h_img)  cudaFreeHost(sc->h_img);
     delete sc;
 }
 
@@ -725,7 +820,10 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
            && tryMalloc((void**)&sc->dbinSmall, sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinMed,   sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinLarge, sizeof(int) * 2 * tris.size())
-           && tryMalloc((void**)&sc->dbinCnt,   sizeof(int) * 3);
+           && tryMalloc((void**)&sc->dbinCnt,   sizeof(int) * 3)
+           && tryMalloc((void**)&sc->dhist, 65536 * sizeof(unsigned int))
+           && tryMalloc((void**)&sc->dlut,  raster::srgbLut8().size())
+           && tryMallocHost((void**)&sc->h_hist, 65536 * sizeof(unsigned int));
     if (ok && !hl.empty())
         ok = tryMalloc((void**)&sc->dlights, sizeof(DLight) * hl.size());
     if (ok && !htexMeta.empty())
@@ -745,6 +843,10 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
     if (!htexels.empty() &&
         cudaMemcpy(sc->dtexels, htexels.data(), sizeof(float3) * htexels.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    // The EXACT sRGB table bytes the host tonemap indexes — sharing it is part of the
+    // byte-identity guarantee of the device tonemap (see kToneMap / encodeSrgb).
+    if (cudaMemcpy(sc->dlut, raster::srgbLut8().data(), raster::srgbLut8().size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     return sc;
 }
 
@@ -757,11 +859,8 @@ static bool ensurePix(Scene* sc, size_t N) {
     if (sc->emis)   { cudaFree(sc->emis);   sc->emis = nullptr; }
     if (sc->clearT) { cudaFree(sc->clearT); sc->clearT = nullptr; }
     if (sc->milkT)  { cudaFree(sc->milkT);  sc->milkT = nullptr; }
-    if (sc->h_accum)  { cudaFreeHost(sc->h_accum);  sc->h_accum = nullptr; }
-    if (sc->h_zbuf)   { cudaFreeHost(sc->h_zbuf);   sc->h_zbuf = nullptr; }
-    if (sc->h_emis)   { cudaFreeHost(sc->h_emis);   sc->h_emis = nullptr; }
-    if (sc->h_clearT) { cudaFreeHost(sc->h_clearT); sc->h_clearT = nullptr; }
-    if (sc->h_milkT)  { cudaFreeHost(sc->h_milkT);  sc->h_milkT = nullptr; }
+    if (sc->dimg)   { cudaFree(sc->dimg);   sc->dimg = nullptr; }
+    if (sc->h_img)  { cudaFreeHost(sc->h_img); sc->h_img = nullptr; }
     sc->pixCap = 0;
     bool ok = tryMalloc((void**)&sc->vis,    sizeof(unsigned long long) * N)
            && tryMalloc((void**)&sc->accum,  sizeof(float3) * N)
@@ -769,11 +868,8 @@ static bool ensurePix(Scene* sc, size_t N) {
            && tryMalloc((void**)&sc->emis,   sizeof(unsigned char) * N)
            && tryMalloc((void**)&sc->clearT, sizeof(float) * N)
            && tryMalloc((void**)&sc->milkT,  sizeof(float) * N)
-           && tryMallocHost((void**)&sc->h_accum,  sizeof(float3) * N)
-           && tryMallocHost((void**)&sc->h_zbuf,   sizeof(float) * N)
-           && tryMallocHost((void**)&sc->h_emis,   sizeof(unsigned char) * N)
-           && tryMallocHost((void**)&sc->h_clearT, sizeof(float) * N)
-           && tryMallocHost((void**)&sc->h_milkT,  sizeof(float) * N);
+           && tryMalloc((void**)&sc->dimg,   N * 3)
+           && tryMallocHost((void**)&sc->h_img, N * 3);
     if (!ok) return false;
     sc->pixCap = N;
     return true;
@@ -803,6 +899,7 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                  double exposure, bool autoExpose, double* lockAnchor,
                                  bool seeThrough, double glassClarity) {
     std::vector<uint8_t> empty;
+    (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
     if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return empty;
     const size_t N = (size_t)W * H;
     if (!ensurePix(sc, N)) return empty;
@@ -877,38 +974,64 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
         padd(g_profAcc.clear_ms, tp);
     }
 
-    // Download the HDR accum + hit key + emitter mask into the persistent pinned staging
-    // buffers (full-rate D2H, no per-frame allocation), then run the SHARED host
-    // exposure/tonemap tail in place so exposure (incl. lockAnchor) and encoding match
-    // the CPU path exactly.
-    tp = ptick();
-    if (cudaMemcpy(sc->h_accum, sc->accum, sizeof(float3) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    if (cudaMemcpy(sc->h_zbuf,  sc->zbuf,  sizeof(float)  * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    if (cudaMemcpy(sc->h_emis,  sc->emis,  sizeof(unsigned char) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    if (seeThrough) {
-        if (cudaMemcpy(sc->h_clearT, sc->clearT, sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-        if (cudaMemcpy(sc->h_milkT,  sc->milkT,  sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    }
-    padd(g_profAcc.download_ms, tp);
-
-    // No float3->Vec3 conversion pass: the shared exposure/tonemap core converts each
-    // pixel on the fly (double(float) is exact, so output bytes are unchanged).
+    // Pass D: exposure + tonemap on the DEVICE (twin of raster::exposeAndEncodeT — see
+    // the kernels above). The p99 auto-exposure anchor needs the exact k-th smallest
+    // qualifying luminance; non-negative floats order like their bit patterns, so two
+    // 65536-bin histogram rounds (top 16 bits, then low 16 within the winning bin) find
+    // that exact value with no sort and only a 256KB readback per round. eAuto / the
+    // lockAnchor handshake stay on the host, mirroring the host tail line for line.
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
-    if (nThreads < 1) nThreads = 1;
     tp = ptick();
-    const float3* ha = sc->h_accum;
-    std::vector<uint8_t> img =
-        raster::exposeAndEncodeT([ha](size_t i) {
-                                     return Vec3{ (double)ha[i].x, (double)ha[i].y, (double)ha[i].z };
-                                 },
-                                 sc->h_zbuf, sc->h_emis, W, H, nThreads,
-                                 expComp, autoExpose, lockAnchor,
-                                 seeThrough, seeThrough ? sc->h_clearT : nullptr,
-                                 seeThrough ? sc->h_milkT : nullptr,
-                                 kMilkColor);
+    double eAuto = 1.0;
+    if (autoExpose) {
+        if (lockAnchor && *lockAnchor > 0.0) {
+            eAuto = *lockAnchor;                    // reuse the path's locked anchor
+        } else {
+            unsigned int cut[2] = {0, 0};           // winning top-16 / low-16 bin
+            size_t total = 0, rank = 0;
+            for (int round = 0; round < 2; ++round) {
+                if (cudaMemset(sc->dhist, 0, 65536 * sizeof(unsigned int)) != cudaSuccess) return empty;
+                if (round == 0)
+                    kLumHist1<<<gPix, TPB>>>(sc->accum, sc->zbuf, sc->emis, N, sc->dhist);
+                else
+                    kLumHist2<<<gPix, TPB>>>(sc->accum, sc->zbuf, sc->emis, N, cut[0], sc->dhist);
+                if (cudaMemcpy(sc->h_hist, sc->dhist, 65536 * sizeof(unsigned int),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) return empty;   // syncs
+                if (round == 0) {
+                    for (int b = 0; b < 65536; ++b) total += sc->h_hist[b];
+                    if (total == 0) break;          // no lit surfaces: eAuto stays 1
+                    rank = (size_t)(0.99 * (total - 1));   // the host tail's exact k
+                }
+                size_t cum = 0;                     // descend to the bin holding rank #k
+                for (int b = 0; b < 65536; ++b) {
+                    size_t c = sc->h_hist[b];
+                    if (rank < cum + c) { cut[round] = (unsigned int)b; rank -= cum; break; }
+                    cum += c;
+                }
+            }
+            if (total > 0) {
+                unsigned int bits = (cut[0] << 16) | cut[1];
+                float p99f;                          // exact k-th smallest luminance
+                std::memcpy(&p99f, &bits, sizeof(float));
+                const double p99 = (double)p99f;     // widening is exact, as on the host
+                eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
+            }
+            if (lockAnchor) *lockAnchor = eAuto;     // first frame sets the anchor
+        }
+    }
+    const double finalExp = eAuto * expComp;
+    kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
+                            sc->clearT, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
+                            sc->dlut, sc->dimg);
+    if (!sync()) return empty;
     padd(g_profAcc.expose_ms, tp);
+
+    // Download ONLY the finished RGB8 frame through the pinned staging buffer.
+    tp = ptick();
+    if (cudaMemcpy(sc->h_img, sc->dimg, N * 3, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+    padd(g_profAcc.download_ms, tp);
     if (g_prof) ++g_profAcc.frames;
-    return img;
+    return std::vector<uint8_t>(sc->h_img, sc->h_img + N * 3);
 }
 
 }  // namespace raster_cuda

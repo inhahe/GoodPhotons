@@ -530,19 +530,33 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
     return s;
 }
 
+// sRGB gamma lookup table shared by the CPU tonemap below and the CUDA rasterizer's
+// on-device tonemap (raster_cuda.cu uploads these exact bytes once): the tone map clamps
+// each channel to [0,1] before encoding, and gamma is monotonic (anything >=1 saturates
+// to 255), so a 4096-entry LUT over [0,1] replaces three std::pow calls per pixel with a
+// table read + round — and having BOTH backends index the same table is what keeps their
+// encoded bytes identical.
+inline const std::array<uint8_t, 4097>& srgbLut8() {
+    static const std::array<uint8_t, 4097> t = [] {
+        std::array<uint8_t, 4097> a{};
+        for (int i = 0; i <= 4096; ++i)
+            a[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
+        return a;
+    }();
+    return t;
+}
+
 // Shared exposure + tone-map tail (the back half of renderFrame). Given a per-pixel
 // HDR `accum` buffer that has already been shaded (background pixels hold the unlit bg
 // tint), a `zbuf` hit key (>0 where a surface was drawn), an `emis` mask, and the
 // optional see-through transmittance/milk products, this applies the p99 auto-exposure
 // anchor and the sRGB tone map exactly as filmToRgb8 does, returning W*H*3 RGB8 (row 0 =
-// top). Factored out so the CPU rasterizer and the CUDA rasterizer share ONE copy of the
-// exposure/tonemap logic — the GPU path shades into an identical `accum`/`zbuf` on the
-// device, downloads them, and calls this, guaranteeing byte-identical exposure (including
-// a camera_path's shared `lockAnchor`) regardless of which backend produced the geometry.
-// Template core: `pixel(i)` must return the exact double-precision Vec3 colour of pixel
-// i. The CPU path reads a Vec3 buffer directly; the GPU path converts its downloaded
-// float3 on the fly (double(float) is exact, so the maths — and the output bytes — are
-// identical to converting the whole buffer up front, without the extra pass or memory).
+// top). The CUDA rasterizer no longer calls this (it runs a device twin of this exact
+// maths — same p99 order statistic, same double-precision tonemap, same srgbLut8()
+// table — verified byte-identical); it remains the single host implementation, and any
+// change here must be mirrored in raster_cuda.cu's expose kernels.
+// Template core: `pixel(i)` must return the exact double-precision Vec3 colour of
+// pixel i (kept templated so a non-Vec3 HDR buffer can be adapted without a copy).
 template <class FetchVec3>
 inline std::vector<uint8_t> exposeAndEncodeT(
         FetchVec3&& pixel, const float* zbuf, const uint8_t* emis,
@@ -646,15 +660,7 @@ inline std::vector<uint8_t> exposeAndEncodeT(
     }
     const double finalExp = eAuto * expComp;
 
-    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
-    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
-    // [0,1] replaces three std::pow calls per pixel with a table read + round.
-    static const std::array<uint8_t, 4097> kSrgbLut = [] {
-        std::array<uint8_t, 4097> t{};
-        for (int i = 0; i <= 4096; ++i)
-            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
-        return t;
-    }();
+    const std::array<uint8_t, 4097>& kSrgbLut = srgbLut8();
     auto encode = [&](double c) -> uint8_t {
         if (c <= 0.0) return kSrgbLut[0];
         if (c >= 1.0) return 255;

@@ -4662,12 +4662,13 @@ static int run(int argc, char** argv) {
         }
 
         // GPU preview rasterizer (-device gpu|auto). Bake the world triangles + image skins
-        // to the device ONCE (reused for every camera / flyby frame), then each frame runs the
-        // projection + raster + shade (+ clear-accumulation pass when see-through) on the GPU
-        // and shares the SAME host exposure/tonemap tail as the CPU path
-        // (raster::exposeAndEncode) — so GPU and CPU frames match. The GPU covers all camera
-        // projections (rectilinear + fisheye/panoramic), opaque + textured (skinned) previews,
-        // and see-through (clear-glass) compositing. Any device failure falls back per-frame.
+        // to the device ONCE (reused for every camera / flyby frame), then each frame runs
+        // ENTIRELY on the GPU — projection + raster + shade (+ clear-accumulation pass when
+        // see-through) + a device twin of the host exposure/tonemap tail (exact p99 anchor
+        // via float-bit histograms, double-precision tonemap, shared sRGB LUT) — verified
+        // byte-identical to the CPU path's frames. The GPU covers all camera projections
+        // (rectilinear + fisheye/panoramic), opaque + textured (skinned) previews, and
+        // see-through (clear-glass) compositing. Any device failure falls back per-frame.
 #ifdef HAVE_CUDA
         raster_cuda::Scene* gpuRaster = nullptr;
         {
@@ -4827,11 +4828,11 @@ static int run(int argc, char** argv) {
                 if (p.frames > 0) {
                     double f = 1.0 / p.frames;
                     std::printf("[raster-bench] GPU per-pass avg ms: clearvis %.2f  project %.2f  "
-                                "raster %.2f  shade %.2f  clear %.2f  download %.2f  "
-                                "convert %.2f  expose+encode %.2f\n",
+                                "raster %.2f  shade %.2f  clear %.2f  expose+encode %.2f  "
+                                "download %.2f\n",
                                 p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
-                                p.shade_ms * f, p.clear_ms * f, p.download_ms * f,
-                                p.convert_ms * f, p.expose_ms * f);
+                                p.shade_ms * f, p.clear_ms * f, p.expose_ms * f,
+                                p.download_ms * f);
                 }
             }
 #endif
