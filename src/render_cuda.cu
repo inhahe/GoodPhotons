@@ -2244,18 +2244,34 @@ struct DCamSet {
     unsigned long long  depCap     = 0;
 };
 
+// Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
+// The deposit-side DPhoton carries (pos, wi, n, power, lambda), but the gather never
+// reads wi, and it weighted every visited photon by cie{X,Y,Z}(lambda_p) * power *
+// norm / pi — all per-photon CONSTANTS of the estimate (norm = 1/(pi r^2 nEmitted)).
+// That triple is folded into pX/pY/pZ at upload time (host doubles from PhotonMap::cie
+// times power*norm/pi, rounded to float once), so the per-photon inner loop is just
+// g? += rho(lambda_p) * p? — no CIE multi-Gaussian evaluation (7 exp()s) per visited
+// photon. Device analogue of the CPU PhotonMap::cie precompute (photonmap.h), which
+// was ~74% of profiled mode-M render time when it was added there.
+struct DGatherPhoton {
+    DVec3 pos;              // deposit position (world)
+    DVec3 n;                // shading normal (cross-surface leak rejection)
+    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power * norm / pi (see above)
+    float lambda;           // wavelength (nm) — rho(lambda_p) still varies per photon
+};
+
 // A view-independent photon-map query structure on the device (device twin of PhotonMap
 // in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
 // photon records, so a radius-r query touches only the 3x3x3 neighbourhood. Built on the
 // host (PhotonMap::build) from the deposited photons, then uploaded for the gather kernel.
+// (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
-    const DPhoton* photons;   // reordered into cell-contiguous runs
+    const DGatherPhoton* photons; // reordered into cell-contiguous runs
     const int*     cellStart; // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
     DVec3  lo;                // grid origin (world)
     Real   cellSize;          // == gather radius
     Real   radius;            // gather radius (world units)
     int    nx, ny, nz;
-    long long nEmitted;       // total photons emitted in the pass (normalization)
 };
 
 // Splat a surface vertex to every camera (model B pinhole connect, or model A finite-
@@ -5207,9 +5223,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
-    const double area = DPI * (double)pm.radius * (double)pm.radius;
-    const double norm = (pm.nEmitted > 0 && area > 0.0) ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
-    const double r2 = (double)pm.radius * (double)pm.radius;
+    const double r2 = (double)pm.radius * (double)pm.radius;   // norm folded into pX/pY/pZ
     const int maxBounce = 32;
 
     for (int b = 0; b < maxBounce; ++b) {
@@ -5242,6 +5256,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             // Radius density estimate at the visible point, accumulated in XYZ (each photon
             // folded at its own wavelength): L_r = (1/N) sum_p rho(l_p)/pi * Phi_p / (pi r^2).
+            // Everything but rho(l_p) is baked into the record's pX/pY/pZ (see DGatherPhoton),
+            // so the per-photon work is the two rejection tests + one rho + three MADs.
             double gx = 0, gy = 0, gz = 0;
             int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
             int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
@@ -5254,19 +5270,17 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
                   int c = (cz * pm.ny + cy) * pm.nx + cx;
                   for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                      const DPhoton& ph = pm.photons[k];
+                      const DGatherPhoton& ph = pm.photons[k];
                       DVec3 d = h.p - ph.pos;
                       if ((double)dot(d, d) > r2) continue;
                       if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                      Real rho = dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      double w = (double)rho * (1.0 / DPI) * (double)ph.power;
-                      gx += (double)cieX((Real)ph.lambda) * w;
-                      gy += (double)cieY((Real)ph.lambda) * w;
-                      gz += (double)cieZ((Real)ph.lambda) * w;
+                      double rho = (double)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                      gx += rho * (double)ph.pX;
+                      gy += rho * (double)ph.pY;
+                      gz += rho * (double)ph.pZ;
                   }
                 }}}
-            double s = norm * thr;
-            oX += gx * s; oY += gy * s; oZ += gz * s;
+            oX += gx * thr; oY += gy * thr; oZ += gz * thr;
             return;
         }
 
@@ -6851,32 +6865,44 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     // ---- upload the built grid ----
     DPhotonMap dpm{};
-    dpm.nEmitted = pm.nEmitted;
     dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
     dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
     dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
     dpm.photons = nullptr;
     if (!pm.photons.empty()) {
-        // Upload the sorted map host->device in chunks (no full DPhoton mirror).
+        // Upload the sorted map host->device in chunks (no full mirror), folding each
+        // photon's constant gather weight into the record (see DGatherPhoton):
+        // p? = cie?(lambda) * power * norm / pi, with the CIE triple taken from
+        // PhotonMap::cie (precomputed in double by build(), index-aligned with the
+        // sorted photons). The radius is cast through Real first so the folded
+        // normalization equals the old in-kernel double((Real)radius)^2 exactly.
+        const double rr   = (double)(Real)pm.radius;
+        const double area = DPI * rr * rr;
+        const double fold = (pm.nEmitted > 0 && area > 0.0)
+                          ? 1.0 / (area * (double)pm.nEmitted * DPI) : 0.0;
         size_t n = pm.photons.size();
-        DPhoton* d_sorted = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DPhoton)));
-        std::vector<DPhoton> stage;
+        DGatherPhoton* d_sorted = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
+        std::vector<DGatherPhoton> stage;
         for (size_t off = 0; off < n; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, n - off);
             stage.resize(cnt);
             for (size_t i = 0; i < cnt; ++i) {
                 const Photon& p = pm.photons[off + i];
-                DPhoton& d = stage[i];
+                const Vec3&  ci = pm.cie[off + i];
+                DGatherPhoton& d = stage[i];
                 d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
-                d.wi  = DVec3(p.wi.x,  p.wi.y,  p.wi.z);
                 d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
-                d.power = p.power; d.lambda = p.lambda;
+                const double w = (double)p.power * fold;
+                d.pX = (float)(ci.x * w);
+                d.pY = (float)(ci.y * w);
+                d.pZ = (float)(ci.z * w);
+                d.lambda = p.lambda;
             }
-            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DPhoton),
+            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DGatherPhoton),
                                   cudaMemcpyHostToDevice));
         }
-        dpm.photons = (const DPhoton*)up.keep(d_sorted);
+        dpm.photons = (const DGatherPhoton*)up.keep(d_sorted);
     }
     // cellStart always has >= 2 entries after build() (even for an empty map, where every
     // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
