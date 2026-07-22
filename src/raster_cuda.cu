@@ -13,9 +13,14 @@
 //                     real camera uses, reject-culling any triangle touching the rear pole
 //                     and emitting ONE sub-triangle. Written to fixed slots [2*i], [2*i+1].
 //
-//   Pass B  kRaster   (1 thread / DSTri slot): rasterize the sub-triangle's pixel bbox,
-//                     packing (1/depth, slotIdx) into a 64-bit visibility buffer with a
-//                     single atomicMax. Nearest surface (largest 1/depth) wins per pixel.
+//   Pass B  kClassify + kRasterSmall/Med/Large: bin every DSTri slot by clamped bbox
+//                     pixel count, then rasterize each bin at a matching parallel width
+//                     (small: 1 thread walks the bbox; medium: a warp strides the rows;
+//                     large: a whole block strides the rows), packing (1/depth, slotIdx)
+//                     into a 64-bit visibility buffer with a single atomicMax. Nearest
+//                     surface (largest 1/depth) wins per pixel, in any scheduling order,
+//                     so the binning is bit-identical to the old 1-thread-per-slot kernel
+//                     while a screen-filling quad no longer serializes on one thread.
 //
 //   Pass C  kShade    (1 thread / pixel): decode the winning slot, recompute barycentrics
 //                     at the pixel centre, interpolate world pos/normal, and shade once
@@ -328,43 +333,104 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
 // Pass B: rasterize each valid DSTri into the 64-bit visibility buffer. Each covered pixel
 // packs (1/depth as float bits) << 32 | slotIdx; atomicMax keeps the nearest (largest
 // 1/depth) surface. Mirrors fillTriangleG's barycentric coverage + perspective 1/depth.
-__global__ void kRaster(const DSTri* stris, int nSlots, int W, int H, int seeThrough,
-                        unsigned long long* vis) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nSlots) return;
-    const DSTri& t = stris[idx];
-    if (!t.valid) return;
-    if (seeThrough && t.clear) return;   // clear surfaces handled by the clear-accumulation pass
+// Per-slot rasterization setup: cull checks, clamped pixel bbox, area/derivatives.
+// This is the exact preamble of the old monolithic kRaster, factored out so the
+// classifier and all three binned kernels compute identical values.
+struct SlotSetup { int xlo, xhi, ylo, yhi; float inv, dw0dx, dw1dx; };
 
+__device__ inline bool setupSlot(const DSTri& t, int W, int H, int seeThrough, SlotSetup& s) {
+    if (!t.valid) return false;
+    if (seeThrough && t.clear) return false;   // clear surfaces handled by the clear-accumulation pass
     float minx = floorf(fminf(t.sx0, fminf(t.sx1, t.sx2)));
     float maxx = ceilf (fmaxf(t.sx0, fmaxf(t.sx1, t.sx2)));
     float miny = floorf(fminf(t.sy0, fminf(t.sy1, t.sy2)));
     float maxy = ceilf (fmaxf(t.sy0, fmaxf(t.sy1, t.sy2)));
-    int xlo = max(0, (int)minx), xhi = min(W - 1, (int)maxx);
-    int ylo = max(0, (int)miny), yhi = min(H - 1, (int)maxy);
-    if (xlo > xhi || ylo > yhi) return;
-
+    s.xlo = max(0, (int)minx); s.xhi = min(W - 1, (int)maxx);
+    s.ylo = max(0, (int)miny); s.yhi = min(H - 1, (int)maxy);
+    if (s.xlo > s.xhi || s.ylo > s.yhi) return false;
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
-    if (fabsf(area) < 1e-9f) return;
-    float inv = 1.0f / area;
-    const float dw0dx = (t.sy1 - t.sy2) * inv;
-    const float dw1dx = (t.sy2 - t.sy0) * inv;
+    if (fabsf(area) < 1e-9f) return false;
+    s.inv = 1.0f / area;
+    s.dw0dx = (t.sy1 - t.sy2) * s.inv;
+    s.dw1dx = (t.sy2 - t.sy0) * s.inv;
+    return true;
+}
 
-    for (int y = ylo; y <= yhi; ++y) {
-        float py = y + 0.5f, pxL = xlo + 0.5f;
-        float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * inv;
-        float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * inv;
-        unsigned long long row = (unsigned long long)y * W + xlo;
-        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
-            float w2 = 1.0f - w0 - w1;
-            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
-            float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
-            if (invd <= 0.0f) continue;
-            unsigned long long packed =
-                ((unsigned long long)__float_as_uint(invd) << 32) | (unsigned int)idx;
-            atomicMax(&vis[row], packed);
-        }
+// Rasterize ONE bbox row of one sub-triangle: seed the barycentrics at the row's left
+// edge by direct evaluation (exactly as the old kernel did per row) and step
+// incrementally along x. The float arithmetic per (slot,row) is identical no matter
+// which thread executes it, and the atomicMax visibility merge is order-independent,
+// so any distribution of rows across threads yields bit-identical output.
+__device__ inline void rasterRow(const DSTri& t, int slot, int y, const SlotSetup& s,
+                                 int W, unsigned long long* vis) {
+    float py = y + 0.5f, pxL = s.xlo + 0.5f;
+    float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * s.inv;
+    float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * s.inv;
+    unsigned long long row = (unsigned long long)y * W + s.xlo;
+    for (int x = s.xlo; x <= s.xhi; ++x, ++row, w0 += s.dw0dx, w1 += s.dw1dx) {
+        float w2 = 1.0f - w0 - w1;
+        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
+        if (invd <= 0.0f) continue;
+        unsigned long long packed =
+            ((unsigned long long)__float_as_uint(invd) << 32) | (unsigned int)slot;
+        atomicMax(&vis[row], packed);
     }
+}
+
+// Bin thresholds (clamped bbox pixel count). ≤ kSmallMaxPx: one thread walks the whole
+// bbox (the common case for finely tessellated scenes). ≤ kMedMaxPx: a 32-lane warp
+// strides the bbox rows. Larger: a whole block strides the rows — a full-screen wall
+// quad's bbox is walked by 256 threads instead of serializing on one.
+constexpr long long kSmallMaxPx = 128;
+constexpr long long kMedMaxPx   = 16384;
+
+__global__ void kClassify(const DSTri* stris, int nSlots, int W, int H, int seeThrough,
+                          int* binSmall, int* binMed, int* binLarge, int* cnt) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nSlots) return;
+    SlotSetup s;
+    if (!setupSlot(stris[idx], W, H, seeThrough, s)) return;   // culled: nothing to raster
+    long long px = (long long)(s.xhi - s.xlo + 1) * (s.yhi - s.ylo + 1);
+    if      (px <= kSmallMaxPx) binSmall[atomicAdd(&cnt[0], 1)] = idx;
+    else if (px <= kMedMaxPx)   binMed  [atomicAdd(&cnt[1], 1)] = idx;
+    else                        binLarge[atomicAdd(&cnt[2], 1)] = idx;
+}
+
+__global__ void kRasterSmall(const DSTri* stris, const int* list, int n, int W, int H,
+                             int seeThrough, unsigned long long* vis) {
+    int li = blockIdx.x * blockDim.x + threadIdx.x;
+    if (li >= n) return;
+    int slot = list[li];
+    const DSTri& t = stris[slot];
+    SlotSetup s;
+    if (!setupSlot(t, W, H, seeThrough, s)) return;
+    for (int y = s.ylo; y <= s.yhi; ++y)
+        rasterRow(t, slot, y, s, W, vis);
+}
+
+__global__ void kRasterMed(const DSTri* stris, const int* list, int n, int W, int H,
+                           int seeThrough, unsigned long long* vis) {
+    int gt = blockIdx.x * blockDim.x + threadIdx.x;
+    int li = gt >> 5, lane = gt & 31;
+    if (li >= n) return;
+    int slot = list[li];
+    const DSTri& t = stris[slot];
+    SlotSetup s;
+    if (!setupSlot(t, W, H, seeThrough, s)) return;
+    for (int y = s.ylo + lane; y <= s.yhi; y += 32)
+        rasterRow(t, slot, y, s, W, vis);
+}
+
+__global__ void kRasterLarge(const DSTri* stris, const int* list, int n, int W, int H,
+                             int seeThrough, unsigned long long* vis) {
+    if (blockIdx.x >= (unsigned)n) return;
+    int slot = list[blockIdx.x];
+    const DSTri& t = stris[slot];
+    SlotSetup s;
+    if (!setupSlot(t, W, H, seeThrough, s)) return;
+    for (int y = s.ylo + threadIdx.x; y <= s.yhi; y += blockDim.x)
+        rasterRow(t, slot, y, s, W, vis);
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +601,11 @@ struct Scene {
     float*              clearT = nullptr;   // see-through cumulative transmittance
     float*              milkT  = nullptr;   // see-through milk (haze) product
     size_t              pixCap = 0;
+    // Raster bin lists (slot indices by bbox size, rebuilt per frame) + 3 counters.
+    int* dbinSmall = nullptr;
+    int* dbinMed   = nullptr;
+    int* dbinLarge = nullptr;
+    int* dbinCnt   = nullptr;
 };
 
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
@@ -560,6 +631,10 @@ void destroy(Scene* sc) {
     if (sc->emis)     cudaFree(sc->emis);
     if (sc->clearT)   cudaFree(sc->clearT);
     if (sc->milkT)    cudaFree(sc->milkT);
+    if (sc->dbinSmall) cudaFree(sc->dbinSmall);
+    if (sc->dbinMed)   cudaFree(sc->dbinMed);
+    if (sc->dbinLarge) cudaFree(sc->dbinLarge);
+    if (sc->dbinCnt)   cudaFree(sc->dbinCnt);
     delete sc;
 }
 
@@ -623,7 +698,11 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
     sc->fill     = (float)light.fill;
 
     bool ok = tryMalloc((void**)&sc->dtris,  sizeof(DPTri) * tris.size())
-           && tryMalloc((void**)&sc->dstris, sizeof(DSTri) * 2 * tris.size());
+           && tryMalloc((void**)&sc->dstris, sizeof(DSTri) * 2 * tris.size())
+           && tryMalloc((void**)&sc->dbinSmall, sizeof(int) * 2 * tris.size())
+           && tryMalloc((void**)&sc->dbinMed,   sizeof(int) * 2 * tris.size())
+           && tryMalloc((void**)&sc->dbinLarge, sizeof(int) * 2 * tris.size())
+           && tryMalloc((void**)&sc->dbinCnt,   sizeof(int) * 3);
     if (ok && !hl.empty())
         ok = tryMalloc((void**)&sc->dlights, sizeof(DLight) * hl.size());
     if (ok && !htexMeta.empty())
@@ -722,8 +801,25 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dstris);
     if (!sync()) return empty;
     padd(g_profAcc.project_ms, tp);
+    // Bin the slots by bbox size, then rasterize each bin at a matching parallel width
+    // (thread / warp / block per sub-triangle). Every (slot,row) runs the exact row maths
+    // of the old single kernel and atomicMax merges order-independently, so the result is
+    // bit-identical while a screen-filling quad no longer serializes on one thread.
     tp = ptick();
-    kRaster<<<gSlots, TPB>>>(sc->dstris, 2 * sc->nTris, W, H, seeThrough ? 1 : 0, sc->vis);
+    if (cudaMemset(sc->dbinCnt, 0, 3 * sizeof(int)) != cudaSuccess) return empty;
+    kClassify<<<gSlots, TPB>>>(sc->dstris, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
+                               sc->dbinSmall, sc->dbinMed, sc->dbinLarge, sc->dbinCnt);
+    int hcnt[3] = {0, 0, 0};   // blocking copy also orders the classify before the readback
+    if (cudaMemcpy(hcnt, sc->dbinCnt, 3 * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+    if (hcnt[0] > 0)
+        kRasterSmall<<<(hcnt[0] + TPB - 1) / TPB, TPB>>>(sc->dstris, sc->dbinSmall, hcnt[0],
+                                                         W, H, seeThrough ? 1 : 0, sc->vis);
+    if (hcnt[1] > 0)
+        kRasterMed<<<(int)(((long long)hcnt[1] * 32 + TPB - 1) / TPB), TPB>>>(
+            sc->dstris, sc->dbinMed, hcnt[1], W, H, seeThrough ? 1 : 0, sc->vis);
+    if (hcnt[2] > 0)
+        kRasterLarge<<<hcnt[2], TPB>>>(sc->dstris, sc->dbinLarge, hcnt[2],
+                                       W, H, seeThrough ? 1 : 0, sc->vis);
     if (!sync()) return empty;
     padd(g_profAcc.raster_ms, tp);
     tp = ptick();
