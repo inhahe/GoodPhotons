@@ -5,6 +5,30 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG (2026-07-22): freshly CMake-configured build dirs produce a GPU-silently-dead ftrace.exe (black renders, no CUDA error) — affects fresh clones!
+
+Any build dir configured from scratch (observed with VS 2022 generator + CUDA 13.0,
+`cmake -S . -B <fresh> -G "Visual Studio 17 2022" -A x64 -DFTRACE_GPU_FP32=ON`) yields an
+exe whose GPU renders are silently dead: the GPU is detected, kernels appear to launch and
+"complete" (cornell `-n 1e6 -device gpu` finishes in ~0.5 s), no CUDA error is reported,
+but the tally is `absorbed=1.0000 sensor=0.0000`, auto-exposure=1, image black. Proven
+**source-independent** during the 2026-07-21/22 optimization campaign: revisions 5b75bfb
+and f0d2f13 both broken when built from freshly configured dirs (tried both
+`FTRACE_CUDA_ARCH=native` default and `=89` → `--generate-code=arch=compute_89,code=[compute_89,sm_89]`,
+full recompiles), while the **same 5b75bfb source built in the long-lived
+`build_cuda2`** (incremental, originally configured weeks ago) renders correctly
+(absorbed=0.6724 escaped=0.3301 on cornell). HEAD from the long-lived dir also works.
+The failure signature (everything "absorbed", zero sensor hits, no error) suggests device
+code that runs but sees zeroed/duplicated `__constant__` scene state — prime suspects:
+RDC device-link `__constant__` symbol duplication, or a difference in the VS CUDA
+integration props/targets picked up at configure time between the old and new CMake runs.
+**Workaround:** build in the long-lived `build_cuda2` (for old revisions: temporary
+`git checkout <rev> -- src/`, build, `git checkout HEAD -- src/`). **Must investigate** —
+a fresh clone of the repo currently cannot produce a working GPU build. Next steps: diff
+the generated `ftrace.vcxproj` + CMakeCache between the long-lived and a fresh dir
+(beyond the arch flags already ruled out), check CUDA toolset version selection, and probe
+`cudaMemcpyFromSymbol` of the scene constants at render start in a fresh-dir build.
+
 ### FIXED (2026-07-21): mode D heap-use-after-free (dangling `Vertex&` across `push_back`) + per-work-unit RNG seeding makes all CPU spp/photon modes chunk- and resume-independent
 
 Two intertwined fixes, one commit (v0.18.2):
@@ -339,6 +363,11 @@ scene-cache request above); (d) no persistent GPU-resident vertex buffers / we m
 step:** profile a representative scene (CPU vs `-raster-gpu`) to find the actual bottleneck rather
 than guessing; compare against what a trivial WebGL draw of the same triangle count costs. This is a
 "why is it slow" investigation, not a confirmed single bug.
+**Update 2026-07-22:** the optimization campaign cut CPU raster gallery startup+render
+2.68× (15.24 s → 5.68 s; OBJ parser rewrite 00b0765, parallel per-implicit marching
+828e7a0, parallel marchImplicit stages 1a78ef6). Still not WebGL-class — the remaining
+gap is per-launch scene rebuild + the software shading passes; the profiling task above
+stands.
 
 ### FEATURE REQUEST (2026-07-19): option for curve-editor curve to be occluded by geometry in front of it
 The camera-path / curve overlay shown in the curve editor currently draws over everything (an
