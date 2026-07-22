@@ -80,8 +80,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`render_cuda.cu`** (~7000) — the whole GPU backend: megakernel + wavefront
   forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
-  buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). `raster_cuda.cu` = GPU raster
-  (own section below).
+  buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
+  (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror
+  pools (`DFieldNodeF`/`PatNodeF`, float VM twins `dFieldEvalF`/`dPatternEvalF`)
+  since 0.19.14 — the committed hit is float anyway and FP64 VM ops serialize on
+  consumer GPUs' 1/64-rate FP64 pipe (~2× on implicit-heavy scenes); normals
+  (`dFieldGradient`) and media bound-fields stay FP64 on the original pools.
+  `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
 - **`record.h` / `render_progress.h`** — run records, live status line

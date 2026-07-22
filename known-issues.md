@@ -5,6 +5,26 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TOOLING (2026-07-22): Nsight Compute (`ncu`) blocked by ERR_NVGPUCTRPERM — GPU perf counters admin-locked in the driver
+
+`ncu` profiling of ftrace kernels fails with `ERR_NVGPUCTRPERM` (GPU performance
+counters restricted to admin). Until unlocked, kernel-level profiling has to fall back
+to ablation timing (code ablation + scene-copy ablation, as used for the 2026-07-22
+BDPT campaign) and `cuobjdump -res-usage ftrace.exe` for register/stack pressure.
+**Fix (user action, one-time):** NVIDIA Control Panel → Desktop menu → enable Developer
+Settings → Developer → Manage GPU Performance Counters → "Allow access to the GPU
+performance counters to all users", then reboot. (Alternatively run `ncu` from an
+elevated shell.)
+
+### DEBT (2026-07-22): gallery GPU configs are now dominated by the ~8.4 s fixed CPU-side setup (parse/tessellate/BVH/upload)
+
+After the 0.19.14 FP32 implicit march, the gallery kernels are cheap enough that the
+fixed per-run scene setup — `.ftsl` parse, mesh/implicit prep, BVH build, device upload,
+shared by every mode — is the biggest remaining term: ~8.4 s of `M_gpu_gallery`'s ~9.7 s
+total and ~46% of `D_gpu_gallery`'s ~18.2 s (numbers from `scraps/bench_dm_final.json`,
+RTX 4090). Any further wall-clock win on these configs must come from the setup path
+(profile first: parse vs tessellation vs BVH vs upload — unmeasured as of this entry).
+
 ### BUG (2026-07-22): freshly CMake-configured build dirs produce a GPU-silently-dead ftrace.exe (black renders, no CUDA error) — affects fresh clones!
 
 Any build dir configured from scratch (observed with VS 2022 generator + CUDA 13.0,
@@ -2151,7 +2171,9 @@ correctly on **both** backends.
   colored glass, so those scenes fall back to the CPU BDPT.
 - **Implicit surfaces — DONE (2026-07-11, step 5a):** `render_cuda.cu` gained device
   twins `DFieldNode`/`DImplicit`, a postfix field evaluator (`dFieldEval`/`dFieldLeafSDF`/
-  `dFieldGradient`, all FP64 for sphere-trace bisection robustness), and
+  `dFieldGradient`, originally all FP64 for sphere-trace bisection robustness — since
+  0.19.14 the march/refine runs FP32 on mirrored pools, see the 2026-07-22 GPU-implicit
+  entry; gradients/normals and media bound-fields are still FP64), and
   `intersectImplicit` (a direct port of the CPU sphere-trace). `buildUpload` flattens
   every `Implicit`'s `FieldNode` array into one device pool and uploads a `DImplicit`
   descriptor per primitive; `closestHit`/`occluded` dispatch BVH prims with index
