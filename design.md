@@ -32,7 +32,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`cpuSppChunks`, `chunkFixed = !progressive && g_showWindow` — a bare fixed `-n`
   with no `-window`/budget flag runs monolithically with output only at the end),
   periodic write/`-interval`, checkpoint/resume (`.ftbuf`), multi-camera shared
-  passes, exposure-lock metering pre-pass, PNG/PPM output.
+  passes, exposure-lock metering pre-pass (device-aware: each mode meters through
+  its own GPU entry point when `-device gpu|auto` and the mode's support predicate
+  allow, CPU fallback otherwise; all-M pinhole groups meter in one batched
+  `renderPhotonMapSharedCuda` pass with `MeterConverge` early-stop via `onFrame`),
+  PNG/PPM output.
 - **`scene.h` / `ftsl.h`** — scene model and the FTSL scene-language parser
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
   `FTSL.md` documents the language.

@@ -933,38 +933,42 @@ keep the two paths consistent: A/C get `1/N²` from the pupil-area `R²` splat w
 do NOT double-apply. Ideal end state is one camera-equation absolute model (add
 `cos⁴θ` natural vignetting too) that makes A, B, C agree at equal `power`.
 
-### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
+### DONE (2026-07-22, no longer reproduces): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
 
-Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** crashes with
+Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** used to crash with
 `[cuda] bdpt kernel failed: unspecified launch failure` reproducibly at **spp 14**
-(~232 s in; earlier spp complete fine and write correct images). It is an illegal
-memory access inside the BDPT megakernel (`kBdpt`, `render_cuda.cu` ~4283), NOT a TDR
-timeout (chunks are ~0.15 s) and NOT GPU contention (single process).
+(~232 s in; earlier spp complete fine and write correct images) — an illegal memory
+access inside the BDPT megakernel (`kBdpt`), NOT a TDR timeout (chunks ~0.15 s) and
+NOT GPU contention (single process). Bounds inspection of the per-thread
+`eye[]`/`light[]` subpath arrays (`BDPT_MAXV=11`), `DMediumStack` (CAP 8, push
+guarded), media free-flight loops, and the `double st[64]` VM stacks found nothing;
+a bounded memcheck on the still cam (`-camera cam -spp 6`) was clean.
 
-**Ruled out by inspection:** the per-thread `eye[]`/`light[]` subpath arrays
-(`BDPT_MAXV=11`), the `DMediumStack` (CAP 8, push guarded), the media free-flight
-loops, and the `double st[64]` pattern/field VM stacks are all bounds-safe. The fault
-is **data-dependent** (RNG seeded by the global sample index `gidx`, so it reproduces
-deterministically regardless of timing) — some specific path at spp 14 indexes out of
-bounds or dereferences a bad pointer, likely a rare geometric/CSG/medium configuration
-hit only by that sample's random walk.
+**Resolution (v0.19.8): the crash no longer reproduces, on any of three axes tried.**
+1. **Faithful seed replay** — the original failing run was `-noise 3` (progressive,
+   `sppTotal = UNBOUNDED_SPP = 1e9`, so `gidx = pix*1e9 + k`); replaying exactly that
+   (`-camera cam -noise 3 -device gpu`) ran clean to **45 spp**, 3× past the historical
+   crash point, correct images throughout.
+2. **Fixed-budget replay** (`-camera cam -spp 16`, a *different* seed schedule since
+   `gidx` mixes the run's total spp) — clean.
+3. **Flyby-position soak** — the "crash is flyby-viewpoint-specific" hypothesis:
+   72 positions along the fly curve (scratch scene with the curve set to
+   `mode D frames 72`, `-spp 4` each, 960×540) — all 72 frames clean, zero CUDA errors.
 
-**Investigation status (2026-07-15 update):** a **bounded** `compute-sanitizer --tool
-memcheck` run — mode-D BDPT pinned to the single still camera (`-camera cam -spp 6`, so
-it terminates instead of rolling onto the 144-frame flyby) — completed with **ZERO
-memory errors**. So the fault does **not** reproduce on the still frame at low spp; it is
-either **flyby-camera-position specific** (a geometric configuration only some moving-cam
-viewpoint hits) or was already mitigated by unrelated fixes since the crash was first
-seen. The earlier unbounded attempt (`-noise 3`, no `-camera`) never reached spp 14
-(memcheck ~65× slowdown) and also rolled onto the flyby — avoid that; always bound it.
-**Next step:** reproduce at the *specific* crashing spp/camera (drive to spp 14 on the
-flyby camera under a bounded memcheck) to catch the exact `render_cuda.cu:<line>`, then
-fix the OOB. Earlier context: build has `-lineinfo`, so memcheck reports the exact line.
-Repro (headless — sanitizer runs instrumented). Use the real `compute-sanitizer.exe`
-(in the CUDA `compute-sanitizer/` subdir), NOT the `bin/compute-sanitizer.bat` wrapper —
-the `.bat` exits 127 (no useful output) when launched from the bash tool:
-`"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/compute-sanitizer/compute-sanitizer.exe" --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
-Mode B on the same scene is stable, and the new `-raster` preview is unaffected.
+A fresh code audit of `kBdpt` / `dConnectBDPT` / `dMisWeight` / `DCamera::project` /
+`selectEmitter` found no OOB (project is edge-clamped, MIS fully guarded, maxDepth
+clamped to device capacity). Prime suspect for the incidental fix: the **watertight
+ray-triangle intersection** rework (41ac6a4, 2026-07-18, Woop et al. JCGT 2013) —
+changed hit numerics re-route the data-dependent pathological path; the
+shadow-terminator and adjoint-correction changes in the same window are also
+candidates. Root cause was never pinned to a line, so treat as *mitigated in
+practice*, not proven-fixed.
+
+**If it ever recurs:** bound the repro (always pin `-camera` and a finite budget) and
+run the real `compute-sanitizer.exe` (in the CUDA `compute-sanitizer/` subdir — NOT
+`bin/compute-sanitizer.bat`, which exits 127 from the bash tool); the build has
+`-lineinfo`, so memcheck reports the exact `render_cuda.cu:<line>`:
+`"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/compute-sanitizer/compute-sanitizer.exe" --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -camera cam -mode D -device gpu -spp 45 -o png/_sanit.png`
 
 ### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
 
@@ -3263,7 +3267,7 @@ correctly on **both** backends.
   without lossy tessellation — useful independent of any importer, and the right way to
   ever support POV-Ray-style implicit geometry. Not started.
 
-## Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons)
+## DONE (2026-07-22): Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons) — was the CPU meter pre-pass; meter now runs on the requested device
 
 - **Symptom:** `renderPhotonMapSharedCuda` on `scenes/gallery_settled.ftsl` (via
   `scraps/gallery_fly.ftsl`) with `-n 4000000 -spp 6 -r 320 180` ran **67 min pegging
@@ -3308,6 +3312,32 @@ correctly on **both** backends.
   which `-device gpu` should be re-tested on the full-res flyby before concluding anything
   about the GPU build path. (The `-r 320 180` "2M in ~2 min" run was fast partly because
   its meter was also tiny: `meterN` scales with `W·H`.)
+- **RESOLVED 2026-07-22 — the meter pre-pass now runs on the requested device
+  (main.cpp `meterGpu`), and the GPU shared build is confirmed healthy at 4M/960×540.**
+  Two changes in the exposure-lock meter (`run()`, main.cpp ~5654):
+  1. **Per-frame metering follows `-device`.** `meterAnchor` now dispatches each mode's
+     meter render through the same GPU entry point (and the same support predicate) its
+     real render uses — A/B/C via `renderForward(useGpu)`, R via `renderBackwardCuda`,
+     D via `renderBdptCuda`, P both layers — falling back to the CPU renderer whenever
+     the predicate says no. `-device cpu` is **bit-identical** to before (verified:
+     old-vs-new exe print the same anchor to 4 sig figs AND all rendered frames sha1-match
+     on the gallery m8 scratch scene at 192×108).
+  2. **Mode-M groups meter in ONE batched GPU pass.** An all-M pinhole group (the flyby
+     case) now meters via `renderPhotonMapSharedCuda` — one device photon map + GPU
+     gathers for up to `kMeterMax` meter frames, early-stopped by the same `MeterConverge`
+     test through the shared path's `onFrame` hook — instead of one CPU map + up to 64
+     full-res CPU gathers. Gated exactly like `runSharedPhotonMap`'s GPU branch; any
+     gate miss falls through to the per-frame CPU loop unchanged.
+  **End-to-end verification** (8-frame `fly` scratch copy of `gallery_settled.ftsl`,
+  960×540, `-device gpu -n 4000000 -spp 8`): meter = deposit + 8 GPU gathers in ~2–3 min
+  (was 10,000+ CPU-s ≈ 28+ min), anchor 2.981e-09 (CPU meter cross-check at 192×108:
+  2.967e-09, agreement ~0.007 stops); then the REAL `renderPhotonMapSharedCuda` phase —
+  the part the correction above said "was never reached" — ran the **4M-photon device
+  deposit + build + per-camera gathers and streamed frames to disk** with the locked
+  exposure applied (auto-exposure=2.98e-09 on every frame). So the GPU shared build
+  never had a hang at all; the whole symptom was the CPU meter. Remaining perf note:
+  each full-res 960×540×16spp meter gather is ~15 s on the 4090 — the gather kernel is
+  a hot-path optimization candidate (tracked in the 2026-07 D/M GPU optimization work).
 
 ## Mode-M shared render ignores `-window` — no live preview opens (2026-07-21)
 - **Symptom:** rendering the gallery `fly` curve in mode M with `-window` never opens

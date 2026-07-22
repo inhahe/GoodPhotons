@@ -5651,6 +5651,19 @@ static int run(int argc, char** argv) {
     // to the same radiance). One reduced, view-independent photon map (built lazily once)
     // serves every mode-M meter.
     PhotonMap meterPmap; bool meterPmapBuilt = false;
+#ifdef HAVE_CUDA
+    // Meter on the device the run asked for. The meter is a REAL reduced render, so when
+    // a mode's GPU path supports this scene it must use it: metering on the CPU while the
+    // user asked for -device gpu used to front-load the whole pre-pass as silent CPU work
+    // — tens of minutes on a big scene (the mode-M "shared deposit hang" in known-issues
+    // was exactly this meter, misdiagnosed as the GPU build). Every branch below gates on
+    // the same support predicate its real render uses and falls back to the CPU renderer
+    // otherwise, so -device cpu runs are bit-identical to before.
+    const bool meterGpu = (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+                          cudaAvailable();
+#else
+    const bool meterGpu = false;
+#endif
     auto meterAnchor = [&](const MeterCam& mc) -> double {
         const int W = mc.res, H = mc.resY;
         // Reduced budgets: enough coverage for a clean p99 without paying for a full render.
@@ -5664,24 +5677,44 @@ static int run(int argc, char** argv) {
         switch (mode) {
             case 'A': case 'B': case 'C': {
                 EnergyReport e;
+                // renderForward self-gates on cudaForwardSupported and falls back to CPU.
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                    /*forwardCatch*/mode == 'C', /*lensMode*/mode == 'A',
-                                   /*useCamera*/true, e, diffraction, /*useGpu*/false);
+                                   /*useCamera*/true, e, diffraction, /*useGpu*/meterGpu);
                 addEnvBackground(mf, scene, mc.cam, meterN);
                 filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
                 break;
             }
             case 'R': {
-                mf = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
+                bool onGpu = false;
+#ifdef HAVE_CUDA
+                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                    mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    onGpu = true;
+                }
+#endif
+                if (!onGpu)
+                    mf = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
             case 'D': {
-                mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
+                bool onGpu = false;
+#ifdef HAVE_CUDA
+                if (meterGpu && cudaBdptSupported(scene)) {
+                    mf = renderBdptCuda(scene, mc.cam, W, H, meterSpp, /*maxDepth*/8, diffraction);
+                    onGpu = true;
+                }
+#endif
+                if (!onGpu)
+                    mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
             case 'M': {
+                // CPU fallback only: mode-M groups that pass the GPU gates are metered in
+                // ONE batched renderPhotonMapSharedCuda call in the group loop below
+                // (shared device map + GPU gathers), never per-frame here.
                 if (!meterPmapBuilt) {
                     double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                                           : scene.sceneRadius * g_pmRadiusFactor;
@@ -5699,8 +5732,17 @@ static int run(int argc, char** argv) {
                 CompositeClass cc = classifyComposite(scene, mc.cam, W, H);
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                         false, false, true, e, diffraction, false);
-                Film ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
+                                         false, false, true, e, diffraction, meterGpu);
+                Film ref;
+                bool refGpu = false;
+#ifdef HAVE_CUDA
+                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                    ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    refGpu = true;
+                }
+#endif
+                if (!refGpu)
+                    ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
                 mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc,
                                         scene.envIndex >= 0, /*verbose*/false);
                 filmToRgb8(mf, 1.0, 1.0, false, nullptr, &eAuto);
@@ -5709,7 +5751,7 @@ static int run(int argc, char** argv) {
             default: {   // S/U/V and any future mode: general forward mode-B light-trace
                 EnergyReport e;
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                   false, false, true, e, diffraction, false);
+                                   false, false, true, e, diffraction, meterGpu);
                 addEnvBackground(mf, scene, mc.cam, meterN);
                 filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
                 break;
@@ -5724,9 +5766,54 @@ static int run(int argc, char** argv) {
         const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
         const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
         MeterConverge conv(kmn, kmx, kMeterTolStops);
-        for (const auto& mc : cams) {
-            if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
+        bool metered = false;
+#ifdef HAVE_CUDA
+        // Batched GPU meter for a mode-M group: ONE device photon map + GPU gathers for
+        // the (up to kmx) meter frames, early-stopped by the same convergence test via
+        // the shared path's per-frame onFrame hook. Per-frame metering can't reuse a
+        // device map across meterAnchor calls, and the CPU version of this (one CPU map
+        // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
+        // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
+        // branch; any miss falls through to the per-frame loop below unchanged.
+        if (meterGpu && g_pmFinalGather == 0 && cudaPhotonMapSupported(scene)) {
+            bool allM = true, allPinhole = true;
+            for (const auto& mc : cams) {
+                if (mc.mode != 'M')    allM = false;
+                if (mc.cam.hasLens()) allPinhole = false;
+            }
+            if (allM && allPinhole) {
+                std::vector<Camera> mcams; std::vector<int> rxs, rys;
+                for (int i = 0; i < kmx; ++i) {
+                    mcams.push_back(cams[i].cam);
+                    rxs.push_back(cams[i].res); rys.push_back(cams[i].resY);
+                }
+                const long long meterN = std::clamp((long long)cams[0].res * cams[0].resY * 40LL,
+                                                    500000LL, 4000000LL);
+                const long long meterSpp = 16;   // matches meterAnchor's reduced budget
+                double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                                      : scene.sceneRadius * g_pmRadiusFactor;
+                std::printf("[meter] exposure lock: group %d metering on %s (shared "
+                            "photon map, up to %d frame(s)) ...\n",
+                            g, cudaDeviceName(), kmx);
+                std::fflush(stdout);
+                EnergyReport e;
+                std::function<bool(int, const Film&)> onFrame =
+                    [&](int, const Film& f) -> bool {
+                        double eAuto = 0.0;
+                        filmToRgb8(f, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                        return conv.add(eAuto) || g_stopRequested != 0;
+                    };
+                renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
+                                          diffraction, meterSpp, nullptr, &onFrame,
+                                          nullptr, nullptr, g_heroC);
+                metered = true;   // a black meter falls into the no-anchor warning below
+            }
         }
+#endif
+        if (!metered)
+            for (const auto& mc : cams) {
+                if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
+            }
         if (conv.used() > 0) {
             expAnchors[g] = conv.anchor();
             if (adaptive)
