@@ -10,7 +10,10 @@
 #include "linalg.h"
 #include "geometry.h"
 
-inline double vget(const Vec3& v, int a) { return a == 0 ? v.x : (a == 1 ? v.y : v.z); }
+// Branch-free component fetch (Vec3 is standard-layout with x,y,z contiguous —
+// same trick as Vec3::operator[]); the old two-branch ternary showed up in
+// profiles via the slab test's 6 calls per node.
+inline double vget(const Vec3& v, int a) { return (&v.x)[a]; }
 
 struct Aabb {
     Vec3 lo{ DBL_MAX,  DBL_MAX,  DBL_MAX};
@@ -33,18 +36,32 @@ struct Aabb {
         return d.y >= d.z ? 1 : 2;
     }
     // Slab test against [tmin, tmax]. Returns true if the ray overlaps the box;
-    // tEnter is the near intersection distance (>= tmin).
+    // tEnter is the near intersection distance (>= tmin). Fully unrolled over the
+    // three axes (was a for-loop with vget component indirection — this is one of
+    // the hottest functions in every CPU mode, and the straight-line form keeps
+    // each axis's operands in registers). Per axis the arithmetic, the swap, and
+    // the early-out compare are IDENTICAL to the old loop body in the same x,y,z
+    // order, so results are bit-identical.
     bool hit(const Ray& r, const Vec3& invD, double tmin, double tmax, double& tEnter) const {
         double te = tmin, tx = tmax;
-        for (int a = 0; a < 3; ++a) {
-            double o = vget(r.o, a), id = vget(invD, a);
-            double t0 = (vget(lo, a) - o) * id;
-            double t1 = (vget(hi, a) - o) * id;
-            if (t0 > t1) std::swap(t0, t1);
-            te = t0 > te ? t0 : te;
-            tx = t1 < tx ? t1 : tx;
-            if (tx < te) return false;
-        }
+        double t0 = (lo.x - r.o.x) * invD.x;
+        double t1 = (hi.x - r.o.x) * invD.x;
+        if (t0 > t1) { double tt = t0; t0 = t1; t1 = tt; }
+        te = t0 > te ? t0 : te;
+        tx = t1 < tx ? t1 : tx;
+        if (tx < te) return false;
+        t0 = (lo.y - r.o.y) * invD.y;
+        t1 = (hi.y - r.o.y) * invD.y;
+        if (t0 > t1) { double tt = t0; t0 = t1; t1 = tt; }
+        te = t0 > te ? t0 : te;
+        tx = t1 < tx ? t1 : tx;
+        if (tx < te) return false;
+        t0 = (lo.z - r.o.z) * invD.z;
+        t1 = (hi.z - r.o.z) * invD.z;
+        if (t0 > t1) { double tt = t0; t0 = t1; t1 = tt; }
+        te = t0 > te ? t0 : te;
+        tx = t1 < tx ? t1 : tx;
+        if (tx < te) return false;
         tEnter = te;
         return true;
     }
