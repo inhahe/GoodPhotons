@@ -4976,8 +4976,8 @@ static int run(int argc, char** argv) {
             // instead of spinning the view off-screen. (Translation stays feedback-locked
             // per-frame below — that's the collision-safety part; rotating in place can never
             // fling the eye through geometry, so it has no reason to be frame-locked.)
-            const double kYaw   = 1.6;               // max yaw   rad/sec at full pointer deflection
-            const double kPitch = 1.2;               // max pitch rad/sec at full pointer deflection
+            const double kYaw   = 2.6;               // max yaw   rad/sec (~150 deg/s) at full pointer deflection
+            const double kPitch = 2.0;               // max pitch rad/sec (~115 deg/s) at full pointer deflection
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
             auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
                 double c = std::cos(ang), s = std::sin(ang);
