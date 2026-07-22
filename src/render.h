@@ -255,6 +255,29 @@ struct CamTarget {
     Film*         film = nullptr;
 };
 
+// The specular-sphere connectors (connectSpecularSphere / ...Inside) scan the SAME
+// kSphScanN+1 fixed entry angles on every call, and each scan step used to pay a
+// fresh cos+sin pair — the dominant transcendental cost of the mode-B glass-sphere
+// splat. The angles never change, so evaluate them once at first use, with the same
+// runtime std::cos/std::sin the scan itself called (NOT constant-folded — the loop
+// variable keeps the compiler honest), making table reads bit-identical to the
+// per-step evaluation they replace. Bisection refinement still computes live
+// cos/sin (its midpoints are data-dependent).
+inline constexpr int kSphScanN = 96;
+struct SphScanTab { double c[kSphScanN + 1], s[kSphScanN + 1]; };
+inline const SphScanTab& sphScanTab() {
+    static const SphScanTab tab = [] {
+        SphScanTab t;
+        for (int i = 0; i <= kSphScanN; ++i) {
+            double phi = -PI + (2.0 * PI) * i / kSphScanN;
+            t.c[i] = std::cos(phi);
+            t.s[i] = std::sin(phi);
+        }
+        return t;
+    }();
+    return tab;
+}
+
 struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
@@ -790,10 +813,10 @@ struct Renderer {
         double px2 = dot(ap, ex), py2 = dot(ap, ey);        // p   2-D
 
         // In-plane trace: signed perpendicular distance of p from the exit ray, for
-        // entry angle phi (measured in (ex,ey)). Sets valid on a real forward exit.
-        auto trace2D = [&](double phi, bool& valid) -> double {
+        // entry angle phi (measured in (ex,ey), passed as its cos/sin pair). Sets
+        // valid on a real forward exit.
+        auto trace2D = [&](double c1, double s1, bool& valid) -> double {
             valid = false;
-            double c1 = std::cos(phi), s1 = std::sin(phi);
             double P1x = r * c1, P1y = r * s1;
             double dinx = P1x - ex_e, diny = P1y;
             double dl = std::sqrt(dinx * dinx + diny * diny);
@@ -826,15 +849,16 @@ struct Renderer {
         };
 
         // Scan the front arc; bisect sign changes into chief entry angles (<=4 roots).
-        const int NS = 96; double roots[4]; int nroot = 0;
+        const int NS = kSphScanN; double roots[4]; int nroot = 0;
+        const SphScanTab& T = sphScanTab();
         double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
         for (int i = 0; i <= NS && nroot < 4; ++i) {
             double phi = -PI + (2.0 * PI) * i / NS;
-            bool v; double mss = trace2D(phi, v);
+            bool v; double mss = trace2D(T.c[i], T.s[i], v);
             if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
                 double a = prevPhi, b = phi, fa = prevMiss;
                 for (int k = 0; k < 40; ++k) {
-                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(mid, vm);
+                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(std::cos(mid), std::sin(mid), vm);
                     if (!vm) break;
                     if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
                 }
@@ -959,10 +983,10 @@ struct Renderer {
         double px2 = dot(ap, ex), py2 = dot(ap, ey);               // p   2-D
 
         // In-plane trace: signed perp distance of p from the once-refracted exit ray
-        // leaving the surface point at angle phi. valid on a real forward exit.
-        auto trace2D = [&](double phi, bool& valid) -> double {
+        // leaving the surface point at angle phi (passed as its cos/sin pair). valid
+        // on a real forward exit.
+        auto trace2D = [&](double c1, double s1, bool& valid) -> double {
             valid = false;
-            double c1 = std::cos(phi), s1 = std::sin(phi);
             double P1x = r * c1, P1y = r * s1;
             double dinx = P1x - ex_e, diny = P1y - ey_e;
             double dl = std::sqrt(dinx * dinx + diny * diny);
@@ -983,15 +1007,16 @@ struct Renderer {
         };
 
         // Scan the full circle; bisect sign changes into chief exit angles (<=2 roots).
-        const int NS = 96; double roots[4]; int nroot = 0;
+        const int NS = kSphScanN; double roots[4]; int nroot = 0;
+        const SphScanTab& T = sphScanTab();
         double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
         for (int i = 0; i <= NS && nroot < 4; ++i) {
             double phi = -PI + (2.0 * PI) * i / NS;
-            bool v; double mss = trace2D(phi, v);
+            bool v; double mss = trace2D(T.c[i], T.s[i], v);
             if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
                 double a = prevPhi, b = phi, fa = prevMiss;
                 for (int k = 0; k < 40; ++k) {
-                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(mid, vm);
+                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(std::cos(mid), std::sin(mid), vm);
                     if (!vm) break;
                     if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
                 }
