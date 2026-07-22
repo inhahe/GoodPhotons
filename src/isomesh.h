@@ -32,6 +32,8 @@
 #include <unordered_map>
 #include <functional>
 #include <algorithm>
+#include <thread>
+#include <atomic>
 
 namespace isomesh {
 
@@ -123,13 +125,41 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
         return (L > 1e-30) ? g*(1.0/L) : Vec3{0,1,0};
     };
 
-    // Sample the augmented field on the full lattice.
+    // Deterministic parallel-for: runs fn(x) for every x in [0,n). Only used for
+    // stages where each index's work is a PURE function that writes exclusively its
+    // own output slot, so thread count / scheduling cannot affect the result — the
+    // output is bit-identical to the serial loop. `par` gates threading so small
+    // lattices stay serial (they already run concurrently across implicits).
+    auto parallelFor = [](size_t n, bool par, auto&& fn) {
+        unsigned hw = std::thread::hardware_concurrency(); if (hw == 0) hw = 4;
+        size_t T = par ? std::min<size_t>(hw, n) : 1;
+        if (T <= 1) { for (size_t x = 0; x < n; ++x) fn(x); return; }
+        std::atomic<size_t> next{0};
+        const size_t CHUNK = std::max<size_t>(1, n / (T * 8));
+        auto body = [&]() {
+            for (;;) {
+                size_t x = next.fetch_add(CHUNK);
+                if (x >= n) break;
+                size_t e = std::min(n, x + CHUNK);
+                for (; x < e; ++x) fn(x);
+            }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve(T - 1);
+        for (size_t t = 0; t + 1 < T; ++t) pool.emplace_back(body);
+        body();
+        for (auto& th : pool) th.join();
+    };
+
+    // Sample the augmented field on the full lattice. Each lattice point is an
+    // independent pure eval writing its own cell -> slab-parallel, bit-identical.
     std::vector<double> val((size_t)SX * SY * SZ);
     auto vidx = [&](int i, int j, int k){ return ((size_t)i * SY + j) * SZ + k; };
-    for (int i = 0; i < SX; ++i)
+    parallelFor((size_t)SX, val.size() >= (size_t)1 << 18, [&](size_t i) {
         for (int j = 0; j < SY; ++j)
             for (int k = 0; k < SZ; ++k)
-                val[vidx(i,j,k)] = augEval(gridPos(i,j,k));
+                val[vidx((int)i,j,k)] = augEval(gridPos((int)i,j,k));
+    });
 
     // Vertices are welded by the canonical (unordered) pair of LATTICE ENDPOINTS the
     // crossing edge spans. The Kuhn/Freudenthal 6-tetrahedra split below tiles space
@@ -141,29 +171,19 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
     std::unordered_map<uint64_t,int> edgeVert;
     edgeVert.reserve((size_t)SX * SY * 4);
 
-    // Interpolate + bisection-refine the zero crossing on lattice edge (a)-(b); weld.
+    // Weld the zero crossing on lattice edge (a)-(b), DEFERRING the expensive
+    // placement (bisection refine + gradient normal) to a parallel pass below.
+    // Indices are assigned here in first-seen sweep order, so the vertex list —
+    // and therefore every triangle index — is identical to the old in-sweep code.
+    struct PendVert { int i0,j0,k0,i1,j1,k1; double f0,f1; };
+    std::vector<PendVert> pend;
     auto edgeVertex = [&](int i0,int j0,int k0,double f0, int i1,int j1,int k1,double f1)->int {
         uint64_t a = latId(i0,j0,k0), b = latId(i1,j1,k1);
         uint64_t key = a < b ? (a << 32 | b) : (b << 32 | a);
         auto it = edgeVert.find(key);
         if (it != edgeVert.end()) return it->second;
-        Vec3 p0 = gridPos(i0,j0,k0), p1 = gridPos(i1,j1,k1);
-        double denom = f1 - f0;
-        double t = (std::fabs(denom) > 1e-30) ? (-f0 / denom) : 0.5;
-        t = std::min(1.0, std::max(0.0, t));
-        double lo = 0.0, hi = 1.0, flo = f0, fhi = f1;
-        if ((flo < 0) != (fhi < 0)) {
-            for (int r = 0; r < opt.refineIters; ++r) {
-                double tm = 0.5 * (lo + hi);
-                double fm = augEval(p0 + (p1 - p0) * tm);
-                if ((flo < 0) == (fm < 0)) { lo = tm; flo = fm; } else { hi = tm; fhi = fm; }
-            }
-            t = 0.5 * (lo + hi);
-        }
-        Vec3 p = p0 + (p1 - p0) * t;
-        int idx = (int)m.pos.size();
-        m.pos.push_back(p);
-        m.nrm.push_back(augGrad(p));   // unit, outward (augmented field increases outward)
+        int idx = (int)pend.size();
+        pend.push_back({i0,j0,k0,i1,j1,k1,f0,f1});
         edgeVert.emplace(key, idx);
         return idx;
     };
@@ -173,13 +193,13 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
     static const int kTet[6][4] = {
         {0,1,5,6}, {0,1,2,6}, {0,4,5,6}, {0,4,7,6}, {0,3,2,6}, {0,3,7,6}
     };
+    // Record raw triples in emission order; winding needs the refined vertex
+    // positions/normals, so it runs as a cheap serial pass after vertex resolve.
+    // (The degeneracy check is index-based and indices are unchanged, so the set
+    // of dropped triangles is identical.)
     auto emitTri = [&](int a,int b,int c){
         if (a<0||b<0||c<0||a==b||b==c||a==c) return;
-        Vec3 fn = cross(m.pos[b]-m.pos[a], m.pos[c]-m.pos[a]);
-        Vec3 gn = m.nrm[a] + m.nrm[b] + m.nrm[c];
-        int bb=b, cc=c;
-        if (dot(fn,gn) < 0.0) std::swap(bb,cc);   // wind so normal agrees with grad
-        m.tri.push_back(a); m.tri.push_back(bb); m.tri.push_back(cc);
+        m.tri.push_back(a); m.tri.push_back(b); m.tri.push_back(c);
     };
 
     for (int ci = 0; ci < NX; ++ci)
@@ -216,6 +236,42 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
                 emitTri(ac, bd, bc);
             }
         }
+    }
+
+    // Resolve welded vertices: interpolate + bisection-refine the crossing and take
+    // the gradient normal — the SDF-heavy stage (refineIters + 6 evals per vertex).
+    // Pure per vertex, writes only its own slot -> parallel, bit-identical to the
+    // old in-sweep computation (same p0/p1/f0/f1 inputs, same arithmetic).
+    m.pos.resize(pend.size());
+    m.nrm.resize(pend.size());
+    parallelFor(pend.size(), pend.size() >= 8192, [&](size_t n) {
+        const PendVert& pv = pend[n];
+        Vec3 p0 = gridPos(pv.i0,pv.j0,pv.k0), p1 = gridPos(pv.i1,pv.j1,pv.k1);
+        double f0 = pv.f0, f1 = pv.f1;
+        double denom = f1 - f0;
+        double t = (std::fabs(denom) > 1e-30) ? (-f0 / denom) : 0.5;
+        t = std::min(1.0, std::max(0.0, t));
+        double lo = 0.0, hi = 1.0, flo = f0, fhi = f1;
+        if ((flo < 0) != (fhi < 0)) {
+            for (int r = 0; r < opt.refineIters; ++r) {
+                double tm = 0.5 * (lo + hi);
+                double fm = augEval(p0 + (p1 - p0) * tm);
+                if ((flo < 0) == (fm < 0)) { lo = tm; flo = fm; } else { hi = tm; fhi = fm; }
+            }
+            t = 0.5 * (lo + hi);
+        }
+        Vec3 p = p0 + (p1 - p0) * t;
+        m.pos[n] = p;
+        m.nrm[n] = augGrad(p);   // unit, outward (augmented field increases outward)
+    });
+
+    // Wind triangles in place so each normal agrees with the field gradient —
+    // identical decision to the old emitTri (same fn/gn from the same values).
+    for (size_t t3 = 0; t3 + 2 < m.tri.size(); t3 += 3) {
+        int a = m.tri[t3], b = m.tri[t3+1], c = m.tri[t3+2];
+        Vec3 fn = cross(m.pos[b]-m.pos[a], m.pos[c]-m.pos[a]);
+        Vec3 gn = m.nrm[a] + m.nrm[b] + m.nrm[c];
+        if (dot(fn,gn) < 0.0) std::swap(m.tri[t3+1], m.tri[t3+2]);
     }
     return m;
 }
