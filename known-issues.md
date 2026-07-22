@@ -11,10 +11,24 @@ as practical; this file is the fallback for what can't be addressed immediately.
 counters restricted to admin). Until unlocked, kernel-level profiling has to fall back
 to ablation timing (code ablation + scene-copy ablation, as used for the 2026-07-22
 BDPT campaign) and `cuobjdump -res-usage ftrace.exe` for register/stack pressure.
-**Fix (user action, one-time):** NVIDIA Control Panel → Desktop menu → enable Developer
-Settings → Developer → Manage GPU Performance Counters → "Allow access to the GPU
-performance counters to all users", then reboot. (Alternatively run `ncu` from an
-elevated shell.)
+
+**Fixes (in order of practicality):**
+1. **Just run `ncu` from an elevated (Administrator) shell** — the restriction is only
+   enforced for non-admin users, so an admin PowerShell/Terminal profiles without any
+   system change or reboot. Simplest for occasional profiling.
+2. **Permanently allow all users via the driver registry policy** (this is the value the
+   Control-Panel checkbox actually writes). In an elevated PowerShell:
+   ```powershell
+   New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" -Force | Out-Null
+   Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" -Name "RmProfilingAdminOnly" -Type DWord -Value 0
+   ```
+   `RmProfilingAdminOnly = 0` = allow all users; `1` or absent = admin-only. **Reboot**,
+   then `ncu` works from a normal shell.
+3. NVIDIA Control Panel → Developer → Manage GPU Performance Counters → "Allow access to
+   all users" is the documented GUI path, **but the Developer section is frequently
+   absent** from recent drivers' classic Control Panel (verified 2026-07-22: no Developer
+   node in the left tree, and there is no toggle for it under Desktop/3D-settings), so
+   don't rely on this — use (1) or (2).
 
 ### DEBT (2026-07-22): gallery GPU configs are now dominated by the ~8.4 s fixed CPU-side setup (parse/tessellate/BVH/upload)
 
