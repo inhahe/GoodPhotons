@@ -339,9 +339,10 @@ struct DInstance {
 
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
 // The field is a flat postfix array evaluated with a scalar stack, sphere-traced for
-// intersection. All math is done in DOUBLE (independent of the FP32 transport `Real`):
-// the sign-change bisection converges to ~1e-12, which needs the precision, and
-// implicits are already the expensive path, so the FP64 cost is acceptable. POD twins
+// intersection. The MARCH + root REFINE run in FP32 on pre-converted mirror pools
+// (DFieldNodeF/PatNodeF): the committed hit is float anyway, and FP64 VM ops
+// serialize on consumer GPUs' 1/64-rate FP64 pipe. Normals (dFieldGradient) and
+// media bound-field evals stay in DOUBLE on the original pools. POD twins
 // of FieldOp / FieldNode / Implicit (see src/implicit.h).
 // NOTE: this order MUST match FieldOp in implicit.h (dn.op = (int)fn.op on upload).
 // DF_EXPR is the arbitrary-formula isosurface leaf: its value is f(x,y,z) evaluated
@@ -358,6 +359,23 @@ struct DFieldNode {
     double scale;         // world = scale * local; d_world = d_local * scale (leaf only)
     int    exprOff, exprN;// DF_EXPR: slice into DScene::fieldExprNodes (postfix PatNode program)
 };
+// FP32 mirrors of the field/pattern node pools, pre-converted on upload. The sphere-
+// trace MARCH + root REFINE in intersectImplicit run entirely on these: the committed
+// hit is stored in float anyway (DHit::t/p are Real), so double stepping buys nothing
+// there, while the FP64 VM ops serialize on the 1/64-rate FP64 pipe of consumer GPUs
+// (measured: ~90% of BDPT subpath generation on the gallery scene). Pre-converting
+// whole pools (rather than casting per-op) keeps F64<->F32 cvt instructions — which
+// also issue on the FP64 pipe — out of the inner loop. Normals (dFieldGradient) and
+// media bound-fields still use the DOUBLE pools.
+struct DFieldNodeF {
+    int   op;
+    float p[4];
+    float inv[9];
+    float tx, ty, tz;
+    float scale;
+    int   exprOff, exprN;  // same slice indices as the double twin (pools are parallel)
+};
+struct PatNodeF { int op; float a; };   // FP32 twin of pattern.h PatNode (8B vs 16B)
 struct DImplicit {
     int    nodeOff, nodeN;   // slice [nodeOff, nodeOff+nodeN) into DScene::fieldNodes
     int    matId;
@@ -541,6 +559,10 @@ struct DScene {
     // each Expr FieldNode slices it by [exprOff, exprOff+exprN). Separate from
     // patNodes so material patterns and field formulas don't share offsets.
     const PatNode*    fieldExprNodes;
+    // FP32 mirrors of fieldNodes/fieldExprNodes (same order/offsets) for the sphere-
+    // trace march hot path. Null iff the double pools are null.
+    const DFieldNodeF* fieldNodesF;
+    const PatNodeF*    fieldExprNodesF;
     const DImplicit*  implicits; int nImplicits;
     // Instancing (two-level BVH). BVH prims with index >= nTris+nSph+nImplicits map to
     // instances[prim - nTris - nSph - nImplicits]; each instance references a DBlas
@@ -1236,6 +1258,12 @@ __device__ static inline double dSmin(double a, double b, double k) {
     return (a < b ? a : b) - h * h * k * 0.25;
 }
 __device__ static inline double dSmax(double a, double b, double k) { return -dSmin(-a, -b, k); }
+__device__ static inline float dSminF(float a, float b, float k) {
+    if (k <= 0.0f) return a < b ? a : b;
+    float h = fmaxf(k - fabsf(a - b), 0.0f) / k;
+    return (a < b ? a : b) - h * h * k * 0.25f;
+}
+__device__ static inline float dSmaxF(float a, float b, float k) { return -dSminF(-a, -b, k); }
 
 // Leaf SDF at the leaf-LOCAL query point (px,py,pz). Mirrors fieldLeafSDF exactly.
 // Forward decl: DF_EXPR leaves evaluate their formula with the pattern VM, which is
@@ -1244,6 +1272,10 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v);
+__device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
+                                      float x, float y, float z, float f,
+                                      float nx, float ny, float nz, float r,
+                                      float u, float v);
 
 __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
                                        const PatNode* exprPool) {
@@ -1318,6 +1350,80 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
     }
     return sp > 0 ? st[0] : BIG;
 }
+// ---- FP32 twins of the field VM (see DFieldNodeF): used ONLY by the sphere-trace
+// march/refine in intersectImplicit, where the result is stored in float anyway.
+__device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py, float pz,
+                                       const PatNodeF* exprPool) {
+    switch (nd.op) {
+        case DF_SPHERE:
+            return sqrtf(px*px + py*py + pz*pz) - nd.p[0];
+        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+            if (!exprPool) return (float)BIG;
+            float r = sqrtf(px*px + py*py + pz*pz);
+            return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0f,
+                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f);
+        }
+        case DF_BOX: {
+            float r = nd.p[3];
+            float qx = fabsf(px) - nd.p[0] + r, qy = fabsf(py) - nd.p[1] + r, qz = fabsf(pz) - nd.p[2] + r;
+            float ox = fmaxf(qx, 0.0f), oy = fmaxf(qy, 0.0f), oz = fmaxf(qz, 0.0f);
+            float outside = sqrtf(ox*ox + oy*oy + oz*oz);
+            float inside  = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
+            return outside + inside - r;
+        }
+        case DF_TORUS: {
+            float qx = sqrtf(px*px + pz*pz) - nd.p[0];
+            return sqrtf(qx*qx + py*py) - nd.p[1];
+        }
+        case DF_PLANE:
+            return px*nd.p[0] + py*nd.p[1] + pz*nd.p[2] + nd.p[3];
+        case DF_CYLINDER: {
+            float dxz = sqrtf(px*px + pz*pz) - nd.p[0];
+            float dy  = fabsf(py) - nd.p[1];
+            float a   = fminf(fmaxf(dxz, dy), 0.0f);
+            float bx  = fmaxf(dxz, 0.0f), by = fmaxf(dy, 0.0f);
+            return a + sqrtf(bx*bx + by*by);
+        }
+        case DF_CONE: {
+            float rb = nd.p[0], rt = nd.p[1], h = nd.p[2];
+            float qx = sqrtf(px*px + pz*pz), qy = py;
+            float k1x = rt, k1y = h, k2x = rt - rb, k2y = 2.0f*h;
+            float cax = qx - fminf(qx, (qy < 0.0f) ? rb : rt);
+            float cay = fabsf(qy) - h;
+            float k2dot = k2x*k2x + k2y*k2y;
+            float tt = (k2dot > 0.0f) ? ((k1x - qx)*k2x + (k1y - qy)*k2y) / k2dot : 0.0f;
+            tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+            float cbx = qx - k1x + k2x*tt, cby = qy - k1y + k2y*tt;
+            float s = (cbx < 0.0f && cay < 0.0f) ? -1.0f : 1.0f;
+            float da = cax*cax + cay*cay, db = cbx*cbx + cby*cby;
+            return s * sqrtf(fminf(da, db));
+        }
+        default: return (float)BIG;
+    }
+}
+__device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
+                                    float pwx, float pwy, float pwz,
+                                    const PatNodeF* exprPool) {
+    float st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const DFieldNodeF& nd = nodes[i];
+        switch (nd.op) {
+            case DF_UNION:            { float b = st[--sp], a = st[--sp]; st[sp++] = a < b ? a : b; break; }
+            case DF_INTERSECT:        { float b = st[--sp], a = st[--sp]; st[sp++] = a > b ? a : b; break; }
+            case DF_DIFFERENCE:       { float b = st[--sp], a = st[--sp]; st[sp++] = a > -b ? a : -b; break; }
+            case DF_SMOOTH_UNION:     { float b = st[--sp], a = st[--sp]; st[sp++] = dSminF(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_INTERSECT: { float b = st[--sp], a = st[--sp]; st[sp++] = dSmaxF(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_DIFFERENCE:{ float b = st[--sp], a = st[--sp]; st[sp++] = dSmaxF(a, -b, nd.p[0]); break; }
+            default: {   // leaf: world -> local via inv, then local SDF * scale
+                float plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
+                float ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
+                float plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
+                st[sp++] = dFieldLeafSDFF(nd, plx, ply, plz, exprPool) * nd.scale;
+            }
+        }
+    }
+    return sp > 0 ? st[0] : (float)BIG;
+}
 // Field gradient (tetrahedron central differences) -> unit normal. Mirrors fieldGradient.
 __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
                                       double px, double py, double pz, double eps,
@@ -1368,8 +1474,12 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                                           const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
     double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
 
-    const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
+    const DFieldNode* nd = sc.fieldNodes + im.nodeOff;   // double pool: gradient/normal only
     const PatNode* exprPool = sc.fieldExprNodes;
+    // FP32 mirror pools: the march + root refine run entirely in float (the committed
+    // hit is float anyway; FP64 VM ops serialize on the 1/64-rate FP64 pipe).
+    const DFieldNodeF* ndF = sc.fieldNodesF + im.nodeOff;
+    const PatNodeF* exprPoolF = sc.fieldExprNodesF;
     const int N = im.nodeN;
 
     // ---- Container clip: entry/exit params [tEnter, tExit] and the container's OUTWARD
@@ -1429,6 +1539,14 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const double fixedStep   = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
     const bool   regulaFalsi = (im.refine == 1);
 
+    // FP32 march state (double ray kept for the hit commit + gradient).
+    const float oxF = (float)ox, oyF = (float)oy, ozF = (float)oz;
+    const float dxF = (float)dx, dyF = (float)dy, dzF = (float)dz;
+    const float dlenF    = (float)dlen;
+    const float invLipF  = (float)invLip, minStepF = (float)minStep;
+    const float fixedStepF = (float)fixedStep;
+    const float t1F = (float)t1;
+
     // Commit a hit at parametric `th`, world point (px,py,pz), geometric normal (gx,gy,gz).
     auto writeHit = [&](double th, double px, double py, double pz,
                         double gx, double gy, double gz) -> bool {
@@ -1445,43 +1563,43 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         return true;
     };
 
-    double t = t0;
-    double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
+    float t = (float)t0;
+    float f = dFieldEvalF(ndF, N, oxF + dxF*t, oyF + dyF*t, ozF + dzF*t, exprPoolF);
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
-    if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0)
+    if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
         return writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
     for (int i = 0; i < MAX_STEP; ++i) {
-        double step = sampleMode ? fixedStep : fmax(fabs(f) * invLip, minStep) / dlen;
-        double tn = t + step;
+        float step = sampleMode ? fixedStepF : fmaxf(fabsf(f) * invLipF, minStepF) / dlenF;
+        float tn = t + step;
         bool last = false;
-        if (tn >= t1) { tn = t1; last = true; }
-        double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn, exprPool);
-        bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) || (f == 0.0 && fn != 0.0);
+        if (tn >= t1F) { tn = t1F; last = true; }
+        float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF);
+        bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
-            double ta = t, tb = tn, fa = f, fb = fn;
+            float ta = t, tb = tn, fa = f, fb = fn;
             int rfSide = 0;
-            for (int b = 0; b < 80; ++b) {
-                double tm;
-                if (regulaFalsi && (fb - fa) != 0.0) {
+            for (int b = 0; b < 48; ++b) {
+                float tm;
+                if (regulaFalsi && (fb - fa) != 0.0f) {
                     tm = (ta * fb - tb * fa) / (fb - fa);
-                    if (tm <= ta || tm >= tb) tm = 0.5*(ta + tb);
+                    if (tm <= ta || tm >= tb) tm = 0.5f*(ta + tb);
                 } else {
-                    tm = 0.5*(ta + tb);
+                    tm = 0.5f*(ta + tb);
                 }
-                double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm, exprPool);
-                if ((fa > 0.0) == (fm > 0.0)) {
+                if (tm <= ta || tm >= tb) break;   // float interval exhausted: converged
+                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF);
+                if ((fa > 0.0f) == (fm > 0.0f)) {
                     ta = tm; fa = fm;
-                    if (regulaFalsi && rfSide == +1) fb *= 0.5;
+                    if (regulaFalsi && rfSide == +1) fb *= 0.5f;
                     rfSide = +1;
                 } else {
                     tb = tm; fb = fm;
-                    if (regulaFalsi && rfSide == -1) fa *= 0.5;
+                    if (regulaFalsi && rfSide == -1) fa *= 0.5f;
                     rfSide = -1;
                 }
-                if ((tb - ta) * dlen < 1e-12) break;
             }
-            double th = 0.5*(ta + tb);
+            double th = 0.5*((double)ta + (double)tb);
             if (th < tmin || th >= (double)hit.t) return false;
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
@@ -1491,7 +1609,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         if (last) {
             // FAR CAP: reached the container exit still inside the solid (fn<0), and the
             // far clip is the container itself — seal the sawn-off solid.
-            if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < (double)hit.t)
+            if (capped && exitIsContainer && fn < 0.0f && tExit >= tmin && tExit < (double)hit.t)
                 return writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
             return false;
         }
@@ -2962,6 +3080,102 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
         }
     }
     return sp > 0 ? st[0] : 0.0;
+}
+// ---- FP32 twin of the pattern VM: used ONLY for DF_EXPR field formulas inside the
+// sphere-trace march (dFieldLeafSDFF). Same integer hash lattice, float blend.
+__device__ static float dPatHash3F(int ix, int iy, int iz) {
+    unsigned int h = (unsigned int)ix * 374761393u + (unsigned int)iy * 668265263u
+                   + (unsigned int)iz * 2147483647u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= (h >> 16);
+    return (float)h * (1.0f / 4294967295.0f);   // [0,1]
+}
+__device__ static float dPatValueNoiseF(float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+    float tx = x - fx, ty = y - fy, tz = z - fz;
+    float ux = tx * tx * (3.0f - 2.0f * tx);
+    float uy = ty * ty * (3.0f - 2.0f * ty);
+    float uz = tz * tz * (3.0f - 2.0f * tz);
+    float c000 = dPatHash3F(ix,     iy,     iz);
+    float c100 = dPatHash3F(ix + 1, iy,     iz);
+    float c010 = dPatHash3F(ix,     iy + 1, iz);
+    float c110 = dPatHash3F(ix + 1, iy + 1, iz);
+    float c001 = dPatHash3F(ix,     iy,     iz + 1);
+    float c101 = dPatHash3F(ix + 1, iy,     iz + 1);
+    float c011 = dPatHash3F(ix,     iy + 1, iz + 1);
+    float c111 = dPatHash3F(ix + 1, iy + 1, iz + 1);
+    float x00 = c000 + (c100 - c000) * ux;
+    float x10 = c010 + (c110 - c010) * ux;
+    float x01 = c001 + (c101 - c001) * ux;
+    float x11 = c011 + (c111 - c011) * ux;
+    float y0  = x00 + (x10 - x00) * uy;
+    float y1  = x01 + (x11 - x01) * uy;
+    return y0 + (y1 - y0) * uz;
+}
+__device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
+                                      float x, float y, float z, float f,
+                                      float nx, float ny, float nz, float r,
+                                      float u, float v) {
+    float st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const PatNodeF& nd = nodes[i];
+        switch ((PatOp)nd.op) {
+            case PatOp::Const:    st[sp++] = nd.a; break;
+            case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarY:     st[sp++] = y;  break;
+            case PatOp::VarZ:     st[sp++] = z;  break;
+            case PatOp::VarF:     st[sp++] = f;  break;
+            case PatOp::VarNx:    st[sp++] = nx; break;
+            case PatOp::VarNy:    st[sp++] = ny; break;
+            case PatOp::VarNz:    st[sp++] = nz; break;
+            case PatOp::VarR:     st[sp++] = r;  break;
+            case PatOp::VarU:     st[sp++] = u;  break;
+            case PatOp::VarV:     st[sp++] = v;  break;
+            case PatOp::VarT:     st[sp++] = 0.0f; break;
+            case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
+            case PatOp::Abs:      st[sp-1] = fabsf(st[sp-1]); break;
+            case PatOp::Sqrt:     st[sp-1] = sqrtf(fmaxf(0.0f, st[sp-1])); break;
+            case PatOp::Sin:      st[sp-1] = sinf(st[sp-1]); break;
+            case PatOp::Cos:      st[sp-1] = cosf(st[sp-1]); break;
+            case PatOp::Tan:      st[sp-1] = tanf(st[sp-1]); break;
+            case PatOp::Exp:      st[sp-1] = expf(st[sp-1]); break;
+            case PatOp::Log:      st[sp-1] = logf(fmaxf(1e-30f, st[sp-1])); break;
+            case PatOp::Floor:    st[sp-1] = floorf(st[sp-1]); break;
+            case PatOp::Fract:    st[sp-1] = st[sp-1] - floorf(st[sp-1]); break;
+            case PatOp::Sign:     st[sp-1] = (float)((st[sp-1] > 0.0f) - (st[sp-1] < 0.0f)); break;
+            case PatOp::Saturate: st[sp-1] = fminf(1.0f, fmaxf(0.0f, st[sp-1])); break;
+            case PatOp::Add:      { float b = st[--sp]; st[sp-1] += b; break; }
+            case PatOp::Sub:      { float b = st[--sp]; st[sp-1] -= b; break; }
+            case PatOp::Mul:      { float b = st[--sp]; st[sp-1] *= b; break; }
+            case PatOp::Div:      { float b = st[--sp]; st[sp-1] = (b != 0.0f) ? st[sp-1] / b : 0.0f; break; }
+            case PatOp::Mod:      { float b = st[--sp]; st[sp-1] = (b != 0.0f) ? st[sp-1] - b * floorf(st[sp-1] / b) : 0.0f; break; }
+            case PatOp::Pow:      { float b = st[--sp]; st[sp-1] = powf(st[sp-1], b); break; }
+            case PatOp::Min:      { float b = st[--sp]; st[sp-1] = fminf(st[sp-1], b); break; }
+            case PatOp::Max:      { float b = st[--sp]; st[sp-1] = fmaxf(st[sp-1], b); break; }
+            case PatOp::Atan2:    { float b = st[--sp]; st[sp-1] = atan2f(st[sp-1], b); break; }
+            case PatOp::Step:     { float b = st[--sp]; st[sp-1] = (b >= st[sp-1]) ? 1.0f : 0.0f; break; }
+            case PatOp::Clamp:    { float hi = st[--sp], lo = st[--sp]; st[sp-1] = fminf(hi, fmaxf(lo, st[sp-1])); break; }
+            case PatOp::Mix:      { float t = st[--sp], b = st[--sp]; st[sp-1] = st[sp-1] + (b - st[sp-1]) * t; break; }
+            case PatOp::Smoothstep: {
+                float xx = st[--sp], e1 = st[--sp], e0 = st[sp-1];
+                float tt = (e1 != e0) ? (xx - e0) / (e1 - e0) : 0.0f;
+                tt = fminf(1.0f, fmaxf(0.0f, tt));
+                st[sp-1] = tt * tt * (3.0f - 2.0f * tt);
+                break;
+            }
+            case PatOp::Noise:    { float zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoiseF(st[sp-1], yy, zz); break; }
+            case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
+                int id = (int)nd.a;
+                int na = povFnArity(id);
+                double args[POV_FN_MAX_ARGS];
+                for (int k = na - 1; k >= 0; --k) args[k] = (double)st[--sp];
+                st[sp++] = (float)povFnEval(id, args);
+                break;
+            }
+        }
+    }
+    return sp > 0 ? st[0] : 0.0f;
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
 // The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
@@ -5862,6 +6076,26 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
     DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
     PatNode*    d_fexpr  = fieldExprNodes.empty() ? nullptr : (PatNode*)keep(uploadVec(fieldExprNodes));
+    // FP32 mirrors of the (final, fully-appended) field pools for the sphere-trace
+    // march. Same order/offsets as the double pools; converted once here so the march
+    // never touches FP64 loads or F64->F32 cvts.
+    std::vector<DFieldNodeF> fieldNodesF(fieldNodes.size());
+    for (size_t i = 0; i < fieldNodes.size(); ++i) {
+        const DFieldNode& s = fieldNodes[i]; DFieldNodeF& d = fieldNodesF[i];
+        d.op = s.op;
+        for (int k = 0; k < 4; ++k) d.p[k] = (float)s.p[k];
+        for (int k = 0; k < 9; ++k) d.inv[k] = (float)s.inv[k];
+        d.tx = (float)s.tx; d.ty = (float)s.ty; d.tz = (float)s.tz;
+        d.scale = (float)s.scale;
+        d.exprOff = s.exprOff; d.exprN = s.exprN;
+    }
+    std::vector<PatNodeF> fieldExprNodesF(fieldExprNodes.size());
+    for (size_t i = 0; i < fieldExprNodes.size(); ++i) {
+        fieldExprNodesF[i].op = (int)fieldExprNodes[i].op;
+        fieldExprNodesF[i].a  = (float)fieldExprNodes[i].a;
+    }
+    DFieldNodeF* d_fnodesF = fieldNodesF.empty() ? nullptr : (DFieldNodeF*)keep(uploadVec(fieldNodesF));
+    PatNodeF*    d_fexprF  = fieldExprNodesF.empty() ? nullptr : (PatNodeF*)keep(uploadVec(fieldExprNodesF));
     DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
     // Two-level BVH pools (shared BLAS + instance table). Empty for scenes with no instances.
     DInstance*  d_inst   = dinst.empty()     ? nullptr : (DInstance*)keep(uploadVec(dinst));
@@ -5986,6 +6220,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
+    sc.fieldNodesF = d_fnodesF; sc.fieldExprNodesF = d_fexprF;
     sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
