@@ -34,6 +34,19 @@ chunk splits, thread count, banding, and `-resume` boundaries. This also fixed S
 Observable consequence: CPU renders of R/P/D/M/S produce different (correct-noise)
 realizations than v0.18.1; bench reference hashes rebased (`scraps/bench_cpu2.json`).
 
+### PERF NOTE (2026-07-22): GPU photon-gather CIE side-table tried and REVERTED — 11–14% *slower*; don't retry
+
+The mode-M CPU win (commit 9907034: precompute per-photon `cieX/Y/Z` once in
+`PhotonMap::build`, 3.65×) does NOT transfer to the GPU gather (`dPhotonGather`,
+src/render_cuda.cu). A device twin (`kPhotonCie` filling a 3-`Real`-per-photon
+side-buffer, reads bit-identical — sha1 matched the per-visit evaluation exactly)
+benched 96.7–99.1s vs 86.8s baseline on `M_gpu_cornell` (-n 3e7 -spp 64 -r 512,
+RTX 4090). Reason: with FTRACE_GPU_FP32 the CMF fit is 21 `expf` → SFU ops, nearly
+free, while the gather is memory-latency-bound on random photon reads — adding a
+second 12-byte random-access stream per visit only added traffic. Packing the CIE
+into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
+bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
+
 ### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the GPU forward megakernel (A/B/C + M-deposit) — GPU wavefront, GPU backward/BDPT, and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
