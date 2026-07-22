@@ -3178,6 +3178,34 @@ correctly on **both** backends.
 - **Proper fix (TODO):** profile the deposit/build with 2M vs 4M; find why host CPU
   scales super-linearly (likely an O(n^2) or lock-contended path, or grid cellSize
   degenerating so build buckets explode). Until fixed, cap flyby photons at ~2M.
+- **UPDATE 2026-07-21 — the "2M is fine" escape hatch does NOT hold at full film
+  resolution.** Re-tested on the real 600-frame `fly` curve (960×540, mode M) after
+  the Camera-film OOM fix: `-device gpu -n 2000000 -spp 4` (and `-spp 6`) **also
+  hangs** — GPU util sits at 0–6 %, working set ~1 GB, and **zero frames** are written
+  after 3–8 min (killed). The known-good "2M in ~2 min" measurement above used
+  `-r 320 180`; the hang is NOT purely a photon-count effect — it recurs at 2M once
+  the gather resolution is full. So the host-side build/download phase is the real
+  culprit regardless of photon count, and `-device gpu` is currently unusable for
+  this flyby at any practical resolution. The **CPU** shared path works but is slow
+  (~16 s/frame at 400k/spp3, 960×540 → ~3–5 h for 600 frames). `render_gallery_flyby.bat`
+  therefore forces `-device cpu`. Fixing the GPU host-side build is the unblock that
+  would make the flyby render in minutes instead of hours.
+
+## Mode-M shared render ignores `-window` — no live preview opens (2026-07-21)
+- **Symptom:** rendering the gallery `fly` curve in mode M with `-window` never opens
+  a Win32 live-preview window. Verified via `Get-Process ftrace` → `MainWindowHandle=0`
+  and empty `MainWindowTitle` for the entire render, on both the GPU and CPU paths,
+  even while the CPU path was actively writing frames to disk. (Single-camera forward
+  and mode-R/B/C renders DO open the window normally — this is specific to the
+  mode-M shared-photon-map multi-camera path, `runSharedPhotonMap` in `src/main.cpp`.)
+- **Impact:** violates the project's "always show the live preview so the user can
+  watch it converge" rule for exactly the long multi-frame renders where watching
+  matters most. The user cannot see a flyby converging; only the on-disk PNGs reveal
+  progress.
+- **Proper fix (TODO):** wire the shared-photon-map gather loop into the same
+  `LiveWindow` lifecycle the single-camera forward path uses — create/show the window
+  before the first gather and push each freshly-gathered frame's tone-mapped buffer to
+  it (mirroring the per-frame `writeFrame`), instead of only writing the PNG.
 
 ## Access-violation popup when closing the live-preview window (intermittent) — PARTIALLY ADDRESSED (2026-07-17)
 
