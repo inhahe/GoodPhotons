@@ -6822,24 +6822,50 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B, heroC);
     };
 
-    depositLaunch(nullptr, 0);              // count-only sizing pass
-    unsigned long long nDep = 0;
-    CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-
+    // Single-pass deposit: the old flow ran the WHOLE forward trace twice (a count-only
+    // sizing pass, then a fill pass). Instead, stage into a generously guessed buffer
+    // (2.5 deposits/photon + slack, clamped to half of free VRAM) and only rerun if the
+    // guess undershot — the atomic cursor keeps counting past the cap, so an overflow
+    // still yields the exact total and the rerun costs no more than the old flow did.
+    // Same seed every pass => identical deposits regardless of which path executes.
     pm.nEmitted = N;
-    if (nDep > 0) {
-        DPhoton* d_photons = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
-        depositLaunch(d_photons, nDep);     // fill pass (same seed => same nDep deposits)
-        unsigned long long nFill = 0;
-        CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        unsigned long long stored = (nFill < nDep) ? nFill : nDep;
-
+    unsigned long long cap = (unsigned long long)((double)N * 2.5) + (1ull << 20);
+    { size_t freeB = 0, totalB = 0;
+      if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+          unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
+          if (cap > fit) cap = fit; } }
+    DPhoton* d_photons = nullptr;
+    while (cap >= (1ull << 22) &&
+           cudaMalloc(&d_photons, (size_t)cap * sizeof(DPhoton)) != cudaSuccess) {
+        cudaGetLastError(); d_photons = nullptr; cap >>= 1;   // halve until it fits
+    }
+    unsigned long long nDep = 0;
+    if (d_photons) {
+        depositLaunch(d_photons, cap);      // optimistic fill against the guess
+        CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        if (nDep > cap) {                   // undershot: rerun once at the exact size
+            cudaFree(d_photons); d_photons = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+            depositLaunch(d_photons, nDep);
+            unsigned long long nFill = 0;
+            CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            if (nFill < nDep) nDep = nFill;
+        }
+    } else {
+        // Couldn't stage even a modest guess: fall back to the old two-pass flow.
+        depositLaunch(nullptr, 0);          // count-only sizing pass
+        CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        if (nDep > 0) {
+            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+            depositLaunch(d_photons, nDep); // fill pass (same seed => same nDep deposits)
+        }
+    }
+    if (nDep > 0 && d_photons) {
         // Download + convert to Photon in chunks (never a full host-side DPhoton copy).
-        pm.photons.resize((size_t)stored);
+        pm.photons.resize((size_t)nDep);
         std::vector<DPhoton> stage;
-        for (size_t off = 0; off < (size_t)stored; off += PM_CHUNK) {
-            size_t cnt = std::min(PM_CHUNK, (size_t)stored - off);
+        for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
             stage.resize(cnt);
             CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton),
                                   cudaMemcpyDeviceToHost));
@@ -6852,8 +6878,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 p.power = d.power; p.lambda = d.lambda;
             }
         }
-        cudaFree(d_photons);
     }
+    if (d_photons) cudaFree(d_photons);
     pm.build(radius);                       // host counting sort -> cell-contiguous runs
 
     double energy[5] = {0,0,0,0,0};
