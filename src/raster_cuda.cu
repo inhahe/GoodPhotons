@@ -766,22 +766,21 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     }
     padd(g_profAcc.download_ms, tp);
 
-    tp = ptick();
-    std::vector<Vec3> accum(N);
-    for (size_t i = 0; i < N; ++i)
-        accum[i] = Vec3{ (double)haccum[i].x, (double)haccum[i].y, (double)haccum[i].z };
-    padd(g_profAcc.convert_ms, tp);
-
+    // No float3->Vec3 conversion pass: the shared exposure/tonemap core converts each
+    // pixel on the fly (double(float) is exact, so output bytes are unchanged).
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
-    static const std::vector<float> emptyClear;   // unused when !seeThrough
     if (nThreads < 1) nThreads = 1;
     tp = ptick();
+    const float3* ha = haccum.data();
     std::vector<uint8_t> img =
-        raster::exposeAndEncode(accum, hzbuf, hemis, W, H, nThreads,
-                                expComp, autoExpose, lockAnchor,
-                                seeThrough, seeThrough ? hclear : emptyClear,
-                                seeThrough ? hmilk : emptyClear,
-                                kMilkColor);
+        raster::exposeAndEncodeT([ha](size_t i) {
+                                     return Vec3{ (double)ha[i].x, (double)ha[i].y, (double)ha[i].z };
+                                 },
+                                 hzbuf.data(), hemis.data(), W, H, nThreads,
+                                 expComp, autoExpose, lockAnchor,
+                                 seeThrough, seeThrough ? hclear.data() : nullptr,
+                                 seeThrough ? hmilk.data() : nullptr,
+                                 kMilkColor);
     padd(g_profAcc.expose_ms, tp);
     if (g_prof) ++g_profAcc.frames;
     return img;

@@ -539,11 +539,16 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
 // exposure/tonemap logic — the GPU path shades into an identical `accum`/`zbuf` on the
 // device, downloads them, and calls this, guaranteeing byte-identical exposure (including
 // a camera_path's shared `lockAnchor`) regardless of which backend produced the geometry.
-inline std::vector<uint8_t> exposeAndEncode(
-        const std::vector<Vec3>& accum, const std::vector<float>& zbuf,
-        const std::vector<uint8_t>& emis, int W, int H, int nThreads,
+// Template core: `pixel(i)` must return the exact double-precision Vec3 colour of pixel
+// i. The CPU path reads a Vec3 buffer directly; the GPU path converts its downloaded
+// float3 on the fly (double(float) is exact, so the maths — and the output bytes — are
+// identical to converting the whole buffer up front, without the extra pass or memory).
+template <class FetchVec3>
+inline std::vector<uint8_t> exposeAndEncodeT(
+        FetchVec3&& pixel, const float* zbuf, const uint8_t* emis,
+        int W, int H, int nThreads,
         double expComp, bool autoExpose, double* lockAnchor,
-        bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
+        bool seeThrough, const float* clearT, const float* milkT,
         const Vec3& milkColor) {
     const size_t N = (size_t)W * H;
     if (nThreads < 1) nThreads = 1;
@@ -566,23 +571,74 @@ inline std::vector<uint8_t> exposeAndEncode(
     // exposure (they just clip to white, as in the real render, instead of dragging the
     // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
     // bypasses this so aperture/power brightness differences survive into the preview.
+    //
+    // The collect runs banded across threads into a persistent scratch buffer: band ti
+    // fills [off[ti], off[ti]+cnt[ti]) with its qualifying pixels in row-major order, so
+    // the packed buffer holds the exact sequence a serial scan would produce and
+    // nth_element selects the identical 99th-percentile value.
     double eAuto = 1.0;
     if (autoExpose) {
         if (lockAnchor && *lockAnchor > 0.0) {
             eAuto = *lockAnchor;                    // reuse the path's locked anchor
         } else {
-            std::vector<double> lum; lum.reserve(N);
-            for (size_t i = 0; i < N; ++i) {
-                if (zbuf[i] <= 0.0f || emis[i]) continue;   // skip background + emitters
-                const Vec3& c = accum[i];
-                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
+            static thread_local std::vector<double> s_lum;   // persistent scratch (per calling thread)
+            size_t total = 0;
+            if (nThreads == 1) {
+                if (s_lum.size() < N) s_lum.resize(N);
+                double* dst = s_lum.data();
+                for (size_t i = 0; i < N; ++i) {
+                    if (zbuf[i] <= 0.0f || emis[i]) continue;   // skip background + emitters
+                    const Vec3 c = pixel(i);
+                    *dst++ = std::max({c.x, c.y, c.z, 0.0});
+                }
+                total = (size_t)(dst - s_lum.data());
+            } else {
+                const size_t bands = (size_t)nThreads;
+                const size_t chunk = (N + bands - 1) / bands;
+                std::vector<size_t> cnt(bands, 0), off(bands, 0);
+                {   // pass 1: count qualifying pixels per band (reads only zbuf/emis)
+                    std::vector<std::thread> pool;
+                    for (size_t ti = 0; ti < bands; ++ti) {
+                        size_t a = ti * chunk, b = std::min(N, a + chunk);
+                        if (a >= b) break;
+                        pool.emplace_back([&, ti, a, b] {
+                            size_t c = 0;
+                            for (size_t i = a; i < b; ++i)
+                                if (!(zbuf[i] <= 0.0f || emis[i])) ++c;
+                            cnt[ti] = c;
+                        });
+                    }
+                    for (auto& th : pool) th.join();
+                }
+                for (size_t ti = 0; ti < bands; ++ti) { off[ti] = total; total += cnt[ti]; }
+                if (s_lum.size() < total) s_lum.resize(total);
+                // NB: s_lum is thread_local, and lambdas do NOT capture thread-locals —
+                // each worker would resolve the name to its own empty instance. Hand the
+                // workers a plain pointer to *this* thread's buffer instead.
+                double* lumBase = s_lum.data();
+                {   // pass 2: pack each band's luminances at its offset
+                    std::vector<std::thread> pool;
+                    for (size_t ti = 0; ti < bands; ++ti) {
+                        size_t a = ti * chunk, b = std::min(N, a + chunk);
+                        if (a >= b) break;
+                        pool.emplace_back([&, ti, a, b] {
+                            double* dst = lumBase + off[ti];
+                            for (size_t i = a; i < b; ++i) {
+                                if (zbuf[i] <= 0.0f || emis[i]) continue;
+                                const Vec3 c = pixel(i);
+                                *dst++ = std::max({c.x, c.y, c.z, 0.0});
+                            }
+                        });
+                    }
+                    for (auto& th : pool) th.join();
+                }
             }
-            if (!lum.empty()) {
+            if (total > 0) {
                 // Only the 99th-percentile order statistic matters, so partition instead
                 // of a full sort (O(n) vs O(n log n)).
-                size_t k = (size_t)(0.99 * (lum.size() - 1));
-                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
-                double p99 = lum[k];
+                size_t k = (size_t)(0.99 * (total - 1));
+                std::nth_element(s_lum.begin(), s_lum.begin() + k, s_lum.begin() + total);
+                double p99 = s_lum[k];
                 eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
             }
             if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
@@ -609,7 +665,7 @@ inline std::vector<uint8_t> exposeAndEncode(
     std::vector<uint8_t> img(N * 3);
     parallelFor(N, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
-            Vec3 c = accum[i];
+            Vec3 c = pixel(i);
             if (zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
             if (seeThrough) {                          // composite clear glass (display-linear)
                 float T = clearT[i], mt = milkT[i];
@@ -622,6 +678,23 @@ inline std::vector<uint8_t> exposeAndEncode(
         }
     });
     return img;
+}
+
+// Vector-based wrapper (the original signature): the CPU rasterizer and any other
+// Vec3-buffer caller go through here; it simply adapts to the template core above.
+inline std::vector<uint8_t> exposeAndEncode(
+        const std::vector<Vec3>& accum, const std::vector<float>& zbuf,
+        const std::vector<uint8_t>& emis, int W, int H, int nThreads,
+        double expComp, bool autoExpose, double* lockAnchor,
+        bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
+        const Vec3& milkColor) {
+    const Vec3* A = accum.data();
+    return exposeAndEncodeT([A](size_t i) { return A[i]; },
+                            zbuf.data(), emis.data(), W, H, nThreads,
+                            expComp, autoExpose, lockAnchor, seeThrough,
+                            clearT.empty() ? nullptr : clearT.data(),
+                            milkT.empty()  ? nullptr : milkT.data(),
+                            milkColor);
 }
 
 // Render one camera to an 8-bit RGB image (row 0 = image top), multithreaded by
