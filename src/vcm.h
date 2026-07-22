@@ -107,6 +107,11 @@ struct LightVertex {
                           // reversed incident photon direction — used by connect AND merge)
     double beta = 0.0;    // geometric throughput carried here (single wavelength, no cie)
     float  lambda = 0.0f; // this subpath's wavelength (for the XYZ merge estimate)
+    // cieX/Y/Z(lambda) cached at store time: the merge loop reads a vertex once per
+    // NEARBY CAMERA VERTEX, so evaluating the three CIE Gaussian sums there repaid
+    // the cost per gather instead of once per vertex. Same call on the same stored
+    // float lambda -> bit-identical values.
+    double cx = 0.0, cy = 0.0, cz = 0.0;
     double dVCM = 0.0, dVC = 0.0, dVM = 0.0;
     int    matId = -1;
     const Material* mat = nullptr;
@@ -453,6 +458,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
             lv.beta = beta; lv.lambda = (float)lambda;
+            lv.cx = cieX(lv.lambda); lv.cy = cieY(lv.lambda); lv.cz = cieZ(lv.lambda);
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
             out.push_back(lv);
@@ -700,7 +706,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * Mis(camDirPdfW);
                     double wCamera = dVCM * ctx.misVcWeight + dVM * Mis(camRevPdfW);
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
-                    Vec3 cieL(cieX(lv.lambda), cieY(lv.lambda), cieZ(lv.lambda));
+                    Vec3 cieL(lv.cx, lv.cy, lv.cz);   // cached at store time (bit-identical)
                     mergeXYZ += cieL * (misW * fCam * lv.beta);
                 });
                 result += mergeXYZ * (beta * ctx.vmNorm);
