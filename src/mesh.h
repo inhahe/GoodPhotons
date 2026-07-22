@@ -8,8 +8,8 @@
 // (per-face materials, full .mtl) can replace this later.
 #pragma once
 #include <cstdio>
-#include <fstream>
-#include <sstream>
+#include <cstring>
+#include <charconv>
 #include <string>
 #include <vector>
 #include <functional>
@@ -20,42 +20,56 @@
 #include "geometry.h"
 #include "scene.h"
 
-// Parse the leading vertex index of an OBJ face token ("12", "12/3", "12/3/4",
-// "12//4"). OBJ indices are 1-based; negative means relative to the current end.
-inline int objVertexIndex(const std::string& tok, int vertexCount) {
-    int idx = std::atoi(tok.c_str());
-    if (idx > 0)  return idx - 1;
-    if (idx < 0)  return vertexCount + idx;   // relative
-    return -1;
+// --- Fast OBJ text scanning (Opt 8) -----------------------------------------
+// The loader slurps the whole file once and walks it with the helpers below
+// instead of constructing a per-line std::istringstream: stream construction,
+// locale-imbued num_get and per-token std::string allocation dominated load
+// time for real meshes (>1M lines). std::from_chars and stream `>>` are both
+// correctly rounded, so every parsed double is bit-identical to the old path.
+
+// Whitespace `>>` would skip inside a line ('\n' is consumed by the line split).
+inline bool objIsWs(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f';
+}
+inline const char* objSkipWs(const char* p, const char* e) {
+    while (p < e && objIsWs(*p)) ++p;
+    return p;
 }
 
-// Parse the texture-coordinate index (the 2nd field) of an OBJ face token
-// ("12/3", "12/3/4"). Returns -1 when the token carries no vt ("12" or "12//4").
-inline int objTexIndex(const std::string& tok, int texCount) {
-    auto p = tok.find('/');
-    if (p == std::string::npos) return -1;
-    auto q = tok.find('/', p + 1);
-    std::string field = (q == std::string::npos) ? tok.substr(p + 1)
-                                                  : tok.substr(p + 1, q - p - 1);
-    if (field.empty()) return -1;              // "12//4" has no vt
-    int idx = std::atoi(field.c_str());
-    if (idx > 0)  return idx - 1;
-    if (idx < 0)  return texCount + idx;       // relative
-    return -1;
+// One double with istream semantics: skip leading whitespace, accept a leading
+// '+' (std::from_chars doesn't), store 0.0 on failure (what a failed C++11
+// stream extraction assigns to its target).
+inline const char* objParseDouble(const char* p, const char* e, double& out, bool& ok) {
+    p = objSkipWs(p, e);
+    const char* q = (p < e && *p == '+') ? p + 1 : p;
+    auto r = std::from_chars(q, e, out);
+    if (r.ec != std::errc{}) { out = 0.0; ok = false; return p; }
+    return r.ptr;
 }
 
-// Parse the normal index (the 3rd field) of an OBJ face token ("12/3/4",
-// "12//4"). Returns -1 when the token carries no vn ("12" or "12/3").
-inline int objNormalIndex(const std::string& tok, int normCount) {
-    auto p = tok.find('/');
-    if (p == std::string::npos) return -1;
-    auto q = tok.find('/', p + 1);
-    if (q == std::string::npos) return -1;     // "12/3" has no vn
-    std::string field = tok.substr(q + 1);
-    if (field.empty()) return -1;
-    int idx = std::atoi(field.c_str());
-    if (idx > 0)  return idx - 1;
-    if (idx < 0)  return normCount + idx;      // relative
+// Up to n whitespace-separated doubles, stopping at the first failure — matching
+// chained `ss >> a >> b >> c`, where failbit halts the later extractions (every
+// call site pre-zeroes the outputs, and the failing slot itself reads 0).
+inline void objParseDoubles(const char* p, const char* e, double* out, int n) {
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) p = objParseDouble(p, e, out[i], ok);
+}
+
+// std::atoi on a bounded range: optional sign, decimal digits, stop at the first
+// non-digit (an OBJ face field puts '/' or the token end there); no digits -> 0.
+inline int objParseInt(const char* p, const char* e) {
+    bool neg = false;
+    if (p < e && (*p == '+' || *p == '-')) neg = (*p++ == '-');
+    long long v = 0;
+    while (p < e && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    return (int)(neg ? -v : v);
+}
+
+// Resolve a raw OBJ index against a running element count: 1-based when
+// positive, relative-to-end when negative ("-1" = last), 0/absent -> -1.
+inline int objResolveIndex(int raw, int count) {
+    if (raw > 0) return raw - 1;
+    if (raw < 0) return count + raw;
     return -1;
 }
 
@@ -132,15 +146,23 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
                    bool loadUV = false, const MtlResolver* matResolver = nullptr,
                    UvProjection uvProj = UvProjection::None, int uvAxis = 1,
                    double creaseAngleDeg = -1.0) {
-    std::ifstream f(path);
-    if (!f) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
+    // Slurp the whole file (binary; CRLF is handled at the line split below, so
+    // the parsed lines are exactly what text-mode getline used to produce).
+    std::FILE* fp = std::fopen(path, "rb");
+    if (!fp) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
+    std::string buf;
+    {
+        char tmp[1 << 16];
+        size_t got;
+        while ((got = std::fread(tmp, 1, sizeof tmp, fp)) > 0) buf.append(tmp, got);
+    }
+    std::fclose(fp);
 
     std::vector<Vec3> verts;
     std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
     std::vector<Vec3> normals;     // per `vn`, already in WORLD space (inv-transpose)
     int curMat = matId;            // active material (switched by `usemtl` when resolving)
     int added = 0;
-    std::string line;
     // For a procedural UV projection we need the whole mesh AABB, so record each
     // added triangle's source vertex indices and fill UVs in a second pass. Crease
     // smoothing needs the same per-tri vertex indices, so record them for either.
@@ -149,40 +171,67 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
     const bool recordVI = proceduralUV || wantSmooth;
     std::vector<std::array<int, 3>> triVI;   // vertex indices per added tri
     size_t triStart = s.tris.size();
-    while (std::getline(f, line)) {
-        if (line.size() < 2) continue;
-        if (line[0] == 'v' && line[1] == ' ') {
-            std::istringstream ss(line.substr(2));
-            Vec3 v; ss >> v.x >> v.y >> v.z;
-            verts.push_back(xf.apply(v));
-        } else if (loadUV && line[0] == 'v' && line[1] == 't') {
-            std::istringstream ss(line.substr(2));
-            double u = 0, v = 0; ss >> u >> v;
-            texcoords.push_back(Vec3{u, v, 0});
-        } else if (line[0] == 'v' && line[1] == 'n') {
+    std::vector<int> fIdx, fTidx, fNidx;     // per-face scratch (capacity reused)
+    const char* p = buf.data();
+    const char* const bend = p + buf.size();
+    while (p < bend) {
+        const char* nl = static_cast<const char*>(std::memchr(p, '\n', (size_t)(bend - p)));
+        const char* ls = p;                   // line = [ls, le)
+        const char* le = nl ? nl : bend;
+        p = nl ? nl + 1 : bend;
+        if (le > ls && le[-1] == '\r') --le;  // CRLF: what text-mode getline stripped
+        if (le - ls < 2) continue;
+        const char c0 = ls[0], c1 = ls[1];
+        if (c0 == 'v' && c1 == ' ') {
+            double d[3] = {0, 0, 0};
+            objParseDoubles(ls + 2, le, d, 3);
+            verts.push_back(xf.apply(Vec3{d[0], d[1], d[2]}));
+        } else if (loadUV && c0 == 'v' && c1 == 't') {
+            double d[2] = {0, 0};
+            objParseDoubles(ls + 2, le, d, 2);
+            texcoords.push_back(Vec3{d[0], d[1], 0});
+        } else if (c0 == 'v' && c1 == 'n') {
             // Smooth shading normal: transform object->world by the inverse-transpose
             // of the mesh transform's linear part, then normalize (renormalized again
             // in finalize()). Stored world-space so it feeds Tri.n{0,1,2} directly.
-            std::istringstream ss(line.substr(2));
-            Vec3 vn; ss >> vn.x >> vn.y >> vn.z;
-            Vec3 wn = xf.applyNormal(vn);
+            double d[3] = {0, 0, 0};
+            objParseDoubles(ls + 2, le, d, 3);
+            Vec3 wn = xf.applyNormal(Vec3{d[0], d[1], d[2]});
             double l = std::sqrt(dot(wn, wn));
             normals.push_back(l > 1e-18 ? wn * (1.0 / l) : Vec3{0, 0, 0});
-        } else if (matResolver && line.rfind("usemtl", 0) == 0) {
-            std::istringstream ss(line.substr(6));
-            std::string name; ss >> name;
+        } else if (matResolver && le - ls >= 6 && std::memcmp(ls, "usemtl", 6) == 0) {
+            const char* q = objSkipWs(ls + 6, le);
+            const char* qe = q;
+            while (qe < le && !objIsWs(*qe)) ++qe;
+            std::string name(q, qe);
             int resolved = name.empty() ? -1 : (*matResolver)(name);
             curMat = (resolved >= 0) ? resolved : matId;
-        } else if (line[0] == 'f' && line[1] == ' ') {
-            std::istringstream ss(line.substr(2));
-            std::vector<int> idx, tidx, nidx;
-            std::string tok;
-            while (ss >> tok) {
-                int vi = objVertexIndex(tok, (int)verts.size());
+        } else if (c0 == 'f' && c1 == ' ') {
+            fIdx.clear(); fTidx.clear(); fNidx.clear();
+            const char* q = ls + 2;
+            for (;;) {
+                q = objSkipWs(q, le);
+                if (q >= le) break;
+                const char* t = q;                        // token = [t, q)
+                while (q < le && !objIsWs(*q)) ++q;
+                int vi = objResolveIndex(objParseInt(t, q), (int)verts.size());
                 if (vi < 0 || vi >= (int)verts.size()) continue;
-                idx.push_back(vi);
-                tidx.push_back(loadUV ? objTexIndex(tok, (int)texcoords.size()) : -1);
-                nidx.push_back(objNormalIndex(tok, (int)normals.size()));
+                // Fields: "v", "v/vt", "v/vt/vn", "v//vn".
+                int ti = -1, ni = -1;
+                const char* s1 = t;
+                while (s1 < q && *s1 != '/') ++s1;        // 1st '/'
+                if (s1 < q) {
+                    const char* f2 = s1 + 1;
+                    const char* s2 = f2;
+                    while (s2 < q && *s2 != '/') ++s2;    // 2nd '/' (or token end)
+                    if (loadUV && s2 > f2)                // non-empty vt field
+                        ti = objResolveIndex(objParseInt(f2, s2), (int)texcoords.size());
+                    if (s2 < q && s2 + 1 < q)             // non-empty vn field
+                        ni = objResolveIndex(objParseInt(s2 + 1, q), (int)normals.size());
+                }
+                fIdx.push_back(vi);
+                fTidx.push_back(ti);
+                fNidx.push_back(ni);
             }
             // Fan-triangulate the polygon (0, k, k+1).
             auto uvAt = [&](int ti) -> Vec3 {
@@ -191,16 +240,16 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
             auto nAt = [&](int ni) -> Vec3 {
                 return (ni >= 0 && ni < (int)normals.size()) ? normals[ni] : Vec3{0, 0, 0};
             };
-            for (size_t k = 1; k + 1 < idx.size(); ++k) {
-                Tri t{verts[idx[0]], verts[idx[k]], verts[idx[k + 1]], curMat, -1, {}};
+            for (size_t k = 1; k + 1 < fIdx.size(); ++k) {
+                Tri t{verts[fIdx[0]], verts[fIdx[k]], verts[fIdx[k + 1]], curMat, -1, {}};
                 if (loadUV) {
-                    t.uv0 = uvAt(tidx[0]); t.uv1 = uvAt(tidx[k]); t.uv2 = uvAt(tidx[k + 1]);
+                    t.uv0 = uvAt(fTidx[0]); t.uv1 = uvAt(fTidx[k]); t.uv2 = uvAt(fTidx[k + 1]);
                 }
                 // Per-vertex shading normals (zero => finalize() falls back to gn,
                 // preserving exact flat-shading for meshes without `vn`).
-                t.n0 = nAt(nidx[0]); t.n1 = nAt(nidx[k]); t.n2 = nAt(nidx[k + 1]);
+                t.n0 = nAt(fNidx[0]); t.n1 = nAt(fNidx[k]); t.n2 = nAt(fNidx[k + 1]);
                 s.tris.push_back(t);
-                if (recordVI) triVI.push_back({idx[0], idx[k], idx[k + 1]});
+                if (recordVI) triVI.push_back({fIdx[0], fIdx[k], fIdx[k + 1]});
                 ++added;
             }
         }

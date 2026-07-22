@@ -28,6 +28,20 @@ from .signals.vector import VecSignal, Vecish
 from .data import PointPath, TrackedPath, Grid, Scatter
 
 
+def _local_query(dataset, q: VecSignal) -> VecSignal:
+    """If ``dataset`` carries a placement Transform, inverse-map the world-space
+    query ``q`` into the dataset's local frame; otherwise return ``q`` unchanged.
+
+    This is what decouples a sampling curve from a data object: the curve stays in
+    world space while the dataset can be moved / resized / skewed, and the field
+    reads whatever local coordinate the world point maps to (see
+    :meth:`loom.transform.Transform.inverse_apply`)."""
+    xf = getattr(dataset, "xf", None)
+    if xf is not None and not xf.is_identity():
+        return xf.inverse_apply(q)
+    return q
+
+
 # ---------------------------------------------------------------------------
 # 1. LoopCurve — seamless closed curve (scribbles3), N-D
 # ---------------------------------------------------------------------------
@@ -467,6 +481,7 @@ class GridField(Signal):
         if grid.is_vector:
             raise TypeError("GridField requires scalar grid values; "
                             "use VecGridField for a vector-valued Grid")
+        self.q = _local_query(grid, self.q)
         self._cubic = _parse_grid_interp(interp)
         self._outside = _parse_on_outside(on_outside)
 
@@ -502,6 +517,7 @@ class VecGridField(VecSignal):
         if not grid.is_vector:
             raise TypeError("VecGridField requires a vector-valued Grid; "
                             "use GridField for a scalar Grid")
+        self.q = _local_query(grid, self.q)
         self._cubic = _parse_grid_interp(interp)
         self._outside = _parse_on_outside(on_outside)
         self._vdim = grid.value_dim
@@ -557,6 +573,7 @@ class ScatterField(Signal):
         if scatter.is_vector:
             raise TypeError("ScatterField requires scalar values; "
                             "use VecScatterField for a vector-valued Scatter")
+        self.q = _local_query(scatter, self.q)
         self.power = float(power)
         self.eps = float(eps)
 
@@ -593,6 +610,7 @@ class VecScatterField(VecSignal):
         if not scatter.is_vector:
             raise TypeError("VecScatterField requires a vector-valued Scatter; "
                             "use ScatterField for scalar values")
+        self.q = _local_query(scatter, self.q)
         self.power = float(power)
         self.eps = float(eps)
         self._vdim = scatter.value_dim
@@ -796,6 +814,7 @@ class RbfScatterField(Signal):
         if scatter.is_vector:
             raise TypeError("RbfScatterField requires scalar values; "
                             "use VecRbfScatterField for a vector-valued Scatter")
+        self.q = _local_query(scatter, self.q)
         self._eng = _RbfEngine(scatter, kernel, epsilon, smoothing,
                                degree, neighbors, on_outside)
 
@@ -827,6 +846,7 @@ class VecRbfScatterField(VecSignal):
         if not scatter.is_vector:
             raise TypeError("VecRbfScatterField requires a vector-valued Scatter; "
                             "use RbfScatterField for scalar values")
+        self.q = _local_query(scatter, self.q)
         self._eng = _RbfEngine(scatter, kernel, epsilon, smoothing,
                                degree, neighbors, on_outside)
         self._vdim = scatter.value_dim

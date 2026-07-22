@@ -12,13 +12,15 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 ## Highlights
 
-- **Spectral transport** — single-wavelength photons over a configurable band
+- **Spectral transport** — continuous per-photon wavelengths over a configurable band
   (e.g. `spectral 360 830 1`); per-wavelength refraction gives dispersion and
-  chromatic aberration with no extra code. Carrying **one wavelength per photon**
-  — rather than a bundled RGB triple or wavelength-multiplexed packet, as most
-  forward light tracers do — means dispersive **caustics** (light focused through
-  a prism, a lens, or a glass of water) split into true spectral colour instead of
-  smearing an averaged RGB, for more physically realistic focusing.
+  chromatic aberration with no extra code. On the **CPU** the tracers use
+  **hero-wavelength sampling** (4 stratified λ share one BVH walk, cutting colour
+  noise ~0.77×), collapsing to a **single continuous λ** the moment dispersion
+  matters — so dispersive **caustics** (light focused through a prism, a lens, or a
+  glass of water) still split into true spectral colour instead of smearing an
+  averaged RGB, for more physically realistic focusing. (`kHeroC=1` reverts to one
+  λ per photon, bit-identically.)
 - **Forward *and* backward** engines that validate each other (mode `V` reports
   the residual between them).
 - **Realistic cameras** — from a simple pinhole to a **physical multi-element
@@ -50,6 +52,18 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   gather every frame of a camera flythrough (or every camera of a multi-camera
   render), so an *N*-frame flyby costs roughly one render's worth of photons instead
   of *N* — far more efficient than re-tracing the scene per frame.
+- **Decorrelated volumetric flybys (`-beams`, photon beams)** — the shared forward
+  mode-`B` pass normally splats one photon realisation to every camera, so a rainbow /
+  fogbow / glory (view-dependent **single** scattering) comes out with the *same*
+  frozen speckle welded into every frame of a flyby. Adding **`-beams`** (alias
+  `-photonbeams`) switches to a single-scattering **long-beam** estimator: the photon
+  crosses the medium straight (deposited once), and **each camera independently draws
+  its own in-scatter point** toward its own eye. Result: the *same* mean bow with
+  **independent per-frame noise** — the "fast AND best" combination (≈1× photon cost
+  across the flyby, correct per-view angle, clean non-frozen grain). It deliberately
+  drops the multiple-scatter haze wash, so the bow is actually *crisper* than the
+  shared baseline. CPU-only for now; forces `-device cpu`. Rainbows/fogbows/glories are
+  single scatter, so this loses nothing that matters for them.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
@@ -109,6 +123,9 @@ ftrace -scene cornell -n 200000000 -r 512 -o cornell.png
 # Render an FTSL scene file
 ftrace -in scenes/cornell.ftsl -n 200000000 -o out.png
 
+# Quick-view a bare mesh — auto-lit, auto-framed, live raster preview window
+ftrace cloud1.glb            # also .obj/.gltf/.fbx/.stl/.ply; drag-drop / double-click works
+
 # Physical-lens camera demo (depth of field from real optics; forces mode R)
 ftrace -in scenes/realcam.ftsl -n 6000000 -o realcam.png
 
@@ -119,7 +136,21 @@ ftrace -in scenes/group.ftsl -time 120 -preview -o group.png
 Run `ftrace -h` (or `--help`) for a grouped summary of the common flags. An
 unrecognized `-flag` (e.g. a typo) is a hard error — ftrace prints
 `unknown option '…'` and exits non-zero rather than silently falling back to the
-default demo render.
+default demo render. Likewise a bare positional argument that looks like a file
+but isn't a recognized scene or mesh (e.g. `ftrace foo.xyz`) is a hard error, not
+a silent fall-through to the demo scene.
+
+> **Quick mesh viewer.** A bare positional **mesh** path — `ftrace model.glb`
+> (also `.obj` / `.gltf` / `.fbx` / `.stl` / `.ply`) — wraps the mesh in a
+> synthesized, auto-lit scene (a neutral clay fallback material under a soft uniform
+> environment; glTF/GLB primitives keep their own imported materials) and opens it in
+> an **auto-framed live raster preview window** — the same interactive fly-camera as a
+> double-clicked `.ftsl`. The camera is aimed at the mesh's bounding sphere from a
+> three-quarter front-high angle and pulled back so the whole model fits the frame, so
+> you never have to hand-place a camera just to look at a model. Presentation flags
+> (`-window`, `-o`, `-r`, `-camera`, `-view`) keep it a preview; to render the same
+> auto-lit scene with real light transport instead, pass a transport flag —
+> `ftrace model.glb -mode D -n 100000000 -o png/model.png`.
 
 ---
 
@@ -268,8 +299,8 @@ paths they can capture at all**.
 > | **move the mouse over the window** | **steer** (joystick/rate look) — the cursor's offset from the window centre sets a **turn rate**: rest it near the centre (a neutral dead zone) and the view holds still so you can look at the scene; push it toward an edge and the view keeps turning that way (left/right = yaw, up/down = pitch, clamped just shy of straight up/down) for as long as you hold it there, so you can look a full circle. Where you look is where you fly. The pointer stays **visible** and free; steering only happens while the cursor is inside the window and stops the moment it leaves. |
 > | **`Space`** or **`+`** (held) | **fly forward** continuously along the view direction — one fixed **step per rendered frame** (see note below) |
 > | **`Shift`** or **`-`** (held) | **fly backward** — the exact opposite of where you're looking |
-> | **mouse wheel** | **dolly** one step forward (up) / back (down) per notch — a discrete, fully-rendered nudge for precise positioning (can't overshoot into geometry) |
-> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (starts at 2 % of the scene radius, clamped to a sane band) |
+> | **mouse wheel** | **dolly** forward (up) / back (down) — a discrete, fully-rendered move per notch (can't overshoot into geometry). Each notch travels several fly-steps, so it's a quick reposition; the held-key travel is the fine cruise |
+> | **`Ctrl` + mouse wheel** | change the **step size**: up = bigger steps, down = smaller (held-key step starts at 2 % of the scene radius, clamped to a sane band; the wheel dolly scales with it) |
 > | `C` | cycle **wall collision**: `slide` → `stop` → `noclip` (see note below) |
 > | `0` (or `Home`) | reset to the authored camera |
 > | `P` | print a paste-ready `camera "cam" { eye … look_at … up … fov_y … }` block |
@@ -389,9 +420,12 @@ paths they can capture at all**.
 > acts like a joystick whose distance from the window centre sets how fast the view
 > turns (centre = a dead zone that holds still so you can see the scene; toward an edge
 > = keep turning that way), and moving the pointer off the window (to the title bar,
-> another app, etc.) stops the turn entirely. Because the turn is applied **per rendered
-> frame** (like the fly motion), a heavy scene turns in careful steps you actually see
-> rather than spinning past. The window title shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
+> another app, etc.) stops the turn entirely. The turn rate is **wall-clock-based**
+> (radians per second, integrated by the frame time), so steering feels the same
+> whether a scene raster-previews at 20 fps or 300 — a light model won't spin off-screen
+> at the slightest cursor offset. (Free *translation* stays feedback-locked per frame so
+> you can't fly through geometry between two frames you never saw.) The window title
+> shows the live `eye(…) dir(…)` as you move. Frames re-rasterize at
 > the live window's resolution — drag a corner to make the preview smaller (and
 > snappier) or larger (and sharper); the aspect ratio and the readout are
 > resolution-independent, so this only trades preview sharpness for speed while you
@@ -865,6 +899,15 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   `sigma` in nm. Purples/magentas (no real dominant wavelength) become a two-line
   violet+red mix. Meant for **lights** (`spd rgbline 0 0 1`); a reflectance has no
   single wavelength, but the form is accepted anywhere a spectrum is.
+- **`rgbillum r g b`** (also `hsvillum …`, `hslillum …`) — the Jakob–Hanika
+  *illuminant* upsample: the **emitter analogue of `rgb`**. Where `rgb` fits a bounded
+  (0,1) reflectance under D65, `rgbillum` fits a smooth, full-spectrum **emission** SPD
+  — modelled as `A·sigmoid(quadratic)` so the magnitude is unbounded — whose integral
+  under the *bare* CIE observer reproduces the colour exactly (round-trips to <0.001 for
+  every colour, including saturated primaries and white). Unlike `rgbline` this is a
+  broadband source, not a monochromatic spike, so it reads as a natural coloured light
+  rather than a laser line. Meant for **lights** (`spd rgbillum 1 0.6 0.2`); accepted
+  anywhere a spectrum is.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
   (piecewise-linear).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
@@ -925,7 +968,25 @@ second:**
   saturated lights, fluorescence: everything RGB's three channels smear. *Every*
   full-spectrum renderer below is as accurate here as ftrace, and the hero-wavelength
   ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
-  per path instead of our one. **We claim no edge on this axis.**
+  per path. **We claim no edge on this axis** — and ftrace now closes the noise gap on
+  the **CPU** tracers — the **backward reference tracer (`-mode R`)**, the
+  **forward light tracers (`-mode A/B/C`)**, and the **photon-mapping modes (`-mode M/S`)** —
+  plus the **GPU forward megakernel** (modes `A/B/C` and the `M` photon-map deposit)
+  all use hero-wavelength sampling (a hero λ plus 3 stratified secondaries riding one
+  shared BVH walk, secondaries de-hero'd at the first dispersive interface — Wilkie et
+  al. 2014 / PBRT-v4 `TerminateSecondary`), so they reach a given colour-noise level in
+  fewer samples (measured ~0.77× chroma-noise RMS at equal photons in the light tracers,
+  ~0.87× in the photon map, luma unchanged) while dispersion stays bit-for-bit intact.
+  For photon mapping each traced path deposits all its live wavelengths as per-λ photon
+  records, so total stored energy is unchanged. Hero collapses to a single continuous
+  wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
+  caustic splitting (below) rather than trading it away. Still single-λ **by design or
+  pending work**: the **GPU wavefront** backend (hero forces the megakernel), the **GPU
+  backward / BDPT megakernels**, **BDPT (`-mode D`)**, and **VCM/UPS (`-mode U`)** — these
+  carry one λ per photon for now (hero for U is planned; see `known-issues.md`). The bundle
+  size is runtime-configurable with **`-heroc N`** (default 4, range 1–8); `-heroc 1` turns
+  hero off, reducing every hero tracer (CPU and the GPU forward megakernel) bit-identically
+  to the classic single-λ estimator.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.
@@ -935,7 +996,7 @@ see sources below):
 
 | Renderer (engine) | Default colour | Spectral mode | Per-path/photon carrier |
 |---|---|---|---|
-| **ftrace (this — forward photon)** | spectral | always | **1 λ per photon** — true dispersive caustics |
+| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C, R & photon-map M/S); 1 λ on GPU / BDPT / VCM (U)** — true dispersive caustics either way |
 | PBRT-v3 (SPPM photon map) | RGB | compile-time (`SampledSpectrum`, ~30 bins @ 10 nm) | **co-sampled: all bins on one photon** — no split |
 | Mitsuba 0.x (`ptracer`/`ppm`/`sppm`) | RGB | compile-time (`SPECTRUM_SAMPLES`, e.g. 15–30) | **co-sampled: all bins per sample** — no split |
 | PBRT-v4 | spectral | always | hero wavelength, 4 λ/path (default, recompilable) |
@@ -1042,11 +1103,18 @@ Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
-`group { translate … rotate … scale … <children> }` composes transform
+`group { translate … rotate … scale … shear … <children> }` composes transform
 hierarchies (baked to world space at load). Children may be `sphere`, `quad`,
 `triangle`, `mesh`, `mesh_instance`, `isosurface`, `light`, or nested `group`s —
 so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap an
-isosurface CSG/implicit just as easily as a mesh.
+isosurface CSG/implicit just as easily as a mesh. `shear <a> <b> <c>` adds a
+unit-diagonal upper-triangular skew (`x' = x + a·y + b·z`, `y' = y + c·z`) to the
+group's affine, applied in the group's local frame (innermost, before scale/rotate);
+it lets quad/tri/mesh geometry be sheared into parallelograms. A `sphere` under a
+**non-uniform scale or shear** (which the analytic ray-sphere can't represent) is
+**automatically tessellated** into a smooth-normal ellipsoid / sheared quadric mesh
+at load — so squashed and skewed spheres just work; a uniform-scaled sphere keeps
+the fast analytic path.
 
 **Instancing.** `mesh_asset "name" { file … material … }` loads a mesh once into
 its local space; `mesh_instance { of "name"  translate … rotate … scale …
@@ -1938,6 +2006,8 @@ add-on), this doubles as a Blender → FTSL path.
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
+| `-heroc <N>` | Hero-wavelength bundle size on the **CPU** spectral tracers (modes `A`/`B`/`C`, `R`, and photon-map `M`/`S`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). GPU / BDPT (`D`) / VCM (`U`) ignore it (still single-λ) |
+| `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). **CPU-only** (forces `-device cpu`); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
 | `-t <threads>` | CPU thread count |
@@ -1981,6 +2051,7 @@ alone can't restore, so they are not disk-resumable.
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
+| `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
 | `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. |

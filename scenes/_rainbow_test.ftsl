@@ -1,0 +1,52 @@
+# Rainbow prototype — validate that ftrace's physical Airy-droplet rainbow phase
+# (src/rainbow.h, `phase rainbow`) produces a real, view-dependent bow, so we can
+# judge whether it holds up on a moving-camera flyby.
+#
+# Geometry of a rainbow: a near-parallel "sun" shines in ~the viewing direction; light
+# backscatters at the ~138 deg Descartes angle (42 deg off the antisolar point) inside
+# the water-droplet fog and returns to the eye as a coloured arc. The bow is anchored to
+# the antisolar DIRECTION (sun->viewer), i.e. to optical infinity — so it stays put in
+# angle while the foreground slides past, exactly like a real rainbow.
+scene { units meters  spectral 360 830 1 }
+
+material "floor" { type diffuse  reflect rgb 0.22 0.24 0.28 }
+material "wall"  { type diffuse  reflect rgb 0.30 0.32 0.36 }
+# Fixed world-space marker posts, so a second (panned) camera shows the bow shifting
+# RELATIVE to these — proving it's anchored to the viewer, not welded to the world.
+material "postR" { type diffuse  reflect rgb 0.70 0.15 0.15 }
+material "postB" { type diffuse  reflect rgb 0.15 0.25 0.70 }
+
+quad { origin -6 0 -8   u 16 0 0   v 0 0 14   material floor }   # ground plane
+quad { origin -6 0 0.6  u 16 0 0   v 0 6 0     material wall }   # backdrop behind the fog
+
+# Fixed foreground marker balls (just in front of the fog) — crisp world-space parallax
+# references. Under a lateral camera dolly THESE slide across the frame while the bow
+# (anchored to the antisolar direction at optical infinity) stays put: the proof.
+sphere { center 1.05 0.85 4.05  radius 0.28  material postR }
+sphere { center 2.95 0.85 4.05  radius 0.28  material postB }
+
+# --- Water-droplet fog: the rainbow lives in its angular phase function. Keep it
+# optically thin-ish (single scattering dominant) so the bow stays crisp. ----------
+medium {
+    sigma_t 0.6   albedo 0.98
+    bounds { min -1 0 1   max 5 4 4.2 }
+    phase rainbow { droplet_um 500 }   # 0.5 mm rain -> sharp primary+secondary bow
+}
+
+# --- The "sun": a wide COLLIMATED (parallel-ray) beam shining in the viewing
+# direction (-z). group `scale` widens the default 3 cm pencil to 0.03*scale = 7.5 m so
+# it floods the ENTIRE fog volume; parallel rays keep the bow sharp and every forward
+# photon is useful. The emitter quad grows from its corner along +x and -y (onb of the
+# -z beam), so to CENTER the 7.5 m square on (x=2, y=2) the corner sits at
+# (2-3.75, 2+3.75) = (-1.75, 5.75). Just behind the camera so backscatter returns. ----
+group { translate -1.75 5.75 5.6   scale 250
+    light collimated { origin 0 0 0   dir 0 0 -1   spd blackbody 5800   lumens 900000 }
+}
+
+# Centered view: antisolar point straight ahead (-z), so with a wide fov the ~42 deg
+# bow sits well inside the frame as a near-full ring around screen center.
+camera "cam" {
+    eye 3.4 1.5 5.3   look_at 3.4 1.5 1.0   up 0 1 0
+    fov_y 100   mode B
+    film { res 320 240   exposure 11 }
+}

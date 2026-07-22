@@ -24,7 +24,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <utility>
+#include <thread>
 #include "linalg.h"
+#include "color.h"
 
 // One deposited photon: where light landed, where it came from, and how much power it
 // carried at what wavelength. `wi` (incident direction, pointing back toward the source
@@ -43,6 +45,14 @@ struct Photon {
 // pointer-free layout (counting sort) that ports directly to the GPU.
 struct PhotonMap {
     std::vector<Photon> photons;   // reordered to cell order by build()
+    // Per-photon CIE XYZ response at photons[i].lambda, filled by build(). The gather
+    // estimate weights every photon by cie(lambda_p); evaluating the analytic CIE
+    // multi-Gaussians (several exp() each) per photon PER QUERY dominated mode-M render
+    // time (~74% profiled), so build() computes each photon's triple exactly once and
+    // queries index cie[k] instead. The stored values are the exact same doubles the
+    // direct call produced (same function, same float->double promoted lambda), so
+    // gather results are bit-identical.
+    std::vector<Vec3>   cie;
     long long nEmitted = 0;        // total photons EMITTED in the pass (normalization)
     double    radius   = 0.02;     // gather radius (world units); == grid cell size
 
@@ -72,7 +82,7 @@ struct PhotonMap {
     void build(double r) {
         radius = r;
         cellSize = (r > 0.0) ? r : 1e-6;
-        if (photons.empty()) { nx = ny = nz = 1; cellStart.assign(2, 0); return; }
+        if (photons.empty()) { nx = ny = nz = 1; cellStart.assign(2, 0); cie.clear(); return; }
 
         Vec3 mn = photons[0].pos, mx = photons[0].pos;
         for (const Photon& ph : photons) {
@@ -105,9 +115,31 @@ struct PhotonMap {
         for (size_t i = 0; i < photons.size(); ++i)
             sorted[cursor[cellOf[i]]++] = photons[i];
         photons.swap(sorted);
+
+        // Precompute each (sorted) photon's CIE XYZ triple once — see `cie` above.
+        // Embarrassingly parallel and worth threading: a large map costs several exp()
+        // per photon, which would otherwise serialize ~1s+ onto the build.
+        const size_t nPh = photons.size();
+        cie.resize(nPh);
+        auto fill = [&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                const double l = photons[i].lambda;
+                cie[i] = Vec3{cieX(l), cieY(l), cieZ(l)};
+            }
+        };
+        unsigned nT = std::max(1u, std::thread::hardware_concurrency());
+        if (nPh < 65536 || nT == 1) {
+            fill(0, nPh);
+        } else {
+            std::vector<std::thread> pool;
+            for (unsigned t = 0; t < nT; ++t)
+                pool.emplace_back(fill, nPh * t / nT, nPh * (t + 1) / nT);
+            for (auto& th : pool) th.join();
+        }
     }
 
-    // Invoke fn(const Photon&, double dist2) for every photon within `radius` of p.
+    // Invoke fn(const Photon&, double dist2, int index) for every photon within
+    // `radius` of p. `index` addresses the photon's row in photons[] / cie[].
     template <class F>
     void query(const Vec3& p, F&& fn) const { queryR(p, radius, std::forward<F>(fn)); }
 
@@ -131,7 +163,7 @@ struct PhotonMap {
                         const Photon& ph = photons[k];
                         Vec3 d = p - ph.pos;
                         double d2 = dot(d, d);
-                        if (d2 <= r2) fn(ph, d2);
+                        if (d2 <= r2) fn(ph, d2, k);
                     }
                 }
             }

@@ -28,9 +28,10 @@ from .interp import (
 from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
     Scene, Material, Texture, skin, ProcTexture, func_skin, Sphere, Beads, Raw,
-    Light, Camera, CameraCurve, Element,
+    Light, Camera, CameraCurve, Element, Group,
     Pattern, SweptMesh, IsoMesh, ribbon, tube, blob, fan, Volume,
 )
+from .transform import Transform
 from .mcubes import mesh_field
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
@@ -85,7 +86,7 @@ __all__ = [
     "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
     "Scene", "Material", "Texture", "skin", "ProcTexture", "func_skin",
     "Sphere", "Beads", "Raw", "Light",
-    "Camera", "CameraCurve", "Element",
+    "Camera", "CameraCurve", "Element", "Group", "Transform",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
     "waves", "checker", "rings", "blobs",
     "Record", "RecordChannel", "RecordStop",

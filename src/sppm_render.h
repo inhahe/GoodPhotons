@@ -197,7 +197,8 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
 // progressive radius/flux update. Updates `st` in place.
 inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                      long long photonsPerPass, int nThreads, bool diffraction,
-                     double alpha, int maxBounce, uint64_t passSeed) {
+                     double alpha, int maxBounce, uint64_t passSeed,
+                     int heroC = hero::kHeroC) {
     if (nThreads < 1) nThreads = 1;
     const int W = st.resX, H = st.resY;
 
@@ -228,7 +229,11 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
     for (const auto& P : st.px) if (P.vpValid) rMax = std::max(rMax, P.radius);
     if (rMax <= 0.0) rMax = 1e-4;
     PhotonMap pm;
-    tracePhotonPass(scene, photonsPerPass, nThreads, diffraction, pm);
+    // seedBase = cumulative photons emitted before this pass, so every pass traces a
+    // FRESH, independent photon set (SPPM's convergence requires it) while staying
+    // deterministic for a fixed pass sequence.
+    tracePhotonPass(scene, photonsPerPass, nThreads, diffraction, pm, heroC,
+                    (uint64_t)st.emittedTotal);
     pm.build(rMax);
     st.emittedTotal += pm.nEmitted;
     st.passes += 1;
@@ -244,12 +249,11 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 const Material& m = scene.mats[h.matId];
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
-                pm.queryR(h.p, P.radius, [&](const Photon& ph, double) {
+                pm.queryR(h.p, P.radius, [&](const Photon& ph, double, int k) {
                     if (dot(ph.n, h.n) < 0.5) return;   // reject cross-surface leakage
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
-                    phi += Vec3(cieX(ph.lambda), cieY(ph.lambda), cieZ(ph.lambda))
-                           * (f * (double)ph.power);
+                    phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });
                 // Progressive radius / flux update (shared-statistics PPM).

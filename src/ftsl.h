@@ -1162,15 +1162,19 @@ private:
         // [0,1] (l = lightness). The `…line` heads (`rgbline`/`hsvline`/`hslline`)
         // instead take the K3 dominant-wavelength *emission* form: `rgbline r g b [sigma]`
         // emits a narrow band at the colour's dominant wavelength (near-monochromatic, so
-        // glass disperses it), width from saturation or the explicit `sigma` (nm). Meant
-        // for lights (`spd rgbline 0 0 1`); a reflectance has no single wavelength, but the
-        // form is accepted anywhere a spectrum is. (A head keyword, not a trailing modifier,
-        // because the parser stops a value at the next bareword.)
+        // glass disperses it), width from saturation or the explicit `sigma` (nm). The
+        // `…illum` heads (`rgbillum`/`hsvillum`/`hslillum`) take the K1 Jakob-Hanika
+        // *illuminant* upsample: a smooth, full-spectrum *emission* SPD (A·sigmoid) whose
+        // integral under the bare CIE observer reproduces the colour — the emitter analogue
+        // of `rgb`, right for coloured lights (`spd rgbillum 1 0.6 0.2`). Meant for lights;
+        // accepted anywhere a spectrum is. (Head keywords, not trailing modifiers, because
+        // the parser stops a value at the next bareword.)
         {
-            bool isLine = (h == "rgbline" || h == "hsvline" || h == "hslline");
-            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine) {
+            bool isLine  = (h == "rgbline"  || h == "hsvline"  || h == "hslline");
+            bool isIllum = (h == "rgbillum" || h == "hsvillum" || h == "hslillum");
+            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = isLine ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum) ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1179,6 +1183,7 @@ private:
                     double sigma = (w.size() > 4 && isNumber(w[4])) ? num(w[4]) : -1.0;
                     return rgbToLineEmission(c.x, c.y, c.z, sigma);
                 }
+                if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
                 return rgbToReflectanceJH(c.x, c.y, c.z);
             }
         }
@@ -2028,15 +2033,60 @@ private:
     // chain otherwise). Authored coordinates are transformed by `xf` FIRST, then
     // P()/Len() fold in the unit scale (→ metres). With xf = identity the result
     // is bit-identical to the pre-group path.
+    // Tessellate a sphere (authored center `c`, radius `r`) baked through a
+    // non-uniform / sheared affine `xf` into a smooth-normal triangle mesh, so a
+    // squashed / skewed sphere renders as the ellipsoid (or sheared quadric) the
+    // analytic primitive can't represent. Positions go through the affine; shading
+    // normals go through its inverse-transpose (`applyNormal`) so the surface stays
+    // smooth under non-uniform scale. Only the fallback — a uniform-scaled sphere
+    // keeps the fast analytic path in addSphere().
+    void addTessellatedSphere(Loaded& L, const Affine& xf, const Vec3& c,
+                              double r, int id) {
+        const int nlat = 48;   // latitude bands  (theta 0..PI)
+        const int nlon = 96;   // longitude steps (phi   0..2PI)
+        auto dirOf = [&](int i, int j) -> Vec3 {
+            double theta = PI * (double)i / nlat;
+            double phi   = 2.0 * PI * (double)j / nlon;
+            double st = std::sin(theta), ct = std::cos(theta);
+            return Vec3{st * std::cos(phi), ct, st * std::sin(phi)};  // y-up unit dir
+        };
+        auto pos = [&](const Vec3& d) { return P(xf.apply(c + d * r)); };
+        auto nrm = [&](const Vec3& d) { return normalize(xf.applyNormal(d)); };
+        auto uv  = [&](int i, int j) { return Vec3{(double)j / nlon, (double)i / nlat, 0.0}; };
+        for (int i = 0; i < nlat; ++i) {
+            for (int j = 0; j < nlon; ++j) {
+                Vec3 d00 = dirOf(i, j),     d01 = dirOf(i, j + 1);
+                Vec3 d10 = dirOf(i + 1, j), d11 = dirOf(i + 1, j + 1);
+                if (i != 0) {                       // skip degenerate north-pole tri
+                    Tri t{pos(d00), pos(d10), pos(d11), id, -1, {}};
+                    t.n0 = nrm(d00); t.n1 = nrm(d10); t.n2 = nrm(d11);
+                    t.uv0 = uv(i, j); t.uv1 = uv(i + 1, j); t.uv2 = uv(i + 1, j + 1);
+                    L.scene.tris.push_back(t);
+                }
+                if (i != nlat - 1) {                // skip degenerate south-pole tri
+                    Tri t{pos(d00), pos(d11), pos(d01), id, -1, {}};
+                    t.n0 = nrm(d00); t.n1 = nrm(d11); t.n2 = nrm(d01);
+                    t.uv0 = uv(i, j); t.uv1 = uv(i + 1, j + 1); t.uv2 = uv(i, j + 1);
+                    L.scene.tris.push_back(t);
+                }
+            }
+        }
+    }
     bool addSphere(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
         double r = dblOf(b, "radius", 1.0);
         int id = matFieldId(b, L, "sphere"); if (id < 0) return false;
-        // A sphere stays a sphere only under translate + rotation + UNIFORM scale;
-        // a non-uniform scale would make it an ellipsoid the analytic primitive
-        // cannot represent (see known-issues.md — true instancing/quadrics).
+        // A sphere stays an analytic sphere only under translate + rotation + UNIFORM
+        // scale. A non-uniform scale (or a shear) would make it an ellipsoid / sheared
+        // quadric the analytic primitive can't represent, so tessellate it into a
+        // smooth-normal mesh baked through the affine instead of failing.
         bool nonUniform = false; double s = xf.uniformScale(nonUniform);
-        if (nonUniform) { fail("sphere under non-uniform scale would be an ellipsoid; use translate + uniform scale (or a mesh)"); return false; }
+        if (nonUniform) {
+            addTessellatedSphere(L, xf, c, r, id);
+            // (A tessellated sphere has no analytic center/radius, so it is not
+            // registered in sphereByName_ — it can't serve as an analytic fog bound.)
+            return true;
+        }
         Vec3 wc = P(xf.apply(c));
         double wr = Len(r) * s;
         L.scene.spheres.push_back(Sphere{wc, wr, id});
@@ -2335,7 +2385,23 @@ private:
                 double k = num(sc->val.words[0]); scl = {k, k, k};
             }
         }
-        Affine world = parentXf.compose(affineFromTRS(tr, rot, scl));
+        // `shear a b c` (all optional, default 0) is a unit-diagonal upper-triangular
+        // shear applied in the group's LOCAL frame (innermost, before scale/rotate):
+        //   x' = x + a*y + b*z    y' = y + c*z    z' = z
+        // so a shears X along Y, b shears X along Z, c shears Y along Z. It composes
+        // as world = parent ∘ TRS ∘ Shear. Analytic spheres reject any shear (they
+        // would become ellipsoids, see addSphere); meshes/quads/triangles take it.
+        Vec3 shr{0, 0, 0};
+        vec3Of(b, "shear", shr);
+        Affine localXf = affineFromTRS(tr, rot, scl);
+        if (shr.x != 0.0 || shr.y != 0.0 || shr.z != 0.0) {
+            Affine sh;                 // identity, then fill the strict-upper triangle
+            sh.m[1] = shr.x;           // x += a*y
+            sh.m[2] = shr.y;           // x += b*z
+            sh.m[5] = shr.z;           // y += c*z
+            localXf = localXf.compose(sh);   // apply shear first, then scale/rotate
+        }
+        Affine world = parentXf.compose(localXf);
         // Child primitives are nested brace blocks; the transform-only statements
         // (translate/rotate/scale) carry no block and are skipped here.
         for (const auto& s : b.stmts) {
@@ -4330,22 +4396,19 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 // scene contains `prefer{}/else{}` blocks, `supported` chooses which branch renders (see
 // SupportFn): the first branch whose spliced scene is fully renderable wins, falling back
 // to the last branch when none are (a loud mode error then fires at render time).
-inline bool load(const std::string& path, Loaded& L, std::string& err,
-                 const SupportFn& supported = {}) {
-    std::ifstream f(path);
-    if (!f) { err = "cannot open scene file: " + path; return false; }
-    std::stringstream ss; ss << f.rdbuf();
-    std::string src = ss.str();
-
+// Load an FTSL scene from an in-memory source string (rather than a file). `nameForMsgs`
+// is used only for diagnostics (grammar-shim path label, error messages). This is the
+// shared core of `load()`; it also backs the synthesized quick-viewer scene (a bare
+// `ftrace foo.glb` builds an auto-lit scene string and loads it through here).
+inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
+                       Loaded& L, std::string& err,
+                       const SupportFn& supported = {}) {
     Parser p; p.t = tokenize(src);
     std::vector<Block> blocks = p.parseTop();
     if (!p.err.empty()) { err = p.err; return false; }
 
-    // J3c validation shim (non-authoritative): when -validate-grammar is on,
-    // parse `src` with the shared .ftsl grammar via the GPDA engine and diff its
-    // Block tree against `blocks` above, warning on any mismatch. Rendering still
-    // proceeds from ftrace's own parse. See src/gpda/ftsl_shim.hpp.
-    ftsl_shim::validate(src, blocks, path);
+    // J3c validation shim (non-authoritative); see load() below and src/gpda/ftsl_shim.hpp.
+    ftsl_shim::validate(src, blocks, nameForMsgs);
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;
@@ -4431,6 +4494,15 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
         std::printf("[prefer] using branch %d of %d\n",
                     choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());
     return true;
+}
+
+inline bool load(const std::string& path, Loaded& L, std::string& err,
+                 const SupportFn& supported = {}) {
+    std::ifstream f(path);
+    if (!f) { err = "cannot open scene file: " + path; return false; }
+    std::stringstream ss; ss << f.rdbuf();
+    std::string src = ss.str();
+    return loadSource(src, path, L, err, supported);
 }
 
 } // namespace ftsl

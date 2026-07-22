@@ -130,9 +130,10 @@ struct EmissionSampler {
         if (acc > 0) for (auto& c : cdf) c /= acc; // normalise to [0,1]
     }
 
-    // Returns lambda and sets pdf (per nm). p(lambda) = SPD(lambda)/integral.
-    double sample(Pcg32& rng, double& pdf) const {
-        double u = rng.uniform();
+    // Invert the CDF at a supplied uniform u in [0,1). Sets pdf (per nm) and
+    // returns lambda. Factored out of sample() so hero-wavelength sampling can
+    // draw stratified secondaries from the *same* CDF without a fresh rng draw.
+    double sampleAt(double u, double& pdf) const {
         int lo = 0, hi = static_cast<int>(cdf.size()) - 1;
         while (lo + 1 < hi) { int mid = (lo + hi) / 2; (cdf[mid] <= u ? lo : hi) = mid; }
         double c0 = cdf[lo], c1 = cdf[lo + 1];
@@ -141,5 +142,10 @@ struct EmissionSampler {
         double binProb = c1 - c0;         // probability mass of this bin
         pdf = binProb / step;             // convert to density per nm
         return w;
+    }
+
+    // Returns lambda and sets pdf (per nm). p(lambda) = SPD(lambda)/integral.
+    double sample(Pcg32& rng, double& pdf) const {
+        return sampleAt(rng.uniform(), pdf);
     }
 };

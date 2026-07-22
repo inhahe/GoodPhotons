@@ -28,7 +28,17 @@ from . import sweep as _sweep
 # ---------------------------------------------------------------------------
 
 class Element:
-    """Base scene element.  Emits ftsl text and exposes its modulator roots."""
+    """Base scene element.  Emits ftsl text and exposes its modulator roots.
+
+    An element may carry an optional :class:`~loom.transform.Transform` in ``xf``
+    (position / size / rotation / skew, each animatable).  The transform is applied
+    by the *container* (the :class:`Scene` or an enclosing :class:`Group`) when it
+    emits the element — see :func:`emit_element` / :func:`element_roots` — so
+    ``emit()`` always returns the element's *own* untransformed block and nesting a
+    transformed element inside a transformed :class:`Group` composes correctly.
+    """
+
+    xf = None  # Optional[Transform]; applied by the container on emit
 
     def roots(self) -> List:
         """Every Signal / VecSignal stored on this element (for cycle checking)."""
@@ -40,6 +50,41 @@ class Element:
 
     def emit(self, ctx: EmitCtx) -> str:
         raise NotImplementedError
+
+    def transformed(self, transform=None, *, translate=None, rotate=None,
+                    scale=None, skew=None) -> "Element":
+        """Attach a :class:`~loom.transform.Transform` (position / size / rotation /
+        skew, all signal-modulatable) and return ``self`` for chaining::
+
+            scene.add(Sphere((0, 0, 0), 1, "m").transformed(translate=(2, 0, 0),
+                                                             scale=1.5))
+
+        Pass a ready ``transform=Transform(...)`` or the individual fields.  Meant for
+        geometry (spheres/meshes/sweeps/volumes); ``skew`` needs ftrace's ``shear``
+        and does not apply to analytic ``sphere{}`` (which would become an ellipsoid).
+        """
+        from .transform import Transform
+        self.xf = transform if transform is not None else Transform(
+            translate=translate, rotate=rotate, scale=scale, skew=skew)
+        return self
+
+
+def emit_element(e: "Element", ctx: EmitCtx) -> str:
+    """Emit an element's block, wrapping it in its :class:`~loom.transform.Transform`
+    (an ftsl ``group { … }``) when it carries one.  Containers use this instead of
+    calling ``e.emit()`` directly so per-element transforms are honoured (and nest)."""
+    body = e.emit(ctx)
+    xf = getattr(e, "xf", None)
+    return xf.wrap(body, ctx) if xf is not None else body
+
+
+def element_roots(e: "Element") -> List:
+    """An element's modulator roots, including its transform's, for cycle checking."""
+    out = list(e.roots())
+    xf = getattr(e, "xf", None)
+    if xf is not None:
+        out.extend(xf.roots())
+    return out
 
 
 class Pattern(Element):
@@ -250,6 +295,39 @@ class Raw(Element):
 
     def emit(self, ctx: EmitCtx) -> str:
         return self.text
+
+
+class Group(Element):
+    """Apply one :class:`~loom.transform.Transform` to several child elements at
+    once, emitted as a single ftsl ``group { … <children> }``.
+
+    Position / size / rotation / skew all animate (each field may be a
+    :class:`~loom.signals.core.Signal` / :class:`~loom.signals.vector.VecSignal`).
+    Children may themselves be transformed — a child's own ``xf`` composes *inside*
+    this group's (nested ftsl groups), so::
+
+        Group(Sphere(...).transformed(scale=2), Beads(...),
+              translate=(0, 1, 0), rotate=(0, t*90, 0))
+
+    rotates the whole cluster while the sphere keeps its local 2× size.  Give the
+    transform via the individual fields or a ready ``transform=Transform(...)``.
+    """
+
+    def __init__(self, *children: "Element", translate=None, rotate=None,
+                 scale=None, skew=None, transform=None) -> None:
+        from .transform import Transform
+        self.children = list(children)
+        self.xf = transform if transform is not None else Transform(
+            translate=translate, rotate=rotate, scale=scale, skew=skew)
+
+    def roots(self) -> List:
+        out: List = []
+        for c in self.children:
+            out.extend(element_roots(c))
+        return out
+
+    def emit(self, ctx: EmitCtx) -> str:
+        return "\n".join(emit_element(c, ctx) for c in self.children)
 
 
 class SweptMesh(Element):
@@ -781,7 +859,7 @@ class Scene:
     def check_cycles(self) -> None:
         """Run the loop detector over every modulator in the scene."""
         for el in self._all_elements():
-            for r in el.roots():
+            for r in element_roots(el):
                 detect_signal_cycle(r)
 
     def emit(self, clock: Clock, cache: Optional[Cache] = None, *,
@@ -806,10 +884,10 @@ class Scene:
             blocks.append(m.emit(ctx))
         blocks.append("")
         for e in self.elements:
-            blocks.append(e.emit(ctx))
+            blocks.append(emit_element(e, ctx))
         blocks.append("")
         for lt in self.lights:
-            blocks.append(lt.emit(ctx))
+            blocks.append(emit_element(lt, ctx))
         blocks.append("")
         blocks.append(self.camera.emit(ctx))
         return "\n".join(blocks) + "\n"

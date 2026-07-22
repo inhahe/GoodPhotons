@@ -1,0 +1,14 @@
+# Shear-equivalence test B: the same quad as _shear_a.ftsl but with its four
+# corners hand-sheared into world space (no group). Shear (0.5,0.2,0) maps the
+# authored corners of `quad { origin 0.2 0.2 0.2  u 0.4 0 0  v 0 0.4 0.3 }` to a
+# parallelogram origin (0.34,0.2,0.2), u (0.4,0,0), v (0.26,0.4,0.3).
+scene { units meters  spectral 360 830 1 }
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+
+quad { origin 0.34 0.2 0.2   u 0.4 0 0   v 0.26 0.4 0.3   material red }
+
+light area { origin 0.35 0.999 0.35  u 0.30 0 0  v 0 0 0.30  normal 0 -1 0  spd preset:bb6500 }
+camera "cam" { eye 0.5 0.5 2.7  look_at 0.5 0.5 0.5  up 0 1 0  fov_y 40  mode B  film { res 128 128 } }

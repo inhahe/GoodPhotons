@@ -200,6 +200,19 @@ And one **field-routed** curve:
    `.channel(name|idx)` are DAG nodes that can drive scene variables; `.sample(u, clock)`
    polls at an explicit progression index → `(coords, {channel: value})`.
 
+**Dataset placement transform (decoupled sampling curve).** A `Grid` / `Scatter` may
+carry an optional local→world **`Transform`** (`.transformed(translate=, rotate=, scale=,
+skew=)`, from §7d) that places its fixed *local* frame in world space. The stored samples
+do **not** move; instead the field **inverse-maps** a world-space query into the dataset's
+local frame (`Transform.inverse_apply`, threaded through `_local_query` in `interp.py` for
+all six field classes) before interpolating. This is what **decouples the sampling curve
+from the data object**: the curve lives in world space and stays put, so moving / resizing
+/ skewing the data object changes *which local coordinate each world curve point lands on*
+— and therefore the value it reads back (moving the object actually does something). The
+inverse exactly round-trips the ftrace forward map; every transform parameter is a Signal
+(so the remap animates and threads into the DAG). Applies to 2-D or 3-D datasets (2-D uses
+the in-plane parameters only: translate/scale XY, rotate about Z, skew X-along-Y).
+
 Because interpolators are `Signal`s, you can: feed a modulator into a control point;
 *or* feed an N-D value into an interpolator to read a value out and pass it onward;
 *or* chain modulators through interpolators arbitrarily. All one DAG, all cycle-checked.
@@ -235,6 +248,23 @@ anchor) are all `Animatable`.
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.
 over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property animate.
+
+### 7d. Per-object transform (`Transform`)
+A general **`Transform`** (`transform.py`) bundles four independently *animatable* fields —
+`translate` (position), `scale` (size, per-axis or uniform), `rotate` (Euler XYZ degrees)
+and `skew` (unit-diagonal upper-triangular shear `x'=x+a·y+b·z, y'=y+c·z`). Every field is
+a `Signal`/`VecSignal`, so all of position/size/rotation/skew modulate over time. Attach one
+to **any** element with `element.transformed(translate=, rotate=, scale=, skew=)` (or bundle
+several children under a `Group`); it emits an ftsl `group { translate/rotate/scale/shear … }`
+whose composed affine ftrace bakes into world-space prims at load. Order matches ftrace
+(`src/mesh.h` `MeshXform`, `src/ftsl.h` `addGroup`): `world = translate + Rz·Ry·Rx·(scale ⊙
+(shear · local))`. **`shear`** is a real ftsl `group` statement (added alongside
+translate/rotate/scale); skew works for quad/tri/mesh/sweep geometry, and a `sphere{}` under a
+non-uniform scale or shear is auto-tessellated by ftrace into a smooth-normal ellipsoid /
+sheared quadric (uniform-scaled spheres keep the fast analytic path).
+The same `Transform` doubles as a **dataset placement transform** via
+`Transform.inverse_apply` (see §6): a `Grid`/`Scatter` carrying one is sampled by
+inverse-mapping the world query into the dataset's local frame.
 
 ---
 

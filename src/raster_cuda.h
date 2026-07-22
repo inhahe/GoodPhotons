@@ -3,10 +3,12 @@
 // This is the device twin of the CPU rasterizer in raster.h. It runs the same
 // deferred-visibility pipeline — project+clip each world triangle, resolve the nearest
 // surface per pixel, then shade it once — on the GPU, and returns a byte-identical-format
-// RGB8 frame. Only the GEOMETRY + SHADING (the embarrassingly parallel part) runs on the
-// device; the downloaded HDR buffer is exposed and tone-mapped by the SAME host code the
-// CPU path uses (raster::exposeAndEncode), so a camera_path's shared auto-exposure anchor
-// and the sRGB encoding are bit-identical regardless of backend.
+// RGB8 frame. The WHOLE frame stays on the device: geometry + shading, then a device
+// twin of raster::exposeAndEncodeT's exposure/tonemap (exact p99 luminance selection via
+// float-bit histograms, double-precision tonemap, the shared raster::srgbLut8() table),
+// so only the final W*H*3 RGB8 image is downloaded. The device maths mirrors the host
+// tail operation-for-operation, so a camera_path's shared auto-exposure anchor and the
+// sRGB encoding stay bit-identical regardless of backend.
 //
 // Scope: all camera projections (RECTILINEAR pinhole plus the fisheye/panoramic lens
 // maps — equidistant, equisolid, stereographic, orthographic), OPAQUE geometry, image
@@ -49,11 +51,31 @@ void destroy(Scene* sc);
 // format and exposure. Any projection (rectilinear or fisheye/panoramic) is supported, as
 // are image skins and (when `seeThrough`) clear-glass compositing. `exposure`, `autoExpose`,
 // `lockAnchor`, `seeThrough` and `glassClarity` have the same meaning as in
-// raster::renderFrame (the shared host tail applies exposure). Returns an EMPTY vector on
-// any device failure so the caller can fall back to the CPU rasterizer.
+// raster::renderFrame (exposure/tonemap runs on the device, byte-identical to the host
+// tail). Returns an EMPTY vector on any device failure so the caller can fall back to the
+// CPU rasterizer.
 std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                                  double exposure = 1.0, bool autoExpose = true,
                                  double* lockAnchor = nullptr,
                                  bool seeThrough = false, double glassClarity = 0.85);
+
+// Optional per-pass profiling (used by -raster-bench). While enabled, renderFrame
+// records CUDA events into the stream between passes and accumulates each pass's
+// GPU-timeline milliseconds into an internal tally (resolved once per frame after
+// the final image download; the frame itself stays sync-free). Zero overhead when
+// disabled. profTake() returns the tally accumulated since the last take and
+// resets it; frames==0 means no GPU frames ran while enabled.
+struct Prof {
+    double clearvis_ms = 0;   // vis-buffer clear (cudaMemset)
+    double project_ms  = 0;   // kProject (clip + project)
+    double raster_ms   = 0;   // kRaster (visibility)
+    double shade_ms    = 0;   // kShade (resolve + shade)
+    double clear_ms    = 0;   // see-through clear pass (0 unless -see-through)
+    double expose_ms   = 0;   // device expose: p99 histogram rounds + tonemap kernel
+    double download_ms = 0;   // device->host copy of the final RGB8 image
+    int    frames      = 0;
+};
+void profEnable(bool on);
+Prof profTake();
 
 }  // namespace raster_cuda

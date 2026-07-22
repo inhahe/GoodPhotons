@@ -55,6 +55,31 @@ def _check_channels(channels: Optional[Sequence[str]], value_dim: int) -> Option
     return names
 
 
+class _Transformable:
+    """Mixin giving a dataset an optional local→world :class:`~loom.transform.Transform`.
+
+    The transform does **not** move the stored samples; it defines how the dataset's
+    fixed *local* frame is placed in world space.  A field sampled by a world-space
+    curve inverse-maps the query through this transform (see
+    :meth:`loom.transform.Transform.inverse_apply`), so transforming the data object
+    changes what values the (independent) curve reads back — while the curve itself
+    stays put.  Every transform parameter is signal-modulatable.
+    """
+
+    xf = None  # type: ignore[assignment]
+
+    def transformed(self, transform=None, *, translate=None, rotate=None,
+                    scale=None, skew=None):
+        """Attach a :class:`~loom.transform.Transform` (position / size / rotation /
+        skew, all signal-modulatable) placing this dataset's local frame in world
+        space, and return ``self`` for chaining.  2-D datasets use only the in-plane
+        parameters (translate/scale XY, rotate about Z, skew X-along-Y)."""
+        from .transform import Transform
+        self.xf = transform if transform is not None else Transform(
+            translate=translate, rotate=rotate, scale=scale, skew=skew)
+        return self
+
+
 def _resolve_channel(channels: Optional[Tuple[str, ...]], value_dim: int,
                      channel: Union[int, str]) -> int:
     """Map a channel selector (index or name) to a component index in range."""
@@ -199,7 +224,7 @@ class TrackedPath:
         return tuple(kids)
 
 
-class Grid:
+class Grid(_Transformable):
     """N-D scalar-or-vector values on a **regular, fixed** lattice.
 
     ``shape`` is the number of samples per axis (arbitrary rarity).  ``lo``/``hi``
@@ -264,7 +289,7 @@ class Grid:
         return tuple(self.values)
 
 
-class Scatter:
+class Scatter(_Transformable):
     """N-D values at arbitrary positions (positions animatable too)."""
 
     def __init__(self, samples: Iterable[Tuple[Vecish, Union[Signal, VecSignal, Number]]],

@@ -899,11 +899,35 @@ static int checkUpsample() {
     double greyErr = std::max({std::fabs(gl.x - 0.5), std::fabs(gl.y - 0.5), std::fabs(gl.z - 0.5)});
     bool passC = greyErr < 1e-4;
 
-    bool pass = passA && passB && passW && passC;
+    // (d) Illuminant (emission) upsample round-trips: build the A·sigmoid emission
+    // SPD, integrate it under the *bare* CIE observer (illumBasis, no D65), convert
+    // XYZ -> linear sRGB, and compare to the input colour. Unlike reflectance, the
+    // magnitude is unbounded (carried by A), so even saturated primaries and the
+    // 1,1,1 white round-trip accurately.
+    const upsample::IllumBasis& IB = upsample::illumBasis();
+    double illumErr = 0.0;
+    for (const C& c : tests) {
+        if (c.r == 0.0 && c.g == 0.0 && c.b == 0.0) continue;   // black -> zero SPD
+        Spectrum spd = rgbToIlluminantJH(c.r, c.g, c.b);
+        double X = 0, Y = 0, Z = 0;
+        for (int i = 0; i < IB.N; ++i) {
+            double s = spd(IB.lam[i]);
+            X += s * IB.wX[i]; Y += s * IB.wY[i]; Z += s * IB.wZ[i];
+        }
+        Vec3 lin = xyzToLinearSrgb(Vec3{X, Y, Z});
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        illumErr = std::max(illumErr, e);
+        std::printf("[checkupsample] illum %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+    bool passD = illumErr < 2e-3;
+
+    bool pass = passA && passB && passW && passC && passD;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
     std::printf("[checkupsample] mid-grey round-trip = %.6f  (%s)\n", greyErr, passC ? "ok" : "BAD");
+    std::printf("[checkupsample] illuminant round-trip max error = %.5f  (%s)\n", illumErr, passD ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
@@ -1060,6 +1084,21 @@ static double g_sppmAlpha = 0.7;
 // SmallVCM default. Initial radius R0 reuses the mode-M -pmradius / -pmradiusfrac controls.
 static double g_vcmAlpha = 0.75;
 
+// Hero-wavelength bundle size (CLI -heroc N). Number of wavelengths carried per path
+// (hero + N-1 stratified secondaries) on the CPU hero tracers (modes A/B/C, R, M/S).
+// Set once at arg-parse; clamped to [1, hero::kHeroMax]. N==1 turns hero off (bit-identical
+// single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
+static int g_heroC = hero::kHeroC;
+
+// PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
+// the shared A/B pass has each camera resample its own medium in-scatter point per beam
+// segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
+// instead of one frozen speckle pattern, while the photon flight is still traced once.
+// Only affects groups of >1 shared camera with participating media; single stills and
+// media-free scenes are byte-for-byte unchanged. Forces the CPU forward path (the GPU
+// shared kernel doesn't implement the per-camera resample yet).
+static bool g_beamGather = false;
+
 // Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
 // Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
 static void enableAnsiTerminal() {
@@ -1193,7 +1232,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // selects the streaming backend over the default megakernel (same physics/energy).
     if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
         char camMode = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
-        return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camMode, seedBase, wavefront);
+        return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camMode, seedBase, wavefront, g_heroC);
     }
 #else
     (void)useGpu; (void)wavefront;
@@ -1202,16 +1241,25 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     std::vector<EnergyReport> reports(nThreads);
     for (auto& f : films) { f.resX = resX; f.resY = resY; f.alloc(); }
 
+    // Hero-wavelength sampling: on when C>1 and the scene has no participating media /
+    // GRIN (dispersive interfaces de-hero mid-path). Forward modes A/B/C all qualify —
+    // the finite-lens pupil is achromatic, so the C wavelengths share the connection.
+    const bool heroOn = (g_heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
-                            (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
+        r.useHero = heroOn; r.heroC = g_heroC;
+        // Photon i draws from its own stream keyed by the ABSOLUTE photon index
+        // seedBase+i (seedBase = cumulative photons of earlier batches), so the traced
+        // set is independent of batch splits and thread count (see rng.h seedUnit).
+        Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         Film* sensorFilm = useCamera ? nullptr : &films[tid];
         const Camera* camPtr = useCamera ? cam : nullptr;
         Film* camFilm = useCamera ? &films[tid] : nullptr;
-        for (long long i = lo; i < hi; ++i)
+        for (long long i = lo; i < hi; ++i) {
+            seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
             r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
+        }
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1244,7 +1292,8 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                                              long long N, int nThreads,
                                              EnergyReport& eOut, bool diffraction = true,
                                              bool lensMode = false,
-                                             unsigned long long seedBase = 0) {
+                                             unsigned long long seedBase = 0,
+                                             bool beamGather = false) {
     int nc = (int)cams.size();
     // Per-thread × per-camera films (each thread accumulates into its own copies to
     // avoid shared-pixel races; merged per camera at the end).
@@ -1253,21 +1302,24 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     for (int t = 0; t < nThreads; ++t)
         for (int c = 0; c < nc; ++c) { films[t][c].resX = resX[c]; films[t][c].resY = resY[c]; films[t][c].alloc(); }
 
+    const bool heroOn = (g_heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
-        // Identical seeding to renderForward. For model B this makes each camera's shared
-        // film bit-identical to its standalone single-camera render (at seedBase 0); for
-        // model A the aperture draws perturb the stream, so it matches in distribution.
-        // `seedBase` (the cumulative photon count) decorrelates successive accumulation
-        // chunks so a checkpointed / resumed / budgeted shared render draws independent
-        // photons each pass; seedBase==0 reproduces the original single-shot stream.
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
-                            (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
+        r.useHero = heroOn; r.heroC = g_heroC; r.beamGather = beamGather;
+        // Identical per-photon seeding to renderForward (absolute index seedBase+i via
+        // seedUnit). For model B this keeps each camera's shared film bit-identical to
+        // its standalone single-camera render at the same seedBase; for model A the
+        // aperture draws perturb the stream, so it matches in distribution. `seedBase`
+        // (the cumulative photon count) makes a checkpointed / resumed / budgeted
+        // shared render draw fresh photons each pass, independent of the batch split.
+        Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
         for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
-        for (long long i = lo; i < hi; ++i)
+        for (long long i = lo; i < hi; ++i) {
+            seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
+        }
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1287,20 +1339,18 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 
 // Backward reference: `spp` samples per pixel, threads render disjoint row bands
 // of a shared film (no shared-pixel writes, so no race).
-// `seedOffset` decorrelates the RNG stream so a chunked/progressive render can call
-// this repeatedly (each chunk with a distinct offset) and merge the SUM films for an
-// independent, ever-refining estimate. seedOffset==0 reproduces the original stream.
+// `sampleBase` is the ABSOLUTE index of the first sample: a chunked/progressive
+// render passes its running spp count so successive chunks render successive
+// per-(pixel,sample) streams — the realization is identical for ANY chunk split,
+// thread count, or resume boundary (see renderRows / rng.h seedUnit).
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
                            long long spp, int nThreads, bool diffraction = true,
-                           unsigned long long seedOffset = 0) {
+                           unsigned long long sampleBase = 0) {
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
-        BackwardRenderer br; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7,
-                            0xD1B54A32D192ED03ULL ^ (uint64_t)tid
-                              ^ (seedOffset * 0x9E3779B97F4A7C15ULL));
+        BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, out, y0, y1, spp, rng);
+        br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1318,17 +1368,14 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // by cieYIntegral for display, exactly like mode P's composite.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long spp, int nThreads, int maxDepth, bool diffraction = true,
-                       unsigned long long seedOffset = 0) {
+                       unsigned long long sampleBase = 0) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11,
-                            0x9E3779B97F4A7C15ULL ^ (uint64_t)tid
-                              ^ (seedOffset * 0xD1B54A32D192ED03ULL));
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, cf, sf, y0, y1, spp, rng);
+        br.renderRows(scene, cam, cf, sf, y0, y1, spp, sampleBase);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1980,19 +2027,30 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
                          const std::function<Film(long long, unsigned long long)>& renderOne) {
     if (!prog || !prog->report) return renderOne(sppTarget, 0);
     using clk = std::chrono::steady_clock;
-    // On resume the loaded film already holds `sampleBase` spp; bias the fresh seeds past
-    // it so the continued samples are an independent realization (see SppProgress).
+    // On resume the loaded film already holds `sampleBase` spp; continue from that
+    // absolute sample index. renderOne(c, base) renders the absolute samples
+    // [base, base+c) — per-(pixel,sample) seeding downstream makes the realization
+    // identical no matter how this loop happens to split the chunks.
     const unsigned long long seedBias = (unsigned long long)prog->sampleBase;
     Film acc; acc.resX = resX; acc.resY = resY; acc.alloc();
     long long done = 0, chunk = 1;
+    // Debug aids (determinism triage): FTRACE_CHUNK_SPP=K pins every chunk to K
+    // samples (making the normally wall-clock-adaptive split sequence exactly
+    // reproducible); FTRACE_CHUNK_DEBUG=1 logs the sequence actually used.
+    long long forcedChunk = 0;
+    if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
+    if (forcedChunk > 0) chunk = forcedChunk;
+    const bool chunkDebug = std::getenv("FTRACE_CHUNK_DEBUG") != nullptr;
     while (done < sppTarget) {
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
-        Film f = renderOne(c, seedBias + (unsigned long long)(done + 1));
+        Film f = renderOne(c, seedBias + (unsigned long long)done);
         acc.merge(f);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
-        if (dt > 1e-4) {                       // retarget chunk toward ~0.4s of work
+        if (chunkDebug) std::fprintf(stderr, "[chunk] c=%lld base=%llu dt=%.3f\n",
+                                     c, seedBias + (unsigned long long)(done - c), dt);
+        if (forcedChunk <= 0 && dt > 1e-4) {   // retarget chunk toward ~0.4s of work
             long long next = (long long)((double)c * (0.4 / dt));
             if (next < 1) next = 1;
             if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
@@ -2230,7 +2288,7 @@ static int runCompositeProgressive(
             } else
 #endif
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
-                                   (uint64_t)acc.spp + 1);
+                                   (uint64_t)acc.spp);
             acc.ref.merge(r); acc.spp += dSpp;
         }
         // Adapt the batch toward ~0.5 s so early frames appear fast and overhead stays low.
@@ -2582,7 +2640,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         "(density query one bounce away)\n", g_pmFinalGather);
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
         pm.build(radius);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
@@ -2622,7 +2680,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
             for (long long pass = 0; pass < passTarget; ++pass) {
                 sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
-                         /*maxBounce*/32, (uint64_t)(pass + 1));
+                         /*maxBounce*/32, (uint64_t)(pass + 1), g_heroC);
                 disp = sppmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
@@ -3218,12 +3276,14 @@ static void printHelp(const char* prog) {
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
 "  %s <scene.ftsl>                       quick raster preview in a live window\n"
+"  %s <model.glb|.obj|.gltf|.fbx>        quick-view a bare mesh (auto-lit, auto-framed)\n"
 "  %s [options]                          render the built-in demo scene\n"
 "  %s -topng <in.ppm|in.ftbuf> <out.png> convert an artifact to PNG (no render)\n"
 "  %s -review <base>                     play a rendered frame sequence\n"
 "\n"
 "Scene & camera:\n"
 "  -in <file>            FTSL scene file (.ftsl/.scene); a bare positional path works too\n"
+"                        (a bare mesh path .obj/.gltf/.glb/.fbx/.stl/.ply auto-lights & views it)\n"
 "  -scene <name>         built-in demo scene (default: cornell)\n"
 "  -light <name>         built-in light preset (default: bb6500)\n"
 "  -camera <sel>         pick FTSL camera(s): <name>|<pathbase>|all|#N|near=X,Y,Z\n"
@@ -3272,7 +3332,7 @@ static void printHelp(const char* prog) {
 "  -h | --help           show this help and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 static int run(int argc, char** argv) {
@@ -3373,6 +3433,7 @@ static int run(int argc, char** argv) {
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
+    int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
@@ -3391,24 +3452,48 @@ static int run(int argc, char** argv) {
     const char* inFile = nullptr;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
-    // Positional scene file: `ftrace scene.ftsl` (e.g. a double-click) with no -in.
-    // Accept a bare token that ends in a scene extension so a file association / drag-drop
-    // "just works" as a quick preview. Only scene-file extensions qualify, so this never
-    // swallows a flag value (no other flag takes a `.ftsl`/`.scene` argument).
+    // Positional scene / mesh file: `ftrace scene.ftsl` or `ftrace model.glb` (e.g. a
+    // double-click / drag-drop) with no -in. Accept a bare token that ends in a scene
+    // extension (loaded directly) OR a mesh extension (.obj/.gltf/.glb/.fbx/.stl/.ply —
+    // wrapped in a synthesized, auto-lit quick-viewer scene below). Only these extensions
+    // qualify, so this never swallows a flag value (no flag takes such a path argument).
+    // A bare token that LOOKS like a file (has an extension or a path separator) but isn't
+    // a recognized scene/mesh is remembered so we ERROR instead of silently rendering the
+    // built-in demo — the old, confusing behavior (`ftrace foo.glb` used to draw cornell).
     bool positionalScene = false;
+    bool positionalMesh  = false;
+    const char* unknownPositional = nullptr;
     if (!inFile) {
-        auto hasSceneExt = [](const char* s) {
-            std::string t = s; for (auto& c : t) c = (char)std::tolower((unsigned char)c);
-            auto ends = [&](const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
-            return ends(".ftsl") || ends(".scene") || ends(".fts");
-        };
+        auto lower = [](const char* s){ std::string t = s; for (auto& c : t) c = (char)std::tolower((unsigned char)c); return t; };
+        auto ends  = [](const std::string& t, const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
+        auto hasSceneExt = [&](const char* s){ std::string t = lower(s); return ends(t,".ftsl") || ends(t,".scene") || ends(t,".fts"); };
+        auto hasMeshExt  = [&](const char* s){ std::string t = lower(s);
+            return ends(t,".obj") || ends(t,".gltf") || ends(t,".glb") || ends(t,".fbx") || ends(t,".stl") || ends(t,".ply"); };
+        auto looksLikeFile = [](const char* s){ std::string t = s; size_t sl = t.find_last_of("/\\");
+            std::string base = (sl == std::string::npos) ? t : t.substr(sl + 1);
+            return base.find('.') != std::string::npos || sl != std::string::npos; };
         for (int i = 1; i < argc; ++i) {
-            if (argv[i][0] == '-') continue;                 // a flag (or its value we skip below)
-            if (i > 0 && argv[i-1][0] == '-') {              // could be a flag's value; only take it if it's a scene file
-                if (!hasSceneExt(argv[i])) continue;
+            if (argv[i][0] == '-') continue;                 // a flag
+            const bool couldBeFlagValue = (i > 0 && argv[i-1][0] == '-');
+            if (couldBeFlagValue) {                          // a flag's value: only claim it if it's a scene/mesh path
+                if (!hasSceneExt(argv[i]) && !hasMeshExt(argv[i])) continue;
             }
             if (hasSceneExt(argv[i])) { inFile = argv[i]; positionalScene = true; break; }
+            if (hasMeshExt(argv[i]))  { inFile = argv[i]; positionalScene = true; positionalMesh = true; break; }
+            // Not a recognized scene/mesh. If it looks like a file path (and isn't a flag
+            // value), flag it as an error candidate rather than silently ignoring it.
+            if (!couldBeFlagValue && !unknownPositional && looksLikeFile(argv[i])) unknownPositional = argv[i];
         }
+    }
+    if (!inFile && unknownPositional) {
+        std::fprintf(stderr,
+            "[ftrace] unrecognized argument '%s': not a scene (.ftsl/.scene/.fts) or a mesh "
+            "(.obj/.gltf/.glb/.fbx/.stl/.ply).\n"
+            "  To render a scene file:   ftrace <scene.ftsl>\n"
+            "  To quick-view a mesh:      ftrace <model.glb>\n"
+            "  For the built-in demos:    ftrace -scene <cornell|materials|prism|fluoro|...>\n",
+            unknownPositional);
+        return 2;
     }
     // Pre-scan the two flags that affect `prefer{}/else{}` branch selection (which the
     // loader resolves up-front): a `-mode` override forces the mode a branch is judged
@@ -3427,7 +3512,47 @@ static int run(int argc, char** argv) {
 
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
-    if (inFile) {
+    if (positionalMesh) {
+        // ---- Quick mesh viewer -------------------------------------------------------
+        // `ftrace model.glb` (or .obj/.gltf/.fbx/.stl/.ply) with no scene file wraps the
+        // bare mesh in a synthesized, auto-lit FTSL scene and renders it with an
+        // auto-framed camera. The mesh keeps its own materials when the format carries
+        // them (glTF/GLB import materials by default); a neutral clay fallback covers
+        // primitives/faces with none. Lit by a soft uniform environment so any mesh reads
+        // with shape. Bare invocation then defaults to the fast raster preview in a live
+        // window (see the positional-preview block below); pass -mode/-n/etc. to force a
+        // real light-transport render of the same auto-lit scene.
+        std::string mp = inFile;
+        for (char& c : mp) if (c == '\\') c = '/';    // FTSL file strings use forward slashes
+        std::string src;
+        src += "scene { units meters spectral 360 830 1 }\n";
+        src += "material \"clay\" { type diffuse reflect whitewall 0.6 }\n";
+        src += "mesh { file \"" + mp + "\"  material clay }\n";
+        src += "light env { spd 0.5 }\n";
+        std::string ferr;
+        if (!ftsl::loadSource(src, std::string("<mesh-viewer:") + inFile + ">", ftslScene, ferr)) {
+            std::fprintf(stderr, "[ftrace] could not load mesh '%s': %s\n", inFile, ferr.c_str());
+            return 1;
+        }
+        fromFtsl = true;
+        std::printf("[viewer] quick-view scene for mesh %s (%zu triangles)\n",
+                    inFile, ftslScene.scene.tris.size());
+        // Auto-frame the camera on the scene bounding sphere from a 3/4 front-high angle,
+        // far enough that the sphere fits the vertical FOV (with a little margin). Skip if
+        // the user pinned their own -view.
+        if (!haveView) {
+            Vec3 ctr = ftslScene.scene.sceneCenter;
+            double rad = (ftslScene.scene.sceneRadius > 0.0) ? ftslScene.scene.sceneRadius : 1.0;
+            const double fovDeg = 40.0, half = fovDeg * 0.5 * PI / 180.0;
+            double dist = (rad / std::sin(half)) * 1.15;
+            Vec3 dir = {0.55, 0.42, 1.0};
+            { double L = std::sqrt(dot(dir, dir)); dir = dir * (1.0 / L); }
+            viewEye = ctr + dir * dist; viewLook = ctr; viewUp = {0, 1, 0}; viewFov = fovDeg;
+            haveView = true;
+            std::printf("[viewer] auto-framed: center (%.3f,%.3f,%.3f) radius %.3f -> eye (%.3f,%.3f,%.3f)\n",
+                        ctr.x, ctr.y, ctr.z, rad, viewEye.x, viewEye.y, viewEye.z);
+        }
+    } else if (inFile) {
         std::string ferr;
         // The prefer/else resolver asks this predicate whether a branch renders; when the
         // policy is fallback/strip we accept every branch (the policy handles it later at
@@ -3486,6 +3611,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-heroc") && i + 1 < argc) {
+            g_heroC = std::atoi(argv[++i]);
+            if (g_heroC < 1) g_heroC = 1;
+            if (g_heroC > hero::kHeroMax) g_heroC = hero::kHeroMax;
+        }
         else if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc) exposureCli = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
@@ -3548,10 +3678,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
+        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
         else if (!std::strcmp(argv[i], "-raster-gpu")) { doRaster = true; rasterGpu = true; }
+        else if (!std::strcmp(argv[i], "-raster-bench") && i + 1 < argc) { rasterBench = std::atoi(argv[++i]); doRaster = true; }
         else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
             // Interactive fly-through: start at the first selected camera frame and let
             // the user explore with the raster viewer instead of rendering every frame.
@@ -3615,14 +3747,28 @@ static int run(int argc, char** argv) {
     // (a mode/budget/device/camera flag, an explicit -raster, etc.) we respect that and
     // don't force preview.
     if (positionalScene && !doRaster) {
-        static const char* kRenderFlags[] = {
+        // A scene file's preview yields to ANY render-control flag. The quick MESH viewer
+        // is fundamentally a preview, so it stays a raster preview even with presentation
+        // flags (-window/-o/-r/-camera/-view) and only yields to a genuine light-transport
+        // request (-mode and the budget/device/map flags). So `ftrace model.glb -window`
+        // shows a raster preview in a window, while `ftrace model.glb -mode D -n 1e8`
+        // renders it for real.
+        static const char* kSceneRenderFlags[] = {
             "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
             "-camera","-view","-savemap","-loadmap","-wavefront","-o","-r","-window"
         };
+        static const char* kMeshRenderFlags[] = {
+            "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
+            "-savemap","-loadmap","-wavefront"
+        };
         bool explicitControl = false;
-        for (int i = 1; i < argc && !explicitControl; ++i)
-            for (const char* f : kRenderFlags)
-                if (!std::strcmp(argv[i], f)) { explicitControl = true; break; }
+        auto scan = [&](const char* const* flags, size_t nflags) {
+            for (int i = 1; i < argc && !explicitControl; ++i)
+                for (size_t k = 0; k < nflags; ++k)
+                    if (!std::strcmp(argv[i], flags[k])) { explicitControl = true; break; }
+        };
+        if (positionalMesh) scan(kMeshRenderFlags, sizeof(kMeshRenderFlags)/sizeof(*kMeshRenderFlags));
+        else                scan(kSceneRenderFlags, sizeof(kSceneRenderFlags)/sizeof(*kSceneRenderFlags));
         if (!explicitControl) {
             doRaster = true;
             g_showWindow = true;
@@ -4516,12 +4662,13 @@ static int run(int argc, char** argv) {
         }
 
         // GPU preview rasterizer (-device gpu|auto). Bake the world triangles + image skins
-        // to the device ONCE (reused for every camera / flyby frame), then each frame runs the
-        // projection + raster + shade (+ clear-accumulation pass when see-through) on the GPU
-        // and shares the SAME host exposure/tonemap tail as the CPU path
-        // (raster::exposeAndEncode) — so GPU and CPU frames match. The GPU covers all camera
-        // projections (rectilinear + fisheye/panoramic), opaque + textured (skinned) previews,
-        // and see-through (clear-glass) compositing. Any device failure falls back per-frame.
+        // to the device ONCE (reused for every camera / flyby frame), then each frame runs
+        // ENTIRELY on the GPU — projection + raster + shade (+ clear-accumulation pass when
+        // see-through) + a device twin of the host exposure/tonemap tail (exact p99 anchor
+        // via float-bit histograms, double-precision tonemap, shared sRGB LUT) — verified
+        // byte-identical to the CPU path's frames. The GPU covers all camera projections
+        // (rectilinear + fisheye/panoramic), opaque + textured (skinned) previews, and
+        // see-through (clear-glass) compositing. Any device failure falls back per-frame.
 #ifdef HAVE_CUDA
         raster_cuda::Scene* gpuRaster = nullptr;
         {
@@ -4625,6 +4772,82 @@ static int run(int argc, char** argv) {
         }
         std::fflush(stdout);
 
+        // -raster-bench N: steady-state per-frame cost — the interactive explorer's
+        // metric (it re-renders one frame per camera move) — measured independently of
+        // process launch, scene build/tessellation and the GPU upload, which have all
+        // already happened by this point. Renders the FIRST selected camera N times
+        // through the same rasterOne path the explorer uses (per-frame auto-exposure,
+        // no lock anchor), reports min/median/mean ms per frame and, when the GPU
+        // rasterizer ran, a per-pass breakdown. Writes the last frame to -o so
+        // backends/builds can be byte-compared.
+        if (rasterBench > 0 && !toRender.empty()) {
+            const RenderCam& rc = toRender.front();
+            const int W = rc.res, H = rc.resY;
+            double ev = (rc.exposure > 0.0) ? rc.exposure : 1.0;
+            if (scene.absolute && (rc.mode == 'A' || rc.mode == 'C')) {
+                const double Rref = 0.02; double R = rc.cam.apertureR;
+                if (R > 0.0) ev *= (R * R) / (Rref * Rref);
+            }
+            const bool autoExp = !scene.absolute;
+            // Warmup frame (not timed): first-frame scratch allocs, GPU clock ramp.
+            std::vector<uint8_t> img = rasterOne(rc.cam, W, H, ev, autoExp, nullptr);
+#ifdef HAVE_CUDA
+            raster_cuda::profEnable(true);
+            (void)raster_cuda::profTake();
+#endif
+            std::vector<double> ms;
+            ms.reserve(rasterBench);
+            for (int it = 0; it < rasterBench && !g_stopRequested; ++it) {
+                auto t0 = std::chrono::steady_clock::now();
+                img = rasterOne(rc.cam, W, H, ev, autoExp, nullptr);
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0).count());
+                if (g_showWindow) {
+                    if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
+                    g_liveWin->update(W, H, img);
+                    if (g_liveWin->closed()) g_stopRequested = 1;
+                }
+            }
+#ifdef HAVE_CUDA
+            raster_cuda::profEnable(false);
+#endif
+            if (!ms.empty()) {
+                std::vector<double> s = ms;
+                std::sort(s.begin(), s.end());
+                double mean = 0;
+                for (double v : ms) mean += v;
+                mean /= ms.size();
+                double mn = s.front(), md = s[s.size() / 2];
+                std::printf("[raster-bench] %zu frames %dx%d: min %.2f ms  median %.2f ms  "
+                            "mean %.2f ms  (%.1f fps @ median)\n",
+                            ms.size(), W, H, mn, md, mean, md > 0 ? 1000.0 / md : 0.0);
+            }
+#ifdef HAVE_CUDA
+            {
+                raster_cuda::Prof p = raster_cuda::profTake();
+                if (p.frames > 0) {
+                    double f = 1.0 / p.frames;
+                    std::printf("[raster-bench] GPU per-pass avg ms: clearvis %.2f  project %.2f  "
+                                "raster %.2f  shade %.2f  clear %.2f  expose+encode %.2f  "
+                                "download %.2f\n",
+                                p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
+                                p.shade_ms * f, p.clear_ms * f, p.expose_ms * f,
+                                p.download_ms * f);
+                }
+            }
+#endif
+            std::string path = outFor(rc.name);
+            if (!writeImage(path, W, H, img))
+                std::fprintf(stderr, "[raster-bench] failed to write %s\n", path.c_str());
+            else
+                std::printf("[raster-bench] wrote %s (%dx%d)\n", path.c_str(), W, H);
+            std::fflush(stdout);
+#ifdef HAVE_CUDA
+            raster_cuda::destroy(gpuRaster);
+#endif
+            return 0;
+        }
+
         int frame = 0;
         auto ft0 = std::chrono::steady_clock::now();
         for (const auto& rc : toRender) {
@@ -4725,12 +4948,22 @@ static int run(int argc, char** argv) {
             // (heavy scene -> careful crawl, light scene -> quick) and you can never skip past
             // geometry between two frames you didn't see. `step` is the per-move distance,
             // adjustable live with Ctrl+wheel.
-            double       step   = sceneR * 0.02;     // per-frame / per-notch travel, world units
+            double       step   = sceneR * 0.02;     // held-key per-frame travel, world units
+            // The plain wheel is a quick DOLLY, so a notch moves several fly-steps (a held
+            // key is the fine cruise; the wheel repositions in a few flicks). Still tied to
+            // `step` so Ctrl+wheel scales both together, and still collision-feedback-locked
+            // (resolveMove stops at surfaces), so a coarse notch can't punch through geometry.
+            const double kWheelDolly = 8.0;           // fly-steps travelled per plain-wheel notch
             // Hover-look turn RATES: the cursor's dead-zoned offset from the window centre
-            // (nav.lookX/lookY, -1..+1) is multiplied by these to turn the view PER RENDERED
-            // FRAME. Full deflection = kYaw/kPitch radians/frame; centre dead zone = no turn.
-            const double kYaw   = 0.040;             // max yaw   per frame at full pointer deflection
-            const double kPitch = 0.030;             // max pitch per frame at full pointer deflection
+            // (nav.lookX/lookY, -1..+1) is multiplied by these AND the wall-clock frame time
+            // to turn the view. Full deflection = kYaw/kPitch radians per SECOND, integrated
+            // by dt, so the turn speed is FRAME-RATE INDEPENDENT: a light scene that raster-
+            // previews at hundreds of fps turns at the same comfortable rate as a heavy one,
+            // instead of spinning the view off-screen. (Translation stays feedback-locked
+            // per-frame below — that's the collision-safety part; rotating in place can never
+            // fling the eye through geometry, so it has no reason to be frame-locked.)
+            const double kYaw   = 1.6;               // max yaw   rad/sec at full pointer deflection
+            const double kPitch = 1.2;               // max pitch rad/sec at full pointer deflection
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
             auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
                 double c = std::cos(ang), s = std::sin(ang);
@@ -5123,7 +5356,7 @@ static int run(int argc, char** argv) {
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
-              "         dolly:  mouse wheel up/down = step forward/back one nudge (each notch renders — no overshoot)\n"
+              "         dolly:  mouse wheel up/down = dolly forward/back one notch (each notch renders — no overshoot; Ctrl+wheel scales it)\n"
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
@@ -5279,7 +5512,7 @@ static int run(int argc, char** argv) {
                     // slide) sees the true combined motion. Plain wheel DOLLIES one `step` per notch
                     // along the view ray (up = forward); held keys advance one `step`/frame.
                     Vec3 moveDelta{0, 0, 0};
-                    if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * nav.wheel);
+                    if (nav.wheel != 0.0) moveDelta = moveDelta + fwd * (step * kWheelDolly * nav.wheel);
                     // Mouse-look STEERS at a RATE set by how far the cursor sits from the window
                     // centre (joystick/hover-look): each rendered frame turns by that offset x the
                     // max rate, so the view keeps turning while you hold the pointer off-centre and
@@ -5289,8 +5522,8 @@ static int run(int argc, char** argv) {
                     // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
                     // see rather than spinning past.
                     if (nav.lookX != 0.0 || nav.lookY != 0.0) {
-                        double yaw   = -nav.lookX * kYaw;     // pointer right -> turn right
-                        double pitch = -nav.lookY * kPitch;   // pointer down  -> look down
+                        double yaw   = -nav.lookX * kYaw   * dt;   // pointer right -> turn right (rad/sec x dt)
+                        double pitch = -nav.lookY * kPitch * dt;   // pointer down  -> look down  (rad/sec x dt)
                         fwd = norml(rotAxis(fwd, worldUp, yaw));
                         Vec3 right = cross(fwd, worldUp);
                         double rl = std::sqrt(dot(right, right));
@@ -5428,6 +5661,19 @@ static int run(int argc, char** argv) {
     // to the same radiance). One reduced, view-independent photon map (built lazily once)
     // serves every mode-M meter.
     PhotonMap meterPmap; bool meterPmapBuilt = false;
+#ifdef HAVE_CUDA
+    // Meter on the device the run asked for. The meter is a REAL reduced render, so when
+    // a mode's GPU path supports this scene it must use it: metering on the CPU while the
+    // user asked for -device gpu used to front-load the whole pre-pass as silent CPU work
+    // — tens of minutes on a big scene (the mode-M "shared deposit hang" in known-issues
+    // was exactly this meter, misdiagnosed as the GPU build). Every branch below gates on
+    // the same support predicate its real render uses and falls back to the CPU renderer
+    // otherwise, so -device cpu runs are bit-identical to before.
+    const bool meterGpu = (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+                          cudaAvailable();
+#else
+    const bool meterGpu = false;
+#endif
     auto meterAnchor = [&](const MeterCam& mc) -> double {
         const int W = mc.res, H = mc.resY;
         // Reduced budgets: enough coverage for a clean p99 without paying for a full render.
@@ -5441,28 +5687,48 @@ static int run(int argc, char** argv) {
         switch (mode) {
             case 'A': case 'B': case 'C': {
                 EnergyReport e;
+                // renderForward self-gates on cudaForwardSupported and falls back to CPU.
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                    /*forwardCatch*/mode == 'C', /*lensMode*/mode == 'A',
-                                   /*useCamera*/true, e, diffraction, /*useGpu*/false);
+                                   /*useCamera*/true, e, diffraction, /*useGpu*/meterGpu);
                 addEnvBackground(mf, scene, mc.cam, meterN);
                 filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
                 break;
             }
             case 'R': {
-                mf = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
+                bool onGpu = false;
+#ifdef HAVE_CUDA
+                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                    mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    onGpu = true;
+                }
+#endif
+                if (!onGpu)
+                    mf = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
             case 'D': {
-                mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
+                bool onGpu = false;
+#ifdef HAVE_CUDA
+                if (meterGpu && cudaBdptSupported(scene)) {
+                    mf = renderBdptCuda(scene, mc.cam, W, H, meterSpp, /*maxDepth*/8, diffraction);
+                    onGpu = true;
+                }
+#endif
+                if (!onGpu)
+                    mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
                 break;
             }
             case 'M': {
+                // CPU fallback only: mode-M groups that pass the GPU gates are metered in
+                // ONE batched renderPhotonMapSharedCuda call in the group loop below
+                // (shared device map + GPU gathers), never per-frame here.
                 if (!meterPmapBuilt) {
                     double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                                           : scene.sceneRadius * g_pmRadiusFactor;
-                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap);
+                    tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC);
                     meterPmap.build(radius);
                     meterPmapBuilt = true;
                 }
@@ -5476,8 +5742,17 @@ static int run(int argc, char** argv) {
                 CompositeClass cc = classifyComposite(scene, mc.cam, W, H);
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                         false, false, true, e, diffraction, false);
-                Film ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
+                                         false, false, true, e, diffraction, meterGpu);
+                Film ref;
+                bool refGpu = false;
+#ifdef HAVE_CUDA
+                if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
+                    ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    refGpu = true;
+                }
+#endif
+                if (!refGpu)
+                    ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
                 mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc,
                                         scene.envIndex >= 0, /*verbose*/false);
                 filmToRgb8(mf, 1.0, 1.0, false, nullptr, &eAuto);
@@ -5486,7 +5761,7 @@ static int run(int argc, char** argv) {
             default: {   // S/U/V and any future mode: general forward mode-B light-trace
                 EnergyReport e;
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                   false, false, true, e, diffraction, false);
+                                   false, false, true, e, diffraction, meterGpu);
                 addEnvBackground(mf, scene, mc.cam, meterN);
                 filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
                 break;
@@ -5501,9 +5776,54 @@ static int run(int argc, char** argv) {
         const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
         const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
         MeterConverge conv(kmn, kmx, kMeterTolStops);
-        for (const auto& mc : cams) {
-            if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
+        bool metered = false;
+#ifdef HAVE_CUDA
+        // Batched GPU meter for a mode-M group: ONE device photon map + GPU gathers for
+        // the (up to kmx) meter frames, early-stopped by the same convergence test via
+        // the shared path's per-frame onFrame hook. Per-frame metering can't reuse a
+        // device map across meterAnchor calls, and the CPU version of this (one CPU map
+        // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
+        // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
+        // branch; any miss falls through to the per-frame loop below unchanged.
+        if (meterGpu && g_pmFinalGather == 0 && cudaPhotonMapSupported(scene)) {
+            bool allM = true, allPinhole = true;
+            for (const auto& mc : cams) {
+                if (mc.mode != 'M')    allM = false;
+                if (mc.cam.hasLens()) allPinhole = false;
+            }
+            if (allM && allPinhole) {
+                std::vector<Camera> mcams; std::vector<int> rxs, rys;
+                for (int i = 0; i < kmx; ++i) {
+                    mcams.push_back(cams[i].cam);
+                    rxs.push_back(cams[i].res); rys.push_back(cams[i].resY);
+                }
+                const long long meterN = std::clamp((long long)cams[0].res * cams[0].resY * 40LL,
+                                                    500000LL, 4000000LL);
+                const long long meterSpp = 16;   // matches meterAnchor's reduced budget
+                double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
+                                                      : scene.sceneRadius * g_pmRadiusFactor;
+                std::printf("[meter] exposure lock: group %d metering on %s (shared "
+                            "photon map, up to %d frame(s)) ...\n",
+                            g, cudaDeviceName(), kmx);
+                std::fflush(stdout);
+                EnergyReport e;
+                std::function<bool(int, const Film&)> onFrame =
+                    [&](int, const Film& f) -> bool {
+                        double eAuto = 0.0;
+                        filmToRgb8(f, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                        return conv.add(eAuto) || g_stopRequested != 0;
+                    };
+                renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
+                                          diffraction, meterSpp, nullptr, &onFrame,
+                                          nullptr, nullptr, g_heroC);
+                metered = true;   // a black meter falls into the no-anchor warning below
+            }
         }
+#endif
+        if (!metered)
+            for (const auto& mc : cams) {
+                if (conv.add(meterAnchor(mc))) break;   // adaptive early-stop once converged
+            }
         if (conv.used() > 0) {
             expAnchors[g] = conv.anchor();
             if (adaptive)
@@ -5542,8 +5862,8 @@ static int run(int argc, char** argv) {
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
-        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
-            useGpuForward = true;
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene) && !g_beamGather)
+            useGpuForward = true;   // -beams per-camera resample is CPU-only for now
     }
 #endif
     (void)useGpuForward;   // only read under HAVE_CUDA; keep CPU-only builds warning-clean
@@ -5645,11 +5965,11 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             if (useGpuForward)
                 films = renderForwardSharedCuda(scene, cams, rxs, rys, batchN, e, diffraction,
-                                                groupMode, (unsigned long long)accN, wavefront);
+                                                groupMode, (unsigned long long)accN, wavefront, g_heroC);
             else
 #endif
                 films = renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
-                                            groupMode == 'A', (unsigned long long)accN);
+                                            groupMode == 'A', (unsigned long long)accN, g_beamGather);
             for (int c = 0; c < nc; ++c) acc[c].merge(films[c]);
             accN += batchN;
             accE.emitted += e.emitted; accE.absorbed += e.absorbed; accE.sensor += e.sensor;
@@ -5869,7 +6189,7 @@ static int run(int argc, char** argv) {
                                           diffraction, spp,
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
-                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str());
+                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
@@ -5884,7 +6204,7 @@ static int run(int argc, char** argv) {
                     g_pmFinalGather > 0 ? " [final gather]" : "");
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
-        tracePhotonPass(scene, N, nThreads, diffraction, pm);
+        tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
         pm.build(radius);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "

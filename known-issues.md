@@ -5,6 +5,182 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TOOLING (2026-07-22): Nsight Compute (`ncu`) blocked by ERR_NVGPUCTRPERM — GPU perf counters admin-locked in the driver
+
+`ncu` profiling of ftrace kernels fails with `ERR_NVGPUCTRPERM` (GPU performance
+counters restricted to admin). Until unlocked, kernel-level profiling has to fall back
+to ablation timing (code ablation + scene-copy ablation, as used for the 2026-07-22
+BDPT campaign) and `cuobjdump -res-usage ftrace.exe` for register/stack pressure.
+
+**Fixes (in order of practicality):**
+1. **Just run `ncu` from an elevated (Administrator) shell** — the restriction is only
+   enforced for non-admin users, so an admin PowerShell/Terminal profiles without any
+   system change or reboot. Simplest for occasional profiling.
+2. **Permanently allow all users via the driver registry policy** (this is the value the
+   Control-Panel checkbox actually writes). In an elevated PowerShell:
+   ```powershell
+   New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" -Force | Out-Null
+   Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" -Name "RmProfilingAdminOnly" -Type DWord -Value 0
+   ```
+   `RmProfilingAdminOnly = 0` = allow all users; `1` or absent = admin-only. **Reboot**,
+   then `ncu` works from a normal shell.
+3. NVIDIA Control Panel → Developer → Manage GPU Performance Counters → "Allow access to
+   all users" is the documented GUI path, **but the Developer section is frequently
+   absent** from recent drivers' classic Control Panel (verified 2026-07-22: no Developer
+   node in the left tree, and there is no toggle for it under Desktop/3D-settings), so
+   don't rely on this — use (1) or (2).
+
+### DEBT (2026-07-22): gallery GPU configs are now dominated by the ~8.4 s fixed CPU-side setup (parse/tessellate/BVH/upload)
+
+After the 0.19.14 FP32 implicit march, the gallery kernels are cheap enough that the
+fixed per-run scene setup — `.ftsl` parse, mesh/implicit prep, BVH build, device upload,
+shared by every mode — is the biggest remaining term: ~8.4 s of `M_gpu_gallery`'s ~9.7 s
+total and ~46% of `D_gpu_gallery`'s ~18.2 s (numbers from `scraps/bench_dm_final.json`,
+RTX 4090). Any further wall-clock win on these configs must come from the setup path
+(profile first: parse vs tessellation vs BVH vs upload — unmeasured as of this entry).
+
+### BUG (2026-07-22): freshly CMake-configured build dirs produce a GPU-silently-dead ftrace.exe (black renders, no CUDA error) — affects fresh clones!
+
+Any build dir configured from scratch (observed with VS 2022 generator + CUDA 13.0,
+`cmake -S . -B <fresh> -G "Visual Studio 17 2022" -A x64 -DFTRACE_GPU_FP32=ON`) yields an
+exe whose GPU renders are silently dead: the GPU is detected, kernels appear to launch and
+"complete" (cornell `-n 1e6 -device gpu` finishes in ~0.5 s), no CUDA error is reported,
+but the tally is `absorbed=1.0000 sensor=0.0000`, auto-exposure=1, image black. Proven
+**source-independent** during the 2026-07-21/22 optimization campaign: revisions 5b75bfb
+and f0d2f13 both broken when built from freshly configured dirs (tried both
+`FTRACE_CUDA_ARCH=native` default and `=89` → `--generate-code=arch=compute_89,code=[compute_89,sm_89]`,
+full recompiles), while the **same 5b75bfb source built in the long-lived
+`build_cuda2`** (incremental, originally configured weeks ago) renders correctly
+(absorbed=0.6724 escaped=0.3301 on cornell). HEAD from the long-lived dir also works.
+The failure signature (everything "absorbed", zero sensor hits, no error) suggests device
+code that runs but sees zeroed/duplicated `__constant__` scene state — prime suspects:
+RDC device-link `__constant__` symbol duplication, or a difference in the VS CUDA
+integration props/targets picked up at configure time between the old and new CMake runs.
+**Workaround:** build in the long-lived `build_cuda2` (for old revisions: temporary
+`git checkout <rev> -- src/`, build, `git checkout HEAD -- src/`). **Must investigate** —
+a fresh clone of the repo currently cannot produce a working GPU build. Next steps: diff
+the generated `ftrace.vcxproj` + CMakeCache between the long-lived and a fresh dir
+(beyond the arch flags already ruled out), check CUDA toolset version selection, and probe
+`cudaMemcpyFromSymbol` of the scene constants at render start in a fresh-dir build.
+
+### MINOR (2026-07-22): GPU raster see-through output isn't run-to-run bit-stable (atomicMulF product order)
+
+The GPU rasterizer's see-through clear pass (`kClear` in src/raster_cuda.cu) accumulates
+per-pixel transmittance/milk as `atomicMulF` products. Float multiplication isn't
+associative, so when ≥2 clear fragments cover one pixel the low-order bits of the final
+product depend on which thread's CAS lands first — a GPU-scheduling artifact. Observed
+during the 2026-07-22 raster-perf campaign: `-in scenes/gallery_settled.ftsl -camera cam
+-raster -see-through -raster-bench 20 -device gpu` flips between exactly two output
+sha1s (`fdd7e910…`/`dfb365a7…`) across runs, stable *within* a time window (back-to-back
+invocations of even *different* builds agree; runs hours apart can differ — consistent
+with clock/thermal state steering the same race the same way). Affects the 0.19.0
+pre-optimization binary identically, so it predates the optimization work; the opaque
+paths (no `-see-through`) are fully deterministic. The kernel comment's
+"order-independent" claim holds mathematically (commutative product) but not bit-exactly.
+Impact: invisible (±1 ulp on a transmittance product); matters only to byte-comparison
+harnesses, which must A/B ref-vs-new within one run (as scraps/rb_verify.sh does) rather
+than compare hashes across sessions. Proper fix if ever needed: deterministic ordered
+reduction (sort fragments per pixel by slot index, or accumulate in fixed-point).
+
+### MINOR tech debt (2026-07-22): HIP alias block deliberately omits `__shfl_sync` (kRasterMed ticket broadcast)
+
+`kRasterMed` in src/raster_cuda.cu broadcasts its warp ticket with
+`__shfl_sync(0xffffffffu, li, 0)`. The file's HIP compatibility alias block does **not**
+alias it, on purpose: a naive `__shfl` alias would compile on ROCm but silently
+mis-broadcast on wave64 GPUs (64-lane wavefronts vs the 32-lane mask/stride the kernel
+assumes), dropping triangles. As written, a HIP build fails loudly at the call site
+instead. Proper fix when HIP is actually targeted: make the ticket queue wave-size-aware
+(`warpSize`-based lane math + the matching wave-wide shuffle/ballot intrinsics). No
+impact on CUDA builds; HIP remains untested/no-AMD-hardware anyway (see the HIP entry
+near the end of this file).
+
+### FIXED (2026-07-21): mode D heap-use-after-free (dangling `Vertex&` across `push_back`) + per-work-unit RNG seeding makes all CPU spp/photon modes chunk- and resume-independent
+
+Two intertwined fixes, one commit (v0.18.2):
+
+**(1) BDPT use-after-free (real, long-standing).** `bdpt::randomWalk` (src/bdpt.h) took
+`Vertex& prev = path.back()` *before* `path.push_back(v)`; when the push reallocated,
+`prev` dangled — the later `wo = normalize(prev.p - cur.p)` read freed heap (corrupting
+MIS pdfs by up to ~9% rel in ~1e5 doubles of a 256² film) and `prev.pdfRev = …` **wrote**
+8 bytes into the freed block (heap corruption; almost certainly the one-off hard crash
+seen in a bench run — exit with no output, never reproduced). Whether the realloc fired
+at a given vertex depended on the *capacity history* of the per-thread `eye`/`light`
+vectors, i.e. on how `cpuSppChunks` happened to split the spp — which is wall-clock
+adaptive — so paired runs differed and the corruption masqueraded as a thread race.
+Fix: index (`prevSurfIdx`), matching the medium branch, which already did it right.
+Verified: MSVC ASan (container annotations proven active via probe) clean on the
+reproducing config; ftbufs byte-identical across three builds (ASan / plain CPU /
+CUDA) under forced splits (`FTRACE_CHUNK_SPP=K` debug env, added to `cpuSppChunks`
+alongside `FTRACE_CHUNK_DEBUG`); adaptive-split pairs now differ only at ≤1e-15 rel
+(pure summation-order ulp, same benign class as mode R).
+
+**(2) Per-work-unit seeding.** Every photon (A/B/C/P/M/S) and every (pixel, sample)
+(R/D) now seeds its own Pcg32 via `seedUnit(rng, unitIndex, salt)` (splitmix64 mix in
+src/rng.h) instead of seeding per chunk/thread — the realization is independent of
+chunk splits, thread count, banding, and `-resume` boundaries. This also fixed SPPM
+(mode S) re-emitting the *same* photons every pass (`tracePhotonPass` now takes
+`seedBase` = cumulative emitted count), which had silently capped S convergence.
+Observable consequence: CPU renders of R/P/D/M/S produce different (correct-noise)
+realizations than v0.18.1; bench reference hashes rebased (`scraps/bench_cpu2.json`).
+
+### PERF NOTE (2026-07-22): GPU photon-gather CIE side-table tried and REVERTED — 11–14% *slower*; don't retry
+
+The mode-M CPU win (commit 9907034: precompute per-photon `cieX/Y/Z` once in
+`PhotonMap::build`, 3.65×) does NOT transfer to the GPU gather (`dPhotonGather`,
+src/render_cuda.cu). A device twin (`kPhotonCie` filling a 3-`Real`-per-photon
+side-buffer, reads bit-identical — sha1 matched the per-visit evaluation exactly)
+benched 96.7–99.1s vs 86.8s baseline on `M_gpu_cornell` (-n 3e7 -spp 64 -r 512,
+RTX 4090). Reason: with FTRACE_GPU_FP32 the CMF fit is 21 `expf` → SFU ops, nearly
+free, while the gather is memory-latency-bound on random photon reads — adding a
+second 12-byte random-access stream per visit only added traffic. Packing the CIE
+into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
+bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
+
+### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the GPU forward megakernel (A/B/C + M-deposit) — GPU wavefront, GPU backward/BDPT, and VCM (U) still single-λ
+`radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
+`tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
+**CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
+secondaries, `hero.h` `kHeroC=4`). Its **device twin** (`traceHeroPhoton`/`genPhotonHero`/`shadeStepHero` in
+`src/render_cuda.cu`) now gives the **GPU forward megakernel** the same thing (modes A/B/C and the mode-M photon
+deposit — see the DONE item below). Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
+spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
+`sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
+chroma 0.87×, luma flat); GPU mode B on `cornell` (n=5e7, 300²: `-heroc 4` and `-heroc 1` both converge to
+auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-items are **not yet done**:
+- **GPU forward megakernel (A/B/C + M-deposit) — DONE 2026-07-20.** `render_cuda.cu` grows a device twin of
+  `tracePhotonHero`: `genPhotonHero` (stratified λ via the shared `sampleLambdaU`), `shadeStepHero` (per-λ
+  deposit + camera splat via `connectHero`/`connectLensHero`/`camSpecularSplatAllHero`, hero RR with secondary
+  reweight), `traceHeroPhoton` (de-hero at a dispersive interface boosts the hero ×C and falls through to the
+  scalar `shadeStep`). No duplication: the nine specular lobes were extracted into a shared device
+  `interactSpecular()` used by both `shadeStep` and de-hero. `kTrace` branches on a new `heroC` parameter;
+  `launchForward` gates it on `mediaN==0 && !hasGrin` and **forces the megakernel** (hero is not in the wavefront
+  scheduler), threaded through `renderForwardCuda`/`renderForwardSharedCuda`/`renderPhotonMapSharedCuda` fed
+  `g_heroC`. `-heroc 1` is bit-identical to the classic single-λ device stream.
+- **GPU wavefront (streaming) backend** (`render_cuda.cu` `wavefrontTrace`) — still 1 λ/photon; `-wavefront`
+  with `-heroc>1` silently falls back to the megakernel (which does carry hero). Port the SoA pool to hold the
+  `lam[]`/`beta[]` bundle if the streaming backend ever needs the chroma win on divergent scenes.
+- **GPU backward megakernel** (`renderBackwardCuda`) — mode R on GPU is still single-λ, so `-mode R -device gpu`
+  does *not* get the colour-noise reduction. (The `-device auto` default picks GPU on this machine, so hero only
+  kicks in with `-device cpu`.)
+- **GPU BDPT megakernel** (`kBdpt`) and **BDPT (D)** — still 1 λ/photon.
+  Propagate the same shared wavelength-sampling + de-hero policy rather than copying the logic per mode.
+- **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
+  **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
+  beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets
+  `r.useHero` under the `kHeroC>1 && scene.media.empty() && !sceneHasGrin` gate. The gather keys off each photon's
+  own λ (`photonmap_render.h:245`), so the heterogeneous-λ map gathers correctly; C records of `base/C` sum to
+  `base` and `nEmitted` counts PATHS, so the estimate is energy-identical to single-λ. Cost: up to C× more stored
+  photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
+  BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
+- **Two known approximations in the CPU hero path** (both minor, documented for when they're revisited):
+  - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
+    varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
+    weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.
+  - **Equal-*time* benefit is geometry-dependent.** Hero shares one BVH walk across C wavelengths, so its win grows
+    with scene complexity. On trivial geometry (Cornell: a few quads + 2 spheres) traversal is nearly free and the
+    4× per-λ shading makes hero ~1.6× slower per spp, so at *equal time* single-λ can edge it there. On heavy
+    geometry the shared traversal amortizes and hero wins outright. This is expected hero behaviour, not a bug.
+
 ### TECH-DEBT (2026-07-20): forward mode B barely converges the water-droplet rainbow (`scraps/rainbow_test.ftsl`); mode D works well
 The Airy rainbow phase model (`src/rainbow.h`) is **verified correct** — `ftrace -rainbow-selftest`
 reports textbook geometry (primary 40.7°–42.5° antisolar, secondary 50.1°–53.4° with reversed
@@ -24,6 +200,105 @@ at this scale. **Proper fix (deferred):** give the forward medium-scatter path a
 camera-connection term for participating media (so each scatter vertex connects to the camera with a
 proper importance weight, like BDPT does) instead of relying on the plain pinhole splat, or document
 that rainbow/fog-bow scenes should use mode D. Low priority — mode D covers the use case.
+(Note: a compact, dense, short-range fog *does* image in mode B — see `scenes/_rainbow_test.ftsl`,
+a room-scale droplet box flooded by a wide collimated beam, which shows a full centred bow in mode B
+though noisily. The gap is specifically thin/large-scale atmospheric slabs.)
+
+### ENHANCEMENT (2026-07-21): photon beams for a CHEAP, clean rainbow/volumetric FLYBY (shared deposit + per-camera gather) — **DONE (single-scatter long-beam, CPU `-beams`)**
+**DONE 2026-07-21.** Shipped as the `-beams` (alias `-photonbeams`) CLI flag on the shared forward
+mode-B pass. The deposit/gather decoupling is implemented as an **unbiased single-scattering
+long-beam estimator** rather than the full Jarosz beam-BVH (see "How it was actually built" below);
+this is the correct trade for a crisp view-dependent bow (rainbows/fogbows/glories ARE single
+scatter). Validated on `scenes/_rainbow_beams_decorr.ftsl` (two identically-placed mode-B cameras):
+baseline shared pass → camA/camB **bit-identical** (frozen speckle, the flaw); `-beams` → camA/camB
+**decorrelated** (93.6% of pixels differ) with a **matching mean** (123.29 vs 123.28) — i.e. same
+bow, independent per-frame noise, unbiased. `[energy] sum/emitted=1.000000`. The original problem
+statement and design are kept below for reference.
+
+**Problem.** A rainbow (or any volumetric single-scatter effect: fogbow, glory, crepuscular rays)
+is **view-dependent single scattering** — the phase angle θ is measured *to the eye*, so every
+camera/frame sees a different bow. On a flyby this forces a per-frame cost with today's integrators:
+- **Forward shared multi-camera pass** (`renderForwardShared`, `main.cpp` ~1264) traces ONE photon
+  flight and splats every volume vertex to *all* cameras — 1× photon cost for the whole flyby, and
+  the bow is per-camera-correct (each connection uses that camera's angle). BUT all frames ride the
+  *same* photon realisation → one **frozen noise/speckle pattern** baked into every frame, which
+  looks wrong in a video (hence a `camera_path` with `exposure_lock` is deliberately rendered
+  UN-shared, `main.cpp` ~5579-5602).
+- **Un-shared forward / mode D (BDPT) per frame** → independent per-frame noise (good video), correct
+  bow, but **N× cost** (retrace the whole light transport every frame). Mode D is the quality route
+  today (the entry above); it is inherently per-camera and cannot share across frames.
+- **Mode M (surface photon map) is the WRONG tool** and cannot help even if volumetric scattering were
+  added to it: photon mapping's payoff is caching the **view-independent** multiple-scatter / indirect
+  solution, but the bow is view-dependent **single** scatter — there is nothing view-independent to
+  cache about it. Mode M also currently has *no* participating-media scattering at all (only the
+  nested-dielectric IOR/Beer-Lambert stack, `photonmap_render.h`), so it renders scattering fog as if
+  it weren't there.
+
+**The fix — photon beams (Jarosz et al. 2011, "progressive photon beams").** Store each photon's
+*path segment through the medium* as a BEAM (origin, direction, power, per-λ), which is **view-
+independent** — deposit the beam set ONCE and reuse it for the whole flyby. Then each camera
+ray-marches its primary rays and gathers in-scattered radiance from the nearby beams, evaluating the
+droplet phase `p(θ,λ)` (`src/rainbow.h`) toward *its own* eye. This **decouples the expensive light
+deposit (shared, 1×) from the per-camera gather (independent noise, correct per-view angle)** — i.e.
+the "fast AND best" combination: ~1× photon cost across the flyby, clean non-frozen per-frame noise,
+correct view-dependent bow. It is essentially a noise-decorrelated version of the shared forward pass.
+
+**Scope / cost.** A substantial new volumetric integrator: a beam data structure + acceleration
+(beam BVH or the standard photon-beam grid), a ray-march-and-gather estimator on the camera side, the
+spectral/hero plumbing to carry per-λ beam power, and wiring into the flyby/checkpoint machinery
+(and ideally the GPU forward path). Only worth building if rainbow/fogbow/volumetric flybys become a
+recurring need. **For a one-off showcase, use mode D per frame (best quality, works today).** Related:
+the "forward medium-scatter next-event/camera-connection" proper-fix in the entry above is a smaller
+step that would make mode B converge the bow (and ride the shared pass for 1× cost) but does NOT solve
+the frozen-noise-in-video problem — only the deposit/gather decoupling of photon beams does.
+
+**How it was actually built (2026-07-21).** Instead of a stored beam data structure + BVH, the
+implementation exploits the fact that a rainbow is *single scatter* and folds deposit-and-gather into
+the existing shared forward photon trace, decorrelated per camera:
+- **Photon crosses the medium STRAIGHT** in `-beams` mode (`tracePhoton`, `src/render.h`): the analog
+  in-medium collision sampling is skipped (`doBeamGather = beamGather && nCam>1 && !forwardCatch &&
+  !media.empty()`), so the photon carries the full light path up to the medium and is attenuated by
+  extinction (`beta *= mediaTransmittance(...)`, the loss booked to `e.absorbed` so `sum/emitted=1`).
+  No analog scatter/redirect ⇒ no correlated realisation shared across cameras.
+- **Each camera independently draws its OWN single-scatter point** along the crossing with a
+  per-photon `Pcg32 crng` (seeded from the photon's RNG): `sampleMediaCollision` over `[0,dSurf]`,
+  then splat via `connectVolume` (+ `camSpecularSplatVolumeAll`). This is unbiased for single scatter
+  because the free-flight collision pdf's `Tr` cancels `connectVolume`'s `albedo·phase·T_cam·β`, so
+  `E = I(dSurf)` = the exact single-scatter in-scatter integral, and each camera's independent RNG
+  gives independent (non-frozen) noise. `connectLensVolume` used under `-lens`.
+- **Deliberately omits multiple scattering** (the desaturating haze wash the baseline shows) — that is
+  what makes the `-beams` bow visibly *crisper* than the shared baseline, at slightly lower total
+  brightness (single-scatter only). This is the intended quality trade for a clean view-dependent bow.
+- **Wiring** (`src/main.cpp`): `static bool g_beamGather`; `-beams`/`-photonbeams` flag; `beamGather`
+  param threaded into `renderForwardShared` → `r.beamGather`. **Forced onto CPU** (the GPU forward
+  path is not wired for it): `-beams` disables the GPU-forward auto-select. Rides the existing shared
+  chunking/checkpoint/`-resume` machinery unchanged. Bonus: single-scatter photons terminate at the
+  medium so the pass is *faster* than the full analog trace.
+- **Not done / future:** GPU port, multiple-scatter beams (full Jarosz), and the stored-beam BVH (only
+  needed if a use case wants view-independent beam reuse beyond the shared-pass model). Mode M/D
+  untouched.
+
+### RESOLVED (2026-07-21): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
+**FIXED 2026-07-21.** The real root cause was narrower than the per-render-target
+`Film` note below: `struct Camera` (`src/camera.h`) *embeds a full `Film film;`
+member*, and `Camera::lookAt()` called `film.alloc()` on it. Every selected camera
+(600 `toRender` RenderCams **plus** 600 `meterPlan` MeterCams for the exposure_lock
+pre-pass) therefore carried a live 960×540 film (~16.6 MB) → ~20 GB of allocations
+*before a single photon was traced*. But nothing ever reads a `Camera` instance's
+embedded `xyz`/`hits` — `project()`/`genRay()`/`pixelPlaneArea()`/`pixelSolidAngle()`/
+`genLensRay()` only read `film.resX`/`resY` metadata; every actual render path
+(`renderForward`, `renderPhotonCamera`, `renderForwardShared`'s per-thread targets,
+the backward tracer, checkpoints) owns a *separate* `Film`. Fix: drop the
+`film.alloc()` in `lookAt()`, keep only `film.resX/resY`. Each camera falls from
+~16 MB to a few hundred bytes; verified the flyby now plateaus at ~938 MB (was
+~20 GB) and renders correct, energy-conserving frames. Bit-identical to baseline
+(only an unused allocation removed). This is cleaner than the "chunk the film
+allocation in batches" workaround floated below — it fixes *all* multi-camera
+renders, not just this scene. `render_gallery_flyby.bat` drives the full 600-frame
+mode-M flyby → `png/gallery_settled_fly/gallery_settled.mp4` (cap photons at ~2M per
+the mode-M shared-build caveat elsewhere in this file).
+
+Original report follows.
 
 ### BUG (2026-07-19; root-caused 2026-07-20): `scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera selection
 `error: bad allocation` (exit 1) rendering `scenes/gallery_settled.ftsl`.
@@ -153,6 +428,11 @@ scene-cache request above); (d) no persistent GPU-resident vertex buffers / we m
 step:** profile a representative scene (CPU vs `-raster-gpu`) to find the actual bottleneck rather
 than guessing; compare against what a trivial WebGL draw of the same triangle count costs. This is a
 "why is it slow" investigation, not a confirmed single bug.
+**Update 2026-07-22:** the optimization campaign cut CPU raster gallery startup+render
+2.68× (15.24 s → 5.68 s; OBJ parser rewrite 00b0765, parallel per-implicit marching
+828e7a0, parallel marchImplicit stages 1a78ef6). Still not WebGL-class — the remaining
+gap is per-launch scene rebuild + the software shading passes; the profiling task above
+stands.
 
 ### FEATURE REQUEST (2026-07-19): option for curve-editor curve to be occluded by geometry in front of it
 The camera-path / curve overlay shown in the curve editor currently draws over everything (an
@@ -161,6 +441,20 @@ in front of it occlude it (more spatially truthful), while keeping the always-vi
 (often you *want* to see the whole path through geometry). Implementation: test the curve fragments'
 depth against the opaque z-buffer the rasterizer already produces; expose as a toggle (CLI flag +/or
 editor control). Low risk — the z-buffer is already there.
+
+### DONE (2026-07-22): interactive hover-look spun the view off-screen on light scenes (frame-rate-locked turn rate)
+The live-window fly viewer's hover-look turn was applied **per rendered frame**
+(`kYaw = 0.040`, `kPitch = 0.030` rad/frame in main.cpp's interactive loop), so the turn
+speed scaled with render fps. On a heavy scene that self-limited, but a light model
+(e.g. `ftrace cloud1.glb`, which raster-previews at hundreds of fps) turned hundreds of
+times faster than intended: since it's *hover*-look (the view keeps turning while the
+cursor merely sits off-centre), just having the cursor slightly off-centre after clicking
+Reset flung the model out of frame almost instantly. **Fix:** integrate the turn by the
+wall-clock frame time — `kYaw`/`kPitch` are now rad/**second** (1.6 / 1.2) multiplied by
+the loop's already-computed `dt` (clamped to 0.25 s), making steering frame-rate
+independent. Free *translation* stays feedback-locked per frame (collision safety — can't
+skip through geometry between unseen frames); rotation-in-place never moves the eye, so it
+had no reason to be frame-locked. (0.19.15; README interactive-controls note updated.)
 
 ### DONE (2026-07-19): loom RBF scatter field rebuilt the interpolator every frame
 `RbfScatterField` / `VecRbfScatterField` (`loom/interp.py`, `_RbfEngine`) used to rebuild the
@@ -687,38 +981,42 @@ keep the two paths consistent: A/C get `1/N²` from the pupil-area `R²` splat w
 do NOT double-apply. Ideal end state is one camera-equation absolute model (add
 `cos⁴θ` natural vignetting too) that makes A, B, C agree at equal `power`.
 
-### OPEN (2026-07-15): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
+### DONE (2026-07-22, no longer reproduces): mode D (GPU BDPT) — data-dependent "unspecified launch failure" on gallery_settled.ftsl
 
-Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** crashes with
+Rendering `scenes/gallery_settled.ftsl` in **mode D on the GPU** used to crash with
 `[cuda] bdpt kernel failed: unspecified launch failure` reproducibly at **spp 14**
-(~232 s in; earlier spp complete fine and write correct images). It is an illegal
-memory access inside the BDPT megakernel (`kBdpt`, `render_cuda.cu` ~4283), NOT a TDR
-timeout (chunks are ~0.15 s) and NOT GPU contention (single process).
+(~232 s in; earlier spp complete fine and write correct images) — an illegal memory
+access inside the BDPT megakernel (`kBdpt`), NOT a TDR timeout (chunks ~0.15 s) and
+NOT GPU contention (single process). Bounds inspection of the per-thread
+`eye[]`/`light[]` subpath arrays (`BDPT_MAXV=11`), `DMediumStack` (CAP 8, push
+guarded), media free-flight loops, and the `double st[64]` VM stacks found nothing;
+a bounded memcheck on the still cam (`-camera cam -spp 6`) was clean.
 
-**Ruled out by inspection:** the per-thread `eye[]`/`light[]` subpath arrays
-(`BDPT_MAXV=11`), the `DMediumStack` (CAP 8, push guarded), the media free-flight
-loops, and the `double st[64]` pattern/field VM stacks are all bounds-safe. The fault
-is **data-dependent** (RNG seeded by the global sample index `gidx`, so it reproduces
-deterministically regardless of timing) — some specific path at spp 14 indexes out of
-bounds or dereferences a bad pointer, likely a rare geometric/CSG/medium configuration
-hit only by that sample's random walk.
+**Resolution (v0.19.8): the crash no longer reproduces, on any of three axes tried.**
+1. **Faithful seed replay** — the original failing run was `-noise 3` (progressive,
+   `sppTotal = UNBOUNDED_SPP = 1e9`, so `gidx = pix*1e9 + k`); replaying exactly that
+   (`-camera cam -noise 3 -device gpu`) ran clean to **45 spp**, 3× past the historical
+   crash point, correct images throughout.
+2. **Fixed-budget replay** (`-camera cam -spp 16`, a *different* seed schedule since
+   `gidx` mixes the run's total spp) — clean.
+3. **Flyby-position soak** — the "crash is flyby-viewpoint-specific" hypothesis:
+   72 positions along the fly curve (scratch scene with the curve set to
+   `mode D frames 72`, `-spp 4` each, 960×540) — all 72 frames clean, zero CUDA errors.
 
-**Investigation status (2026-07-15 update):** a **bounded** `compute-sanitizer --tool
-memcheck` run — mode-D BDPT pinned to the single still camera (`-camera cam -spp 6`, so
-it terminates instead of rolling onto the 144-frame flyby) — completed with **ZERO
-memory errors**. So the fault does **not** reproduce on the still frame at low spp; it is
-either **flyby-camera-position specific** (a geometric configuration only some moving-cam
-viewpoint hits) or was already mitigated by unrelated fixes since the crash was first
-seen. The earlier unbounded attempt (`-noise 3`, no `-camera`) never reached spp 14
-(memcheck ~65× slowdown) and also rolled onto the flyby — avoid that; always bound it.
-**Next step:** reproduce at the *specific* crashing spp/camera (drive to spp 14 on the
-flyby camera under a bounded memcheck) to catch the exact `render_cuda.cu:<line>`, then
-fix the OOB. Earlier context: build has `-lineinfo`, so memcheck reports the exact line.
-Repro (headless — sanitizer runs instrumented). Use the real `compute-sanitizer.exe`
-(in the CUDA `compute-sanitizer/` subdir), NOT the `bin/compute-sanitizer.bat` wrapper —
-the `.bat` exits 127 (no useful output) when launched from the bash tool:
-`"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/compute-sanitizer/compute-sanitizer.exe" --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -mode D -device gpu -noise 3 -o png/_sanit.png`
-Mode B on the same scene is stable, and the new `-raster` preview is unaffected.
+A fresh code audit of `kBdpt` / `dConnectBDPT` / `dMisWeight` / `DCamera::project` /
+`selectEmitter` found no OOB (project is edge-clamped, MIS fully guarded, maxDepth
+clamped to device capacity). Prime suspect for the incidental fix: the **watertight
+ray-triangle intersection** rework (41ac6a4, 2026-07-18, Woop et al. JCGT 2013) —
+changed hit numerics re-route the data-dependent pathological path; the
+shadow-terminator and adjoint-correction changes in the same window are also
+candidates. Root cause was never pinned to a line, so treat as *mitigated in
+practice*, not proven-fixed.
+
+**If it ever recurs:** bound the repro (always pin `-camera` and a finite budget) and
+run the real `compute-sanitizer.exe` (in the CUDA `compute-sanitizer/` subdir — NOT
+`bin/compute-sanitizer.bat`, which exits 127 from the bash tool); the build has
+`-lineinfo`, so memcheck reports the exact `render_cuda.cu:<line>`:
+`"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/compute-sanitizer/compute-sanitizer.exe" --tool memcheck --log-file scraps/_sanit.log build_cuda2/bin/ftrace.exe -in scenes/gallery_settled.ftsl -camera cam -mode D -device gpu -spp 45 -o png/_sanit.png`
 
 ### DONE (2026-07-15): Forward modes now smooth-shade interpolated normals — Veach adjoint correction applied
 
@@ -1901,7 +2199,9 @@ correctly on **both** backends.
   colored glass, so those scenes fall back to the CPU BDPT.
 - **Implicit surfaces — DONE (2026-07-11, step 5a):** `render_cuda.cu` gained device
   twins `DFieldNode`/`DImplicit`, a postfix field evaluator (`dFieldEval`/`dFieldLeafSDF`/
-  `dFieldGradient`, all FP64 for sphere-trace bisection robustness), and
+  `dFieldGradient`, originally all FP64 for sphere-trace bisection robustness — since
+  0.19.14 the march/refine runs FP32 on mirrored pools, see the 2026-07-22 GPU-implicit
+  entry; gradients/normals and media bound-fields are still FP64), and
   `intersectImplicit` (a direct port of the CPU sphere-trace). `buildUpload` flattens
   every `Implicit`'s `FieldNode` array into one device pool and uploads a `DImplicit`
   descriptor per primitive; `closestHit`/`occluded` dispatch BVH prims with index
@@ -3017,7 +3317,7 @@ correctly on **both** backends.
   without lossy tessellation — useful independent of any importer, and the right way to
   ever support POV-Ray-style implicit geometry. Not started.
 
-## Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons)
+## DONE (2026-07-22): Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons) — was the CPU meter pre-pass; meter now runs on the requested device
 
 - **Symptom:** `renderPhotonMapSharedCuda` on `scenes/gallery_settled.ftsl` (via
   `scraps/gallery_fly.ftsl`) with `-n 4000000 -spp 6 -r 320 180` ran **67 min pegging
@@ -3034,6 +3334,76 @@ correctly on **both** backends.
 - **Proper fix (TODO):** profile the deposit/build with 2M vs 4M; find why host CPU
   scales super-linearly (likely an O(n^2) or lock-contended path, or grid cellSize
   degenerating so build buckets explode). Until fixed, cap flyby photons at ~2M.
+- **UPDATE 2026-07-21 — the "2M is fine" escape hatch does NOT hold at full film
+  resolution.** Re-tested on the real 600-frame `fly` curve (960×540, mode M) after
+  the Camera-film OOM fix: `-device gpu -n 2000000 -spp 4` (and `-spp 6`) **also
+  hangs** — GPU util sits at 0–6 %, working set ~1 GB, and **zero frames** are written
+  after 3–8 min (killed). The known-good "2M in ~2 min" measurement above used
+  `-r 320 180`; the hang is NOT purely a photon-count effect — it recurs at 2M once
+  the gather resolution is full. So the host-side build/download phase is the real
+  culprit regardless of photon count, and `-device gpu` is currently unusable for
+  this flyby at any practical resolution. The **CPU** shared path works but is slow
+  (~16 s/frame at 400k/spp3, 960×540 → ~3–5 h for 600 frames). `render_gallery_flyby.bat`
+  therefore forces `-device cpu`. Fixing the GPU host-side build is the unblock that
+  would make the flyby render in minutes instead of hours.
+- **CORRECTION 2026-07-21 — the "GPU hang" above was a MISDIAGNOSIS; the real cost is
+  the mode-M CPU meter pre-pass, not the GPU photon-map build.** `gallery_settled.ftsl`
+  uses `exposure_lock` (EXPLOCK_AVERAGE), so `meterAnchor` (main.cpp ~5484) runs a
+  CPU-only metering phase BEFORE any GPU render, **regardless of `-device`**: for mode M
+  it builds a ~4M-photon **CPU** photon map once (`meterN = clamp(W·H·40, 500k, 4M)` = 4M
+  at 960×540) and then gathers up to `kMeterMax = 64` frames at `meterSpp = 16` on the
+  CPU. That front-loaded phase is 10,000+ CPU-seconds (~28+ min) during which the GPU
+  correctly sits at ~1–6 % and **zero frames are written** (meter frames aren't saved) —
+  exactly the "hang" symptom I attributed to `renderPhotonMapSharedCuda`. Killing at
+  3–8 min just killed it mid-meter, before the GPU render ever started. So: the GPU
+  shared build is NOT known to hang at 2M/960×540; it was never reached. **The real
+  proper fix is to make the mode-M meter cheap** — e.g. drop `meterN`/`meterSpp` for the
+  noise-robust p99 anchor, cap `kMeterMax` lower, or GPU-accelerate `meterAnchor` — after
+  which `-device gpu` should be re-tested on the full-res flyby before concluding anything
+  about the GPU build path. (The `-r 320 180` "2M in ~2 min" run was fast partly because
+  its meter was also tiny: `meterN` scales with `W·H`.)
+- **RESOLVED 2026-07-22 — the meter pre-pass now runs on the requested device
+  (main.cpp `meterGpu`), and the GPU shared build is confirmed healthy at 4M/960×540.**
+  Two changes in the exposure-lock meter (`run()`, main.cpp ~5654):
+  1. **Per-frame metering follows `-device`.** `meterAnchor` now dispatches each mode's
+     meter render through the same GPU entry point (and the same support predicate) its
+     real render uses — A/B/C via `renderForward(useGpu)`, R via `renderBackwardCuda`,
+     D via `renderBdptCuda`, P both layers — falling back to the CPU renderer whenever
+     the predicate says no. `-device cpu` is **bit-identical** to before (verified:
+     old-vs-new exe print the same anchor to 4 sig figs AND all rendered frames sha1-match
+     on the gallery m8 scratch scene at 192×108).
+  2. **Mode-M groups meter in ONE batched GPU pass.** An all-M pinhole group (the flyby
+     case) now meters via `renderPhotonMapSharedCuda` — one device photon map + GPU
+     gathers for up to `kMeterMax` meter frames, early-stopped by the same `MeterConverge`
+     test through the shared path's `onFrame` hook — instead of one CPU map + up to 64
+     full-res CPU gathers. Gated exactly like `runSharedPhotonMap`'s GPU branch; any
+     gate miss falls through to the per-frame CPU loop unchanged.
+  **End-to-end verification** (8-frame `fly` scratch copy of `gallery_settled.ftsl`,
+  960×540, `-device gpu -n 4000000 -spp 8`): meter = deposit + 8 GPU gathers in ~2–3 min
+  (was 10,000+ CPU-s ≈ 28+ min), anchor 2.981e-09 (CPU meter cross-check at 192×108:
+  2.967e-09, agreement ~0.007 stops); then the REAL `renderPhotonMapSharedCuda` phase —
+  the part the correction above said "was never reached" — ran the **4M-photon device
+  deposit + build + per-camera gathers and streamed frames to disk** with the locked
+  exposure applied (auto-exposure=2.98e-09 on every frame). So the GPU shared build
+  never had a hang at all; the whole symptom was the CPU meter. Remaining perf note:
+  each full-res 960×540×16spp meter gather is ~15 s on the 4090 — the gather kernel is
+  a hot-path optimization candidate (tracked in the 2026-07 D/M GPU optimization work).
+
+## Mode-M shared render ignores `-window` — no live preview opens (2026-07-21)
+- **Symptom:** rendering the gallery `fly` curve in mode M with `-window` never opens
+  a Win32 live-preview window. Verified via `Get-Process ftrace` → `MainWindowHandle=0`
+  and empty `MainWindowTitle` for the entire render, on both the GPU and CPU paths,
+  even while the CPU path was actively writing frames to disk. (Single-camera forward
+  and mode-R/B/C renders DO open the window normally — this is specific to the
+  mode-M shared-photon-map multi-camera path, `runSharedPhotonMap` in `src/main.cpp`.)
+- **Impact:** violates the project's "always show the live preview so the user can
+  watch it converge" rule for exactly the long multi-frame renders where watching
+  matters most. The user cannot see a flyby converging; only the on-disk PNGs reveal
+  progress.
+- **Proper fix (TODO):** wire the shared-photon-map gather loop into the same
+  `LiveWindow` lifecycle the single-camera forward path uses — create/show the window
+  before the first gather and push each freshly-gathered frame's tone-mapped buffer to
+  it (mirroring the per-frame `writeFrame`), instead of only writing the PNG.
 
 ## Access-violation popup when closing the live-preview window (intermittent) — PARTIALLY ADDRESSED (2026-07-17)
 

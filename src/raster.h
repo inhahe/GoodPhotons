@@ -23,6 +23,8 @@
 #include <cmath>
 #include <algorithm>
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <functional>
 #include <array>
 #include "scene.h"
@@ -267,11 +269,58 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
     if (isoRes > 0) {
         isomesh::Options opt; opt.res = isoRes; opt.adaptive = false; opt.refineIters = 3;
         const int nImp = (int)sc.implicits.size();
-        int impIdx = 0;
-        for (const auto& im : sc.implicits) {
-            if (progress) progress(impIdx, nImp);
-            ++impIdx;
-            isomesh::Mesh m = isomesh::marchImplicit(im, opt);
+        // March the implicits in PARALLEL: each marchImplicit(im, opt) is a
+        // deterministic pure function of its inputs and the meshes land in a
+        // per-implicit slot, so emitting PTris below in the original implicit
+        // order yields a triangle list identical to the old sequential loop.
+        // Marching is by far the slow part of tessellation (seconds of field
+        // evals on a heavy scene) and was single-threaded on the calling thread.
+        // Tasks are handed out biggest-lattice-first so one whale implicit
+        // doesn't start last and stretch the makespan.
+        std::vector<isomesh::Mesh> meshes(sc.implicits.size());
+        if (nImp > 0) {
+            if (progress) progress(0, nImp);
+            std::vector<int> order(nImp);
+            for (int i = 0; i < nImp; ++i) order[i] = i;
+            auto cellEstimate = [&](const Implicit& im) -> double {
+                Vec3 e = im.bounds.hi - im.bounds.lo;
+                double maxe = std::max(e.x, std::max(e.y, e.z));
+                if (maxe <= 0) return 0.0;
+                auto cells = [&](double v) { return std::max(1.0, std::round(opt.res * (v / maxe))); };
+                return cells(e.x) * cells(e.y) * cells(e.z);
+            };
+            std::vector<double> est(nImp);
+            for (int i = 0; i < nImp; ++i) est[i] = cellEstimate(sc.implicits[i]);
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return est[a] > est[b]; });
+            unsigned hw = std::thread::hardware_concurrency(); if (hw == 0) hw = 4;
+            int T = (int)std::min<size_t>((size_t)nImp, (size_t)hw);
+            std::atomic<int> next{0}, done{0};
+            std::mutex progMx;
+            auto workBody = [&]() {
+                for (;;) {
+                    int slot = next.fetch_add(1);
+                    if (slot >= nImp) break;
+                    int i = order[slot];
+                    meshes[i] = isomesh::marchImplicit(sc.implicits[i], opt);
+                    int d = done.fetch_add(1) + 1;
+                    if (progress) { std::lock_guard<std::mutex> lk(progMx); progress(d, nImp); }
+                }
+            };
+            if (T <= 1) {
+                workBody();
+            } else {
+                std::vector<std::thread> pool;
+                pool.reserve(T);
+                for (int t = 0; t < T; ++t) pool.emplace_back(workBody);
+                for (auto& th : pool) th.join();
+            }
+        } else if (progress) {
+            progress(nImp, nImp);   // preserve the old progress(0,0) final call
+        }
+        for (int ii = 0; ii < nImp; ++ii) {
+            const auto& im = sc.implicits[ii];
+            const isomesh::Mesh& m = meshes[ii];
             Vec3 col = colOf(im.matId); bool em = emOf(im.matId); bool cl = clearOf(im.matId);
             // Marched implicits carry no per-vertex UVs, so a skin only shows via world
             // triplanar projection (triplanarScale > 0); a plain UV-bound texture stays flat.
@@ -287,7 +336,6 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
                 out.push_back(p);
             }
         }
-        if (progress) progress(nImp, nImp);
     }
 
     // (4) Instanced mesh assets (BLAS) baked into world space.
@@ -482,20 +530,39 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
     return s;
 }
 
+// sRGB gamma lookup table shared by the CPU tonemap below and the CUDA rasterizer's
+// on-device tonemap (raster_cuda.cu uploads these exact bytes once): the tone map clamps
+// each channel to [0,1] before encoding, and gamma is monotonic (anything >=1 saturates
+// to 255), so a 4096-entry LUT over [0,1] replaces three std::pow calls per pixel with a
+// table read + round — and having BOTH backends index the same table is what keeps their
+// encoded bytes identical.
+inline const std::array<uint8_t, 4097>& srgbLut8() {
+    static const std::array<uint8_t, 4097> t = [] {
+        std::array<uint8_t, 4097> a{};
+        for (int i = 0; i <= 4096; ++i)
+            a[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
+        return a;
+    }();
+    return t;
+}
+
 // Shared exposure + tone-map tail (the back half of renderFrame). Given a per-pixel
 // HDR `accum` buffer that has already been shaded (background pixels hold the unlit bg
 // tint), a `zbuf` hit key (>0 where a surface was drawn), an `emis` mask, and the
 // optional see-through transmittance/milk products, this applies the p99 auto-exposure
 // anchor and the sRGB tone map exactly as filmToRgb8 does, returning W*H*3 RGB8 (row 0 =
-// top). Factored out so the CPU rasterizer and the CUDA rasterizer share ONE copy of the
-// exposure/tonemap logic — the GPU path shades into an identical `accum`/`zbuf` on the
-// device, downloads them, and calls this, guaranteeing byte-identical exposure (including
-// a camera_path's shared `lockAnchor`) regardless of which backend produced the geometry.
-inline std::vector<uint8_t> exposeAndEncode(
-        const std::vector<Vec3>& accum, const std::vector<float>& zbuf,
-        const std::vector<uint8_t>& emis, int W, int H, int nThreads,
+// top). The CUDA rasterizer no longer calls this (it runs a device twin of this exact
+// maths — same p99 order statistic, same double-precision tonemap, same srgbLut8()
+// table — verified byte-identical); it remains the single host implementation, and any
+// change here must be mirrored in raster_cuda.cu's expose kernels.
+// Template core: `pixel(i)` must return the exact double-precision Vec3 colour of
+// pixel i (kept templated so a non-Vec3 HDR buffer can be adapted without a copy).
+template <class FetchVec3>
+inline std::vector<uint8_t> exposeAndEncodeT(
+        FetchVec3&& pixel, const float* zbuf, const uint8_t* emis,
+        int W, int H, int nThreads,
         double expComp, bool autoExpose, double* lockAnchor,
-        bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
+        bool seeThrough, const float* clearT, const float* milkT,
         const Vec3& milkColor) {
     const size_t N = (size_t)W * H;
     if (nThreads < 1) nThreads = 1;
@@ -518,23 +585,74 @@ inline std::vector<uint8_t> exposeAndEncode(
     // exposure (they just clip to white, as in the real render, instead of dragging the
     // anchor down when a large light fills the frame). Absolute EV (autoExpose=false)
     // bypasses this so aperture/power brightness differences survive into the preview.
+    //
+    // The collect runs banded across threads into a persistent scratch buffer: band ti
+    // fills [off[ti], off[ti]+cnt[ti]) with its qualifying pixels in row-major order, so
+    // the packed buffer holds the exact sequence a serial scan would produce and
+    // nth_element selects the identical 99th-percentile value.
     double eAuto = 1.0;
     if (autoExpose) {
         if (lockAnchor && *lockAnchor > 0.0) {
             eAuto = *lockAnchor;                    // reuse the path's locked anchor
         } else {
-            std::vector<double> lum; lum.reserve(N);
-            for (size_t i = 0; i < N; ++i) {
-                if (zbuf[i] <= 0.0f || emis[i]) continue;   // skip background + emitters
-                const Vec3& c = accum[i];
-                lum.push_back(std::max({c.x, c.y, c.z, 0.0}));
+            static thread_local std::vector<double> s_lum;   // persistent scratch (per calling thread)
+            size_t total = 0;
+            if (nThreads == 1) {
+                if (s_lum.size() < N) s_lum.resize(N);
+                double* dst = s_lum.data();
+                for (size_t i = 0; i < N; ++i) {
+                    if (zbuf[i] <= 0.0f || emis[i]) continue;   // skip background + emitters
+                    const Vec3 c = pixel(i);
+                    *dst++ = std::max({c.x, c.y, c.z, 0.0});
+                }
+                total = (size_t)(dst - s_lum.data());
+            } else {
+                const size_t bands = (size_t)nThreads;
+                const size_t chunk = (N + bands - 1) / bands;
+                std::vector<size_t> cnt(bands, 0), off(bands, 0);
+                {   // pass 1: count qualifying pixels per band (reads only zbuf/emis)
+                    std::vector<std::thread> pool;
+                    for (size_t ti = 0; ti < bands; ++ti) {
+                        size_t a = ti * chunk, b = std::min(N, a + chunk);
+                        if (a >= b) break;
+                        pool.emplace_back([&, ti, a, b] {
+                            size_t c = 0;
+                            for (size_t i = a; i < b; ++i)
+                                if (!(zbuf[i] <= 0.0f || emis[i])) ++c;
+                            cnt[ti] = c;
+                        });
+                    }
+                    for (auto& th : pool) th.join();
+                }
+                for (size_t ti = 0; ti < bands; ++ti) { off[ti] = total; total += cnt[ti]; }
+                if (s_lum.size() < total) s_lum.resize(total);
+                // NB: s_lum is thread_local, and lambdas do NOT capture thread-locals —
+                // each worker would resolve the name to its own empty instance. Hand the
+                // workers a plain pointer to *this* thread's buffer instead.
+                double* lumBase = s_lum.data();
+                {   // pass 2: pack each band's luminances at its offset
+                    std::vector<std::thread> pool;
+                    for (size_t ti = 0; ti < bands; ++ti) {
+                        size_t a = ti * chunk, b = std::min(N, a + chunk);
+                        if (a >= b) break;
+                        pool.emplace_back([&, ti, a, b] {
+                            double* dst = lumBase + off[ti];
+                            for (size_t i = a; i < b; ++i) {
+                                if (zbuf[i] <= 0.0f || emis[i]) continue;
+                                const Vec3 c = pixel(i);
+                                *dst++ = std::max({c.x, c.y, c.z, 0.0});
+                            }
+                        });
+                    }
+                    for (auto& th : pool) th.join();
+                }
             }
-            if (!lum.empty()) {
+            if (total > 0) {
                 // Only the 99th-percentile order statistic matters, so partition instead
                 // of a full sort (O(n) vs O(n log n)).
-                size_t k = (size_t)(0.99 * (lum.size() - 1));
-                std::nth_element(lum.begin(), lum.begin() + k, lum.end());
-                double p99 = lum[k];
+                size_t k = (size_t)(0.99 * (total - 1));
+                std::nth_element(s_lum.begin(), s_lum.begin() + k, s_lum.begin() + total);
+                double p99 = s_lum[k];
                 eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
             }
             if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
@@ -542,15 +660,7 @@ inline std::vector<uint8_t> exposeAndEncode(
     }
     const double finalExp = eAuto * expComp;
 
-    // sRGB gamma lookup table: the tone map clamps each channel to [0,1] before encoding,
-    // and gamma is monotonic (anything >=1 saturates to 255), so a 4096-entry LUT over
-    // [0,1] replaces three std::pow calls per pixel with a table read + round.
-    static const std::array<uint8_t, 4097> kSrgbLut = [] {
-        std::array<uint8_t, 4097> t{};
-        for (int i = 0; i <= 4096; ++i)
-            t[i] = (uint8_t)std::clamp(srgbGamma(i / 4096.0) * 255.0 + 0.5, 0.0, 255.0);
-        return t;
-    }();
+    const std::array<uint8_t, 4097>& kSrgbLut = srgbLut8();
     auto encode = [&](double c) -> uint8_t {
         if (c <= 0.0) return kSrgbLut[0];
         if (c >= 1.0) return 255;
@@ -561,7 +671,7 @@ inline std::vector<uint8_t> exposeAndEncode(
     std::vector<uint8_t> img(N * 3);
     parallelFor(N, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
-            Vec3 c = accum[i];
+            Vec3 c = pixel(i);
             if (zbuf[i] > 0.0f) c = c * finalExp;   // hit pixels get the exposure
             if (seeThrough) {                          // composite clear glass (display-linear)
                 float T = clearT[i], mt = milkT[i];
@@ -574,6 +684,23 @@ inline std::vector<uint8_t> exposeAndEncode(
         }
     });
     return img;
+}
+
+// Vector-based wrapper (the original signature): the CPU rasterizer and any other
+// Vec3-buffer caller go through here; it simply adapts to the template core above.
+inline std::vector<uint8_t> exposeAndEncode(
+        const std::vector<Vec3>& accum, const std::vector<float>& zbuf,
+        const std::vector<uint8_t>& emis, int W, int H, int nThreads,
+        double expComp, bool autoExpose, double* lockAnchor,
+        bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
+        const Vec3& milkColor) {
+    const Vec3* A = accum.data();
+    return exposeAndEncodeT([A](size_t i) { return A[i]; },
+                            zbuf.data(), emis.data(), W, H, nThreads,
+                            expComp, autoExpose, lockAnchor, seeThrough,
+                            clearT.empty() ? nullptr : clearT.data(),
+                            milkT.empty()  ? nullptr : milkT.data(),
+                            milkColor);
 }
 
 // Render one camera to an 8-bit RGB image (row 0 = image top), multithreaded by

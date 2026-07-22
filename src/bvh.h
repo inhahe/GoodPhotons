@@ -10,7 +10,10 @@
 #include "linalg.h"
 #include "geometry.h"
 
-inline double vget(const Vec3& v, int a) { return a == 0 ? v.x : (a == 1 ? v.y : v.z); }
+// Branch-free component fetch (Vec3 is standard-layout with x,y,z contiguous —
+// same trick as Vec3::operator[]); the old two-branch ternary showed up in
+// profiles via the slab test's 6 calls per node.
+inline double vget(const Vec3& v, int a) { return (&v.x)[a]; }
 
 struct Aabb {
     Vec3 lo{ DBL_MAX,  DBL_MAX,  DBL_MAX};
@@ -33,18 +36,32 @@ struct Aabb {
         return d.y >= d.z ? 1 : 2;
     }
     // Slab test against [tmin, tmax]. Returns true if the ray overlaps the box;
-    // tEnter is the near intersection distance (>= tmin).
+    // tEnter is the near intersection distance (>= tmin). Fully unrolled over the
+    // three axes (was a for-loop with vget component indirection — this is one of
+    // the hottest functions in every CPU mode, and the straight-line form keeps
+    // each axis's operands in registers). Per axis the arithmetic, the swap, and
+    // the early-out compare are IDENTICAL to the old loop body in the same x,y,z
+    // order, so results are bit-identical.
     bool hit(const Ray& r, const Vec3& invD, double tmin, double tmax, double& tEnter) const {
         double te = tmin, tx = tmax;
-        for (int a = 0; a < 3; ++a) {
-            double o = vget(r.o, a), id = vget(invD, a);
-            double t0 = (vget(lo, a) - o) * id;
-            double t1 = (vget(hi, a) - o) * id;
-            if (t0 > t1) std::swap(t0, t1);
-            te = t0 > te ? t0 : te;
-            tx = t1 < tx ? t1 : tx;
-            if (tx < te) return false;
-        }
+        double t0 = (lo.x - r.o.x) * invD.x;
+        double t1 = (hi.x - r.o.x) * invD.x;
+        if (t0 > t1) { double tt = t0; t0 = t1; t1 = tt; }
+        te = t0 > te ? t0 : te;
+        tx = t1 < tx ? t1 : tx;
+        if (tx < te) return false;
+        t0 = (lo.y - r.o.y) * invD.y;
+        t1 = (hi.y - r.o.y) * invD.y;
+        if (t0 > t1) { double tt = t0; t0 = t1; t1 = tt; }
+        te = t0 > te ? t0 : te;
+        tx = t1 < tx ? t1 : tx;
+        if (tx < te) return false;
+        t0 = (lo.z - r.o.z) * invD.z;
+        t1 = (hi.z - r.o.z) * invD.z;
+        if (t0 > t1) { double tt = t0; t0 = t1; t1 = tt; }
+        te = t0 > te ? t0 : te;
+        tx = t1 < tx ? t1 : tx;
+        if (tx < te) return false;
         tEnter = te;
         return true;
     }
@@ -165,12 +182,23 @@ struct Bvh {
                          TraversalStats* stats = nullptr) const {
         if (nodes.empty()) return;
         Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
-        int stack[64]; int sp = 0; stack[sp++] = 0;
+        // Children are slab-tested once at push time and their tEnter recorded with
+        // the stack entry; the pop-time 6-plane retest is replaced by the exactly-
+        // equivalent scalar prune tEnter > tMax. (hit() seeds te with tmin only, so
+        // for a node that passed the push test, a retest against a since-shrunk
+        // tMax passes iff tEnter <= tMax — one compare instead of a slab test.)
+        int stack[64]; double tStack[64]; int sp = 0;
+        double tRoot;
+        if (!nodes[0].box.hit(r, invD, tmin, tMax, tRoot)) {
+            if (stats) stats->nodeVisits++;   // the root "pop" the old loop counted
+            return;
+        }
+        stack[0] = 0; tStack[0] = tRoot; sp = 1;
         while (sp) {
-            const BvhNode& n = nodes[stack[--sp]];
-            double tEnter;
+            --sp;
             if (stats) stats->nodeVisits++;
-            if (!n.box.hit(r, invD, tmin, tMax, tEnter)) continue;
+            if (tStack[sp] > tMax) continue;
+            const BvhNode& n = nodes[stack[sp]];
             if (n.isLeaf()) {
                 if (stats) stats->leafTests += n.count;
                 for (int i = 0; i < n.count; ++i) leafTest(primIdx[n.first + i], tMax);
@@ -182,12 +210,14 @@ struct Bvh {
                 bool hL = nodes[n.left].box.hit(r, invD, tmin, tMax, tL);
                 bool hR = nodes[n.right].box.hit(r, invD, tmin, tMax, tR);
                 if (hL && hR) {
-                    if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
-                    else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
+                    if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp;
+                                    stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+                    else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp;
+                                    stack[sp] = n.right; tStack[sp] = tR; ++sp; }
                 } else if (hL) {
-                    stack[sp++] = n.left;
+                    stack[sp] = n.left;  tStack[sp] = tL; ++sp;
                 } else if (hR) {
-                    stack[sp++] = n.right;
+                    stack[sp] = n.right; tStack[sp] = tR; ++sp;
                 }
             }
         }
@@ -199,11 +229,14 @@ struct Bvh {
     bool traverseAny(const Ray& r, double tmin, double tMax, LeafFn&& leafHit) const {
         if (nodes.empty()) return false;
         Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
+        // tMax never shrinks in any-hit traversal, so a child that passed its
+        // push-time slab test cannot fail the identical pop-time retest — test the
+        // root once and drop the per-pop retest entirely.
+        double tRoot;
+        if (!nodes[0].box.hit(r, invD, tmin, tMax, tRoot)) return false;
         int stack[64]; int sp = 0; stack[sp++] = 0;
         while (sp) {
             const BvhNode& n = nodes[stack[--sp]];
-            double tEnter;
-            if (!n.box.hit(r, invD, tmin, tMax, tEnter)) continue;
             if (n.isLeaf()) {
                 for (int i = 0; i < n.count; ++i) if (leafHit(primIdx[n.first + i])) return true;
             } else {

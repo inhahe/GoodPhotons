@@ -1,16 +1,38 @@
-put a fog with a rainbow in our showcase video/still? make a cloud out of fog (with a believable cloud shape), and rain pouring down from it that does a rainbow. maybe feed that cloud-in-the-center-of-the-room pic (the physics art project) to hyper3d?
-
-build\bin\ftrace -in scenes\gallery_settled.ftsl -explore -seethrough
-
-replace the Klein bottle in the gallerey scene with "D:\visual studio projects\forward raytracer\meshes\klein_a120_b060_c30_d127_lite.obj"
-^ doing
-
-view a gyroid oscillating along the drift dimension - should get smaller and bigger
+when rendering a flyby / multiple cameras, make sure the terminal shows which stages of the render are being shared between frames (or if none are) and whether grainy noise is shared between cameras, since these seem to differ according to which mode is used
 
 --
 
-"The gyroid drift animation is done — png/gyroid_drift/gyroid_drift000.gif (48 frames). Let me inspect a few frames to see what drift actually does to the gyroid (whether it "gets smaller and bigger" or morphs), then open the gif for viewing:"
+"B and A are two camera models of the forward kernel, plus R, D, M, plus B_gallery as the big-scene data point. A C_gpu, V_gpu, or P_gpu config would re-time the same forward megakernel behind a different camera wrapper"
 
-I must not understand what drift does correctly, then. I thought that (a) one of the premises of gyroid_nd was that it takes a 3d-volume slice of a higher-dimensional space, and (b) that drift translates that 3d slice left and right, or in whatever other dimension. And when you shift a 3d slice of a higher-dimensional orb left or right across the hyper-orb, the 3d object is supposed to grow from nothing and then shrink to nothing again. 
+should we unify the gpu models that are internally unified in the cli/scene description language too? by keeping them separate, are we making certain benefits of each mode mutually exclusive that don't have to be?
 
-When dragging the rasterizer window bigger or smaller (in explore mode), it preserves the aspect ratio and adds black to the right/left or bottom/top, and also, dragging it smaller doesn't improve the speed at all. So, I'm inferring that it doesn't actually change how much it's rasterizing but only rescales the result. I want it to change the dimensions of the actual rasterizer. 
+--
+
+Gallery × GPU combos are blocked by pre-existing bugs already in known-issues.md: GPU mode D has the data-dependent "unspecified launch failure" on gallery_settled, and mode M's shared deposit hangs on the 4M-photon gallery scene. That's why B_gpu_gallery is the lone gallery GPU config
+
+to Fable:
+Can you fix the above bugs, then optimize the hot paths for those two and show me the speedup percentages? make sure to commit before you change anything so you can revert if it's slower or doesn't work and you can't fix it.
+
+--
+
+can we optimize raster gpu? and measure the difference by measuring the rasterization time independently of the launch time? for example, gpu raster is used for the interactive explorer and updates every time the user changes position/orientation.
+
+^ doing in Fable
+
+--
+put a fog with a rainbow in our showcase video/still? make a cloud out of fog (with a believable cloud shape), and rain pouring down from it that does a rainbow. 
+maybe feed that cloud-in-the-center-of-the-room pic (the physics art project) to hyper3d? <- done. cloud1, cloud2 and cloud3.
+
+build\bin\ftrace -in scenes\gallery_settled.ftsl -explore -seethrough
+
+view a gyroid oscillating along the drift dimension - should get smaller and bigger
+no: the reason drift doesn't grow and shrink the gyroid is that the gyroid actually has no bounds, it only appears to due to its being clipped by its bounding container. 
+
+--
+
+make sure cloud1.glb, cloud2.glb, and cloud3.glb are different clouds. if not, get the missing one from meshy.ai.
+
+--
+
+test the loom object viewer. ask claude how.
+

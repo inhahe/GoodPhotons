@@ -39,20 +39,37 @@
 // Traces N photons across nThreads, each depositing into a private bank, then
 // concatenates into pm.photons and records pm.nEmitted (= N). Does NOT build the grid;
 // the caller picks the gather radius and calls pm.build(radius).
+//
+// `seedBase` is the ABSOLUTE index of the first photon of this pass: photon i draws
+// from its own stream seeded by seedBase+i (seedUnit), so the deposited set is
+// thread-count independent — and, crucially, a repeated-pass caller (SPPM) that
+// passes its cumulative emitted count gets FRESH photons every pass. (Before this
+// parameter existed every SPPM pass re-traced the identical photon set — a real
+// correctness bug: progressive photon mapping's convergence needs independent
+// passes, so mode S was re-averaging the same deposits at shrinking radii.)
 inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
-                            bool diffraction, PhotonMap& pm) {
+                            bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
+                            uint64_t seedBase = 0) {
     if (nThreads < 1) nThreads = 1;
     std::vector<std::vector<Photon>> banks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
 
+    // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths
+    // as per-λ photon records via tracePhotonHero (render.h). nEmitted still counts PATHS
+    // (below), so the density estimate is energy-identical to single-λ but with far lower
+    // chroma noise. Same gate as the forward tracers: no media / no GRIN (those stay C=1).
+    const bool heroOn = (heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
+
     auto worker = [&](int tid) {
         Renderer r; r.diffraction = diffraction; r.photonDeposit = &banks[tid];
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 31,
-                            0xD1B54A32D192ED03ULL ^ (uint64_t)tid);
+        r.useHero = heroOn; r.heroC = heroC;
+        Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         EnergyReport e;
-        for (long long i = lo; i < hi; ++i)
+        for (long long i = lo; i < hi; ++i) {
+            seedUnit(rng, seedBase + (uint64_t)i, 0xEB44ACCAB455D165ULL);
             r.tracePhoton(scene, (const Camera*)nullptr, (Film*)nullptr, (Film*)nullptr, rng, e);
+        }
         emitted[tid] = hi - lo;
     };
     std::vector<std::thread> pool;
@@ -149,13 +166,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // Density estimate at y, folding the visible-point reflectance per photon
                 // wavelength: L_o(vis) += rho(vis,l_p) * [rho(y,l_p)/pi] * Phi_p / (pi r^2 N).
                 Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double) {
+                pm.query(h.p, [&](const Photon& ph, double, int k) {
                     if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                     double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
                     double f = rhoY * (1.0 / PI);
-                    g += Vec3(cieX(ph.lambda), cieY(ph.lambda), cieZ(ph.lambda))
-                         * (f * rhoV * (double)ph.power);
+                    g += pm.cie[k] * (f * rhoV * (double)ph.power);   // == cie(lambda_p), precomputed
                 });
                 L += g * (norm * thr);
                 return L;
@@ -325,12 +341,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 //   L_r(x) = (1/N) sum_p f_r * Phi_p / (pi r^2), f_r = rho/pi (Lambertian),
                 // accumulated in XYZ per photon wavelength.
                 Vec3 g{0, 0, 0};
-                pm.query(h.p, [&](const Photon& ph, double) {
+                pm.query(h.p, [&](const Photon& ph, double, int k) {
                     if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
-                    g += Vec3(cieX(ph.lambda), cieY(ph.lambda), cieZ(ph.lambda))
-                         * (f * (double)ph.power);
+                    g += pm.cie[k] * (f * (double)ph.power);          // == cie(lambda_p), precomputed
                 });
                 L += g * (norm * thr);
                 return L;
@@ -420,25 +435,32 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
 // ---- Camera pass driver (single camera) ---------------------------------------------
 // Accumulates a SUM over spp (display divides by spp via writeFilm), matching the
 // backward/BDPT convention so a chunked/progressive render sums batches.
+// `sampleBase` = absolute index of the first sample rendered here; each
+// (pixel, absolute sample) seeds its own stream via seedUnit(), so the
+// realization is chunk-split / banding / thread-count independent (see
+// BackwardRenderer::renderRows).
 inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, int resY,
                                const PhotonMap& pm, long long spp, int nThreads,
                                bool diffraction, int maxBounce = 32,
-                               unsigned long long seedOffset = 0, int fgRays = 0) {
+                               unsigned long long sampleBase = 0, int fgRays = 0) {
     if (nThreads < 1) nThreads = 1;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
+    const uint64_t nPix = (uint64_t)resX * (uint64_t)resY;
     auto worker = [&](int tid) {
         Film& f = bands[tid]; f.resX = resX; f.resY = resY; f.alloc();
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 23,
-                            0xA24BAED4963EE407ULL ^ (uint64_t)tid
-                              ^ (seedOffset * 0x9E3779B97F4A7C15ULL));
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         for (int py = y0; py < y1; ++py)
-            for (int px = 0; px < resX; ++px)
+            for (int px = 0; px < resX; ++px) {
+                const uint64_t pixIdx = (uint64_t)py * (uint64_t)resX + (uint64_t)px;
                 for (long long s = 0; s < spp; ++s) {
+                    Pcg32 rng;
+                    seedUnit(rng, (sampleBase + (uint64_t)s) * nPix + pixIdx,
+                             0xA24BAED4963EE407ULL);
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
                     f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce, fgRays));
                 }
+            }
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);

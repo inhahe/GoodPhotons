@@ -30,6 +30,13 @@ for MP4 and **NumPy** for the mesher / spacetime tools).
 5. **Emit-`.ftsl`-first.** Prefer letting the renderer mesh / root-find isosurfaces
    from emitted `.ftsl`; an in-tool marching-cubes mesher is used only where a field
    must be baked to geometry.
+6. **Everything transformable, everything modulatable.** Any element takes a
+   signal-driven `Transform` — `element.transformed(translate=, rotate=, scale=, skew=)`
+   (position / size / Euler rotation / x·y·z shear, each a `Signal`) — emitted as an ftsl
+   `group{}` (`shear` included). A `Grid`/`Scatter` can carry the *same* transform as a
+   local→world **placement**: the field inverse-maps a world query into the dataset's local
+   frame, so a fixed world-space sampling curve reads *different* values as you move / resize
+   / skew the data object under it (the curve is decoupled from the object).
 
 ---
 
@@ -50,6 +57,7 @@ tools/loom/
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
+│   ├── transform.py per-object Transform (translate/rotate/scale/skew, animatable) → ftsl group{}; dataset inverse-map
 │   ├── canvas.py    2-D canvas (motion graphics: markers, strokes)
 │   ├── audio.py     procedural audio: one sample-buffer back-end → WAV (offline)
 │   ├── xvideo.py    two-pass spacetime transforms (rotate/shear a 4-D block)

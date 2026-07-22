@@ -22,6 +22,25 @@ struct Pcg32 {
     double uniform() { return (next() >> 8) * (1.0 / 16777216.0); }
 };
 
+// SplitMix64 finalizer: bijective avalanche mix for turning structured indices
+// (pixel number, absolute sample/photon index) into decorrelated seed material.
+inline uint64_t mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// Seed `rng` for the k-th unit of work (absolute photon index, or a pixel-sample
+// pair folded into one index) of the estimator family `salt`. Every CPU estimator
+// seeds per WORK UNIT through this one helper, so a render's realization depends
+// only on (unit index, salt) — never on how units are chunked into progressive
+// batches or banded across threads. That is what makes fixed-parameter CPU renders
+// bit-identical across -t values, -window/-time chunking, and resume boundaries.
+inline void seedUnit(Pcg32& rng, uint64_t k, uint64_t salt) {
+    rng.seed(mix64(k ^ salt), mix64(k + salt));
+}
+
 // Cosine-weighted hemisphere direction around unit normal n. pdf = cos/pi.
 inline Vec3 cosineHemisphere(const Vec3& n, Pcg32& rng) {
     double u1 = rng.uniform(), u2 = rng.uniform();

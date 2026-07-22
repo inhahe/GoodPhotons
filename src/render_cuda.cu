@@ -339,9 +339,10 @@ struct DInstance {
 
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
 // The field is a flat postfix array evaluated with a scalar stack, sphere-traced for
-// intersection. All math is done in DOUBLE (independent of the FP32 transport `Real`):
-// the sign-change bisection converges to ~1e-12, which needs the precision, and
-// implicits are already the expensive path, so the FP64 cost is acceptable. POD twins
+// intersection. The MARCH + root REFINE run in FP32 on pre-converted mirror pools
+// (DFieldNodeF/PatNodeF): the committed hit is float anyway, and FP64 VM ops
+// serialize on consumer GPUs' 1/64-rate FP64 pipe. Normals (dFieldGradient) and
+// media bound-field evals stay in DOUBLE on the original pools. POD twins
 // of FieldOp / FieldNode / Implicit (see src/implicit.h).
 // NOTE: this order MUST match FieldOp in implicit.h (dn.op = (int)fn.op on upload).
 // DF_EXPR is the arbitrary-formula isosurface leaf: its value is f(x,y,z) evaluated
@@ -358,6 +359,23 @@ struct DFieldNode {
     double scale;         // world = scale * local; d_world = d_local * scale (leaf only)
     int    exprOff, exprN;// DF_EXPR: slice into DScene::fieldExprNodes (postfix PatNode program)
 };
+// FP32 mirrors of the field/pattern node pools, pre-converted on upload. The sphere-
+// trace MARCH + root REFINE in intersectImplicit run entirely on these: the committed
+// hit is stored in float anyway (DHit::t/p are Real), so double stepping buys nothing
+// there, while the FP64 VM ops serialize on the 1/64-rate FP64 pipe of consumer GPUs
+// (measured: ~90% of BDPT subpath generation on the gallery scene). Pre-converting
+// whole pools (rather than casting per-op) keeps F64<->F32 cvt instructions — which
+// also issue on the FP64 pipe — out of the inner loop. Normals (dFieldGradient) and
+// media bound-fields still use the DOUBLE pools.
+struct DFieldNodeF {
+    int   op;
+    float p[4];
+    float inv[9];
+    float tx, ty, tz;
+    float scale;
+    int   exprOff, exprN;  // same slice indices as the double twin (pools are parallel)
+};
+struct PatNodeF { int op; float a; };   // FP32 twin of pattern.h PatNode (8B vs 16B)
 struct DImplicit {
     int    nodeOff, nodeN;   // slice [nodeOff, nodeOff+nodeN) into DScene::fieldNodes
     int    matId;
@@ -541,6 +559,10 @@ struct DScene {
     // each Expr FieldNode slices it by [exprOff, exprOff+exprN). Separate from
     // patNodes so material patterns and field formulas don't share offsets.
     const PatNode*    fieldExprNodes;
+    // FP32 mirrors of fieldNodes/fieldExprNodes (same order/offsets) for the sphere-
+    // trace march hot path. Null iff the double pools are null.
+    const DFieldNodeF* fieldNodesF;
+    const PatNodeF*    fieldExprNodesF;
     const DImplicit*  implicits; int nImplicits;
     // Instancing (two-level BVH). BVH prims with index >= nTris+nSph+nImplicits map to
     // instances[prim - nTris - nSph - nImplicits]; each instance references a DBlas
@@ -1236,6 +1258,12 @@ __device__ static inline double dSmin(double a, double b, double k) {
     return (a < b ? a : b) - h * h * k * 0.25;
 }
 __device__ static inline double dSmax(double a, double b, double k) { return -dSmin(-a, -b, k); }
+__device__ static inline float dSminF(float a, float b, float k) {
+    if (k <= 0.0f) return a < b ? a : b;
+    float h = fmaxf(k - fabsf(a - b), 0.0f) / k;
+    return (a < b ? a : b) - h * h * k * 0.25f;
+}
+__device__ static inline float dSmaxF(float a, float b, float k) { return -dSminF(-a, -b, k); }
 
 // Leaf SDF at the leaf-LOCAL query point (px,py,pz). Mirrors fieldLeafSDF exactly.
 // Forward decl: DF_EXPR leaves evaluate their formula with the pattern VM, which is
@@ -1244,6 +1272,10 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v);
+__device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
+                                      float x, float y, float z, float f,
+                                      float nx, float ny, float nz, float r,
+                                      float u, float v);
 
 __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
                                        const PatNode* exprPool) {
@@ -1318,6 +1350,80 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
     }
     return sp > 0 ? st[0] : BIG;
 }
+// ---- FP32 twins of the field VM (see DFieldNodeF): used ONLY by the sphere-trace
+// march/refine in intersectImplicit, where the result is stored in float anyway.
+__device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py, float pz,
+                                       const PatNodeF* exprPool) {
+    switch (nd.op) {
+        case DF_SPHERE:
+            return sqrtf(px*px + py*py + pz*pz) - nd.p[0];
+        case DF_EXPR: {   // arbitrary formula f(x,y,z); r=|p|, other vars (f/normals) are 0
+            if (!exprPool) return (float)BIG;
+            float r = sqrtf(px*px + py*py + pz*pz);
+            return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0f,
+                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f);
+        }
+        case DF_BOX: {
+            float r = nd.p[3];
+            float qx = fabsf(px) - nd.p[0] + r, qy = fabsf(py) - nd.p[1] + r, qz = fabsf(pz) - nd.p[2] + r;
+            float ox = fmaxf(qx, 0.0f), oy = fmaxf(qy, 0.0f), oz = fmaxf(qz, 0.0f);
+            float outside = sqrtf(ox*ox + oy*oy + oz*oz);
+            float inside  = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
+            return outside + inside - r;
+        }
+        case DF_TORUS: {
+            float qx = sqrtf(px*px + pz*pz) - nd.p[0];
+            return sqrtf(qx*qx + py*py) - nd.p[1];
+        }
+        case DF_PLANE:
+            return px*nd.p[0] + py*nd.p[1] + pz*nd.p[2] + nd.p[3];
+        case DF_CYLINDER: {
+            float dxz = sqrtf(px*px + pz*pz) - nd.p[0];
+            float dy  = fabsf(py) - nd.p[1];
+            float a   = fminf(fmaxf(dxz, dy), 0.0f);
+            float bx  = fmaxf(dxz, 0.0f), by = fmaxf(dy, 0.0f);
+            return a + sqrtf(bx*bx + by*by);
+        }
+        case DF_CONE: {
+            float rb = nd.p[0], rt = nd.p[1], h = nd.p[2];
+            float qx = sqrtf(px*px + pz*pz), qy = py;
+            float k1x = rt, k1y = h, k2x = rt - rb, k2y = 2.0f*h;
+            float cax = qx - fminf(qx, (qy < 0.0f) ? rb : rt);
+            float cay = fabsf(qy) - h;
+            float k2dot = k2x*k2x + k2y*k2y;
+            float tt = (k2dot > 0.0f) ? ((k1x - qx)*k2x + (k1y - qy)*k2y) / k2dot : 0.0f;
+            tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+            float cbx = qx - k1x + k2x*tt, cby = qy - k1y + k2y*tt;
+            float s = (cbx < 0.0f && cay < 0.0f) ? -1.0f : 1.0f;
+            float da = cax*cax + cay*cay, db = cbx*cbx + cby*cby;
+            return s * sqrtf(fminf(da, db));
+        }
+        default: return (float)BIG;
+    }
+}
+__device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
+                                    float pwx, float pwy, float pwz,
+                                    const PatNodeF* exprPool) {
+    float st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const DFieldNodeF& nd = nodes[i];
+        switch (nd.op) {
+            case DF_UNION:            { float b = st[--sp], a = st[--sp]; st[sp++] = a < b ? a : b; break; }
+            case DF_INTERSECT:        { float b = st[--sp], a = st[--sp]; st[sp++] = a > b ? a : b; break; }
+            case DF_DIFFERENCE:       { float b = st[--sp], a = st[--sp]; st[sp++] = a > -b ? a : -b; break; }
+            case DF_SMOOTH_UNION:     { float b = st[--sp], a = st[--sp]; st[sp++] = dSminF(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_INTERSECT: { float b = st[--sp], a = st[--sp]; st[sp++] = dSmaxF(a,  b, nd.p[0]); break; }
+            case DF_SMOOTH_DIFFERENCE:{ float b = st[--sp], a = st[--sp]; st[sp++] = dSmaxF(a, -b, nd.p[0]); break; }
+            default: {   // leaf: world -> local via inv, then local SDF * scale
+                float plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
+                float ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
+                float plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
+                st[sp++] = dFieldLeafSDFF(nd, plx, ply, plz, exprPool) * nd.scale;
+            }
+        }
+    }
+    return sp > 0 ? st[0] : (float)BIG;
+}
 // Field gradient (tetrahedron central differences) -> unit normal. Mirrors fieldGradient.
 __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
                                       double px, double py, double pz, double eps,
@@ -1368,8 +1474,12 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                                           const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
     double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
 
-    const DFieldNode* nd = sc.fieldNodes + im.nodeOff;
+    const DFieldNode* nd = sc.fieldNodes + im.nodeOff;   // double pool: gradient/normal only
     const PatNode* exprPool = sc.fieldExprNodes;
+    // FP32 mirror pools: the march + root refine run entirely in float (the committed
+    // hit is float anyway; FP64 VM ops serialize on the 1/64-rate FP64 pipe).
+    const DFieldNodeF* ndF = sc.fieldNodesF + im.nodeOff;
+    const PatNodeF* exprPoolF = sc.fieldExprNodesF;
     const int N = im.nodeN;
 
     // ---- Container clip: entry/exit params [tEnter, tExit] and the container's OUTWARD
@@ -1429,6 +1539,14 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const double fixedStep   = (im.sampleStep > 0.0 ? im.sampleStep : minStep) / dlen;
     const bool   regulaFalsi = (im.refine == 1);
 
+    // FP32 march state (double ray kept for the hit commit + gradient).
+    const float oxF = (float)ox, oyF = (float)oy, ozF = (float)oz;
+    const float dxF = (float)dx, dyF = (float)dy, dzF = (float)dz;
+    const float dlenF    = (float)dlen;
+    const float invLipF  = (float)invLip, minStepF = (float)minStep;
+    const float fixedStepF = (float)fixedStep;
+    const float t1F = (float)t1;
+
     // Commit a hit at parametric `th`, world point (px,py,pz), geometric normal (gx,gy,gz).
     auto writeHit = [&](double th, double px, double py, double pz,
                         double gx, double gy, double gz) -> bool {
@@ -1445,43 +1563,43 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         return true;
     };
 
-    double t = t0;
-    double f = dFieldEval(nd, N, ox + dx*t, oy + dy*t, oz + dz*t, exprPool);
+    float t = (float)t0;
+    float f = dFieldEvalF(ndF, N, oxF + dxF*t, oyF + dyF*t, ozF + dzF*t, exprPoolF);
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
-    if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0)
+    if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
         return writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
     for (int i = 0; i < MAX_STEP; ++i) {
-        double step = sampleMode ? fixedStep : fmax(fabs(f) * invLip, minStep) / dlen;
-        double tn = t + step;
+        float step = sampleMode ? fixedStepF : fmaxf(fabsf(f) * invLipF, minStepF) / dlenF;
+        float tn = t + step;
         bool last = false;
-        if (tn >= t1) { tn = t1; last = true; }
-        double fn = dFieldEval(nd, N, ox + dx*tn, oy + dy*tn, oz + dz*tn, exprPool);
-        bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) || (f == 0.0 && fn != 0.0);
+        if (tn >= t1F) { tn = t1F; last = true; }
+        float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF);
+        bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
-            double ta = t, tb = tn, fa = f, fb = fn;
+            float ta = t, tb = tn, fa = f, fb = fn;
             int rfSide = 0;
-            for (int b = 0; b < 80; ++b) {
-                double tm;
-                if (regulaFalsi && (fb - fa) != 0.0) {
+            for (int b = 0; b < 48; ++b) {
+                float tm;
+                if (regulaFalsi && (fb - fa) != 0.0f) {
                     tm = (ta * fb - tb * fa) / (fb - fa);
-                    if (tm <= ta || tm >= tb) tm = 0.5*(ta + tb);
+                    if (tm <= ta || tm >= tb) tm = 0.5f*(ta + tb);
                 } else {
-                    tm = 0.5*(ta + tb);
+                    tm = 0.5f*(ta + tb);
                 }
-                double fm = dFieldEval(nd, N, ox + dx*tm, oy + dy*tm, oz + dz*tm, exprPool);
-                if ((fa > 0.0) == (fm > 0.0)) {
+                if (tm <= ta || tm >= tb) break;   // float interval exhausted: converged
+                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF);
+                if ((fa > 0.0f) == (fm > 0.0f)) {
                     ta = tm; fa = fm;
-                    if (regulaFalsi && rfSide == +1) fb *= 0.5;
+                    if (regulaFalsi && rfSide == +1) fb *= 0.5f;
                     rfSide = +1;
                 } else {
                     tb = tm; fb = fm;
-                    if (regulaFalsi && rfSide == -1) fa *= 0.5;
+                    if (regulaFalsi && rfSide == -1) fa *= 0.5f;
                     rfSide = -1;
                 }
-                if ((tb - ta) * dlen < 1e-12) break;
             }
-            double th = 0.5*(ta + tb);
+            double th = 0.5*((double)ta + (double)tb);
             if (th < tmin || th >= (double)hit.t) return false;
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
@@ -1491,7 +1609,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         if (last) {
             // FAR CAP: reached the container exit still inside the solid (fn<0), and the
             // far clip is the container itself — seal the sawn-off solid.
-            if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < (double)hit.t)
+            if (capped && exitIsContainer && fn < 0.0f && tExit >= tmin && tExit < (double)hit.t)
                 return writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
             return false;
         }
@@ -1631,11 +1749,18 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
     const DTriShear sh = makeTriShear(lrd);   // watertight shear: once per ray
     Real tMax = h.t;
     bool found = false;
-    int stack[48]; int sp = 0; stack[sp++] = 0;
+    // Children are slab-tested once at push time with tEnter recorded; the pop-time
+    // 6-plane retest is the exactly-equivalent scalar prune tEnter > tMax (boxHit
+    // seeds te with tmin only — see Bvh::traverseClosest for the derivation). A
+    // pruned pop also skips loading the node entirely.
+    int stack[48]; Real tStack[48]; int sp = 0;
+    Real tRoot;
+    if (!boxHit(N[0], lro, invD, tmin, tMax, tRoot)) return false;
+    stack[0] = 0; tStack[0] = tRoot; sp = 1;
     while (sp) {
-        const DNode& n = N[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, lro, invD, tmin, tMax, tE)) continue;
+        --sp;
+        if (tStack[sp] > tMax) continue;
+        const DNode& n = N[stack[sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
@@ -1646,10 +1771,12 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
             bool hL = boxHit(N[n.left],  lro, invD, tmin, tMax, tL);
             bool hR = boxHit(N[n.right], lro, invD, tmin, tMax, tR);
             if (hL && hR) {
-                if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
-                else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
-            } else if (hL) stack[sp++] = n.left;
-            else if (hR)   stack[sp++] = n.right;
+                if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp;
+                                stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+                else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp;
+                                stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+            } else if (hL) { stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+            else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
     return found;
@@ -1664,11 +1791,14 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
     const DTri*  T = sc.blasTris   + bl.triOff;
     DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
     const DTriShear sh = makeTriShear(lrd);
+    // maxDist never shrinks in any-hit traversal, so a child that passed its
+    // push-time slab test cannot fail the identical pop-time retest — test the
+    // root once and drop the per-pop retest entirely.
+    Real tRoot;
+    if (!boxHit(N[0], lro, invD, tmin, maxDist, tRoot)) return false;
     int stack[48]; int sp = 0; stack[sp++] = 0;
     while (sp) {
         const DNode& n = N[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, lro, invD, tmin, maxDist, tE)) continue;
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
@@ -1705,11 +1835,15 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
     const DTriShear sh = makeTriShear(rd);
     Real tMax = BIG;
-    int stack[64]; int sp = 0; stack[sp++] = 0;
+    // Push-time slab tests + pop-time scalar prune (see blasClosest).
+    int stack[64]; Real tStack[64]; int sp = 0;
+    Real tRoot;
+    if (!boxHit(sc.nodes[0], ro, invD, tmin, tMax, tRoot)) return h;
+    stack[0] = 0; tStack[0] = tRoot; sp = 1;
     while (sp) {
-        const DNode& n = sc.nodes[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, ro, invD, tmin, tMax, tE)) continue;
+        --sp;
+        if (tStack[sp] > tMax) continue;
+        const DNode& n = sc.nodes[stack[sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
@@ -1734,10 +1868,12 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
             bool hL = boxHit(sc.nodes[n.left], ro, invD, tmin, tMax, tL);
             bool hR = boxHit(sc.nodes[n.right], ro, invD, tmin, tMax, tR);
             if (hL && hR) {
-                if (tL <= tR) { stack[sp++] = n.right; stack[sp++] = n.left; }
-                else          { stack[sp++] = n.left;  stack[sp++] = n.right; }
-            } else if (hL) stack[sp++] = n.left;
-            else if (hR)   stack[sp++] = n.right;
+                if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp;
+                                stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+                else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp;
+                                stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+            } else if (hL) { stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+            else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
     return h;
@@ -1794,11 +1930,12 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
     Real tMax = maxDist - tmin;
+    // tMax is fixed for the whole walk: push-time tests suffice (see blasOccluded).
+    Real tRoot;
+    if (!boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) return false;
     int stack[64]; int sp = 0; stack[sp++] = 0;
     while (sp) {
         const DNode& n = sc.nodes[stack[--sp]];
-        Real tE;
-        if (!boxHit(n, o, invD, tmin, tMax, tE)) continue;
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
@@ -2225,18 +2362,34 @@ struct DCamSet {
     unsigned long long  depCap     = 0;
 };
 
+// Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
+// The deposit-side DPhoton carries (pos, wi, n, power, lambda), but the gather never
+// reads wi, and it weighted every visited photon by cie{X,Y,Z}(lambda_p) * power *
+// norm / pi — all per-photon CONSTANTS of the estimate (norm = 1/(pi r^2 nEmitted)).
+// That triple is folded into pX/pY/pZ at upload time (host doubles from PhotonMap::cie
+// times power*norm/pi, rounded to float once), so the per-photon inner loop is just
+// g? += rho(lambda_p) * p? — no CIE multi-Gaussian evaluation (7 exp()s) per visited
+// photon. Device analogue of the CPU PhotonMap::cie precompute (photonmap.h), which
+// was ~74% of profiled mode-M render time when it was added there.
+struct DGatherPhoton {
+    DVec3 pos;              // deposit position (world)
+    DVec3 n;                // shading normal (cross-surface leak rejection)
+    float pX, pY, pZ;       // cie{X,Y,Z}(lambda) * power * norm / pi (see above)
+    float lambda;           // wavelength (nm) — rho(lambda_p) still varies per photon
+};
+
 // A view-independent photon-map query structure on the device (device twin of PhotonMap
 // in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
 // photon records, so a radius-r query touches only the 3x3x3 neighbourhood. Built on the
 // host (PhotonMap::build) from the deposited photons, then uploaded for the gather kernel.
+// (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
-    const DPhoton* photons;   // reordered into cell-contiguous runs
+    const DGatherPhoton* photons; // reordered into cell-contiguous runs
     const int*     cellStart; // size nCells+1; cell c occupies [cellStart[c], cellStart[c+1])
     DVec3  lo;                // grid origin (world)
     Real   cellSize;          // == gather radius
     Real   radius;            // gather radius (world units)
     int    nx, ny, nz;
-    long long nEmitted;       // total photons emitted in the pass (normalization)
 };
 
 // Splat a surface vertex to every camera (model B pinhole connect, or model A finite-
@@ -2399,6 +2552,27 @@ __device__ static bool dTraceOutOfSphere(const D3& o, const D3& d, const DSphere
     return true;
 }
 
+// --- specular-sphere scan-angle tables (Opt 3) -------------------------------
+// Both sphere connectors scan the SAME SPH_SCAN_N+1 fixed entry angles on every
+// call, and each scan step used to pay a software-fp64 cos+sin pair — the
+// dominant transcendental cost of the glass-sphere splat on GPU. The angles
+// never change, so a one-time init kernel fills these tables with the SAME
+// device cos/sin the macros called (host-computed values could differ by 1 ulp),
+// making table reads bit-identical to the per-step evaluation they replace.
+// Bisection refinement still computes live cos/sin (midpoints are data-dependent).
+static constexpr int SPH_SCAN_N = 96;
+__device__ static double g_sphScanC[SPH_SCAN_N + 1];
+__device__ static double g_sphScanS[SPH_SCAN_N + 1];
+
+__global__ void kSphScanInit() {
+    int i = threadIdx.x;
+    if (i > SPH_SCAN_N) return;
+    const int NS = SPH_SCAN_N;
+    double phi = -DPI + (2.0 * DPI) * i / NS;
+    g_sphScanC[i] = cos(phi);
+    g_sphScanS[i] = sin(phi);
+}
+
 // Connect EXTERIOR vertex p to a pinhole INSIDE dielectric sphere S (single
 // refraction) — the path the camera sees flying THROUGH the glass. Port of
 // Renderer::connectSpecularSphereInside.
@@ -2421,9 +2595,10 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
 
     // In-plane once-refracted exit-ray miss of p. Encoded as a helper via lambda-free
     // repeated code (no std::function on device): returns miss, sets valid.
-    #define D_TRACE2D_INSIDE(PHI, MISS, VALID) do {                                   \
+    // Takes the entry angle as its (cos, sin) pair.
+    #define D_TRACE2D_INSIDE(C1, S1, MISS, VALID) do {                                \
         VALID = false; MISS = 0.0;                                                    \
-        double c1 = cos(PHI), s1 = sin(PHI);                                          \
+        double c1 = (C1), s1 = (S1);                                                  \
         double P1x = r * c1, P1y = r * s1;                                            \
         double dinx = P1x - ex_e, diny = P1y - ey_e;                                  \
         double dl = sqrt(dinx*dinx + diny*diny);                                      \
@@ -2448,15 +2623,15 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         }                                                                            \
     } while (0)
 
-    const int NS = 96; double roots[4]; int nroot = 0;
+    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
     double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
     for (int i = 0; i <= NS && nroot < 4; ++i) {
         double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_INSIDE(phi, mss, v);
+        bool v; double mss; D_TRACE2D_INSIDE(g_sphScanC[i], g_sphScanS[i], mss, v);
         if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
             double a = prevPhi, b = phi, fa = prevMiss;
             for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_INSIDE(mid, fm, vm);
+                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_INSIDE(cos(mid), sin(mid), fm, vm);
                 if (!vm) break;
                 if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
             }
@@ -2545,9 +2720,10 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     double ex_e = dEyeO;
     double px2 = d3dot(ap, ex), py2 = d3dot(ap, ey);
 
-    #define D_TRACE2D_THRU(PHI, MISS, VALID) do {                                    \
+    // Takes the entry angle as its (cos, sin) pair.
+    #define D_TRACE2D_THRU(C1, S1, MISS, VALID) do {                                 \
         VALID = false; MISS = 0.0;                                                   \
-        double c1 = cos(PHI), s1 = sin(PHI);                                         \
+        double c1 = (C1), s1 = (S1);                                                 \
         double P1x = r * c1, P1y = r * s1;                                           \
         double dinx = P1x - ex_e, diny = P1y;                                        \
         double dl = sqrt(dinx*dinx + diny*diny);                                     \
@@ -2587,15 +2763,15 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         }                                                                           \
     } while (0)
 
-    const int NS = 96; double roots[4]; int nroot = 0;
+    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
     double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
     for (int i = 0; i <= NS && nroot < 4; ++i) {
         double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_THRU(phi, mss, v);
+        bool v; double mss; D_TRACE2D_THRU(g_sphScanC[i], g_sphScanS[i], mss, v);
         if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
             double a = prevPhi, b = phi, fa = prevMiss;
             for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_THRU(mid, fm, vm);
+                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_THRU(cos(mid), sin(mid), fm, vm);
                 if (!vm) break;
                 if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
             }
@@ -2698,9 +2874,11 @@ __device__ static void camSpecularSplatVolumeAll(const DScene& sc, const DMedium
 
 // ============================ megakernel ============================
 
-__device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
-    // CDF search stays in double (host-baked table); the returned wavelength/pdf are Real.
-    double u = (double)rng.uniform();
+// Wavelength from an emitter's SPD CDF given an explicit uniform `u` in [0,1). Split out
+// so the hero-wavelength sampler can pass stratified strata (u + i/C wrapped) that share
+// the emitter's CDF, while the scalar sampleLambda below just draws its own u. The CDF
+// search stays in double (host-baked table); the returned wavelength/pdf are Real.
+__device__ static Real sampleLambdaU(const DScene& sc, const DEmitter& em, double u, Real& pdf) {
     const double* cdf = sc.lightCdfAll + em.cdfOffset;
     int lo = 0, hi = em.cdfN - 1;
     while (lo + 1 < hi) { int mid = (lo + hi) / 2; if (cdf[mid] <= u) lo = mid; else hi = mid; }
@@ -2708,6 +2886,9 @@ __device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& 
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
     pdf = (Real)((c1 - c0) / em.cdfStep);
     return (Real)(DLMIN + (lo + frac) * em.cdfStep);
+}
+__device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
+    return sampleLambdaU(sc, em, (double)rng.uniform(), pdf);
 }
 
 // Power-weighted emitter selection (mirrors Scene::selectEmitter). Single
@@ -2899,6 +3080,102 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
         }
     }
     return sp > 0 ? st[0] : 0.0;
+}
+// ---- FP32 twin of the pattern VM: used ONLY for DF_EXPR field formulas inside the
+// sphere-trace march (dFieldLeafSDFF). Same integer hash lattice, float blend.
+__device__ static float dPatHash3F(int ix, int iy, int iz) {
+    unsigned int h = (unsigned int)ix * 374761393u + (unsigned int)iy * 668265263u
+                   + (unsigned int)iz * 2147483647u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= (h >> 16);
+    return (float)h * (1.0f / 4294967295.0f);   // [0,1]
+}
+__device__ static float dPatValueNoiseF(float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+    float tx = x - fx, ty = y - fy, tz = z - fz;
+    float ux = tx * tx * (3.0f - 2.0f * tx);
+    float uy = ty * ty * (3.0f - 2.0f * ty);
+    float uz = tz * tz * (3.0f - 2.0f * tz);
+    float c000 = dPatHash3F(ix,     iy,     iz);
+    float c100 = dPatHash3F(ix + 1, iy,     iz);
+    float c010 = dPatHash3F(ix,     iy + 1, iz);
+    float c110 = dPatHash3F(ix + 1, iy + 1, iz);
+    float c001 = dPatHash3F(ix,     iy,     iz + 1);
+    float c101 = dPatHash3F(ix + 1, iy,     iz + 1);
+    float c011 = dPatHash3F(ix,     iy + 1, iz + 1);
+    float c111 = dPatHash3F(ix + 1, iy + 1, iz + 1);
+    float x00 = c000 + (c100 - c000) * ux;
+    float x10 = c010 + (c110 - c010) * ux;
+    float x01 = c001 + (c101 - c001) * ux;
+    float x11 = c011 + (c111 - c011) * ux;
+    float y0  = x00 + (x10 - x00) * uy;
+    float y1  = x01 + (x11 - x01) * uy;
+    return y0 + (y1 - y0) * uz;
+}
+__device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
+                                      float x, float y, float z, float f,
+                                      float nx, float ny, float nz, float r,
+                                      float u, float v) {
+    float st[64]; int sp = 0;
+    for (int i = 0; i < n; ++i) {
+        const PatNodeF& nd = nodes[i];
+        switch ((PatOp)nd.op) {
+            case PatOp::Const:    st[sp++] = nd.a; break;
+            case PatOp::VarX:     st[sp++] = x;  break;
+            case PatOp::VarY:     st[sp++] = y;  break;
+            case PatOp::VarZ:     st[sp++] = z;  break;
+            case PatOp::VarF:     st[sp++] = f;  break;
+            case PatOp::VarNx:    st[sp++] = nx; break;
+            case PatOp::VarNy:    st[sp++] = ny; break;
+            case PatOp::VarNz:    st[sp++] = nz; break;
+            case PatOp::VarR:     st[sp++] = r;  break;
+            case PatOp::VarU:     st[sp++] = u;  break;
+            case PatOp::VarV:     st[sp++] = v;  break;
+            case PatOp::VarT:     st[sp++] = 0.0f; break;
+            case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
+            case PatOp::Abs:      st[sp-1] = fabsf(st[sp-1]); break;
+            case PatOp::Sqrt:     st[sp-1] = sqrtf(fmaxf(0.0f, st[sp-1])); break;
+            case PatOp::Sin:      st[sp-1] = sinf(st[sp-1]); break;
+            case PatOp::Cos:      st[sp-1] = cosf(st[sp-1]); break;
+            case PatOp::Tan:      st[sp-1] = tanf(st[sp-1]); break;
+            case PatOp::Exp:      st[sp-1] = expf(st[sp-1]); break;
+            case PatOp::Log:      st[sp-1] = logf(fmaxf(1e-30f, st[sp-1])); break;
+            case PatOp::Floor:    st[sp-1] = floorf(st[sp-1]); break;
+            case PatOp::Fract:    st[sp-1] = st[sp-1] - floorf(st[sp-1]); break;
+            case PatOp::Sign:     st[sp-1] = (float)((st[sp-1] > 0.0f) - (st[sp-1] < 0.0f)); break;
+            case PatOp::Saturate: st[sp-1] = fminf(1.0f, fmaxf(0.0f, st[sp-1])); break;
+            case PatOp::Add:      { float b = st[--sp]; st[sp-1] += b; break; }
+            case PatOp::Sub:      { float b = st[--sp]; st[sp-1] -= b; break; }
+            case PatOp::Mul:      { float b = st[--sp]; st[sp-1] *= b; break; }
+            case PatOp::Div:      { float b = st[--sp]; st[sp-1] = (b != 0.0f) ? st[sp-1] / b : 0.0f; break; }
+            case PatOp::Mod:      { float b = st[--sp]; st[sp-1] = (b != 0.0f) ? st[sp-1] - b * floorf(st[sp-1] / b) : 0.0f; break; }
+            case PatOp::Pow:      { float b = st[--sp]; st[sp-1] = powf(st[sp-1], b); break; }
+            case PatOp::Min:      { float b = st[--sp]; st[sp-1] = fminf(st[sp-1], b); break; }
+            case PatOp::Max:      { float b = st[--sp]; st[sp-1] = fmaxf(st[sp-1], b); break; }
+            case PatOp::Atan2:    { float b = st[--sp]; st[sp-1] = atan2f(st[sp-1], b); break; }
+            case PatOp::Step:     { float b = st[--sp]; st[sp-1] = (b >= st[sp-1]) ? 1.0f : 0.0f; break; }
+            case PatOp::Clamp:    { float hi = st[--sp], lo = st[--sp]; st[sp-1] = fminf(hi, fmaxf(lo, st[sp-1])); break; }
+            case PatOp::Mix:      { float t = st[--sp], b = st[--sp]; st[sp-1] = st[sp-1] + (b - st[sp-1]) * t; break; }
+            case PatOp::Smoothstep: {
+                float xx = st[--sp], e1 = st[--sp], e0 = st[sp-1];
+                float tt = (e1 != e0) ? (xx - e0) / (e1 - e0) : 0.0f;
+                tt = fminf(1.0f, fmaxf(0.0f, tt));
+                st[sp-1] = tt * tt * (3.0f - 2.0f * tt);
+                break;
+            }
+            case PatOp::Noise:    { float zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoiseF(st[sp-1], yy, zz); break; }
+            case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
+                int id = (int)nd.a;
+                int na = povFnArity(id);
+                double args[POV_FN_MAX_ARGS];
+                for (int k = na - 1; k >= 0; --k) args[k] = (double)st[--sp];
+                st[sp++] = (float)povFnEval(id, args);
+                break;
+            }
+        }
+    }
+    return sp > 0 ? st[0] : 0.0f;
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
 // The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
@@ -3240,79 +3517,17 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     return true;
 }
 
-// Advance a photon by one bounce given its precomputed intersection `h`. Mutates
-// ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
-// when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
-// with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
-__device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
-                                int camMode, int diffraction, const DHit& h,
-                                DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
-                                double& eAbsorbed, double& eSensor, double& eEscaped,
-                                DMediumStack& stk) {
-    Real dSurf = h.valid ? h.t : BIG;
-
-    // fog free-flight; dEvent is the nearer of surface hit / volume collision.
-    bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
-    if (sc.mediaN > 0) {
-        // Superposition of all media: each does its own delta (Woodcock) tracking (or
-        // exact analytic free-flight if homogeneous); the earliest collision wins and
-        // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
-        Real tMed; int which;
-        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
-            mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
-        }
-    }
-
-    // Model C perspective catch: if the photon flies through the aperture
-    // nearer than the surface/fog event, it lands on the film. Analog physics.
-    if (camMode == CAM_C) {
-        int px, py;
-        // Model C never shares a trace (it consumes the photon), so nCam==1 here.
-        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
-            // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
-            // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
-            // scenes unaffected).
-            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
-            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
-            eSensor += beta; return WF_TERMINATE;
-        }
-    }
-
-    // Beer-Lambert attenuation over the free path just travelled inside a dielectric
-    // (colored/attenuating glass), applied before the event is processed (matches the
-    // host: attenuate over dEvent using the medium carried from the previous vertex).
-    {
-        int cm = stk.topMat();
-        Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-        if (a > 0) beta *= exp(-a * dEvent);
-    }
-
-    if (mediumEvent) {
-        const DMedium& sm = sc.media[scatterMed];
-        splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
-        camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
-        if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
-        ro = mp; rd = nd;
-        return WF_CONTINUE;
-    }
-
-    if (!h.valid) { eEscaped += beta; return WF_TERMINATE; }
-    if (h.sensorId >= 0) {
-        // Legacy contact sensor: no geometry carries a sensorId in the current
-        // camera modes, so this is inert (kept for absorption bookkeeping).
-        eSensor += beta; return WF_TERMINATE;
-    }
-
-    const DMaterial* mptr = &sc.mats[h.matId];
-    int matIndex = h.matId;
-    // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
-    if (mptr->type == D_MIX) {
-        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
-        if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        mptr = &sc.mats[child]; matIndex = child;
-    }
-    const DMaterial& m = *mptr;
+// Specular / wavelength-switching material interaction (the nine families that are NOT
+// Diffuse / DiffuseTransmit): Dielectric, ThinFilm, Multilayer, Mirror, Grating,
+// HalfMirror, Filter, Glossy, Fluorescent. Split out of shadeStep so BOTH the scalar
+// forward tracer AND the hero-wavelength tracer (after de-hero) share one source of truth
+// for these lobes — the device twin of Renderer::interactPhotonSpecular (render.h). `m` is
+// the already-resolved material (post-Mix); `matIndex` drives the dielectric priority stack.
+// Mutates ro/rd/beta/lambda (Fluorescent Stokes shift) and returns WF_CONTINUE/WF_TERMINATE.
+__device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int camMode,
+        int diffraction, const DMaterial& m, int matIndex, const DHit& h,
+        DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
+        DMediumStack& stk) {
     if (m.type == D_DIELECTRIC) {
         DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matIndex, stk, nro, nrd);
         ro = nro; rd = nrd; return WF_CONTINUE;
@@ -3391,6 +3606,89 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
           ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE; }
+    }
+    return WF_CONTINUE;   // unreachable: caller dispatches only the nine specular types
+}
+
+// Advance a photon by one bounce given its precomputed intersection `h`. Mutates
+// ro/rd/beta and accumulates absorbed/sensor/escaped energy. Returns WF_TERMINATE
+// when the path ends (absorbed / escaped / landed on the sensor), else WF_CONTINUE
+// with ro/rd set for the next segment. `h` is the closestHit(sc, ro, rd) result.
+__device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
+                                int camMode, int diffraction, const DHit& h,
+                                DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
+                                double& eAbsorbed, double& eSensor, double& eEscaped,
+                                DMediumStack& stk) {
+    Real dSurf = h.valid ? h.t : BIG;
+
+    // fog free-flight; dEvent is the nearer of surface hit / volume collision.
+    bool mediumEvent = false; int scatterMed = -1; DVec3 mp; Real dEvent = dSurf;
+    if (sc.mediaN > 0) {
+        // Superposition of all media: each does its own delta (Woodcock) tracking (or
+        // exact analytic free-flight if homogeneous); the earliest collision wins and
+        // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
+        Real tMed; int which;
+        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
+            mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
+        }
+    }
+
+    // Model C perspective catch: if the photon flies through the aperture
+    // nearer than the surface/fog event, it lands on the film. Analog physics.
+    if (camMode == CAM_C) {
+        int px, py;
+        // Model C never shares a trace (it consumes the photon), so nCam==1 here.
+        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
+            // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
+            // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
+            // scenes unaffected).
+            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
+            eSensor += beta; return WF_TERMINATE;
+        }
+    }
+
+    // Beer-Lambert attenuation over the free path just travelled inside a dielectric
+    // (colored/attenuating glass), applied before the event is processed (matches the
+    // host: attenuate over dEvent using the medium carried from the previous vertex).
+    {
+        int cm = stk.topMat();
+        Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+        if (a > 0) beta *= exp(-a * dEvent);
+    }
+
+    if (mediumEvent) {
+        const DMedium& sm = sc.media[scatterMed];
+        splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+        camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+        if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
+        DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
+        ro = mp; rd = nd;
+        return WF_CONTINUE;
+    }
+
+    if (!h.valid) { eEscaped += beta; return WF_TERMINATE; }
+    if (h.sensorId >= 0) {
+        // Legacy contact sensor: no geometry carries a sensorId in the current
+        // camera modes, so this is inert (kept for absorption bookkeeping).
+        eSensor += beta; return WF_TERMINATE;
+    }
+
+    const DMaterial* mptr = &sc.mats[h.matId];
+    int matIndex = h.matId;
+    // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
+    if (mptr->type == D_MIX) {
+        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
+        if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
+        mptr = &sc.mats[child]; matIndex = child;
+    }
+    const DMaterial& m = *mptr;
+    if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
+        m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
+        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
+        // The nine specular / wavelength-switching lobes — shared with the hero tracer.
+        return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+                                ro, rd, beta, lambda, rng, eAbsorbed, stk);
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -3432,9 +3730,315 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     }
 }
 
+// ==================== hero-wavelength forward tracer (device) ================
+// Device twin of Renderer::tracePhotonHero (render.h): one path carries a HERO wavelength
+// (index 0) plus C-1 stratified SECONDARY wavelengths that SHARE a single BVH walk. The
+// geometry is driven by the hero λ; each λ carries its own throughput beta[i]. At any
+// dispersive / wavelength-switching interface the secondaries "de-hero" (terminate,
+// beta[0] *= C) and the path continues as an ordinary single-λ photon — energy is
+// preserved exactly and the estimator is unbiased. Only CHROMATIC noise is reduced (all C
+// share one geometric sample). Gated OFF when the scene has participating media or a GRIN
+// region (see launchForward), so the fog/GRIN code paths never appear here.
+
+// Mode-B pinhole connect for all `nUp` live wavelengths through ONE shared geometry
+// (draws no RNG). Per-λ ordering matches connect().
+__device__ static void connectHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+    DVec3 toCam = cam.eye - p;
+    Real dist = length(toCam);
+    DVec3 wdir = toCam / dist;
+    Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
+    int px, py; Real cosCam, dist2;
+    if (!cam.project(p, px, py, cosCam, dist2)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
+    for (int i = 0; i < nUp; ++i) {
+        Real contrib = beta[i] * (rho[i] / (Real)DPI) * geo;
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
+    }
+}
+// Model-A finite-lens splat for all `nUp` live wavelengths through ONE shared aperture
+// sample (drawn once — the thin-lens pupil is achromatic, so C wavelengths legitimately
+// share the connection, exactly like connectLensHero on the CPU). Per-λ ordering matches
+// connectLens().
+__device__ static void connectLensHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;
+    Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
+    Real cosLens = -dot(wdir, cam.w);
+    if (cosLens <= (Real)1e-6) return;
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    if (occluded(sc, p + ng * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
+    Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+    Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
+    for (int i = 0; i < nUp; ++i) {
+        Real contrib = beta[i] * rho[i] * geo;
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
+    }
+}
+// Splat a surface vertex to every camera, all `nUp` live wavelengths (mode A/B). No-op for
+// mode C (which consumes the photon) and for the mode-M deposit pass (nCam == 0).
+__device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, int camMode,
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+        else if (camMode == CAM_A) connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+    }
+}
+// Refract each live wavelength's Lambertian reflection through every glass sphere. Unlike
+// the achromatic camera connection this CANNOT share geometry: the sphere IOR is dispersive
+// (per-λ), so each wavelength traces its own refracted image — exactly what makes a glass-
+// sphere caustic chromatically dispersed. Draws no RNG (mode B only inside).
+__device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode,
+        const DVec3& p, const DVec3& n, const Real* lam, const Real* beta, const Real* rho,
+        int nUp, DRng& rng) {
+    for (int i = 0; i < nUp; ++i)
+        camSpecularSplatAll(sc, cs, camMode, p, n, lam[i], beta[i], rho[i], rng);
+}
+
+// Emit one hero photon: fills ro/rd and the per-λ lam[]/beta[] bundle, sets secAlive, does
+// the direct emitter->camera splat, and accrues emitted energy (sum of live betas). Returns
+// false when the hero wavelength draws a zero pdf (skip this photon). Emission geometry is
+// byte-identical to genPhoton (λ-independent); only the wavelength/throughput bundle differs.
+__device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int camMode, int C,
+        DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted) {
+    int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+    const DEmitter em = sc.emitters[ei];
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 origin, emitN, dir;
+    Real spotW = (Real)1;
+    bool envImage = false; double envPdfW = 0.0;
+    if (em.shape == 2) {
+        origin = em.origin;
+        double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
+        double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+        double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+        DVec3 t, b; onb(em.beamDir, t, b);
+        dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
+        emitN = em.beamDir;
+        double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
+        spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
+    } else if (em.shape == 3) {
+        if (sc.env.scale != nullptr) {
+            dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
+            envImage = true;
+        } else {
+            double z = 1.0 - 2.0 * (double)u1;
+            double sr = sqrt(fmax(0.0, 1.0 - z * z));
+            double phi = 2.0 * 3.14159265358979323846 * (double)u2;
+            dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        }
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
+        emitN = dir;
+    } else {
+        emitterSamplePoint(em, u1, u2, origin, emitN);
+        dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+    }
+
+    // Hero + stratified secondaries from this emitter's SPD (one base draw, C-1 wrapped
+    // strata). The hero must have a valid pdf; a dead secondary simply carries beta 0.
+    double u = (double)rng.uniform();
+    Real pdf0 = 0;
+    lam[0] = sampleLambdaU(sc, em, u, pdf0);
+    if (pdf0 <= 0) return false;
+    for (int i = 1; i < C; ++i) {
+        double uu = u + (double)i / C;
+        if (uu >= 1.0) uu -= 1.0;                     // wrap into [0,1)
+        Real pdfi;
+        lam[i] = sampleLambdaU(sc, em, uu, pdfi);
+    }
+    Real base = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
+    base *= spotW;
+    for (int i = 0; i < C; ++i) beta[i] = base / (Real)C;
+    if (envImage) {
+        int ti = dEnvTexel(sc.env, dir);
+        for (int i = 0; i < C; ++i) {
+            double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lam[i]);
+            double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lam[i]);
+            double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
+            beta[i] = (denom > 0.0) ? (Real)((double)beta[i] * rad / denom) : (Real)0;
+        }
+    }
+    secAlive = (C > 1);
+    int nUp = secAlive ? C : 1;
+    for (int i = 0; i < nUp; ++i) eEmitted += (double)beta[i];
+
+    // Direct emitter->camera connection (area/quad emitters only; spot/env have no direct
+    // term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
+    if (em.shape != 2 && em.shape != 3) {
+        Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = (Real)1;
+        splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng);
+        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng);
+    }
+
+    ro = origin + dir * RAY_EPS; rd = dir;
+    return true;
+}
+
+// One hero bounce (called only while secAlive, so nUp == C). Handles the model-C catch,
+// escape/sensor bookkeeping, and the diffuse / diffuse-transmit lobes with per-λ deposit +
+// splat + Russian-roulette on the hero (secondaries reweighted by rho[i]/rho[0]). At any of
+// the nine specular / wavelength-switching materials it DE-HEROS (beta[0] *= C, secAlive =
+// false) and delegates that same hit to the shared scalar interactSpecular — from then on
+// the caller runs the ordinary single-λ shadeStep. No fog/GRIN here (gated out upstream).
+__device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
+        int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
+        bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
+        DMediumStack& stk) {
+    const int nUp = C;
+    Real dEvent = h.valid ? h.t : BIG;
+
+    // Model C aperture catch: deposit every live wavelength that threads the pupil.
+    if (camMode == CAM_C) {
+        int px, py;
+        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
+            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            for (int i = 0; i < nUp; ++i) {
+                filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lam[i], beta[i] * cCell);
+                eSensor += (double)beta[i];
+            }
+            return WF_TERMINATE;
+        }
+    }
+    // (No Beer-Lambert while secAlive: entering a dielectric de-heros, so the stack is empty
+    // here and topMat() would be -1.)
+    if (!h.valid) { for (int i = 0; i < nUp; ++i) eEscaped += (double)beta[i]; return WF_TERMINATE; }
+    if (h.sensorId >= 0) { for (int i = 0; i < nUp; ++i) eSensor += (double)beta[i]; return WF_TERMINATE; }
+
+    const DMaterial* mptr = &sc.mats[h.matId];
+    int matIndex = h.matId;
+    if (mptr->type == D_MIX) {
+        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
+        if (child < 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+        mptr = &sc.mats[child]; matIndex = child;
+    }
+    const DMaterial& m = *mptr;
+
+    if (m.type == D_DIFFUSETRANSMIT) {
+        Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
+        for (int i = 0; i < nUp; ++i) {
+            Real rr = clamp01(dDiffuseRho(sc, m, h, lam[i]));
+            Real rt = clamp01(specLookup(m.transmit, lam[i]));
+            Real s = rr + rt; if (s > (Real)1) { rr /= s; rt /= s; }   // per-λ energy guard
+            rhoR[i] = rr; rhoT[i] = rt;
+        }
+        DVec3 nb = h.n * (Real)(-1);
+        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+        DVec3 wiPrev = -rd;
+        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+        if (camMode == CAM_A || camMode == CAM_B) {
+            splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
+            splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
+            camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rhoR, nUp, rng);
+            camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, lam, beta, rhoT, nUp, rng);
+        }
+        Real sumHero = rhoR[0] + rhoT[0];
+        Real uu = rng.uniform();
+        if (uu < rhoR[0]) {
+            for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+            DVec3 wo = cosineHemisphere(h.n, rng);
+            Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+            for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+            ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
+        } else if (uu < sumHero) {
+            for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+            DVec3 wo = cosineHemisphere(nb, rng);
+            Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+            for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+            ro = h.p + nb * RAY_EPS; rd = wo; return WF_CONTINUE;
+        }
+        for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
+        return WF_TERMINATE;
+    }
+
+    if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
+        m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
+        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
+        // Dispersive / wavelength-switching: terminate secondaries, boost the hero ×C, then
+        // run the shared scalar interaction on the (now single-λ) hero channel.
+        beta[0] *= (Real)C; secAlive = false;
+        return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
+    }
+
+    // Diffuse (texture-sampled reflectance when the material binds a texture).
+    Real rho[hero::kHeroMax];
+    for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
+    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 wiPrev = -rd;
+    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+    if (camMode == CAM_A || camMode == CAM_B) {
+        splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
+        camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
+    }
+    Real rhoHero = rho[0];
+    if (rng.uniform() >= rhoHero) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;   // secondary reweight
+    DVec3 wo = cosineHemisphere(h.n, rng);
+    Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+    for (int i = 0; i < nUp; ++i) beta[i] *= corr;
+    ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
+}
+
+// Full hero photon: emit, then bounce until termination. While the secondaries are alive
+// each bounce runs shadeStepHero; once a dispersive interface de-heros the path, it falls
+// through to the ordinary single-λ shadeStep on beta[0]/lam[0].
+__device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int camMode,
+        int diffraction, int maxBounce, int C, DRng& rng,
+        double& eEmitted, double& eAbsorbed, double& eSensor, double& eEscaped, double& eResidual) {
+    Real lam[hero::kHeroMax], beta[hero::kHeroMax];
+    bool secAlive = false;
+    DVec3 ro, rd;
+    if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted)) return;
+    DMediumStack stk; stk.clear();
+    bool done = false;
+    for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
+        if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
+        DHit h = closestHit(sc, ro, rd);
+        int r;
+        if (secAlive)
+            r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
+                              eAbsorbed, eSensor, eEscaped, stk);
+        else
+            r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
+                          eAbsorbed, eSensor, eEscaped, stk);
+        if (r == WF_TERMINATE) done = true;
+    }
+    if (!done) {
+        int n = secAlive ? C : 1;
+        for (int i = 0; i < n; ++i) eResidual += (double)beta[i];
+    }
+}
+
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
-                       int camMode) {
+                       int camMode, int heroC) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seed((unsigned long long)(g * 2 + 1), seedBase ^ (unsigned long long)g);
@@ -3442,6 +4046,13 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
+        if (heroC > 1) {
+            // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
+            // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
+            traceHeroPhoton(sc, cs, camMode, diffraction, maxBounce, heroC, rng,
+                            eEmitted, eAbsorbed, eSensor, eEscaped, eResidual);
+            continue;
+        }
         DVec3 ro, rd; Real beta, lambda;
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted)) continue;
         bool done = false;
@@ -3705,11 +4316,6 @@ __device__ static double dBsdfPdf(const DScene& sc, int matId, const DVec3& ns,
 }
 
 // Camera importance (PBRT imagePlaneArea convention — see bdpt.h cameraWe/PdfDir).
-__device__ static double dCamCos(const DCamera& cam, const DVec3& p) {
-    DVec3 d = p - cam.eye;
-    double len = sqrt(ddot(d, d));
-    return len > 0 ? ddot(d, cam.w) / len : 0.0;
-}
 __device__ static double dCameraPdfDir(const DCamera& cam, double cosCam) {
     if (cosCam <= 0) return 0.0;
     return 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam);
@@ -3729,49 +4335,68 @@ __device__ static double dConvertDensity(double pdfW, const DVertex& from, const
     if (dOnSurface(to)) pdfW *= fabs(ddot(to.ns, w * (Real)sqrt(invD2)));
     return pdfW * invD2;
 }
+// ---- FP32 MIS pdf probes ----------------------------------------------------
+// These are used ONLY by dMisWeight. The MIS weight is a bounded ratio sum
+// (1/(1+sumRi), sumRi >= 0): any weight partition of unity keeps the estimator
+// unbiased, so last-ulp precision buys nothing -- and on GeForce parts FP64
+// issues at 1/64 rate, which makes the per-connection reverse-density probes a
+// direct FP64-pipe cost. FP32 is ample for these like-magnitude area-density
+// ratios, and overflow is graceful (an inf ratio drives the weight to 0, same
+// place the double path was headed). BSDF/phase backends keep their double
+// internals; results fold to float at the boundary. The transport quantities
+// themselves (beta/pdfFwd along the walk, connect radiance) stay double.
 // Emission directional density at a light vertex toward `next` (area measure).
-__device__ static double dVertexPdfLight(const DVertex& cur, const DVertex& next) {
+__device__ static float dVertexPdfLightF(const DVertex& cur, const DVertex& next) {
     DVec3 w = next.p - cur.p;
-    double d2 = ddot(w, w);
-    if (d2 == 0.0) return 0.0;
-    double invD2 = 1.0 / d2;
-    DVec3 wn = w * (Real)sqrt(invD2);
-    double cosLight = ddot(cur.ng, wn);
-    if (cosLight <= 0.0) return 0.0;
-    double pdf = (cosLight / DPI) * invD2;
-    if (dOnSurface(next)) pdf *= fabs(ddot(next.ns, wn));
+    float d2 = dot(w, w);
+    if (d2 == 0.f) return 0.f;
+    float invD2 = 1.0f / d2;
+    DVec3 wn = w * (Real)sqrtf(invD2);
+    float cosLight = dot(cur.ng, wn);
+    if (cosLight <= 0.f) return 0.f;
+    float pdf = (cosLight * (float)(1.0 / DPI)) * invD2;
+    if (dOnSurface(next)) pdf *= fabsf(dot(next.ns, wn));
     return pdf;
 }
-__device__ static double dVertexPdf(const DScene& sc, const DCamera& cam,
+__device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
                                     const DVertex* prev, const DVertex& cur, const DVertex& next) {
-    if (cur.type == BV_LIGHT) return dVertexPdfLight(cur, next);
+    if (cur.type == BV_LIGHT) return dVertexPdfLightF(cur, next);
     DVec3 wn = next.p - cur.p;
-    if (ddot(wn, wn) == 0.0) return 0.0;
+    if (dot(wn, wn) == 0.f) return 0.f;
     wn = normalize(wn);
-    double pdfW = 0.0;
+    float pdfW = 0.f;
     if (cur.type == BV_CAMERA) {
-        pdfW = dCameraPdfDir(cam, dCamCos(cam, next.p));
+        DVec3 d = next.p - cam.eye;                       // dCameraPdfDir in FP32
+        float len = sqrtf(dot(d, d));
+        float cosCam = len > 0.f ? dot(d, cam.w) / len : 0.f;
+        if (cosCam <= 0.f) return 0.f;
+        pdfW = 1.0f / ((float)cam.imagePlaneArea() * cosCam * cosCam * cosCam);
     } else if (cur.type == BV_MEDIUM) {          // volume in-scatter: HG phase pdf
-        if (!prev) return 0.0;
+        if (!prev) return 0.f;
         DVec3 wp = prev->p - cur.p;
-        if (ddot(wp, wp) == 0.0) return 0.0;
+        if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = dPhasePdf(cur, wp, wn);
+        pdfW = (float)dPhasePdf(cur, wp, wn);
     } else {
-        if (!prev) return 0.0;
+        if (!prev) return 0.f;
         DVec3 wp = prev->p - cur.p;
-        if (ddot(wp, wp) == 0.0) return 0.0;
+        if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = dBsdfPdf(sc, cur.matId, cur.ns, wp, wn);
+        pdfW = (float)dBsdfPdf(sc, cur.matId, cur.ns, wp, wn);
     }
-    return dConvertDensity(pdfW, cur, next);
+    // dConvertDensity in FP32: solid angle -> area density at `next`.
+    DVec3 wv = next.p - cur.p;
+    float d2 = dot(wv, wv);
+    if (d2 == 0.f) return 0.f;
+    float invD2 = 1.0f / d2;
+    if (dOnSurface(next)) pdfW *= fabsf(dot(next.ns, wv) * sqrtf(invD2));
+    return pdfW * invD2;
 }
-__device__ static double dVertexPdfLightOrigin(const DScene& sc, const DVertex& cur) {
-    if (cur.lightIdx < 0) return 0.0;
+__device__ static float dVertexPdfLightOriginF(const DScene& sc, const DVertex& cur) {
+    if (cur.lightIdx < 0) return 0.f;
     const DEmitter& em = sc.emitters[cur.lightIdx];
-    if (sc.totalPower <= 0.0 || em.area <= 0.0) return 0.0;
-    double pdfChoice = em.power / sc.totalPower;
-    return pdfChoice / em.area;
+    if (sc.totalPower <= 0.0 || em.area <= 0.0) return 0.f;
+    return (float)((em.power / sc.totalPower) / em.area);
 }
 // Emitted radiance (single wavelength) leaving a light vertex toward w.
 __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVec3& w,
@@ -4542,67 +5167,59 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // per-thread local arrays, so we save whole vertices before ANY mutation and restore
 // them at the end (whole-vertex restore subsumes PBRT's field-wise ScopedAssignments).
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
-                                    DVertex* light, DVertex* eye, const DVertex& sampled,
-                                    int s, int t) {
+                                    const DVertex* light, const DVertex* eye,
+                                    const DVertex& sampled, int s, int t) {
     if (s + t == 2) return 1.0;
-    int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
-    bool hasQs = s > 0, hasPt = t > 0, hasQsM = s > 1, hasPtM = t > 1;
+    const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
 
-    DVertex sQs, sPt, sQsM, sPtM;
-    if (hasQs)  sQs  = light[si];
-    if (hasPt)  sPt  = eye[ti];
-    if (hasQsM) sQsM = light[sMi];
-    if (hasPtM) sPtM = eye[tMi];
+    // Non-mutating rewrite of the PBRT ScopedAssignment dance: the old code copied the
+    // four vertices adjacent to the connection edge to locals, wrote hypotheticals into
+    // the arrays, walked, and restored (8 x 96B local-memory copies per call). Instead,
+    // resolve the a1 endpoint substitution (s==1/t==1 use the resampled endpoint) through
+    // pointers and apply the a2/a3 delta-clears + a4..a7 pdfRev overrides inline in the
+    // walks by index compare. Arithmetic per PBRT 16.3; FP32 per the note above.
+    const DVertex* QsP = (s > 0) ? ((s == 1) ? &sampled : &light[si]) : nullptr;
+    const DVertex* PtP = (t == 1) ? &sampled : &eye[ti];   // t >= 1 always
 
-    // a1: install the resampled endpoint for s==1 / t==1.
-    if (s == 1)      light[si] = sampled;
-    else if (t == 1) eye[ti]   = sampled;
-    // a2/a3: connection endpoints act as non-delta while probing hypotheticals.
-    if (hasPt) eye[ti].delta   = 0;
-    if (hasQs) light[si].delta = 0;
-    // a4: reverse density of the eye connection vertex pt.
-    if (hasPt) {
-        double val = (s > 0) ? dVertexPdf(sc, cam, hasQsM ? &light[sMi] : nullptr, light[si], eye[ti])
-                             : dVertexPdfLightOrigin(sc, eye[ti]);
-        eye[ti].pdfRev = val;
-    }
-    // a5: reverse density of pt's predecessor.
-    if (hasPtM) {
-        double val = (s > 0) ? dVertexPdf(sc, cam, hasQs ? &light[si] : nullptr, eye[ti], eye[tMi])
-                             : dVertexPdfLight(eye[ti], eye[tMi]);
-        eye[tMi].pdfRev = val;
-    }
-    // a6/a7: reverse density of the light connection vertex qs and its predecessor.
-    if (hasQs)  light[si].pdfRev  = dVertexPdf(sc, cam, hasPtM ? &eye[tMi] : nullptr, eye[ti], light[si]);
-    if (hasQsM) light[sMi].pdfRev = dVertexPdf(sc, cam, hasPt ? &eye[ti] : nullptr, light[si], light[sMi]);
+    // a4..a7: reverse densities of the connection-adjacent vertices. Each is only read
+    // by a walk index >= 1, so skip the provably-dead ones (the old code computed those
+    // too, wrote them into the arrays, and restored over them unread).
+    float ptPdfRev = 0.f, ptMPdfRev = 0.f, qsPdfRev = 0.f, qsMPdfRev = 0.f;
+    if (t >= 2)
+        ptPdfRev = (s > 0) ? dVertexPdfF(sc, cam, (s > 1) ? &light[sMi] : nullptr, *QsP, *PtP)
+                           : dVertexPdfLightOriginF(sc, *PtP);
+    if (t >= 3)
+        ptMPdfRev = (s > 0) ? dVertexPdfF(sc, cam, QsP, *PtP, eye[tMi])
+                            : dVertexPdfLightF(*PtP, eye[tMi]);
+    if (s >= 1) qsPdfRev  = dVertexPdfF(sc, cam, (t > 1) ? &eye[tMi] : nullptr, *PtP, *QsP);
+    if (s >= 2) qsMPdfRev = dVertexPdfF(sc, cam, PtP, *QsP, light[sMi]);
 
-    double sumRi = 0.0, ri = 1.0;
+    float sumRi = 0.f, ri = 1.f;
     for (int i = t - 1; i > 0; --i) {
-        double num = eye[i].pdfRev != 0.0 ? eye[i].pdfRev : 1.0;
-        double den = eye[i].pdfFwd != 0.0 ? eye[i].pdfFwd : 1.0;
-        ri *= num / den;
-        if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
+        float num, den; int dl;
+        if (i == ti)       { num = ptPdfRev;             den = (float)PtP->pdfFwd;   dl = 0; }
+        else if (i == tMi) { num = ptMPdfRev;            den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
+        else               { num = (float)eye[i].pdfRev; den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
+        ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
+        if (!dl && !eye[i - 1].delta) sumRi += ri;
     }
-    ri = 1.0;
+    ri = 1.f;
     for (int i = s - 1; i >= 0; --i) {
-        double num = light[i].pdfRev != 0.0 ? light[i].pdfRev : 1.0;
-        double den = light[i].pdfFwd != 0.0 ? light[i].pdfFwd : 1.0;
-        ri *= num / den;
+        float num, den; int dl;
+        if (i == si)       { num = qsPdfRev;               den = (float)QsP->pdfFwd;     dl = 0; }
+        else if (i == sMi) { num = qsMPdfRev;              den = (float)light[i].pdfFwd; dl = light[i].delta; }
+        else               { num = (float)light[i].pdfRev; den = (float)light[i].pdfFwd; dl = light[i].delta; }
+        ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
         bool deltaPrev = (i > 0) ? (light[i - 1].delta != 0) : false;
-        if (!light[i].delta && !deltaPrev) sumRi += ri;
+        if (!dl && !deltaPrev) sumRi += ri;
     }
-
-    if (hasQsM) light[sMi] = sQsM;
-    if (hasPtM) eye[tMi]   = sPtM;
-    if (hasQs)  light[si]  = sQs;
-    if (hasPt)  eye[ti]    = sPt;
-    return 1.0 / (1.0 + sumRi);
+    return 1.0 / (1.0 + (double)sumRi);
 }
 
 // Connect strategy (s,t); returns the MIS-weighted radiance. For t==1 the result is a
 // light-image splat to (outPx,outPy) with isSplat=1. Direct port of bdpt.h connectBDPT.
 __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
-                                      DVertex* light, DVertex* eye, int s, int t,
+                                      const DVertex* light, const DVertex* eye, int s, int t,
                                       Real lambda, double invPdfLambda, DRng& rng,
                                       int& outPx, int& outPy, int& isSplat) {
     isSplat = 0;
@@ -4766,7 +5383,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // Chunked exactly like kBackward: renders `chunkSpp` samples-per-pixel starting at
 // `sampleBase`, seeding on the global sample index (pixel*sppTotal + sampleBase + local)
 // so any chunking is bit-identical to a single sppTotal pass.
-__global__ void kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
+// __launch_bounds__(128, 3): unconstrained the kernel compiles to 254 regs -> only 2
+// blocks (256 threads) resident per SM. Capping at 3 blocks/SM (<=170 regs) trades a few
+// extra spills for +50% latency hiding; the kernel is latency-bound on spilled/local
+// state (8KB stack/thread), so occupancy wins.
+__global__ void __launch_bounds__(128, 3)
+kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase) {
@@ -4826,9 +5448,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
-    const double area = DPI * (double)pm.radius * (double)pm.radius;
-    const double norm = (pm.nEmitted > 0 && area > 0.0) ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
-    const double r2 = (double)pm.radius * (double)pm.radius;
+    // norm folded into pX/pY/pZ; radius^2 kept in Real — the distance test runs once per
+    // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
+    // f2d convert issue at 1/64 rate, so keeping the test in FP32 matters.
+    const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
     const int maxBounce = 32;
 
     for (int b = 0; b < maxBounce; ++b) {
@@ -4861,7 +5484,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             // Radius density estimate at the visible point, accumulated in XYZ (each photon
             // folded at its own wavelength): L_r = (1/N) sum_p rho(l_p)/pi * Phi_p / (pi r^2).
-            double gx = 0, gy = 0, gz = 0;
+            // Everything but rho(l_p) is baked into the record's pX/pY/pZ (see DGatherPhoton),
+            // so the per-photon work is the two rejection tests + one rho + three FMAs — all
+            // FP32: a float sum of <= (cell occupancy) same-sign terms errs ~n*2^-24 relative,
+            // far below the 8-bit output quantum, and FP64 FMAs would issue at 1/64 rate. The
+            // per-sample total is promoted to double once at the end (film math stays double).
+            float gx = 0.f, gy = 0.f, gz = 0.f;
             int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
             int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
             int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
@@ -4873,19 +5501,17 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
                   int c = (cz * pm.ny + cy) * pm.nx + cx;
                   for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
-                      const DPhoton& ph = pm.photons[k];
+                      const DGatherPhoton& ph = pm.photons[k];
                       DVec3 d = h.p - ph.pos;
-                      if ((double)dot(d, d) > r2) continue;
+                      if (dot(d, d) > r2) continue;
                       if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                      Real rho = dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      double w = (double)rho * (1.0 / DPI) * (double)ph.power;
-                      gx += (double)cieX((Real)ph.lambda) * w;
-                      gy += (double)cieY((Real)ph.lambda) * w;
-                      gz += (double)cieZ((Real)ph.lambda) * w;
+                      float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                      gx += rho * ph.pX;
+                      gy += rho * ph.pY;
+                      gz += rho * ph.pZ;
                   }
                 }}}
-            double s = norm * thr;
-            oX += gx * s; oY += gy * s; oZ += gz * s;
+            oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
 
@@ -5450,6 +6076,26 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DMaterial* d_mats  = mats.empty()    ? nullptr : (DMaterial*)keep(uploadVec(mats));
     DFieldNode* d_fnodes = fieldNodes.empty() ? nullptr : (DFieldNode*)keep(uploadVec(fieldNodes));
     PatNode*    d_fexpr  = fieldExprNodes.empty() ? nullptr : (PatNode*)keep(uploadVec(fieldExprNodes));
+    // FP32 mirrors of the (final, fully-appended) field pools for the sphere-trace
+    // march. Same order/offsets as the double pools; converted once here so the march
+    // never touches FP64 loads or F64->F32 cvts.
+    std::vector<DFieldNodeF> fieldNodesF(fieldNodes.size());
+    for (size_t i = 0; i < fieldNodes.size(); ++i) {
+        const DFieldNode& s = fieldNodes[i]; DFieldNodeF& d = fieldNodesF[i];
+        d.op = s.op;
+        for (int k = 0; k < 4; ++k) d.p[k] = (float)s.p[k];
+        for (int k = 0; k < 9; ++k) d.inv[k] = (float)s.inv[k];
+        d.tx = (float)s.tx; d.ty = (float)s.ty; d.tz = (float)s.tz;
+        d.scale = (float)s.scale;
+        d.exprOff = s.exprOff; d.exprN = s.exprN;
+    }
+    std::vector<PatNodeF> fieldExprNodesF(fieldExprNodes.size());
+    for (size_t i = 0; i < fieldExprNodes.size(); ++i) {
+        fieldExprNodesF[i].op = (int)fieldExprNodes[i].op;
+        fieldExprNodesF[i].a  = (float)fieldExprNodes[i].a;
+    }
+    DFieldNodeF* d_fnodesF = fieldNodesF.empty() ? nullptr : (DFieldNodeF*)keep(uploadVec(fieldNodesF));
+    PatNodeF*    d_fexprF  = fieldExprNodesF.empty() ? nullptr : (PatNodeF*)keep(uploadVec(fieldExprNodesF));
     DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
     // Two-level BVH pools (shared BLAS + instance table). Empty for scenes with no instances.
     DInstance*  d_inst   = dinst.empty()     ? nullptr : (DInstance*)keep(uploadVec(dinst));
@@ -5574,6 +6220,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.mats = d_mats;
     sc.nodes = d_nodes; sc.primIdx = d_prim; sc.nNodes = (int)nodes.size();
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
+    sc.fieldNodesF = d_fnodesF; sc.fieldExprNodesF = d_fexprF;
     sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
@@ -5646,6 +6293,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
+
+    // One-time fill of the specular-sphere scan-angle cos/sin tables (device-computed
+    // so table entries are bit-identical to the per-step evaluation they replace).
+    kSphScanInit<<<1, SPH_SCAN_N + 1>>>();
+    cudaCheckKernel("sphScanInit");
 }
 
 // Bake one Camera into a POD DCamera for the given film resolution. Any device memory
@@ -5783,27 +6435,35 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
-                          bool wavefront, int camModeInt) {
+                          bool wavefront, int camModeInt, int heroC) {
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream.
     unsigned long long kseed = 0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL;
-    if (wavefront) {
+    // Hero-wavelength sampling shares one BVH walk across C stratified wavelengths, cutting
+    // chromatic noise. It is only physical without participating media / GRIN bending (the
+    // geometry must be wavelength-independent between dispersive events), and it lives ONLY
+    // in the megakernel — so gate on the scene and force the megakernel when hero is active.
+    int effHeroC = 1;
+    if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
+        effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
+    }
+    if (wavefront && effHeroC == 1) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
-        // maxBounce (32) and camera mode/set as the megakernel.
+        // maxBounce (32) and camera mode/set as the megakernel. (Hero forces megakernel.)
         wavefrontTrace(up, cs, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
     } else {
         int blockSize = 128;
         int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
         kTrace<<<numBlocks, blockSize>>>(up.sc, cs, d_energy, N, diffraction ? 1 : 0,
-                                         kseed, 32, camModeInt);
+                                         kseed, 32, camModeInt, effHeroC);
     }
     cudaCheckKernel("forward");
 }
 
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode, unsigned long long seedBase, bool wavefront) {
+                       char camMode, unsigned long long seedBase, bool wavefront, int heroC) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -5826,7 +6486,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     std::vector<DCamera> hc{ up.dc };
     std::vector<double*> fp{ d_film }, hp{ d_hits };
     DCamSet cs = makeCamSet(up, hc, fp, hp);
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
 
     // --- download ---
     std::vector<double> film(npix * 3);
@@ -5853,7 +6513,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase,
-                                          bool wavefront) {
+                                          bool wavefront, int heroC) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -5882,7 +6542,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
 
     int camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
     DCamSet cs = makeCamSet(up, hcams, d_films, d_hits);
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
 
     // --- download each camera's film ---
     for (int c = 0; c < nc; ++c) {
@@ -6360,7 +7020,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             bool diffraction, long long spp,
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
-                                            const char* mapLoad, const char* mapSave) {
+                                            const char* mapLoad, const char* mapSave, int heroC) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -6405,27 +7065,53 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         DCamSet cs{};                       // nCam == 0: every camera splat is a no-op
         cs.cams = nullptr; cs.films = nullptr; cs.hits = nullptr; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = d_depCount; cs.depCap = cap;
-        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B);
+        launchForward(up, cs, d_energy, N, diffraction, /*seedBase*/0, /*wavefront*/false, CAM_B, heroC);
     };
 
-    depositLaunch(nullptr, 0);              // count-only sizing pass
-    unsigned long long nDep = 0;
-    CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-
+    // Single-pass deposit: the old flow ran the WHOLE forward trace twice (a count-only
+    // sizing pass, then a fill pass). Instead, stage into a generously guessed buffer
+    // (2.5 deposits/photon + slack, clamped to half of free VRAM) and only rerun if the
+    // guess undershot — the atomic cursor keeps counting past the cap, so an overflow
+    // still yields the exact total and the rerun costs no more than the old flow did.
+    // Same seed every pass => identical deposits regardless of which path executes.
     pm.nEmitted = N;
-    if (nDep > 0) {
-        DPhoton* d_photons = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
-        depositLaunch(d_photons, nDep);     // fill pass (same seed => same nDep deposits)
-        unsigned long long nFill = 0;
-        CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        unsigned long long stored = (nFill < nDep) ? nFill : nDep;
-
+    unsigned long long cap = (unsigned long long)((double)N * 2.5) + (1ull << 20);
+    { size_t freeB = 0, totalB = 0;
+      if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+          unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
+          if (cap > fit) cap = fit; } }
+    DPhoton* d_photons = nullptr;
+    while (cap >= (1ull << 22) &&
+           cudaMalloc(&d_photons, (size_t)cap * sizeof(DPhoton)) != cudaSuccess) {
+        cudaGetLastError(); d_photons = nullptr; cap >>= 1;   // halve until it fits
+    }
+    unsigned long long nDep = 0;
+    if (d_photons) {
+        depositLaunch(d_photons, cap);      // optimistic fill against the guess
+        CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        if (nDep > cap) {                   // undershot: rerun once at the exact size
+            cudaFree(d_photons); d_photons = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+            depositLaunch(d_photons, nDep);
+            unsigned long long nFill = 0;
+            CUDA_CHECK(cudaMemcpy(&nFill, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            if (nFill < nDep) nDep = nFill;
+        }
+    } else {
+        // Couldn't stage even a modest guess: fall back to the old two-pass flow.
+        depositLaunch(nullptr, 0);          // count-only sizing pass
+        CUDA_CHECK(cudaMemcpy(&nDep, d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        if (nDep > 0) {
+            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+            depositLaunch(d_photons, nDep); // fill pass (same seed => same nDep deposits)
+        }
+    }
+    if (nDep > 0 && d_photons) {
         // Download + convert to Photon in chunks (never a full host-side DPhoton copy).
-        pm.photons.resize((size_t)stored);
+        pm.photons.resize((size_t)nDep);
         std::vector<DPhoton> stage;
-        for (size_t off = 0; off < (size_t)stored; off += PM_CHUNK) {
-            size_t cnt = std::min(PM_CHUNK, (size_t)stored - off);
+        for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
             stage.resize(cnt);
             CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton),
                                   cudaMemcpyDeviceToHost));
@@ -6438,8 +7124,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 p.power = d.power; p.lambda = d.lambda;
             }
         }
-        cudaFree(d_photons);
     }
+    if (d_photons) cudaFree(d_photons);
     pm.build(radius);                       // host counting sort -> cell-contiguous runs
 
     double energy[5] = {0,0,0,0,0};
@@ -6457,32 +7143,44 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     // ---- upload the built grid ----
     DPhotonMap dpm{};
-    dpm.nEmitted = pm.nEmitted;
     dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
     dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
     dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
     dpm.photons = nullptr;
     if (!pm.photons.empty()) {
-        // Upload the sorted map host->device in chunks (no full DPhoton mirror).
+        // Upload the sorted map host->device in chunks (no full mirror), folding each
+        // photon's constant gather weight into the record (see DGatherPhoton):
+        // p? = cie?(lambda) * power * norm / pi, with the CIE triple taken from
+        // PhotonMap::cie (precomputed in double by build(), index-aligned with the
+        // sorted photons). The radius is cast through Real first so the folded
+        // normalization equals the old in-kernel double((Real)radius)^2 exactly.
+        const double rr   = (double)(Real)pm.radius;
+        const double area = DPI * rr * rr;
+        const double fold = (pm.nEmitted > 0 && area > 0.0)
+                          ? 1.0 / (area * (double)pm.nEmitted * DPI) : 0.0;
         size_t n = pm.photons.size();
-        DPhoton* d_sorted = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DPhoton)));
-        std::vector<DPhoton> stage;
+        DGatherPhoton* d_sorted = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
+        std::vector<DGatherPhoton> stage;
         for (size_t off = 0; off < n; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, n - off);
             stage.resize(cnt);
             for (size_t i = 0; i < cnt; ++i) {
                 const Photon& p = pm.photons[off + i];
-                DPhoton& d = stage[i];
+                const Vec3&  ci = pm.cie[off + i];
+                DGatherPhoton& d = stage[i];
                 d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
-                d.wi  = DVec3(p.wi.x,  p.wi.y,  p.wi.z);
                 d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
-                d.power = p.power; d.lambda = p.lambda;
+                const double w = (double)p.power * fold;
+                d.pX = (float)(ci.x * w);
+                d.pY = (float)(ci.y * w);
+                d.pZ = (float)(ci.z * w);
+                d.lambda = p.lambda;
             }
-            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DPhoton),
+            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DGatherPhoton),
                                   cudaMemcpyHostToDevice));
         }
-        dpm.photons = (const DPhoton*)up.keep(d_sorted);
+        dpm.photons = (const DGatherPhoton*)up.keep(d_sorted);
     }
     // cellStart always has >= 2 entries after build() (even for an empty map, where every
     // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.

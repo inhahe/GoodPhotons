@@ -465,8 +465,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         v.p = h.p; v.ns = h.n; v.ng = h.ng; v.hit = h;
         v.matId = h.matId; v.mat = mp; v.beta = beta;
         if (mp->isLight) v.light = scene.emitterForMat(h.matId);
-        Vertex& prev = path.back();
-        v.pdfFwd = convertDensity(pdfFwd, prev, v);
+        // Index, not a reference: push_back below may reallocate the vector, and a
+        // Vertex& taken before it would dangle (stale reads corrupted mode-D MIS pdfs
+        // and the pdfRev write below scribbled on freed heap memory — ASan-verified).
+        size_t prevSurfIdx = path.size() - 1;
+        v.pdfFwd = convertDensity(pdfFwd, path[prevSurfIdx], v);
         path.push_back(v);
         Vertex& cur = path.back();
         if (++bounces >= maxDepth) return;
@@ -474,7 +477,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // Sample a continuation direction wi, its forward solid-angle pdf pdfW, the
         // reverse pdf pdfRevW (wi<->wo swapped), the throughput factor, and whether
         // this vertex is a delta (specular) scatter.
-        Vec3 wo = normalize(prev.p - cur.p);         // toward the previous vertex
+        Vec3 wo = normalize(path[prevSurfIdx].p - cur.p);   // toward the previous vertex
         Vec3 wi; double pdfW = 0.0, pdfRevW = 0.0, betaFactor = 0.0;
         bool delta = false, terminate = false;
         switch (mp->type) {
@@ -613,7 +616,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
 
         // The reverse density flows back to the previous vertex (area measure).
-        prev.pdfRev = convertDensity(pdfRevW, cur, prev);
+        path[prevSurfIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevSurfIdx]);
 
         beta *= betaFactor;
         // Veach shading-normal ADJOINT correction (§5.3) for the LIGHT (Importance)
@@ -1005,13 +1008,22 @@ struct BdptRenderer {
     int maxDepth = 8;          // maximum path length in edges (connection cost ~ depth^2)
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
 
+    // `sampleBase` = absolute index of the first sample rendered here; each
+    // (pixel, absolute sample) seeds its own stream via seedUnit(), so the
+    // realization is chunk-split / banding / thread-count independent (see
+    // BackwardRenderer::renderRows).
     void renderRows(const Scene& scene, const Camera& cam, Film& camFilm, Film& splatFilm,
-                    int y0, int y1, long long spp, Pcg32& rng) const {
+                    int y0, int y1, long long spp, unsigned long long sampleBase) const {
         Renderer mats; mats.diffraction = diffraction;
         std::vector<Vertex> eye, light;
+        const uint64_t nPix = (uint64_t)camFilm.resX * (uint64_t)camFilm.resY;
         for (int py = y0; py < y1; ++py)
-            for (int px = 0; px < camFilm.resX; ++px)
+            for (int px = 0; px < camFilm.resX; ++px) {
+                const uint64_t pixIdx = (uint64_t)py * (uint64_t)camFilm.resX + (uint64_t)px;
                 for (long long si = 0; si < spp; ++si) {
+                    Pcg32 rng;
+                    seedUnit(rng, (sampleBase + (uint64_t)si) * nPix + pixIdx,
+                             0x8CB92BA72F3D8DD7ULL);
                     double pdfLam = 0.0;
                     double lambda = scene.emitSampler.sample(rng, pdfLam);
                     if (pdfLam <= 0.0) continue;
@@ -1033,6 +1045,7 @@ struct BdptRenderer {
                             else         camFilm.add(px, py, cie * c);
                         }
                 }
+            }
     }
 };
 
