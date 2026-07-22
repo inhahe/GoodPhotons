@@ -56,4 +56,23 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                  double* lockAnchor = nullptr,
                                  bool seeThrough = false, double glassClarity = 0.85);
 
+// Optional per-pass profiling (used by -raster-bench). While enabled, renderFrame
+// accumulates each pass's milliseconds (device passes are bracketed by the per-pass
+// syncs, so host wall time is the pass time) into an internal tally. Zero overhead
+// when disabled. profTake() returns the tally accumulated since the last take and
+// resets it; frames==0 means no GPU frames ran while enabled.
+struct Prof {
+    double clearvis_ms = 0;   // vis-buffer clear (cudaMemset)
+    double project_ms  = 0;   // kProject (clip + project)
+    double raster_ms   = 0;   // kRaster (visibility)
+    double shade_ms    = 0;   // kShade (resolve + shade)
+    double clear_ms    = 0;   // see-through clear pass (0 unless -see-through)
+    double download_ms = 0;   // device->host copies
+    double convert_ms  = 0;   // float3 -> Vec3 double conversion
+    double expose_ms   = 0;   // shared host exposeAndEncode tail (p99 + sRGB encode)
+    int    frames      = 0;
+};
+void profEnable(bool on);
+Prof profTake();
+
 }  // namespace raster_cuda

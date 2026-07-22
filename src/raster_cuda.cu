@@ -56,6 +56,7 @@
 #include <cstdint>
 #include <vector>
 #include <cmath>
+#include <chrono>
 
 #include "raster_cuda.h"
 #include "camera.h"    // Camera, CAM_RECTILINEAR
@@ -672,6 +673,20 @@ static bool sync() {
     return e == cudaSuccess;
 }
 
+// --- optional per-pass profiling (see raster_cuda.h). The per-pass syncs in
+// renderFrame bracket each device pass, so plain host wall clocks are exact.
+static bool g_prof = false;
+static Prof g_profAcc;
+void profEnable(bool on) { g_prof = on; }
+Prof profTake() { Prof p = g_profAcc; g_profAcc = Prof(); return p; }
+using ProfClock = std::chrono::steady_clock;
+static inline ProfClock::time_point ptick() {
+    return g_prof ? ProfClock::now() : ProfClock::time_point{};
+}
+static inline void padd(double& acc, ProfClock::time_point t0) {
+    if (g_prof) acc += std::chrono::duration<double, std::milli>(ProfClock::now() - t0).count();
+}
+
 std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
                                  double exposure, bool autoExpose, double* lockAnchor,
                                  bool seeThrough, double glassClarity) {
@@ -694,26 +709,35 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     const double kRimStrength    = 0.55;
     const Vec3   kMilkColor{0.52, 0.55, 0.60};
 
+    auto tp = ptick();
     if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return empty;
+    padd(g_profAcc.clearvis_ms, tp);
 
     int TPB = 256;
     int gTris  = (sc->nTris + TPB - 1) / TPB;
     int gSlots = (2 * sc->nTris + TPB - 1) / TPB;
     int gPix   = (int)((N + TPB - 1) / TPB);
 
+    tp = ptick();
     kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dstris);
     if (!sync()) return empty;
+    padd(g_profAcc.project_ms, tp);
+    tp = ptick();
     kRaster<<<gSlots, TPB>>>(sc->dstris, 2 * sc->nTris, W, H, seeThrough ? 1 : 0, sc->vis);
     if (!sync()) return empty;
+    padd(g_profAcc.raster_ms, tp);
+    tp = ptick();
     kShade<<<gPix, TPB>>>(sc->dstris, sc->vis, sc->dlights, sc->nLights,
                           sc->ambient, sc->keyScale, sc->fill, dc, W, H, bg, EMIS_BOOST,
                           sc->dtexMeta, sc->dtexels, sc->nTex,
                           sc->accum, sc->zbuf, sc->emis);
     if (!sync()) return empty;
+    padd(g_profAcc.shade_ms, tp);
 
     // See-through clear pass: reset clearT/milkT to 1 and accumulate each clear surface's
     // transmittance/haze against the now-complete opaque depth (sc->zbuf, written by kShade).
     if (seeThrough) {
+        tp = ptick();
         kFillF<<<gPix, TPB>>>(sc->clearT, 1.0f, N);
         kFillF<<<gPix, TPB>>>(sc->milkT,  1.0f, N);
         if (!sync()) return empty;
@@ -721,10 +745,12 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
                                 sc->clearT, sc->milkT);
         if (!sync()) return empty;
+        padd(g_profAcc.clear_ms, tp);
     }
 
     // Download the HDR accum + hit key + emitter mask; run the SHARED host exposure/tonemap
     // tail so exposure (incl. lockAnchor) and encoding match the CPU path exactly.
+    tp = ptick();
     std::vector<float3>  haccum(N);
     std::vector<float>   hzbuf(N);
     std::vector<uint8_t> hemis(N);
@@ -738,19 +764,27 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
         if (cudaMemcpy(hclear.data(), sc->clearT, sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
         if (cudaMemcpy(hmilk.data(),  sc->milkT,  sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
     }
+    padd(g_profAcc.download_ms, tp);
 
+    tp = ptick();
     std::vector<Vec3> accum(N);
     for (size_t i = 0; i < N; ++i)
         accum[i] = Vec3{ (double)haccum[i].x, (double)haccum[i].y, (double)haccum[i].z };
+    padd(g_profAcc.convert_ms, tp);
 
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
     static const std::vector<float> emptyClear;   // unused when !seeThrough
     if (nThreads < 1) nThreads = 1;
-    return raster::exposeAndEncode(accum, hzbuf, hemis, W, H, nThreads,
-                                   expComp, autoExpose, lockAnchor,
-                                   seeThrough, seeThrough ? hclear : emptyClear,
-                                   seeThrough ? hmilk : emptyClear,
-                                   kMilkColor);
+    tp = ptick();
+    std::vector<uint8_t> img =
+        raster::exposeAndEncode(accum, hzbuf, hemis, W, H, nThreads,
+                                expComp, autoExpose, lockAnchor,
+                                seeThrough, seeThrough ? hclear : emptyClear,
+                                seeThrough ? hmilk : emptyClear,
+                                kMilkColor);
+    padd(g_profAcc.expose_ms, tp);
+    if (g_prof) ++g_profAcc.frames;
+    return img;
 }
 
 }  // namespace raster_cuda

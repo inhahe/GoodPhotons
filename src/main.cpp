@@ -3433,6 +3433,7 @@ static int run(int argc, char** argv) {
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
+    int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     double exposureCli = -1.0;    // -exposure/-ev <comp>: override every camera's exposure compensation (>0; <=0 = use authored)
@@ -3682,6 +3683,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
         else if (!std::strcmp(argv[i], "-raster-gpu")) { doRaster = true; rasterGpu = true; }
+        else if (!std::strcmp(argv[i], "-raster-bench") && i + 1 < argc) { rasterBench = std::atoi(argv[++i]); doRaster = true; }
         else if (!std::strcmp(argv[i], "-explore") || !std::strcmp(argv[i], "-fly")) {
             // Interactive fly-through: start at the first selected camera frame and let
             // the user explore with the raster viewer instead of rendering every frame.
@@ -4768,6 +4770,82 @@ static int run(int argc, char** argv) {
             }
         }
         std::fflush(stdout);
+
+        // -raster-bench N: steady-state per-frame cost — the interactive explorer's
+        // metric (it re-renders one frame per camera move) — measured independently of
+        // process launch, scene build/tessellation and the GPU upload, which have all
+        // already happened by this point. Renders the FIRST selected camera N times
+        // through the same rasterOne path the explorer uses (per-frame auto-exposure,
+        // no lock anchor), reports min/median/mean ms per frame and, when the GPU
+        // rasterizer ran, a per-pass breakdown. Writes the last frame to -o so
+        // backends/builds can be byte-compared.
+        if (rasterBench > 0 && !toRender.empty()) {
+            const RenderCam& rc = toRender.front();
+            const int W = rc.res, H = rc.resY;
+            double ev = (rc.exposure > 0.0) ? rc.exposure : 1.0;
+            if (scene.absolute && (rc.mode == 'A' || rc.mode == 'C')) {
+                const double Rref = 0.02; double R = rc.cam.apertureR;
+                if (R > 0.0) ev *= (R * R) / (Rref * Rref);
+            }
+            const bool autoExp = !scene.absolute;
+            // Warmup frame (not timed): first-frame scratch allocs, GPU clock ramp.
+            std::vector<uint8_t> img = rasterOne(rc.cam, W, H, ev, autoExp, nullptr);
+#ifdef HAVE_CUDA
+            raster_cuda::profEnable(true);
+            (void)raster_cuda::profTake();
+#endif
+            std::vector<double> ms;
+            ms.reserve(rasterBench);
+            for (int it = 0; it < rasterBench && !g_stopRequested; ++it) {
+                auto t0 = std::chrono::steady_clock::now();
+                img = rasterOne(rc.cam, W, H, ev, autoExp, nullptr);
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0).count());
+                if (g_showWindow) {
+                    if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
+                    g_liveWin->update(W, H, img);
+                    if (g_liveWin->closed()) g_stopRequested = 1;
+                }
+            }
+#ifdef HAVE_CUDA
+            raster_cuda::profEnable(false);
+#endif
+            if (!ms.empty()) {
+                std::vector<double> s = ms;
+                std::sort(s.begin(), s.end());
+                double mean = 0;
+                for (double v : ms) mean += v;
+                mean /= ms.size();
+                double mn = s.front(), md = s[s.size() / 2];
+                std::printf("[raster-bench] %zu frames %dx%d: min %.2f ms  median %.2f ms  "
+                            "mean %.2f ms  (%.1f fps @ median)\n",
+                            ms.size(), W, H, mn, md, mean, md > 0 ? 1000.0 / md : 0.0);
+            }
+#ifdef HAVE_CUDA
+            {
+                raster_cuda::Prof p = raster_cuda::profTake();
+                if (p.frames > 0) {
+                    double f = 1.0 / p.frames;
+                    std::printf("[raster-bench] GPU per-pass avg ms: clearvis %.2f  project %.2f  "
+                                "raster %.2f  shade %.2f  clear %.2f  download %.2f  "
+                                "convert %.2f  expose+encode %.2f\n",
+                                p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
+                                p.shade_ms * f, p.clear_ms * f, p.download_ms * f,
+                                p.convert_ms * f, p.expose_ms * f);
+                }
+            }
+#endif
+            std::string path = outFor(rc.name);
+            if (!writeImage(path, W, H, img))
+                std::fprintf(stderr, "[raster-bench] failed to write %s\n", path.c_str());
+            else
+                std::printf("[raster-bench] wrote %s (%dx%d)\n", path.c_str(), W, H);
+            std::fflush(stdout);
+#ifdef HAVE_CUDA
+            raster_cuda::destroy(gpuRaster);
+#endif
+            return 0;
+        }
 
         int frame = 0;
         auto ft0 = std::chrono::steady_clock::now();
