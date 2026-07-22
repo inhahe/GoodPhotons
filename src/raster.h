@@ -23,6 +23,8 @@
 #include <cmath>
 #include <algorithm>
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <functional>
 #include <array>
 #include "scene.h"
@@ -267,11 +269,58 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
     if (isoRes > 0) {
         isomesh::Options opt; opt.res = isoRes; opt.adaptive = false; opt.refineIters = 3;
         const int nImp = (int)sc.implicits.size();
-        int impIdx = 0;
-        for (const auto& im : sc.implicits) {
-            if (progress) progress(impIdx, nImp);
-            ++impIdx;
-            isomesh::Mesh m = isomesh::marchImplicit(im, opt);
+        // March the implicits in PARALLEL: each marchImplicit(im, opt) is a
+        // deterministic pure function of its inputs and the meshes land in a
+        // per-implicit slot, so emitting PTris below in the original implicit
+        // order yields a triangle list identical to the old sequential loop.
+        // Marching is by far the slow part of tessellation (seconds of field
+        // evals on a heavy scene) and was single-threaded on the calling thread.
+        // Tasks are handed out biggest-lattice-first so one whale implicit
+        // doesn't start last and stretch the makespan.
+        std::vector<isomesh::Mesh> meshes(sc.implicits.size());
+        if (nImp > 0) {
+            if (progress) progress(0, nImp);
+            std::vector<int> order(nImp);
+            for (int i = 0; i < nImp; ++i) order[i] = i;
+            auto cellEstimate = [&](const Implicit& im) -> double {
+                Vec3 e = im.bounds.hi - im.bounds.lo;
+                double maxe = std::max(e.x, std::max(e.y, e.z));
+                if (maxe <= 0) return 0.0;
+                auto cells = [&](double v) { return std::max(1.0, std::round(opt.res * (v / maxe))); };
+                return cells(e.x) * cells(e.y) * cells(e.z);
+            };
+            std::vector<double> est(nImp);
+            for (int i = 0; i < nImp; ++i) est[i] = cellEstimate(sc.implicits[i]);
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return est[a] > est[b]; });
+            unsigned hw = std::thread::hardware_concurrency(); if (hw == 0) hw = 4;
+            int T = (int)std::min<size_t>((size_t)nImp, (size_t)hw);
+            std::atomic<int> next{0}, done{0};
+            std::mutex progMx;
+            auto workBody = [&]() {
+                for (;;) {
+                    int slot = next.fetch_add(1);
+                    if (slot >= nImp) break;
+                    int i = order[slot];
+                    meshes[i] = isomesh::marchImplicit(sc.implicits[i], opt);
+                    int d = done.fetch_add(1) + 1;
+                    if (progress) { std::lock_guard<std::mutex> lk(progMx); progress(d, nImp); }
+                }
+            };
+            if (T <= 1) {
+                workBody();
+            } else {
+                std::vector<std::thread> pool;
+                pool.reserve(T);
+                for (int t = 0; t < T; ++t) pool.emplace_back(workBody);
+                for (auto& th : pool) th.join();
+            }
+        } else if (progress) {
+            progress(nImp, nImp);   // preserve the old progress(0,0) final call
+        }
+        for (int ii = 0; ii < nImp; ++ii) {
+            const auto& im = sc.implicits[ii];
+            const isomesh::Mesh& m = meshes[ii];
             Vec3 col = colOf(im.matId); bool em = emOf(im.matId); bool cl = clearOf(im.matId);
             // Marched implicits carry no per-vertex UVs, so a skin only shows via world
             // triplanar projection (triplanarScale > 0); a plain UV-bound texture stays flat.
@@ -287,7 +336,6 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
                 out.push_back(p);
             }
         }
-        if (progress) progress(nImp, nImp);
     }
 
     // (4) Instanced mesh assets (BLAS) baked into world space.
