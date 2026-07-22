@@ -90,6 +90,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   drives a `shadeStep` branch that (with an independent per-photon `DRng crng` seeded
   in `kTrace`) crosses the medium straight and has each shared camera resample its own
   single-scatter in-scatter point — decorrelated per-frame flyby noise, megakernel-only.
+  The shared multi-camera pass runs through a **resident GPU session** (0.20.2):
+  `sharedForwardGpuBegin/Batch/Hits0/Download/End` (render_cuda.h) bake+upload the
+  scene, bake all cameras, and allocate device films/hits/energy **once**; each
+  progressive batch is then a bare `launchForward` accumulating in place, and host
+  films are only downloaded lazily (`syncAcc` in `runSharedGroup`) at `-interval` /
+  status / final boundaries — download REPLACES host `acc[]`/`accE` with running
+  totals rather than merging. `-resume` seeds the device accumulators from the
+  loaded checkpoint at Begin. Between intervals a `-noise` budget polls only cam-0's
+  hits plane (`sharedForwardGpuHits0`). The old wrapper paid full
+  upload/alloc/download/convert/merge/free per ~2M-photon batch, which throttled the
+  loop (measured: +80% photons/s on 16 cams @ 640×360, +22% on 2 cams @ 320×240);
+  `renderForwardSharedCuda` survives as a one-shot wrapper over the session.
   `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.

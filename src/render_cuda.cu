@@ -6562,6 +6562,121 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     return out;
 }
 
+// ---- Resident shared forward session (see render_cuda.h) --------------------
+// Everything a progressive shared pass needs to keep on the device across batches:
+// the baked scene, the baked cameras, and the per-camera film/hits accumulators.
+// batch() is then a bare kernel launch; the full bake/upload/alloc/download/free
+// round trip is paid once per RENDER instead of once per ~2M-photon batch.
+struct SharedGpuSession {
+    DUpload up;
+    std::vector<gpu::DCamera> hcams;
+    std::vector<double*> d_films, d_hits;   // resident per-camera accumulators
+    std::vector<size_t>  npix;
+    double* d_energy = nullptr;             // resident 5-counter energy tally
+    gpu::DCamSet cs{};
+    int  camModeInt = 0;
+    bool wavefront = false;
+    int  heroC = 1;
+    int  nc = 0;
+};
+
+SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
+                                        const std::vector<Camera>& cams,
+                                        const std::vector<int>& resX,
+                                        const std::vector<int>& resY,
+                                        char camMode, bool wavefront, int heroC,
+                                        bool beamGather,
+                                        const std::vector<Film>* seedFilms,
+                                        const EnergyReport* seedEnergy) {
+    using namespace gpu;
+    int nc = (int)cams.size();
+    if (nc == 0 || !cudaAvailable() || !cudaForwardSupported(scene)) return nullptr;
+
+    auto* s = new SharedGpuSession;
+    s->nc = nc; s->wavefront = wavefront; s->heroC = heroC;
+    s->camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
+
+    // Bake the scene ONCE, then bake every camera against it (the win: one photon set,
+    // splat to all cameras — and with the session, ONE bake for the whole render).
+    buildUploadScene(scene, s->up);
+    s->hcams.resize(nc);
+    for (int c = 0; c < nc; ++c) s->hcams[c] = bakeCamera(scene, cams[c], resX[c], resY[c], s->up);
+
+    // Per-camera film / hits device accumulators (each camera keeps its own resolution).
+    // On -resume the checkpoint films seed them, so the device always holds the full
+    // running totals and download() is a plain replace on the host side.
+    s->d_films.assign(nc, nullptr); s->d_hits.assign(nc, nullptr); s->npix.resize(nc);
+    for (int c = 0; c < nc; ++c) {
+        s->npix[c] = (size_t)resX[c] * resY[c];
+        CUDA_CHECK(cudaMalloc(&s->d_films[c], s->npix[c] * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&s->d_hits[c],  s->npix[c] * sizeof(double)));
+        if (seedFilms && c < (int)seedFilms->size() && (*seedFilms)[c].xyz.size() == s->npix[c]) {
+            const Film& sf = (*seedFilms)[c];
+            std::vector<double> f(s->npix[c] * 3);
+            for (size_t i = 0; i < s->npix[c]; ++i) {
+                f[i * 3 + 0] = sf.xyz[i].x; f[i * 3 + 1] = sf.xyz[i].y; f[i * 3 + 2] = sf.xyz[i].z;
+            }
+            CUDA_CHECK(cudaMemcpy(s->d_films[c], f.data(), f.size() * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(s->d_hits[c], sf.hits.data(), s->npix[c] * sizeof(double), cudaMemcpyHostToDevice));
+        } else {
+            CUDA_CHECK(cudaMemset(s->d_films[c], 0, s->npix[c] * 3 * sizeof(double)));
+            CUDA_CHECK(cudaMemset(s->d_hits[c],  0, s->npix[c] * sizeof(double)));
+        }
+    }
+    CUDA_CHECK(cudaMalloc(&s->d_energy, 5 * sizeof(double)));
+    double e0[5] = {0, 0, 0, 0, 0};
+    if (seedEnergy) {
+        e0[0] = seedEnergy->emitted; e0[1] = seedEnergy->absorbed; e0[2] = seedEnergy->sensor;
+        e0[3] = seedEnergy->escaped; e0[4] = seedEnergy->residual;
+    }
+    CUDA_CHECK(cudaMemcpy(s->d_energy, e0, sizeof e0, cudaMemcpyHostToDevice));
+
+    s->cs = makeCamSet(s->up, s->hcams, s->d_films, s->d_hits);
+    // Photon-beams gather: only meaningful with several cameras sharing one flight and a
+    // participating medium present (the device gates the per-step branch on the same).
+    s->cs.beamGather = beamGather && nc > 1 && !scene.media.empty();
+    return s;
+}
+
+void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
+                           unsigned long long seedBase, bool diffraction) {
+    if (!s || N <= 0) return;
+    launchForward(s->up, s->cs, s->d_energy, N, diffraction, seedBase,
+                  s->wavefront, s->camModeInt, s->heroC);
+}
+
+void sharedForwardGpuHits0(SharedGpuSession* s, std::vector<double>& hits) {
+    if (!s || hits.size() < s->npix[0]) return;
+    CUDA_CHECK(cudaMemcpy(hits.data(), s->d_hits[0], s->npix[0] * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+}
+
+void sharedForwardGpuDownload(SharedGpuSession* s, std::vector<Film>& films,
+                              EnergyReport& e) {
+    if (!s) return;
+    for (int c = 0; c < s->nc && c < (int)films.size(); ++c) {
+        std::vector<double> f(s->npix[c] * 3);
+        CUDA_CHECK(cudaMemcpy(f.data(), s->d_films[c], f.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(films[c].hits.data(), s->d_hits[c], s->npix[c] * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < s->npix[c]; ++i)
+            films[c].xyz[i] = Vec3(f[i * 3 + 0], f[i * 3 + 1], f[i * 3 + 2]);
+    }
+    // The photon trace is shared, so energy is counted once for the whole pass. These
+    // are running TOTALS (the seed energy was uploaded at begin), so REPLACE.
+    double energy[5] = {0, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemcpy(energy, s->d_energy, sizeof energy, cudaMemcpyDeviceToHost));
+    e.emitted = energy[0]; e.absorbed = energy[1]; e.sensor = energy[2];
+    e.escaped = energy[3]; e.residual = energy[4];
+}
+
+void sharedForwardGpuEnd(SharedGpuSession* s) {
+    if (!s) return;
+    freeUpload(s->up);
+    for (int c = 0; c < s->nc; ++c) { cudaFree(s->d_films[c]); cudaFree(s->d_hits[c]); }
+    cudaFree(s->d_energy);
+    delete s;
+}
+
 std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<Camera>& cams,
                                           const std::vector<int>& resX,
@@ -6569,59 +6684,20 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase,
                                           bool wavefront, int heroC, bool beamGather) {
-    using namespace gpu;
+    // One-shot wrapper over the session API (bit-compatible with the historical
+    // single-call behaviour: same bake, same launch, same seeding, energy ADDED to eOut).
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
     for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
-    if (nc == 0 || !cudaAvailable() || !cudaForwardSupported(scene)) return out;
-
-    // Bake the scene ONCE, then bake every camera against it (the win: one photon set,
-    // splat to all cameras). Shared pass is model A or B only (C consumes the photon).
-    DUpload up;
-    buildUploadScene(scene, up);
-    std::vector<DCamera> hcams(nc);
-    for (int c = 0; c < nc; ++c) hcams[c] = bakeCamera(scene, cams[c], resX[c], resY[c], up);
-
-    // Per-camera film / hits device buffers (each camera keeps its own resolution).
-    std::vector<double*> d_films(nc, nullptr), d_hits(nc, nullptr);
-    std::vector<size_t>  npix(nc);
-    for (int c = 0; c < nc; ++c) {
-        npix[c] = (size_t)resX[c] * resY[c];
-        CUDA_CHECK(cudaMalloc(&d_films[c], npix[c] * 3 * sizeof(double)));
-        CUDA_CHECK(cudaMemset(d_films[c], 0, npix[c] * 3 * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_hits[c], npix[c] * sizeof(double)));
-        CUDA_CHECK(cudaMemset(d_hits[c], 0, npix[c] * sizeof(double)));
-    }
-    double* d_energy = nullptr; CUDA_CHECK(cudaMalloc(&d_energy, 5 * sizeof(double)));
-    CUDA_CHECK(cudaMemset(d_energy, 0, 5 * sizeof(double)));
-
-    int camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
-    DCamSet cs = makeCamSet(up, hcams, d_films, d_hits);
-    // Photon-beams gather: only meaningful with several cameras sharing one flight and a
-    // participating medium present (the device gates the per-step branch on the same).
-    cs.beamGather = beamGather && nc > 1 && !scene.media.empty();
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
-
-    // --- download each camera's film ---
-    for (int c = 0; c < nc; ++c) {
-        std::vector<double> film(npix[c] * 3);
-        CUDA_CHECK(cudaMemcpy(film.data(), d_films[c], film.size() * sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(out[c].hits.data(), d_hits[c], npix[c] * sizeof(double), cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < npix[c]; ++i)
-            out[c].xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
-    }
-    // The photon trace is shared, so energy is counted once for the whole pass.
-    double energy[5] = {0,0,0,0,0};
-    CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
-    eOut.emitted  += energy[0];
-    eOut.absorbed += energy[1];
-    eOut.sensor   += energy[2];
-    eOut.escaped  += energy[3];
-    eOut.residual += energy[4];
-
-    freeUpload(up);
-    for (int c = 0; c < nc; ++c) { cudaFree(d_films[c]); cudaFree(d_hits[c]); }
-    cudaFree(d_energy);
+    SharedGpuSession* s = sharedForwardGpuBegin(scene, cams, resX, resY, camMode,
+                                               wavefront, heroC, beamGather);
+    if (!s) return out;
+    sharedForwardGpuBatch(s, N, seedBase, diffraction);
+    EnergyReport e;
+    sharedForwardGpuDownload(s, out, e);
+    eOut.emitted += e.emitted; eOut.absorbed += e.absorbed; eOut.sensor += e.sensor;
+    eOut.escaped += e.escaped; eOut.residual += e.residual;
+    sharedForwardGpuEnd(s);
     return out;
 }
 
