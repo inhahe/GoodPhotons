@@ -29,6 +29,25 @@ the generated `ftrace.vcxproj` + CMakeCache between the long-lived and a fresh d
 (beyond the arch flags already ruled out), check CUDA toolset version selection, and probe
 `cudaMemcpyFromSymbol` of the scene constants at render start in a fresh-dir build.
 
+### MINOR (2026-07-22): GPU raster see-through output isn't run-to-run bit-stable (atomicMulF product order)
+
+The GPU rasterizer's see-through clear pass (`kClear` in src/raster_cuda.cu) accumulates
+per-pixel transmittance/milk as `atomicMulF` products. Float multiplication isn't
+associative, so when ≥2 clear fragments cover one pixel the low-order bits of the final
+product depend on which thread's CAS lands first — a GPU-scheduling artifact. Observed
+during the 2026-07-22 raster-perf campaign: `-in scenes/gallery_settled.ftsl -camera cam
+-raster -see-through -raster-bench 20 -device gpu` flips between exactly two output
+sha1s (`fdd7e910…`/`dfb365a7…`) across runs, stable *within* a time window (back-to-back
+invocations of even *different* builds agree; runs hours apart can differ — consistent
+with clock/thermal state steering the same race the same way). Affects the 0.19.0
+pre-optimization binary identically, so it predates the optimization work; the opaque
+paths (no `-see-through`) are fully deterministic. The kernel comment's
+"order-independent" claim holds mathematically (commutative product) but not bit-exactly.
+Impact: invisible (±1 ulp on a transmittance product); matters only to byte-comparison
+harnesses, which must A/B ref-vs-new within one run (as scraps/rb_verify.sh does) rather
+than compare hashes across sessions. Proper fix if ever needed: deterministic ordered
+reduction (sort fragments per pixel by slot index, or accumulate in fixed-point).
+
 ### FIXED (2026-07-21): mode D heap-use-after-free (dangling `Vertex&` across `push_back`) + per-work-unit RNG seeding makes all CPU spp/photon modes chunk- and resume-independent
 
 Two intertwined fixes, one commit (v0.18.2):
