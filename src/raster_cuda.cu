@@ -50,6 +50,8 @@
   #define cudaMemcpyDeviceToHost  hipMemcpyDeviceToHost
   #define cudaMemset              hipMemset
   #define cudaFree                hipFree
+  #define cudaMallocHost          hipHostMalloc
+  #define cudaFreeHost            hipHostFree
   #define cudaGetLastError        hipGetLastError
   #define cudaDeviceSynchronize   hipDeviceSynchronize
   #define cudaGetErrorString      hipGetErrorString
@@ -606,6 +608,15 @@ struct Scene {
     int* dbinMed   = nullptr;
     int* dbinLarge = nullptr;
     int* dbinCnt   = nullptr;
+    // Pinned host staging for the per-frame downloads (grown with pixCap): a pageable
+    // std::vector target caps D2H copies at a few GB/s and costs a fresh ~26MB
+    // allocation every frame; pinned staging runs at full PCIe rate, allocated once,
+    // and the exposure/tonemap tail reads it in place.
+    float3*        h_accum  = nullptr;
+    float*         h_zbuf   = nullptr;
+    unsigned char* h_emis   = nullptr;
+    float*         h_clearT = nullptr;
+    float*         h_milkT  = nullptr;
 };
 
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
@@ -614,6 +625,13 @@ static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (
 // rather than killing the process, unlike the transport CUDA path's CUDA_CHECK).
 static bool tryMalloc(void** p, size_t bytes) {
     cudaError_t e = cudaMalloc(p, bytes);
+    if (e != cudaSuccess) { *p = nullptr; return false; }
+    return true;
+}
+
+// Same, for page-locked (pinned) host staging memory.
+static bool tryMallocHost(void** p, size_t bytes) {
+    cudaError_t e = cudaMallocHost(p, bytes);
     if (e != cudaSuccess) { *p = nullptr; return false; }
     return true;
 }
@@ -635,6 +653,11 @@ void destroy(Scene* sc) {
     if (sc->dbinMed)   cudaFree(sc->dbinMed);
     if (sc->dbinLarge) cudaFree(sc->dbinLarge);
     if (sc->dbinCnt)   cudaFree(sc->dbinCnt);
+    if (sc->h_accum)  cudaFreeHost(sc->h_accum);
+    if (sc->h_zbuf)   cudaFreeHost(sc->h_zbuf);
+    if (sc->h_emis)   cudaFreeHost(sc->h_emis);
+    if (sc->h_clearT) cudaFreeHost(sc->h_clearT);
+    if (sc->h_milkT)  cudaFreeHost(sc->h_milkT);
     delete sc;
 }
 
@@ -734,13 +757,23 @@ static bool ensurePix(Scene* sc, size_t N) {
     if (sc->emis)   { cudaFree(sc->emis);   sc->emis = nullptr; }
     if (sc->clearT) { cudaFree(sc->clearT); sc->clearT = nullptr; }
     if (sc->milkT)  { cudaFree(sc->milkT);  sc->milkT = nullptr; }
+    if (sc->h_accum)  { cudaFreeHost(sc->h_accum);  sc->h_accum = nullptr; }
+    if (sc->h_zbuf)   { cudaFreeHost(sc->h_zbuf);   sc->h_zbuf = nullptr; }
+    if (sc->h_emis)   { cudaFreeHost(sc->h_emis);   sc->h_emis = nullptr; }
+    if (sc->h_clearT) { cudaFreeHost(sc->h_clearT); sc->h_clearT = nullptr; }
+    if (sc->h_milkT)  { cudaFreeHost(sc->h_milkT);  sc->h_milkT = nullptr; }
     sc->pixCap = 0;
     bool ok = tryMalloc((void**)&sc->vis,    sizeof(unsigned long long) * N)
            && tryMalloc((void**)&sc->accum,  sizeof(float3) * N)
            && tryMalloc((void**)&sc->zbuf,   sizeof(float) * N)
            && tryMalloc((void**)&sc->emis,   sizeof(unsigned char) * N)
            && tryMalloc((void**)&sc->clearT, sizeof(float) * N)
-           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N);
+           && tryMalloc((void**)&sc->milkT,  sizeof(float) * N)
+           && tryMallocHost((void**)&sc->h_accum,  sizeof(float3) * N)
+           && tryMallocHost((void**)&sc->h_zbuf,   sizeof(float) * N)
+           && tryMallocHost((void**)&sc->h_emis,   sizeof(unsigned char) * N)
+           && tryMallocHost((void**)&sc->h_clearT, sizeof(float) * N)
+           && tryMallocHost((void**)&sc->h_milkT,  sizeof(float) * N);
     if (!ok) return false;
     sc->pixCap = N;
     return true;
@@ -844,21 +877,17 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
         padd(g_profAcc.clear_ms, tp);
     }
 
-    // Download the HDR accum + hit key + emitter mask; run the SHARED host exposure/tonemap
-    // tail so exposure (incl. lockAnchor) and encoding match the CPU path exactly.
+    // Download the HDR accum + hit key + emitter mask into the persistent pinned staging
+    // buffers (full-rate D2H, no per-frame allocation), then run the SHARED host
+    // exposure/tonemap tail in place so exposure (incl. lockAnchor) and encoding match
+    // the CPU path exactly.
     tp = ptick();
-    std::vector<float3>  haccum(N);
-    std::vector<float>   hzbuf(N);
-    std::vector<uint8_t> hemis(N);
-    if (cudaMemcpy(haccum.data(), sc->accum, sizeof(float3) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    if (cudaMemcpy(hzbuf.data(),  sc->zbuf,  sizeof(float)  * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    if (cudaMemcpy(hemis.data(),  sc->emis,  sizeof(unsigned char) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-
-    std::vector<float> hclear, hmilk;
+    if (cudaMemcpy(sc->h_accum, sc->accum, sizeof(float3) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+    if (cudaMemcpy(sc->h_zbuf,  sc->zbuf,  sizeof(float)  * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+    if (cudaMemcpy(sc->h_emis,  sc->emis,  sizeof(unsigned char) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
     if (seeThrough) {
-        hclear.resize(N); hmilk.resize(N);
-        if (cudaMemcpy(hclear.data(), sc->clearT, sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-        if (cudaMemcpy(hmilk.data(),  sc->milkT,  sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+        if (cudaMemcpy(sc->h_clearT, sc->clearT, sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
+        if (cudaMemcpy(sc->h_milkT,  sc->milkT,  sizeof(float) * N, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
     }
     padd(g_profAcc.download_ms, tp);
 
@@ -867,15 +896,15 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
     if (nThreads < 1) nThreads = 1;
     tp = ptick();
-    const float3* ha = haccum.data();
+    const float3* ha = sc->h_accum;
     std::vector<uint8_t> img =
         raster::exposeAndEncodeT([ha](size_t i) {
                                      return Vec3{ (double)ha[i].x, (double)ha[i].y, (double)ha[i].z };
                                  },
-                                 hzbuf.data(), hemis.data(), W, H, nThreads,
+                                 sc->h_zbuf, sc->h_emis, W, H, nThreads,
                                  expComp, autoExpose, lockAnchor,
-                                 seeThrough, seeThrough ? hclear.data() : nullptr,
-                                 seeThrough ? hmilk.data() : nullptr,
+                                 seeThrough, seeThrough ? sc->h_clearT : nullptr,
+                                 seeThrough ? sc->h_milkT : nullptr,
                                  kMilkColor);
     padd(g_profAcc.expose_ms, tp);
     if (g_prof) ++g_profAcc.frames;
