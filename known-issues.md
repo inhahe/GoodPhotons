@@ -5,6 +5,24 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG (2026-07-22): collimated light with an exactly axis-aligned `-y` (straight-down) direction only lights half its footprint
+
+A `light collimated { dir 0 -1 0 }` (pure straight-down beam) illuminates only one half
+of its `w×w` emitter footprint, split along a hard vertical seam through the beam centre —
+so a downward god-ray beam over a fog box lights, e.g., only `x > centre`, leaving the
+other half in shadow. Repro: `scraps/_fogtune2.ftsl` with `dir 0 -1 0` shows a sharp
+vertical brightness seam at the beam's x-centre that does **not** move when the beam is
+widened (scale 250→700), proving it's not a footprint-edge artifact. Tilting the beam a
+little off vertical (`dir 0.18 -1 0.14`) makes the seam vanish and the footprint light
+uniformly — so this is a degenerate emitter-basis problem when `beamDir` is (anti)parallel
+to the world-up axis used to build the quad's `u/v` frame (see `ftsl.h` collimated-light
+construction, ~line 2765: `w = Len(0.03)*scale`, `u/v` built from `beamDir`). **Proper
+fix:** when building the collimated quad's tangent basis, pick the reference up-vector
+robustly (use a different axis when `|beamDir·up|` is near 1, i.e. Duff et al.
+branchless ONB), instead of a fixed world-up that collapses for vertical beams.
+Workaround in scenes for now: aim collimated beams slightly off the vertical axis
+(as `scenes/_beams_hg_decorr.ftsl` now does).
+
 ### TOOLING (2026-07-22): Nsight Compute (`ncu`) blocked by ERR_NVGPUCTRPERM — GPU perf counters admin-locked in the driver
 
 `ncu` profiling of ftrace kernels fails with `ERR_NVGPUCTRPERM` (GPU performance
