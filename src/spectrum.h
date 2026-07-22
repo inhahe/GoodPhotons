@@ -103,6 +103,66 @@ inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) 
     };
 }
 
+// Monotone piecewise-cubic (Fritsch-Carlson / PCHIP) measured curve — the opt-in
+// `interp=cubic` alternative to the linear `tabulatedSpectrum` above. It is C1-smooth
+// yet SHAPE-PRESERVING: unlike a natural/plain cubic spline it never overshoots, so an
+// interpolated value stays within its two bracketing samples (a reflectance/absorption
+// curve can't ring negative or exceed its neighbours — which a plain spline would, and
+// which is unphysical). Best for sparse hand-authored control points (`table { … }`)
+// where linear kinks are visible; for dense measured data it matches linear closely.
+// Reduces to linear for 2 points; clamps to the endpoints outside the measured range
+// (no extrapolation — same tail policy as tabulatedSpectrum).
+inline Spectrum tabulatedSpectrumMono(std::vector<std::pair<double, double>> pairs) {
+    std::sort(pairs.begin(), pairs.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    // Collapse exact-duplicate wavelengths (a zero-width interval would divide by 0).
+    pairs.erase(std::unique(pairs.begin(), pairs.end(),
+                    [](const auto& a, const auto& b) { return a.first == b.first; }),
+                pairs.end());
+    size_t n = pairs.size();
+    std::vector<double> x(n), y(n), m(n, 0.0);
+    for (size_t i = 0; i < n; ++i) { x[i] = pairs[i].first; y[i] = pairs[i].second; }
+    if (n >= 2) {
+        std::vector<double> h(n - 1), d(n - 1);           // interval widths, secant slopes
+        for (size_t i = 0; i + 1 < n; ++i) { h[i] = x[i + 1] - x[i]; d[i] = (y[i + 1] - y[i]) / h[i]; }
+        // Interior tangents: weighted harmonic mean of the two adjacent secants, forced
+        // to 0 at a local extremum (sign change) — this is what kills overshoot.
+        for (size_t i = 1; i + 1 < n; ++i) {
+            if (d[i - 1] * d[i] <= 0.0) { m[i] = 0.0; continue; }
+            double w1 = 2.0 * h[i] + h[i - 1];
+            double w2 = h[i] + 2.0 * h[i - 1];
+            m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+        }
+        // Endpoints: one-sided 3-point estimate with the standard shape-preserving limiter.
+        auto endTangent = [](double h0, double h1, double d0, double d1) {
+            double m0 = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+            if (m0 * d0 <= 0.0) return 0.0;                              // don't flip sign
+            if (d0 * d1 <= 0.0 && std::fabs(m0) > 3.0 * std::fabs(d0)) return 3.0 * d0; // cap
+            return m0;
+        };
+        if (n == 2) { m[0] = d[0]; m[1] = d[0]; }
+        else {
+            m[0]     = endTangent(h[0],     h[1],     d[0],     d[1]);
+            m[n - 1] = endTangent(h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
+        }
+    }
+    return [x, y, m](double w) -> double {
+        size_t n = x.size();
+        if (n == 0) return 0.0;
+        if (n == 1 || w <= x.front()) return y.front();
+        if (w >= x.back()) return y.back();
+        size_t lo = 0, hi = n - 1;
+        while (lo + 1 < hi) { size_t mid = (lo + hi) / 2; (x[mid] <= w ? lo : hi) = mid; }
+        double hlen = x[lo + 1] - x[lo];
+        double t = (w - x[lo]) / hlen, t2 = t * t, t3 = t2 * t;
+        double h00 =  2 * t3 - 3 * t2 + 1;   // Hermite basis
+        double h10 =      t3 - 2 * t2 + t;
+        double h01 = -2 * t3 + 3 * t2;
+        double h11 =      t3 -     t2;
+        return h00 * y[lo] + h10 * hlen * m[lo] + h01 * y[lo + 1] + h11 * hlen * m[lo + 1];
+    };
+}
+
 // RGB -> reflectance upsampling now lives in src/upsample.h
 // (`rgbToReflectanceJH`, a Jakob-Hanika 2019 sigmoid fit that round-trips linear
 // sRGB under D65). The earlier three-lobe placeholder was removed once the

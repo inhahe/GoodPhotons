@@ -63,7 +63,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by
   R, A/B/C, M/S on CPU and the GPU forward megakernel. Emitter SPD sampling is
-  cached per light.
+  cached per light. Tabulated curves (FTSL `table { }` / `file:`) build a
+  `Spectrum` via `tabulatedSpectrum` (piecewise-linear, default) or
+  `tabulatedSpectrumMono` (opt-in `interp=cubic`: monotone Fritsch–Carlson/PCHIP —
+  C¹ but shape-preserving, no overshoot, so an interpolated reflectance/absorption
+  can't ring outside its neighbouring samples). Both clamp to the endpoints outside
+  the sampled range (no extrapolation); `loadSpdFile` warns once if a `file:` curve
+  doesn't span the 360–830 nm render range. Since `Spectrum` is
+  `std::function<double(double)>` evaluated at each photon's exact λ, the interpolant
+  shape shows directly (there's no pre-binning), which is why overshoot matters.
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.

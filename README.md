@@ -910,12 +910,22 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   broadband source, not a monochromatic spike, so it reads as a natural coloured light
   rather than a laser line. Meant for **lights** (`spd rgbillum 1 0.6 0.2`); accepted
   anywhere a spectrum is.
-- **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum
-  (piecewise-linear).
+- **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
+  **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
+  (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —
+  C¹-smooth yet shape-preserving, so it never overshoots (a value stays within its
+  neighbouring samples, so a reflectance/absorption can't ring negative the way a plain
+  spline would). Cubic is worth it for **sparse** control points where linear kinks
+  show; for dense data it matches linear. Outside the sampled range the value is held
+  flat at the nearest endpoint (no extrapolation).
 - **`file:<path>`** — load a measured curve (SPD, reflectance, or n(λ)) from an
   external CSV/whitespace data file (`#` comments, a header row, `wavelength_nm,value`
   rows); the runtime ingestion point for the data under `data/`. E.g.
-  `spd file:data/illuminant/f2.csv` (see `scenes/measured_spd.ftsl`).
+  `spd file:data/illuminant/f2.csv` (see `scenes/measured_spd.ftsl`). Same
+  interpolation controls as `table`: append **`interp=cubic`** for monotone-cubic
+  (`absorb file:data/absorb/red.csv interp=cubic`), else piecewise-linear. If the file
+  doesn't span the render's spectral range a one-line **coverage warning** is printed
+  (the tails are held flat, not extrapolated).
 - **`glass:<name>`** — dispersive index via Sellmeier: `BK7`/crown, `SF10`/flint,
   `silica`/fused-silica, `sapphire`, `diamond`, plus Cauchy fits for `water`,
   `ice`, `acrylic`/PMMA, `polycarbonate`.
