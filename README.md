@@ -123,6 +123,9 @@ ftrace -scene cornell -n 200000000 -r 512 -o cornell.png
 # Render an FTSL scene file
 ftrace -in scenes/cornell.ftsl -n 200000000 -o out.png
 
+# Quick-view a bare mesh — auto-lit, auto-framed, live raster preview window
+ftrace cloud1.glb            # also .obj/.gltf/.fbx/.stl/.ply; drag-drop / double-click works
+
 # Physical-lens camera demo (depth of field from real optics; forces mode R)
 ftrace -in scenes/realcam.ftsl -n 6000000 -o realcam.png
 
@@ -133,7 +136,21 @@ ftrace -in scenes/group.ftsl -time 120 -preview -o group.png
 Run `ftrace -h` (or `--help`) for a grouped summary of the common flags. An
 unrecognized `-flag` (e.g. a typo) is a hard error — ftrace prints
 `unknown option '…'` and exits non-zero rather than silently falling back to the
-default demo render.
+default demo render. Likewise a bare positional argument that looks like a file
+but isn't a recognized scene or mesh (e.g. `ftrace foo.xyz`) is a hard error, not
+a silent fall-through to the demo scene.
+
+> **Quick mesh viewer.** A bare positional **mesh** path — `ftrace model.glb`
+> (also `.obj` / `.gltf` / `.fbx` / `.stl` / `.ply`) — wraps the mesh in a
+> synthesized, auto-lit scene (a neutral clay fallback material under a soft uniform
+> environment; glTF/GLB primitives keep their own imported materials) and opens it in
+> an **auto-framed live raster preview window** — the same interactive fly-camera as a
+> double-clicked `.ftsl`. The camera is aimed at the mesh's bounding sphere from a
+> three-quarter front-high angle and pulled back so the whole model fits the frame, so
+> you never have to hand-place a camera just to look at a model. Presentation flags
+> (`-window`, `-o`, `-r`, `-camera`, `-view`) keep it a preview; to render the same
+> auto-lit scene with real light transport instead, pass a transport flag —
+> `ftrace model.glb -mode D -n 100000000 -o png/model.png`.
 
 ---
 

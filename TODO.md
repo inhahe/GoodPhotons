@@ -973,8 +973,22 @@ in that site's axis set). **Open q (defer to scheduling):** the concrete `Animat
 how axis-set inference/annotation is represented in the loom struct + the on-disk projection; where the
 explicit reduction node and the video node sit in that taxonomy.
 
-### E6 — Quick OBJ viewer: a CLI flag to open a mesh in a ready-lit scene  *(ftrace; small, self-contained; user-proposed 2026-07-19)*
-**Idea.** A command-line option that takes an `.obj` file and renders/opens it directly in a viewable
+### E6 — Quick mesh viewer: open a bare mesh in a ready-lit scene  ✅ DONE 2026-07-21  *(ftrace; user-proposed 2026-07-19)*
+**Shipped.** A bare positional mesh path — `ftrace model.glb` (also `.obj`/`.gltf`/`.fbx`/`.stl`/`.ply`) —
+now wraps the mesh in a synthesized auto-lit FTSL scene (neutral clay fallback material under a soft
+uniform `light env`; glTF/GLB keep their imported materials) with an **auto-framed camera** (aimed at the
+mesh bounding sphere from a 3/4 front-high angle, pulled back to fit the vertical FOV) and opens the
+interactive raster-preview live window — the same viewer as a double-clicked `.ftsl`. Presentation flags
+(`-window`/`-o`/`-r`/`-camera`/`-view`) keep it a preview; a transport flag (`-mode`/`-n`/…) renders the
+same auto-lit scene for real. A bare file-like positional that isn't a recognized scene/mesh is now a hard
+error instead of silently rendering the demo. Implementation: `ftsl::loadSource(src,…)` (a string-source
+refactor of `ftsl::load`, `src/ftsl.h`) + positional mesh detection & scene synthesis in `src/main.cpp`.
+Deviations from the sketch below: entry point is the **bare positional** (not a `-view`/`-obj` flag, since
+`-view` already takes eye/look numbers), the default is the **raster preview** (not a full light-transport
+render), and lighting is a single soft **environment** (not a three-point rig) — sufficient for "just let
+me look at this mesh," and a real render is one transport flag away.
+
+**Original idea.** A command-line option that takes an `.obj` file and renders/opens it directly in a viewable
 scene with **sufficient built-in lighting** — no hand-authored `.ftsl` required. Point ftrace at a bare
 mesh (e.g. `ftrace -view foo.obj` / `-obj foo.obj`) and get an immediately watchable, well-lit result:
 auto-frame the camera to the mesh bounds, drop in a default key/fill/ambient (or an environment light) so

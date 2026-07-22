@@ -3265,12 +3265,14 @@ static void printHelp(const char* prog) {
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
 "  %s <scene.ftsl>                       quick raster preview in a live window\n"
+"  %s <model.glb|.obj|.gltf|.fbx>        quick-view a bare mesh (auto-lit, auto-framed)\n"
 "  %s [options]                          render the built-in demo scene\n"
 "  %s -topng <in.ppm|in.ftbuf> <out.png> convert an artifact to PNG (no render)\n"
 "  %s -review <base>                     play a rendered frame sequence\n"
 "\n"
 "Scene & camera:\n"
 "  -in <file>            FTSL scene file (.ftsl/.scene); a bare positional path works too\n"
+"                        (a bare mesh path .obj/.gltf/.glb/.fbx/.stl/.ply auto-lights & views it)\n"
 "  -scene <name>         built-in demo scene (default: cornell)\n"
 "  -light <name>         built-in light preset (default: bb6500)\n"
 "  -camera <sel>         pick FTSL camera(s): <name>|<pathbase>|all|#N|near=X,Y,Z\n"
@@ -3319,7 +3321,7 @@ static void printHelp(const char* prog) {
 "  -h | --help           show this help and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 static int run(int argc, char** argv) {
@@ -3438,24 +3440,48 @@ static int run(int argc, char** argv) {
     const char* inFile = nullptr;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
-    // Positional scene file: `ftrace scene.ftsl` (e.g. a double-click) with no -in.
-    // Accept a bare token that ends in a scene extension so a file association / drag-drop
-    // "just works" as a quick preview. Only scene-file extensions qualify, so this never
-    // swallows a flag value (no other flag takes a `.ftsl`/`.scene` argument).
+    // Positional scene / mesh file: `ftrace scene.ftsl` or `ftrace model.glb` (e.g. a
+    // double-click / drag-drop) with no -in. Accept a bare token that ends in a scene
+    // extension (loaded directly) OR a mesh extension (.obj/.gltf/.glb/.fbx/.stl/.ply —
+    // wrapped in a synthesized, auto-lit quick-viewer scene below). Only these extensions
+    // qualify, so this never swallows a flag value (no flag takes such a path argument).
+    // A bare token that LOOKS like a file (has an extension or a path separator) but isn't
+    // a recognized scene/mesh is remembered so we ERROR instead of silently rendering the
+    // built-in demo — the old, confusing behavior (`ftrace foo.glb` used to draw cornell).
     bool positionalScene = false;
+    bool positionalMesh  = false;
+    const char* unknownPositional = nullptr;
     if (!inFile) {
-        auto hasSceneExt = [](const char* s) {
-            std::string t = s; for (auto& c : t) c = (char)std::tolower((unsigned char)c);
-            auto ends = [&](const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
-            return ends(".ftsl") || ends(".scene") || ends(".fts");
-        };
+        auto lower = [](const char* s){ std::string t = s; for (auto& c : t) c = (char)std::tolower((unsigned char)c); return t; };
+        auto ends  = [](const std::string& t, const char* e){ size_t n = std::strlen(e); return t.size() >= n && t.compare(t.size()-n, n, e) == 0; };
+        auto hasSceneExt = [&](const char* s){ std::string t = lower(s); return ends(t,".ftsl") || ends(t,".scene") || ends(t,".fts"); };
+        auto hasMeshExt  = [&](const char* s){ std::string t = lower(s);
+            return ends(t,".obj") || ends(t,".gltf") || ends(t,".glb") || ends(t,".fbx") || ends(t,".stl") || ends(t,".ply"); };
+        auto looksLikeFile = [](const char* s){ std::string t = s; size_t sl = t.find_last_of("/\\");
+            std::string base = (sl == std::string::npos) ? t : t.substr(sl + 1);
+            return base.find('.') != std::string::npos || sl != std::string::npos; };
         for (int i = 1; i < argc; ++i) {
-            if (argv[i][0] == '-') continue;                 // a flag (or its value we skip below)
-            if (i > 0 && argv[i-1][0] == '-') {              // could be a flag's value; only take it if it's a scene file
-                if (!hasSceneExt(argv[i])) continue;
+            if (argv[i][0] == '-') continue;                 // a flag
+            const bool couldBeFlagValue = (i > 0 && argv[i-1][0] == '-');
+            if (couldBeFlagValue) {                          // a flag's value: only claim it if it's a scene/mesh path
+                if (!hasSceneExt(argv[i]) && !hasMeshExt(argv[i])) continue;
             }
             if (hasSceneExt(argv[i])) { inFile = argv[i]; positionalScene = true; break; }
+            if (hasMeshExt(argv[i]))  { inFile = argv[i]; positionalScene = true; positionalMesh = true; break; }
+            // Not a recognized scene/mesh. If it looks like a file path (and isn't a flag
+            // value), flag it as an error candidate rather than silently ignoring it.
+            if (!couldBeFlagValue && !unknownPositional && looksLikeFile(argv[i])) unknownPositional = argv[i];
         }
+    }
+    if (!inFile && unknownPositional) {
+        std::fprintf(stderr,
+            "[ftrace] unrecognized argument '%s': not a scene (.ftsl/.scene/.fts) or a mesh "
+            "(.obj/.gltf/.glb/.fbx/.stl/.ply).\n"
+            "  To render a scene file:   ftrace <scene.ftsl>\n"
+            "  To quick-view a mesh:      ftrace <model.glb>\n"
+            "  For the built-in demos:    ftrace -scene <cornell|materials|prism|fluoro|...>\n",
+            unknownPositional);
+        return 2;
     }
     // Pre-scan the two flags that affect `prefer{}/else{}` branch selection (which the
     // loader resolves up-front): a `-mode` override forces the mode a branch is judged
@@ -3474,7 +3500,47 @@ static int run(int argc, char** argv) {
 
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
-    if (inFile) {
+    if (positionalMesh) {
+        // ---- Quick mesh viewer -------------------------------------------------------
+        // `ftrace model.glb` (or .obj/.gltf/.fbx/.stl/.ply) with no scene file wraps the
+        // bare mesh in a synthesized, auto-lit FTSL scene and renders it with an
+        // auto-framed camera. The mesh keeps its own materials when the format carries
+        // them (glTF/GLB import materials by default); a neutral clay fallback covers
+        // primitives/faces with none. Lit by a soft uniform environment so any mesh reads
+        // with shape. Bare invocation then defaults to the fast raster preview in a live
+        // window (see the positional-preview block below); pass -mode/-n/etc. to force a
+        // real light-transport render of the same auto-lit scene.
+        std::string mp = inFile;
+        for (char& c : mp) if (c == '\\') c = '/';    // FTSL file strings use forward slashes
+        std::string src;
+        src += "scene { units meters spectral 360 830 1 }\n";
+        src += "material \"clay\" { type diffuse reflect whitewall 0.6 }\n";
+        src += "mesh { file \"" + mp + "\"  material clay }\n";
+        src += "light env { spd 0.5 }\n";
+        std::string ferr;
+        if (!ftsl::loadSource(src, std::string("<mesh-viewer:") + inFile + ">", ftslScene, ferr)) {
+            std::fprintf(stderr, "[ftrace] could not load mesh '%s': %s\n", inFile, ferr.c_str());
+            return 1;
+        }
+        fromFtsl = true;
+        std::printf("[viewer] quick-view scene for mesh %s (%zu triangles)\n",
+                    inFile, ftslScene.scene.tris.size());
+        // Auto-frame the camera on the scene bounding sphere from a 3/4 front-high angle,
+        // far enough that the sphere fits the vertical FOV (with a little margin). Skip if
+        // the user pinned their own -view.
+        if (!haveView) {
+            Vec3 ctr = ftslScene.scene.sceneCenter;
+            double rad = (ftslScene.scene.sceneRadius > 0.0) ? ftslScene.scene.sceneRadius : 1.0;
+            const double fovDeg = 40.0, half = fovDeg * 0.5 * PI / 180.0;
+            double dist = (rad / std::sin(half)) * 1.15;
+            Vec3 dir = {0.55, 0.42, 1.0};
+            { double L = std::sqrt(dot(dir, dir)); dir = dir * (1.0 / L); }
+            viewEye = ctr + dir * dist; viewLook = ctr; viewUp = {0, 1, 0}; viewFov = fovDeg;
+            haveView = true;
+            std::printf("[viewer] auto-framed: center (%.3f,%.3f,%.3f) radius %.3f -> eye (%.3f,%.3f,%.3f)\n",
+                        ctr.x, ctr.y, ctr.z, rad, viewEye.x, viewEye.y, viewEye.z);
+        }
+    } else if (inFile) {
         std::string ferr;
         // The prefer/else resolver asks this predicate whether a branch renders; when the
         // policy is fallback/strip we accept every branch (the policy handles it later at
@@ -3668,14 +3734,28 @@ static int run(int argc, char** argv) {
     // (a mode/budget/device/camera flag, an explicit -raster, etc.) we respect that and
     // don't force preview.
     if (positionalScene && !doRaster) {
-        static const char* kRenderFlags[] = {
+        // A scene file's preview yields to ANY render-control flag. The quick MESH viewer
+        // is fundamentally a preview, so it stays a raster preview even with presentation
+        // flags (-window/-o/-r/-camera/-view) and only yields to a genuine light-transport
+        // request (-mode and the budget/device/map flags). So `ftrace model.glb -window`
+        // shows a raster preview in a window, while `ftrace model.glb -mode D -n 1e8`
+        // renders it for real.
+        static const char* kSceneRenderFlags[] = {
             "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
             "-camera","-view","-savemap","-loadmap","-wavefront","-o","-r","-window"
         };
+        static const char* kMeshRenderFlags[] = {
+            "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
+            "-savemap","-loadmap","-wavefront"
+        };
         bool explicitControl = false;
-        for (int i = 1; i < argc && !explicitControl; ++i)
-            for (const char* f : kRenderFlags)
-                if (!std::strcmp(argv[i], f)) { explicitControl = true; break; }
+        auto scan = [&](const char* const* flags, size_t nflags) {
+            for (int i = 1; i < argc && !explicitControl; ++i)
+                for (size_t k = 0; k < nflags; ++k)
+                    if (!std::strcmp(argv[i], flags[k])) { explicitControl = true; break; }
+        };
+        if (positionalMesh) scan(kMeshRenderFlags, sizeof(kMeshRenderFlags)/sizeof(*kMeshRenderFlags));
+        else                scan(kSceneRenderFlags, sizeof(kSceneRenderFlags)/sizeof(*kSceneRenderFlags));
         if (!explicitControl) {
             doRaster = true;
             g_showWindow = true;

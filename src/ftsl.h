@@ -4396,22 +4396,19 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 // scene contains `prefer{}/else{}` blocks, `supported` chooses which branch renders (see
 // SupportFn): the first branch whose spliced scene is fully renderable wins, falling back
 // to the last branch when none are (a loud mode error then fires at render time).
-inline bool load(const std::string& path, Loaded& L, std::string& err,
-                 const SupportFn& supported = {}) {
-    std::ifstream f(path);
-    if (!f) { err = "cannot open scene file: " + path; return false; }
-    std::stringstream ss; ss << f.rdbuf();
-    std::string src = ss.str();
-
+// Load an FTSL scene from an in-memory source string (rather than a file). `nameForMsgs`
+// is used only for diagnostics (grammar-shim path label, error messages). This is the
+// shared core of `load()`; it also backs the synthesized quick-viewer scene (a bare
+// `ftrace foo.glb` builds an auto-lit scene string and loads it through here).
+inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
+                       Loaded& L, std::string& err,
+                       const SupportFn& supported = {}) {
     Parser p; p.t = tokenize(src);
     std::vector<Block> blocks = p.parseTop();
     if (!p.err.empty()) { err = p.err; return false; }
 
-    // J3c validation shim (non-authoritative): when -validate-grammar is on,
-    // parse `src` with the shared .ftsl grammar via the GPDA engine and diff its
-    // Block tree against `blocks` above, warning on any mismatch. Rendering still
-    // proceeds from ftrace's own parse. See src/gpda/ftsl_shim.hpp.
-    ftsl_shim::validate(src, blocks, path);
+    // J3c validation shim (non-authoritative); see load() below and src/gpda/ftsl_shim.hpp.
+    ftsl_shim::validate(src, blocks, nameForMsgs);
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;
@@ -4497,6 +4494,15 @@ inline bool load(const std::string& path, Loaded& L, std::string& err,
         std::printf("[prefer] using branch %d of %d\n",
                     choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());
     return true;
+}
+
+inline bool load(const std::string& path, Loaded& L, std::string& err,
+                 const SupportFn& supported = {}) {
+    std::ifstream f(path);
+    if (!f) { err = "cannot open scene file: " + path; return false; }
+    std::stringstream ss; ss << f.rdbuf();
+    std::string src = ss.str();
+    return loadSource(src, path, L, err, supported);
 }
 
 } // namespace ftsl
