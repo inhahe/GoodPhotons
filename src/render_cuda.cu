@@ -5223,7 +5223,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
-    const double r2 = (double)pm.radius * (double)pm.radius;   // norm folded into pX/pY/pZ
+    // norm folded into pX/pY/pZ; radius^2 kept in Real — the distance test runs once per
+    // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
+    // f2d convert issue at 1/64 rate, so keeping the test in FP32 matters.
+    const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
     const int maxBounce = 32;
 
     for (int b = 0; b < maxBounce; ++b) {
@@ -5257,8 +5260,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             // Radius density estimate at the visible point, accumulated in XYZ (each photon
             // folded at its own wavelength): L_r = (1/N) sum_p rho(l_p)/pi * Phi_p / (pi r^2).
             // Everything but rho(l_p) is baked into the record's pX/pY/pZ (see DGatherPhoton),
-            // so the per-photon work is the two rejection tests + one rho + three MADs.
-            double gx = 0, gy = 0, gz = 0;
+            // so the per-photon work is the two rejection tests + one rho + three FMAs — all
+            // FP32: a float sum of <= (cell occupancy) same-sign terms errs ~n*2^-24 relative,
+            // far below the 8-bit output quantum, and FP64 FMAs would issue at 1/64 rate. The
+            // per-sample total is promoted to double once at the end (film math stays double).
+            float gx = 0.f, gy = 0.f, gz = 0.f;
             int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
             int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
             int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
@@ -5272,15 +5278,15 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                   for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
                       const DGatherPhoton& ph = pm.photons[k];
                       DVec3 d = h.p - ph.pos;
-                      if ((double)dot(d, d) > r2) continue;
+                      if (dot(d, d) > r2) continue;
                       if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
-                      double rho = (double)dDiffuseRho(sc, m, h, (Real)ph.lambda);
-                      gx += rho * (double)ph.pX;
-                      gy += rho * (double)ph.pY;
-                      gz += rho * (double)ph.pZ;
+                      float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                      gx += rho * ph.pX;
+                      gy += rho * ph.pY;
+                      gz += rho * ph.pZ;
                   }
                 }}}
-            oX += gx * thr; oY += gy * thr; oZ += gz * thr;
+            oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
         }
 
