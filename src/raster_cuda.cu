@@ -35,6 +35,10 @@
 //                     while a screen-filling quad no longer serializes on one thread.
 //                     Dead slots are skipped via the dense 4-byte `flags` probe (8 slots
 //                     per 32-byte sector); live ones read only the dense 36B DGeo.
+//                     The raster kernels read their bin count from device memory
+//                     (small: upper-bound 1:1 grid; med/large: warp-/block-level
+//                     ticket queues), so the host never reads the counts back and
+//                     the whole frame enqueues without a mid-frame wait.
 //
 //   Pass C  kShade    (1 thread / pixel): decode the winning slot, recompute barycentrics
 //                     at the pixel centre, interpolate world pos/normal, and shade once
@@ -85,6 +89,9 @@
   #define cudaEventSynchronize    hipEventSynchronize
   #define cudaEventElapsedTime    hipEventElapsedTime
   #define cudaEventDestroy        hipEventDestroy
+  // NOTE: kRasterMed's ticket broadcast uses __shfl_sync (32-wide). No alias on
+  // purpose: a HIP build fails loudly there instead of silently mis-broadcasting on
+  // wave64 GPUs — port it to a wave-size-aware __shfl if HIP is ever actually built.
 #else
   #include <cuda_runtime.h>
 #endif
@@ -516,10 +523,21 @@ __global__ void kClassify(const DGeo* geos, const int* flags, int nSlots, int W,
     else                        binLarge[atomicAdd(&cnt[2], 1)] = idx;
 }
 
-__global__ void kRasterSmall(const DGeo* geos, const int* flags, const int* list, int n,
+// The three binned kernels read their bin's count from device memory (cnt[0..2],
+// written by kClassify), so the host never has to read the counts back to size the
+// grids — on WDDM that readback was the frame's only mid-frame flush+wait. The small
+// bin (millions of items in tessellated scenes) keeps its 1:1 thread↔item mapping
+// under an upper-bound grid (excess threads exit after one cached load) because the
+// hardware block scheduler load-balances the variable per-item cost far better than
+// a grid-stride loop; med warps and large blocks take tickets from work queues
+// (cnt[3]/cnt[4]) so their variable-cost items stay dynamically balanced. In every
+// case each (slot,row) executes the exact old arithmetic and atomicMax merges
+// order-independently, so the output stays bit-identical no matter which thread
+// runs it.
+__global__ void kRasterSmall(const DGeo* geos, const int* flags, const int* list, const int* cnt,
                              int W, int H, int seeThrough, unsigned long long* vis) {
     int li = blockIdx.x * blockDim.x + threadIdx.x;
-    if (li >= n) return;
+    if (li >= cnt[0]) return;
     int slot = list[li];
     const DGeo& t = geos[slot];
     SlotSetup s;
@@ -528,28 +546,51 @@ __global__ void kRasterSmall(const DGeo* geos, const int* flags, const int* list
         rasterRow(t, slot, y, s, W, vis);
 }
 
-__global__ void kRasterMed(const DGeo* geos, const int* flags, const int* list, int n,
+// Med items are heavy (128..16K px) and can number far beyond the fixed grid's warps,
+// so a static stride would leave straggler warps serially walking several of them.
+// Instead the warps take tickets from a work queue (cnt[3], zeroed with the counts):
+// one cheap atomicAdd per ITEM keeps every warp busy until the list is drained —
+// the same dynamic balancing the hardware gave the old exact-sized 1:1 launch.
+__global__ void kRasterMed(const DGeo* geos, const int* flags, const int* list, int* cnt,
                            int W, int H, int seeThrough, unsigned long long* vis) {
-    int gt = blockIdx.x * blockDim.x + threadIdx.x;
-    int li = gt >> 5, lane = gt & 31;
-    if (li >= n) return;
-    int slot = list[li];
-    const DGeo& t = geos[slot];
-    SlotSetup s;
-    if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) return;
-    for (int y = s.ylo + lane; y <= s.yhi; y += 32)
-        rasterRow(t, slot, y, s, W, vis);
+    const int n = cnt[1];
+    int lane = threadIdx.x & 31;
+    for (;;) {
+        int li;
+        if (lane == 0) li = atomicAdd(&cnt[3], 1);
+        li = __shfl_sync(0xffffffffu, li, 0);
+        if (li >= n) return;
+        int slot = list[li];
+        const DGeo& t = geos[slot];
+        SlotSetup s;
+        if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) continue;
+        for (int y = s.ylo + lane; y <= s.yhi; y += 32)
+            rasterRow(t, slot, y, s, W, vis);
+    }
 }
 
-__global__ void kRasterLarge(const DGeo* geos, const int* flags, const int* list, int n,
+// Large items are the heaviest of all (16K..screen-sized bboxes), so like med they
+// self-balance through a ticket queue (cnt[4]) instead of a static stride: thread 0
+// takes the block's next ticket and broadcasts it through shared memory. Every branch
+// below is uniform across the block (all threads see the same li/slot), so the
+// barriers can't diverge.
+__global__ void kRasterLarge(const DGeo* geos, const int* flags, const int* list, int* cnt,
                              int W, int H, int seeThrough, unsigned long long* vis) {
-    if (blockIdx.x >= (unsigned)n) return;
-    int slot = list[blockIdx.x];
-    const DGeo& t = geos[slot];
-    SlotSetup s;
-    if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) return;
-    for (int y = s.ylo + threadIdx.x; y <= s.yhi; y += blockDim.x)
-        rasterRow(t, slot, y, s, W, vis);
+    const int n = cnt[2];
+    __shared__ int sLi;
+    for (;;) {
+        if (threadIdx.x == 0) sLi = atomicAdd(&cnt[4], 1);
+        __syncthreads();                 // ticket visible to the whole block
+        int li = sLi;
+        __syncthreads();                 // everyone has copied it before the next write
+        if (li >= n) return;
+        int slot = list[li];
+        const DGeo& t = geos[slot];
+        SlotSetup s;
+        if (!setupSlot(t, flags[slot], W, H, seeThrough, s)) continue;
+        for (int y = s.ylo + threadIdx.x; y <= s.yhi; y += blockDim.x)
+            rasterRow(t, slot, y, s, W, vis);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -968,7 +1009,7 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
            && tryMalloc((void**)&sc->dbinSmall, sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinMed,   sizeof(int) * 2 * tris.size())
            && tryMalloc((void**)&sc->dbinLarge, sizeof(int) * 2 * tris.size())
-           && tryMalloc((void**)&sc->dbinCnt,   sizeof(int) * 3)
+           && tryMalloc((void**)&sc->dbinCnt,   sizeof(int) * 5)   // 3 counts + med/large tickets
            && tryMalloc((void**)&sc->dhist, 65536 * sizeof(unsigned int))
            && tryMalloc((void**)&sc->dlut,  raster::srgbLut8().size())
            && tryMallocHost((void**)&sc->h_hist, 65536 * sizeof(unsigned int));
@@ -1030,8 +1071,8 @@ static bool ensurePix(Scene* sc, size_t N) {
 // reaches it, so the windows have exactly the same composition as the old synced wall
 // clocks (any host-readback bubbles inside a pass are included) WITHOUT renderFrame
 // having to synchronize after every pass. The frame runs sync-free except for its real
-// data dependencies (bin-count readback, histogram readbacks, final image download);
-// event pairs are resolved once per frame after that download has fenced everything.
+// data dependencies (first-frame histogram readbacks, final image download); event
+// pairs are resolved once per frame after that download has fenced everything.
 static bool g_prof = false;
 static Prof g_profAcc;
 void profEnable(bool on) { g_prof = on; }
@@ -1082,20 +1123,19 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // (thread / warp / block per sub-triangle). Every (slot,row) runs the exact row maths
     // of the old single kernel and atomicMax merges order-independently, so the result is
     // bit-identical while a screen-filling quad no longer serializes on one thread.
-    if (cudaMemset(sc->dbinCnt, 0, 3 * sizeof(int)) != cudaSuccess) return empty;
+    if (cudaMemset(sc->dbinCnt, 0, 5 * sizeof(int)) != cudaSuccess) return empty;   // counts + tickets
     kClassify<<<gSlots, TPB>>>(sc->dgeos, sc->dflags, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
                                sc->dbinSmall, sc->dbinMed, sc->dbinLarge, sc->dbinCnt);
-    int hcnt[3] = {0, 0, 0};   // blocking copy also orders the classify before the readback
-    if (cudaMemcpy(hcnt, sc->dbinCnt, 3 * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    if (hcnt[0] > 0)
-        kRasterSmall<<<(hcnt[0] + TPB - 1) / TPB, TPB>>>(sc->dgeos, sc->dflags, sc->dbinSmall,
-                                                         hcnt[0], W, H, seeThrough ? 1 : 0, sc->vis);
-    if (hcnt[1] > 0)
-        kRasterMed<<<(int)(((long long)hcnt[1] * 32 + TPB - 1) / TPB), TPB>>>(
-            sc->dgeos, sc->dflags, sc->dbinMed, hcnt[1], W, H, seeThrough ? 1 : 0, sc->vis);
-    if (hcnt[2] > 0)
-        kRasterLarge<<<hcnt[2], TPB>>>(sc->dgeos, sc->dflags, sc->dbinLarge, hcnt[2],
-                                       W, H, seeThrough ? 1 : 0, sc->vis);
+    // The raster kernels read their bin count from dbinCnt, so nothing here waits on
+    // the classify results. Small gets a 1-thread-per-item upper-bound grid (all slots
+    // could be small); med/large get fixed device-filling grids and self-balance via
+    // their ticket queues. Excess threads/blocks exit after one cached 4-byte load.
+    kRasterSmall<<<gSlots, TPB>>>(sc->dgeos, sc->dflags, sc->dbinSmall, sc->dbinCnt,
+                                  W, H, seeThrough ? 1 : 0, sc->vis);
+    kRasterMed<<<2048, TPB>>>(sc->dgeos, sc->dflags, sc->dbinMed, sc->dbinCnt,
+                              W, H, seeThrough ? 1 : 0, sc->vis);
+    kRasterLarge<<<768, TPB>>>(sc->dgeos, sc->dflags, sc->dbinLarge, sc->dbinCnt,
+                               W, H, seeThrough ? 1 : 0, sc->vis);
     rec(3);
     kShade<<<gPix, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, sc->vis,
                           sc->dlights, sc->nLights,
