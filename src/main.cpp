@@ -3299,6 +3299,8 @@ static void printHelp(const char* prog) {
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
 "  -spp <n>              samples/pixel for backward modes R/V\n"
+"  -beams|-photonbeams   decorrelated photon-beams gather for shared multi-camera flybys\n"
+"                        (single-scatter volumetrics; CPU-only, kills frozen speckle)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -t <n>                CPU thread count\n"
 "\n"
@@ -3678,7 +3680,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
         else if (!std::strcmp(argv[i], "-preview")) preview = true;
-        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "-photonbeams")) g_beamGather = true;
+        else if (!std::strcmp(argv[i], "-beams") || !std::strcmp(argv[i], "--beams") ||
+                 !std::strcmp(argv[i], "-photonbeams") || !std::strcmp(argv[i], "--photonbeams")) g_beamGather = true;
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-keepwindow") || !std::strcmp(argv[i], "-hold")) { g_showWindow = true; g_keepWindow = true; }
         else if (!std::strcmp(argv[i], "-raster")) doRaster = true;
