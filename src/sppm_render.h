@@ -229,7 +229,11 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
     for (const auto& P : st.px) if (P.vpValid) rMax = std::max(rMax, P.radius);
     if (rMax <= 0.0) rMax = 1e-4;
     PhotonMap pm;
-    tracePhotonPass(scene, photonsPerPass, nThreads, diffraction, pm, heroC);
+    // seedBase = cumulative photons emitted before this pass, so every pass traces a
+    // FRESH, independent photon set (SPPM's convergence requires it) while staying
+    // deterministic for a fixed pass sequence.
+    tracePhotonPass(scene, photonsPerPass, nThreads, diffraction, pm, heroC,
+                    (uint64_t)st.emittedTotal);
     pm.build(rMax);
     st.emittedTotal += pm.nEmitted;
     st.passes += 1;

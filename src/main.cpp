@@ -1248,14 +1248,18 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
         r.useHero = heroOn; r.heroC = g_heroC;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
-                            (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
+        // Photon i draws from its own stream keyed by the ABSOLUTE photon index
+        // seedBase+i (seedBase = cumulative photons of earlier batches), so the traced
+        // set is independent of batch splits and thread count (see rng.h seedUnit).
+        Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         Film* sensorFilm = useCamera ? nullptr : &films[tid];
         const Camera* camPtr = useCamera ? cam : nullptr;
         Film* camFilm = useCamera ? &films[tid] : nullptr;
-        for (long long i = lo; i < hi; ++i)
+        for (long long i = lo; i < hi; ++i) {
+            seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
             r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
+        }
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1302,19 +1306,20 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
         r.useHero = heroOn; r.heroC = g_heroC; r.beamGather = beamGather;
-        // Identical seeding to renderForward. For model B this makes each camera's shared
-        // film bit-identical to its standalone single-camera render (at seedBase 0); for
-        // model A the aperture draws perturb the stream, so it matches in distribution.
-        // `seedBase` (the cumulative photon count) decorrelates successive accumulation
-        // chunks so a checkpointed / resumed / budgeted shared render draws independent
-        // photons each pass; seedBase==0 reproduces the original single-shot stream.
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 1,
-                            (0x9e3779b97f4a7c15ULL ^ (uint64_t)tid) + seedBase * 0x9e3779b97f4a7c15ULL);
+        // Identical per-photon seeding to renderForward (absolute index seedBase+i via
+        // seedUnit). For model B this keeps each camera's shared film bit-identical to
+        // its standalone single-camera render at the same seedBase; for model A the
+        // aperture draws perturb the stream, so it matches in distribution. `seedBase`
+        // (the cumulative photon count) makes a checkpointed / resumed / budgeted
+        // shared render draw fresh photons each pass, independent of the batch split.
+        Pcg32 rng;
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
         for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
-        for (long long i = lo; i < hi; ++i)
+        for (long long i = lo; i < hi; ++i) {
+            seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
+        }
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1334,20 +1339,18 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 
 // Backward reference: `spp` samples per pixel, threads render disjoint row bands
 // of a shared film (no shared-pixel writes, so no race).
-// `seedOffset` decorrelates the RNG stream so a chunked/progressive render can call
-// this repeatedly (each chunk with a distinct offset) and merge the SUM films for an
-// independent, ever-refining estimate. seedOffset==0 reproduces the original stream.
+// `sampleBase` is the ABSOLUTE index of the first sample: a chunked/progressive
+// render passes its running spp count so successive chunks render successive
+// per-(pixel,sample) streams — the realization is identical for ANY chunk split,
+// thread count, or resume boundary (see renderRows / rng.h seedUnit).
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
                            long long spp, int nThreads, bool diffraction = true,
-                           unsigned long long seedOffset = 0) {
+                           unsigned long long sampleBase = 0) {
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 7,
-                            0xD1B54A32D192ED03ULL ^ (uint64_t)tid
-                              ^ (seedOffset * 0x9E3779B97F4A7C15ULL));
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, out, y0, y1, spp, rng);
+        br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -1365,17 +1368,14 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // by cieYIntegral for display, exactly like mode P's composite.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long spp, int nThreads, int maxDepth, bool diffraction = true,
-                       unsigned long long seedOffset = 0) {
+                       unsigned long long sampleBase = 0) {
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
-        Pcg32 rng; rng.seed((uint64_t)tid * 2 + 11,
-                            0x9E3779B97F4A7C15ULL ^ (uint64_t)tid
-                              ^ (seedOffset * 0xD1B54A32D192ED03ULL));
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, cf, sf, y0, y1, spp, rng);
+        br.renderRows(scene, cam, cf, sf, y0, y1, spp, sampleBase);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -2027,19 +2027,30 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
                          const std::function<Film(long long, unsigned long long)>& renderOne) {
     if (!prog || !prog->report) return renderOne(sppTarget, 0);
     using clk = std::chrono::steady_clock;
-    // On resume the loaded film already holds `sampleBase` spp; bias the fresh seeds past
-    // it so the continued samples are an independent realization (see SppProgress).
+    // On resume the loaded film already holds `sampleBase` spp; continue from that
+    // absolute sample index. renderOne(c, base) renders the absolute samples
+    // [base, base+c) — per-(pixel,sample) seeding downstream makes the realization
+    // identical no matter how this loop happens to split the chunks.
     const unsigned long long seedBias = (unsigned long long)prog->sampleBase;
     Film acc; acc.resX = resX; acc.resY = resY; acc.alloc();
     long long done = 0, chunk = 1;
+    // Debug aids (determinism triage): FTRACE_CHUNK_SPP=K pins every chunk to K
+    // samples (making the normally wall-clock-adaptive split sequence exactly
+    // reproducible); FTRACE_CHUNK_DEBUG=1 logs the sequence actually used.
+    long long forcedChunk = 0;
+    if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
+    if (forcedChunk > 0) chunk = forcedChunk;
+    const bool chunkDebug = std::getenv("FTRACE_CHUNK_DEBUG") != nullptr;
     while (done < sppTarget) {
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
-        Film f = renderOne(c, seedBias + (unsigned long long)(done + 1));
+        Film f = renderOne(c, seedBias + (unsigned long long)done);
         acc.merge(f);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
-        if (dt > 1e-4) {                       // retarget chunk toward ~0.4s of work
+        if (chunkDebug) std::fprintf(stderr, "[chunk] c=%lld base=%llu dt=%.3f\n",
+                                     c, seedBias + (unsigned long long)(done - c), dt);
+        if (forcedChunk <= 0 && dt > 1e-4) {   // retarget chunk toward ~0.4s of work
             long long next = (long long)((double)c * (0.4 / dt));
             if (next < 1) next = 1;
             if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
@@ -2277,7 +2288,7 @@ static int runCompositeProgressive(
             } else
 #endif
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
-                                   (uint64_t)acc.spp + 1);
+                                   (uint64_t)acc.spp);
             acc.ref.merge(r); acc.spp += dSpp;
         }
         // Adapt the batch toward ~0.5 s so early frames appear fast and overhead stays low.

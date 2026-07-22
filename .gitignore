@@ -4,6 +4,9 @@
 /build_cuda2/
 /build_het/
 /build_verify/
+/build_asan/
+/build_plain/
+/build_prof/
 /out/
 # ftrace.exe copied into the repo root by build.bat (build artifact)
 /ftrace.exe

@@ -816,14 +816,25 @@ struct BackwardRenderer {
     // the pixel rows [y0, y1) — the caller partitions rows across threads. On a
     // pinhole camera in a scene without fog / GRIN, hero-wavelength sampling is used
     // (C wavelengths per camera path); otherwise the single-wavelength radiance().
+    //
+    // `sampleBase` is the ABSOLUTE index of the first sample this call renders (a
+    // chunked/progressive render passes its running spp count; a resume passes the
+    // checkpointed count). Each (pixel, absolute sample) pair seeds its own RNG
+    // stream via seedUnit(), so the rendered realization is independent of the
+    // chunk split, the row banding, and the thread count.
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
-                    int y0, int y1, long long spp, Pcg32& rng) const {
+                    int y0, int y1, long long spp, unsigned long long sampleBase) const {
         const int C = heroC;
         const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
+        const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
+                const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
                 for (long long s = 0; s < spp; ++s) {
+                    Pcg32 rng;
+                    seedUnit(rng, (sampleBase + (uint64_t)s) * nPix + pixIdx,
+                             0xD1B54A32D192ED03ULL);
                     if (useHero) {
                         // One stratified base draw → hero + C-1 secondary wavelengths,
                         // all from the emission CDF. The hero (index 0) must have a

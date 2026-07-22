@@ -5,6 +5,35 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-07-21): mode D heap-use-after-free (dangling `Vertex&` across `push_back`) + per-work-unit RNG seeding makes all CPU spp/photon modes chunk- and resume-independent
+
+Two intertwined fixes, one commit (v0.18.2):
+
+**(1) BDPT use-after-free (real, long-standing).** `bdpt::randomWalk` (src/bdpt.h) took
+`Vertex& prev = path.back()` *before* `path.push_back(v)`; when the push reallocated,
+`prev` dangled — the later `wo = normalize(prev.p - cur.p)` read freed heap (corrupting
+MIS pdfs by up to ~9% rel in ~1e5 doubles of a 256² film) and `prev.pdfRev = …` **wrote**
+8 bytes into the freed block (heap corruption; almost certainly the one-off hard crash
+seen in a bench run — exit with no output, never reproduced). Whether the realloc fired
+at a given vertex depended on the *capacity history* of the per-thread `eye`/`light`
+vectors, i.e. on how `cpuSppChunks` happened to split the spp — which is wall-clock
+adaptive — so paired runs differed and the corruption masqueraded as a thread race.
+Fix: index (`prevSurfIdx`), matching the medium branch, which already did it right.
+Verified: MSVC ASan (container annotations proven active via probe) clean on the
+reproducing config; ftbufs byte-identical across three builds (ASan / plain CPU /
+CUDA) under forced splits (`FTRACE_CHUNK_SPP=K` debug env, added to `cpuSppChunks`
+alongside `FTRACE_CHUNK_DEBUG`); adaptive-split pairs now differ only at ≤1e-15 rel
+(pure summation-order ulp, same benign class as mode R).
+
+**(2) Per-work-unit seeding.** Every photon (A/B/C/P/M/S) and every (pixel, sample)
+(R/D) now seeds its own Pcg32 via `seedUnit(rng, unitIndex, salt)` (splitmix64 mix in
+src/rng.h) instead of seeding per chunk/thread — the realization is independent of
+chunk splits, thread count, banding, and `-resume` boundaries. This also fixed SPPM
+(mode S) re-emitting the *same* photons every pass (`tracePhotonPass` now takes
+`seedBase` = cumulative emitted count), which had silently capped S convergence.
+Observable consequence: CPU renders of R/P/D/M/S produce different (correct-noise)
+realizations than v0.18.1; bench reference hashes rebased (`scraps/bench_cpu2.json`).
+
 ### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the GPU forward megakernel (A/B/C + M-deposit) — GPU wavefront, GPU backward/BDPT, and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
