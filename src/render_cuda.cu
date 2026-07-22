@@ -4102,11 +4102,6 @@ __device__ static double dBsdfPdf(const DScene& sc, int matId, const DVec3& ns,
 }
 
 // Camera importance (PBRT imagePlaneArea convention — see bdpt.h cameraWe/PdfDir).
-__device__ static double dCamCos(const DCamera& cam, const DVec3& p) {
-    DVec3 d = p - cam.eye;
-    double len = sqrt(ddot(d, d));
-    return len > 0 ? ddot(d, cam.w) / len : 0.0;
-}
 __device__ static double dCameraPdfDir(const DCamera& cam, double cosCam) {
     if (cosCam <= 0) return 0.0;
     return 1.0 / (cam.imagePlaneArea() * cosCam * cosCam * cosCam);
@@ -4126,49 +4121,68 @@ __device__ static double dConvertDensity(double pdfW, const DVertex& from, const
     if (dOnSurface(to)) pdfW *= fabs(ddot(to.ns, w * (Real)sqrt(invD2)));
     return pdfW * invD2;
 }
+// ---- FP32 MIS pdf probes ----------------------------------------------------
+// These are used ONLY by dMisWeight. The MIS weight is a bounded ratio sum
+// (1/(1+sumRi), sumRi >= 0): any weight partition of unity keeps the estimator
+// unbiased, so last-ulp precision buys nothing -- and on GeForce parts FP64
+// issues at 1/64 rate, which makes the per-connection reverse-density probes a
+// direct FP64-pipe cost. FP32 is ample for these like-magnitude area-density
+// ratios, and overflow is graceful (an inf ratio drives the weight to 0, same
+// place the double path was headed). BSDF/phase backends keep their double
+// internals; results fold to float at the boundary. The transport quantities
+// themselves (beta/pdfFwd along the walk, connect radiance) stay double.
 // Emission directional density at a light vertex toward `next` (area measure).
-__device__ static double dVertexPdfLight(const DVertex& cur, const DVertex& next) {
+__device__ static float dVertexPdfLightF(const DVertex& cur, const DVertex& next) {
     DVec3 w = next.p - cur.p;
-    double d2 = ddot(w, w);
-    if (d2 == 0.0) return 0.0;
-    double invD2 = 1.0 / d2;
-    DVec3 wn = w * (Real)sqrt(invD2);
-    double cosLight = ddot(cur.ng, wn);
-    if (cosLight <= 0.0) return 0.0;
-    double pdf = (cosLight / DPI) * invD2;
-    if (dOnSurface(next)) pdf *= fabs(ddot(next.ns, wn));
+    float d2 = dot(w, w);
+    if (d2 == 0.f) return 0.f;
+    float invD2 = 1.0f / d2;
+    DVec3 wn = w * (Real)sqrtf(invD2);
+    float cosLight = dot(cur.ng, wn);
+    if (cosLight <= 0.f) return 0.f;
+    float pdf = (cosLight * (float)(1.0 / DPI)) * invD2;
+    if (dOnSurface(next)) pdf *= fabsf(dot(next.ns, wn));
     return pdf;
 }
-__device__ static double dVertexPdf(const DScene& sc, const DCamera& cam,
+__device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
                                     const DVertex* prev, const DVertex& cur, const DVertex& next) {
-    if (cur.type == BV_LIGHT) return dVertexPdfLight(cur, next);
+    if (cur.type == BV_LIGHT) return dVertexPdfLightF(cur, next);
     DVec3 wn = next.p - cur.p;
-    if (ddot(wn, wn) == 0.0) return 0.0;
+    if (dot(wn, wn) == 0.f) return 0.f;
     wn = normalize(wn);
-    double pdfW = 0.0;
+    float pdfW = 0.f;
     if (cur.type == BV_CAMERA) {
-        pdfW = dCameraPdfDir(cam, dCamCos(cam, next.p));
+        DVec3 d = next.p - cam.eye;                       // dCameraPdfDir in FP32
+        float len = sqrtf(dot(d, d));
+        float cosCam = len > 0.f ? dot(d, cam.w) / len : 0.f;
+        if (cosCam <= 0.f) return 0.f;
+        pdfW = 1.0f / ((float)cam.imagePlaneArea() * cosCam * cosCam * cosCam);
     } else if (cur.type == BV_MEDIUM) {          // volume in-scatter: HG phase pdf
-        if (!prev) return 0.0;
+        if (!prev) return 0.f;
         DVec3 wp = prev->p - cur.p;
-        if (ddot(wp, wp) == 0.0) return 0.0;
+        if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = dPhasePdf(cur, wp, wn);
+        pdfW = (float)dPhasePdf(cur, wp, wn);
     } else {
-        if (!prev) return 0.0;
+        if (!prev) return 0.f;
         DVec3 wp = prev->p - cur.p;
-        if (ddot(wp, wp) == 0.0) return 0.0;
+        if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = dBsdfPdf(sc, cur.matId, cur.ns, wp, wn);
+        pdfW = (float)dBsdfPdf(sc, cur.matId, cur.ns, wp, wn);
     }
-    return dConvertDensity(pdfW, cur, next);
+    // dConvertDensity in FP32: solid angle -> area density at `next`.
+    DVec3 wv = next.p - cur.p;
+    float d2 = dot(wv, wv);
+    if (d2 == 0.f) return 0.f;
+    float invD2 = 1.0f / d2;
+    if (dOnSurface(next)) pdfW *= fabsf(dot(next.ns, wv) * sqrtf(invD2));
+    return pdfW * invD2;
 }
-__device__ static double dVertexPdfLightOrigin(const DScene& sc, const DVertex& cur) {
-    if (cur.lightIdx < 0) return 0.0;
+__device__ static float dVertexPdfLightOriginF(const DScene& sc, const DVertex& cur) {
+    if (cur.lightIdx < 0) return 0.f;
     const DEmitter& em = sc.emitters[cur.lightIdx];
-    if (sc.totalPower <= 0.0 || em.area <= 0.0) return 0.0;
-    double pdfChoice = em.power / sc.totalPower;
-    return pdfChoice / em.area;
+    if (sc.totalPower <= 0.0 || em.area <= 0.0) return 0.f;
+    return (float)((em.power / sc.totalPower) / em.area);
 }
 // Emitted radiance (single wavelength) leaving a light vertex toward w.
 __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVec3& w,
@@ -4939,67 +4953,59 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // per-thread local arrays, so we save whole vertices before ANY mutation and restore
 // them at the end (whole-vertex restore subsumes PBRT's field-wise ScopedAssignments).
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
-                                    DVertex* light, DVertex* eye, const DVertex& sampled,
-                                    int s, int t) {
+                                    const DVertex* light, const DVertex* eye,
+                                    const DVertex& sampled, int s, int t) {
     if (s + t == 2) return 1.0;
-    int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
-    bool hasQs = s > 0, hasPt = t > 0, hasQsM = s > 1, hasPtM = t > 1;
+    const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
 
-    DVertex sQs, sPt, sQsM, sPtM;
-    if (hasQs)  sQs  = light[si];
-    if (hasPt)  sPt  = eye[ti];
-    if (hasQsM) sQsM = light[sMi];
-    if (hasPtM) sPtM = eye[tMi];
+    // Non-mutating rewrite of the PBRT ScopedAssignment dance: the old code copied the
+    // four vertices adjacent to the connection edge to locals, wrote hypotheticals into
+    // the arrays, walked, and restored (8 x 96B local-memory copies per call). Instead,
+    // resolve the a1 endpoint substitution (s==1/t==1 use the resampled endpoint) through
+    // pointers and apply the a2/a3 delta-clears + a4..a7 pdfRev overrides inline in the
+    // walks by index compare. Arithmetic per PBRT 16.3; FP32 per the note above.
+    const DVertex* QsP = (s > 0) ? ((s == 1) ? &sampled : &light[si]) : nullptr;
+    const DVertex* PtP = (t == 1) ? &sampled : &eye[ti];   // t >= 1 always
 
-    // a1: install the resampled endpoint for s==1 / t==1.
-    if (s == 1)      light[si] = sampled;
-    else if (t == 1) eye[ti]   = sampled;
-    // a2/a3: connection endpoints act as non-delta while probing hypotheticals.
-    if (hasPt) eye[ti].delta   = 0;
-    if (hasQs) light[si].delta = 0;
-    // a4: reverse density of the eye connection vertex pt.
-    if (hasPt) {
-        double val = (s > 0) ? dVertexPdf(sc, cam, hasQsM ? &light[sMi] : nullptr, light[si], eye[ti])
-                             : dVertexPdfLightOrigin(sc, eye[ti]);
-        eye[ti].pdfRev = val;
-    }
-    // a5: reverse density of pt's predecessor.
-    if (hasPtM) {
-        double val = (s > 0) ? dVertexPdf(sc, cam, hasQs ? &light[si] : nullptr, eye[ti], eye[tMi])
-                             : dVertexPdfLight(eye[ti], eye[tMi]);
-        eye[tMi].pdfRev = val;
-    }
-    // a6/a7: reverse density of the light connection vertex qs and its predecessor.
-    if (hasQs)  light[si].pdfRev  = dVertexPdf(sc, cam, hasPtM ? &eye[tMi] : nullptr, eye[ti], light[si]);
-    if (hasQsM) light[sMi].pdfRev = dVertexPdf(sc, cam, hasPt ? &eye[ti] : nullptr, light[si], light[sMi]);
+    // a4..a7: reverse densities of the connection-adjacent vertices. Each is only read
+    // by a walk index >= 1, so skip the provably-dead ones (the old code computed those
+    // too, wrote them into the arrays, and restored over them unread).
+    float ptPdfRev = 0.f, ptMPdfRev = 0.f, qsPdfRev = 0.f, qsMPdfRev = 0.f;
+    if (t >= 2)
+        ptPdfRev = (s > 0) ? dVertexPdfF(sc, cam, (s > 1) ? &light[sMi] : nullptr, *QsP, *PtP)
+                           : dVertexPdfLightOriginF(sc, *PtP);
+    if (t >= 3)
+        ptMPdfRev = (s > 0) ? dVertexPdfF(sc, cam, QsP, *PtP, eye[tMi])
+                            : dVertexPdfLightF(*PtP, eye[tMi]);
+    if (s >= 1) qsPdfRev  = dVertexPdfF(sc, cam, (t > 1) ? &eye[tMi] : nullptr, *PtP, *QsP);
+    if (s >= 2) qsMPdfRev = dVertexPdfF(sc, cam, PtP, *QsP, light[sMi]);
 
-    double sumRi = 0.0, ri = 1.0;
+    float sumRi = 0.f, ri = 1.f;
     for (int i = t - 1; i > 0; --i) {
-        double num = eye[i].pdfRev != 0.0 ? eye[i].pdfRev : 1.0;
-        double den = eye[i].pdfFwd != 0.0 ? eye[i].pdfFwd : 1.0;
-        ri *= num / den;
-        if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
+        float num, den; int dl;
+        if (i == ti)       { num = ptPdfRev;             den = (float)PtP->pdfFwd;   dl = 0; }
+        else if (i == tMi) { num = ptMPdfRev;            den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
+        else               { num = (float)eye[i].pdfRev; den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
+        ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
+        if (!dl && !eye[i - 1].delta) sumRi += ri;
     }
-    ri = 1.0;
+    ri = 1.f;
     for (int i = s - 1; i >= 0; --i) {
-        double num = light[i].pdfRev != 0.0 ? light[i].pdfRev : 1.0;
-        double den = light[i].pdfFwd != 0.0 ? light[i].pdfFwd : 1.0;
-        ri *= num / den;
+        float num, den; int dl;
+        if (i == si)       { num = qsPdfRev;               den = (float)QsP->pdfFwd;     dl = 0; }
+        else if (i == sMi) { num = qsMPdfRev;              den = (float)light[i].pdfFwd; dl = light[i].delta; }
+        else               { num = (float)light[i].pdfRev; den = (float)light[i].pdfFwd; dl = light[i].delta; }
+        ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
         bool deltaPrev = (i > 0) ? (light[i - 1].delta != 0) : false;
-        if (!light[i].delta && !deltaPrev) sumRi += ri;
+        if (!dl && !deltaPrev) sumRi += ri;
     }
-
-    if (hasQsM) light[sMi] = sQsM;
-    if (hasPtM) eye[tMi]   = sPtM;
-    if (hasQs)  light[si]  = sQs;
-    if (hasPt)  eye[ti]    = sPt;
-    return 1.0 / (1.0 + sumRi);
+    return 1.0 / (1.0 + (double)sumRi);
 }
 
 // Connect strategy (s,t); returns the MIS-weighted radiance. For t==1 the result is a
 // light-image splat to (outPx,outPy) with isSplat=1. Direct port of bdpt.h connectBDPT.
 __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
-                                      DVertex* light, DVertex* eye, int s, int t,
+                                      const DVertex* light, const DVertex* eye, int s, int t,
                                       Real lambda, double invPdfLambda, DRng& rng,
                                       int& outPx, int& outPy, int& isSplat) {
     isSplat = 0;
