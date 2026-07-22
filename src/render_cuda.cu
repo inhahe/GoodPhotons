@@ -2399,6 +2399,27 @@ __device__ static bool dTraceOutOfSphere(const D3& o, const D3& d, const DSphere
     return true;
 }
 
+// --- specular-sphere scan-angle tables (Opt 3) -------------------------------
+// Both sphere connectors scan the SAME SPH_SCAN_N+1 fixed entry angles on every
+// call, and each scan step used to pay a software-fp64 cos+sin pair — the
+// dominant transcendental cost of the glass-sphere splat on GPU. The angles
+// never change, so a one-time init kernel fills these tables with the SAME
+// device cos/sin the macros called (host-computed values could differ by 1 ulp),
+// making table reads bit-identical to the per-step evaluation they replace.
+// Bisection refinement still computes live cos/sin (midpoints are data-dependent).
+static constexpr int SPH_SCAN_N = 96;
+__device__ static double g_sphScanC[SPH_SCAN_N + 1];
+__device__ static double g_sphScanS[SPH_SCAN_N + 1];
+
+__global__ void kSphScanInit() {
+    int i = threadIdx.x;
+    if (i > SPH_SCAN_N) return;
+    const int NS = SPH_SCAN_N;
+    double phi = -DPI + (2.0 * DPI) * i / NS;
+    g_sphScanC[i] = cos(phi);
+    g_sphScanS[i] = sin(phi);
+}
+
 // Connect EXTERIOR vertex p to a pinhole INSIDE dielectric sphere S (single
 // refraction) — the path the camera sees flying THROUGH the glass. Port of
 // Renderer::connectSpecularSphereInside.
@@ -2421,9 +2442,10 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
 
     // In-plane once-refracted exit-ray miss of p. Encoded as a helper via lambda-free
     // repeated code (no std::function on device): returns miss, sets valid.
-    #define D_TRACE2D_INSIDE(PHI, MISS, VALID) do {                                   \
+    // Takes the entry angle as its (cos, sin) pair.
+    #define D_TRACE2D_INSIDE(C1, S1, MISS, VALID) do {                                \
         VALID = false; MISS = 0.0;                                                    \
-        double c1 = cos(PHI), s1 = sin(PHI);                                          \
+        double c1 = (C1), s1 = (S1);                                                  \
         double P1x = r * c1, P1y = r * s1;                                            \
         double dinx = P1x - ex_e, diny = P1y - ey_e;                                  \
         double dl = sqrt(dinx*dinx + diny*diny);                                      \
@@ -2448,15 +2470,15 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         }                                                                            \
     } while (0)
 
-    const int NS = 96; double roots[4]; int nroot = 0;
+    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
     double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
     for (int i = 0; i <= NS && nroot < 4; ++i) {
         double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_INSIDE(phi, mss, v);
+        bool v; double mss; D_TRACE2D_INSIDE(g_sphScanC[i], g_sphScanS[i], mss, v);
         if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
             double a = prevPhi, b = phi, fa = prevMiss;
             for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_INSIDE(mid, fm, vm);
+                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_INSIDE(cos(mid), sin(mid), fm, vm);
                 if (!vm) break;
                 if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
             }
@@ -2545,9 +2567,10 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     double ex_e = dEyeO;
     double px2 = d3dot(ap, ex), py2 = d3dot(ap, ey);
 
-    #define D_TRACE2D_THRU(PHI, MISS, VALID) do {                                    \
+    // Takes the entry angle as its (cos, sin) pair.
+    #define D_TRACE2D_THRU(C1, S1, MISS, VALID) do {                                 \
         VALID = false; MISS = 0.0;                                                   \
-        double c1 = cos(PHI), s1 = sin(PHI);                                         \
+        double c1 = (C1), s1 = (S1);                                                 \
         double P1x = r * c1, P1y = r * s1;                                           \
         double dinx = P1x - ex_e, diny = P1y;                                        \
         double dl = sqrt(dinx*dinx + diny*diny);                                     \
@@ -2587,15 +2610,15 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         }                                                                           \
     } while (0)
 
-    const int NS = 96; double roots[4]; int nroot = 0;
+    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
     double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
     for (int i = 0; i <= NS && nroot < 4; ++i) {
         double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_THRU(phi, mss, v);
+        bool v; double mss; D_TRACE2D_THRU(g_sphScanC[i], g_sphScanS[i], mss, v);
         if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
             double a = prevPhi, b = phi, fa = prevMiss;
             for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_THRU(mid, fm, vm);
+                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_THRU(cos(mid), sin(mid), fm, vm);
                 if (!vm) break;
                 if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
             }
@@ -5985,6 +6008,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
+
+    // One-time fill of the specular-sphere scan-angle cos/sin tables (device-computed
+    // so table entries are bit-identical to the per-step evaluation they replace).
+    kSphScanInit<<<1, SPH_SCAN_N + 1>>>();
+    cudaCheckKernel("sphScanInit");
 }
 
 // Bake one Camera into a POD DCamera for the given film resolution. Any device memory
