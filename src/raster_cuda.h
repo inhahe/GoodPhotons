@@ -60,9 +60,10 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                  bool seeThrough = false, double glassClarity = 0.85);
 
 // Optional per-pass profiling (used by -raster-bench). While enabled, renderFrame
-// accumulates each pass's milliseconds (device passes are bracketed by the per-pass
-// syncs, so host wall time is the pass time) into an internal tally. Zero overhead
-// when disabled. profTake() returns the tally accumulated since the last take and
+// records CUDA events into the stream between passes and accumulates each pass's
+// GPU-timeline milliseconds into an internal tally (resolved once per frame after
+// the final image download; the frame itself stays sync-free). Zero overhead when
+// disabled. profTake() returns the tally accumulated since the last take and
 // resets it; frames==0 means no GPU frames ran while enabled.
 struct Prof {
     double clearvis_ms = 0;   // vis-buffer clear (cudaMemset)

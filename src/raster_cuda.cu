@@ -79,6 +79,12 @@
   #define cudaGetLastError        hipGetLastError
   #define cudaDeviceSynchronize   hipDeviceSynchronize
   #define cudaGetErrorString      hipGetErrorString
+  #define cudaEvent_t             hipEvent_t
+  #define cudaEventCreate         hipEventCreate
+  #define cudaEventRecord         hipEventRecord
+  #define cudaEventSynchronize    hipEventSynchronize
+  #define cudaEventElapsedTime    hipEventElapsedTime
+  #define cudaEventDestroy        hipEventDestroy
 #else
   #include <cuda_runtime.h>
 #endif
@@ -88,7 +94,6 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
-#include <chrono>
 
 #include "raster_cuda.h"
 #include "camera.h"    // Camera, CAM_RECTILINEAR
@@ -846,6 +851,9 @@ struct Scene {
     unsigned char* dlut   = nullptr;   // raster::srgbLut8() bytes (4097)
     unsigned char* dimg   = nullptr;   // final W*H*3 RGB8 (device, pixCap-sized)
     unsigned char* h_img  = nullptr;   // pinned download staging for dimg
+    // Per-pass profiling events (stream marks; see renderFrame). [0]=frame start,
+    // then after: clearvis, project, raster, shade, clear, tonemap, download.
+    cudaEvent_t ev[8] = {};
 };
 
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
@@ -889,6 +897,8 @@ void destroy(Scene* sc) {
     if (sc->dimg)   cudaFree(sc->dimg);
     if (sc->h_hist) cudaFreeHost(sc->h_hist);
     if (sc->h_img)  cudaFreeHost(sc->h_img);
+    for (int i = 0; i < 8; ++i)
+        if (sc->ev[i]) cudaEventDestroy(sc->ev[i]);
     delete sc;
 }
 
@@ -962,6 +972,8 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
            && tryMalloc((void**)&sc->dhist, 65536 * sizeof(unsigned int))
            && tryMalloc((void**)&sc->dlut,  raster::srgbLut8().size())
            && tryMallocHost((void**)&sc->h_hist, 65536 * sizeof(unsigned int));
+    for (int i = 0; ok && i < 8; ++i)
+        ok = (cudaEventCreate(&sc->ev[i]) == cudaSuccess);
     if (ok && !hl.empty())
         ok = tryMalloc((void**)&sc->dlights, sizeof(DLight) * hl.size());
     if (ok && !htexMeta.empty())
@@ -1013,24 +1025,20 @@ static bool ensurePix(Scene* sc, size_t N) {
     return true;
 }
 
-static bool sync() {
-    cudaError_t e = cudaGetLastError();
-    if (e == cudaSuccess) e = cudaDeviceSynchronize();
-    return e == cudaSuccess;
-}
-
-// --- optional per-pass profiling (see raster_cuda.h). The per-pass syncs in
-// renderFrame bracket each device pass, so plain host wall clocks are exact.
+// --- optional per-pass profiling (see raster_cuda.h). Passes are timed with CUDA
+// events recorded into the stream between passes: the GPU timestamps each mark as it
+// reaches it, so the windows have exactly the same composition as the old synced wall
+// clocks (any host-readback bubbles inside a pass are included) WITHOUT renderFrame
+// having to synchronize after every pass. The frame runs sync-free except for its real
+// data dependencies (bin-count readback, histogram readbacks, final image download);
+// event pairs are resolved once per frame after that download has fenced everything.
 static bool g_prof = false;
 static Prof g_profAcc;
 void profEnable(bool on) { g_prof = on; }
 Prof profTake() { Prof p = g_profAcc; g_profAcc = Prof(); return p; }
-using ProfClock = std::chrono::steady_clock;
-static inline ProfClock::time_point ptick() {
-    return g_prof ? ProfClock::now() : ProfClock::time_point{};
-}
-static inline void padd(double& acc, ProfClock::time_point t0) {
-    if (g_prof) acc += std::chrono::duration<double, std::milli>(ProfClock::now() - t0).count();
+static inline void paddEv(double& acc, cudaEvent_t a, cudaEvent_t b) {
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, a, b) == cudaSuccess) acc += ms;
 }
 
 std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
@@ -1056,24 +1064,24 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     const double kRimStrength    = 0.55;
     const Vec3   kMilkColor{0.52, 0.55, 0.60};
 
-    auto tp = ptick();
+    // Per-pass stream marks (no-ops unless profiling; resolved after the download).
+    auto rec = [&](int i) { if (g_prof) cudaEventRecord(sc->ev[i], 0); };
+
+    rec(0);
     if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return empty;
-    padd(g_profAcc.clearvis_ms, tp);
+    rec(1);
 
     int TPB = 256;
     int gTris  = (sc->nTris + TPB - 1) / TPB;
     int gSlots = (2 * sc->nTris + TPB - 1) / TPB;
     int gPix   = (int)((N + TPB - 1) / TPB);
 
-    tp = ptick();
     kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dgeos, sc->dattrs, sc->dflags);
-    if (!sync()) return empty;
-    padd(g_profAcc.project_ms, tp);
+    rec(2);
     // Bin the slots by bbox size, then rasterize each bin at a matching parallel width
     // (thread / warp / block per sub-triangle). Every (slot,row) runs the exact row maths
     // of the old single kernel and atomicMax merges order-independently, so the result is
     // bit-identical while a screen-filling quad no longer serializes on one thread.
-    tp = ptick();
     if (cudaMemset(sc->dbinCnt, 0, 3 * sizeof(int)) != cudaSuccess) return empty;
     kClassify<<<gSlots, TPB>>>(sc->dgeos, sc->dflags, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
                                sc->dbinSmall, sc->dbinMed, sc->dbinLarge, sc->dbinCnt);
@@ -1088,31 +1096,26 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     if (hcnt[2] > 0)
         kRasterLarge<<<hcnt[2], TPB>>>(sc->dgeos, sc->dflags, sc->dbinLarge, hcnt[2],
                                        W, H, seeThrough ? 1 : 0, sc->vis);
-    if (!sync()) return empty;
-    padd(g_profAcc.raster_ms, tp);
-    tp = ptick();
+    rec(3);
     kShade<<<gPix, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, sc->vis,
                           sc->dlights, sc->nLights,
                           sc->ambient, sc->keyScale, sc->fill, dc, W, H, bg, EMIS_BOOST,
                           sc->dtexMeta, sc->dtexels, sc->nTex,
                           sc->accum, sc->zbuf, sc->emis);
-    if (!sync()) return empty;
-    padd(g_profAcc.shade_ms, tp);
+    rec(4);
 
     // See-through clear pass: reset clearT/milkT to 1 and accumulate each clear surface's
     // transmittance/haze against the now-complete opaque depth (sc->zbuf, written by kShade).
     if (seeThrough) {
-        tp = ptick();
         kFillF<<<gPix, TPB>>>(sc->clearT, 1.0f, N);
         kFillF<<<gPix, TPB>>>(sc->milkT,  1.0f, N);
-        if (!sync()) return empty;
+        // Stream order already runs kClear after both fills complete.
         kClear<<<gSlots, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, 2 * sc->nTris,
                                 sc->zbuf, dc, W, H,
                                 (float)glassClarity, (float)kMilkPerSurface, (float)kRimStrength,
                                 sc->clearT, sc->milkT);
-        if (!sync()) return empty;
-        padd(g_profAcc.clear_ms, tp);
     }
+    rec(5);   // recorded either way; the clear window is simply ~0 when see-through is off
 
     // Pass D: exposure + tonemap on the DEVICE (twin of raster::exposeAndEncodeT — see
     // the kernels above). The p99 auto-exposure anchor needs the exact k-th smallest
@@ -1121,7 +1124,6 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // that exact value with no sort and only a 256KB readback per round. eAuto / the
     // lockAnchor handshake stay on the host, mirroring the host tail line for line.
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
-    tp = ptick();
     double eAuto = 1.0;
     if (autoExpose) {
         if (lockAnchor && *lockAnchor > 0.0) {
@@ -1163,14 +1165,27 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
                             sc->clearT, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
                             sc->dlut, sc->dimg);
-    if (!sync()) return empty;
-    padd(g_profAcc.expose_ms, tp);
+    rec(6);
 
-    // Download ONLY the finished RGB8 frame through the pinned staging buffer.
-    tp = ptick();
+    // Download ONLY the finished RGB8 frame through the pinned staging buffer. This
+    // blocking copy fences every pass enqueued above; a poisoned context surfaces in
+    // its return code (or the earlier readbacks'), and the sticky-error sweep below
+    // catches kernel-launch failures that never poisoned a blocking call.
     if (cudaMemcpy(sc->h_img, sc->dimg, N * 3, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    padd(g_profAcc.download_ms, tp);
-    if (g_prof) ++g_profAcc.frames;
+    rec(7);
+    if (cudaGetLastError() != cudaSuccess) return empty;
+    if (g_prof) {
+        if (cudaEventSynchronize(sc->ev[7]) == cudaSuccess) {
+            paddEv(g_profAcc.clearvis_ms, sc->ev[0], sc->ev[1]);
+            paddEv(g_profAcc.project_ms,  sc->ev[1], sc->ev[2]);
+            paddEv(g_profAcc.raster_ms,   sc->ev[2], sc->ev[3]);
+            paddEv(g_profAcc.shade_ms,    sc->ev[3], sc->ev[4]);
+            paddEv(g_profAcc.clear_ms,    sc->ev[4], sc->ev[5]);
+            paddEv(g_profAcc.expose_ms,   sc->ev[5], sc->ev[6]);
+            paddEv(g_profAcc.download_ms, sc->ev[6], sc->ev[7]);
+        }
+        ++g_profAcc.frames;
+    }
     return std::vector<uint8_t>(sc->h_img, sc->h_img + N * 3);
 }
 
