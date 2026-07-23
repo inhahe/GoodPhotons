@@ -659,10 +659,11 @@ stay non-resumable.
   and backward tracers. GPU **BDPT** (mode `D`) now threads the **per-hit surface point**
   (texcoords stored on each path vertex, reconstructed into a `Hit` for the connection
   BSDF) so textured/patterned/record-driven diffuse albedo & glossy reflect, per-hit
-  glossy roughness + thin-film maps, mix blend masks, and Beer–Lambert **colored-glass**
-  interior absorption all render **on-device** with MIS-consistent densities; it still
-  falls back only for **frosted (rough) glass**, **fluorescence**, **diffuse-transmit**,
-  and **spot/env** emitters (no device strategy yet). **Parametric records** (a
+  glossy roughness + thin-film maps, mix blend masks, Beer–Lambert **colored-glass**
+  interior absorption, and **diffuse-transmit** (two-sided Lambertian — both lobes +
+  back-hemisphere connections) all render **on-device** with MIS-consistent densities; it
+  still falls back only for **frosted (rough) glass**, **fluorescence**, and **spot/env**
+  emitters (no device strategy yet). **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
   reflect/albedo and roughness slots** (constant stop selectors bake into the device
@@ -795,7 +796,7 @@ Declared with `material "name" { type <type> … }`.
 | Type | Description | Key parameters |
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
-| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). CPU only. Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
+| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). Both lobes and the back-hemisphere connections run **on the GPU in mode D** (BDPT, M9). Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
 | `dielectric` | Refractive glass with dispersion, optional **frosting**, **colored-glass tint** and **nested-dielectric priority** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption; `priority <N>` (integer) disambiguates overlapping dielectrics — see below |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
@@ -841,7 +842,8 @@ two physically-motivated translucency controls (both compose with dispersion):
   spectrum (e.g. `absorb gaussian center=470 sigma=60 amp=14` for amber). Interior
   absorption is threaded through all three CPU transport loops (forward, backward,
   BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
-  frosting and colored-glass tint; mode-`D` BDPT still falls back to the CPU.)*
+  frosting and colored-glass tint; mode-`D` BDPT now runs colored glass on-device too
+  (M9), and only **frosted (rough)** glass still falls back to the CPU there.)*
 
 **Nested dielectrics (`priority`).** When two glass/liquid solids overlap — a glass
 ice cube in a whisky, a lens cemented to another, a coating flush against a body — the

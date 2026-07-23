@@ -1745,16 +1745,20 @@ mark the corresponding row in `gpu-fallbacks.md`.
       on the GPU. Validated GPU==CPU on `scenes/cornell.ftsl` (glass sphere + diffuse walls, `-pmfg 16/24`): mean
       linear radiance 0.43%, background 0.98%, per-pixel diff √-scales 22%→11.5% at 4× spp (independent-MC noise,
       not bias). Falls back to CPU for lens cameras / unsupported scenes exactly as the direct gather does.
-- [~] **M9. Per-hit BSDFs in GPU BDPT (mode D).** FIRST INCREMENT DONE 2026-07-23. `DVertex` now stores the
+- [~] **M9. Per-hit BSDFs in GPU BDPT (mode D).** TWO INCREMENTS DONE 2026-07-23. (1) `DVertex` now stores the
       per-hit texcoords (`u,v`) and `dVertHit` reconstructs a `DHit`, so the connection BSDF (`dBsdfF`/`dBsdfPdf`)
       and the random walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the
       pdf/eval — MIS-safe. Ported: textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy
       roughness + thin-film thickness maps, mix blend masks, and Beer-Lambert colored-glass interior absorption
-      (delta vertex → throughput only, mirrors bdpt.h). `cudaBdptSupported` relaxed (frosted/fluoro/diffuse-
-      transmit/spot/env still reject). Validated GPU==CPU on `textured.ftsl` (mean 0.06%, background 0.00%,
-      per-pixel diff halves 8.2%→4.3% at 4× spp = unbiased) and `mixmat.ftsl` (mean 0.21%, background 0.12%).
-      REMAINING (deferred): diffuse-transmit two-lobe connection, frosted (rough) dielectric microfacet BSDF,
-      fluorescence re-emission vertex, and spot/env light-subpath strategies.
+      (delta vertex → throughput only, mirrors bdpt.h). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
+      per-pixel diff halves 8.2%→4.3% at 4× spp = unbiased) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided
+      **diffuse-transmit** (translucent) now on-device — both lobes (front `reflect` / back `transmit`,
+      energy-clamped) + the two-sided back-hemisphere connection strategy; `lambda` threaded through
+      `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf; `dConnectBDPT`
+      two-sided guards mirror bdpt.h. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp,
+      per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). `cudaBdptSupported` relaxed accordingly.
+      REMAINING (deferred): frosted (rough) dielectric microfacet BSDF, fluorescence re-emission vertex, and
+      spot/env light-subpath strategies.
 - [ ] **M10. Spectral rainbow-phase media on device.** `cudaForwardSupported`/`cudaBackwardSupported`/
       `cudaBdptSupported` all reject rainbow media (device only knows analytic HG). Upload the λ×µ CDF
       (`rainbow.h`) + per-λ importance sampling into the device volume path. Relax the rainbow rejects across

@@ -4428,7 +4428,7 @@ __device__ static inline bool dOnSurface(const DVertex& v) {
     return v.type == BV_SURFACE || v.type == BV_LIGHT;
 }
 __device__ static inline bool dConnectibleType(int tp) {
-    return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT;
+    return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT;
 }
 __device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
     if (v.type == BV_CAMERA) return true;
@@ -4460,6 +4460,21 @@ __device__ static inline double dGlossyExp(double roughness) {
     double e = 2.0 / (rr * rr) - 2.0;
     return e < 0 ? 0 : e;
 }
+// A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
+// connection edge on the side opposite the shading normal is legal (transmit lobe). Only
+// DiffuseTransmit qualifies (device twin of bdpt.h isTwoSidedMat).
+__device__ static inline bool dTwoSidedType(int tp) { return tp == D_DIFFUSETRANSMIT; }
+// Clamped reflect/transmit albedos of a DiffuseTransmit vertex (energy guard shared by
+// dBsdfF / dBsdfPdf / the scatter switch so MIS densities stay consistent; twin of
+// bdpt.h diffuseTransmitAlbedos). rhoR is the per-hit front lobe (texture-aware).
+__device__ static inline void dDiffuseTransmitAlbedos(const DScene& sc, const DMaterial& m,
+                                                      const DHit& h, Real lambda,
+                                                      double& rhoR, double& rhoT) {
+    rhoR = clamp01(dDiffuseRho(sc, m, h, lambda));
+    rhoT = clamp01(specLookup(m.transmit, lambda));
+    double sum = rhoR + rhoT;
+    if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
+}
 
 // BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L).
 // Takes the full DVertex so textured/patterned/record-driven albedo & roughness are
@@ -4485,6 +4500,12 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         if (cosLobe <= 0) return 0.0;
         double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
         return r * lobe / cosWi;
+    } else if (m.type == D_DIFFUSETRANSMIT) {
+        // Two-sided Lambertian: same-hemisphere pair -> reflect albedo, opposite -> transmit.
+        DHit h = dVertHit(vt);
+        double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+        bool sameSide = (cosWi * cosWo) > 0.0;
+        return (sameSide ? rhoR : rhoT) / DPI;
     }
     return 0.0;
 }
@@ -4492,7 +4513,7 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
 // Per-hit roughness (glossy) is read from the vertex's texcoords so the density matches
 // the sampling that used the same textured/patterned roughness (M9).
 __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
-                                  const DVec3& wo, const DVec3& wi) {
+                                  const DVec3& wo, const DVec3& wi, Real lambda) {
     const DMaterial& m = sc.mats[vt.matId];
     const DVec3& ns = vt.ns;
     double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
@@ -4507,6 +4528,17 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
         return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+    } else if (m.type == D_DIFFUSETRANSMIT) {
+        // The reflect lobe is chosen with prob rhoR/(rhoR+rhoT) and cosine-samples wo's
+        // hemisphere; the transmit lobe (prob rhoT/(rhoR+rhoT)) cosine-samples the opposite
+        // hemisphere. For a given wi only one lobe applies (by its sign vs wo).
+        DHit h = dVertHit(vt);
+        double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+        double tot = rhoR + rhoT;
+        if (tot <= 0.0) return 0.0;
+        bool sameSide = (cosWi * cosWo) > 0.0;
+        double pSel = sameSide ? rhoR / tot : rhoT / tot;
+        return pSel * fabs(cosWi) / DPI;
     }
     return 0.0;
 }
@@ -4555,7 +4587,8 @@ __device__ static float dVertexPdfLightF(const DVertex& cur, const DVertex& next
     return pdf;
 }
 __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
-                                    const DVertex* prev, const DVertex& cur, const DVertex& next) {
+                                    const DVertex* prev, const DVertex& cur, const DVertex& next,
+                                    Real lambda) {
     if (cur.type == BV_LIGHT) return dVertexPdfLightF(cur, next);
     DVec3 wn = next.p - cur.p;
     if (dot(wn, wn) == 0.f) return 0.f;
@@ -4578,7 +4611,7 @@ __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
         DVec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = (float)dBsdfPdf(sc, cur, wp, wn);
+        pdfW = (float)dBsdfPdf(sc, cur, wp, wn, lambda);
     }
     // dConvertDensity in FP32: solid angle -> area density at `next`.
     DVec3 wv = next.p - cur.p;
@@ -5722,8 +5755,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 wi = cosineHemisphere(path[cur].ns, rng);
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));   // per-hit (tex/pat/record)
-                pdfW = dBsdfPdf(sc, path[cur], wo, wi);
-                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo);
+                pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
+                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = rho;
                 if (rho <= 0) terminate = true;
                 break;
@@ -5733,10 +5766,28 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng);   // per-hit roughness
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double r = clamp01(dReflectSlot(sc, *mp, h, lambda));      // per-hit reflect
-                pdfW = dBsdfPdf(sc, path[cur], wo, wi);
-                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo);
+                pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
+                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
                 if (r <= 0 || pdfW <= 0) terminate = true;
+                break;
+            }
+            case D_DIFFUSETRANSMIT: {
+                // Two-lobe Lambertian: pick reflect (+ns) with prob rhoR/(rhoR+rhoT) or
+                // transmit (-ns) with prob rhoT/(rhoR+rhoT); cosine-sample the chosen
+                // hemisphere. Analog: on a scatter beta is unchanged (f*|cos|/pdf == 1 with
+                // the lobe-selection pdf), like the diffuse case. Device twin of render.h.
+                double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, *mp, h, lambda, rhoR, rhoT);
+                double tot = rhoR + rhoT;
+                if (tot <= 0) { terminate = true; break; }
+                DVec3 nb = path[cur].ns * (Real)(-1);
+                if (rng.uniform() < rhoR / tot) wi = cosineHemisphere(path[cur].ns, rng);
+                else                            wi = cosineHemisphere(nb, rng);
+                pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
+                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
+                if (pdfW <= 0) { terminate = true; break; }
+                // f*|cos|/pdf = rho_lobe/PI * |cos| / (pSel*|cos|/PI) = rho_lobe/pSel = tot.
+                betaFactor = tot;
                 break;
             }
             case D_MIRROR: {
@@ -5891,7 +5942,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // them at the end (whole-vertex restore subsumes PBRT's field-wise ScopedAssignments).
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                     const DVertex* light, const DVertex* eye,
-                                    const DVertex& sampled, int s, int t) {
+                                    const DVertex& sampled, int s, int t, Real lambda) {
     if (s + t == 2) return 1.0;
     const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
 
@@ -5909,13 +5960,13 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     // too, wrote them into the arrays, and restored over them unread).
     float ptPdfRev = 0.f, ptMPdfRev = 0.f, qsPdfRev = 0.f, qsMPdfRev = 0.f;
     if (t >= 2)
-        ptPdfRev = (s > 0) ? dVertexPdfF(sc, cam, (s > 1) ? &light[sMi] : nullptr, *QsP, *PtP)
+        ptPdfRev = (s > 0) ? dVertexPdfF(sc, cam, (s > 1) ? &light[sMi] : nullptr, *QsP, *PtP, lambda)
                            : dVertexPdfLightOriginF(sc, *PtP);
     if (t >= 3)
-        ptMPdfRev = (s > 0) ? dVertexPdfF(sc, cam, QsP, *PtP, eye[tMi])
+        ptMPdfRev = (s > 0) ? dVertexPdfF(sc, cam, QsP, *PtP, eye[tMi], lambda)
                             : dVertexPdfLightF(*PtP, eye[tMi]);
-    if (s >= 1) qsPdfRev  = dVertexPdfF(sc, cam, (t > 1) ? &eye[tMi] : nullptr, *PtP, *QsP);
-    if (s >= 2) qsMPdfRev = dVertexPdfF(sc, cam, PtP, *QsP, light[sMi]);
+    if (s >= 1) qsPdfRev  = dVertexPdfF(sc, cam, (t > 1) ? &eye[tMi] : nullptr, *PtP, *QsP, lambda);
+    if (s >= 2) qsMPdfRev = dVertexPdfF(sc, cam, PtP, *QsP, light[sMi], lambda);
 
     float sumRi = 0.f, ri = 1.f;
     for (int i = t - 1; i > 0; --i) {
@@ -5982,17 +6033,22 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             cosSurf = 1.0; f = dMediumScatterF(sc, qs, wo, wcam, lambda); o = qs.p;
         } else {
             cosSurf = ddot(qs.ns, wcam);
-            if (cosSurf <= 0.0) return 0.0;
+            // Reflect-only vertices require the +ns side; a two-sided (DiffuseTransmit)
+            // vertex may connect on either side (transmit lobe), so gate on dBsdfF and use
+            // |cosSurf| in G (mirrors CPU bdpt.h connectBDPT).
+            bool twoSided = dTwoSidedType(sc.mats[qs.matId].type);
+            if (cosSurf == 0.0 || (!twoSided && cosSurf < 0.0)) return 0.0;
             // Geometric-hemisphere softening (matches CPU bdpt.h): the camera must lie on the
             // geometric front side too, else a smoothed shading normal leaks light through the
             // back face; ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng
-            // (stG==1). GPU BDPT is reflect-only (v1), so unconditional.
+            // (stG==1); skipped for two-sided (transmissive) materials.
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
-            double stG = (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
+            double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
             if (stG <= 0.0) return 0.0;
             f = dBsdfF(sc, qs, wo, wcam, lambda);
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
+            // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
             f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
             double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
             o = qs.p + qs.ng * (Real)(sgn * 1e-6);
@@ -6001,7 +6057,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (occluded(sc, o, wcam, (Real)(dist - 2e-6))) return 0.0;
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
-        double G = cosSurf * cosCam / dist2;
+        double G = fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * dCameraWe(cam, cosCam) * Tr;
         if (L <= 0.0) return 0.0;
         sampled.type = BV_CAMERA; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
@@ -6028,12 +6084,19 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             cosSurf = 1.0; f = dMediumScatterF(sc, pt, wo, wi, lambda); o = pt.p;
         } else {
             cosSurf = ddot(pt.ns, wi);
-            if (cosSurf <= 0.0) return 0.0;
+            // Two-sided eye vertex may connect to the light through its transmit lobe (back
+            // hemisphere); gate on dBsdfF, use |cosSurf| in G (mirrors CPU bdpt.h).
+            bool twoSided = dTwoSidedType(sc.mats[pt.matId].type);
+            if (cosSurf == 0.0 || (!twoSided && cosSurf < 0.0)) return 0.0;
             // Geometric-hemisphere softening on the eye/radiance vertex (matches CPU bdpt.h):
-            // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
-            DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
-            double stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
-            if (stG <= 0.0) return 0.0;
+            // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1);
+            // skipped for two-sided (transmissive) materials.
+            double stG = 1.0;
+            if (!twoSided) {
+                DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+                stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
+                if (stG <= 0.0) return 0.0;
+            }
             f = dBsdfF(sc, pt, wo, wi, lambda) * stG;
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
@@ -6044,7 +6107,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         double pdfA = pdfChoice / em.area;
         if (pdfA <= 0.0) return 0.0;
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
-        double G = cosSurf * cosLight / dist2;
+        double G = fabs(cosSurf) * cosLight / dist2;
         L = pt.beta * f * Le * G / pdfA * Tr;
         if (L <= 0.0) return 0.0;
         sampled.type = BV_LIGHT; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
@@ -6064,12 +6127,19 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             cosE = 1.0; fE = dMediumScatterF(sc, pt, woE, w, lambda); o = pt.p;
         } else {
             cosE = ddot(pt.ns, w);
-            if (cosE <= 0.0) return 0.0;
+            // Two-sided eye endpoint may connect on its back hemisphere (transmit lobe);
+            // gate on dBsdfF, use |cosE| in G (mirrors CPU bdpt.h).
+            bool twoSidedE = dTwoSidedType(sc.mats[pt.matId].type);
+            if (cosE == 0.0 || (!twoSidedE && cosE < 0.0)) return 0.0;
             // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
-            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
-            DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
-            double stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
-            if (stGE <= 0.0) return 0.0;
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1);
+            // skipped for two-sided (transmissive) materials.
+            double stGE = 1.0;
+            if (!twoSidedE) {
+                DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+                stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
+                if (stGE <= 0.0) return 0.0;
+            }
             fE = dBsdfF(sc, pt, woE, w, lambda) * stGE;
             double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
@@ -6078,25 +6148,32 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             cosL = 1.0; fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
         } else {
             cosL = ddot(qs.ns, w * (Real)-1);
-            if (cosL <= 0.0) return 0.0;
+            // Two-sided light endpoint may connect on its back hemisphere (transmit lobe).
+            bool twoSidedL = dTwoSidedType(sc.mats[qs.matId].type);
+            if (cosL == 0.0 || (!twoSidedL && cosL < 0.0)) return 0.0;
             // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
-            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
+            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1);
+            // skipped for two-sided (transmissive) materials.
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
-            double stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
-            if (stGL <= 0.0) return 0.0;
+            double stGL = 1.0;
+            if (!twoSidedL) {
+                stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
+                if (stGL <= 0.0) return 0.0;
+            }
             fL = dBsdfF(sc, qs, woL, w * (Real)-1, lambda) * stGL;
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
+            // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
             fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
         if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, w, (Real)dist, lambda, rng) : 1.0;
-        double G = cosE * cosL / dist2;
+        double G = fabs(cosE) * fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr;
     }
     if (L <= 0.0) return 0.0;
-    return L * dMisWeight(sc, cam, light, eye, sampled, s, t);
+    return L * dMisWeight(sc, cam, light, eye, sampled, s, t, lambda);
 }
 
 // BDPT megakernel: one thread renders one (pixel,sample), grid-stride over all
@@ -7811,21 +7888,20 @@ bool cudaBdptSupported(const Scene& scene) {
         if (m.type != MatType::Dielectric) return false;
         return (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0);
     };
-    // Fluorescence (re-emission vertex) and diffuse-transmission (two-sided/back-lobe)
-    // still have no GPU BDPT vertex strategy — fall back to the CPU BDPT (bdpt.h) which
-    // handles both (isConnectibleMat + isTwoSidedMat + fluorescent strategy).
+    // Diffuse-transmission (two-sided Lambertian) is now on-device (M9): dRandomWalk samples
+    // the two lobes, dBsdfF/dBsdfPdf evaluate them, and dConnectBDPT allows back-hemisphere
+    // connections (|cos| G, shadow-terminator skip). Fluorescence (re-emission vertex) still
+    // has no GPU BDPT strategy — fall back to the CPU BDPT (bdpt.h) for it and frosted glass.
     auto unsupportedMat = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
         const Material& m = scene.mats[matId];
         if (frostedGlass(m)) return true;
         if (m.type == MatType::Fluorescent) return true;
-        if (m.type == MatType::DiffuseTransmit) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
                     (frostedGlass(scene.mats[c]) ||
-                     scene.mats[c].type == MatType::Fluorescent ||
-                     scene.mats[c].type == MatType::DiffuseTransmit))
+                     scene.mats[c].type == MatType::Fluorescent))
                     return true;
         return false;
     };

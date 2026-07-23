@@ -137,10 +137,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   roughness feeds the same `dMatRoughness` into sampler and pdf). On-device now: textured/
   patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps,
   mix blend masks, and Beer–Lambert **colored-glass** interior absorption (delta vertex →
-  throughput only, mirroring `bdpt.h`'s `curAbsorb`). `cudaBdptSupported` relaxed to reject only
-  **frosted (rough) glass**, **fluorescence**, **diffuse-transmit**, and spot/env emitters (no
-  device strategy yet). Validated GPU==CPU on `textured.ftsl` (mean 0.06%, background 0.00%,
-  per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased) and `mixmat.ftsl` (mean 0.21%). Since
+  throughput only, mirroring `bdpt.h`'s `curAbsorb`). Since 0.35.0 two-sided **diffuse-transmit**
+  (translucent) also renders on-device — both lobes (front-hemisphere `reflect`, back-hemisphere
+  `transmit`, energy-clamped) plus the two-sided back-hemisphere connection (allow back hemisphere,
+  skip the shadow-terminator softening, `|cos|` in G); `lambda` is threaded through
+  `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` because the lobe-selection pdf is wavelength-dependent.
+  `cudaBdptSupported` relaxed to reject only **frosted (rough) glass**, **fluorescence**, and
+  spot/env emitters (no device strategy yet). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
+  per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%), and
+  `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halving 8.42%→4.39% at 4× spp). Since
   0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
