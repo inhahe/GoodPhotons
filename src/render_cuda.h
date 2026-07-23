@@ -244,6 +244,35 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
                            const SppProgress* prog = nullptr,
                            int maxBounce = 32, bool directOnly = false);
 
+// ---- Resident fast-RGB backward PREVIEW session (interactive -explore) ----------------
+// The batch renderBackwardRGBCuda re-uploads the whole scene, re-bakes the camera, allocs
+// films, launches, downloads and frees on every call — fine for one shot, wasteful when an
+// interactive viewer wants to progressively converge a still while the camera holds, then
+// re-aim and start over on the next move. A session makes the scene bake RESIDENT: begin()
+// uploads the (already ignore-flag-stripped) scene and allocs a persistent SUM film ONCE;
+// setCamera() re-bakes just the pinhole camera (cheap POD) and zeroes the film to start a
+// fresh accumulation; accumulate() launches kBackwardRGB adding `spp` more samples into the
+// resident film (running total, distinct RNG streams per batch); download() fetches the
+// running SUM (the caller divides by samples() and tone-maps via filmToRgb8, exactly as the
+// batch path does); end() frees. Scene-ignore flags need no special handling — they mutate
+// the Scene host-side before begin(), so the baked device scene already reflects them.
+struct BackwardRGBSession;   // opaque; lives in render_cuda.cu
+// Returns nullptr if CUDA is unavailable. `maxBounce` (<1 => device default 32) and
+// `directOnly` are the Stage-3 knobs, baked into the resident DScene. The scene must pass
+// cudaBackwardRGBSupported() for the chosen camera(s); callers gate on that first.
+BackwardRGBSession* backwardRGBSessionBegin(const Scene& scene, int resX, int resY,
+                                            int maxBounce = 32, bool directOnly = false);
+// Re-aim: bake `cam` into the resident scene and reset the accumulation (samples()->0).
+void backwardRGBSessionSetCamera(BackwardRGBSession* s, const Camera& cam);
+// Trace `spp` more samples-per-pixel into the resident SUM film; returns the new running
+// total spp. `diffraction` matches the batch path's flag (unused by the RGB walk today).
+long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, bool diffraction);
+// Download the running SUM film (xyz + hits) into `out` (already alloc'd at resX*resY).
+void backwardRGBSessionDownload(BackwardRGBSession* s, Film& out);
+// Samples-per-pixel accumulated since the last setCamera() (0 right after a re-aim).
+long long backwardRGBSessionSamples(const BackwardRGBSession* s);
+void backwardRGBSessionEnd(BackwardRGBSession* s);
+
 // True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
 // (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),
 // and a non-physical camera (dGenRay handles pinhole + fisheye/panoramic; a mesh-lens

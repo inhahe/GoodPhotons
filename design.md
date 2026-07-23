@@ -127,6 +127,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   wrappers. `directOnly` (terminate after the first non-specular NEE, specular chains
   still recurse) is scoped to the camera path tracers (R spectral + RGB, P's backward
   layer); forward B and the photon/BDPT modes honour only `maxBounce`.
+  Since 0.29.0 the interactive `-explore` fly-viewer can toggle (key **`T`**) a live
+  **path-traced preview** using the fast RGB backward tracer instead of the flat raster:
+  a resident `BackwardRGBSession` (render_cuda.cu) bakes/uploads the scene ONCE
+  (`buildUploadScene`) and keeps a persistent SUM film; while the camera holds still the
+  main loop calls `backwardRGBSessionAccumulate(batch)` each idle tick (advancing the RNG
+  `sampleBase`, fixed large `kSppCap` so streams stay unique) and presents the converging
+  image via the shared `filmToRgb8` (auto-exposure anchor locked per pose); a camera move
+  shows the responsive raster and marks the session for a `setCamera()` re-aim (which
+  re-bakes only the cheap POD `bakeCamera` and zeroes the film). Availability mirrors the
+  batch `-rgb` scope (`cudaBackwardRGBSupported`); the scene-ignore flags carry in for free
+  (scene already stripped host-side; maxBounce/directOnly passed to `...SessionBegin`).
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror

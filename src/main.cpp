@@ -3368,7 +3368,7 @@ static void printHelp(const char* prog) {
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
-"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter)\n"
+"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T for a live path-traced preview\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
 "\n"
@@ -5455,6 +5455,7 @@ static int run(int argc, char** argv) {
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
+              "         trace:  T toggles a live PATH-TRACED preview (fast RGB backward) — holds still to converge, re-aims on move (GPU, if the scene is in RGB scope)\n"
               "         panel:  Clip / Reset buttons below the image%s\n"
               "         editor: Rec records your flight into a camera_curve; +Pt appends the current pose;\n"
               "                 Ins inserts at the scrub point; Del removes the nearest point; Save writes a camera_curve block\n"
@@ -5496,6 +5497,33 @@ static int run(int argc, char** argv) {
             bool gpuWarmKeep = false;
 #ifdef HAVE_CUDA
             gpuWarmKeep = (gpuRaster != nullptr);   // only meaningful on the discrete GPU path
+#endif
+            // ---- Interactive PATH-TRACED preview (fast RGB backward), toggled with 'T' ----
+            // The explorer normally shows the flat-shaded raster (instant, for navigation).
+            // Press 'T' to instead progressively PATH-TRACE the current view with the fast RGB
+            // backward tracer (Stage 2) into a resident GPU session: while the camera holds
+            // still the image converges in place; the instant it moves we drop back to the
+            // responsive raster and re-aim the session. The scene-ignore flags (-no-media/-env/
+            // -fluoro, -max-bounce, -direct-only) already apply — they mutated the Scene before
+            // this session bakes it, and the depth/Whitted knobs are passed into begin(). GPU
+            // only, and only when the scene+camera are inside the fast-RGB scope.
+            bool  traceMode  = false;             // 'T' toggle: path-traced preview vs. flat raster
+            bool  traceAvail = false;             // scene+camera in fast-RGB scope on this GPU
+            bool  traceDirty = true;              // camera moved -> re-aim + restart accumulation
+            double traceAnchor = 0.0;             // locked auto-exposure anchor for the current pose (0 = recompute)
+            const long long kTraceBatchSpp = 4;   // spp accumulated per idle iteration (responsive batches)
+            const long long kTraceCapSpp   = 4096;// stop refining once this converged (idle after)
+#ifdef HAVE_CUDA
+            BackwardRGBSession* traceSess = nullptr;   // resident RGB-backward preview (lazy)
+            int   traceResX = 0, traceResY = 0;        // session film size (recreated on a resize)
+            Film  traceFilm;                           // scratch download film (lazily sized)
+            if (gpuRaster != nullptr)
+                traceAvail = cudaBackwardRGBSupported(scene, rc0.cam);   // same scope the batch -rgb uses
+            if (traceAvail)
+                std::printf("[viewer] press 'T' for a live path-traced preview (fast RGB backward)\n");
+            else
+                std::printf("[viewer] path-trace preview ('T') unavailable (scene/camera outside fast-RGB GPU scope)\n");
+            std::fflush(stdout);
 #endif
             while (!g_liveWin->closed() && !g_stopRequested) {
                 // Match the render resolution to the live window: a user resize re-renders
@@ -5549,6 +5577,19 @@ static int run(int argc, char** argv) {
                 if (nav.cycleCollide) {
                     collide = (CollideMode)((collide + 1) % 3);
                     std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
+                }
+                // T toggles the live path-traced (fast RGB backward) preview vs. flat raster.
+                if (nav.toggleTrace) {
+                    if (!traceAvail) {
+                        std::printf("[viewer] path-trace preview unavailable (scene/camera outside fast-RGB GPU scope)\n");
+                    } else {
+                        traceMode = !traceMode;
+                        traceDirty = true;   // restart accumulation at the current pose
+                        changed = true;      // repaint immediately (raster if off; re-aim if on)
+                        std::printf("[viewer] path-trace preview %s\n",
+                                    traceMode ? "ON (fast RGB backward)" : "OFF (raster)");
+                    }
+                    std::fflush(stdout);
                 }
                 // Reset is the reliable "put me back to a normal, steerable state" escape:
                 // ALWAYS return to free flight at the authored pose. Previously, resetting
@@ -5734,7 +5775,54 @@ static int run(int argc, char** argv) {
                 // the slot that samples the next scrub position (the timeline-"chunking" bug).
                 bool warmOnly = gpuWarmKeep && !changed &&
                                 idleFor >= kWarmGapSec && idleFor < kWarmGraceSec;
-                if (changed || warmOnly) {
+                // `tracingNow` is set below when the path-traced preview is actively refining
+                // this idle pose; it suppresses the raster warm-frame and the idle sleep so the
+                // image keeps converging (the accumulate() launch already holds the GPU warm).
+                bool tracingNow = false;
+#ifdef HAVE_CUDA
+                if (traceMode && traceAvail) {
+                    Camera c; c.projection = proj;
+                    c.lookAt(eye, tgt, rUp, rFov, VW, VH);
+                    // (Re)create the resident session on first use or after a resize.
+                    if (!traceSess || traceResX != VW || traceResY != VH) {
+                        if (traceSess) backwardRGBSessionEnd(traceSess);
+                        traceSess = backwardRGBSessionBegin(scene, VW, VH, g_maxBounceOverride, g_directOnly);
+                        traceResX = VW; traceResY = VH;
+                        traceFilm.resX = VW; traceFilm.resY = VH; traceFilm.alloc();
+                        traceDirty = true;
+                    }
+                    if (changed) {
+                        // Camera moved: show the responsive raster and mark the trace stale.
+                        std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                        drawOverlay(c, VW, VH, img);
+                        g_liveWin->update(VW, VH, img);
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                            ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
+                        traceDirty = true;
+                        changed = false;
+                    } else if (traceSess) {
+                        // Idle: re-aim on the first still frame after a move, then keep adding
+                        // sample batches until the pose is well converged.
+                        if (traceDirty) {
+                            backwardRGBSessionSetCamera(traceSess, c);
+                            traceAnchor = 0.0;   // re-lock auto-exposure for the new pose
+                            traceDirty = false;
+                        }
+                        if (backwardRGBSessionSamples(traceSess) < kTraceCapSpp) {
+                            long long spp = backwardRGBSessionAccumulate(traceSess, kTraceBatchSpp, /*diffraction*/false);
+                            backwardRGBSessionDownload(traceSess, traceFilm);
+                            std::vector<uint8_t> img = filmToRgb8(traceFilm, (double)spp, ev,
+                                                                  scene.absolute, &traceAnchor);
+                            drawOverlay(c, VW, VH, img);
+                            g_liveWin->update(VW, VH, img);
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  path-trace " +
+                                                std::to_string(spp) + " spp  eye(" + fmt3(eye) + ")");
+                            tracingNow = (spp < kTraceCapSpp);   // more to refine -> keep spinning
+                        }
+                    }
+                }
+#endif
+                if (!traceMode && (changed || warmOnly)) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     std::vector<uint8_t> img =
@@ -5781,11 +5869,14 @@ static int run(int argc, char** argv) {
                 // drag event drains promptly (the timeline tracks the thumb without chunking)
                 // yet not a busy spin; past the grace window we sleep the full idle interval
                 // and let the card power down.
-                if (!nav.any() && !playing && !warmOnly) {
+                if (!nav.any() && !playing && !warmOnly && !tracingNow) {
                     bool inGrace = gpuWarmKeep && idleFor < kWarmGraceSec;
                     std::this_thread::sleep_for(std::chrono::milliseconds(inGrace ? 3 : 15));
                 }
             }
+#ifdef HAVE_CUDA
+            if (traceSess) backwardRGBSessionEnd(traceSess);   // free the resident preview session
+#endif
             g_stopRequested = 1;   // window closed → done
         }
 #ifdef HAVE_CUDA

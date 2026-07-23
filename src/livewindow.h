@@ -60,6 +60,7 @@ struct NavInput {
     bool   reset  = false;               // '0' / Home / Reset button since last drain
     bool   print  = false;               // 'P' pressed since last drain
     bool   cycleCollide = false;         // 'C' / Clip button since last drain (cycle collision mode)
+    bool   toggleTrace = false;          // 'T' pressed since last drain (toggle path-traced preview) (one-shot)
     bool   looking = false;              // cursor currently inside the client area (steering live)
     // ---- Control-panel outputs (drained alongside the fly input) ----
     bool   togglePath = false;           // "Path" (lock-to-path) button pressed since last drain (one-shot)
@@ -88,7 +89,7 @@ struct NavInput {
     bool   paintMode  = false;           // "Paint" checkbox: wheel=speed, mouse=orientation on the path (persistent)
     bool   speedReset = false;           // "Flat" button: reset painted speed to uniform (one-shot)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
-                                || cycleCollide || togglePath || togglePlay || scrubTo >= 0
+                                || cycleCollide || toggleTrace || togglePath || togglePlay || scrubTo >= 0
                                 || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset; }
 };
 

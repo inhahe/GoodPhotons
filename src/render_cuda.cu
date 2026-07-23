@@ -7618,6 +7618,88 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     return out;
 }
 
+// ------------- Resident fast-RGB backward PREVIEW session (interactive) -------------
+// See render_cuda.h for the rationale. The scene bake (buildUploadScene) is done once in
+// begin() and kept in `up`; each setCamera() re-bakes only the pinhole DCamera (bakeCamera
+// records nothing for a lensless camera, so there is no per-aim leak) and zeroes the SUM
+// film. accumulate() advances `base` so every batch draws an independent RNG stream, with
+// a fixed large `sppTotal` cap so the gidx = pix*sppTotal + base + local index stays unique
+// per pixel across the whole idle convergence.
+struct BackwardRGBSession {
+    DUpload up;                   // resident baked scene (+ current camera in up.dc)
+    const Scene* scene = nullptr; // borrowed; must outlive the session (bakeCamera arg)
+    int    resX = 0, resY = 0;
+    size_t npix = 0;
+    double* d_film = nullptr;     // resX*resY*3 doubles (running XYZ SUM)
+    double* d_hits = nullptr;     // resX*resY doubles
+    long long accum = 0;          // spp accumulated since the last setCamera()
+    bool   haveCam = false;
+    static constexpr long long kSppCap = 1LL << 22;   // per-pixel RNG-stream capacity
+};
+
+BackwardRGBSession* backwardRGBSessionBegin(const Scene& scene, int resX, int resY,
+                                            int maxBounce, bool directOnly) {
+    using namespace gpu;
+    if (!cudaAvailable() || resX <= 0 || resY <= 0) return nullptr;
+    auto* s = new BackwardRGBSession();
+    s->scene = &scene;
+    s->resX = resX; s->resY = resY;
+    s->npix = (size_t)resX * resY;
+    buildUploadScene(scene, s->up);
+    if (maxBounce >= 1) s->up.sc.bkMaxBounce = maxBounce;
+    s->up.sc.bkDirectOnly = directOnly ? 1 : 0;
+    CUDA_CHECK(cudaMalloc(&s->d_film, s->npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_hits, s->npix * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->d_film, 0, s->npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->d_hits, 0, s->npix * sizeof(double)));
+    return s;
+}
+
+void backwardRGBSessionSetCamera(BackwardRGBSession* s, const Camera& cam) {
+    using namespace gpu;
+    if (!s) return;
+    s->up.dc = bakeCamera(*s->scene, cam, s->resX, s->resY, s->up);
+    CUDA_CHECK(cudaMemset(s->d_film, 0, s->npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->d_hits, 0, s->npix * sizeof(double)));
+    s->accum = 0;
+    s->haveCam = true;
+}
+
+long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, bool diffraction) {
+    using namespace gpu;
+    if (!s || !s->haveCam || spp <= 0) return s ? s->accum : 0;
+    const long long base = s->accum;
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL
+        ^ (unsigned long long)base * 0x9E3779B97F4A7C15ULL;
+    long long totalSamples = (long long)s->npix * spp;
+    kBackwardRGB<<<2048, 128>>>(s->up.sc, s->up.dc, s->d_film, s->d_hits,
+                                totalSamples, spp, BackwardRGBSession::kSppCap, base,
+                                s->resX, diffraction ? 1 : 0, seed);
+    cudaCheckKernel("backwardRGB-session");
+    s->accum += spp;
+    return s->accum;
+}
+
+void backwardRGBSessionDownload(BackwardRGBSession* s, Film& out) {
+    using namespace gpu;
+    if (!s) return;
+    std::vector<double> film(s->npix * 3);
+    CUDA_CHECK(cudaMemcpy(film.data(), s->d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(out.hits.data(), s->d_hits, s->npix * sizeof(double), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < s->npix; ++i)
+        out.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+}
+
+long long backwardRGBSessionSamples(const BackwardRGBSession* s) { return s ? s->accum : 0; }
+
+void backwardRGBSessionEnd(BackwardRGBSession* s) {
+    if (!s) return;
+    freeUpload(s->up);
+    if (s->d_film) cudaFree(s->d_film);
+    if (s->d_hits) cudaFree(s->d_hits);
+    delete s;
+}
+
 // --------------------- G2 iso preview (GPU raster) host ----------------------
 
 bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam) {

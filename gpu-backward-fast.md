@@ -192,4 +192,31 @@ sample. This is the fastest, most POV-Ray-like path.
     GPU and CPU** (no colour bleeding, black shadows, dark ceiling) — verified on the
     Cornell box (`png/_direct_cornell.png` GPU, `png/_cpu_direct.png` CPU); `-max-bounce`
     parses and caps depth.
-- [ ] Stage 4: `-explore` integration
+- [x] **Stage 4: `-explore` integration.** The interactive fly-viewer (`-explore`/`-fly`)
+  can toggle a **live path-traced preview** with the key **`T`**, swapping the flat raster
+  still for a progressively-converging fast-RGB backward render:
+  - **Resident session** (`BackwardRGBSession` in `src/render_cuda.cu`, decls in
+    `render_cuda.h`): `backwardRGBSessionBegin` runs `buildUploadScene` ONCE (scene bake is
+    the expensive part) and keeps a persistent double-precision SUM film; `...SetCamera`
+    re-bakes only the cheap POD camera (`bakeCamera`, no per-aim alloc for a pinhole) and
+    zeroes the film; `...Accumulate(spp)` launches the same validated `kBackwardRGB` kernel
+    adding a batch into the resident film (advancing `sampleBase`, fixed `kSppCap = 2^22` so
+    the per-pixel RNG streams stay unique across the whole idle convergence); `...Download`
+    fetches the running SUM; `...End` frees. The Stage-3 knobs bake in via `bkMaxBounce`/
+    `bkDirectOnly` on begin().
+  - **Viewer wiring** (`src/main.cpp` interactive loop; `T` key added through
+    `livewindow.{h,cpp}` → `NavInput::toggleTrace`): while the camera **holds still** the
+    loop accumulates a small spp batch each idle tick and presents the converging image via
+    the shared `filmToRgb8` (auto-exposure anchor locked per pose so it doesn't flicker as
+    noise settles); a camera **move** shows the responsive raster and flags a `setCamera`
+    re-aim; the idle-sleep is suppressed while refining so it converges without a busy spin.
+    The session is (re)created on a window resize and freed on close.
+  - **Availability** mirrors the batch `-rgb` scope exactly (`cudaBackwardRGBSupported`), so
+    the viewer prints whether `T` is usable at startup; the **scene-ignore flags** apply for
+    free (they mutate the `Scene` host-side before the session bakes it; `-max-bounce` /
+    `-direct-only` are passed into begin()).
+  - **Validated:** on `scenes/_rgb_neutral.ftsl` (in scope) `T` engages the preview, the
+    window title's `spp` climbs and the image converges to a correct neutral Cornell
+    (captured live at 1536 spp); `T` again returns to the raster; no crash and the session
+    frees on exit. On the built-in `cornell` (out of RGB scope) the viewer correctly reports
+    the preview unavailable, matching the batch `-rgb` fallback.
