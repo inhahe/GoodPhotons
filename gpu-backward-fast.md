@@ -76,7 +76,20 @@ sample. This is the fastest, most POV-Ray-like path.
     block-averaged structural residual falls monotonically toward zero
     (1.75%→1.02%→0.56% at 8/16/32-px blocks) = noise only, no bias. Compare tools:
     `scraps/cmp_ftbuf.py` (raw radiance) and `scraps/cmp_fog.py` (tone-mapped PNGs).
-  - [ ] 1b — fluorescence (Stokes-shift vertex, reuse forward `fluoCdfAll`)
+  - [x] **1b — fluorescence (bispectral Stokes-shift adjoint).** Ported the
+    `D_FLUORESCENT` branch into `bkRadiance` (was falling through to plain diffuse):
+    elastic base NEE at the output wavelength, a separately-sampled excitation
+    wavelength `lambdaIn` (`dSampleSceneLambda` + `dInvPdfLambda`, the machinery the
+    initial wavelength already uses), the fluoro direct-NEE weighted by
+    `gOut = (M(lambda)/Mint)*invPdf` and `rhoFluo = min(eps(lambdaIn),1-rho)*yield`,
+    then a stochastic elastic/fluoro/absorb continuation with the Stokes-shift
+    wavelength switch. Added `fluoEmitSpec[SPEC_N]` (baked continuous emission SPD)
+    + `fluoMint` to `DMaterial` so the adjoint can evaluate `M(lambda)` at a *fixed*
+    output wavelength (the forward path samples from the CDF where `M/pdf` cancels).
+    `cudaBackwardSupported` now accepts fluorescence. **Validated** vs CPU on
+    `_fluo_cornell` (blue-excited green-emitting dye sphere): raw film radiance
+    agrees to **0.02%** in absolute luminance, per-channel XYZ within 0.1%, block
+    residual 0.34%→0.19%→0.09% (noise only).
   - [ ] 1c — environment light (env-miss radiance + env-NEE)
   - [ ] 1d — spot / collimated / env emitter sampling + pdf in backward NEE
 - [ ] Stage 2: fast RGB backward (Option B)

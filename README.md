@@ -502,9 +502,10 @@ that converges to the same physical image.
   fluorescent tracer). GPU-accelerated (its own backward megakernel, which also drives
   the **physical multi-element lens** camera on the GPU). It gets **noisy on caustics**
   (light focused through glass/water is hard to find backward). *GPU scope:* the
-  megakernel covers area/sphere/cylinder Lambertian lights and all the
-  specular/textured materials; scenes using fog, environment lights, spot/collimated
-  lights, or fluorescence fall back to the CPU tracer automatically.
+  megakernel covers area/sphere/cylinder Lambertian lights, all the specular/textured
+  materials, **participating media** (homogeneous + heterogeneous) and
+  **fluorescence**; scenes using environment lights or spot/collimated lights (plus
+  GRIN / rainbow-dispersive media) still fall back to the CPU tracer automatically.
 - **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
   check, not a production renderer (roughly twice the work).
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for
@@ -625,7 +626,8 @@ stay non-resumable.
   on a non-env, pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (env/spot/collimated lights, fluorescence; any fog for `R`), for a mode-`M` render
+  (env/spot/collimated lights; GRIN/rainbow media — mode `R` now runs fog and
+  fluorescence on the device), for a mode-`M` render
   that uses a `-pmfg` final gather or an env light, and for
   fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous

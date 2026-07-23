@@ -1,0 +1,36 @@
+# Fluorescent Cornell box — validation scene for GPU-vs-CPU backward fluorescence.
+# A fluorescent sphere (blue-excited, green-emitting) + area light only, no media /
+# env / spot, so the GPU backward (mode R) and CPU backward must converge to the
+# SAME image.
+#
+#   ftrace -in scenes/_fluo_cornell.ftsl -mode R -noise 1 -o png/_fluo_gpu.png
+#   ftrace -in scenes/_fluo_cornell.ftsl -mode R -noise 1 -device cpu -o png/_fluo_cpu.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "red"   { type diffuse    reflect redwall }
+material "green" { type diffuse    reflect greenwall }
+material "dye"   { type fluorescent reflect 0.05 absorb shortpass edge=480 slope=0.2 amp=1 emit gaussian center=560 sigma=25 amp=1 yield 0.9 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.32 0.4   radius 0.25   material dye }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

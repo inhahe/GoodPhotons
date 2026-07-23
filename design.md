@@ -91,7 +91,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   0.23.0 (free-flight `dMediaSampleCollision` competing with the surface hit,
   volume NEE `bkNeeVolume`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
   HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous; only
-  GRIN and rainbow/dispersive media still route the backward pass to CPU.
+  GRIN and rainbow/dispersive media still route the backward pass to CPU. Since
+  0.24.0 it also does **fluorescence** (bispectral Stokes-shift adjoint: elastic +
+  excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic
+  elastic/reemit/absorb continuation — baked `fluoEmitSpec`/`fluoMint` on the
+  device material).
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror

@@ -228,6 +228,12 @@ struct DMaterial {
     double fluoYield;
     int    fluoCdfOffset, fluoCdfN;
     double fluoCdfStep;
+    // Baked emission SPD M(lambda) and its integral, so the backward adjoint can
+    // evaluate the continuous emission density gOut = (M(lambda)/fluoMint)*invPdf
+    // at a FIXED output wavelength (the forward path samples lambda' from the CDF
+    // instead, where M/pdf cancels and these aren't needed).
+    double fluoEmitSpec[SPEC_N];
+    double fluoMint;
     // Multilayer stack (D_MULTILAYER): per-layer index/extinction/thickness; the
     // substrate is ior + substrateK (spectral). layer 0 is outermost.
     int    layerCount;
@@ -4818,8 +4824,47 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 else if (u < sum) { ro = h.p + nb  * RAY_EPS; rd = cosineHemisphere(nb,  rng); specularArrival = false; break; }
                 return L;                                // absorbed
             }
+            case D_FLUORESCENT: {
+                // Bispectral reradiation — device adjoint of backward.h MatType::Fluorescent.
+                // Elastic base reflects at the output wavelength; the fluorescent channel
+                // excites at a separately-sampled lambdaIn (Stokes shift). Both channels NEE;
+                // one stochastic continuation carries the indirect term.
+                double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
+                L += thr * bkNeeLight(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
+                double Mint = mp->fluoMint;
+                bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
+                double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
+                Real lambdaIn = 0;
+                if (haveFluoro) {
+                    gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
+                    double pin = 0.0;
+                    lambdaIn = dSampleSceneLambda(sc, rng, pin);
+                    if (pin > 0.0) {
+                        invPdfIn = dInvPdfLambda(sc, lambdaIn);
+                        double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
+                        double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
+                        double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
+                        rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
+                        if (rhoFluo > 0.0)                                        // fluoro DIRECT NEE
+                            L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                    }
+                }
+                double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
+                double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
+                double u = rng.uniform();
+                if (u < rhoEl) {                                                  // elastic continuation
+                    ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng);
+                    specularArrival = false; break;
+                } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
+                    thr *= wFluo / pF;
+                    lambda = lambdaIn;                                            // Stokes shift (to the input wl)
+                    invPdfLambda = invPdfIn;
+                    ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng);
+                    specularArrival = false; break;
+                }
+                return L;                                                         // absorbed / terminated
+            }
             case D_DIFFUSE:
-            case D_FLUORESCENT:
             default: {
                 Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
                 L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
@@ -6084,8 +6129,12 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.fluoCdfStep = m.fluoEmitSampler.step;
             fluoCdfAll.insert(fluoCdfAll.end(), m.fluoEmitSampler.cdf.begin(),
                               m.fluoEmitSampler.cdf.end());
+            bakeSpec(m.fluoEmit, d.fluoEmitSpec);       // continuous M(lambda) for backward gOut
+            d.fluoMint = m.fluoEmitSampler.integral;
         } else {
             d.fluoCdfOffset = 0; d.fluoCdfN = 0; d.fluoCdfStep = 1.0;
+            for (int s = 0; s < SPEC_N; ++s) d.fluoEmitSpec[s] = 0.0;
+            d.fluoMint = 0.0;
         }
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
@@ -6920,9 +6969,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // GPU mode R needs the same POD-bakeable materials as the forward path, plus the
-    // current backward scope: participating media ARE supported (homogeneous + hetero-
-    // geneous, minus GRIN/rainbow), but no environment light, only area/sphere/cylinder
-    // Lambertian emitters (spot/env/collimated fall back to the CPU), and no fluorescence.
+    // current backward scope: participating media AND fluorescence ARE supported
+    // (media: homogeneous + heterogeneous, minus GRIN/rainbow; fluorescence: the
+    // bispectral Stokes-shift adjoint), but no environment light and only area/sphere/
+    // cylinder Lambertian emitters (spot/env/collimated fall back to the CPU).
     // Textured albedo IS supported (dDiffuseRho ports it). This keeps dInvPdfLambda exact
     // (geomWeight = area*PI for every emitter).
     if (!cudaForwardSupported(scene)) return false;
@@ -6933,18 +6983,6 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     if (grin::sceneHasGrin(scene)) return false;
     for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     if (scene.envIndex >= 0)   return false;
-    auto usesFluoro = [&](int matId) {
-        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
-        const Material& m = scene.mats[matId];
-        if (m.type == MatType::Fluorescent) return true;
-        if (m.type == MatType::Mix)
-            for (int c : m.mixChildren)
-                if (c >= 0 && c < (int)scene.mats.size() &&
-                    scene.mats[c].type == MatType::Fluorescent) return true;
-        return false;
-    };
-    for (const auto& t : scene.tris)    if (usesFluoro(t.matId)) return false;
-    for (const auto& s : scene.spheres) if (usesFluoro(s.matId)) return false;
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
