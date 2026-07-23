@@ -55,7 +55,7 @@ has no `Hit` in scope, so a per-hit BSDF would bias MIS):
 Forward scope plus:
 | Feature | Why CPU today | Class |
 |---|---|---|
-| **Any environment light** | device `kGather` has no env term; CPU `photonGather` adds env on escape / at diffuse hits | **portable** (add env term to gather kernel) |
+| ~~Any environment light~~ | **DONE (M2, 2026-07-23)** — deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image via `dEnvRadiance`); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%. | ✅ |
 | **Final gather** (`g_pmFinalGather > 0`) | device does only the direct density estimate; final gather stays CPU (caller-gated, main.cpp:6034/6441) | **portable-hard, high value** (a second bounce of gather rays on device) |
 | Physical-lens cameras | caller-gated | secondary |
 
@@ -80,7 +80,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 ## Scheduled work (greenlit by user 2026-07-23) — quickest wins first
 
 1. ~~**Image-based env NEE in GPU backward** (M1)~~ — **DONE 2026-07-23.** Added `dEnvRadiance`/`dEnvPdf`, uploaded the illuminant table, wired the device env sampler into `bkNeeEnv`/`bkNeeEnvVolume` + MIS'd env-miss; dropped the `envMap` reject. Validated GPU==CPU to 0.14% at 8192 spp. Also unblocks mode P camera-side.
-2. **Env term in the mode-M GPU gather** (M2) — small kernel addition; unblocks env-lit photon maps.
+2. ~~**Env term in the mode-M GPU gather** (M2)~~ — **DONE 2026-07-23.** Deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image env); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%.
 3. **GPU SPPM** (M3) — reuses existing deposit + gather kernels; biggest quality-mode win.
 4. **Mode-M final gather on GPU** (M4) — high value, more work.
 5. Longer tail: **per-hit BSDFs in GPU BDPT** (M9); **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).

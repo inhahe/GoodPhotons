@@ -105,7 +105,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   2-D CDF), with `dEnvRadiance` (per-texel JH `coeff`·`scale`·`illum`) and `dEnvPdf`
   for MIS-consistent env-miss; the previously-canceled illuminant table is uploaded
   as `DEnvMap::illum`. Validated GPU==CPU to 0.14% in linear radiance at 8192 spp.
-  Since 0.26.0 it also does
+  The same `dEnvRadiance` also serves **mode-M (photon map) env** on the GPU (M2,
+  0.31.0): the deposit already emits env photons (env's indirect bounces land in the
+  map), and `dPhotonGather` adds env's direct term on gather-ray escape — so
+  `cudaPhotonMapSupported` no longer rejects env scenes (validated GPU==CPU mean 0.18%,
+  background sky 0.04%). Since 0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.

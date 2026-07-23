@@ -6127,9 +6127,9 @@ kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
 // diffuse / translucent hit it estimates reflected radiance by a radius density query
 // into the uploaded photon map, each photon reflected at ITS OWN wavelength so the
 // estimate is built directly in XYZ (returned via oX/oY/oZ). Directly-viewed emitters
-// are added as a monochromatic estimate at the sampled lambda. No final gather, no env
-// (both gated out by cudaPhotonMapSupported); Beer-Lambert interior absorption is tracked
-// exactly like bkRadiance. Keep in sync with photonGather.
+// and the environment (on gather-ray escape) are added as a monochromatic estimate at the
+// sampled lambda. No final gather (gated out by the caller); Beer-Lambert interior
+// absorption is tracked exactly like bkRadiance. Keep in sync with photonGather.
 __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
                                      DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
                                      double& oX, double& oY, double& oZ) {
@@ -6149,7 +6149,21 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0) thr *= exp(-(double)a * (double)h.t);
         }
-        if (!h.valid) return;                            // escaped (env gated out of mode-M GPU)
+        if (!h.valid) {                                  // escaped -> environment
+            // Direct env term on gather-ray escape (mirrors photonGather, fgRays==0). The
+            // map already carries env's INDIRECT bounces (the deposit emits env photons);
+            // this adds env's DIRECT contribution, monochromatic at the sampled lambda.
+            if (sc.envIndex >= 0) {
+                double envRad = (sc.env.scale != nullptr)
+                                    ? dEnvRadiance(sc.env, rd, lambda)
+                                    : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+                double e = thr * envRad * invPdfL;
+                oX += (double)cieX(lambda) * e;
+                oY += (double)cieY(lambda) * e;
+                oZ += (double)cieZ(lambda) * e;
+            }
+            return;
+        }
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
@@ -7892,16 +7906,16 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
 bool cudaPhotonMapSupported(const Scene& scene) {
     // The GPU mode-M path reuses the forward photon tracer (deposit) and a device gather
     // that mirrors photonGather's DIRECT (fgRays == 0) density estimate. Scope for v1:
-    //   * same POD-bakeable materials as the forward path (cudaForwardSupported), and
-    //   * NO environment light — the device gather has no env term (CPU photonGather adds
-    //     env on escape / at diffuse hits); an env scene must stay on the CPU.
+    //   * same POD-bakeable materials as the forward path (cudaForwardSupported).
+    // Environment lights (constant AND image-based, M2) are supported: the deposit emits
+    // env photons (env's INDIRECT bounces land in the map) and dPhotonGather adds env's
+    // DIRECT term on gather-ray escape, mirroring CPU photonGather.
     // Final gather (g_pmFinalGather > 0) and physical-lens cameras are gated by the caller
     // (main.cpp) since those are render-config, not scene, properties. Fluorescence is fine:
     // neither CPU nor GPU deposits at a fluorescent vertex, and both gather it as a query
     // point, so the two agree. Participating media (fog) are supported — the forward deposit
     // pass runs the same Woodcock free-flight as the CPU tracePhoton.
     if (!cudaForwardSupported(scene)) return false;
-    if (scene.envIndex >= 0) return false;
     return true;
 }
 

@@ -1713,9 +1713,14 @@ mark the corresponding row in `gpu-fallbacks.md`.
       `scene.envMap` reject. Also unblocks mode P camera-side. **Validated:** GPU vs CPU backward on
       `scenes/envmap.ftsl` at 8192 spp match to 0.14% in linear radiance (background sky 0.15%); the earlier
       ~5% gap was noisy p99 auto-exposure, not radiance.
-- [ ] **M2. Env term in the mode-M GPU gather.** `cudaPhotonMapSupported` (render_cuda.cu:7842) rejects ANY
-      env light because device `kGather` has no env term (CPU `photonGather` adds env on escape / at diffuse
-      hits). Add the env term to the gather kernel; drop the `envIndex >= 0` reject. Validate vs CPU.
+- [x] **M2. Env term in the mode-M GPU gather.** *(done 2026-07-23)* `cudaPhotonMapSupported` rejected ANY
+      env light because device `dPhotonGather` had no env term. The deposit already emits env photons (env's
+      indirect bounces), so only the DIRECT term was missing: added the env contribution on gather-ray escape
+      in `dPhotonGather` (constant via `emitSpd`, image via `dEnvRadiance`, monochromatic at the sampled
+      lambda like CPU `photonGather`) and dropped the `envIndex >= 0` reject. **Validated:** GPU vs CPU
+      mode-M on `scenes/envmap.ftsl` (20M photons) match in mean to 0.18%, background sky to 0.04%; residual
+      per-pixel diff is mode-M's inherent density-estimate + monochromatic-background noise (identical
+      character on CPU).
 - [ ] **M3. GPU SPPM (mode S).** Currently CPU-only (`sppm_render.h`). Build a device SPPM: repeated bounded
       photon-deposit passes (reuse the forward deposit kernel) + radius-shrinking gather (reuse `kGather`),
       accumulating per-pixel flux with the Hachisuka radius-shrink (`-sppmalpha`). Reuse the mode-M
