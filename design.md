@@ -86,7 +86,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.
 - **`render_cuda.cu`** (~7000) — the whole GPU backend: megakernel + wavefront
-  forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling
+  forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling.
+  GPU backward (`bkRadiance`) supports **participating media** natively since
+  0.23.0 (free-flight `dMediaSampleCollision` competing with the surface hit,
+  volume NEE `bkNeeVolume`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
+  HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous; only
+  GRIN and rainbow/dispersive media still route the backward pass to CPU.
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror

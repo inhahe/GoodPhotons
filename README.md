@@ -36,7 +36,10 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
   **density fields** — either formula-defined blobs with soft edges *or* imported
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
-  tracking on the forward modes (CPU and GPU).
+  tracking on the forward modes (CPU and GPU) **and the backward reference (mode
+  `R`) on both CPU and GPU** (GPU backward runs homogeneous *and* heterogeneous
+  media natively; only GRIN and spectrally-dispersive/rainbow media still force the
+  CPU backward).
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward

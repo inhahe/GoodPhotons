@@ -4653,18 +4653,57 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         Real G = cosSurf * cosLight / dist2;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(f * G) * emitW * (double)em.area * (double)stG;
-        // Backward (mode R) treats media as a single global HOMOGENEOUS haze (first
-        // medium); GPU backward is only reached when no medium is present (cudaBackwardSupported
-        // rejects any), so this is defensive parity with the host backwardMedium().
-        if (sc.mediaN > 0) contrib *= exp(-(double)medSigmaT(sc.media[0], lambda) * (double)dist);
+        // Shadow-ray transmittance through any participating media (superposition;
+        // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
+        // Matches the forward connectVolume / device volume-NEE transmittance so surface
+        // direct light agrees between the forward and backward estimators.
+        if (sc.mediaN > 0)
+            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, dist, lambda, rng);
+        total += contrib;
+    }
+    return total;
+}
+
+// Volume next-event estimation (device twin of backward.h neeVolume): connect a fog
+// scattering vertex `p` (photon arriving along `wIn`) to each area/sphere/cylinder
+// emitter. The surface BRDF+cosine are replaced by the single-scattering albedo and the
+// HG phase function; the shadow ray carries media transmittance (superposition over all
+// media). Spot/env/collimated emitters are gated to the CPU, so they're skipped here.
+// Uniform area sampling (an independent noise realization vs the CPU's cone/arc
+// importance sampling, same expectation) — matches bkNeeLight's convention.
+__device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVec3& wIn,
+                                     const DMedium& med, double invPdfLambda, Real lambda,
+                                     DRng& rng) {
+    double total = 0.0;
+    Real g   = (Real)med.g;
+    Real alb = medAlbedo(med, lambda);
+    if (alb <= (Real)0) return 0.0;
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 2 || em.shape == 3) continue;   // beams/spot/env
+        Real u1 = rng.uniform(), u2 = rng.uniform();
+        DVec3 y, nL;
+        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        DVec3 toL = y - p;
+        Real dist2 = dot(toL, toL);
+        Real dist  = sqrt(dist2);
+        DVec3 wi = toL / dist;
+        Real cosLight = dot(nL, wi * (Real)(-1));         // light is one-sided
+        if (cosLight <= 0) continue;
+        if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        Real phase = hgPhase(dot(wIn, wi), g);            // HG phase == its own pdf
+        Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
+        double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
+        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
         total += contrib;
     }
     return total;
 }
 
 // Estimate spectral-weighted radiance for one wavelength along a camera ray (port of
-// backward.h radiance, v1 scope: no fog/env). Emission added only on specular/camera
-// arrival; diffuse arrivals are covered by NEE (no double counting).
+// backward.h radiance, v1 scope: participating media supported, no env/fluorescence).
+// Emission added only on specular/camera arrival; diffuse arrivals are covered by NEE.
 __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
                                     Real lambda, double invPdfLambda, DRng& rng) {
     double L = 0.0, thr = 1.0;
@@ -4673,6 +4712,27 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
+        Real dSurf = h.valid ? h.t : (Real)1e30;
+        // Participating media: sample a free-flight collision (superposition over all
+        // media — homogeneous = exact free-flight, heterogeneous = Woodcock/delta
+        // tracking) that competes with the surface hit. On a volume collision, add
+        // phase-function NEE, then scatter (HG) or absorb — analog, throughput unchanged.
+        // Mirrors backward.h radiance() so the two estimators agree.
+        if (sc.mediaN > 0) {
+            Real tMed; int whichMed;
+            if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
+                DVec3 p = ro + rd * tMed;
+                int cm = stk.topMat();     // Beer-Lambert over the in-glass free-flight leg
+                Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+                if (a > 0) thr *= exp(-(double)a * (double)tMed);
+                const DMedium& med = sc.media[whichMed];
+                L += thr * bkNeeVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
+                Real alb = medAlbedo(med, lambda);
+                if (rng.uniform() >= (double)alb) return L;        // absorbed
+                ro = p; rd = sampleHG(rd, (Real)med.g, rng); specularArrival = false;
+                continue;
+            }
+        }
         if (!h.valid) return L;                        // escaped (no env in v1)
         // Beer-Lambert attenuation over the in-glass segment up to this surface
         // (current medium = highest-priority stack entry).
@@ -6860,12 +6920,18 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // GPU mode R needs the same POD-bakeable materials as the forward path, plus the
-    // v1 backward scope: no participating media, no environment light, only area/
-    // sphere/cylinder Lambertian emitters (spot/env/collimated fall back to the CPU),
-    // and no fluorescence. Textured albedo IS supported (dDiffuseRho ports it). This
-    // keeps dInvPdfLambda exact (geomWeight = area*PI for every emitter).
+    // current backward scope: participating media ARE supported (homogeneous + hetero-
+    // geneous, minus GRIN/rainbow), but no environment light, only area/sphere/cylinder
+    // Lambertian emitters (spot/env/collimated fall back to the CPU), and no fluorescence.
+    // Textured albedo IS supported (dDiffuseRho ports it). This keeps dInvPdfLambda exact
+    // (geomWeight = area*PI for every emitter).
     if (!cudaForwardSupported(scene)) return false;
-    if (scene.anyMedium()) return false;
+    // Participating media now run on the device backward walk (dMediaSampleCollision /
+    // dMediaTransmittance — homogeneous AND heterogeneous), EXCEPT gradient-index (GRIN)
+    // media (bkRadiance has no Eikonal marcher) and spectral-rainbow phase (the device
+    // only knows the analytic HG lobe). Those fall back to the CPU backward tracer.
+    if (grin::sceneHasGrin(scene)) return false;
+    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     if (scene.envIndex >= 0)   return false;
     auto usesFluoro = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
