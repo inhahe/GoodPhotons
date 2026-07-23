@@ -7882,26 +7882,24 @@ bool cudaBdptSupported(const Scene& scene) {
     // and thin-film thickness maps, mix blend masks, and Beer-Lambert colored-glass
     // interior absorption (delta vertex — throughput only).
     //
-    // Still CPU-only (no device strategy yet): FROSTED (rough) dielectric needs a
-    // microfacet dielectric BSDF; the kernel treats every dielectric as smooth.
-    auto frostedGlass = [&](const Material& m) {
-        if (m.type != MatType::Dielectric) return false;
-        return (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0);
-    };
-    // Diffuse-transmission (two-sided Lambertian) is now on-device (M9): dRandomWalk samples
-    // the two lobes, dBsdfF/dBsdfPdf evaluate them, and dConnectBDPT allows back-hemisphere
-    // connections (|cos| G, shadow-terminator skip). Fluorescence (re-emission vertex) still
-    // has no GPU BDPT strategy — fall back to the CPU BDPT (bdpt.h) for it and frosted glass.
+    // FROSTED (rough) dielectric is now on-device too (M9): the device refractOrReflect
+    // jitters the chosen reflect/refract lobe by the per-hit roughness (dMatRoughness,
+    // texture/pattern/constant), keeping it on the intended side — bit-for-bit the same
+    // "stochastic-delta" model as the CPU bdpt.h (a rough dielectric stays a non-connectable
+    // delta vertex; only its scattered direction is jittered). dDielectricStep in the BDPT
+    // random walk already routes through it, so no separate gate is needed.
+    // Diffuse-transmission (two-sided Lambertian) is likewise on-device (M9): dRandomWalk
+    // samples the two lobes, dBsdfF/dBsdfPdf evaluate them, and dConnectBDPT allows
+    // back-hemisphere connections (|cos| G, shadow-terminator skip). Fluorescence
+    // (re-emission vertex) still has no GPU BDPT strategy — fall back to the CPU BDPT.
     auto unsupportedMat = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
         const Material& m = scene.mats[matId];
-        if (frostedGlass(m)) return true;
         if (m.type == MatType::Fluorescent) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
-                    (frostedGlass(scene.mats[c]) ||
-                     scene.mats[c].type == MatType::Fluorescent))
+                    scene.mats[c].type == MatType::Fluorescent)
                     return true;
         return false;
     };

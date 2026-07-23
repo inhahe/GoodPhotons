@@ -660,9 +660,10 @@ stay non-resumable.
   (texcoords stored on each path vertex, reconstructed into a `Hit` for the connection
   BSDF) so textured/patterned/record-driven diffuse albedo & glossy reflect, per-hit
   glossy roughness + thin-film maps, mix blend masks, Beer–Lambert **colored-glass**
-  interior absorption, and **diffuse-transmit** (two-sided Lambertian — both lobes +
-  back-hemisphere connections) all render **on-device** with MIS-consistent densities; it
-  still falls back only for **frosted (rough) glass**, **fluorescence**, and **spot/env**
+  interior absorption, **diffuse-transmit** (two-sided Lambertian — both lobes +
+  back-hemisphere connections), and **frosted (rough) glass** (stochastic-delta lobe jitter
+  by per-hit roughness) all render **on-device** with MIS-consistent densities; it
+  still falls back only for **fluorescence** and **spot/env**
   emitters (no device strategy yet). **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
@@ -842,8 +843,8 @@ two physically-motivated translucency controls (both compose with dispersion):
   spectrum (e.g. `absorb gaussian center=470 sigma=60 amp=14` for amber). Interior
   absorption is threaded through all three CPU transport loops (forward, backward,
   BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
-  frosting and colored-glass tint; mode-`D` BDPT now runs colored glass on-device too
-  (M9), and only **frosted (rough)** glass still falls back to the CPU there.)*
+  frosting and colored-glass tint; mode-`D` BDPT now runs colored glass **and** frosted
+  (rough) glass on-device too (M9).)*
 
 **Nested dielectrics (`priority`).** When two glass/liquid solids overlap — a glass
 ice cube in a whisky, a lens cemented to another, a coating flush against a body — the
@@ -1544,9 +1545,8 @@ point (checkerboard of red vs green diffuse, noise-selected metal vs glass, …)
 `scenes/procedural.ftsl`. *(GPU: patterns run on the device forward and backward
 paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
 (mode `D`) now runs pattern-driven diffuse albedo / glossy reflect & roughness, thin-film
-maps, mix `weight_map` masks, and colored glass on-device too (per-hit point threaded
-through its MIS kernel); only **frosted (rough)** glass still falls back to the CPU
-there.)*
+maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device too
+(per-hit point threaded through its MIS kernel).)*
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`

@@ -142,10 +142,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `transmit`, energy-clamped) plus the two-sided back-hemisphere connection (allow back hemisphere,
   skip the shadow-terminator softening, `|cos|` in G); `lambda` is threaded through
   `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` because the lobe-selection pdf is wavelength-dependent.
-  `cudaBdptSupported` relaxed to reject only **frosted (rough) glass**, **fluorescence**, and
+  Since 0.36.0 **frosted (rough) dielectric** also renders on-device: `refractOrReflect`/
+  `dDielectricStep` already jitter the chosen reflect/refract lobe by the per-hit roughness, so a
+  rough dielectric is the same non-connectable **stochastic-delta** vertex on GPU as in `bdpt.h`
+  (only the gate needed relaxing). `cudaBdptSupported` now rejects only **fluorescence** and
   spot/env emitters (no device strategy yet). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
-  per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%), and
-  `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halving 8.42%→4.39% at 4× spp). Since
+  per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%),
+  `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halving 8.42%→4.39% at 4× spp),
+  and `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halving 10.86%→5.73%). Since
   0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only

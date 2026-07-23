@@ -1745,7 +1745,7 @@ mark the corresponding row in `gpu-fallbacks.md`.
       on the GPU. Validated GPU==CPU on `scenes/cornell.ftsl` (glass sphere + diffuse walls, `-pmfg 16/24`): mean
       linear radiance 0.43%, background 0.98%, per-pixel diff √-scales 22%→11.5% at 4× spp (independent-MC noise,
       not bias). Falls back to CPU for lens cameras / unsupported scenes exactly as the direct gather does.
-- [~] **M9. Per-hit BSDFs in GPU BDPT (mode D).** TWO INCREMENTS DONE 2026-07-23. (1) `DVertex` now stores the
+- [~] **M9. Per-hit BSDFs in GPU BDPT (mode D).** THREE INCREMENTS DONE 2026-07-23. (1) `DVertex` now stores the
       per-hit texcoords (`u,v`) and `dVertHit` reconstructs a `DHit`, so the connection BSDF (`dBsdfF`/`dBsdfPdf`)
       and the random walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the
       pdf/eval — MIS-safe. Ported: textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy
@@ -1756,9 +1756,12 @@ mark the corresponding row in `gpu-fallbacks.md`.
       energy-clamped) + the two-sided back-hemisphere connection strategy; `lambda` threaded through
       `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf; `dConnectBDPT`
       two-sided guards mirror bdpt.h. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp,
-      per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). `cudaBdptSupported` relaxed accordingly.
-      REMAINING (deferred): frosted (rough) dielectric microfacet BSDF, fluorescence re-emission vertex, and
-      spot/env light-subpath strategies.
+      per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). (3) **Frosted (rough) dielectric** now on-device
+      — only the gate needed relaxing: `refractOrReflect`/`dDielectricStep` already jittered the chosen lobe by
+      per-hit `dMatRoughness` (stochastic-delta, non-connectable, exactly like `bdpt.h`); the old "kernel treats
+      every dielectric as smooth" note was stale. Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991
+      at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). `cudaBdptSupported` relaxed accordingly.
+      REMAINING (deferred): fluorescence re-emission vertex, and spot/env light-subpath strategies.
 - [ ] **M10. Spectral rainbow-phase media on device.** `cudaForwardSupported`/`cudaBackwardSupported`/
       `cudaBdptSupported` all reject rainbow media (device only knows analytic HG). Upload the λ×µ CDF
       (`rainbow.h`) + per-λ importance sampling into the device volume path. Relax the rainbow rejects across

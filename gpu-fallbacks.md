@@ -58,10 +58,19 @@ lobe-selection pdf (`pSel = rhoR/tot` vs `rhoT/tot`) is wavelength-dependent; `d
 uses two-sided guards (allow back hemisphere, skip shadow-terminator, `|cos|` in G) mirroring
 the CPU reference. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp,
 background 1.0026, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased).
+
+**M9 third increment (2026-07-23, 0.36.0):** **frosted (rough) dielectric** is now on-device
+in mode D. This one only needed the gate relaxed: the device `refractOrReflect` already
+jittered the chosen reflect/refract lobe by the per-hit `dMatRoughness` (keeping it on the
+intended side), and `dDielectricStep` in the BDPT random walk already routed through it, so a
+rough dielectric is the same **stochastic-delta** vertex on GPU as on CPU (`bdpt.h` treats
+every dielectric as a non-connectable delta and only jitters its scattered direction). The old
+"kernel treats every dielectric as smooth" note was stale. Validated GPU==CPU on
+`scraps/frosted.ftsl` (Cornell box + rough BK7 sphere): mean B/A=0.9991 at 512 spp, and the
+per-pixel abs diff halves 10.86%→5.73% at 4× spp = unbiased.
 Remaining CPU-only (no device strategy yet):
 | Feature | Why CPU today | Class |
 |---|---|---|
-| Frosted (rough) glass | kernel treats every dielectric as smooth (no microfacet dielectric BSDF) | **portable** |
 | Fluorescence | no re-emission vertex strategy | **portable-hard** |
 | Spot/env/collimated emitters | no light-subpath strategy for them | **portable-hard** |
 | GRIN / rainbow media | straight-segment MIS assumptions / HG-only phase | **inherently-CPU** / rainbow portable-hard |
@@ -98,7 +107,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 2. ~~**Env term in the mode-M GPU gather** (M2)~~ — **DONE 2026-07-23.** Deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image env); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%.
 3. ~~**GPU SPPM** (M3)~~ — **DONE 2026-07-23.** Resident device SPPM session reusing the mode-M deposit + a per-pixel visible-point/gather/update kernel trio; per-pixel progressive state stays on-device across passes. Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%).
 4. ~~**Mode-M final gather on GPU** (M4)~~ — **DONE 2026-07-23.** Device `dPhotonGatherSub` (specular walk → one-bounce density query folding `rho(y)*rho(vis)` per photon; env/specular-emitter reflected off the visible point) + a `fgRays>0` branch in `dPhotonGather` (NEE direct + K cosine sub-rays); `fgRays` threaded through `kGather`/`renderPhotonMapSharedCuda`, `g_pmFinalGather==0` caller gates dropped. Validated GPU==CPU mean 0.43%, background 0.98%, per-pixel noise √-scales with spp.
-5. **Per-hit BSDFs in GPU BDPT** (M9) — **two increments DONE 2026-07-23.** (1) DVertex now stores per-hit `u,v`; `dVertHit` reconstructs a `DHit` so `dBsdfF`/`dBsdfPdf`/`dRandomWalk` evaluate textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps, mix masks, and colored-glass Beer-Lambert — all MIS-safe (same per-hit value in sampler and pdf). Validated GPU==CPU on `textured.ftsl` (mean 0.06%) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided **diffuse-transmit** (translucent) now on-device — both lobes + back-hemisphere connection; `lambda` threaded through `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). Gate `cudaBdptSupported` relaxed accordingly. Still deferred: frosted (rough) dielectric microfacet BSDF, fluorescence vertex, spot/env light-subpath strategies.
+5. **Per-hit BSDFs in GPU BDPT** (M9) — **three increments DONE 2026-07-23.** (1) DVertex now stores per-hit `u,v`; `dVertHit` reconstructs a `DHit` so `dBsdfF`/`dBsdfPdf`/`dRandomWalk` evaluate textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps, mix masks, and colored-glass Beer-Lambert — all MIS-safe (same per-hit value in sampler and pdf). Validated GPU==CPU on `textured.ftsl` (mean 0.06%) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided **diffuse-transmit** (translucent) now on-device — both lobes + back-hemisphere connection; `lambda` threaded through `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). (3) **Frosted (rough) dielectric** now on-device — only the gate needed relaxing; `refractOrReflect`/`dDielectricStep` already jittered the lobe by per-hit roughness (stochastic-delta, same as `bdpt.h`). Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). Gate `cudaBdptSupported` relaxed accordingly. Still deferred: fluorescence re-emission vertex, spot/env light-subpath strategies.
 6. Longer tail: **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
 
 ### Descoped by user (2026-07-23) — NOT scheduled
