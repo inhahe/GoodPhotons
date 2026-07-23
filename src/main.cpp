@@ -5439,15 +5439,23 @@ static int run(int argc, char** argv) {
                     collide = (CollideMode)((collide + 1) % 3);
                     std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
                 }
-                // Reset: in free flight, restore the authored eye + look direction; while
-                // locked to the path, jump back to the start of the timeline and pause.
+                // Reset is the reliable "put me back to a normal, steerable state" escape:
+                // ALWAYS return to free flight at the authored pose. Previously, resetting
+                // while locked to the path only rewound the timeline but LEFT you locked —
+                // with mouse-look suspended — so a user who got locked (e.g. by an accidental
+                // click on the timeline slider, which snaps+locks onto the path) was stuck:
+                // the view wouldn't steer and Reset didn't help. Now Reset also RELEASES the
+                // path lock (and stops playback), so it dependably restores free-flight look.
+                // Rewinding-while-locked is still available via the timeline / Play-from-top.
                 if (nav.reset) {
-                    if (pathMode) { pathPos = 0.0; playing = false; }
-                    else {
-                        eye = eye0; fwd = norml(tgt0 - eye0);
-                        lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
-                        if (lookDist < 1e-4) lookDist = sceneR;
+                    if (pathMode) {
+                        pathMode = false; playing = false;
+                        std::printf("[viewer] path lock OFF (reset -> free flight)\n"); std::fflush(stdout);
                     }
+                    pathPos = 0.0;
+                    eye = eye0; fwd = norml(tgt0 - eye0);
+                    lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+                    if (lookDist < 1e-4) lookDist = sceneR;
                     changed = true;
                 }
 

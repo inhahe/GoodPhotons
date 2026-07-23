@@ -326,8 +326,10 @@ paths they can capture at all**.
 > **Control panel (below the image).** The live window reserves a strip under the
 > preview for on-screen controls, so you don't have to remember key bindings. Two
 > buttons are always present: **Clip** (cycles the same `slide` → `stop` → `noclip`
-> collision modes as `C`, showing the current mode) and **Reset** (jumps back to the
-> start — the authored camera in free flight, or frame 0 of the path when locked).
+> collision modes as `C`, showing the current mode) and **Reset** (a dependable escape:
+> **releases any path-lock and returns to the authored camera in free flight**, so
+> mouse-look always works again afterwards — handy if you accidentally locked onto the
+> path by clicking the timeline).
 > When you entered via `-explore` / `-fly` on a **multi-frame flyby**, the panel also
 > gains the flyby's **camera-path timeline** and its controls:
 >
