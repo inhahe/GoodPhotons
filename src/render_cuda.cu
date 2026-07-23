@@ -4492,9 +4492,11 @@ __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
     double g = 0.0;
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& e = sc.emitters[k];
-        // geomWeight: area/sphere/cylinder = area*PI; env (shape 3) = envGeom = 4*PI^2*R^2
-        // (mirrors Scene::Emitter::geomWeight). Spot/collimated are gated to the CPU.
-        double gw = (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
+        // geomWeight (mirrors Scene::Emitter::geomWeight): area/sphere/cylinder = area*PI;
+        // point-spot (shape 2) = spotOmega (falloff-weighted solid angle); env (shape 3) =
+        // envGeom = 4*PI^2*R^2. Collimated beams are gated to the CPU.
+        double gw = (e.shape == 2) ? e.spotOmega
+                  : (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
                                    : ((double)e.area * DPI);
         g += gw * (double)specLookup(e.emitSpd, lambda);
     }
@@ -4639,9 +4641,32 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     double invPdfLambda, Real lambda, DRng& rng) {
     double total = 0.0;
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
+    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& em = sc.emitters[k];
-        if (em.collimated || em.shape == 2 || em.shape == 3) continue;   // beams/spot/env
+        if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
+        if (em.shape == 2) {
+            // Point spot (device twin of emitterGeom's spot branch): deterministic connect
+            // to the light point, cone falloff toward the surface, no rng draw. Peak
+            // intensity/SPD = 1; the falloff scales it toward the cone edge.
+            DVec3 toL = em.origin - h.p;
+            Real dist2 = dot(toL, toL);
+            Real dist  = sqrt(dist2);
+            DVec3 wi = toL / dist;
+            Real cosSurf = dot(h.n, wi);
+            if (cosSurf <= (Real)0) continue;
+            Real stG = dShadowTerminatorG(wi, h.n, ngo0);
+            if (stG <= (Real)0) continue;
+            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+            if (fall <= (Real)0) continue;
+            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+            double contrib = (double)(f * fall * cosSurf / dist2 * stG) * emitW;
+            if (sc.mediaN > 0)
+                contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, dist, lambda, rng);
+            total += contrib;
+            continue;
+        }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
         emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
@@ -4691,7 +4716,24 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
     if (alb <= (Real)0) return 0.0;
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& em = sc.emitters[k];
-        if (em.collimated || em.shape == 2 || em.shape == 3) continue;   // beams/spot/env
+        if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnvVolume)
+        if (em.shape == 2) {
+            // Point spot at a volume vertex (device twin of neeVolume's spot branch): no
+            // surface cosine, cone falloff only; HG phase toward the light supplies the pdf.
+            DVec3 toL = em.origin - p;
+            Real dist2 = dot(toL, toL);
+            Real dist  = sqrt(dist2);
+            DVec3 wi = toL / dist;
+            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+            if (fall <= (Real)0) continue;
+            if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            Real phase = hgPhase(dot(wIn, wi), g);
+            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+            double contrib = (double)(alb * phase * fall / dist2) * emitW;
+            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
+            total += contrib;
+            continue;
+        }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
         emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
@@ -7076,8 +7118,9 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // environment light ARE supported (media: homogeneous + heterogeneous, minus
     // GRIN/rainbow; fluorescence: the bispectral Stokes-shift adjoint; env: bkNeeEnv /
     // bkNeeEnvVolume + MIS'd env-miss, constant only — an IMAGE env stays on the CPU).
-    // Only area/sphere/cylinder Lambertian emitters otherwise (spot/collimated fall back
-    // to the CPU). Textured albedo IS supported (dDiffuseRho ports it). dInvPdfLambda is
+    // Emitters: area/sphere/cylinder Lambertian AND point-spot lights (bkNeeLight /
+    // bkNeeVolume spot branch); only collimated beams (not NEE-samplable) fall back to
+    // the CPU. Textured albedo IS supported (dDiffuseRho ports it). dInvPdfLambda is
     // exact (geomWeight = area*PI for area emitters, 4pi^2 R^2 for the env emitter).
     if (!cudaForwardSupported(scene)) return false;
     // Participating media now run on the device backward walk (dMediaSampleCollision /
@@ -7092,8 +7135,9 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     for (size_t i = 0; i < scene.emitters.size(); ++i) {
         if ((int)i == scene.envIndex) continue;    // constant env: handled by bkNeeEnv, not area NEE
         const auto& em = scene.emitters[i];
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
-            return false;
+        if (em.collimated) return false;                    // collimated beams: not NEE-samplable, CPU only
+        if (em.shape == EmitterShape::Env) return false;    // stray (non-env) env-shape emitter: CPU
+        // Spot lights ARE supported now (bkNeeLight / bkNeeVolume point-spot branch).
     }
     // A physical lens deeper than the device cap falls back to the CPU tracer.
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;

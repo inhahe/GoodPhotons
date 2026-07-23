@@ -108,7 +108,23 @@ sample. This is the fastest, most POV-Ray-like path.
     haze, exercises `bkNeeEnvVolume` + HG-phase env-miss MIS): **0.23%** luminance,
     XYZ within 0.3%, block residual 1.82%→1.10%→0.49%. Compare tool
     `scraps/cmp_ftbuf.py`.
-  - [ ] 1d — spot / collimated / env-EMITTER sampling + pdf in backward NEE (image env)
+  - [~] **1d — spot / collimated / image-env emitter sampling + pdf in backward NEE.**
+    - [x] **Point-spot lights.** Ported into `bkNeeLight` (surface) and `bkNeeVolume`
+      (fog vertex): deterministic connect to `em.origin`, `spotFalloff` cone weight,
+      Beer-Lambert shadow transmittance, no rng draw (matches the CPU `emitterGeom` /
+      `neeVolume` spot branch). Added the spot geomWeight (`spotOmega`) to
+      `dInvPdfLambda` and relaxed the gate to accept spot emitters. **Validated** vs CPU
+      on `_spot_cornell` (single down-aimed spot, cone 18°/32°): raw film radiance
+      agrees to **0.17%** in absolute luminance, per-channel XYZ within 0.2% (no scale
+      bias → the spotOmega weight + falloff are exact). Structural residual is noisier
+      (4.1%→2.4%→1.4% at 8/16/32 px) because a spot casts a hard-edged high-contrast
+      pool, but falls monotonically = noise only.
+    - [ ] **Collimated beams** — intentionally kept on the CPU: a zero-solid-angle beam
+      is not NEE-samplable (the CPU tracer also skips it in NEE), so a backward path can
+      essentially never connect to it; the gate still routes collimated scenes to CPU.
+    - [ ] **Image-based environment** (lat-long map): env-NEE via the luminance CDF
+      (`dEnvSample`), image env-miss with `envPdfDir`, and the per-texel radiance
+      reweight. Deferred; a constant env already works (1c).
 - [ ] Stage 2: fast RGB backward (Option B)
 - [ ] Stage 3: scene-ignore flags
 - [ ] Stage 4: `-explore` integration

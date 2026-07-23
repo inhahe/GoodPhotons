@@ -502,11 +502,12 @@ that converges to the same physical image.
   fluorescent tracer). GPU-accelerated (its own backward megakernel, which also drives
   the **physical multi-element lens** camera on the GPU). It gets **noisy on caustics**
   (light focused through glass/water is hard to find backward). *GPU scope:* the
-  megakernel covers area/sphere/cylinder Lambertian lights, all the specular/textured
-  materials, **participating media** (homogeneous + heterogeneous), **fluorescence**
-  and a **constant environment light** (env-NEE + MIS'd env-miss, at surface *and* fog
-  vertices); scenes using an **image-based** environment or spot/collimated lights (plus
-  GRIN / rainbow-dispersive media) still fall back to the CPU tracer automatically.
+  megakernel covers area/sphere/cylinder Lambertian **and point-spot** lights, all the
+  specular/textured materials, **participating media** (homogeneous + heterogeneous),
+  **fluorescence** and a **constant environment light** (env-NEE + MIS'd env-miss, at
+  surface *and* fog vertices); scenes using an **image-based** environment or collimated
+  beams (plus GRIN / rainbow-dispersive media) still fall back to the CPU tracer
+  automatically.
 - **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
   check, not a production renderer (roughly twice the work).
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for

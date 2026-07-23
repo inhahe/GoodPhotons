@@ -99,7 +99,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`bkNeeEnv` surface-vertex + `bkNeeEnvVolume` fog-vertex env-NEE, uniform-sphere
   sample, balance-heuristic MIS against a tracked `contBsdfPdf`, MIS'd env-miss on
   ray escape; `envIndex` + env geomWeight added to `DScene`/`dInvPdfLambda`) — an
-  IMAGE-based env still routes the backward pass to CPU.
+  IMAGE-based env still routes the backward pass to CPU. Since 0.26.0 it also does
+  **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
+  `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
+  collimated beams (not NEE-samplable) still force the CPU backward tracer.
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror
