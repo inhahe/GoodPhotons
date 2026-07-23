@@ -164,6 +164,19 @@ HIP portability note: the alias block deliberately does **not** alias
 `__shfl_sync`, so a HIP build fails loudly at kRasterMed instead of silently
 mis-broadcasting on wave64 GPUs (see known-issues).
 
+**GPU clock keep-warm (interactive explorer).** The explorer re-renders one frame
+per camera move, then idle-sleeps — a bursty, low-duty submission pattern the
+NVIDIA driver's DVFS reads as "idle", parking the card in its lowest power state
+(measured RTX 4090: **P8 @ 210 MHz** vs **P0/P2 @ 2520–2775 MHz** under load, a
+~13× clock drop; ~33× for a cold first frame). That made each fresh mouse-look
+burst pay a cold-clock penalty until continuous motion finally ramped the clocks.
+Fix (`main.cpp` explorer loop): for `kWarmGraceSec` (2.5 s) after the last real
+interaction the loop keeps submitting GPU render work even when the frame hasn't
+changed (a discarded "warm-only" `rasterOne` that never touches the window) and
+skips the idle sleep, holding the boost clock through an active session; past the
+grace window it falls back to the 15 ms passive sleep and the card powers down to
+P8. Gated on the discrete-GPU path (`gpuRaster != nullptr`); CPU raster unaffected.
+
 ## Threading model (CPU)
 
 Band/chunk parallelism via `std::thread` pools sized by `hardware_concurrency`;

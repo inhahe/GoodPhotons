@@ -5,6 +5,31 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — DONE (2026-07-23): interactive `-explore`/`-fly` felt intermittently slow (GPU parked in its idle power state between mouse-look bursts)
+
+Users reported the GPU rasterizer explorer being slow right after launch on
+`scenes/gallery_settled.ftsl`, then "suddenly fast" after moving around for a second or
+two in the *same* window (no resize, no restart), then slow again on a fresh `-explore`
+relaunch. This was NOT a rasterizer regression — `-raster-bench 200` on that scene reports
+**3.91 ms/frame (255 fps)** at 1440×810 warm, so the kernels are fast (the 92% speedup a
+prior session landed is real). The intermittency was **GPU DVFS**: the explorer re-renders
+ONE frame per camera move, then idle-sleeps 15 ms, so the NVIDIA driver reads the bursty,
+low-duty submission pattern as "idle" and parks the card in its lowest power state. Measured
+live on an RTX 4090 with `nvidia-smi`: **P8 @ 210 MHz idle vs P0/P2 @ 2520–2760 MHz under
+sustained load — a ~13× clock drop**, and ~33× slower for a first cold frame once
+first-frame allocations are added (an early interactive frame timed at ~130 ms / 7.6 fps vs
+3.9 ms warm). Only a second or two of *continuous* motion built enough sustained load to
+ramp the clocks — exactly the "slow → suddenly fast → slow again after relaunch" pattern.
+
+**Fix (main.cpp, explorer loop):** a GPU clock keep-warm grace window. For `kWarmGraceSec`
+(2.5 s) after the last real interaction, the loop keeps submitting GPU render work even when
+the frame hasn't changed — a "warm-only" `rasterOne` whose result is discarded and never
+touches the window/overlay — and skips the idle sleep, so the driver holds the boost clock
+through an active exploration session. Once the user is idle past the grace window the loop
+falls back to the passive 15 ms sleep and lets the card power all the way down. Gated on the
+discrete-GPU path (`gpuRaster != nullptr`); the CPU rasterizer is unaffected. Net effect:
+mouse-look no longer pays the cold-clock penalty on every fresh burst.
+
 ### BUG — DONE (2026-07-22): a group-scaled collimated beam lit only half its footprint (offset by half its width from the aim point)
 
 A group-scaled `light collimated { ... }` illuminated only one half of its `w×w`
