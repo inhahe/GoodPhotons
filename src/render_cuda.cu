@@ -589,6 +589,10 @@ struct DEnvMap {
     double rot = 0.0;                     // horizontal rotation in [0,1) turns
     const double* coeff = nullptr;        // 3*w*h : texel i -> coeff[3i .. 3i+2]
     const double* scale = nullptr;        // w*h   : per-texel brightness (non-null => image env)
+    // Normalised illuminant baked over [DLMIN,DLMAX] (SPEC_N). The forward reweight
+    // cancels the illuminant, but image-env NEE (bkNeeEnv) needs the ABSOLUTE radiance
+    // L(dir,lambda) = scale*reflAt(coeff,lambda)*illum(lambda), so upload it.
+    const double* illum = nullptr;        // SPEC_N : illumAt(lambda), non-null iff image env
     double avgCoeff[3] = {0, 0, 0};
     double avgScale = 0.0;
     const double* margCdf     = nullptr;  // h+1
@@ -3514,6 +3518,34 @@ __device__ static int dEnvTexel(const DEnvMap& e, const DVec3& d) {
     return row * e.w + col;
 }
 
+// Absolute env radiance in a direction (mirrors EnvMap::radiance): the per-texel JH
+// reflectance times the baked normalised illuminant. Image env only (e.scale non-null).
+__device__ static double dEnvRadiance(const DEnvMap& e, const DVec3& d, Real lambda) {
+    int ti = dEnvTexel(e, d);
+    double refl = (double)dReflAt(&e.coeff[3 * ti], lambda) * e.scale[ti];
+    return refl * (double)specLookup(e.illum, lambda);
+}
+
+// Solid-angle pdf of the env importance sampler for a direction (mirrors EnvMap::pdf /
+// Distribution2D::pdf): condFunc[iv*w+iu]/margFuncInt divided by the lat-long Jacobian
+// 2*PI^2*sin(theta). Image env only.
+__device__ static double dEnvPdf(const DEnvMap& e, const DVec3& d) {
+    const double PI = 3.14159265358979323846;
+    double y = fmin(fmax((double)d.y, -1.0), 1.0);
+    double theta = acos(y);
+    double phi = atan2((double)d.z, (double)d.x);
+    double v = theta / PI;
+    double u = phi / (2.0 * PI) + 0.5 - e.rot;
+    u -= floor(u);
+    int iu = (int)(u * e.w); if (iu < 0) iu = 0; if (iu >= e.w) iu = e.w - 1;
+    int iv = (int)(v * e.h); if (iv < 0) iv = 0; if (iv >= e.h) iv = e.h - 1;
+    if (e.margFuncInt == 0.0) return 0.0;
+    double sinT = sin(theta);
+    if (sinT <= 0.0) return 0.0;
+    double distPdf = e.condFunc[(size_t)iv * e.w + iu] / e.margFuncInt;
+    return distPdf / (2.0 * PI * PI * sinT);
+}
+
 // ---- shared photon physics (megakernel + wavefront share these exactly) ----
 // Both backends run identical physics; only the *scheduling* of the two stages
 // differs (megakernel: an inner per-thread loop; wavefront: separate coherent
@@ -4841,12 +4873,22 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
 __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
                                   double invPdfLambda, Real lambda, DRng& rng) {
     if (sc.envIndex < 0) return 0.0;
-    // Uniform-sphere sample (constant env), solid-angle pdf 1/4pi.
-    double z = 1.0 - 2.0 * (double)rng.uniform();
-    double sr = sqrt(fmax(0.0, 1.0 - z * z));
-    double phi = 2.0 * DPI * (double)rng.uniform();
-    DVec3 wi{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-    double pdfW = 1.0 / (4.0 * DPI);
+    // Sample an incoming env direction: image env importance-samples the luminance CDF
+    // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
+    // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
+    // scene.sampleEnvDir, so the estimator matches.
+    DVec3 wi; double pdfW;
+    const bool imageEnv = (sc.env.scale != nullptr);
+    if (imageEnv) {
+        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
+        if (pdfW <= 0.0) return 0.0;
+    } else {
+        double z = 1.0 - 2.0 * (double)rng.uniform();
+        double sr = sqrt(fmax(0.0, 1.0 - z * z));
+        double phi = 2.0 * DPI * (double)rng.uniform();
+        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        pdfW = 1.0 / (4.0 * DPI);
+    }
     Real cosSurf = dot(h.n, wi);
     if (cosSurf <= (Real)0) return 0.0;                     // below the shading horizon
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
@@ -4854,7 +4896,8 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
     if (stG <= (Real)0) return 0.0;                         // behind true geometry: hard shadow
     double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
     if (occluded(sc, h.p + ngo * RAY_EPS, wi, (Real)farDist)) return 0.0;
-    double Lenv = (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+    double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
+                           : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
     double pdfBsdf = (double)cosSurf / DPI;                 // cosine-hemisphere pdf for wi
     double wMis = pdfW / (pdfW + pdfBsdf);                  // balance heuristic
@@ -4875,14 +4918,22 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
     Real g   = (Real)med.g;
     Real alb = medAlbedo(med, lambda);
     if (alb <= (Real)0) return 0.0;
-    double z = 1.0 - 2.0 * (double)rng.uniform();
-    double sr = sqrt(fmax(0.0, 1.0 - z * z));
-    double phi = 2.0 * DPI * (double)rng.uniform();
-    DVec3 wi{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-    double pdfW = 1.0 / (4.0 * DPI);
+    DVec3 wi; double pdfW;
+    const bool imageEnv = (sc.env.scale != nullptr);
+    if (imageEnv) {
+        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
+        if (pdfW <= 0.0) return 0.0;
+    } else {
+        double z = 1.0 - 2.0 * (double)rng.uniform();
+        double sr = sqrt(fmax(0.0, 1.0 - z * z));
+        double phi = 2.0 * DPI * (double)rng.uniform();
+        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        pdfW = 1.0 / (4.0 * DPI);
+    }
     double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
     if (occluded(sc, p + wi * RAY_EPS, wi, (Real)farDist)) return 0.0;
-    double Lenv = (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+    double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
+                           : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
     Real phase = hgPhase(dot(wIn, wi), g);                  // HG phase == its own pdf
     double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
@@ -4936,11 +4987,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // MIS-weighted (balance heuristic) on a diffuse/volume arrival against the
             // env-NEE already done at the previous vertex, to avoid double-counting.
             if (sc.envIndex >= 0) {
-                double Lenv = (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda) * invPdfLambda;
+                const bool imageEnv = (sc.env.scale != nullptr);
+                double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lambda)
+                                        : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda))
+                              * invPdfLambda;
                 if (specularArrival) {
                     L += thr * Lenv;
                 } else {
-                    double pdfEnv = 1.0 / (4.0 * DPI);         // constant env: uniform sphere
+                    double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     double wMis = (contBsdfPdf + pdfEnv > 0.0)
                                       ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                     L += thr * Lenv * wMis;
@@ -6813,9 +6867,16 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             condFunc.insert(condFunc.end(), c.func.begin(), c.func.end());
             condFuncInt[v] = c.funcInt;
         }
+        // Bake the normalised illuminant over [DLMIN,DLMAX] for image-env NEE.
+        std::vector<double> illumTab(SPEC_N);
+        for (int i = 0; i < SPEC_N; ++i) {
+            double wl = DLMIN + (double)i / (SPEC_N - 1) * (DLMAX - DLMIN);
+            illumTab[i] = em.illumAt(wl);
+        }
         denv.w = w; denv.h = h; denv.rot = em.rotOffset;
         denv.coeff = (double*)keep(uploadVec(coeffFlat));
         denv.scale = (double*)keep(uploadVec(em.scaleT));
+        denv.illum = (double*)keep(uploadVec(illumTab));
         denv.avgCoeff[0] = em.avgCoeff[0];
         denv.avgCoeff[1] = em.avgCoeff[1];
         denv.avgCoeff[2] = em.avgCoeff[2];
@@ -7481,9 +7542,10 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // only knows the analytic HG lobe). Those fall back to the CPU backward tracer.
     if (grin::sceneHasGrin(scene)) return false;
     for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
-    // Constant environment light IS supported (bkNeeEnv / bkNeeEnvVolume / env-miss with
-    // MIS); an IMAGE env (lat-long map) still falls back to the CPU tracer.
-    if (scene.envIndex >= 0 && scene.envMap) return false;
+    // Environment light IS supported on the device backward walk: a CONSTANT env
+    // (bkNeeEnv / bkNeeEnvVolume / env-miss with MIS) and now an IMAGE env (lat-long
+    // map — importance-sampled via dEnvSample, evaluated via dEnvRadiance/dEnvPdf, with
+    // the baked illuminant table). Neither forces a CPU fallback (M1).
     for (size_t i = 0; i < scene.emitters.size(); ++i) {
         if ((int)i == scene.envIndex) continue;    // constant env: handled by bkNeeEnv, not area NEE
         const auto& em = scene.emitters[i];

@@ -1698,6 +1698,57 @@ start with the backward tracer (R) as the reference, then propagate the shared `
 
 ---
 
+## M. GPU fallback closure — port CPU-only features/modes to the GPU  *(ftrace renderer; audit in `gpu-fallbacks.md`, greenlit by user 2026-07-23)*
+
+Close the GPU/CPU-fallback gaps found by auditing every `cuda*Supported()` predicate.
+Full rationale + per-feature classification lives in `gpu-fallbacks.md`. Ordered by the
+recommended priority (quickest, highest-value wins first). Check each off as it lands and
+mark the corresponding row in `gpu-fallbacks.md`.
+
+- [x] **M1. Image-based env NEE in GPU backward (mode R).** *(done 2026-07-23)* `cudaBackwardSupported`
+      rejected an image env (`scene.envMap`) → CPU. The forward path already uploads the lat-long luminance
+      2-D CDF + per-texel JH coeff/scale and samples it on-device; added `dEnvRadiance`/`dEnvPdf`, uploaded
+      the previously-canceled illuminant table (`DEnvMap::illum`), and wired the on-device env sampler into
+      `bkNeeEnv` / `bkNeeEnvVolume` (+ MIS'd env-miss) so a lat-long env stays on the GPU. Dropped the
+      `scene.envMap` reject. Also unblocks mode P camera-side. **Validated:** GPU vs CPU backward on
+      `scenes/envmap.ftsl` at 8192 spp match to 0.14% in linear radiance (background sky 0.15%); the earlier
+      ~5% gap was noisy p99 auto-exposure, not radiance.
+- [ ] **M2. Env term in the mode-M GPU gather.** `cudaPhotonMapSupported` (render_cuda.cu:7842) rejects ANY
+      env light because device `kGather` has no env term (CPU `photonGather` adds env on escape / at diffuse
+      hits). Add the env term to the gather kernel; drop the `envIndex >= 0` reject. Validate vs CPU.
+- [ ] **M3. GPU SPPM (mode S).** Currently CPU-only (`sppm_render.h`). Build a device SPPM: repeated bounded
+      photon-deposit passes (reuse the forward deposit kernel) + radius-shrinking gather (reuse `kGather`),
+      accumulating per-pixel flux with the Hachisuka radius-shrink (`-sppmalpha`). Reuse the mode-M
+      deposit/grid/gather infrastructure. Validate vs CPU SPPM at equal passes.
+- [ ] **M4. Mode-M final gather on GPU.** Device gather does only the direct density estimate; final gather
+      (`g_pmFinalGather > 0`) stays CPU (caller-gated, main.cpp:6034/6441). Port the secondary gather-ray
+      bounce to the device so `-pmfg` runs on the GPU. High value (final gather is the quality mode).
+- [ ] **M9. Per-hit BSDFs in GPU BDPT (mode D).** `cudaBdptSupported` rejects every per-hit BSDF because the
+      connection BSDF (`dBsdfF`/`dBsdfPdf`) has no `Hit` in scope, so it would bias MIS. Thread the `Hit`
+      through `dConnect`/`dBsdfF`/`dBsdfPdf` and port the full set: diffuse-transmit + frosted/colored glass
+      (highest value), then textured albedo, fluorescence, roughness/film-thickness textures & patterns, mix
+      masks, and records. Also add light-subpath strategies for spot/env emitters. Relax the corresponding
+      rejects in `usesTexOrFluoro` + the emitter loop as each lands.
+- [ ] **M10. Spectral rainbow-phase media on device.** `cudaForwardSupported`/`cudaBackwardSupported`/
+      `cudaBdptSupported` all reject rainbow media (device only knows analytic HG). Upload the λ×µ CDF
+      (`rainbow.h`) + per-λ importance sampling into the device volume path. Relax the rainbow rejects across
+      forward, backward, and BDPT.
+- [ ] **M11. GRIN (gradient-index) media on device backward.** `cudaBackwardSupported` rejects GRIN (no
+      Eikonal marcher in `bkRadiance`). Port the Eikonal ray-marcher to the device volume walk. Relax the
+      `grin::sceneHasGrin` reject in backward (BDPT stays CPU — straight-segment MIS).
+- [ ] **M12. GPU VCM (mode U).** Currently CPU-only (`vcm.h`). Largest/last: needs GPU BDPT correctness
+      (from M9) plus photon merging under one MIS weight. Reuse M3's device SPPM merge + GPU BDPT connect.
+
+**Descoped by user (2026-07-23) — not scheduled:** indexed-spectral palette maps on device forward,
+Layered material on device, participating media in the RGB fast path, and textured/record albedo in the
+RGB fast path. These stay on their current CPU/spectral fallbacks.
+
+Left on CPU **by design** (not in this list): collimated beams (not NEE-samplable), dispersion-dependent
+materials in the RGB fast path (inherently spectral), and fixed-cap overflows (oversized multilayer/mix,
+>64-stop driven records, over-deep lens). See `gpu-fallbacks.md` → "Left on CPU by design".
+
+---
+
 ## Progress log
 - 2026-07-19: **J3c started (option-a) — GPDA vendored + shared grammar reads the record block.** Stood up
   `loom/grammar/`: vendored the pinned tokenized `gpda.py` as `_gpda.py` (GraphParser commit 1ac4cbf,

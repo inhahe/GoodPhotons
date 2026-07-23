@@ -98,8 +98,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   device material). Since 0.25.0 it does a **constant environment light**
   (`bkNeeEnv` surface-vertex + `bkNeeEnvVolume` fog-vertex env-NEE, uniform-sphere
   sample, balance-heuristic MIS against a tracked `contBsdfPdf`, MIS'd env-miss on
-  ray escape; `envIndex` + env geomWeight added to `DScene`/`dInvPdfLambda`) — an
-  IMAGE-based env still routes the backward pass to CPU. Since 0.26.0 it also does
+  ray escape; `envIndex` + env geomWeight added to `DScene`/`dInvPdfLambda`). Since
+  0.30.0 (M1) it also handles an **IMAGE-based (lat-long HDR) env** on the GPU
+  backward: `bkNeeEnv`/`bkNeeEnvVolume` branch on `sc.env.scale != nullptr` and
+  importance-sample the map on-device via `dEnvSample` (the forward path's luminance
+  2-D CDF), with `dEnvRadiance` (per-texel JH `coeff`·`scale`·`illum`) and `dEnvPdf`
+  for MIS-consistent env-miss; the previously-canceled illuminant table is uploaded
+  as `DEnvMap::illum`. Validated GPU==CPU to 0.14% in linear radiance at 8192 spp.
+  Since 0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.

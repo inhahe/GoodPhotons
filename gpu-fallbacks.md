@@ -27,7 +27,7 @@ Status legend: **portable** (worth doing) · **portable-hard** (large but feasib
 Everything forward rejects, **plus**:
 | Feature | Why CPU today | Class |
 |---|---|---|
-| **Image-based env NEE** (lat-long map) | `bkNeeEnv`/`bkNeeEnvVolume` don't call the device image-env sampler — but the forward path *already* uploads the luminance CDF + per-texel coeffs and samples it on-device | **portable — top pick** (sampler already exists on device) |
+| ~~Image-based env NEE (lat-long map)~~ | **DONE (M1, 2026-07-23)** — added `dEnvRadiance`/`dEnvPdf`, uploaded the illuminant table, wired the device env sampler into `bkNeeEnv`/`bkNeeEnvVolume` + MIS'd env-miss; dropped the `envMap` reject. Validated GPU==CPU to 0.14% at 8192 spp. | ✅ |
 | GRIN media | `bkRadiance` has no Eikonal ray-marcher | **portable-hard** |
 | Collimated beams / stray Env-shape emitter | not NEE-samplable even on CPU | **inherently-CPU** (low value) |
 | Lens deeper than `D_MAXLENS` | fixed device cap | low value |
@@ -77,13 +77,18 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 
 ---
 
-## Recommended priority (quickest wins first)
+## Scheduled work (greenlit by user 2026-07-23) — quickest wins first
 
-1. **Image-based env NEE in GPU backward** — sampler already on device; wire into `bkNeeEnv`. Also unblocks mode P camera-side.
-2. **Env term in the mode-M GPU gather** — small kernel addition; unblocks env-lit photon maps.
-3. **GPU SPPM** — reuses existing deposit + gather kernels; biggest quality-mode win.
-4. **Mode-M final gather on GPU** — high value, more work.
-5. Longer tail: **indexed palette** + **Layered material** on device forward; **participating media** + **textured/record albedo** in the RGB walk; **diffuse-transmit / frosted-colored glass** in GPU BDPT; **rainbow media** on device; **GRIN marcher**; **GPU VCM**.
+1. ~~**Image-based env NEE in GPU backward** (M1)~~ — **DONE 2026-07-23.** Added `dEnvRadiance`/`dEnvPdf`, uploaded the illuminant table, wired the device env sampler into `bkNeeEnv`/`bkNeeEnvVolume` + MIS'd env-miss; dropped the `envMap` reject. Validated GPU==CPU to 0.14% at 8192 spp. Also unblocks mode P camera-side.
+2. **Env term in the mode-M GPU gather** (M2) — small kernel addition; unblocks env-lit photon maps.
+3. **GPU SPPM** (M3) — reuses existing deposit + gather kernels; biggest quality-mode win.
+4. **Mode-M final gather on GPU** (M4) — high value, more work.
+5. Longer tail: **per-hit BSDFs in GPU BDPT** (M9); **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
+
+### Descoped by user (2026-07-23) — NOT scheduled
+Left on their current CPU/spectral fallbacks: **indexed-spectral palette maps** on device forward,
+**Layered material** on device, **participating media in the RGB fast path**, and **textured/record
+albedo in the RGB fast path**.
 
 ## Left on CPU by design (do NOT port)
 Collimated beams (not NEE-samplable), dispersion-dependent materials in the RGB fast

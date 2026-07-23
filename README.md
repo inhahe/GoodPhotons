@@ -504,9 +504,10 @@ that converges to the same physical image.
   (light focused through glass/water is hard to find backward). *GPU scope:* the
   megakernel covers area/sphere/cylinder Lambertian **and point-spot** lights, all the
   specular/textured materials, **participating media** (homogeneous + heterogeneous),
-  **fluorescence** and a **constant environment light** (env-NEE + MIS'd env-miss, at
-  surface *and* fog vertices); scenes using an **image-based** environment or collimated
-  beams (plus GRIN / rainbow-dispersive media) still fall back to the CPU tracer
+  **fluorescence** and **both constant *and* image-based (lat-long HDR) environment
+  lights** (env-NEE + MIS'd env-miss, at surface *and* fog vertices — the image env is
+  importance-sampled on-device from its luminance CDF); scenes using collimated beams
+  (plus GRIN / rainbow-dispersive media) still fall back to the CPU tracer
   automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
   sampling one wavelength per sample it carries an RGB throughput triple and does one
   intersection walk per full-colour sample, so a clean colour image converges much
