@@ -129,7 +129,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   visible point. `fgRays` is threaded through `kGather`→`renderPhotonMapSharedCuda` and the
   `g_pmFinalGather==0` caller gates in `main.cpp` were dropped. Validated GPU==CPU on a Cornell
   glass-sphere+diffuse-walls box (mean 0.43%, background 0.98%, per-pixel noise √-scaling with
-  spp — unbiased). Since 0.26.0 it also does
+  spp — unbiased). Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
+  surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords
+  (`u,v`) and `dVertHit` reconstructs a minimal `DHit`, so `dBsdfF`/`dBsdfPdf` and the random
+  walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the
+  pdf/eval (MIS-safe: a textured albedo changes only `f`, not the cosine pdf; per-hit glossy
+  roughness feeds the same `dMatRoughness` into sampler and pdf). On-device now: textured/
+  patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps,
+  mix blend masks, and Beer–Lambert **colored-glass** interior absorption (delta vertex →
+  throughput only, mirroring `bdpt.h`'s `curAbsorb`). `cudaBdptSupported` relaxed to reject only
+  **frosted (rough) glass**, **fluorescence**, **diffuse-transmit**, and spot/env emitters (no
+  device strategy yet). Validated GPU==CPU on `textured.ftsl` (mean 0.06%, background 0.00%,
+  per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased) and `mixmat.ftsl` (mean 0.21%). Since
+  0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.

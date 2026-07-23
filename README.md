@@ -656,17 +656,21 @@ stay non-resumable.
   **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
   GPU-accelerated now — the device sphere-traces the same field expressions, runs the
   same pattern VM, and threads the interior-absorption medium through both the forward
-  and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
-  material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
-  reproduce. **Parametric records** (a material's slots driven by a per-hit driver
-  sampling a named LUT bank — see *Parametric records* below) run on the **GPU forward
-  and backward tracers for both the reflect/albedo and roughness slots** (constant stop
-  selectors bake into the device material; per-hit driven reflect uploads the record's
-  baked LUT + driver program, and a driven scalar/roughness slot uploads each stop's
-  compiled expression + driver — both sampled on-device by exact twins of the CPU
-  sampler). **Any** record-bound scene still falls back on GPU **BDPT** (mode `D`) —
-  its MIS connection BSDF has no per-hit surface point to evaluate the driver. The
-  fallback is automatic. `cpu` is fully deterministic and is used for reference/validation baselines.
+  and backward tracers. GPU **BDPT** (mode `D`) now threads the **per-hit surface point**
+  (texcoords stored on each path vertex, reconstructed into a `Hit` for the connection
+  BSDF) so textured/patterned/record-driven diffuse albedo & glossy reflect, per-hit
+  glossy roughness + thin-film maps, mix blend masks, and Beer–Lambert **colored-glass**
+  interior absorption all render **on-device** with MIS-consistent densities; it still
+  falls back only for **frosted (rough) glass**, **fluorescence**, **diffuse-transmit**,
+  and **spot/env** emitters (no device strategy yet). **Parametric records** (a
+  material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
+  records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
+  reflect/albedo and roughness slots** (constant stop selectors bake into the device
+  material; per-hit driven reflect uploads the record's baked LUT + driver program, and a
+  driven scalar/roughness slot uploads each stop's compiled expression + driver — both
+  sampled on-device by exact twins of the CPU sampler; mode `D`'s connection BSDF
+  reconstructs the per-hit point to sample the driver). The fallback is automatic. `cpu`
+  is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -885,9 +889,10 @@ sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled 
 Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
 is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
 A record driving the **reflect/albedo** *or* **roughness** slot runs on the **GPU**
-forward and backward tracers (the LUT/stop programs + driver upload to the device and
-are sampled by device twins of the CPU sampler); any record-bound scene still falls back
-on **GPU BDPT** (mode `D`). Fallback is automatic. See FTSL.md §7.5 for the full grammar.
+forward, backward, **and BDPT (`D`)** tracers (the LUT/stop programs + driver upload to
+the device and are sampled by device twins of the CPU sampler; mode `D`'s connection BSDF
+reconstructs the per-hit point to sample the driver). Fallback is automatic. See FTSL.md
+§7.5 for the full grammar.
 
 ---
 
@@ -1535,9 +1540,11 @@ Bind a pattern anywhere a scalar `texture:<name>` map is accepted, using
 weight makes the *material itself* — colour **and** BSDF type — vary from point to
 point (checkerboard of red vs green diffuse, noise-selected metal vs glass, …). See
 `scenes/procedural.ftsl`. *(GPU: patterns run on the device forward and backward
-paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT is the
-exception — its MIS kernel falls back to the CPU for any pattern or frosted/colored
-glass.)*
+paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
+(mode `D`) now runs pattern-driven diffuse albedo / glossy reflect & roughness, thin-film
+maps, mix `weight_map` masks, and colored glass on-device too (per-hit point threaded
+through its MIS kernel); only **frosted (rough)** glass still falls back to the CPU
+there.)*
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`

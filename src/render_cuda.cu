@@ -4402,7 +4402,22 @@ struct DVertex {
     int   lightIdx;             // sc.emitters index if emissive, else -1
     double mediumG;             // HG asymmetry g at a BV_MEDIUM vertex
     int   mediumId;             // sc.media index at a BV_MEDIUM vertex (-1 otherwise)
+    Real  u, v;                 // interpolated surface texcoords (per-hit BSDF eval, M9)
 };
+
+// Reconstruct a minimal DHit at a surface vertex so the per-hit material helpers
+// (dDiffuseRho / dReflectSlot / dMatRoughness / dRecordReflect / dMixResolveChild) can
+// evaluate textured / patterned / record-driven params on the connection BSDF exactly as
+// the sampler did — the enabler for per-hit BSDFs in GPU BDPT (M9). Only p/n/ng/u/v are
+// read by those helpers (t/valid/sensorId are unused there).
+__device__ static inline DHit dVertHit(const DVertex& vt) {
+    DHit h;
+    h.t = (Real)0; h.valid = true;
+    h.p = vt.p; h.n = vt.ns; h.ng = vt.ng;
+    h.matId = vt.matId; h.sensorId = -1;
+    h.u = vt.u; h.v = vt.v;
+    return h;
+}
 
 __device__ static inline double ddot(const DVec3& a, const DVec3& b) {
     return (double)a.x * b.x + (double)a.y * b.y + (double)a.z * b.z;
@@ -4447,18 +4462,24 @@ __device__ static inline double dGlossyExp(double roughness) {
 }
 
 // BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L).
-__device__ static double dBsdfF(const DScene& sc, int matId, const DVec3& ns,
+// Takes the full DVertex so textured/patterned/record-driven albedo & roughness are
+// evaluated per-hit (M9) — the reconstructed DHit feeds dDiffuseRho / dReflectSlot /
+// dMatRoughness exactly as the sampler used them, so MIS densities stay consistent.
+__device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
                                 const DVec3& wo, const DVec3& wi, Real lambda) {
-    const DMaterial& m = sc.mats[matId];
+    const DMaterial& m = sc.mats[vt.matId];
+    const DVec3& ns = vt.ns;
     double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
     if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
-        double rho = clamp01(specLookup(m.reflect, lambda));
+        DHit h = dVertHit(vt);
+        double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
         return rho / DPI;
     } else if (m.type == D_GLOSSY) {
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
-        double r = clamp01(specLookup(m.reflect, lambda));
-        double e = dGlossyExp(m.roughness);
+        DHit h = dVertHit(vt);
+        double r = clamp01(dReflectSlot(sc, m, h, lambda));
+        double e = dGlossyExp((double)dMatRoughness(sc, m, h));
         DVec3 mdir = reflectv(wo * (Real)-1, ns);
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
@@ -4468,16 +4489,20 @@ __device__ static double dBsdfF(const DScene& sc, int matId, const DVec3& ns,
     return 0.0;
 }
 // Directional pdf (solid angle) of sampling wi at a surface vertex (double, for MIS).
-__device__ static double dBsdfPdf(const DScene& sc, int matId, const DVec3& ns,
+// Per-hit roughness (glossy) is read from the vertex's texcoords so the density matches
+// the sampling that used the same textured/patterned roughness (M9).
+__device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
                                   const DVec3& wo, const DVec3& wi) {
-    const DMaterial& m = sc.mats[matId];
+    const DMaterial& m = sc.mats[vt.matId];
+    const DVec3& ns = vt.ns;
     double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
     if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
         return cosWi / DPI;
     } else if (m.type == D_GLOSSY) {
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
-        double e = dGlossyExp(m.roughness);
+        DHit h = dVertHit(vt);
+        double e = dGlossyExp((double)dMatRoughness(sc, m, h));
         DVec3 mdir = reflectv(wo * (Real)-1, ns);
         double cosLobe = ddot(wi, mdir);
         if (cosLobe <= 0) return 0.0;
@@ -4553,7 +4578,7 @@ __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
         DVec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = (float)dBsdfPdf(sc, cur.matId, cur.ns, wp, wn);
+        pdfW = (float)dBsdfPdf(sc, cur, wp, wn);
     }
     // dConvertDensity in FP32: solid angle -> area density at `next`.
     DVec3 wv = next.p - cur.p;
@@ -5630,6 +5655,16 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
         }
 
+        // Beer-Lambert attenuation over the in-glass segment just traversed, up to the
+        // event (surface hit OR medium collision, whichever is nearer). Mirrors CPU
+        // bdpt.h randomWalk: attenuates only the subpath walk; connection edges that
+        // cross glass are NOT absorption-weighted (see known-issues.md).
+        {
+            int cm = stk.topMat();
+            double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
+            if (a > 0.0) beta *= exp(-a * (mediumEvent ? tMed : dSurf));
+        }
+
         // Medium collision precedes the surface: append a volume in-scatter vertex, then
         // scatter (prob = albedo) or absorb. Throughput unchanged on scatter (HG sampling
         // pdf == phase value, analog MC). Stored area densities are cosine-free and carry
@@ -5664,8 +5699,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (mp->type == D_MIX) {
-            Real u = rng.uniform(), acc = 0; int child = -1;
-            for (int k = 0; k < mp->mixCount; ++k) { acc += (Real)mp->mixWeight[k]; if (u < acc) { child = mp->mixChild[k]; break; } }
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());   // honours per-hit blend mask
             if (child < 0) return;
             mp = &sc.mats[child]; matId = child;
         }
@@ -5675,6 +5709,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
         v.matId = matId; v.lightIdx = dEmitterForMat(sc, matId);
         v.mediumG = 0.0; v.mediumId = -1;
+        v.u = h.u; v.v = h.v;   // per-hit texcoords for textured/patterned/record BSDF eval (M9)
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
         if (++bounces >= maxDepth) return;
@@ -5686,20 +5721,20 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             case D_FLUORESCENT: {
                 wi = cosineHemisphere(path[cur].ns, rng);
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
-                double rho = clamp01(specLookup(mp->reflect, lambda));
-                pdfW = dBsdfPdf(sc, matId, path[cur].ns, wo, wi);
-                pdfRevW = dBsdfPdf(sc, matId, path[cur].ns, wi, wo);
+                double rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));   // per-hit (tex/pat/record)
+                pdfW = dBsdfPdf(sc, path[cur], wo, wi);
+                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo);
                 betaFactor = rho;
                 if (rho <= 0) terminate = true;
                 break;
             }
             case D_GLOSSY: {
                 DVec3 mdir = reflectv(rd, path[cur].ns);   // rd == -wo (incoming dir)
-                wi = sampleGlossy(mdir, (Real)mp->roughness, rng);
+                wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng);   // per-hit roughness
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
-                double r = clamp01(specLookup(mp->reflect, lambda));
-                pdfW = dBsdfPdf(sc, matId, path[cur].ns, wo, wi);
-                pdfRevW = dBsdfPdf(sc, matId, path[cur].ns, wi, wo);
+                double r = clamp01(dReflectSlot(sc, *mp, h, lambda));      // per-hit reflect
+                pdfW = dBsdfPdf(sc, path[cur], wo, wi);
+                pdfRevW = dBsdfPdf(sc, path[cur], wi, wo);
                 betaFactor = r;
                 if (r <= 0 || pdfW <= 0) terminate = true;
                 break;
@@ -5917,7 +5952,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     DVertex sampled;
     sampled.type = BV_SURFACE; sampled.beta = 0; sampled.pdfFwd = 0; sampled.pdfRev = 0;
     sampled.delta = 0; sampled.matId = -1; sampled.lightIdx = -1;
-    sampled.mediumG = 0.0; sampled.mediumId = -1;
+    sampled.mediumG = 0.0; sampled.mediumId = -1; sampled.u = 0; sampled.v = 0;
 
     if (s == 0) {
         if (t < 2) return 0.0;
@@ -5955,7 +5990,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             double stG = (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
             if (stG <= 0.0) return 0.0;
-            f = dBsdfF(sc, qs.matId, qs.ns, wo, wcam, lambda);
+            f = dBsdfF(sc, qs, wo, wcam, lambda);
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
             f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
@@ -5999,7 +6034,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
             double stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
             if (stG <= 0.0) return 0.0;
-            f = dBsdfF(sc, pt.matId, pt.ns, wo, wi, lambda) * stG;
+            f = dBsdfF(sc, pt, wo, wi, lambda) * stG;
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
@@ -6035,7 +6070,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
             double stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
             if (stGE <= 0.0) return 0.0;
-            fE = dBsdfF(sc, pt.matId, pt.ns, woE, w, lambda) * stGE;
+            fE = dBsdfF(sc, pt, woE, w, lambda) * stGE;
             double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
@@ -6049,7 +6084,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             double stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
             if (stGL <= 0.0) return 0.0;
-            fL = dBsdfF(sc, qs.matId, qs.ns, woL, w * (Real)-1, lambda) * stGL;
+            fL = dBsdfF(sc, qs, woL, w * (Real)-1, lambda) * stGL;
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
             fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
@@ -7763,63 +7798,40 @@ bool cudaBdptSupported(const Scene& scene) {
     // ratio-tracking transmittance, matching the CPU BDPT), and only area/sphere/cylinder
     // Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
-    // Dielectric translucency (frosting + Beer-Lambert interior absorption) runs on the
-    // device forward/backward tracers, but the BDPT kernel (kBdpt) treats every dielectric
-    // as smooth & non-absorbing and its pdf/eval use constant params — a frosted or colored
-    // glass would bias MIS. Fall back to the CPU BDPT for such scenes.
-    auto frostedOrColoredGlass = [&](const Material& m) {
+    // M9: the GPU BDPT kernel now threads the per-hit texcoords (DVertex.u/v -> DHit)
+    // through dBsdfF / dBsdfPdf / dRandomWalk / dConnect, so per-hit-driven throughput
+    // slots evaluate consistently in the sampler AND the pdf/eval — MIS-safe. Enabled:
+    // textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness
+    // and thin-film thickness maps, mix blend masks, and Beer-Lambert colored-glass
+    // interior absorption (delta vertex — throughput only).
+    //
+    // Still CPU-only (no device strategy yet): FROSTED (rough) dielectric needs a
+    // microfacet dielectric BSDF; the kernel treats every dielectric as smooth.
+    auto frostedGlass = [&](const Material& m) {
         if (m.type != MatType::Dielectric) return false;
-        if (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0) return true; // frosted
-        if (m.absorb)
-            for (int i = 0; i <= 8; ++i)
-                if (m.absorb(DLMIN + (DLMAX - DLMIN) * i / 8.0) > 0.0) return true;  // colored
-        return false;
+        return (m.roughness > 1e-3 || m.roughnessTex >= 0 || m.roughnessPat >= 0);
     };
-    // The forward path now supports textured albedo + fluorescence on the device, but
-    // the BDPT kernel (kBdpt) does not implement either — its diffuse vertices sample
-    // the constant reflect spectrum and it has no fluorescent-vertex strategy — so
-    // scenes using them fall back to the CPU BDPT (which does handle both).
-    auto usesTexOrFluoro = [&](int matId) {
+    // Fluorescence (re-emission vertex) and diffuse-transmission (two-sided/back-lobe)
+    // still have no GPU BDPT vertex strategy — fall back to the CPU BDPT (bdpt.h) which
+    // handles both (isConnectibleMat + isTwoSidedMat + fluorescent strategy).
+    auto unsupportedMat = [&](int matId) {
         if (matId < 0 || matId >= (int)scene.mats.size()) return false;
         const Material& m = scene.mats[matId];
-        if (frostedOrColoredGlass(m)) return true;
-        if (m.reflectTex >= 0 || m.type == MatType::Fluorescent) return true;
-        // Diffuse-transmission (two-sided Lambertian): the GPU BDPT kernel (dBsdfF /
-        // dBsdfPdf / dRandomWalk / dConnect) has no two-lobe / back-hemisphere strategy,
-        // so a translucent vertex would render black or bias MIS. The CPU BDPT (bdpt.h)
-        // handles it fully (isConnectibleMat + isTwoSidedMat), so fall back to it.
+        if (frostedGlass(m)) return true;
+        if (m.type == MatType::Fluorescent) return true;
         if (m.type == MatType::DiffuseTransmit) return true;
-        // Non-albedo texture maps (roughness / film-thickness) drive the glossy/thin-film
-        // BSDF sampling per-hit; the GPU BDPT kernel's pdf/eval use the constant params,
-        // which would bias MIS. Fall back to CPU BDPT (which threads the Hit through).
-        if (m.roughnessTex >= 0 || m.filmThicknessTex >= 0) return true;
-        // Procedural patterns drive the same per-hit params; the GPU BDPT kernel's
-        // pdf/eval use the constants, so a pattern would bias MIS — use CPU BDPT.
-        if (m.roughnessPat >= 0 || m.filmThicknessPat >= 0 || m.mixWeightPat >= 0) return true;
-        // Parametric records drive slots from a per-hit driver, but the BDPT connection
-        // BSDF (dBsdfF / dBsdfPdf) has no Hit in scope — it can't sample the driver, so a
-        // record-bound vertex would bias MIS. Forward records run on-device (stage 6a),
-        // but any record binding forces the CPU BDPT here (both driven reflect AND the
-        // constant selStop case, since even the baked reflect would MIS against a driver-
-        // less pdf inconsistently for driven neighbours). Keep BDPT record scenes on CPU.
-        if (m.hasRecordBinding()) return true;
-        // Mix blend mask: the GPU BDPT mix-pick uses constant weights; use CPU BDPT.
-        if (m.mixWeightTex >= 0) return true;
         if (m.type == MatType::Mix)
             for (int c : m.mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size() &&
-                    (frostedOrColoredGlass(scene.mats[c]) ||
-                     scene.mats[c].reflectTex >= 0 || scene.mats[c].type == MatType::Fluorescent ||
-                     scene.mats[c].type == MatType::DiffuseTransmit ||
-                     scene.mats[c].roughnessTex >= 0 || scene.mats[c].filmThicknessTex >= 0 ||
-                     scene.mats[c].roughnessPat >= 0 || scene.mats[c].filmThicknessPat >= 0 ||
-                     scene.mats[c].mixWeightPat >= 0 || scene.mats[c].hasRecordBinding()))
+                    (frostedGlass(scene.mats[c]) ||
+                     scene.mats[c].type == MatType::Fluorescent ||
+                     scene.mats[c].type == MatType::DiffuseTransmit))
                     return true;
         return false;
     };
-    for (const auto& t : scene.tris)      if (usesTexOrFluoro(t.matId)) return false;
-    for (const auto& s : scene.spheres)   if (usesTexOrFluoro(s.matId)) return false;
-    for (const auto& im : scene.implicits) if (usesTexOrFluoro(im.matId)) return false;
+    for (const auto& t : scene.tris)      if (unsupportedMat(t.matId)) return false;
+    for (const auto& s : scene.spheres)   if (unsupportedMat(s.matId)) return false;
+    for (const auto& im : scene.implicits) if (unsupportedMat(im.matId)) return false;
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
