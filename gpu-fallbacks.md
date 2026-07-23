@@ -68,11 +68,22 @@ every dielectric as a non-connectable delta and only jitters its scattered direc
 "kernel treats every dielectric as smooth" note was stale. Validated GPU==CPU on
 `scraps/frosted.ftsl` (Cornell box + rough BK7 sphere): mean B/A=0.9991 at 512 spp, and the
 per-pixel abs diff halves 10.86%→5.73% at 4× spp = unbiased.
-Remaining CPU-only (no device strategy yet):
+
+**M9 wrap-up (2026-07-23, 0.36.0): the per-hit-BSDF GPU-vs-CPU parity gaps in mode D are
+now all closed.** The items that were previously listed here as "remaining" — **fluorescence**
+and **spot/env/collimated lights** — turned out NOT to be GPU-vs-CPU gaps at all. BDPT can't
+render either on *any* backend: `main.cpp bdptUnsupportedFeature()` flags them (along with
+layered materials) at the mode-D guard, which **refuses the render** (or demotes D → B with
+`-on-unsupported fallback`) before any BDPT dispatch, so a
+fluorescent/spot/env scene never reaches the BDPT path (CPU or GPU) — the CPU BDPT's
+"elastic-base-only" fluorescent handling in `bdpt.h` is itself unreachable dead code for
+whole-scene fluorescence. The stale per-material rejects in `cudaBdptSupported` (which the
+demotion made unreachable) were removed; the gate now carries no material reject and only
+mirrors the emitter/GRIN/rainbow refusals as belt-and-suspenders. True fluorescence / spot /
+env rendering is a mode B/P/R feature on both CPU and GPU.
+Genuinely still CPU-only in mode D (real device-volume limits, not per-BSDF):
 | Feature | Why CPU today | Class |
 |---|---|---|
-| Fluorescence | no re-emission vertex strategy | **portable-hard** |
-| Spot/env/collimated emitters | no light-subpath strategy for them | **portable-hard** |
 | GRIN / rainbow media | straight-segment MIS assumptions / HG-only phase | **inherently-CPU** / rainbow portable-hard |
 
 ### Photon map M — `cudaPhotonMapSupported` (render_cuda.cu:7830)
@@ -107,7 +118,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 2. ~~**Env term in the mode-M GPU gather** (M2)~~ — **DONE 2026-07-23.** Deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image env); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%.
 3. ~~**GPU SPPM** (M3)~~ — **DONE 2026-07-23.** Resident device SPPM session reusing the mode-M deposit + a per-pixel visible-point/gather/update kernel trio; per-pixel progressive state stays on-device across passes. Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%).
 4. ~~**Mode-M final gather on GPU** (M4)~~ — **DONE 2026-07-23.** Device `dPhotonGatherSub` (specular walk → one-bounce density query folding `rho(y)*rho(vis)` per photon; env/specular-emitter reflected off the visible point) + a `fgRays>0` branch in `dPhotonGather` (NEE direct + K cosine sub-rays); `fgRays` threaded through `kGather`/`renderPhotonMapSharedCuda`, `g_pmFinalGather==0` caller gates dropped. Validated GPU==CPU mean 0.43%, background 0.98%, per-pixel noise √-scales with spp.
-5. **Per-hit BSDFs in GPU BDPT** (M9) — **three increments DONE 2026-07-23.** (1) DVertex now stores per-hit `u,v`; `dVertHit` reconstructs a `DHit` so `dBsdfF`/`dBsdfPdf`/`dRandomWalk` evaluate textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps, mix masks, and colored-glass Beer-Lambert — all MIS-safe (same per-hit value in sampler and pdf). Validated GPU==CPU on `textured.ftsl` (mean 0.06%) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided **diffuse-transmit** (translucent) now on-device — both lobes + back-hemisphere connection; `lambda` threaded through `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). (3) **Frosted (rough) dielectric** now on-device — only the gate needed relaxing; `refractOrReflect`/`dDielectricStep` already jittered the lobe by per-hit roughness (stochastic-delta, same as `bdpt.h`). Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). Gate `cudaBdptSupported` relaxed accordingly. Still deferred: fluorescence re-emission vertex, spot/env light-subpath strategies.
+5. **Per-hit BSDFs in GPU BDPT** (M9) — **three increments DONE 2026-07-23.** (1) DVertex now stores per-hit `u,v`; `dVertHit` reconstructs a `DHit` so `dBsdfF`/`dBsdfPdf`/`dRandomWalk` evaluate textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps, mix masks, and colored-glass Beer-Lambert — all MIS-safe (same per-hit value in sampler and pdf). Validated GPU==CPU on `textured.ftsl` (mean 0.06%) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided **diffuse-transmit** (translucent) now on-device — both lobes + back-hemisphere connection; `lambda` threaded through `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). (3) **Frosted (rough) dielectric** now on-device — only the gate needed relaxing; `refractOrReflect`/`dDielectricStep` already jittered the lobe by per-hit roughness (stochastic-delta, same as `bdpt.h`). Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). Gate `cudaBdptSupported` relaxed accordingly. **M9 COMPLETE:** the two items once listed as deferred (fluorescence, spot/env light-subpaths) are not GPU-vs-CPU gaps — BDPT can't render them on any backend, so the `main.cpp` mode-D guard refuses those scenes (or demotes D → B with `-on-unsupported fallback`) before dispatch. The stale unreachable per-material rejects in `cudaBdptSupported` were removed. Only genuine device-volume limits (GRIN/rainbow, handled by M10/M11) keep a mode-D scene on the CPU.
 6. Longer tail: **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
 
 ### Descoped by user (2026-07-23) — NOT scheduled

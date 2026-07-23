@@ -1745,7 +1745,8 @@ mark the corresponding row in `gpu-fallbacks.md`.
       on the GPU. Validated GPU==CPU on `scenes/cornell.ftsl` (glass sphere + diffuse walls, `-pmfg 16/24`): mean
       linear radiance 0.43%, background 0.98%, per-pixel diff √-scales 22%→11.5% at 4× spp (independent-MC noise,
       not bias). Falls back to CPU for lens cameras / unsupported scenes exactly as the direct gather does.
-- [~] **M9. Per-hit BSDFs in GPU BDPT (mode D).** THREE INCREMENTS DONE 2026-07-23. (1) `DVertex` now stores the
+- [x] **M9. Per-hit BSDFs in GPU BDPT (mode D). DONE 2026-07-23** — all genuine per-hit-BSDF GPU-vs-CPU parity
+      gaps in mode D are closed. THREE INCREMENTS. (1) `DVertex` now stores the
       per-hit texcoords (`u,v`) and `dVertHit` reconstructs a `DHit`, so the connection BSDF (`dBsdfF`/`dBsdfPdf`)
       and the random walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the
       pdf/eval — MIS-safe. Ported: textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy
@@ -1761,7 +1762,11 @@ mark the corresponding row in `gpu-fallbacks.md`.
       per-hit `dMatRoughness` (stochastic-delta, non-connectable, exactly like `bdpt.h`); the old "kernel treats
       every dielectric as smooth" note was stale. Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991
       at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). `cudaBdptSupported` relaxed accordingly.
-      REMAINING (deferred): fluorescence re-emission vertex, and spot/env light-subpath strategies.
+      NOT GAPS (investigated, closed out): fluorescence and spot/env/collimated lights are unsupported by BDPT on
+      *every* backend — `main.cpp bdptUnsupportedFeature()` refuses mode D (or demotes D→B with -on-unsupported
+      fallback) for those scenes before dispatch, so they never reach the BDPT path (CPU or GPU). The stale,
+      now-unreachable per-material rejects in `cudaBdptSupported` were removed. True fluorescence/spot/env is a
+      mode A/B/C/R/P feature on both CPU and GPU — not a GPU-BDPT closure item.
 - [ ] **M10. Spectral rainbow-phase media on device.** `cudaForwardSupported`/`cudaBackwardSupported`/
       `cudaBdptSupported` all reject rainbow media (device only knows analytic HG). Upload the λ×µ CDF
       (`rainbow.h`) + per-λ importance sampling into the device volume path. Relax the rainbow rejects across

@@ -145,8 +145,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Since 0.36.0 **frosted (rough) dielectric** also renders on-device: `refractOrReflect`/
   `dDielectricStep` already jitter the chosen reflect/refract lobe by the per-hit roughness, so a
   rough dielectric is the same non-connectable **stochastic-delta** vertex on GPU as in `bdpt.h`
-  (only the gate needed relaxing). `cudaBdptSupported` now rejects only **fluorescence** and
-  spot/env emitters (no device strategy yet). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
+  (only the gate needed relaxing). With that, **all genuine per-hit-BSDF GPU-vs-CPU parity gaps in
+  mode D are closed** (M9 complete): `cudaBdptSupported` carries no per-material reject. The things
+  BDPT still can't render — **fluorescence**, **layered stacks**, **spot/env/collimated lights** —
+  are *not* GPU gaps: `main.cpp`'s mode-D guard (`bdptUnsupportedFeature`) refuses those scenes (or
+  demotes D→B with `-on-unsupported fallback`) on both backends before any BDPT dispatch, so they
+  never reach the device path; only GRIN/rainbow media (curved paths / spectral phase) keep an
+  in-scope mode-D scene on the CPU. Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
   per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%),
   `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halving 8.42%→4.39% at 4× spp),
   and `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halving 10.86%→5.73%). Since

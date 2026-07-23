@@ -662,9 +662,12 @@ stay non-resumable.
   glossy roughness + thin-film maps, mix blend masks, Beer–Lambert **colored-glass**
   interior absorption, **diffuse-transmit** (two-sided Lambertian — both lobes +
   back-hemisphere connections), and **frosted (rough) glass** (stochastic-delta lobe jitter
-  by per-hit roughness) all render **on-device** with MIS-consistent densities; it
-  still falls back only for **fluorescence** and **spot/env**
-  emitters (no device strategy yet). **Parametric records** (a
+  by per-hit roughness) all render **on-device** with MIS-consistent densities — the GPU
+  BDPT scope now matches the CPU BDPT exactly (no per-material fallback). (Fluorescence,
+  layered stacks, and spot/env/collimated lights aren't a GPU limitation — BDPT can't render
+  them on *any* backend, so mode `D` refuses or drops to mode `B` for those scenes on both
+  CPU and GPU; use mode B/P/R for them. GRIN/rainbow media keep an in-scope mode-`D` scene on
+  the CPU.) **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
   reflect/albedo and roughness slots** (constant stop selectors bake into the device

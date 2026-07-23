@@ -252,8 +252,8 @@ struct DMaterial {
     // Spatially-varying NON-albedo scalar params (spec §9.4), device twins of
     // Material::roughnessTex / filmThicknessTex. >=0 => sample the texture's grayscale
     // value (dTexScalarAt) at the hit (u,v); -1 => use the constant roughness /
-    // filmThickness. Honoured by the forward paths (megakernel + wavefront); the GPU
-    // BDPT kernel rejects such scenes (cudaBdptSupported) so they fall back to CPU.
+    // filmThickness. Honoured by the forward paths (megakernel + wavefront) AND the GPU
+    // BDPT kernel (M9: the per-hit point is threaded into dMatRoughness/dMatFilmThickness).
     int    roughnessTex;
     int    filmThicknessTex;
     // Fluorescence (D_FLUORESCENT): fluoAbsorb is the baked excitation probability
@@ -7890,22 +7890,17 @@ bool cudaBdptSupported(const Scene& scene) {
     // random walk already routes through it, so no separate gate is needed.
     // Diffuse-transmission (two-sided Lambertian) is likewise on-device (M9): dRandomWalk
     // samples the two lobes, dBsdfF/dBsdfPdf evaluate them, and dConnectBDPT allows
-    // back-hemisphere connections (|cos| G, shadow-terminator skip). Fluorescence
-    // (re-emission vertex) still has no GPU BDPT strategy — fall back to the CPU BDPT.
-    auto unsupportedMat = [&](int matId) {
-        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
-        const Material& m = scene.mats[matId];
-        if (m.type == MatType::Fluorescent) return true;
-        if (m.type == MatType::Mix)
-            for (int c : m.mixChildren)
-                if (c >= 0 && c < (int)scene.mats.size() &&
-                    scene.mats[c].type == MatType::Fluorescent)
-                    return true;
-        return false;
-    };
-    for (const auto& t : scene.tris)      if (unsupportedMat(t.matId)) return false;
-    for (const auto& s : scene.spheres)   if (unsupportedMat(s.matId)) return false;
-    for (const auto& im : scene.implicits) if (unsupportedMat(im.matId)) return false;
+    // back-hemisphere connections (|cos| G, shadow-terminator skip).
+    //
+    // No per-MATERIAL reject remains here. The features BDPT can't render at all —
+    // fluorescence, layered stacks, and spot/env/collimated lights — are NOT GPU-vs-CPU
+    // gaps: main.cpp's bdptUnsupportedFeature() flags them at the mode-D guard, which
+    // REFUSES the render (or demotes D->B with -on-unsupported fallback) on both backends
+    // BEFORE any BDPT dispatch, so a fluorescent/spot/env scene never reaches the BDPT path
+    // (CPU or GPU) to begin with. cudaBdptSupported is therefore only ever consulted for
+    // scenes already within BDPT scope. The spot/env/collimated emitter check below is kept
+    // purely as belt-and-suspenders (mirrors bdptUnsupportedFeature); if it were ever
+    // reached it just keeps the CPU and GPU BDPT scope identical.
     for (const auto& em : scene.emitters)
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
