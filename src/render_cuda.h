@@ -273,6 +273,32 @@ void backwardRGBSessionDownload(BackwardRGBSession* s, Film& out);
 long long backwardRGBSessionSamples(const BackwardRGBSession* s);
 void backwardRGBSessionEnd(BackwardRGBSession* s);
 
+// ---- GPU SPPM (mode S) ----------------------------------------------------------------
+// Resident device SPPM session: keeps per-pixel progressive state (tau / radius / nAcc /
+// directSum + this pass's visible point) on the device across passes, so the mode-S driver
+// calls one pass per iteration and resolves the current radiance whenever it wants a
+// preview / checkpoint frame. Each pass (1) resamples camera visible points, (2) deposits a
+// bounded photon set via the SAME forward tracer as mode M and host-builds the grid at the
+// largest current per-pixel radius, and (3) gathers + progressively updates every pixel.
+// Device twin of sppm_render.h; validated statistically against the CPU (independent MC).
+struct SppmSession;   // opaque; lives in render_cuda.cu
+// True when the scene is device-bakeable for SPPM: same scope as the photon map (mode M,
+// which now includes constant + image env). Pinhole cameras only (dGenRay) — the caller
+// gates the camera choice.
+bool cudaSppmSupported(const Scene& scene);
+// Returns nullptr if CUDA is unavailable or the scene is out of scope. `R0` is the initial
+// per-pixel gather radius, `maxBounce` (<1 => device default 32) the specular-walk cap.
+SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
+                              double R0, bool diffraction, int maxBounce, int heroC);
+// Run one SPPM pass: resample visible points, deposit `photonsPerPass` fresh photons, gather
+// at each pixel's current radius, and apply the shared-statistics radius/flux update.
+void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha);
+// Resolve the current accumulated state into `out` (radiance L, exactly like sppmResolve).
+void sppmSessionResolve(SppmSession* s, Film& out);
+long long sppmSessionPasses(const SppmSession* s);
+long long sppmSessionEmitted(const SppmSession* s);
+void sppmSessionEnd(SppmSession* s);
+
 // True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
 // (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),
 // and a non-physical camera (dGenRay handles pinhole + fisheye/panoramic; a mesh-lens

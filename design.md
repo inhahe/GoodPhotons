@@ -109,7 +109,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   0.31.0): the deposit already emits env photons (env's indirect bounces land in the
   map), and `dPhotonGather` adds env's direct term on gather-ray escape — so
   `cudaPhotonMapSupported` no longer rejects env scenes (validated GPU==CPU mean 0.18%,
-  background sky 0.04%). Since 0.26.0 it also does
+  background sky 0.04%). Since 0.32.0 (M3) there is a resident **GPU SPPM** session
+  (`SppmSession`, `cudaSppmSupported == cudaPhotonMapSupported`): per-pixel progressive
+  state (`tau`/`radius`/`nAcc`/`directSum` + this pass's visible point) lives on the device
+  across passes, and each pass runs `kSppmVisiblePoint` (resample the camera visible point +
+  direct term via the specular walk), reuses the mode-M forward deposit (`launchForward`,
+  fresh seed = cumulative emitted), host-builds the grid at the largest current per-pixel
+  radius, then `kSppmGather` (query + Hachisuka shared-statistics radius/flux update) and
+  `kSppmResolve` (`L = directSum/passes + tau/(pi R^2 Nemit)`). The SPPM photon record bakes
+  `pX = cie(lambda)·power/pi` with NO area/nEmitted fold (those depend on the current
+  per-pixel radius, applied at resolve) — unlike mode M, which folds them in. Validated
+  GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background wall 0.3%, per-pixel
+  diff shrinking with passes). Since 0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.

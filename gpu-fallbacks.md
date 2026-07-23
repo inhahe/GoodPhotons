@@ -72,7 +72,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 
 | Mode | File | Portability |
 |---|---|---|
-| **S — SPPM** (stochastic progressive photon mapping) | `sppm_render.h` | **portable — most feasible large port**: repeated bounded photon deposits + radius-shrinking gather; the GPU already has the forward deposit pass and `kGather` from mode M, so it's largely a loop around existing kernels. High value. |
+| ~~**S — SPPM**~~ | `sppm_render.h` | **DONE (M3, 2026-07-23)** — resident device SPPM session (`SppmSession`): per-pixel `tau`/`radius`/`nAcc`/`directSum` stay on-device across passes; each pass reuses the mode-M forward deposit + a per-pixel visible-point/gather/update kernel trio (`kSppmVisiblePoint`/`kSppmGather`/`kSppmResolve`). Wired into main.cpp mode-S (`-device gpu/auto`). Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%, per-pixel diff shrinks with passes). ✅ |
 | **U — VCM/UPS** (vertex connection + merging) | `vcm.h` | **portable-hard, lowest priority**: needs GPU BDPT correctness *and* photon merging under one MIS weight. |
 
 ---
@@ -81,7 +81,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 
 1. ~~**Image-based env NEE in GPU backward** (M1)~~ — **DONE 2026-07-23.** Added `dEnvRadiance`/`dEnvPdf`, uploaded the illuminant table, wired the device env sampler into `bkNeeEnv`/`bkNeeEnvVolume` + MIS'd env-miss; dropped the `envMap` reject. Validated GPU==CPU to 0.14% at 8192 spp. Also unblocks mode P camera-side.
 2. ~~**Env term in the mode-M GPU gather** (M2)~~ — **DONE 2026-07-23.** Deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image env); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%.
-3. **GPU SPPM** (M3) — reuses existing deposit + gather kernels; biggest quality-mode win.
+3. ~~**GPU SPPM** (M3)~~ — **DONE 2026-07-23.** Resident device SPPM session reusing the mode-M deposit + a per-pixel visible-point/gather/update kernel trio; per-pixel progressive state stays on-device across passes. Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%).
 4. **Mode-M final gather on GPU** (M4) — high value, more work.
 5. Longer tail: **per-hit BSDFs in GPU BDPT** (M9); **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
 

@@ -47,8 +47,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   (mode `R`, CPU); BDPT (`D`) refuses GRIN scenes (its straight-line connection
   geometry would be biased — use `A`/`B`/`C` or `R`).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
-  BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
-  across a whole camera flythrough), megakernel or wavefront, with CPU fallback.
+  BDPT references (`R`/`D`), the **view-independent photon map** (`M`, shared
+  across a whole camera flythrough), and **stochastic progressive photon mapping**
+  (`S`, a resident per-pixel SPPM session), megakernel or wavefront, with CPU fallback.
 - **Whole camera flybys in one render** — some modes amortise a *single* light
   transport pass across an entire moving-camera shot. The **view-independent photon
   map** (mode `M`) is built **once** from one forward photon pass, then reused to
@@ -177,7 +178,7 @@ paths they can capture at all**.
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
-| `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
+| `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
 
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
@@ -588,8 +589,12 @@ that converges to the same physical image.
   directly. `-n` is photons **per pass**, `-spp` is the **number of passes** (or use a
   `-time`/`-noise`/`-forever` budget); the radius-shrink rate is `-sppmalpha` (default
   `0.7`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`. A single pass reduces
-  exactly to mode `M`. CPU only. *Cost:* many passes to converge; the running preview
-  starts blurry (large radius) and sharpens as the radius shrinks.
+  exactly to mode `M`. GPU-accelerated (`-device gpu`/`auto`): a resident device SPPM
+  session keeps every pixel's progressive state (flux/radius/count + this pass's visible
+  point) on the GPU across passes and reuses the mode-`M` deposit + an on-device
+  gather/update — same scope as the GPU photon map (pinhole cameras); otherwise it runs on
+  the CPU. *Cost:* many passes to converge; the running preview starts blurry (large
+  radius) and sharpens as the radius shrinks.
 - **`U` — VCM/UPS (the "have it all" estimator).** Vertex Connection and Merging
   (Georgiev et al. 2012, a.k.a. Unified Path Sampling): each pass traces a **light
   subpath and a camera subpath per pixel**, and combines **every** BDPT-style vertex

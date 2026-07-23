@@ -1721,10 +1721,21 @@ mark the corresponding row in `gpu-fallbacks.md`.
       mode-M on `scenes/envmap.ftsl` (20M photons) match in mean to 0.18%, background sky to 0.04%; residual
       per-pixel diff is mode-M's inherent density-estimate + monochromatic-background noise (identical
       character on CPU).
-- [ ] **M3. GPU SPPM (mode S).** Currently CPU-only (`sppm_render.h`). Build a device SPPM: repeated bounded
-      photon-deposit passes (reuse the forward deposit kernel) + radius-shrinking gather (reuse `kGather`),
-      accumulating per-pixel flux with the Hachisuka radius-shrink (`-sppmalpha`). Reuse the mode-M
-      deposit/grid/gather infrastructure. Validate vs CPU SPPM at equal passes.
+- [x] **M3. GPU SPPM (mode S).** *(done 2026-07-23)* Built a resident device SPPM session (`SppmSession` in
+      `render_cuda.cu`): per-pixel progressive state (`tau`/`radius`/`nAcc`/`directSum` + this pass's visible
+      point) stays on the device across passes. Each pass runs `kSppmVisiblePoint` (resample camera visible
+      point + direct term, following the specular walk like CPU `sppmVisiblePoint`), deposits a bounded photon
+      set via the SAME forward tracer as mode M (`launchForward`, fresh seed = cumulative emitted), host-builds
+      the grid at the largest current per-pixel radius, then `kSppmGather` (query + Hachisuka shared-statistics
+      radius/flux update `-sppmalpha`) and `kSppmResolve` (`L = directSum/passes + tau/(pi R^2 Nemit)`). SPPM
+      photon record bakes `pX = cie(lambda)*power/pi` — NO area/nEmitted fold (those depend on the current
+      per-pixel radius, applied at resolve), unlike mode M. Stores the PARENT matId at the visible point and
+      gathers with it, matching CPU. `cudaSppmSupported == cudaPhotonMapSupported`; pinhole cameras only. Wired
+      the GPU dispatch into main.cpp's mode-S block (`-device gpu/auto`, self-gated). **Validated:** GPU vs CPU
+      mode-S on `scenes/cornell.ftsl` (glass sphere + caustic, 300k photons/pass): mean linear radiance 0.2–1.2%,
+      background wall 0.3%, and the per-pixel diff shrinks 7.9%→5.4% as passes go 60→240 (independent-MC noise,
+      not bias); images structurally identical incl. the floor caustic + refracted light. GPU ~4x the CPU
+      pass rate at 256².
 - [ ] **M4. Mode-M final gather on GPU.** Device gather does only the direct density estimate; final gather
       (`g_pmFinalGather > 0`) stays CPU (caller-gated, main.cpp:6034/6441). Port the secondary gather-ray
       bounce to the device so `-pmfg` runs on the GPU. High value (final gather is the quality mode).

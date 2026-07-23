@@ -6286,6 +6286,223 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, dou
     }
 }
 
+// ============================ device: SPPM (mode S) ============================
+// Device twin of sppm_render.h. SPPM runs REPEATED bounded photon passes with a per-pixel
+// shrinking gather radius; per-pixel progressive state (tau/radius/nAcc/directSum + the
+// current pass's visible point) lives resident on the device across passes. Each of the
+// three phases below is one kernel; the deposit + host grid build reuse the mode-M path.
+
+// Trace one camera ray to its first diffuse/translucent hit (the "visible point"), following
+// specular surfaces exactly like dPhotonGather / CPU sppmVisiblePoint. Returns the specular
+// throughput in `thrOut` and the diffuse hit in `vp` (with the ORIGINAL matId, matching CPU);
+// emitter/env radiance reached directly or through specular is added to directL (XYZ, a
+// monochromatic MC estimate at the sampled lambda). `vpValid` is false when the ray
+// terminated (light, env, or absorption) without reaching a diffuse surface.
+__device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, Real lambda,
+                                         double invPdfL, DRng& rng, int maxBounce,
+                                         DHit& vp, double& thrOut, bool& vpValid,
+                                         double& dX, double& dY, double& dZ) {
+    thrOut = 0.0; vpValid = false; dX = dY = dZ = 0.0;
+    double thr = 1.0;
+    DMediumStack stk; stk.clear();
+    for (int b = 0; b < maxBounce; ++b) {
+        DHit h = closestHit(sc, ro, rd);
+        if (h.valid) {                                   // Beer-Lambert in current medium
+            int cm = stk.topMat();
+            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        }
+        if (!h.valid) {                                  // escaped -> environment (direct)
+            if (sc.envIndex >= 0) {
+                double envRad = (sc.env.scale != nullptr)
+                                    ? dEnvRadiance(sc.env, rd, lambda)
+                                    : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+                double e = thr * envRad * invPdfL;
+                dX += (double)cieX(lambda) * e;
+                dY += (double)cieY(lambda) * e;
+                dZ += (double)cieZ(lambda) * e;
+            }
+            return;
+        }
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return;                       // absorbed by the mix
+            mp = &sc.mats[child]; matId = child;
+        }
+        const DMaterial& m = *mp;
+
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0) {                                   // directly-viewed / specular-seen emitter
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            dX += (double)cieX(lambda) * e;
+            dY += (double)cieY(lambda) * e;
+            dZ += (double)cieZ(lambda) * e;
+            return;
+        }
+
+        if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            vp = h; thrOut = thr; vpValid = true;        // record the visible point (parent matId)
+            return;
+        }
+
+        switch (m.type) {                                // specular walk (monochromatic)
+            case D_MIRROR: {
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+            case D_GLOSSY: {
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                if (dot(o, h.n) <= 0) return;
+                ro = h.p + h.n * RAY_EPS; rd = o; break;
+            }
+            case D_DIELECTRIC: {
+                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+                ro = nro; rd = nrd; break;
+            }
+            case D_HALFMIRROR: {
+                Real r = clamp01(dReflectSlot(sc, m, h, lambda));
+                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else                   { ro = h.p + rd * RAY_EPS; }
+                break;
+            }
+            case D_FILTER: {
+                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                ro = h.p + rd * RAY_EPS; break;
+            }
+            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+        }
+        if (thr <= 0.0) return;
+    }
+}
+
+// SPPM per-pixel state (structure-of-arrays on the device). One entry per pixel.
+struct DSppmState {
+    double* tau;       // npix*3  accumulated radius-rescaled flux (XYZ)
+    double* radius;    // npix    current gather radius R_i
+    double* nAcc;      // npix    accumulated photon count N_i
+    double* directSum; // npix*3  direct/specular-viewed emitter + env, summed over passes
+    DHit*   vpHit;     // npix    this pass's visible point (diffuse hit)
+    double* vpThr;     // npix    specular throughput camera -> visible point
+    unsigned char* vpValid; // npix
+};
+
+// Phase 1: resample each pixel's camera visible point for this pass and accumulate its
+// direct term. One thread per pixel. Seeds mirror kBackward/kGather (global sample index).
+__global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int resX, int resY,
+                                  int maxBounce, unsigned long long seedBase, long long passIdx) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    long long npix = (long long)resX * resY;
+    for (long long pix = g; pix < npix; pix += G) {
+        int px = (int)(pix % resX), py = (int)(pix / resX);
+        // Distinct stream per (pixel, pass).
+        unsigned long long s = (unsigned long long)(pix) * 0x9E3779B97F4A7C15ULL
+                             + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
+        DRng rng; rng.seed(s * 2 + 23, seedBase ^ s);
+
+        double pdf = 0.0;
+        Real lambda = dSampleSceneLambda(sc, rng, pdf);
+        st.vpValid[pix] = 0;
+        if (pdf <= 0.0) return;
+        double invPdfL = dInvPdfLambda(sc, lambda);
+
+        DVec3 ro, rd;
+        Real jx = rng.uniform(), jy = rng.uniform();
+        dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
+
+        DHit vp; double thr = 0.0; bool valid = false; double dX, dY, dZ;
+        dSppmVisiblePoint(sc, ro, rd, lambda, invPdfL, rng, maxBounce, vp, thr, valid, dX, dY, dZ);
+        st.vpHit[pix] = vp; st.vpThr[pix] = thr; st.vpValid[pix] = valid ? 1 : 0;
+        st.directSum[pix * 3 + 0] += dX;
+        st.directSum[pix * 3 + 1] += dY;
+        st.directSum[pix * 3 + 2] += dZ;
+    }
+}
+
+// Phase 3: gather each valid pixel's visible point at its current radius, then apply the
+// shared-statistics progressive radius/flux update. One thread per pixel. The photon records
+// carry pX/pY/pZ = cie(lambda)*power/pi (NO area/nEmitted fold — those depend on the current
+// per-pixel radius and are applied at resolve), so phi? += rho(lambda_p) * p?.
+__global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, int resY,
+                            double alpha) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    long long npix = (long long)resX * resY;
+    for (long long pix = g; pix < npix; pix += G) {
+        if (!st.vpValid[pix]) continue;
+        const DHit h = st.vpHit[pix];
+        const DMaterial& m = sc.mats[h.matId];           // parent matId, matching CPU SPPM
+        double R = st.radius[pix];
+        Real r2 = (Real)(R * R);
+        float gx = 0.f, gy = 0.f, gz = 0.f;
+        double M = 0.0;
+        int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
+        int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
+        int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
+        ix = min(max(ix, 0), pm.nx - 1);
+        iy = min(max(iy, 0), pm.ny - 1);
+        iz = min(max(iz, 0), pm.nz - 1);
+        for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
+          for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
+            for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
+              int c = (cz * pm.ny + cy) * pm.nx + cx;
+              for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
+                  const DGatherPhoton& ph = pm.photons[k];
+                  DVec3 d = h.p - ph.pos;
+                  if (dot(d, d) > r2) continue;
+                  if (dot(ph.n, h.n) < (Real)0.5) continue;   // reject cross-surface leakage
+                  float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                  gx += rho * ph.pX;
+                  gy += rho * ph.pY;
+                  gz += rho * ph.pZ;
+                  M += 1.0;
+              }
+            }}}
+        // Shared-statistics PPM update (Hachisuka 2008).
+        double nAcc = st.nAcc[pix];
+        double Nnew = nAcc + alpha * M;
+        double denom = nAcc + M;
+        double ratio2 = (denom > 0.0) ? (Nnew / denom) : 1.0;   // (R'/R)^2
+        double thr = st.vpThr[pix];
+        st.tau[pix * 3 + 0] = (st.tau[pix * 3 + 0] + (double)gx * thr) * ratio2;
+        st.tau[pix * 3 + 1] = (st.tau[pix * 3 + 1] + (double)gy * thr) * ratio2;
+        st.tau[pix * 3 + 2] = (st.tau[pix * 3 + 2] + (double)gz * thr) * ratio2;
+        st.radius[pix] = R * sqrt(ratio2);
+        st.nAcc[pix] = Nnew;
+    }
+}
+
+// Resolve the accumulated state into a film: L = directSum/passes + tau/(pi R^2 Nemit).
+__global__ void kSppmResolve(DSppmState st, double* film, int resX, int resY,
+                             long long passes, double Nemit) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    long long npix = (long long)resX * resY;
+    double invPasses = (passes > 0) ? 1.0 / (double)passes : 0.0;
+    for (long long pix = g; pix < npix; pix += G) {
+        double lx = st.directSum[pix * 3 + 0] * invPasses;
+        double ly = st.directSum[pix * 3 + 1] * invPasses;
+        double lz = st.directSum[pix * 3 + 2] * invPasses;
+        double R = st.radius[pix];
+        double area = DPI * R * R;
+        if (area > 0.0 && Nemit > 0.0) {
+            double inv = 1.0 / (area * Nemit);
+            lx += st.tau[pix * 3 + 0] * inv;
+            ly += st.tau[pix * 3 + 1] * inv;
+            lz += st.tau[pix * 3 + 2] * inv;
+        }
+        film[pix * 3 + 0] = lx;
+        film[pix * 3 + 1] = ly;
+        film[pix * 3 + 2] = lz;
+    }
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
@@ -8234,4 +8451,220 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     freeUpload(up);
     return out;
+}
+
+// ============================ GPU SPPM (mode S) ============================
+// Resident device SPPM session: keeps per-pixel progressive state (tau/radius/nAcc/directSum)
+// on the device across passes, so the mode-S driver in main.cpp calls one pass per iteration
+// and resolves the current radiance whenever it wants a preview/checkpoint frame. Each pass
+// (1) resamples camera visible points (kSppmVisiblePoint), (2) deposits a bounded photon set
+// via the SAME forward tracer as mode M, builds the grid on the host at the largest current
+// per-pixel radius, and (3) gathers + progressively updates every pixel (kSppmGather).
+struct SppmSession {
+    DUpload up;
+    gpu::DCamera cam{};
+    int resX = 0, resY = 0;
+    size_t npix = 0;
+    bool diffraction = false;
+    int  maxBounce = 32, heroC = 1;
+    long long emittedTotal = 0;
+    long long passes = 0;
+    gpu::DSppmState st{};
+    double* d_film = nullptr;
+    unsigned long long* d_depCount = nullptr;
+    double* d_energy = nullptr;
+    EnergyReport energy{};
+};
+
+bool cudaSppmSupported(const Scene& scene) {
+    // SPPM reuses the mode-M deposit + a per-pixel visible-point/gather pass. Same
+    // device-bakeable scope as the photon map (which now includes constant + image env, M2);
+    // pinhole cameras only (dGenRay) — the caller gates the camera.
+    return cudaPhotonMapSupported(scene);
+}
+
+SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
+                              double R0, bool diffraction, int maxBounce, int heroC) {
+    if (!cudaAvailable() || !cudaSppmSupported(scene)) return nullptr;
+    SppmSession* s = new SppmSession();
+    s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
+    s->diffraction = diffraction; s->maxBounce = (maxBounce > 0) ? maxBounce : 32; s->heroC = heroC;
+    buildUploadScene(scene, s->up);
+    s->cam = bakeCamera(scene, cam, resX, resY, s->up);
+    const size_t np = s->npix;
+    CUDA_CHECK(cudaMalloc(&s->st.tau,       np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->st.directSum, np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->st.nAcc,      np * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->st.vpThr,     np * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->st.radius,    np * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->st.vpValid,   np * sizeof(unsigned char)));
+    CUDA_CHECK(cudaMalloc(&s->st.vpHit,     np * sizeof(gpu::DHit)));
+    CUDA_CHECK(cudaMemset(s->st.tau,       0, np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->st.directSum, 0, np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->st.nAcc,      0, np * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->st.vpThr,     0, np * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s->st.vpValid,   0, np * sizeof(unsigned char)));
+    { std::vector<double> r0(np, R0);
+      CUDA_CHECK(cudaMemcpy(s->st.radius, r0.data(), np * sizeof(double), cudaMemcpyHostToDevice)); }
+    CUDA_CHECK(cudaMalloc(&s->d_film,    np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_depCount, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&s->d_energy,   5 * sizeof(double)));
+    return s;
+}
+
+// Run one SPPM pass. photonsPerPass photons are deposited fresh (seedBase = cumulative
+// emitted, so every pass is an independent photon set) into a bounded map.
+void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
+    using namespace gpu;
+    const long long passIdx = s->passes;                 // 0-based index of THIS pass
+
+    // (1) Camera visible-point pass: fresh visible point + direct sample per pixel.
+    unsigned long long vpSeed = 0xA24BAED4963EE407ULL
+                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
+    kSppmVisiblePoint<<<2048, 128>>>(s->up.sc, s->cam, s->st, s->resX, s->resY,
+                                     s->maxBounce, vpSeed, passIdx + 1);
+    cudaCheckKernel("sppm-visible-point");
+
+    // (2) Forward deposit into a bounded map (device), download, host-build the grid at the
+    // largest current per-pixel radius, upload. seedBase = cumulative emitted (fresh set).
+    PhotonMap pm;
+    pm.nEmitted = photonsPerPass;
+    const size_t PM_CHUNK = 4u << 20;
+    auto depositLaunch = [&](DPhoton* buf, unsigned long long capv) {
+        CUDA_CHECK(cudaMemset(s->d_depCount, 0, sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(s->d_energy, 0, 5 * sizeof(double)));
+        DCamSet cs{}; cs.nCam = 0;
+        cs.depPhotons = buf; cs.depCount = s->d_depCount; cs.depCap = capv;
+        launchForward(s->up, cs, s->d_energy, photonsPerPass, s->diffraction,
+                      (unsigned long long)s->emittedTotal, /*wavefront*/false, CAM_B, s->heroC);
+    };
+    unsigned long long cap = (unsigned long long)((double)photonsPerPass * 2.5) + (1ull << 20);
+    { size_t freeB = 0, totalB = 0;
+      if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+          unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
+          if (cap > fit) cap = fit; } }
+    DPhoton* d_photons = nullptr;
+    while (cap >= (1ull << 20) &&
+           cudaMalloc(&d_photons, (size_t)cap * sizeof(DPhoton)) != cudaSuccess) {
+        cudaGetLastError(); d_photons = nullptr; cap >>= 1;
+    }
+    unsigned long long nDep = 0;
+    if (d_photons) {
+        depositLaunch(d_photons, cap);
+        CUDA_CHECK(cudaMemcpy(&nDep, s->d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        if (nDep > cap) {                                // undershot: rerun at exact size
+            cudaFree(d_photons); d_photons = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+            depositLaunch(d_photons, nDep);
+            unsigned long long nFill = 0;
+            CUDA_CHECK(cudaMemcpy(&nFill, s->d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            if (nFill < nDep) nDep = nFill;
+        }
+    } else {
+        depositLaunch(nullptr, 0);                       // count-only sizing pass
+        CUDA_CHECK(cudaMemcpy(&nDep, s->d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        if (nDep > 0) { CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
+                        depositLaunch(d_photons, nDep); }
+    }
+    if (nDep > 0 && d_photons) {
+        pm.photons.resize((size_t)nDep);
+        std::vector<DPhoton> stage;
+        for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
+            stage.resize(cnt);
+            CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton), cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < cnt; ++i) {
+                const DPhoton& d = stage[i]; Photon& p = pm.photons[off + i];
+                p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
+                p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
+                p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
+                p.power = d.power; p.lambda = d.lambda;
+            }
+        }
+    }
+    if (d_photons) cudaFree(d_photons);
+    double energy[5] = {0,0,0,0,0};
+    CUDA_CHECK(cudaMemcpy(energy, s->d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
+    s->energy.emitted += energy[0]; s->energy.absorbed += energy[1]; s->energy.sensor += energy[2];
+    s->energy.escaped += energy[3]; s->energy.residual += energy[4];
+
+    // rMax = largest radius over VALID pixels (grid built there so every pixel's — never
+    // larger — radius stays inside the 3x3x3 neighbourhood). Mirrors CPU sppmPass.
+    std::vector<double> radii(s->npix);
+    std::vector<unsigned char> valid(s->npix);
+    CUDA_CHECK(cudaMemcpy(radii.data(), s->st.radius, s->npix * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(valid.data(), s->st.vpValid, s->npix * sizeof(unsigned char), cudaMemcpyDeviceToHost));
+    double rMax = 0.0;
+    for (size_t i = 0; i < s->npix; ++i) if (valid[i]) rMax = std::max(rMax, radii[i]);
+    if (rMax <= 0.0) rMax = 1e-4;
+    pm.build(rMax);
+    s->emittedTotal += pm.nEmitted;
+    s->passes += 1;
+
+    // Upload the SPPM photon record: pX/pY/pZ = cie(lambda)*power/pi (NO area/nEmitted fold;
+    // those depend on the current per-pixel radius, applied at resolve). Then gather+update.
+    DPhotonMap dpm{};
+    dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
+    dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
+    dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
+    dpm.photons = nullptr;
+    DGatherPhoton* d_sorted = nullptr;
+    if (!pm.photons.empty()) {
+        const double fold = 1.0 / DPI;
+        size_t n = pm.photons.size();
+        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
+        std::vector<DGatherPhoton> stage;
+        for (size_t off = 0; off < n; off += PM_CHUNK) {
+            size_t cnt = std::min(PM_CHUNK, n - off);
+            stage.resize(cnt);
+            for (size_t i = 0; i < cnt; ++i) {
+                const Photon& p = pm.photons[off + i]; const Vec3& ci = pm.cie[off + i];
+                DGatherPhoton& d = stage[i];
+                d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
+                d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
+                const double w = (double)p.power * fold;
+                d.pX = (float)(ci.x * w); d.pY = (float)(ci.y * w); d.pZ = (float)(ci.z * w);
+                d.lambda = p.lambda;
+            }
+            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DGatherPhoton), cudaMemcpyHostToDevice));
+        }
+        dpm.photons = d_sorted;
+    }
+    int* d_cellStart = (int*)uploadVec(pm.cellStart);
+    dpm.cellStart = d_cellStart;
+
+    // (3) Gather + progressive update.
+    kSppmGather<<<2048, 128>>>(s->up.sc, dpm, s->st, s->resX, s->resY, alpha);
+    cudaCheckKernel("sppm-gather");
+
+    if (d_sorted)    cudaFree(d_sorted);
+    if (d_cellStart) cudaFree(d_cellStart);
+}
+
+// Resolve the current accumulated state into `out` (radiance L, exactly like CPU sppmResolve).
+void sppmSessionResolve(SppmSession* s, Film& out) {
+    using namespace gpu;
+    kSppmResolve<<<2048, 128>>>(s->st, s->d_film, s->resX, s->resY, s->passes, (double)s->emittedTotal);
+    cudaCheckKernel("sppm-resolve");
+    std::vector<double> film(s->npix * 3);
+    CUDA_CHECK(cudaMemcpy(film.data(), s->d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    if (out.resX != s->resX || out.resY != s->resY || out.xyz.empty()) {
+        out.resX = s->resX; out.resY = s->resY; out.alloc();
+    }
+    for (size_t i = 0; i < s->npix; ++i) {
+        out.xyz[i]  = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+        out.hits[i] = 1.0;
+    }
+}
+
+long long sppmSessionPasses(const SppmSession* s)  { return s ? s->passes : 0; }
+long long sppmSessionEmitted(const SppmSession* s) { return s ? s->emittedTotal : 0; }
+
+void sppmSessionEnd(SppmSession* s) {
+    if (!s) return;
+    cudaFree(s->st.tau); cudaFree(s->st.directSum); cudaFree(s->st.nAcc);
+    cudaFree(s->st.vpThr); cudaFree(s->st.radius); cudaFree(s->st.vpValid); cudaFree(s->st.vpHit);
+    cudaFree(s->d_film); cudaFree(s->d_depCount); cudaFree(s->d_energy);
+    freeUpload(s->up);
+    delete s;
 }

@@ -2517,10 +2517,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             cudaDeviceName());
             }
         } else if (!gpuForwardMode) {
-            const char* why = "unsupported mode - CPU-only path";
-            if (wantGpu) std::fprintf(stderr,
-                "[device] GPU can't accelerate this render: %s; using CPU\n", why);
-            else         std::printf("[device] auto -> CPU (%s)\n", why);
+            // Modes M (shared/flyby gather) and S (SPPM) run their OWN device gating in their
+            // dispatch blocks below, so don't claim "CPU-only" here — that would be wrong for
+            // an S render that then picks the GPU. Stay quiet and let the mode decide.
+            if (mode != 'M' && mode != 'S') {
+                const char* why = "unsupported mode - CPU-only path";
+                if (wantGpu) std::fprintf(stderr,
+                    "[device] GPU can't accelerate this render: %s; using CPU\n", why);
+                else         std::printf("[device] auto -> CPU (%s)\n", why);
+            }
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, or oversized multilayer/mix "
@@ -2711,6 +2716,50 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     if (mode == 'S') {
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
+#ifdef HAVE_CUDA
+        // GPU SPPM (M3): per-pixel progressive state (tau/radius/nAcc/directSum + this pass's
+        // visible point) stays resident on the device across passes; each pass deposits a
+        // bounded photon set with the SAME forward tracer as mode M, host-builds the grid at
+        // the largest current radius, and gathers on the device. Pinhole cameras only (dGenRay)
+        // and the photon-map-supported scene scope; anything else falls through to the CPU.
+        {
+            const bool wantGpu  = !std::strcmp(device, "gpu");
+            const bool wantAuto = !std::strcmp(device, "auto");
+            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+                cudaAvailable() && cudaSppmSupported(scene)) {
+                SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
+                                                     /*maxBounce*/32, g_heroC);
+                if (sess) {
+                    std::printf("mode S: SPPM on %s — %lld photons/pass, R0=%.4g, alpha=%.2f "
+                                "at %dx%d (light=%s) ...\n",
+                                cudaDeviceName(), N, R0, g_sppmAlpha, res, resY, lightLabel);
+                    auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+                        Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+                        for (long long pass = 0; pass < passTarget; ++pass) {
+                            sppmSessionPass(sess, N, g_sppmAlpha);
+                            sppmSessionResolve(sess, disp);
+                            long long passes = sppmSessionPasses(sess);
+                            for (auto& v : disp.xyz) v = v * (double)passes;   // undone by /sppDone
+                            if (p->report(disp, passes, passes >= passTarget)) break;
+                        }
+                        return disp;
+                    };
+                    int rc = runSppProgressive(outPath, spp, manualExposure, exposureAnchor,
+                                               scene.absolute, timeBudgetSec, noiseTarget,
+                                               runForever, intervalSec, preview,
+                                               renderChunked, res, resY);
+                    sppmSessionEnd(sess);
+                    return rc;
+                }
+                std::fprintf(stderr, "[device] SPPM GPU session failed to start; using CPU\n");
+            } else if (wantGpu) {
+                const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
+                                : !cudaAvailable()     ? "no CUDA device found"
+                                : "a GPU-unsupported scene feature";
+                std::fprintf(stderr, "[device] mode S GPU path unavailable (%s); using CPU\n", why);
+            }
+        }
+#endif
         std::printf("mode S: SPPM — %lld photons/pass, R0=%.4g, alpha=%.2f at %dx%d on "
                     "%d CPU threads (light=%s) ...\n",
                     N, R0, g_sppmAlpha, res, resY, nThreads, lightLabel);
