@@ -103,6 +103,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.
+  Since 0.27.0 there is a separate **fast RGB backward** path
+  (`renderBackwardRGBCuda`/`kBackwardRGB`/`bkRadianceRGB`, selected by `-rgb` on mode R
+  via `cudaBackwardRGBSupported`): an Option-B non-spectral tracer carrying a `DVec3`
+  linear-RGB throughput so one intersection walk yields a full-colour sample. Materials
+  bake to a linear-RGB albedo under equal-energy white and emitters/env to
+  `xyzToLinearSrgb(∫CIE·spd)` (host `namespace rgbbake`, at scene build); deposit maps
+  linear-RGB→XYZ via `dRgbToXyz`. Achromatic specular uses `LREP_RGB=550nm` through the
+  existing `dDielectricStep`; colored glass keeps a 3-tap Beer-Lambert `rgbAbsorb`.
+  RGB Russian roulette survives with `q=rgbLuma(albedo)`. Matches the spectral backward's
+  absolute luminance to noise on flat-spectrum scenes; drops dispersion/thin-film/
+  fluorescence (Option-B). Gate excludes media, image-env, textured/record albedo, and
+  collimated/env-shape emitters (fall back to the spectral backward).
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror

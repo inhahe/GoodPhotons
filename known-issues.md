@@ -1486,6 +1486,22 @@ _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
 ## Tech debt
 
+### Fast RGB backward (`-rgb`) omits media + textured/record albedo — 2026-07-23
+The Stage-2 fast RGB backward path (`renderBackwardRGBCuda`/`bkRadianceRGB` in
+`src/render_cuda.cu`, selected by `-rgb` on mode R) is a deliberately-reduced Option-B
+tracer. Its scope gate `cudaBackwardRGBSupported` currently rejects (falls back to the
+spectral backward with a warning): (a) **participating media** — the RGB walk has no
+volume collision / NEE / Beer-Lambert leg yet, unlike the spectral `bkRadiance`; (b)
+**textured / record-driven reflectance** (`reflectTex>=0`, `recBindingFor(REC_SLOT_REFLECT)`)
+— the per-material RGB albedo is a single baked triple, so spatially-varying albedo isn't
+represented. Proper fixes: port `dMediaSampleCollision`/`bkNeeVolume`/`dMediaTransmittance`
+into `bkRadianceRGB` carrying the RGB `beta` (bake a 3-tap RGB `sigma_a`/`sigma_s` per
+medium, already have `rgbAbsorb` precedent); and sample the reflectance texture per hit
+into a linear-RGB albedo (reuse the forward `specLookup`→XYZ→RGB bake path at runtime).
+Also deferred: image-based env and collimated beams (shared with the spectral backward's
+own deferrals, Stage 1d). None are correctness bugs — the gate routes unsupported scenes
+to the exact spectral tracer — just missing fast-path coverage.
+
 ### Mesh repair exists (`tools/repair_mesh.py`); isosurface cap-at-polygonise still TODO — 2026-07-14 — MESH PART DONE
 `-check-watertight` DETECTS non-airtight geometry and **`tools/repair_mesh.py`** now FIXES meshes
 (MeshLab engine by default: merge-close-vertices → repair non-manifold edges/vertices → close

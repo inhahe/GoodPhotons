@@ -507,7 +507,16 @@ that converges to the same physical image.
   **fluorescence** and a **constant environment light** (env-NEE + MIS'd env-miss, at
   surface *and* fog vertices); scenes using an **image-based** environment or collimated
   beams (plus GRIN / rainbow-dispersive media) still fall back to the CPU tracer
-  automatically.
+  automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
+  sampling one wavelength per sample it carries an RGB throughput triple and does one
+  intersection walk per full-colour sample, so a clean colour image converges much
+  faster. Materials bake to a per-material linear-RGB albedo and emitters/env to a
+  linear-RGB radiance at scene build; achromatic specular uses a 550 nm representative
+  wavelength. On spectrally-flat scenes it matches the spectral backward's absolute
+  luminance to noise; colour scenes carry an Option-B approximation (no dispersion /
+  thin-film / spectral fluorescence). `-rgb` falls back to the spectral backward (with a
+  warning) on scenes outside its scope (media, image-env, textured/record albedo, exotic
+  materials).
 - **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
   check, not a production renderer (roughly twice the work).
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for

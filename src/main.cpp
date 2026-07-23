@@ -2361,7 +2361,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool wantCheckpointFlag = false, bool runForever = false,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
-                     double* exposureAnchor = nullptr) {
+                     double* exposureAnchor = nullptr, bool rgbBackward = false) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
@@ -2419,9 +2419,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
     // the forward layer of the mode-P composite) AND the backward tracer (mode R, and
-    // the mode-P camera-side layer) when the scene is within the backward-GPU v1 scope
-    // (renderBackwardCuda / cudaBackwardSupported — no fog/env/spot/collimated/
-    // fluorescence); otherwise the backward layer falls back to the CPU. Mode V keeps
+    // the mode-P camera-side layer) when the scene is within the backward-GPU scope
+    // (renderBackwardCuda / cudaBackwardSupported — Lambertian/textured/specular,
+    // point-spot lights, participating media, fluorescence, and a constant env light;
+    // image-based env, collimated beams and GRIN/rainbow media still fall back to the
+    // CPU backward tracer); otherwise the backward layer falls back to the CPU. Mode V keeps
     // its backward reference on the CPU by design. Fisheye/panoramic lenses run on the
     // GPU too (the device camera's project()/pixelSolidAngle() port the analytic
     // projection remap) for the pinhole-splat modes (B/V/P).
@@ -2481,12 +2483,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         } else if (gpuBackwardMode) {
             // Mode R has its own GPU support check: the backward reference megakernel
             // (with the physical mesh-lens as a ray-gen front-end) covers area/sphere/
-            // cylinder Lambertian lights and textured/specular materials, but not fog,
-            // env light, spot/collimated lights, or fluorescence (v1 scope).
+            // cylinder Lambertian AND point-spot lights, textured/specular materials,
+            // participating media (homog+heterog), fluorescence, and a constant env
+            // light. Image-based env, collimated beams, GRIN / rainbow media still fall
+            // back to the CPU backward tracer.
             if (!cudaBackwardSupported(scene, cam)) {
                 const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(fog, env light, spot/collimated light, fluorescence, "
-                                  "or a lens deeper than the device cap)";
+                                  "(image-based env, collimated light, GRIN or "
+                                  "rainbow/dispersive media, or a lens deeper than the "
+                                  "device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -2539,13 +2544,31 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the physical lens), CPU otherwise — both chunk internally.
     if (mode == 'R') {
         const bool gpuBackward = useGpu;
-        std::printf("mode R: backward reference at %dx%d on %s (light=%s) ...\n",
+        // Fast RGB backward (-rgb): the non-spectral Option-B previewer. Only on the GPU
+        // and only when the scene is within its reduced scope; otherwise fall back to the
+        // spectral backward (a warning is printed so the flag isn't silently ignored).
+        bool rgbFast = false;
+#ifdef HAVE_CUDA
+        if (rgbBackward) {
+            if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
+            else std::fprintf(stderr, "[render] -rgb (fast RGB backward) not applicable to this "
+                                      "render (%s); using the spectral backward tracer\n",
+                              gpuBackward ? "scene outside the RGB fast-path scope"
+                                          : "RGB fast path is GPU-only");
+        }
+#else
+        if (rgbBackward)
+            std::fprintf(stderr, "[render] -rgb ignored: built without CUDA (RGB fast path is GPU-only)\n");
+#endif
+        std::printf("mode R: backward %s at %dx%d on %s (light=%s) ...\n",
+                    rgbFast ? "RGB fast preview" : "reference",
                     res, resY,
                     gpuBackward ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                     lightLabel);
         auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-            if (gpuBackward) return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p);
+            if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p);
+            if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -3302,6 +3325,8 @@ static void printHelp(const char* prog) {
 "  -beams|-photonbeams   decorrelated photon-beams gather for shared multi-camera flybys\n"
 "                        (single-scatter volumetrics; CPU or GPU; kills frozen speckle)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
+"  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
+"                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
 "  -t <n>                CPU thread count\n"
 "\n"
 "Output, preview & checkpointing:\n"
@@ -3426,6 +3451,7 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
+    bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
     const char* cameraSel = nullptr; // -camera <name>|<pathbase>|all|#N|near=X,Y,Z (FTSL multi-camera select)
     bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
@@ -3688,6 +3714,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
+        else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
         else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
@@ -6357,7 +6384,7 @@ static int run(int argc, char** argv) {
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
-                           preview, intervalSec, noiseTarget, wavefront, anchor);
+                           preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward);
         if (rv != 0) return rv;
     }
 

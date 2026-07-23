@@ -99,6 +99,40 @@ static constexpr double DLMIN    = 360.0;     // mirrors color.h LAMBDA_MIN/MAX
 static constexpr double DLMAX    = 830.0;
 static constexpr double DPI      = 3.141592653589793;
 
+// ---- host-side spectral->RGB bakes for the fast RGB backward (mode R -rgb) ----
+// These run at scene-build time (buildUploadScene) to precompute the Option-B RGB
+// throughput tables. They live at global scope (outside namespace gpu) so `cieX/Y/Z`
+// and `xyzToLinearSrgb` resolve to the HOST color.h functions, not the device twins.
+// A reflectance R(lambda) bakes to its linear-sRGB colour under an equal-energy white
+// (a spectrally flat white reflector -> (1,1,1)); an emission SPD bakes to the exact
+// wavelength-integrated XYZ->linear-sRGB radiance the spectral estimator converges to.
+namespace rgbbake {
+// integral over [LAMBDA_MIN,LAMBDA_MAX] of CIE(lambda)*s(lambda) dlambda (1 nm Riemann).
+inline Vec3 specToXyz(const Spectrum& s) {
+    Vec3 xyz(0, 0, 0);
+    if (!s) return xyz;
+    for (double w = LAMBDA_MIN; w <= LAMBDA_MAX; w += 1.0) {
+        double v = s(w);
+        xyz.x += cieX(w) * v; xyz.y += cieY(w) * v; xyz.z += cieZ(w) * v;
+    }
+    return xyz;   // dlambda = 1 nm
+}
+// Emission SPD -> linear-sRGB radiance (matches the spectral film's absolute scale).
+inline Vec3 emitToRgb(const Spectrum& s) { return xyzToLinearSrgb(specToXyz(s)); }
+// Reflectance SPD -> linear-sRGB albedo under an equal-energy white (white -> 1,1,1),
+// clamped to [0,1] per channel.
+inline Vec3 reflToRgb(const Spectrum& s) {
+    static const Vec3 whiteRgb = [] {
+        Vec3 x(0, 0, 0);
+        for (double w = LAMBDA_MIN; w <= LAMBDA_MAX; w += 1.0) { x.x += cieX(w); x.y += cieY(w); x.z += cieZ(w); }
+        return xyzToLinearSrgb(x);
+    }();
+    Vec3 numRgb = xyzToLinearSrgb(specToXyz(s));
+    auto c01 = [](double a, double b) { double r = (b != 0.0) ? a / b : 0.0; return r < 0 ? 0 : (r > 1 ? 1 : r); };
+    return Vec3(c01(numRgb.x, whiteRgb.x), c01(numRgb.y, whiteRgb.y), c01(numRgb.z, whiteRgb.z));
+}
+}  // namespace rgbbake
+
 // All device code lives in namespace gpu so its helpers (clamp01, cieX, hgPhase,
 // thinFilmReflectance, ...) don't collide with the identically-named host inline
 // functions pulled in via render_cuda.h -> render.h / color.h.
@@ -144,6 +178,8 @@ struct DVec3 {
     HD Real& operator[](int i)       { return (&x)[i]; }
 };
 HD static inline Real dot(const DVec3& a, const DVec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+// Componentwise (Hadamard) product — RGB throughput * albedo in the fast RGB backward.
+HD static inline DVec3 hadamard(const DVec3& a, const DVec3& b) { return {a.x*b.x, a.y*b.y, a.z*b.z}; }
 HD static inline DVec3 cross(const DVec3& a, const DVec3& b) {
     return {a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x};
 }
@@ -284,6 +320,16 @@ struct DMaterial {
     int    recRoughStopOff, recRoughStopN;
     int    recRoughInterp;
     float  recRoughLo, recRoughHi;
+    // Fast RGB backward (Option B — mode R -rgb). Precomputed linear-sRGB reflectance /
+    // transmission albedo (the surface colour under an equal-energy white, so a spectrally
+    // flat white reflector bakes to (1,1,1)); a single representative achromatic index
+    // rgbIor = ior(550 nm) (the RGB path drops dispersion); and a 3-tap Beer-Lambert
+    // absorption rgbAbsorb = sigma_a at the R/G/B pivots (610/550/465 nm) for coloured
+    // glass. Baked once in buildUploadScene; consumed only by bkRadianceRGB.
+    DVec3  rgbAlbedo;
+    DVec3  rgbTransmit;
+    DVec3  rgbAbsorb;
+    double rgbIor;
 };
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
 #define D_NO_PRIORITY (-2147483647 - 1)
@@ -468,6 +514,11 @@ struct DEmitter {
     // device can evaluate Le(lambda) directly (DMaterial carries no emit spectrum).
     int    matId;
     double emitSpd[SPEC_N];
+    // Fast RGB backward (mode R -rgb): the emitter's linear-sRGB radiance, baked as
+    // xyzToLinearSrgb(integral over lambda of CIE(lambda)*emitSpd(lambda)) — the exact
+    // wavelength-integrated radiance the spectral estimator converges to (the
+    // p(lambda)*invPdfLambda cancellation), so NEE folds it in with no per-wavelength term.
+    DVec3  rgbEmit;
 };
 
 // Smoothstep spot falloff (mirrors host scene.h spotFalloff).
@@ -615,6 +666,7 @@ struct DScene {
     double sceneRadius;              // env (shape==3): bounding-sphere radius
     DEnvMap env;                     // image env tables (env.scale null => constant env)
     int    envIndex;                 // index of the env emitter in `emitters`, or -1 (mirrors Scene::envIndex)
+    DVec3  rgbEnv;                    // fast RGB backward: constant-env radiance in linear sRGB (0 if no env)
 };
 
 // Lens-projection radius maps (device twins of camera.h projRadius/Inv/Deriv). The
@@ -878,6 +930,26 @@ __device__ static Real cieY(Real w) {
 __device__ static Real cieZ(Real w) {
     return (Real)1.217 * gaussPiece(w, 437.0, 0.0845, 0.0278)
          + (Real)0.681 * gaussPiece(w, 459.0, 0.0385, 0.0725);
+}
+
+// Linear-sRGB (D65) -> CIE XYZ. Inverse of color.h xyzToLinearSrgb; used by the fast
+// RGB backward path (bkRadianceRGB) to deposit its accumulated linear-RGB radiance into
+// the XYZ film (round-trips an unclamped emitter colour exactly, so a neutral scene
+// matches the spectral estimator's absolute luminance).
+__device__ static inline DVec3 dRgbToXyz(const DVec3& c) {
+    return DVec3(
+        (Real)(0.4124 * c.x + 0.3576 * c.y + 0.1805 * c.z),
+        (Real)(0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z),
+        (Real)(0.0193 * c.x + 0.1192 * c.y + 0.9505 * c.z));
+}
+// Componentwise clamp of an RGB triple to [0,1] (baked reflectance albedos).
+HD static inline DVec3 clampRgb01(const DVec3& c) {
+    return DVec3(clamp01((Real)c.x), clamp01((Real)c.y), clamp01((Real)c.z));
+}
+// Luminance of a linear-sRGB triple (Rec.709 / sRGB Y). Used as the diffuse
+// continuation survival probability (RGB Russian roulette) in bkRadianceRGB.
+HD static inline Real rgbLuma(const DVec3& c) {
+    return (Real)(0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z);
 }
 
 // Spectral table lookup with linear interpolation over [DLMIN, DLMAX]. Tables stay
@@ -5070,6 +5142,251 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
     }
 }
 
+// ======================= fast RGB backward (mode R -rgb) =====================
+// Option B (gpu-backward-fast.md): a non-spectral backward tracer that carries a
+// linear-sRGB throughput triple `beta` (baked per-material RGB albedo) and produces a
+// full-colour result in ONE intersection walk per sample — no wavelength dimension, so
+// a clean colour image converges far faster than the spectral estimator (mode R). The
+// per-emitter/env radiance is baked as the exact wavelength-integrated XYZ->RGB radiance
+// (the p(lambda)*invPdfLambda cancellation), so a neutral (spectrally flat) scene matches
+// the spectral estimator's absolute luminance; colour picks up the Option-B metamerism
+// approximation (no dispersion / thin-film / fluorescence — those stay on mode R / D).
+// Representative wavelength for the achromatic specular interfaces (Fresnel, refraction).
+#define LREP_RGB ((Real)550)
+
+// Surface NEE, RGB twin of bkNeeLight: connect to every area/sphere/cylinder/spot emitter
+// and accumulate the linear-RGB direct contribution (Lambertian BRDF rhoRGB/pi times the
+// baked emitter radiance). No wavelength / invPdfLambda term (baked into rgbEmit).
+__device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVec3& rhoRGB,
+                                      DRng& rng) {
+    DVec3 total(0, 0, 0);
+    DVec3 f = rhoRGB / (Real)DPI;                     // Lambertian BRDF (per channel)
+    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 3) continue;  // collimated beams / env (env: bkNeeEnvRGB)
+        if (em.shape == 2) {                           // point spot
+            DVec3 toL = em.origin - h.p;
+            Real dist2 = dot(toL, toL);
+            Real dist  = sqrt(dist2);
+            DVec3 wi = toL / dist;
+            Real cosSurf = dot(h.n, wi);
+            if (cosSurf <= (Real)0) continue;
+            Real stG = dShadowTerminatorG(wi, h.n, ngo0);
+            if (stG <= (Real)0) continue;
+            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+            if (fall <= (Real)0) continue;
+            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+            total = total + hadamard(f * (fall * cosSurf / dist2 * stG), em.rgbEmit);
+            continue;
+        }
+        Real u1 = rng.uniform(), u2 = rng.uniform();
+        DVec3 y, nL;
+        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        DVec3 toL = y - h.p;
+        Real dist2 = dot(toL, toL);
+        Real dist = sqrt(dist2);
+        DVec3 wi = toL / dist;
+        Real cosSurf = dot(h.n, wi);
+        if (cosSurf <= 0) continue;
+        Real stG = dShadowTerminatorG(wi, h.n, ngo0);
+        if (stG <= (Real)0) continue;
+        Real cosLight = dot(nL, -wi);
+        if (cosLight <= 0) continue;
+        if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
+        Real G = cosSurf * cosLight / dist2;
+        total = total + hadamard(f * (G * em.area * stG), em.rgbEmit);
+    }
+    return total;
+}
+
+// Constant-env NEE, RGB twin of bkNeeEnv: one uniform-sphere sample (pdf 1/4pi), MIS'd
+// (balance heuristic) against the cosine continuation, returns the linear-RGB contribution.
+__device__ static DVec3 bkNeeEnvRGB(const DScene& sc, const DHit& h, const DVec3& rhoRGB,
+                                    DRng& rng) {
+    if (sc.envIndex < 0) return DVec3(0, 0, 0);
+    double z = 1.0 - 2.0 * (double)rng.uniform();
+    double sr = sqrt(fmax(0.0, 1.0 - z * z));
+    double phi = 2.0 * DPI * (double)rng.uniform();
+    DVec3 wi{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+    double pdfW = 1.0 / (4.0 * DPI);
+    Real cosSurf = dot(h.n, wi);
+    if (cosSurf <= (Real)0) return DVec3(0, 0, 0);
+    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    Real stG = dShadowTerminatorG(wi, h.n, ngo);
+    if (stG <= (Real)0) return DVec3(0, 0, 0);
+    double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    if (occluded(sc, h.p + ngo * RAY_EPS, wi, (Real)farDist)) return DVec3(0, 0, 0);
+    double pdfBsdf = (double)cosSurf / DPI;
+    double wMis = pdfW / (pdfW + pdfBsdf);
+    Real k = (Real)((double)cosSurf / pdfW * wMis * (double)stG);
+    return hadamard(rhoRGB / (Real)DPI, sc.rgbEnv) * k;
+}
+
+// RGB backward radiance along a camera ray (Option B). Carries a linear-sRGB throughput
+// and accumulates linear-sRGB radiance; returns L (the kernel converts to XYZ for the
+// film). Scope (cudaBackwardRGBSupported): Lambertian (constant-albedo) + diffuse-transmit
+// + mirror/glossy/half-mirror/filter + non-dispersive dielectric + stochastic mix, area/
+// sphere/cylinder/spot lights and a constant env. Media / fluorescence / thin-film /
+// multilayer / grating / textured albedo / image-env fall back to the spectral tracer.
+__device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
+                                      DRng& rng) {
+    DVec3 L(0, 0, 0), beta(1, 1, 1);
+    bool specularArrival = true;
+    double contBsdfPdf = 0.0;
+    DMediumStack stk; stk.clear();
+    const int maxBounce = 32;
+    for (int b = 0; b < maxBounce; ++b) {
+        DHit h = closestHit(sc, ro, rd);
+        if (!h.valid) {                                // escaped -> constant env
+            if (sc.envIndex >= 0) {
+                if (specularArrival) {
+                    L = L + hadamard(beta, sc.rgbEnv);
+                } else {
+                    double pdfEnv = 1.0 / (4.0 * DPI);
+                    double wMis = (contBsdfPdf + pdfEnv > 0.0)
+                                      ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
+                    L = L + hadamard(beta, sc.rgbEnv) * (Real)wMis;
+                }
+            }
+            return L;
+        }
+        // Beer-Lambert attenuation over the in-glass segment (3-tap RGB sigma_a).
+        {
+            int cm = stk.topMat();
+            if (cm >= 0) {
+                DVec3 a = sc.mats[cm].rgbAbsorb;
+                if (a.x > 0 || a.y > 0 || a.z > 0)
+                    beta = hadamard(beta, DVec3(exp(-(double)a.x * (double)h.t),
+                                                exp(-(double)a.y * (double)h.t),
+                                                exp(-(double)a.z * (double)h.t)));
+            }
+        }
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return L;
+            mp = &sc.mats[child]; matId = child;
+        }
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
+            L = L + hadamard(beta, sc.emitters[li].rgbEmit);
+
+        switch (mp->type) {
+            case D_DIELECTRIC: {
+                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, matId, stk, nro, nrd);
+                ro = nro; rd = nrd; specularArrival = true; break;
+            }
+            case D_MIRROR: {
+                Real q = rgbLuma(mp->rgbAlbedo);
+                if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
+                beta = hadamard(beta, mp->rgbAlbedo) / q;
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
+            }
+            case D_HALFMIRROR: {
+                Real r = clamp01(rgbLuma(mp->rgbAlbedo));
+                if (rng.uniform() < (double)r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else                           { ro = h.p + rd * RAY_EPS; }
+                specularArrival = true; break;
+            }
+            case D_FILTER: {
+                Real q = rgbLuma(mp->rgbTransmit);
+                if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
+                beta = hadamard(beta, mp->rgbTransmit) / q;
+                ro = h.p + rd * RAY_EPS; specularArrival = true; break;
+            }
+            case D_GLOSSY: {
+                Real q = rgbLuma(mp->rgbAlbedo);
+                if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+                if (dot(o, h.n) <= 0) return L;
+                beta = hadamard(beta, mp->rgbAlbedo) / q;
+                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
+            }
+            case D_DIFFUSETRANSMIT: {
+                DVec3 rhoR = clampRgb01(mp->rgbAlbedo);
+                DVec3 rhoT = clampRgb01(mp->rgbTransmit);
+                Real pR = rgbLuma(rhoR), pT = rgbLuma(rhoT);
+                Real s = pR + pT;
+                if (s > (Real)1) { pR /= s; pT /= s; }     // energy guard on the selection probs
+                DVec3 nb = h.n * (Real)(-1);
+                L = L + hadamard(beta, bkNeeLightRGB(sc, h, rhoR, rng));
+                if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rhoR, rng));
+                DHit hb = h; hb.n = nb;
+                L = L + hadamard(beta, bkNeeLightRGB(sc, hb, rhoT, rng));
+                if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, hb, rhoT, rng));
+                Real u = rng.uniform();
+                if (u < pR) {
+                    beta = hadamard(beta, rhoR) / pR;
+                    DVec3 wOut = cosineHemisphere(h.n, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                    ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                } else if (u < pR + pT) {
+                    beta = hadamard(beta, rhoT) / pT;
+                    DVec3 wOut = cosineHemisphere(nb, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
+                    ro = h.p + nb * RAY_EPS; rd = wOut; specularArrival = false; break;
+                }
+                return L;                                   // absorbed
+            }
+            case D_DIFFUSE:
+            default: {
+                DVec3 rho = clampRgb01(mp->rgbAlbedo);
+                L = L + hadamard(beta, bkNeeLightRGB(sc, h, rho, rng));
+                if (sc.envIndex >= 0)
+                    L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rho, rng));
+                Real q = rgbLuma(rho);
+                if (q <= (Real)0 || rng.uniform() >= (double)q) return L;   // RR on luminance
+                beta = hadamard(beta, rho) / q;
+                DVec3 wOut = cosineHemisphere(h.n, rng);
+                contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+            }
+        }
+    }
+    return L;
+}
+
+// Fast RGB backward megakernel (mode R -rgb). Same grid-stride / seeding scheme as
+// kBackward, but each sample does ONE colour walk and deposits the linear-RGB radiance
+// (converted to XYZ) into the film. The specular interfaces use a fixed representative
+// wavelength (LREP_RGB); the camera lens ray uses it too (RGB drops lens dispersion).
+__global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
+                             long long totalSamples, long long chunkSpp, long long sppTotal,
+                             long long sampleBase, int resX,
+                             int diffraction, unsigned long long seedBase) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    for (long long idx = g; idx < totalSamples; idx += G) {
+        long long pix = idx / chunkSpp;
+        long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
+        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        int px = (int)(pix % resX);
+        int py = (int)(pix / resX);
+
+        DVec3 ro, rd;
+        double wLens = 1.0;
+        if (cam.hasLens) {
+            Real jx = rng.uniform(), jy = rng.uniform();
+            Real u1 = rng.uniform(), u2 = rng.uniform();
+            Real wl = 0;
+            if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, LREP_RGB, ro, rd, wl)) continue;  // vignetted
+            wLens = (double)wl;
+        } else {
+            Real jx = rng.uniform(), jy = rng.uniform();
+            dGenRay(cam, px, py, jx, jy, ro, rd);
+        }
+        DVec3 Lrgb = bkRadianceRGB(sc, diffraction, ro, rd, rng);
+        DVec3 xyz = dRgbToXyz(Lrgb * (Real)wLens);
+        size_t o = ((size_t)py * resX + px) * 3;
+        atomicAdd(&film[o + 0], (double)xyz.x);
+        atomicAdd(&film[o + 1], (double)xyz.y);
+        atomicAdd(&film[o + 2], (double)xyz.z);
+        if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+    }
+}
+
 // ---- G2: deterministic primary-ray isosurface PREVIEW kernel -----------------
 // A GPU sibling of the CPU solid rasterizer (raster.h) that renders implicit
 // isosurfaces (and any other bakeable geometry) WITHOUT tessellation: it casts one
@@ -6260,6 +6577,15 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(m.substrateK, d.substrateK);
         bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
         bakeSpec(m.transmit, d.transmit); // diffuse-transmission back-lobe albedo (translucent)
+        // Fast RGB backward (mode R -rgb) bakes: linear-sRGB reflect/transmit albedo,
+        // a representative achromatic index (ior at 550 nm) and a 3-tap Beer-Lambert
+        // sigma_a at the R/G/B pivots (610/550/465 nm). Inert for the spectral paths.
+        { Vec3 ra = rgbbake::reflToRgb(m.reflect); d.rgbAlbedo = {ra.x, ra.y, ra.z}; }
+        { Vec3 rt = rgbbake::reflToRgb(m.transmit); d.rgbTransmit = {rt.x, rt.y, rt.z}; }
+        d.rgbAbsorb = { m.absorb ? m.absorb(610.0) : 0.0,
+                        m.absorb ? m.absorb(550.0) : 0.0,
+                        m.absorb ? m.absorb(465.0) : 0.0 };
+        d.rgbIor = m.ior ? m.ior(550.0) : 1.0;
         d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
@@ -6442,6 +6768,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.cdfStep = e.spd.step;
         de.matId = e.matId;                 // BDPT: link to emissive surface material
         bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
+        { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
         dems.push_back(de);
     }
@@ -6601,6 +6928,13 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
     sc.envIndex = scene.envIndex;
+    // Fast RGB backward: constant-env radiance in linear sRGB (0 when there's no env).
+    if (scene.envIndex >= 0 && scene.envIndex < (int)scene.emitters.size()) {
+        Vec3 le = rgbbake::emitToRgb(scene.emitters[scene.envIndex].spdFn);
+        sc.rgbEnv = {le.x, le.y, le.z};
+    } else {
+        sc.rgbEnv = {0.0, 0.0, 0.0};
+    }
 
     // One-time fill of the specular-sphere scan-angle cos/sin tables (device-computed
     // so table entries are bit-identical to the per-step evaluation they replace).
@@ -7178,6 +7512,81 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     };
 
     if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    else gpuSppChunks(spp, *prog, out, launch, download);
+
+    freeUpload(up);
+    cudaFree(d_film); cudaFree(d_hits);
+    return out;
+}
+
+// --------------------- fast RGB backward (mode R -rgb) host ------------------
+
+bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
+    // The fast RGB path (bkRadianceRGB) is a deliberately-reduced Option-B tracer. It
+    // needs the shared POD scene bake (cudaForwardSupported) and the same emitter/camera
+    // gates as the spectral backward, PLUS: no participating media (not yet ported to the
+    // RGB walk), no dispersion-dependent materials (thin-film / grating / multilayer /
+    // layered / fluorescence — those effects can't survive an RGB throughput), and only
+    // CONSTANT per-material reflectance (no textured / record-driven albedo, which the
+    // baked rgbAlbedo doesn't capture). Scenes outside this scope fall back to the
+    // spectral backward (renderBackwardCuda) or the CPU tracer.
+    if (!cudaForwardSupported(scene)) return false;
+    if (grin::sceneHasGrin(scene)) return false;
+    for (const auto& m : scene.media) if (m.enabled) return false;   // media -> spectral path
+    if (scene.envIndex >= 0 && scene.envMap) return false;           // image env -> spectral path
+    for (size_t i = 0; i < scene.emitters.size(); ++i) {
+        if ((int)i == scene.envIndex) continue;
+        const auto& em = scene.emitters[i];
+        if (em.collimated) return false;
+        if (em.shape == EmitterShape::Env) return false;
+    }
+    for (const auto& m : scene.mats) {
+        switch (m.type) {
+            case MatType::Diffuse: case MatType::Dielectric: case MatType::Mirror:
+            case MatType::HalfMirror: case MatType::Glossy: case MatType::Mix:
+            case MatType::DiffuseTransmit: case MatType::Filter:
+                break;                                              // handled by bkRadianceRGB
+            default: return false;                                  // dispersion/thin-film/etc -> spectral
+        }
+        if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
+        if (m.recBindingFor(REC_SLOT_REFLECT)) return false;        // record-driven reflectance
+    }
+    if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
+    return true;
+}
+
+Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int resY,
+                           long long spp, bool diffraction, const SppProgress* prog) {
+    using namespace gpu;
+    Film out; out.resX = resX; out.resY = resY; out.alloc();
+    if (!cudaAvailable() || !cudaBackwardRGBSupported(scene, cam)) return out;
+
+    DUpload up;
+    buildUpload(scene, cam, resX, resY, up);
+
+    const size_t npix = (size_t)resX * resY;
+    double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
+    double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+    const unsigned long long seed = 0x9e3779b97f4a7c15ULL
+        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+
+    std::vector<double> film(npix * 3);
+    auto download = [&](Film& o) {
+        CUDA_CHECK(cudaMemcpy(film.data(), d_film, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(o.hits.data(), d_hits, npix * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)
+            o.xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+    };
+    auto launch = [&](long long c, long long base) {
+        long long totalSamples = (long long)npix * c;
+        kBackwardRGB<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
+                                    diffraction ? 1 : 0, seed);
+        cudaCheckKernel("backwardRGB");
+    };
+
+    if (!prog || !prog->report) { launch(spp, 0); download(out); }
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);

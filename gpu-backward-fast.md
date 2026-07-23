@@ -125,6 +125,41 @@ sample. This is the fastest, most POV-Ray-like path.
     - [ ] **Image-based environment** (lat-long map): env-NEE via the luminance CDF
       (`dEnvSample`), image env-miss with `envPdfDir`, and the per-texel radiance
       reweight. Deferred; a constant env already works (1c).
-- [ ] Stage 2: fast RGB backward (Option B)
+- [x] **Stage 2: fast RGB backward (Option B).** New non-spectral device path
+  (`renderBackwardRGBCuda` / `kBackwardRGB` / `bkRadianceRGB` in `src/render_cuda.cu`),
+  selected by `-rgb` on mode R when the GPU backward is eligible
+  (`cudaBackwardRGBSupported`). Carries a `DVec3` linear-RGB throughput `beta` and
+  accumulator `L` instead of a single wavelength, so one intersection walk produces a
+  full-colour sample. Baking (at scene build, host side, `namespace rgbbake`):
+  - **Emitter/env radiance** → `xyzToLinearSrgb(∫CIE(λ)·emitSpd(λ)dλ)` (`DEmitter.rgbEmit`,
+    `DScene.rgbEnv`). No area/invPdf term — the spectral estimator's `p(λ)·invPdf = 1`
+    regardless of emitter geometry, so a directly-viewed emitter's film XYZ is exactly
+    that integral; the geometry factors stay in NEE.
+  - **Material reflectance** → linear-RGB albedo under equal-energy white, clamped per
+    channel to [0,1] (`reflToRgb`; flat white → (1,1,1)). Stored as `rgbAlbedo` /
+    `rgbTransmit`; colored glass keeps a 3-tap Beer-Lambert `rgbAbsorb` (σ_a at
+    610/550/465 nm) and `rgbIor = ior(550)`.
+  - **Deposit** converts `L` (linear-RGB) → XYZ via `dRgbToXyz` (inverse of
+    `color.h`'s `xyzToLinearSrgb`) before adding to the film.
+  - **Achromatic specular** uses a representative `LREP_RGB = 550 nm` for Fresnel /
+    refraction via the existing `dDielectricStep`; **RGB Russian roulette** survives
+    with `q = rgbLuma(albedo)` then `beta = hadamard(beta, albedo)/q` (unbiased,
+    colored, lower variance than the spectral RR).
+  - **Scope gate** (`cudaBackwardRGBSupported`): forward-eligible, no GRIN, **no media**
+    (deferred), no image-env, no collimated/env-shape emitters, only material types
+    Diffuse/Dielectric/Mirror/HalfMirror/Glossy/Mix/DiffuseTransmit/Filter, no textured
+    or record-driven reflectance (deferred). Ineligible scenes fall back to the spectral
+    backward with a warning.
+  - **Validated** vs the spectral backward on `scenes/_rgb_neutral.ftsl` (flat-spectrum
+    Cornell: reflectances `0.75`/`0.5`, equal-energy-round-tripping light — no
+    metamerism, so the RGB path must match the spectral estimator's *absolute*
+    luminance): raw film radiance (from `.ftbuf`, no auto-exposure confound) agrees to
+    **0.07%** in mean luminance (ratio B/A = 1.0007), per-channel XYZ within 0.3%
+    (X 1.0005 / Y 1.0007 / Z 1.0034), block residual 1.38%→1.04%→0.41% at 8/16/32 px
+    (monotonic → noise only, no bias). Colored scenes carry the accepted Option-B
+    metamerism approximation (no dispersion / thin-film / spectral fluorescence).
+    Compare tool `scraps/cmp_ftbuf.py`.
+  - **Deferred follow-ups:** participating media in the RGB walk (gated out); textured /
+    record-driven albedo in RGB (gated out). Logged in `known-issues.md`.
 - [ ] Stage 3: scene-ignore flags
 - [ ] Stage 4: `-explore` integration

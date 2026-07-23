@@ -198,10 +198,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
-// v1 scope: no participating media, no environment light, only area/sphere/cylinder
-// Lambertian emitters (no spot/env/collimated), no fluorescence, and a lens no deeper
-// than the device cap (D_MAXLENS). Textured albedo IS supported. When false, the
-// caller must use the CPU backward tracer (which has no such restrictions).
+// Current scope: participating media (homogeneous + heterogeneous, minus GRIN/rainbow),
+// fluorescence, a CONSTANT environment light, textured albedo, and area/sphere/cylinder
+// Lambertian + point-spot emitters; a lens no deeper than the device cap (D_MAXLENS).
+// Image-based env, collimated beams and GRIN/rainbow media fall back to the CPU tracer.
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
 // GPU backward reference trace (mode R). Renders `spp` samples per pixel at the given
@@ -219,6 +219,26 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr);
+
+// True if this scene + camera can be rendered by the FAST RGB backward megakernel
+// (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer
+// that carries a linear-sRGB throughput and produces a full-colour image in ONE walk
+// per sample. Scope is narrower than cudaBackwardSupported — no participating media,
+// no dispersion-dependent materials (thin-film / grating / multilayer / layered /
+// fluorescence), only constant (untextured, non-record) per-material reflectance, no
+// image env / collimated emitters. When false the caller falls back to the spectral
+// backward (renderBackwardCuda) or the CPU tracer.
+bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam);
+
+// Fast RGB backward trace (mode R `-rgb`). Same spp/chunk/checkpoint conventions and
+// film accumulation as renderBackwardCuda, but each sample does a single colour walk
+// (no wavelength dimension), so a clean colour image converges far faster. A neutral
+// (spectrally flat) scene matches the spectral estimator's absolute luminance; colour
+// carries the Option-B metamerism approximation. Requires cudaBackwardRGBSupported();
+// otherwise returns an empty film.
+Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int resY,
+                           long long spp, bool diffraction,
+                           const SppProgress* prog = nullptr);
 
 // True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
 // (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),
