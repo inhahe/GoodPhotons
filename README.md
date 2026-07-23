@@ -2063,6 +2063,19 @@ add-on), this doubles as a Blender → FTSL path.
 | `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) and VCM (`U`) |
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
+**Scene-ignore (speed knobs)** — rasterizer-style flags that strip or cap expensive
+scene features so a render (especially the backward camera modes `R`/`P`, and the fast
+`-rgb` path) runs faster. The three strip flags mutate the scene once at load and print an
+`[ignore] stripped: …` summary; `-max-bounce` / `-direct-only` are render parameters.
+
+| Flag | Meaning |
+|---|---|
+| `-no-media` / `-nomedia` | Drop all participating-media volumes (fog / homogeneous / heterogeneous). Also un-gates the fast `-rgb` backward, which otherwise falls back to spectral on any medium. |
+| `-no-env` / `-noenv` | Remove the environment light (constant or image-based): the scene renders against black, and the emitter CDF is rebuilt without it. |
+| `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
+| `-max-bounce <N>` | Cap path depth at `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, and the photon modes). Default is the tracer's own cap (32). |
+| `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /

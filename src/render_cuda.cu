@@ -667,6 +667,12 @@ struct DScene {
     DEnvMap env;                     // image env tables (env.scale null => constant env)
     int    envIndex;                 // index of the env emitter in `emitters`, or -1 (mirrors Scene::envIndex)
     DVec3  rgbEnv;                    // fast RGB backward: constant-env radiance in linear sRGB (0 if no env)
+    // Scene-ignore render params (Stage 3), set by renderBackward[RGB]Cuda from the CLI
+    // flags. bkMaxBounce caps the backward path-depth loop (default 32). bkDirectOnly=1
+    // renders direct lighting + specular recursion only (no diffuse indirect) — a
+    // Whitted-style near-1-spp preview; 0 = full path tracing.
+    int    bkMaxBounce;
+    int    bkDirectOnly;
 };
 
 // Lens-projection radius maps (device twins of camera.h projRadius/Inv/Deriv). The
@@ -4894,7 +4900,8 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
     bool specularArrival = true;                       // camera ray may see a light directly
     double contBsdfPdf = 0.0;                           // solid-angle pdf of the current continuation (env MIS)
     DMediumStack stk; stk.clear();                     // nested-dielectric medium stack (empty = vacuum)
-    const int maxBounce = 32;
+    const int maxBounce = sc.bkMaxBounce;
+    const bool directOnly = (sc.bkDirectOnly != 0);
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
         Real dSurf = h.valid ? h.t : (Real)1e30;
@@ -4914,6 +4921,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 L += thr * bkNeeVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
                 if (sc.envIndex >= 0)                              // env-NEE at the volume vertex
                     L += thr * bkNeeEnvVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
+                if (directOnly) return L;                          // Whitted: single-scatter only
                 Real alb = medAlbedo(med, lambda);
                 if (rng.uniform() >= (double)alb) return L;        // absorbed
                 DVec3 wIn = rd;
@@ -5023,6 +5031,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
                 if (sc.envIndex >= 0)
                     L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
+                if (directOnly) return L;                // Whitted: no diffuse indirect
                 Real u = rng.uniform();
                 if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break; }
                 else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; break; }
@@ -5058,6 +5067,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                         }
                     }
                 }
+                if (directOnly) return L;                                        // Whitted: no indirect (elastic or fluoro)
                 double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
                 double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
                 double u = rng.uniform();
@@ -5083,6 +5093,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
                 if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
                     L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
+                if (directOnly) return L;               // Whitted: no diffuse indirect
                 if (rng.uniform() >= rho) return L;     // RR on albedo
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
@@ -5235,7 +5246,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
     bool specularArrival = true;
     double contBsdfPdf = 0.0;
     DMediumStack stk; stk.clear();
-    const int maxBounce = 32;
+    const int maxBounce = sc.bkMaxBounce;
+    const bool directOnly = (sc.bkDirectOnly != 0);
     for (int b = 0; b < maxBounce; ++b) {
         DHit h = closestHit(sc, ro, rd);
         if (!h.valid) {                                // escaped -> constant env
@@ -5316,6 +5328,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 DHit hb = h; hb.n = nb;
                 L = L + hadamard(beta, bkNeeLightRGB(sc, hb, rhoT, rng));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, hb, rhoT, rng));
+                if (directOnly) return L;                   // Whitted: no diffuse indirect
                 Real u = rng.uniform();
                 if (u < pR) {
                     beta = hadamard(beta, rhoR) / pR;
@@ -5336,6 +5349,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 L = L + hadamard(beta, bkNeeLightRGB(sc, h, rho, rng));
                 if (sc.envIndex >= 0)
                     L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rho, rng));
+                if (directOnly) return L;                                   // Whitted: no diffuse indirect
                 Real q = rgbLuma(rho);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;   // RR on luminance
                 beta = hadamard(beta, rho) / q;
@@ -6935,6 +6949,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     } else {
         sc.rgbEnv = {0.0, 0.0, 0.0};
     }
+    // Scene-ignore render params (Stage 3). Defaults = full path tracing; the backward
+    // wrappers (renderBackward[RGB]Cuda) override from the CLI flags before launch.
+    sc.bkMaxBounce  = 32;
+    sc.bkDirectOnly = 0;
 
     // One-time fill of the specular-sphere scan-angle cos/sin tables (device-computed
     // so table entries are bit-identical to the per-step evaluation they replace).
@@ -7479,13 +7497,16 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
 }
 
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                        long long spp, bool diffraction, const SppProgress* prog) {
+                        long long spp, bool diffraction, const SppProgress* prog,
+                        int maxBounce, bool directOnly) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
 
     DUpload up;
     buildUpload(scene, cam, resX, resY, up);
+    if (maxBounce >= 1) up.sc.bkMaxBounce = maxBounce;   // Stage 3: -max-bounce cap
+    up.sc.bkDirectOnly = directOnly ? 1 : 0;             // Stage 3: -direct-only (Whitted)
 
     const size_t npix = (size_t)resX * resY;
     double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
@@ -7556,13 +7577,16 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
 }
 
 Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                           long long spp, bool diffraction, const SppProgress* prog) {
+                           long long spp, bool diffraction, const SppProgress* prog,
+                           int maxBounce, bool directOnly) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardRGBSupported(scene, cam)) return out;
 
     DUpload up;
     buildUpload(scene, cam, resX, resY, up);
+    if (maxBounce >= 1) up.sc.bkMaxBounce = maxBounce;   // Stage 3: -max-bounce cap
+    up.sc.bkDirectOnly = directOnly ? 1 : 0;             // Stage 3: -direct-only (Whitted)
 
     const size_t npix = (size_t)resX * resY;
     double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));

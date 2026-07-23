@@ -115,6 +115,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   absolute luminance to noise on flat-spectrum scenes; drops dispersion/thin-film/
   fluorescence (Option-B). Gate excludes media, image-env, textured/record albedo, and
   collimated/env-shape emitters (fall back to the spectral backward).
+  Since 0.28.0 there are **scene-ignore speed flags** (rasterizer-style): host-side
+  `Scene::applyIgnoreFlags(noMedia,noEnv,noFluoro)` (in `scene.h`, run once at load)
+  strips media (`-no-media`), the environment emitter (`-no-env`; erases
+  `emitters[envIndex]`, resets `envIndex`/`envMap`/`envXYZ`, `finalizeEmitters()`), or
+  demotes fluorescent → diffuse (`-no-fluoro`); each prints an `[ignore] stripped:`
+  summary. Depth/Whitted params are threaded via globals `g_maxBounceOverride`
+  (`-max-bounce N`) and `g_directOnly` (`-direct-only`) — mirroring the `g_heroC`
+  pattern — into `BackwardRenderer::maxBounce`/`directOnly`, forward `Renderer::maxBounce`,
+  and (on GPU) `DScene.bkMaxBounce`/`bkDirectOnly` set on the `renderBackward*Cuda`
+  wrappers. `directOnly` (terminate after the first non-specular NEE, specular chains
+  still recurse) is scoped to the camera path tracers (R spectral + RGB, P's backward
+  layer); forward B and the photon/BDPT modes honour only `maxBounce`.
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror

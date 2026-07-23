@@ -216,9 +216,12 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // progress / request an early stop. A null `prog` renders all spp in one launch (the
 // historical path). Either way the result is bit-identical for a given spp (the RNG is
 // seeded on the global sample index, so chunking never changes the image).
+// maxBounce (< 1 => leave the device default of 32) caps the backward path depth
+// (-max-bounce); directOnly (-direct-only) renders direct + specular recursion only.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
-                        const SppProgress* prog = nullptr);
+                        const SppProgress* prog = nullptr,
+                        int maxBounce = 32, bool directOnly = false);
 
 // True if this scene + camera can be rendered by the FAST RGB backward megakernel
 // (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer
@@ -238,7 +241,8 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam);
 // otherwise returns an empty film.
 Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                            long long spp, bool diffraction,
-                           const SppProgress* prog = nullptr);
+                           const SppProgress* prog = nullptr,
+                           int maxBounce = 32, bool directOnly = false);
 
 // True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
 // (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),

@@ -161,5 +161,35 @@ sample. This is the fastest, most POV-Ray-like path.
     Compare tool `scraps/cmp_ftbuf.py`.
   - **Deferred follow-ups:** participating media in the RGB walk (gated out); textured /
     record-driven albedo in RGB (gated out). Logged in `known-issues.md`.
-- [ ] Stage 3: scene-ignore flags
+- [x] **Stage 3: scene-ignore flags.** Rasterizer-style knobs to strip expensive scene
+  features so the fast RGB (or spectral) backward runs faster. Two kinds:
+  - **Scene mutations** (`Scene::applyIgnoreFlags(noMedia, noEnv, noFluoro)` in
+    `src/scene.h`, applied host-side once after scene load, before any upload):
+    - `-no-media` / `-nomedia` — clears `media` (drops all participating-media volumes;
+      also un-gates the RGB fast path, since media are a fast-path gate).
+    - `-no-env` / `-noenv` — erases the environment emitter (`emitters[envIndex]`), resets
+      `envIndex=-1` / `envMap` / `envXYZ=0`, then `finalizeEmitters()` to rebuild the
+      emitter CDF/sampler. Safe because `envIndex` is the only persistently-stored emitter
+      index.
+    - `-no-fluoro` / `-nofluoro` — demotes every `MatType::Fluorescent` material to
+      `MatType::Diffuse` (falls back to the elastic `reflect` albedo — correct by design).
+    Each strip prints `[ignore] stripped: <summary>` (e.g. `1 medium/media`,
+    `environment light`, `1 fluorescent material`).
+  - **Render params** (threaded via globals `g_maxBounceOverride` / `g_directOnly` in
+    `main.cpp`, mirroring the `g_heroC` pattern; on GPU carried as `DScene.bkMaxBounce` /
+    `bkDirectOnly`, set on the `renderBackward*Cuda` wrappers since `render_cuda.cu` is a
+    separate TU):
+    - `-max-bounce <N>` — caps path depth (`BackwardRenderer::maxBounce`, forward
+      `Renderer::maxBounce`, and GPU `bkMaxBounce`). `<0` = tracer default (32).
+    - `-direct-only` / `-directonly` — Whitted mode: after a **non-specular** vertex
+      (Diffuse / DiffuseTransmit / elastic-Fluorescent / fog single-scatter) does its
+      direct-lighting NEE, terminate — no diffuse indirect continuation. Specular chains
+      (mirror / dielectric / glossy / filter) still recurse. **Scoped to the camera path
+      tracers** (backward R spectral + RGB, P's backward side); forward B and the
+      photon/bidirectional modes (M/S/D) honour `maxBounce` but ignore `directOnly`.
+  - **Validated:** all three strip flags print the correct `[ignore] stripped:` summaries
+    and render without crashing; `-direct-only` produces textbook Whitted images on **both
+    GPU and CPU** (no colour bleeding, black shadows, dark ceiling) — verified on the
+    Cornell box (`png/_direct_cornell.png` GPU, `png/_cpu_direct.png` CPU); `-max-bounce`
+    parses and caps depth.
 - [ ] Stage 4: `-explore` integration

@@ -1090,6 +1090,17 @@ static double g_vcmAlpha = 0.75;
 // single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
 static int g_heroC = hero::kHeroC;
 
+// Scene-ignore render params (Stage 3), set once at arg-parse and read by the tracer
+// wrappers (like g_heroC). g_maxBounceOverride < 0 leaves each tracer's own default
+// (32); >= 1 caps the path-depth loop and is honoured UNIVERSALLY (forward B, backward
+// R/RGB, BDPT, photon/SPPM, P). g_directOnly renders direct lighting + specular recursion
+// only (no diffuse indirect bounce) — a Whitted-style near-1-spp preview — in the CAMERA
+// path tracers where it is well-defined: backward R, the RGB fast path, and the backward
+// camera side of the P composite. The forward light tracer (B) and the photon /
+// bidirectional modes (M/S/D) honour maxBounce but ignore directOnly.
+static int  g_maxBounceOverride = -1;
+static bool g_directOnly = false;
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -1248,6 +1259,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
         r.useHero = heroOn; r.heroC = g_heroC;
+        if (g_maxBounceOverride >= 1) r.maxBounce = g_maxBounceOverride;
         // Photon i draws from its own stream keyed by the ABSOLUTE photon index
         // seedBase+i (seedBase = cumulative photons of earlier batches), so the traced
         // set is independent of batch splits and thread count (see rng.h seedUnit).
@@ -1306,6 +1318,7 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
         r.useHero = heroOn; r.heroC = g_heroC; r.beamGather = beamGather;
+        if (g_maxBounceOverride >= 1) r.maxBounce = g_maxBounceOverride;
         // Identical per-photon seeding to renderForward (absolute index seedBase+i via
         // seedUnit). For model B this keeps each camera's shared film bit-identical to
         // its standalone single-camera render at the same seedBase; for model A the
@@ -1349,6 +1362,8 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
+        if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
+        br.directOnly = g_directOnly;
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
     };
@@ -2284,7 +2299,8 @@ static int runCompositeProgressive(
             if (gpuBackward) {
                 SppProgress bp; bp.sampleBase = acc.spp;   // mixes into the device seed
                 bp.report = [](const Film&, long long, bool) { return false; };
-                r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp);
+                r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
+                                       g_maxBounceOverride, g_directOnly);
             } else
 #endif
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
@@ -2361,7 +2377,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool wantCheckpointFlag = false, bool runForever = false,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
-                     double* exposureAnchor = nullptr, bool rgbBackward = false) {
+                     double* exposureAnchor = nullptr, bool rgbBackward = false,
+                     int maxBounceOverride = -1, bool directOnly = false) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
@@ -2567,8 +2584,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     lightLabel);
         auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-            if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p);
-            if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p);
+            if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p,
+                                                           g_maxBounceOverride, g_directOnly);
+            if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p,
+                                                        g_maxBounceOverride, g_directOnly);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -3329,6 +3348,14 @@ static void printHelp(const char* prog) {
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
 "  -t <n>                CPU thread count\n"
 "\n"
+"Scene-ignore (faster preview — strip expensive features, like the rasterizer):\n"
+"  -no-media             drop all participating media (haze/fog/volumes)\n"
+"  -no-env               remove the environment (sky/IBL) light\n"
+"  -no-fluoro            demote fluorescent materials to plain diffuse\n"
+"  -max-bounce <n>       cap path depth at n bounces (default 32)\n"
+"  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
+"                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
+"\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
 "  -window               live OS preview window, refreshed as it converges\n"
@@ -3452,6 +3479,12 @@ static int run(int argc, char** argv) {
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
+    // Scene-ignore flags (Stage 3): rasterizer-style feature stripping for a faster
+    // preview. noMedia/noEnv/noFluoro mutate the scene (Scene::applyIgnoreFlags);
+    // maxBounceOverride caps path depth (<0 = leave the tracer default of 32);
+    // directOnly renders direct lighting + specular recursion only (no diffuse indirect).
+    bool noMedia = false, noEnv = false, noFluoro = false, directOnly = false;
+    int  maxBounceOverride = -1;
     const char* cameraSel = nullptr; // -camera <name>|<pathbase>|all|#N|near=X,Y,Z (FTSL multi-camera select)
     bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
@@ -3715,6 +3748,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
+        else if (!std::strcmp(argv[i], "-no-media") || !std::strcmp(argv[i], "-nomedia")) noMedia = true;
+        else if (!std::strcmp(argv[i], "-no-env") || !std::strcmp(argv[i], "-noenv")) noEnv = true;
+        else if (!std::strcmp(argv[i], "-no-fluoro") || !std::strcmp(argv[i], "-nofluoro")) noFluoro = true;
+        else if (!std::strcmp(argv[i], "-direct-only") || !std::strcmp(argv[i], "-directonly")) directOnly = true;
+        else if (!std::strcmp(argv[i], "-max-bounce") && i + 1 < argc) maxBounceOverride = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
@@ -3890,6 +3928,22 @@ static int run(int argc, char** argv) {
         }
         scene.media.push_back(std::move(fog));
     }
+
+    // Scene-ignore flags (Stage 3): strip expensive features for a faster preview,
+    // "like the rasterizer does". Applied after all scene construction (incl. -fog)
+    // so it sees the final scene. Pure mutation; maxBounce / directOnly are render
+    // params threaded into runRender below.
+    if (noMedia || noEnv || noFluoro) {
+        std::string removed = scene.applyIgnoreFlags(noMedia, noEnv, noFluoro);
+        if (!removed.empty())
+            std::printf("[ignore] stripped: %s\n", removed.c_str());
+    }
+    // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
+    // g_heroC), so every render (incl. the meter pre-pass) honours them.
+    g_maxBounceOverride = maxBounceOverride;
+    g_directOnly = directOnly;
+    if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
+    if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test
@@ -5798,7 +5852,8 @@ static int run(int argc, char** argv) {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
-                    mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
+                                            g_maxBounceOverride, g_directOnly);
                     onGpu = true;
                 }
 #endif
@@ -5846,7 +5901,8 @@ static int run(int argc, char** argv) {
                 bool refGpu = false;
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
-                    ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
+                                             g_maxBounceOverride, g_directOnly);
                     refGpu = true;
                 }
 #endif
@@ -6384,7 +6440,8 @@ static int run(int argc, char** argv) {
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
-                           preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward);
+                           preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward,
+                           maxBounceOverride, directOnly);
         if (rv != 0) return rv;
     }
 

@@ -966,6 +966,44 @@ struct Scene {
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
+    // Scene-ignore flags (Stage 3): cheaply strip expensive features from an
+    // already-built scene so the previewer / -explore can trade physical
+    // completeness for speed, "like the rasterizer does". Call AFTER build().
+    // Pure scene mutation (maxBounce / directOnly are render params, threaded
+    // separately). Returns a human-readable summary of what was removed (empty
+    // if nothing changed) so the caller can log it.
+    //   noMedia  — drop all participating media (haze/volumes) -> vacuum.
+    //   noEnv    — remove the environment light (sky/IBL); scene keeps its
+    //              local emitters only. Rebuilds the emitter CDF / sampler.
+    //   noFluoro — demote fluorescent materials to plain diffuse (their elastic
+    //              `reflect` albedo), dropping the Stokes-shift reradiation.
+    std::string applyIgnoreFlags(bool noMedia, bool noEnv, bool noFluoro) {
+        std::string summary;
+        auto note = [&](const std::string& s) {
+            if (!summary.empty()) summary += ", ";
+            summary += s;
+        };
+        if (noMedia && !media.empty()) {
+            note(std::to_string(media.size()) + " medium/media");
+            media.clear();
+        }
+        if (noEnv && envIndex >= 0) {
+            note("environment light");
+            emitters.erase(emitters.begin() + envIndex);
+            envIndex = -1;
+            envMap.reset();
+            envXYZ = Vec3{0, 0, 0};
+            finalizeEmitters();   // rebuild CDF / emission sampler without the env
+        }
+        if (noFluoro) {
+            int n = 0;
+            for (auto& m : mats)
+                if (m.type == MatType::Fluorescent) { m.type = MatType::Diffuse; ++n; }
+            if (n) note(std::to_string(n) + " fluorescent material" + (n > 1 ? "s" : ""));
+        }
+        return summary;
+    }
+
     void buildBvh() {
         const double pad = 1e-6;       // avoid zero-thickness slabs on flat prims
         std::vector<Aabb> boxes;
