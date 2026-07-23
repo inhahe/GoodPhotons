@@ -1780,9 +1780,15 @@ mark the corresponding row in `gpu-fallbacks.md`.
       bias beyond what HG already shows; forward-mode bulk median ratio is 1.02 (rainbow) / 1.00 (HG); visuals
       show correct primary+secondary bows with spectral separation. The git diff also proves the HG BDPT path
       is bit-for-bit unchanged by the refactor.
-- [ ] **M11. GRIN (gradient-index) media on device backward.** `cudaBackwardSupported` rejects GRIN (no
-      Eikonal marcher in `bkRadiance`). Port the Eikonal ray-marcher to the device volume walk. Relax the
-      `grin::sceneHasGrin` reject in backward (BDPT stays CPU — straight-segment MIS).
+- [x] **M11. GRIN (gradient-index) media on device backward.** *(DONE 2026-07-23, 0.38.0.)* Ported the
+      Eikonal marcher to the device as `dGrinMarch` (render_cuda.cu:2040) — byte-identical to `grin::march`,
+      running (ro,rd) carried in double to mirror the CPU ground truth. `bkRadiance` marches each bounce's
+      ray (incl. the primary camera ray) before `closestHit`, gated by `sc.hasGrin`; removed the GRIN reject
+      in `cudaBackwardSupported`. BDPT (`cudaBdptSupported`) and the RGB fast path (`cudaBackwardRGBSupported`)
+      still reject GRIN (straight-segment MIS / RGB-throughput). Validated GPU==CPU on `scraps/grin_lin.ftsl`
+      (linear lens): SSIM 0.99, Pearson 0.99, both bend identically; a small bent-region float-vs-double
+      residual (~2.7% disc linear, up to ~17% on a strong radial caustic, non-converging) is logged in
+      known-issues.md as the accepted device-float envelope amplified through the lens.
 - [ ] **M12. GPU VCM (mode U).** Currently CPU-only (`vcm.h`). Largest/last: needs GPU BDPT correctness
       (from M9) plus photon merging under one MIS weight. Reuse M3's device SPPM merge + GPU BDPT connect.
 

@@ -28,7 +28,7 @@ Everything forward rejects, **plus**:
 | Feature | Why CPU today | Class |
 |---|---|---|
 | ~~Image-based env NEE (lat-long map)~~ | **DONE (M1, 2026-07-23)** — added `dEnvRadiance`/`dEnvPdf`, uploaded the illuminant table, wired the device env sampler into `bkNeeEnv`/`bkNeeEnvVolume` + MIS'd env-miss; dropped the `envMap` reject. Validated GPU==CPU to 0.14% at 8192 spp. | ✅ |
-| GRIN media | `bkRadiance` has no Eikonal ray-marcher | **portable-hard** |
+| ~~GRIN media~~ | **DONE (M11, 0.38.0)** — `dGrinMarch` (device twin of `grin::march`, double-accumulated running state) now advances each backward bounce's ray through the Eikonal marcher before `closestHit`, gated by `sc.hasGrin`; the `cudaBackwardSupported` GRIN reject was removed. Validated GPU==CPU on the linear-gradient lens (SSIM 0.99, Pearson 0.99); small bent-region float-vs-double residual documented in known-issues.md. **Mode-D BDPT and the RGB fast path still reject GRIN.** | ✅ |
 | Collimated beams / stray Env-shape emitter | not NEE-samplable even on CPU | **inherently-CPU** (low value) |
 | Lens deeper than `D_MAXLENS` | fixed device cap | low value |
 
@@ -128,7 +128,15 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
    the phase from a pre-existing, phase-independent GPU↔CPU media brightness discrepancy (see known-issues.md):
    in clean mode-D BDPT the rainbow and a plain-HG control give the *same* GPU↔CPU B/A=2.41 (3 s.f.), so the
    rainbow adds zero bias beyond HG's; forward-bulk median 1.02 (rainbow) / 1.00 (HG); bows visually correct.
-7. Longer tail: **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
+7. ~~**GRIN marcher** on device backward (M11)~~ — **DONE 2026-07-23 (0.38.0).** `dGrinMarch` (device twin of
+   `grin::march`; running Eikonal state carried in double) marches each backward bounce's ray before
+   `closestHit`, gated by `sc.hasGrin`; `bkRadiance` marches the primary camera ray at the top of its bounce
+   loop, and the GRIN reject in `cudaBackwardSupported` was dropped (mode-D BDPT + RGB fast path still reject).
+   Validated GPU==CPU on the linear-gradient lens (`scraps/grin_lin.ftsl`): SSIM 0.99 / Pearson 0.99, both
+   backends bend identically; a small bent-region float(GPU)-vs-double(CPU) residual (~2.7% disc on linear,
+   up to ~17% on a strong radial caustic, does not converge with spp) is documented in known-issues.md as the
+   accepted device float-precision envelope amplified through the lens.
+8. Longer tail: **GPU VCM** (M12, mode U).
 
 ### Descoped by user (2026-07-23) — NOT scheduled
 Left on their current CPU/spectral fallbacks: **indexed-spectral palette maps** on device forward,

@@ -2039,14 +2039,32 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
 // in step with the CPU marcher (grin.h) so CPU and GPU bend rays identically.
 __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
     const int GRIN_MAX_STEPS = 200000;
+    // Accumulate position/direction in DOUBLE (not Real=float) so the running Eikonal
+    // state mirrors the double-precision CPU marcher (grin.h). The symplectic update
+    // compounds over up to hundreds of steps; carrying the running (ro,rd) in double is
+    // the precision-correct choice for a pre-pass and costs essentially nothing here (it
+    // runs once per bounce, not in the per-photon hot loop). We snapshot to a float DVec3
+    // only for the geometry/pattern queries (closestHit / dMedInside / dMedClip / dMedNAt
+    // / dMedGradN — which return their scalars in double anyway).
+    //
+    // NOTE (measured): this double accumulation does NOT close a residual GPU-vs-CPU
+    // disagreement seen on a strong *radial* gradient lens (~17% mean rel-error inside the
+    // caustic-heavy lens disc). That gap survives it unchanged — it is dominated by (a) a
+    // pre-existing global ~1.2x mode-R float-GPU vs double-CPU exposure difference present
+    // even with NO medium, and (b) the extreme ray->image magnification of a radial caustic
+    // where the two backends' geometry/BLAS float paths diverge. A smooth *linear* gradient
+    // lens matches CPU to ~the noise floor (see known-issues.md "mode-R GRIN radial caustic").
+    double px = ro.x, py = ro.y, pz = ro.z;
+    double dx = rd.x, dy = rd.y, dz = rd.z;
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
+        DVec3 cro{px, py, pz}, crd{dx, dy, dz};   // float snapshot for the geometry queries
         // GRIN region containing ro (first enabled GRIN membership), or -1.
         int gm = -1;
         for (int mi = 0; mi < sc.mediaN; ++mi) {
             const DMedium& md = sc.media[mi];
-            if (md.enabled && md.iorN > 0 && dMedInside(md, ro)) { gm = mi; break; }
+            if (md.enabled && md.iorN > 0 && dMedInside(md, cro)) { gm = mi; break; }
         }
-        DHit hs = closestHit(sc, ro, rd);
+        DHit hs = closestHit(sc, cro, crd);
         double dS = hs.valid ? (double)hs.t : 1e30;
         if (gm < 0) {
             // Outside any GRIN region: jump to the nearest GRIN entry before the next
@@ -2056,10 +2074,11 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
                 const DMedium& md = sc.media[mi];
                 if (!(md.enabled && md.iorN > 0)) continue;
                 double ta, tb;
-                if (dMedClip(md, ro, rd, 1e-4, dS, ta, tb) && ta < bestTa) { bestTa = ta; bestM = mi; }
+                if (dMedClip(md, cro, crd, 1e-4, dS, ta, tb) && ta < bestTa) { bestTa = ta; bestM = mi; }
             }
             if (bestM < 0) break;
-            ro = ro + rd * (Real)(bestTa + 1e-4);   // nudge inside
+            double adv = bestTa + 1e-4;
+            px += dx * adv; py += dy * adv; pz += dz * adv;   // nudge inside
             continue;
         }
         const DMedium& g = sc.media[gm];
@@ -2067,14 +2086,18 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
         if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
-        double n0 = dMedNAt(g, ro);
-        DVec3 grad = dMedGradN(g, ro, 0.5 * ds);
-        DVec3 T = rd * (Real)n0 + grad * (Real)ds;
-        DVec3 newPos = ro + T * (Real)(ds / n0);
-        double tl = sqrt((double)dot(T, T));
-        DVec3 newDir = (tl > 1e-12) ? T * (Real)(1.0 / tl) : rd;
-        ro = newPos; rd = newDir;
+        double n0 = dMedNAt(g, cro);
+        DVec3 grad = dMedGradN(g, cro, 0.5 * ds);
+        double Tx = dx * n0 + (double)grad.x * ds;
+        double Ty = dy * n0 + (double)grad.y * ds;
+        double Tz = dz * n0 + (double)grad.z * ds;
+        double inv = ds / n0;
+        px += Tx * inv; py += Ty * inv; pz += Tz * inv;
+        double tl = sqrt(Tx * Tx + Ty * Ty + Tz * Tz);
+        if (tl > 1e-12) { double s = 1.0 / tl; dx = Tx * s; dy = Ty * s; dz = Tz * s; }
     }
+    ro = DVec3{px, py, pz};
+    rd = DVec3{dx, dy, dz};
 }
 
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
@@ -5084,6 +5107,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
     const int maxBounce = sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
     for (int b = 0; b < maxBounce; ++b) {
+        // GRIN curved-marching pre-pass (M11): bend the ray through any gradient-index
+        // region it enters (symplectic Eikonal integration) BEFORE the surface query —
+        // the exact device twin of the forward megakernel's pre-closestHit march and of
+        // the CPU backward's grin::march (backward.h). Pure marching does NOT consume a
+        // bounce; it stops within one step of a surface or on leaving all GRIN regions.
+        // Gated by sc.hasGrin so ordinary scenes are bit-identical. Media free-flight
+        // below then samples along the post-bend straight segment, matching the CPU order.
+        if (sc.hasGrin) dGrinMarch(sc, ro, rd);
         DHit h = closestHit(sc, ro, rd);
         Real dSurf = h.valid ? h.t : (Real)1e30;
         // Participating media: sample a free-flight collision (superposition over all
@@ -8090,9 +8121,11 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // Participating media now run on the device backward walk (dMediaSampleCollision /
     // dMediaTransmittance — homogeneous AND heterogeneous), INCLUDING spectral-rainbow
     // phase (M10: bkNeeVolume / bkNeeEnvVolume / the volume scatter dispatch through
-    // dMedPhase / dMedPhaseSample read the uploaded Airy table). Gradient-index (GRIN)
-    // media still fall back (bkRadiance has no Eikonal marcher).
-    if (grin::sceneHasGrin(scene)) return false;
+    // dMedPhase / dMedPhaseSample read the uploaded Airy table) AND gradient-index (GRIN)
+    // media (M11: bkRadiance runs the shared Eikonal marcher dGrinMarch as a per-bounce
+    // pre-closestHit pass — the exact device twin of grin::march, so CPU and GPU mode R
+    // bend rays identically). Mode-D BDPT still keeps GRIN on the CPU (area-measure MIS
+    // assumes straight segments), gated separately in cudaBdptSupported.
     // Environment light IS supported on the device backward walk: a CONSTANT env
     // (bkNeeEnv / bkNeeEnvVolume / env-miss with MIS) and now an IMAGE env (lat-long
     // map — importance-sampled via dEnvSample, evaluated via dEnvRadiance/dEnvPdf, with

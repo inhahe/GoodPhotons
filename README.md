@@ -38,14 +38,15 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU) **and the backward reference (mode
   `R`) on both CPU and GPU** (GPU backward runs homogeneous *and* heterogeneous
-  media natively, including spectral **rainbow-phase** media; only GRIN media still
-  force the CPU backward).
+  media natively, including spectral **rainbow-phase** media, and **gradient-index
+  (GRIN) media** on the backward reference now run on GPU too).
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward
   light tracer (modes `A`/`B`/`C`, CPU **and GPU**) and the backward reference
-  (mode `R`, CPU); BDPT (`D`) refuses GRIN scenes (its straight-line connection
-  geometry would be biased — use `A`/`B`/`C` or `R`).
+  (mode `R`, CPU **and GPU** — the device runs the same Eikonal marcher, matching
+  the CPU to the device float-precision envelope); BDPT (`D`) refuses GRIN scenes
+  (its straight-line connection geometry would be biased — use `A`/`B`/`C` or `R`).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
   BDPT references (`R`/`D`), the **view-independent photon map** (`M`, shared
   across a whole camera flythrough), and **stochastic progressive photon mapping**
@@ -508,8 +509,9 @@ that converges to the same physical image.
   **fluorescence** and **both constant *and* image-based (lat-long HDR) environment
   lights** (env-NEE + MIS'd env-miss, at surface *and* fog vertices — the image env is
   importance-sampled on-device from its luminance CDF; **spectral rainbow-phase media**
-  also run on-device now); scenes using collimated beams (plus GRIN media) still fall
-  back to the CPU tracer automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
+  and **gradient-index (GRIN) media** — the same Eikonal marcher as the CPU — also run
+  on-device now); scenes using collimated beams still fall back to the CPU tracer
+  automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
   sampling one wavelength per sample it carries an RGB throughput triple and does one
   intersection walk per full-colour sample, so a clean colour image converges much
   faster. Materials bake to a per-material linear-RGB albedo and emitters/env to a
@@ -647,8 +649,9 @@ stay non-resumable.
   on a pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (spot/collimated lights; GRIN media — mode `R` now runs fog, spectral **rainbow-phase**
-  media, fluorescence, and constant *and* image-based env lights on the device), and for
+  (spot/collimated lights; GRIN media in mode `D` BDPT — mode `R` now runs fog, spectral
+  **rainbow-phase** media, **GRIN gradient-index bending**, fluorescence, and constant *and*
+  image-based env lights on the device), and for
   fluorescent/oversized-mix forward scenes (mode `M`'s `-pmfg` final gather now runs
   on the GPU too). Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous
@@ -1644,7 +1647,7 @@ volumes are bounded by a safety cap; a native sparse device sampler is a future
 optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
 `density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
-**Gradient-index (GRIN) media — bending light *(experimental, mode `R` only)*.** Give a
+**Gradient-index (GRIN) media — bending light.** Give a
 medium an `ior "<expr over x y z r>"` field (or `ior pattern:<name>`) and it becomes a
 **gradient-index region**: rays that enter its `bounds{}` no longer travel straight — they
 **bend continuously**, integrating the Eikonal ray equation `d/ds(n·dr/ds)=∇n` with a
@@ -1652,10 +1655,12 @@ small symplectic march step (`ior_step <v>`, default 1/64 of the smallest bound 
 This makes mirages, hot-air shimmer, and **gradient lenses that focus/warp with no glass
 surface at all**. E.g. `medium { bounds { center 0 0 2 radius 0.9 } ior "1.6 - 0.6*(sqrt(x*x+y*y+(z-2)*(z-2))/0.9)" }`
 is a radial index ball (n=1.6 core → 1.0 rim) that visibly lenses a checkerboard behind it
-(`scenes/grin_lens.ftsl`). **Currently only the CPU backward tracer (mode `R`) bends GRIN
-rays** — the forward modes (A/B/C), BDPT `D`, and all GPU paths still trace these regions
-straight (they ignore `ior`), so render a GRIN scene with `-mode R -device cpu` for now.
-Wiring the Eikonal march through the other tracers/GPU is tracked in `known-issues.md`.
+(`scenes/grin_lens.ftsl`). GRIN bending runs on the **forward light tracer (modes `A`/`B`/`C`)
+and the backward reference (mode `R`), on both CPU and GPU** — all share one symplectic
+marcher (the GPU carries its running Eikonal state in double to match the CPU; a small
+bent-region float-vs-double residual on the GPU is noted in `known-issues.md`). Only **BDPT
+(mode `D`)** still refuses GRIN (its straight-line connection geometry would be biased) — use
+`A`/`B`/`C` or `R` for a GRIN scene.
 
 **Authoring media procedurally (loom).** The [loom toolkit](tools/loom/README.md) emits
 these `medium {}` blocks from a `loom.Volume(...)`: `sigma_t` / `albedo` / `g` are

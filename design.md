@@ -94,8 +94,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Spectral **rainbow-phase** media run on the device too since 0.37.0 (M10):
   a per-medium λ×µ Airy phase table + per-λ CDF is uploaded, and the unified
   `dMedPhase`/`dMedPhaseSample` dispatch (bilinear table eval / CDF importance-sample
-  vs analytic HG) replaces the raw `hgPhase` calls across forward, backward, and BDPT;
-  only GRIN media still route the backward pass to CPU. Since
+  vs analytic HG) replaces the raw `hgPhase` calls across forward, backward, and BDPT.
+  **GRIN (gradient-index) media** run on the backward reference (mode `R`) on-device
+  too since 0.38.0 (M11): `dGrinMarch` (render_cuda.cu) is the device twin of
+  `grin::march`, carrying its running Eikonal state in double, and `bkRadiance` marches
+  each bounce's ray before `closestHit` (gated by `sc.hasGrin`); only mode-`D` BDPT and
+  the RGB fast path still route GRIN scenes to the CPU. Since
   0.24.0 it also does **fluorescence** (bispectral Stokes-shift adjoint: elastic +
   excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic
   elastic/reemit/absorb continuation — baked `fluoEmitSpec`/`fluoMint` on the

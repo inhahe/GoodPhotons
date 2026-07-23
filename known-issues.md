@@ -5,6 +5,39 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT — OPEN (2026-07-23): mode-R GPU GRIN has a small bent-region float-vs-double residual (does not converge with spp)
+
+Logged while validating M11 (GRIN Eikonal marcher on the GPU backward path). The device
+marcher `dGrinMarch` (render_cuda.cu:2040) is algorithmically byte-identical to the CPU
+`grin::march` (grin.h) and accumulates its running (ro,rd) in **double** to mirror the CPU
+ground truth, so both backends bend rays by the same large amount and the images are
+structurally near-identical (SSIM ≈ 0.99, Pearson ≈ 0.99 on the linear-gradient validator).
+**But** a small *systematic* (non-noise) rel-error survives inside the **bent lens region**:
+
+| scene (`scraps/`) | disc rel-err | periphery rel-err | converges with spp? |
+|---|---|---|---|
+| `grin_lin.ftsl` (smooth linear `1.35-0.35*y`) | ~2.7% | ~0.7% | **disc does NOT** (2.90%→2.69% from 400→1600 spp); periphery halves (1.2%→0.69% = pure noise) |
+| `grin_val.ftsl` (strong radial caustic) | ~17% | ~1.7% | disc stays high; caustic amplifies it |
+
+Root cause (measured, not guessed): the device geometry/BLAS + `dMed*` queries run in
+**float** (Real=float, FTRACE_GPU_FP32) while the CPU is double. Through a gradient-index
+lens the ray→image map is magnified, so a sub-pixel float difference in the marched trajectory
+lands the warped high-contrast checker edge a fraction of a pixel away from the CPU — averaging
+to ~2.6% over the disc, scaling to ~17% in the caustic-heavy radial case. Accumulating the
+running Eikonal state in double (already done) does NOT remove it — the residual enters via the
+float geometry queries, and the same queries on the *straight-ray* periphery show ~zero bias
+(they converge to 0.69%), so it is pure lens amplification, not a marcher-logic error. A
+separate pre-existing global ~1.2× mode-R float-GPU vs double-CPU exposure difference exists
+even with NO medium and is folded into this (both are the device-float regime).
+
+Not a correctness bug (both backends bend correctly and agree structurally); it is the accepted
+GPU float-precision envelope showing up amplified in the bent region. **Proper fix (if ever
+warranted):** run the device geometry/BLAS intersection for GRIN-marched rays in double, or
+supersample the bent region on GPU — high cost for a sub-pixel edge placement difference, so
+deferred. Repro: render `scraps/grin_lin.ftsl -mode R` on `-device gpu` and `-device cpu`, then
+`python scraps/grin_residual.py png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err
+vs spp).
+
 ### BUG — OPEN (2026-07-23): GPU vs CPU participating-media brightness disagree systematically across modes (phase-independent, pre-existing)
 
 Discovered while statistically validating M10 (rainbow media on device). For a bounded
