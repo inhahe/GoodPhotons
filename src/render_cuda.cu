@@ -614,6 +614,7 @@ struct DScene {
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
     DEnvMap env;                     // image env tables (env.scale null => constant env)
+    int    envIndex;                 // index of the env emitter in `emitters`, or -1 (mirrors Scene::envIndex)
 };
 
 // Lens-projection radius maps (device twins of camera.h projRadius/Inv/Deriv). The
@@ -4491,7 +4492,11 @@ __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
     double g = 0.0;
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& e = sc.emitters[k];
-        g += (double)e.area * DPI * (double)specLookup(e.emitSpd, lambda);
+        // geomWeight: area/sphere/cylinder = area*PI; env (shape 3) = envGeom = 4*PI^2*R^2
+        // (mirrors Scene::Emitter::geomWeight). Spot/collimated are gated to the CPU.
+        double gw = (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
+                                   : ((double)e.area * DPI);
+        g += gw * (double)specLookup(e.emitSpd, lambda);
     }
     return (g > 0.0) ? sc.emitG / g : 0.0;
 }
@@ -4707,13 +4712,73 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
     return total;
 }
 
+// Environment next-event estimation at a surface vertex (device twin of backward.h
+// neeEnv / envGeom, CONSTANT-env scope: an image env stays on the CPU). One uniform-
+// sphere env-direction sample (pdf 1/4pi), the shading / shadow-terminator gate, a
+// shadow ray to the scene exit carrying media transmittance, and a balance-heuristic
+// MIS weight against the cosine-sampled continuation (MIS'd again on the BSDF-sampled
+// escape in bkRadiance). Returns the contribution (0 if occluded / below the horizon).
+__device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
+                                  double invPdfLambda, Real lambda, DRng& rng) {
+    if (sc.envIndex < 0) return 0.0;
+    // Uniform-sphere sample (constant env), solid-angle pdf 1/4pi.
+    double z = 1.0 - 2.0 * (double)rng.uniform();
+    double sr = sqrt(fmax(0.0, 1.0 - z * z));
+    double phi = 2.0 * DPI * (double)rng.uniform();
+    DVec3 wi{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+    double pdfW = 1.0 / (4.0 * DPI);
+    Real cosSurf = dot(h.n, wi);
+    if (cosSurf <= (Real)0) return 0.0;                     // below the shading horizon
+    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    Real stG = dShadowTerminatorG(wi, h.n, ngo);            // Chiang soft terminator (1 if flat)
+    if (stG <= (Real)0) return 0.0;                         // behind true geometry: hard shadow
+    double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    if (occluded(sc, h.p + ngo * RAY_EPS, wi, (Real)farDist)) return 0.0;
+    double Lenv = (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+    if (Lenv <= 0.0) return 0.0;
+    double pdfBsdf = (double)cosSurf / DPI;                 // cosine-hemisphere pdf for wi
+    double wMis = pdfW / (pdfW + pdfBsdf);                  // balance heuristic
+    double contrib = ((double)rho / DPI) * Lenv * (double)cosSurf * invPdfLambda / pdfW * wMis * (double)stG;
+    if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
+        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, (Real)farDist, lambda, rng);
+    return contrib;
+}
+
+// Environment NEE at a fog scattering vertex (device twin of backward.h neeEnvVolume,
+// constant-env scope). The surface BRDF/cosine is replaced by the single-scattering
+// albedo and the HG phase (which is also the pdf for the MIS weight against the phase-
+// sampled continuation). Only invoked when the scene has an env light.
+__device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const DVec3& wIn,
+                                        const DMedium& med, double invPdfLambda, Real lambda,
+                                        DRng& rng) {
+    if (sc.envIndex < 0) return 0.0;
+    Real g   = (Real)med.g;
+    Real alb = medAlbedo(med, lambda);
+    if (alb <= (Real)0) return 0.0;
+    double z = 1.0 - 2.0 * (double)rng.uniform();
+    double sr = sqrt(fmax(0.0, 1.0 - z * z));
+    double phi = 2.0 * DPI * (double)rng.uniform();
+    DVec3 wi{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+    double pdfW = 1.0 / (4.0 * DPI);
+    double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
+    if (occluded(sc, p + wi * RAY_EPS, wi, (Real)farDist)) return 0.0;
+    double Lenv = (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+    if (Lenv <= 0.0) return 0.0;
+    Real phase = hgPhase(dot(wIn, wi), g);                  // HG phase == its own pdf
+    double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
+    double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis;
+    contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, (Real)farDist, lambda, rng);
+    return contrib;
+}
+
 // Estimate spectral-weighted radiance for one wavelength along a camera ray (port of
-// backward.h radiance, v1 scope: participating media supported, no env/fluorescence).
+// backward.h radiance, v1 scope: participating media + constant environment light).
 // Emission added only on specular/camera arrival; diffuse arrivals are covered by NEE.
 __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
                                     Real lambda, double invPdfLambda, DRng& rng) {
     double L = 0.0, thr = 1.0;
     bool specularArrival = true;                       // camera ray may see a light directly
+    double contBsdfPdf = 0.0;                           // solid-angle pdf of the current continuation (env MIS)
     DMediumStack stk; stk.clear();                     // nested-dielectric medium stack (empty = vacuum)
     const int maxBounce = 32;
     for (int b = 0; b < maxBounce; ++b) {
@@ -4733,13 +4798,34 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 if (a > 0) thr *= exp(-(double)a * (double)tMed);
                 const DMedium& med = sc.media[whichMed];
                 L += thr * bkNeeVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
+                if (sc.envIndex >= 0)                              // env-NEE at the volume vertex
+                    L += thr * bkNeeEnvVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
                 Real alb = medAlbedo(med, lambda);
                 if (rng.uniform() >= (double)alb) return L;        // absorbed
+                DVec3 wIn = rd;
                 ro = p; rd = sampleHG(rd, (Real)med.g, rng); specularArrival = false;
+                contBsdfPdf = (double)hgPhase(dot(wIn, rd), (Real)med.g);  // phase pdf of the scatter (env MIS)
                 continue;
             }
         }
-        if (!h.valid) return L;                        // escaped (no env in v1)
+        if (!h.valid) {                                // escaped the scene
+            // Environment radiance from the escape direction (constant env ignores the
+            // direction). Full weight on a camera/specular arrival (directly-viewed sky);
+            // MIS-weighted (balance heuristic) on a diffuse/volume arrival against the
+            // env-NEE already done at the previous vertex, to avoid double-counting.
+            if (sc.envIndex >= 0) {
+                double Lenv = (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda) * invPdfLambda;
+                if (specularArrival) {
+                    L += thr * Lenv;
+                } else {
+                    double pdfEnv = 1.0 / (4.0 * DPI);         // constant env: uniform sphere
+                    double wMis = (contBsdfPdf + pdfEnv > 0.0)
+                                      ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
+                    L += thr * Lenv * wMis;
+                }
+            }
+            return L;
+        }
         // Beer-Lambert attenuation over the in-glass segment up to this surface
         // (current medium = highest-priority stack entry).
         {
@@ -4817,11 +4903,15 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
                 DVec3 nb = h.n * (Real)(-1);
                 L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
+                if (sc.envIndex >= 0)
+                    L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
                 DHit hb = h; hb.n = nb;
                 L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
+                if (sc.envIndex >= 0)
+                    L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
                 Real u = rng.uniform();
-                if (u < rhoR)     { ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng); specularArrival = false; break; }
-                else if (u < sum) { ro = h.p + nb  * RAY_EPS; rd = cosineHemisphere(nb,  rng); specularArrival = false; break; }
+                if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break; }
+                else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; break; }
                 return L;                                // absorbed
             }
             case D_FLUORESCENT: {
@@ -4831,6 +4921,8 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 // one stochastic continuation carries the indirect term.
                 double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
                 L += thr * bkNeeLight(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
+                if (sc.envIndex >= 0)
+                    L += thr * bkNeeEnv(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
                 double Mint = mp->fluoMint;
                 bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
                 double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
@@ -4845,21 +4937,28 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                         double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
                         double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
                         rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
-                        if (rhoFluo > 0.0)                                        // fluoro DIRECT NEE
+                        if (rhoFluo > 0.0) {                                      // fluoro DIRECT NEE
                             L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                            if (sc.envIndex >= 0)
+                                L += thr * gOut * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                        }
                     }
                 }
                 double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
                 double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
                 double u = rng.uniform();
                 if (u < rhoEl) {                                                  // elastic continuation
-                    ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng);
+                    DVec3 wOut = cosineHemisphere(h.n, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                    ro = h.p + h.n * RAY_EPS; rd = wOut;
                     specularArrival = false; break;
                 } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
                     thr *= wFluo / pF;
                     lambda = lambdaIn;                                            // Stokes shift (to the input wl)
                     invPdfLambda = invPdfIn;
-                    ro = h.p + h.n * RAY_EPS; rd = cosineHemisphere(h.n, rng);
+                    DVec3 wOut = cosineHemisphere(h.n, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                    ro = h.p + h.n * RAY_EPS; rd = wOut;
                     specularArrival = false; break;
                 }
                 return L;                                                         // absorbed / terminated
@@ -4868,8 +4967,11 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             default: {
                 Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
                 L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
+                if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
+                    L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
                 if (rng.uniform() >= rho) return L;     // RR on albedo
                 DVec3 wOut = cosineHemisphere(h.n, rng);
+                contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
                 ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
             }
         }
@@ -6456,6 +6558,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
+    sc.envIndex = scene.envIndex;
 
     // One-time fill of the specular-sphere scan-angle cos/sin tables (device-computed
     // so table entries are bit-identical to the per-step evaluation they replace).
@@ -6969,12 +7072,13 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // GPU mode R needs the same POD-bakeable materials as the forward path, plus the
-    // current backward scope: participating media AND fluorescence ARE supported
-    // (media: homogeneous + heterogeneous, minus GRIN/rainbow; fluorescence: the
-    // bispectral Stokes-shift adjoint), but no environment light and only area/sphere/
-    // cylinder Lambertian emitters (spot/env/collimated fall back to the CPU).
-    // Textured albedo IS supported (dDiffuseRho ports it). This keeps dInvPdfLambda exact
-    // (geomWeight = area*PI for every emitter).
+    // current backward scope: participating media, fluorescence AND a constant
+    // environment light ARE supported (media: homogeneous + heterogeneous, minus
+    // GRIN/rainbow; fluorescence: the bispectral Stokes-shift adjoint; env: bkNeeEnv /
+    // bkNeeEnvVolume + MIS'd env-miss, constant only — an IMAGE env stays on the CPU).
+    // Only area/sphere/cylinder Lambertian emitters otherwise (spot/collimated fall back
+    // to the CPU). Textured albedo IS supported (dDiffuseRho ports it). dInvPdfLambda is
+    // exact (geomWeight = area*PI for area emitters, 4pi^2 R^2 for the env emitter).
     if (!cudaForwardSupported(scene)) return false;
     // Participating media now run on the device backward walk (dMediaSampleCollision /
     // dMediaTransmittance — homogeneous AND heterogeneous), EXCEPT gradient-index (GRIN)
@@ -6982,10 +7086,15 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // only knows the analytic HG lobe). Those fall back to the CPU backward tracer.
     if (grin::sceneHasGrin(scene)) return false;
     for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
-    if (scene.envIndex >= 0)   return false;
-    for (const auto& em : scene.emitters)
+    // Constant environment light IS supported (bkNeeEnv / bkNeeEnvVolume / env-miss with
+    // MIS); an IMAGE env (lat-long map) still falls back to the CPU tracer.
+    if (scene.envIndex >= 0 && scene.envMap) return false;
+    for (size_t i = 0; i < scene.emitters.size(); ++i) {
+        if ((int)i == scene.envIndex) continue;    // constant env: handled by bkNeeEnv, not area NEE
+        const auto& em = scene.emitters[i];
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return false;
+    }
     // A physical lens deeper than the device cap falls back to the CPU tracer.
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
     return true;

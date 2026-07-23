@@ -95,7 +95,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   0.24.0 it also does **fluorescence** (bispectral Stokes-shift adjoint: elastic +
   excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic
   elastic/reemit/absorb continuation — baked `fluoEmitSpec`/`fluoMint` on the
-  device material).
+  device material). Since 0.25.0 it does a **constant environment light**
+  (`bkNeeEnv` surface-vertex + `bkNeeEnvVolume` fog-vertex env-NEE, uniform-sphere
+  sample, balance-heuristic MIS against a tracked `contBsdfPdf`, MIS'd env-miss on
+  ray escape; `envIndex` + env geomWeight added to `DScene`/`dInvPdfLambda`) — an
+  IMAGE-based env still routes the backward pass to CPU.
   (`traceHeroPhoton`/`shadeStepHero`), scene upload into `__constant__`/device
   buffers. FP32 by default (`FTRACE_GPU_FP32=ON`). Implicit sphere-tracing
   (`intersectImplicit`) marches + root-refines in FP32 on pre-converted mirror

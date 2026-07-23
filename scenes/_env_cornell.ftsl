@@ -1,0 +1,34 @@
+# Constant-environment Cornell box — validation scene for GPU-vs-CPU backward env light.
+# Open-topped box (no ceiling) lit ONLY by a constant sky env: diffuse walls sample the
+# sky via env-NEE, rays escaping the open top pick up env radiance via env-miss (MIS'd),
+# no area light / media / spot. The GPU backward (mode R) and CPU backward must converge
+# to the SAME image.
+#
+#   ftrace -in scenes/_env_cornell.ftsl -mode R -noise 1 -o png/_env_gpu.png
+#   ftrace -in scenes/_env_cornell.ftsl -mode R -noise 1 -device cpu -o png/_env_cpu.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+# (ceiling omitted — open to the sky)
+
+sphere { center 0.35 0.25 0.45   radius 0.22   material white }
+sphere { center 0.72 0.18 0.55   radius 0.15   material white }
+
+light env { spd preset:d65 }
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

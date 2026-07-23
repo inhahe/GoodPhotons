@@ -90,8 +90,25 @@ sample. This is the fastest, most POV-Ray-like path.
     `_fluo_cornell` (blue-excited green-emitting dye sphere): raw film radiance
     agrees to **0.02%** in absolute luminance, per-channel XYZ within 0.1%, block
     residual 0.34%→0.19%→0.09% (noise only).
-  - [ ] 1c — environment light (env-miss radiance + env-NEE)
-  - [ ] 1d — spot / collimated / env emitter sampling + pdf in backward NEE
+  - [x] **1c — environment light (constant env: env-miss + env-NEE, MIS'd).** Ported
+    into `bkRadiance`: `bkNeeEnv` (surface-vertex env-NEE, uniform-sphere sample pdf
+    1/4π, shadow-terminator gate, `dMediaTransmittance` to the scene exit, balance-
+    heuristic MIS vs the cosine continuation) called at diffuse / diffuse-transmit
+    (both lobes) / fluoro (elastic + fluoro-direct) vertices; `bkNeeEnvVolume` (fog-
+    vertex env-NEE, albedo·HG-phase in place of BRDF·cos, HG-phase MIS) at media
+    collisions; env-miss at ray escape (full weight on specular/camera arrival,
+    else MIS-weighted against the previous vertex's env-NEE via a tracked
+    `contBsdfPdf` = cosine pdf after diffuse/fluoro, HG-phase pdf after a fog
+    scatter). Added `int envIndex` to `DScene` and the env geomWeight (4π²R²) to
+    `dInvPdfLambda`. `cudaBackwardSupported` now accepts a **constant** env (image env
+    → CPU) and no longer rejects the env-shape emitter. **Validated** vs CPU on
+    `_env_cornell` (open-top Cornell, constant d65 sky, no area light): raw film
+    radiance agrees to **0.17%** in absolute luminance, per-channel XYZ within 0.3%,
+    block residual 1.35%→0.91%→0.37% (noise only); and on `_env_fog` (same + g=0.6
+    haze, exercises `bkNeeEnvVolume` + HG-phase env-miss MIS): **0.23%** luminance,
+    XYZ within 0.3%, block residual 1.82%→1.10%→0.49%. Compare tool
+    `scraps/cmp_ftbuf.py`.
+  - [ ] 1d — spot / collimated / env-EMITTER sampling + pdf in backward NEE (image env)
 - [ ] Stage 2: fast RGB backward (Option B)
 - [ ] Stage 3: scene-ignore flags
 - [ ] Stage 4: `-explore` integration
