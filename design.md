@@ -171,11 +171,19 @@ NVIDIA driver's DVFS reads as "idle", parking the card in its lowest power state
 ~13× clock drop; ~33× for a cold first frame). That made each fresh mouse-look
 burst pay a cold-clock penalty until continuous motion finally ramped the clocks.
 Fix (`main.cpp` explorer loop): for `kWarmGraceSec` (2.5 s) after the last real
-interaction the loop keeps submitting GPU render work even when the frame hasn't
-changed (a discarded "warm-only" `rasterOne` that never touches the window) and
-skips the idle sleep, holding the boost clock through an active session; past the
-grace window it falls back to the 15 ms passive sleep and the card powers down to
-P8. Gated on the discrete-GPU path (`gpuRaster != nullptr`); CPU raster unaffected.
+interaction the loop holds the boost clock with discarded "warm-only" `rasterOne`
+frames (never touch the window), then past the grace window falls back to the 15 ms
+passive sleep and the card powers down to P8. Two thresholds tune it: a warm frame
+fires only once `idleFor` passes `kWarmGapSec` (0.10 s) — i.e. a GENUINE pause — and
+then runs *continuously* (no nap) so the clock actually stays up (a sparse rate-
+limited trickle was measured too weak — the card sat at P8). During an active mouse-
+look or timeline-scrub drag the sub-frame gaps between input events stay under the
+gap, so warm frames are suppressed and every loop slot samples the next scrub
+position; otherwise a warm frame landing between two events would steal that slot and
+the timeline would "chunk" by several cameras per drag (0.22.0 regression, fixed
+0.22.1; see known-issues). Between events inside the gap the loop naps 3 ms (prompt
+drain, no busy spin). Gated on the discrete-GPU path (`gpuRaster != nullptr`); CPU
+raster unaffected.
 
 ## Threading model (CPU)
 

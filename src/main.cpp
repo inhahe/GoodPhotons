@@ -5404,6 +5404,14 @@ static int run(int argc, char** argv) {
             // discards its result — it exists purely to keep the clocks up. GPU only.
             auto lastActiveT = clock::now();
             const double kWarmGraceSec = 2.5;   // hold clocks this long after the last move
+            // A warm-only frame fires only once the user has genuinely PAUSED — i.e. after
+            // `idleFor` passes this gap. During an active scrub/mouse drag the sub-frame gaps
+            // between input events stay under it, so a warm frame never lands between two
+            // events and can't steal the loop slot that samples the next scrub position (that
+            // stolen slot was the timeline "chunking" by several cameras per drag). Once past
+            // the gap (a real pause) warm frames run CONTINUOUSLY to actually hold the boost
+            // clock — a sparse rate-limited trickle was measured too weak (card stayed at P8).
+            const double kWarmGapSec = 0.10;
             bool gpuWarmKeep = false;
 #ifdef HAVE_CUDA
             gpuWarmKeep = (gpuRaster != nullptr);   // only meaningful on the discrete GPU path
@@ -5640,7 +5648,11 @@ static int run(int argc, char** argv) {
                 bool active = changed || nav.any() || playing;
                 if (active) lastActiveT = clock::now();
                 double idleFor = std::chrono::duration<double>(clock::now() - lastActiveT).count();
-                bool warmOnly = gpuWarmKeep && !changed && idleFor < kWarmGraceSec;
+                // Warm-only frame: hold the boost clock, but ONLY during a genuine pause
+                // (idleFor past the gap) and never during an active drag — so it can't steal
+                // the slot that samples the next scrub position (the timeline-"chunking" bug).
+                bool warmOnly = gpuWarmKeep && !changed &&
+                                idleFor >= kWarmGapSec && idleFor < kWarmGraceSec;
                 if (changed || warmOnly) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
@@ -5680,16 +5692,18 @@ static int run(int argc, char** argv) {
                         if (std::fabs(sp - lastSpdSent) > 5e-3) { g_liveWin->setSpeedLabel(sp); lastSpdSent = sp; }
                     }
                 }
-                // Sleep only when truly idle; while a throttle key is held, the mouse is
-                // steering, or the path is auto-playing we loop at full raster speed for
-                // smooth continuous motion. During the post-interaction keep-warm grace
-                // window we also skip the sleep so the GPU keeps receiving render work and
-                // holds its boost clock (see the keep-warm note above); once the grace
-                // window lapses we sleep and let the card power down.
-                bool warmActive = gpuWarmKeep &&
-                    std::chrono::duration<double>(clock::now() - lastActiveT).count() < kWarmGraceSec;
-                if (!nav.any() && !playing && !warmActive)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                // Sleep policy. While a throttle key is held, the mouse is steering, or the
+                // path is auto-playing we loop at full raster speed for smooth motion. A
+                // warm-only frame already ran the GPU this iteration (continuous during a
+                // pause to hold the clock) so it never sleeps. Otherwise: inside the grace
+                // window we take only a SHORT 3 ms nap — short enough that the next scrub/
+                // drag event drains promptly (the timeline tracks the thumb without chunking)
+                // yet not a busy spin; past the grace window we sleep the full idle interval
+                // and let the card power down.
+                if (!nav.any() && !playing && !warmOnly) {
+                    bool inGrace = gpuWarmKeep && idleFor < kWarmGraceSec;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(inGrace ? 3 : 15));
+                }
             }
             g_stopRequested = 1;   // window closed → done
         }

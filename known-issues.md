@@ -30,6 +30,22 @@ falls back to the passive 15 ms sleep and lets the card power all the way down. 
 discrete-GPU path (`gpuRaster != nullptr`); the CPU rasterizer is unaffected. Net effect:
 mouse-look no longer pays the cold-clock penalty on every fresh burst.
 
+**Follow-up (2026-07-23, 0.22.1): the first cut of the keep-warm made the timeline slider
+chunk.** The initial version rendered a discarded warm frame on *every* non-changed loop
+iteration during the 2.5 s grace window. During an active scrub drag, whenever `drainNav`
+briefly returned no new thumb position, the loop burned a full ~4 ms `rasterOne` warm frame
+while the user's thumb kept moving — so the next drain jumped several cameras ahead. Whether
+a warm frame landed in that gap was timing-dependent, so the timeline "chunked" by N cameras
+per drag *intermittently*, toggling within one session (reported after the keep-warm landed).
+Root cause: the warm frame stole the loop slot that would otherwise have sampled the next
+scrub position. Fix (final, 0.22.1): gate the warm frame on `kWarmGapSec` (0.10 s) of `idleFor`
+so it fires ONLY after a genuine pause — during an active drag the sub-frame gaps between input
+events stay under the gap, so warm frames are fully suppressed and every loop slot samples the
+next scrub position (smooth tracking, no chunk). Once past the gap (a real pause) warm frames
+run *continuously* to actually hold the boost clock; an intermediate attempt to rate-limit them
+to a 0.12 s trickle was measured too weak — the card stayed at P8 (210 MHz), defeating the
+keep-warm. Between events inside the gap the loop naps 3 ms (prompt drain, no busy spin).
+
 ### BUG — DONE (2026-07-22): a group-scaled collimated beam lit only half its footprint (offset by half its width from the aim point)
 
 A group-scaled `light collimated { ... }` illuminated only one half of its `w×w`
