@@ -90,8 +90,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   GPU backward (`bkRadiance`) supports **participating media** natively since
   0.23.0 (free-flight `dMediaSampleCollision` competing with the surface hit,
   volume NEE `bkNeeVolume`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
-  HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous; only
-  GRIN and rainbow/dispersive media still route the backward pass to CPU. Since
+  HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous.
+  Spectral **rainbow-phase** media run on the device too since 0.37.0 (M10):
+  a per-medium λ×µ Airy phase table + per-λ CDF is uploaded, and the unified
+  `dMedPhase`/`dMedPhaseSample` dispatch (bilinear table eval / CDF importance-sample
+  vs analytic HG) replaces the raw `hgPhase` calls across forward, backward, and BDPT;
+  only GRIN media still route the backward pass to CPU. Since
   0.24.0 it also does **fluorescence** (bispectral Stokes-shift adjoint: elastic +
   excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic
   elastic/reemit/absorb continuation — baked `fluoEmitSpec`/`fluoMint` on the
@@ -150,8 +154,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   BDPT still can't render — **fluorescence**, **layered stacks**, **spot/env/collimated lights** —
   are *not* GPU gaps: `main.cpp`'s mode-D guard (`bdptUnsupportedFeature`) refuses those scenes (or
   demotes D→B with `-on-unsupported fallback`) on both backends before any BDPT dispatch, so they
-  never reach the device path; only GRIN/rainbow media (curved paths / spectral phase) keep an
-  in-scope mode-D scene on the CPU. Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
+  never reach the device path; only GRIN media (curved paths) keep an in-scope mode-D scene
+  on the CPU (spectral rainbow-phase media now render on-device in mode D since M10/0.37.0). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
   per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%),
   `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halving 8.42%→4.39% at 4× spp),
   and `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halving 10.86%→5.73%). Since

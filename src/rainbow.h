@@ -196,6 +196,17 @@ public:
 
     bool built() const { return built_; }
 
+    // --- Accessors for GPU upload: the device mirrors this exact (lambda x mu) table
+    // and its per-lambda CDF, so its rainbow media match the CPU tracer bit-for-bit
+    // (modulo float rounding). Layout is row-major [li*nMu + mi]; mu = -1 + mi*dMu with
+    // dMu = 2/(nMu-1); lambda = lam0 + li*dLam.
+    int    nLam() const { return nLam_; }
+    int    nMu()  const { return nMu_; }
+    double lam0() const { return lam0_; }
+    double dLam() const { return dLam_; }
+    const std::vector<double>& pdfTable() const { return pdf_; }
+    const std::vector<double>& cdfTable() const { return cdf_; }
+
     // Phase value p(mu) at wavelength lambda (nm). Bilinear in (lambda, mu).
     double eval(double cosTheta, double lambda) const {
         double fl = (lambda - lam0_) / dLam_;

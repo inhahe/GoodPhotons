@@ -5,6 +5,36 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — OPEN (2026-07-23): GPU vs CPU participating-media brightness disagree systematically across modes (phase-independent, pre-existing)
+
+Discovered while statistically validating M10 (rainbow media on device). For a bounded
+homogeneous fog scene (`scraps/rb_val_lowvar.ftsl` / `rb_val_hg.ftsl`, absolute exposure so
+GPU and CPU share a FIXED gain), the GPU and CPU converge to **different overall brightness**
+for the SAME mode/scene — and the gap is **phase-independent** (a plain-HG control shows the
+same factor as a rainbow medium), so it is **not** an M10 rainbow bug:
+
+| mode | GPU↔CPU B/A (CPU/GPU), rainbow | HG control | notes |
+|---|---|---|---|
+| B (forward photon) | ~1.25 (median 1.02) | ~1.58 (median 1.00) | firefly-heavy; **bulk medians agree**, but the image *mean* and the `[energy]` line disagree |
+| D (BDPT) | **2.41 uniform** (median 2.44, p10=1.48…p90=4.27) | **2.41 uniform** | cleanest signal: well-converged (~3% noise), low firefly tail, uniform shift across *every* percentile ⇒ real systematic factor, not noise |
+| R (backward ref) | ~1000× (CPU near-black) | ~1000× | mode R forces media to a single GLOBAL homogeneous haze; camera embedded in fog renders lit-fog+bow on GPU but near-black on CPU ⇒ CPU mode-R likely mishandles camera-inside-global-haze in-scatter/NEE |
+
+Corroborating engine diagnostic: at albedo 0.5 (slab optical depth ~0.16) forward mode prints
+`[energy] absorbed=0.1516` on GPU vs `absorbed=0.0008` on CPU — a ~190× gap. GPU's ~0.15 is the
+physically-expected single-pass absorbed fraction; **CPU appears to barely absorb via medium
+albedo**, which would also make CPU *brighter* (consistent with B/A>1 in modes B and D). So the
+direction hints the **CPU** may be the wrong one (under-absorbing / an accounting-vs-transport
+mismatch) — but it could equally be the GPU BDPT missing volume connection strategies (which
+would make GPU dimmer). **Needs investigation to determine which backend is correct.**
+
+Scope: affects ALL GPU participating media (HG and rainbow alike); pre-existing (M10's git diff
+leaves the HG BDPT phase path bit-for-bit unchanged, yet HG still shows the 2.41×). Repro:
+`ftrace scraps/rb_val_hg.ftsl -mode D -o ppm/x_gpu.ppm -device gpu -noise 3` and again with
+`-device cpu`, then `python scraps/rb_robust_compare.py ppm/x_gpu.ppm 6 ppm/x_cpu.ppm 6`.
+Proper fix: reconcile the two backends' medium collision/absorption + BDPT volume-connection
+strategies so GPU==CPU converges to B/A≈1.0; likely a forward-medium albedo-absorption
+accounting fix on CPU and/or a missing GPU-BDPT volume strategy.
+
 ### PERF — DONE (2026-07-23): interactive `-explore`/`-fly` felt intermittently slow (GPU parked in its idle power state between mouse-look bursts)
 
 Users reported the GPU rasterizer explorer being slow right after launch on

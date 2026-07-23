@@ -198,10 +198,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
-// Current scope: participating media (homogeneous + heterogeneous, minus GRIN/rainbow),
-// fluorescence, a CONSTANT environment light, textured albedo, and area/sphere/cylinder
-// Lambertian + point-spot emitters; a lens no deeper than the device cap (D_MAXLENS).
-// Image-based env, collimated beams and GRIN/rainbow media fall back to the CPU tracer.
+// Current scope: participating media (homogeneous + heterogeneous, incl. spectral-rainbow
+// Airy phase; minus GRIN), fluorescence, a CONSTANT environment light, textured albedo, and
+// area/sphere/cylinder Lambertian + point-spot emitters; a lens no deeper than the device
+// cap (D_MAXLENS). Image-based env, collimated beams and GRIN media fall back to the CPU tracer.
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
 // GPU backward reference trace (mode R). Renders `spp` samples per pixel at the given

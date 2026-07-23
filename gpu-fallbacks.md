@@ -18,7 +18,7 @@ Status legend: **portable** (worth doing) · **portable-hard** (large but feasib
 |---|---|---|
 | Indexed-spectral palette maps | device only bakes the Jakob-Hanika coeff path; palette resolves per-texel to a named reflectance spectrum | **portable** (upload per-texel palette spectra) |
 | Layered material (coat over weighted body) | no device `shadeStep` Layered branch | **portable** (port the branch) |
-| Spectral rainbow-phase media | device volume path only knows the analytic HG lobe; the λ×µ CDF table (`rainbow.h`) isn't uploaded | **portable-hard** (per-λ importance sampling on device); also affects backward + BDPT |
+| ~~Spectral rainbow-phase media~~ | **DONE (M10, 0.37.0)** — λ×µ phase table + per-λ CDF uploaded per-medium; `dMedPhase`/`dMedPhaseSample` dispatch rainbow (bilinear `dRbEval` / CDF sample) vs HG on forward + backward + BDPT | ✔ on device |
 | Oversized multilayer (>`D_MAXLAYERS`) | fixed device cap; CPU has no limit | portable but **low value** (raise cap) |
 | Oversized Mix (>`D_MIXMAX` children) | fixed device cap | portable but **low value** |
 | Driven record scalar >64 stops | overflows device interp array `vs[64]` | portable but **vanishingly rare** |
@@ -79,12 +79,15 @@ fluorescent/spot/env scene never reaches the BDPT path (CPU or GPU) — the CPU 
 "elastic-base-only" fluorescent handling in `bdpt.h` is itself unreachable dead code for
 whole-scene fluorescence. The stale per-material rejects in `cudaBdptSupported` (which the
 demotion made unreachable) were removed; the gate now carries no material reject and only
-mirrors the emitter/GRIN/rainbow refusals as belt-and-suspenders. True fluorescence / spot /
-env rendering is a mode B/P/R feature on both CPU and GPU.
+mirrors the emitter/GRIN refusals as belt-and-suspenders (rainbow is now on device — M10).
+True fluorescence / spot / env rendering is a mode B/P/R feature on both CPU and GPU.
 Genuinely still CPU-only in mode D (real device-volume limits, not per-BSDF):
 | Feature | Why CPU today | Class |
 |---|---|---|
-| GRIN / rainbow media | straight-segment MIS assumptions / HG-only phase | **inherently-CPU** / rainbow portable-hard |
+| GRIN media | straight-segment MIS assumptions | **inherently-CPU** |
+
+(Rainbow media in BDPT: **DONE (M10, 0.37.0)** — `dPhaseF`/`dPhasePdf`/`dMediumScatterF` now
+dispatch the tabulated Airy phase; the rainbow reject in `cudaBdptSupported` was relaxed.)
 
 ### Photon map M — `cudaPhotonMapSupported` (render_cuda.cu:7830)
 Forward scope plus:
@@ -118,8 +121,14 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 2. ~~**Env term in the mode-M GPU gather** (M2)~~ — **DONE 2026-07-23.** Deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image env); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%.
 3. ~~**GPU SPPM** (M3)~~ — **DONE 2026-07-23.** Resident device SPPM session reusing the mode-M deposit + a per-pixel visible-point/gather/update kernel trio; per-pixel progressive state stays on-device across passes. Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%).
 4. ~~**Mode-M final gather on GPU** (M4)~~ — **DONE 2026-07-23.** Device `dPhotonGatherSub` (specular walk → one-bounce density query folding `rho(y)*rho(vis)` per photon; env/specular-emitter reflected off the visible point) + a `fgRays>0` branch in `dPhotonGather` (NEE direct + K cosine sub-rays); `fgRays` threaded through `kGather`/`renderPhotonMapSharedCuda`, `g_pmFinalGather==0` caller gates dropped. Validated GPU==CPU mean 0.43%, background 0.98%, per-pixel noise √-scales with spp.
-5. **Per-hit BSDFs in GPU BDPT** (M9) — **three increments DONE 2026-07-23.** (1) DVertex now stores per-hit `u,v`; `dVertHit` reconstructs a `DHit` so `dBsdfF`/`dBsdfPdf`/`dRandomWalk` evaluate textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps, mix masks, and colored-glass Beer-Lambert — all MIS-safe (same per-hit value in sampler and pdf). Validated GPU==CPU on `textured.ftsl` (mean 0.06%) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided **diffuse-transmit** (translucent) now on-device — both lobes + back-hemisphere connection; `lambda` threaded through `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). (3) **Frosted (rough) dielectric** now on-device — only the gate needed relaxing; `refractOrReflect`/`dDielectricStep` already jittered the lobe by per-hit roughness (stochastic-delta, same as `bdpt.h`). Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). Gate `cudaBdptSupported` relaxed accordingly. **M9 COMPLETE:** the two items once listed as deferred (fluorescence, spot/env light-subpaths) are not GPU-vs-CPU gaps — BDPT can't render them on any backend, so the `main.cpp` mode-D guard refuses those scenes (or demotes D → B with `-on-unsupported fallback`) before dispatch. The stale unreachable per-material rejects in `cudaBdptSupported` were removed. Only genuine device-volume limits (GRIN/rainbow, handled by M10/M11) keep a mode-D scene on the CPU.
-6. Longer tail: **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
+5. **Per-hit BSDFs in GPU BDPT** (M9) — **three increments DONE 2026-07-23.** (1) DVertex now stores per-hit `u,v`; `dVertHit` reconstructs a `DHit` so `dBsdfF`/`dBsdfPdf`/`dRandomWalk` evaluate textured/patterned/record diffuse albedo & glossy reflect, per-hit glossy roughness + thin-film maps, mix masks, and colored-glass Beer-Lambert — all MIS-safe (same per-hit value in sampler and pdf). Validated GPU==CPU on `textured.ftsl` (mean 0.06%) and `mixmat.ftsl` (mean 0.21%). (2) Two-sided **diffuse-transmit** (translucent) now on-device — both lobes + back-hemisphere connection; `lambda` threaded through `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` for the wavelength-dependent lobe-selection pdf. Validated GPU==CPU on `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halves 8.42%→4.39% at 4× spp = unbiased). (3) **Frosted (rough) dielectric** now on-device — only the gate needed relaxing; `refractOrReflect`/`dDielectricStep` already jittered the lobe by per-hit roughness (stochastic-delta, same as `bdpt.h`). Validated GPU==CPU on `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halves 10.86%→5.73% at 4× spp = unbiased). Gate `cudaBdptSupported` relaxed accordingly. **M9 COMPLETE:** the two items once listed as deferred (fluorescence, spot/env light-subpaths) are not GPU-vs-CPU gaps — BDPT can't render them on any backend, so the `main.cpp` mode-D guard refuses those scenes (or demotes D → B with `-on-unsupported fallback`) before dispatch. The stale unreachable per-material rejects in `cudaBdptSupported` were removed. Only genuine device-volume limits (GRIN, handled by M11) keep a mode-D scene on the CPU.
+6. ~~**Rainbow media** on device (M10)~~ — **DONE 2026-07-23 (0.37.0).** λ×µ phase table + per-λ CDF uploaded
+   per-medium; unified `dMedPhase`/`dMedPhaseSample` dispatch (bilinear `dRbEval` / CDF importance-sample vs
+   analytic HG) across forward + backward + BDPT; rejects relaxed in all three gates. Validated by isolating
+   the phase from a pre-existing, phase-independent GPU↔CPU media brightness discrepancy (see known-issues.md):
+   in clean mode-D BDPT the rainbow and a plain-HG control give the *same* GPU↔CPU B/A=2.41 (3 s.f.), so the
+   rainbow adds zero bias beyond HG's; forward-bulk median 1.02 (rainbow) / 1.00 (HG); bows visually correct.
+7. Longer tail: **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
 
 ### Descoped by user (2026-07-23) — NOT scheduled
 Left on their current CPU/spectral fallbacks: **indexed-spectral palette maps** on device forward,

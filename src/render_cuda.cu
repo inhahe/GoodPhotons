@@ -495,6 +495,15 @@ struct DMedium {
     const PatNode*    ior;            // compiled n(x,y,z) program (device pool) or null
     int               iorN;           // node count of the ior program (0 => not GRIN)
     double            iorStep;        // Eikonal march step in world units (>0 for GRIN)
+    // --- Optional spectral rainbow (Airy droplet) phase table (mirrors host RainbowPhase) ---
+    // When `rbPdf` is non-null the angular phase is the tabulated (lambda x mu) Airy
+    // droplet function instead of the analytic HG lobe (`g` above), reproducing the
+    // primary/secondary bows, supernumeraries and fogbow. rbPdf/rbCdf are nLam*nMu
+    // row-major [li*nMu + mi]; mu = -1 + mi*dMu, dMu = 2/(nMu-1); lambda = rbLam0 + li*rbDLam.
+    const double*     rbPdf;          // phase table p(lambda, mu) (device pool) or null => HG
+    const double*     rbCdf;          // per-lambda CDF over mu for importance sampling
+    int               rbNLam, rbNMu;  // table dimensions
+    double            rbLam0, rbDLam; // wavelength axis origin/step (nm)
 };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
@@ -921,6 +930,61 @@ __device__ static DVec3 sampleHG(const DVec3& wi, Real g, DRng& rng) {
     Real phi = (Real)2 * (Real)DPI * u2;
     DVec3 t, b; onb(wi, t, b);
     return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + wi * cosT);
+}
+
+// --- Medium phase dispatch: analytic HG lobe vs. tabulated Airy rainbow ---------------
+// A rainbow medium (rbPdf != null) carries a per-medium (lambda x mu) phase table plus a
+// per-lambda CDF (mirrors host rainbow::RainbowPhase); HG media fall through to the
+// analytic lobe. dMedPhase returns the solid-angle phase value p(cos) at wavelength
+// lambda, which equals the sampling pdf of dMedPhaseSample for BOTH models. Table math is
+// done in double to track the CPU tracer bit-closely.
+__device__ static Real dRbEval(const DMedium& m, Real cosTheta, Real lambda) {
+    double fl = ((double)lambda - m.rbLam0) / m.rbDLam;
+    int li = (int)floor(fl); double tl = fl - li;
+    if (li < 0) { li = 0; tl = 0.0; }
+    if (li > m.rbNLam - 2) { li = m.rbNLam - 2; tl = 1.0; }
+    if (tl < 0.0) tl = 0.0; else if (tl > 1.0) tl = 1.0;
+    double dMu = 2.0 / (m.rbNMu - 1);
+    double fm = ((double)cosTheta + 1.0) / dMu;
+    int mi = (int)floor(fm); double tm = fm - mi;
+    if (mi < 0) { mi = 0; tm = 0.0; }
+    if (mi > m.rbNMu - 2) { mi = m.rbNMu - 2; tm = 1.0; }
+    if (tm < 0.0) tm = 0.0; else if (tm > 1.0) tm = 1.0;
+    const double* P = m.rbPdf; int nMu = m.rbNMu;
+    double a = P[(size_t)li * nMu + mi] * (1 - tm) + P[(size_t)li * nMu + mi + 1] * tm;
+    double b = P[(size_t)(li + 1) * nMu + mi] * (1 - tm) + P[(size_t)(li + 1) * nMu + mi + 1] * tm;
+    return (Real)(a * (1 - tl) + b * tl);
+}
+__device__ static Real dMedPhase(const DMedium& m, Real cosTheta, Real lambda) {
+    if (m.rbPdf) return dRbEval(m, cosTheta, lambda);
+    return hgPhase(cosTheta, (Real)m.g);
+}
+// Importance-sample a scattered direction about propagation `wi` at wavelength lambda;
+// sets pdfOut = p(cos) of the chosen direction. Mirrors host Medium::phaseSample.
+__device__ static DVec3 dMedPhaseSample(const DMedium& m, const DVec3& wi, Real lambda, DRng& rng, Real& pdfOut) {
+    if (m.rbPdf) {
+        int li = (int)lround(((double)lambda - m.rbLam0) / m.rbDLam);
+        if (li < 0) li = 0;
+        if (li > m.rbNLam - 1) li = m.rbNLam - 1;
+        const double* cdf = &m.rbCdf[(size_t)li * m.rbNMu];
+        double u = (double)rng.uniform();
+        int lo = 0, hi = m.rbNMu - 1;
+        while (lo + 1 < hi) { int mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid; else hi = mid; }
+        double c0 = cdf[lo], c1 = cdf[hi];
+        double t = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.0;
+        double dMu = 2.0 / (m.rbNMu - 1);
+        double mu = -1.0 + (lo + t) * dMu;
+        if (mu < -1.0) mu = -1.0; else if (mu > 1.0) mu = 1.0;
+        Real sinT = sqrt(fmax((Real)0, (Real)1 - (Real)(mu * mu)));
+        Real phi = (Real)2 * (Real)DPI * rng.uniform();
+        DVec3 tb, bb; onb(wi, tb, bb);
+        DVec3 dir = normalize(tb * (sinT * cos(phi)) + bb * (sinT * sin(phi)) + wi * (Real)mu);
+        pdfOut = dRbEval(m, (Real)mu, lambda);
+        return dir;
+    }
+    DVec3 d = sampleHG(wi, (Real)m.g, rng);
+    pdfOut = hgPhase(dot(wi, d), (Real)m.g);
+    return d;
 }
 
 // CIE 1931 CMF (analytic multi-Gaussian fit — same as color.h).
@@ -2335,7 +2399,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
-    Real ph = hgPhase(dot(wIn, wdir), (Real)med.g);
+    Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
     // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
@@ -2404,7 +2468,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
-    Real ph = hgPhase(dot(wIn, wdir), (Real)med.g);
+    Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
     // Same flux->film-irradiance normaliser as connectLens (see there); per-camera
@@ -2565,10 +2629,13 @@ struct DSpecVtx {
     D3     wIn;                // incoming photon direction (volume vertices)
     double g;                  // HG asymmetry (volume vertices)
     double weight;             // surface: Lambertian rho ; volume: single-scatter albedo
+    const DMedium* med;        // scattering medium (volume vertices) — for rainbow phase
+    Real   lambda;             // wavelength (volume vertices) — for rainbow phase
     // Throughput at the vertex for a connection leaving toward `wP` (unit, toward the
-    // sphere). Returns <0 to signal "reject" (camera-side behind a surface).
+    // sphere). Returns <0 to signal "reject" (camera-side behind a surface). A rainbow
+    // medium uses its tabulated Airy phase; HG media use the analytic lobe.
     __device__ double term(const D3& wP) const {
-        if (volume) return weight * (double)hgPhase((Real)d3dot(wIn, wP), (Real)g);
+        if (volume) return weight * (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
         double cosSurf = d3dot(np, wP);
         return cosSurf <= 0.0 ? -1.0 : (weight / DPI) * cosSurf;
     }
@@ -2955,6 +3022,7 @@ __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, 
                                            const DVec3& p, const DVec3& n, Real lambda,
                                            Real beta, Real rho, DRng& rng) {
     DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho; vt.g = 0;
+    vt.med = nullptr; vt.lambda = lambda;
     camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
 }
 // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
@@ -2964,6 +3032,7 @@ __device__ static void camSpecularSplatVolumeAll(const DScene& sc, const DMedium
                                                  const DVec3& wIn, Real lambda, Real beta, DRng& rng) {
     DSpecVtx vt; vt.volume = true; vt.wIn = D3(wIn); vt.g = med.g;
     vt.weight = (double)medAlbedo(med, lambda);
+    vt.med = &med; vt.lambda = lambda;
     camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
 }
 
@@ -3827,7 +3896,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
         camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
         if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 nd = sampleHG(rd, (Real)sm.g, rng);
+        Real phPdf;   // scatter dir from HG or the rainbow droplet phase (pdf unused: p/pdf==1)
+        DVec3 nd = dMedPhaseSample(sm, rd, lambda, rng, phPdf);
         ro = mp; rd = nd;
         return WF_CONTINUE;
     }
@@ -4437,20 +4507,24 @@ __device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
     if (v.delta) return false;
     return dConnectibleType(sc.mats[v.matId].type);
 }
-// HG phase as the medium "BSDF": propagation INTO the vertex is -wo, scattered dir is wi
-// (both point away from v), so cosTheta = -dot(wo,wi). hgPhase is its own pdf, so
-// dPhaseF == dPhasePdf. mediumScatterF = albedo * phase is the CONNECTION response
-// (albedo corrects the sigma_t-rate collision to the sigma_s scatter rate; it enters the
-// throughput once, never the MIS density). Mirrors bdpt.h phaseF / mediumScatterF.
-__device__ static inline double dPhaseF(const DVertex& v, const DVec3& wo, const DVec3& wi) {
-    return (double)hgPhase((Real)(-ddot(wo, wi)), (Real)v.mediumG);
+// Medium phase as the "BSDF": propagation INTO the vertex is -wo, scattered dir is wi
+// (both point away from v), so cosTheta = -dot(wo,wi). The phase is its own pdf, so
+// dPhaseF == dPhasePdf. A rainbow medium uses its tabulated Airy phase (wavelength-
+// dependent), so both take the scene + lambda to look up sc.media[v.mediumId].
+// mediumScatterF = albedo * phase is the CONNECTION response (albedo corrects the
+// sigma_t-rate collision to the sigma_s scatter rate; it enters the throughput once,
+// never the MIS density). Mirrors bdpt.h phaseF / mediumScatterF.
+__device__ static inline double dPhaseF(const DScene& sc, const DVertex& v,
+                                        const DVec3& wo, const DVec3& wi, Real lambda) {
+    return (double)dMedPhase(sc.media[v.mediumId], (Real)(-ddot(wo, wi)), lambda);
 }
-__device__ static inline double dPhasePdf(const DVertex& v, const DVec3& wo, const DVec3& wi) {
-    return (double)hgPhase((Real)(-ddot(wo, wi)), (Real)v.mediumG);
+__device__ static inline double dPhasePdf(const DScene& sc, const DVertex& v,
+                                          const DVec3& wo, const DVec3& wi, Real lambda) {
+    return (double)dMedPhase(sc.media[v.mediumId], (Real)(-ddot(wo, wi)), lambda);
 }
 __device__ static inline double dMediumScatterF(const DScene& sc, const DVertex& v,
                                                 const DVec3& wo, const DVec3& wi, Real lambda) {
-    return (double)medAlbedo(sc.media[v.mediumId], lambda) * dPhaseF(v, wo, wi);
+    return (double)medAlbedo(sc.media[v.mediumId], lambda) * dPhaseF(sc, v, wo, wi, lambda);
 }
 __device__ static inline bool dIsLightVertex(const DVertex& v) {
     return v.type == BV_LIGHT || (v.type == BV_SURFACE && v.lightIdx >= 0);
@@ -4605,7 +4679,7 @@ __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
         DVec3 wp = prev->p - cur.p;
         if (dot(wp, wp) == 0.f) return 0.f;
         wp = normalize(wp);
-        pdfW = (float)dPhasePdf(cur, wp, wn);
+        pdfW = (float)dPhasePdf(sc, cur, wp, wn, lambda);
     } else {
         if (!prev) return 0.f;
         DVec3 wp = prev->p - cur.p;
@@ -4879,7 +4953,6 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
                                      const DMedium& med, double invPdfLambda, Real lambda,
                                      DRng& rng) {
     double total = 0.0;
-    Real g   = (Real)med.g;
     Real alb = medAlbedo(med, lambda);
     if (alb <= (Real)0) return 0.0;
     for (int k = 0; k < sc.nEmitters; ++k) {
@@ -4895,7 +4968,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-            Real phase = hgPhase(dot(wIn, wi), g);
+            Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
             contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
@@ -4912,7 +4985,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         Real cosLight = dot(nL, wi * (Real)(-1));         // light is one-sided
         if (cosLight <= 0) continue;
         if (occluded(sc, p + wi * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-        Real phase = hgPhase(dot(wIn, wi), g);            // HG phase == its own pdf
+        Real phase = dMedPhase(med, dot(wIn, wi), lambda); // phase == its own pdf (HG or rainbow)
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
@@ -4973,7 +5046,6 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
                                         const DMedium& med, double invPdfLambda, Real lambda,
                                         DRng& rng) {
     if (sc.envIndex < 0) return 0.0;
-    Real g   = (Real)med.g;
     Real alb = medAlbedo(med, lambda);
     if (alb <= (Real)0) return 0.0;
     DVec3 wi; double pdfW;
@@ -4993,7 +5065,7 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
     double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
-    Real phase = hgPhase(dot(wIn, wi), g);                  // HG phase == its own pdf
+    Real phase = dMedPhase(med, dot(wIn, wi), lambda);      // phase == its own pdf (HG or rainbow)
     double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
     double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis;
     contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, (Real)farDist, lambda, rng);
@@ -5034,8 +5106,9 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 Real alb = medAlbedo(med, lambda);
                 if (rng.uniform() >= (double)alb) return L;        // absorbed
                 DVec3 wIn = rd;
-                ro = p; rd = sampleHG(rd, (Real)med.g, rng); specularArrival = false;
-                contBsdfPdf = (double)hgPhase(dot(wIn, rd), (Real)med.g);  // phase pdf of the scatter (env MIS)
+                Real phPdf;
+                ro = p; rd = dMedPhaseSample(med, rd, lambda, rng, phPdf); specularArrival = false;
+                contBsdfPdf = (double)phPdf;  // phase pdf of the scatter (env MIS)
                 continue;
             }
         }
@@ -5718,9 +5791,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             if (++bounces >= maxDepth) return;
             if (rng.uniform() >= (double)medAlbedo(sm, lambda)) return;   // absorbed (vertex retained)
             DVec3 wo = normalize(path[prevIdx].p - path[cur].p);          // toward previous vertex
-            DVec3 wi = sampleHG(rd, (Real)sm.g, rng);                     // scattered propagation dir
-            double pdfW    = dPhasePdf(path[cur], wo, wi);
-            double pdfRevW = dPhasePdf(path[cur], wi, wo);
+            Real phPdf;
+            DVec3 wi = dMedPhaseSample(sm, rd, lambda, rng, phPdf);       // scattered dir (HG or rainbow)
+            double pdfW    = dPhasePdf(sc, path[cur], wo, wi, lambda);
+            double pdfRevW = dPhasePdf(sc, path[cur], wi, wo, lambda);
             path[prevIdx].pdfRev = dConvertDensity(pdfRevW, path[cur], path[prevIdx]);
             ro = mpos; rd = normalize(wi);
             pdfFwd = pdfW;
@@ -6906,11 +6980,9 @@ bool cudaForwardSupported(const Scene& scene) {
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
-    // Spectral water-droplet (rainbow) phase is a CPU-tabulated (lambda x mu) table with
-    // per-lambda CDF importance sampling (rainbow.h); the device volume path only knows
-    // the analytic HG lobe (hgPhase). Rather than silently drop the bow to a smooth HG
-    // haze, fall back to the CPU tracer for any scene with a rainbow-phase medium.
-    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
+    // Spectral water-droplet (rainbow) phase is now on the device: the (lambda x mu) Airy
+    // table + per-lambda CDF (rainbow.h) is uploaded per medium and dMedPhase / dMedPhaseSample
+    // reproduce the bow bit-closely against the CPU tracer (M10). No fallback needed.
     // Environment lighting runs on-device: the kernel emits env photons from the scene
     // bounding sphere (shape==3) and the directly-viewed background is added by the
     // backend-agnostic addEnvBackground() pass. Both a constant env and an IMAGE-based
@@ -7488,6 +7560,20 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.ior     = m.ior.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.ior));
             dm.iorN    = (int)m.ior.size();
             dm.iorStep = m.iorStep;
+            // Spectral rainbow (Airy droplet) phase: upload the (lambda x mu) pdf table +
+            // per-lambda CDF so the device reproduces the bow instead of the HG lobe.
+            if (m.rainbow() && m.rainbowPhase->built()) {
+                const rainbow::RainbowPhase& rp = *m.rainbowPhase;
+                dm.rbPdf  = (const double*)keep(uploadVec(rp.pdfTable()));
+                dm.rbCdf  = (const double*)keep(uploadVec(rp.cdfTable()));
+                dm.rbNLam = rp.nLam();
+                dm.rbNMu  = rp.nMu();
+                dm.rbLam0 = rp.lam0();
+                dm.rbDLam = rp.dLam();
+            } else {
+                dm.rbPdf = nullptr; dm.rbCdf = nullptr;
+                dm.rbNLam = dm.rbNMu = 0; dm.rbLam0 = 0.0; dm.rbDLam = 1.0;
+            }
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
@@ -7909,10 +7995,9 @@ bool cudaBdptSupported(const Scene& scene) {
     // a GRIN region would bias the estimator. The mode-D guard (bdptUnsupportedFeature) already
     // refuses GRIN before dispatch; reject here too so GPU BDPT can never render it straight.
     if (grin::sceneHasGrin(scene)) return false;
-    // Spectral rainbow phase is CPU-tabulated (see cudaForwardSupported); the device
-    // volume connect/sample only knows the analytic HG lobe, so refuse rainbow media
-    // here too and let mode D run on the CPU BDPT (which evaluates the bow exactly).
-    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
+    // Spectral rainbow phase now runs on the device BDPT too (M10): dPhaseF/dPhasePdf and
+    // the random-walk medium scatter dispatch through dMedPhase / dMedPhaseSample, which
+    // read the uploaded (lambda x mu) Airy table for rainbow media. No fallback needed.
     return true;
 }
 
@@ -7994,8 +8079,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // GPU mode R needs the same POD-bakeable materials as the forward path, plus the
     // current backward scope: participating media, fluorescence AND a constant
-    // environment light ARE supported (media: homogeneous + heterogeneous, minus
-    // GRIN/rainbow; fluorescence: the bispectral Stokes-shift adjoint; env: bkNeeEnv /
+    // environment light ARE supported (media: homogeneous + heterogeneous + spectral-
+    // rainbow phase, minus GRIN; fluorescence: the bispectral Stokes-shift adjoint; env: bkNeeEnv /
     // bkNeeEnvVolume + MIS'd env-miss, constant only — an IMAGE env stays on the CPU).
     // Emitters: area/sphere/cylinder Lambertian AND point-spot lights (bkNeeLight /
     // bkNeeVolume spot branch); only collimated beams (not NEE-samplable) fall back to
@@ -8003,11 +8088,11 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // exact (geomWeight = area*PI for area emitters, 4pi^2 R^2 for the env emitter).
     if (!cudaForwardSupported(scene)) return false;
     // Participating media now run on the device backward walk (dMediaSampleCollision /
-    // dMediaTransmittance — homogeneous AND heterogeneous), EXCEPT gradient-index (GRIN)
-    // media (bkRadiance has no Eikonal marcher) and spectral-rainbow phase (the device
-    // only knows the analytic HG lobe). Those fall back to the CPU backward tracer.
+    // dMediaTransmittance — homogeneous AND heterogeneous), INCLUDING spectral-rainbow
+    // phase (M10: bkNeeVolume / bkNeeEnvVolume / the volume scatter dispatch through
+    // dMedPhase / dMedPhaseSample read the uploaded Airy table). Gradient-index (GRIN)
+    // media still fall back (bkRadiance has no Eikonal marcher).
     if (grin::sceneHasGrin(scene)) return false;
-    for (const auto& m : scene.media) if (m.enabled && m.rainbow()) return false;
     // Environment light IS supported on the device backward walk: a CONSTANT env
     // (bkNeeEnv / bkNeeEnvVolume / env-miss with MIS) and now an IMAGE env (lat-long
     // map — importance-sampled via dEnvSample, evaluated via dEnvRadiance/dEnvPdf, with

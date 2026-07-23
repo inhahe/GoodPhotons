@@ -38,8 +38,8 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU) **and the backward reference (mode
   `R`) on both CPU and GPU** (GPU backward runs homogeneous *and* heterogeneous
-  media natively; only GRIN and spectrally-dispersive/rainbow media still force the
-  CPU backward).
+  media natively, including spectral **rainbow-phase** media; only GRIN media still
+  force the CPU backward).
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward
@@ -67,9 +67,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   across the flyby, correct per-view angle, clean non-frozen grain). It deliberately
   drops the multiple-scatter haze wash, so the bow is actually *crisper* than the
   shared baseline. Runs on **both CPU and GPU** (the per-camera in-scatter resample is
-  ported to the CUDA forward tracer; spectral-rainbow-phase media are still CPU-tabulated
-  and fall back to CPU). Rainbows/fogbows/glories are single scatter, so this loses
-  nothing that matters for them.
+  ported to the CUDA forward tracer, and spectral-rainbow-phase media now run on the GPU
+  too — the λ×µ Airy phase table is uploaded per-medium). Rainbows/fogbows/glories are
+  single scatter, so this loses nothing that matters for them.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
@@ -507,9 +507,9 @@ that converges to the same physical image.
   specular/textured materials, **participating media** (homogeneous + heterogeneous),
   **fluorescence** and **both constant *and* image-based (lat-long HDR) environment
   lights** (env-NEE + MIS'd env-miss, at surface *and* fog vertices — the image env is
-  importance-sampled on-device from its luminance CDF); scenes using collimated beams
-  (plus GRIN / rainbow-dispersive media) still fall back to the CPU tracer
-  automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
+  importance-sampled on-device from its luminance CDF; **spectral rainbow-phase media**
+  also run on-device now); scenes using collimated beams (plus GRIN media) still fall
+  back to the CPU tracer automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
   sampling one wavelength per sample it carries an RGB throughput triple and does one
   intersection walk per full-colour sample, so a clean colour image converges much
   faster. Materials bake to a per-material linear-RGB albedo and emitters/env to a
@@ -647,8 +647,8 @@ stay non-resumable.
   on a pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (spot/collimated lights; GRIN/rainbow media — mode `R` now runs fog,
-  fluorescence, and constant *and* image-based env lights on the device), and for
+  (spot/collimated lights; GRIN media — mode `R` now runs fog, spectral **rainbow-phase**
+  media, fluorescence, and constant *and* image-based env lights on the device), and for
   fluorescent/oversized-mix forward scenes (mode `M`'s `-pmfg` final gather now runs
   on the GPU too). Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous
@@ -666,8 +666,8 @@ stay non-resumable.
   BDPT scope now matches the CPU BDPT exactly (no per-material fallback). (Fluorescence,
   layered stacks, and spot/env/collimated lights aren't a GPU limitation — BDPT can't render
   them on *any* backend, so mode `D` refuses or drops to mode `B` for those scenes on both
-  CPU and GPU; use mode B/P/R for them. GRIN/rainbow media keep an in-scope mode-`D` scene on
-  the CPU.) **Parametric records** (a
+  CPU and GPU; use mode B/P/R for them. GRIN media keep an in-scope mode-`D` scene on
+  the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
   reflect/albedo and roughness slots** (constant stop selectors bake into the device
@@ -1574,9 +1574,9 @@ secondary), **Alexander's dark band**, and **supernumerary arcs**. Features are 
 default; block knobs (`droplet_um`, `secondary`, `supernumerary`, `strength`,
 `forward_g`, `secondary_ratio`) tune or disable them — small drops broaden toward a
 white **fogbow**. Point the camera at the antisolar point with a distant sun behind it
-and keep the fog thin (single-scatter regime). Evaluated by the CPU tracers (forward
-A/B/C, backward R, BDPT D); a rainbow-phase scene automatically falls back to the CPU
-on the GPU backend (the device volume path is HG-only). See FTSL.md §12.
+and keep the fog thin (single-scatter regime). Evaluated on **both CPU and GPU** across
+forward A/B/C, backward R, and BDPT D — the λ×µ Airy phase table + per-λ CDF is uploaded
+per-medium and importance-sampled on the device (no CPU fallback). See FTSL.md §12.
 
 **Multiple, overlapping media.** Author as many `medium` blocks as you like — they
 coexist as independent regions (e.g. two differently-tinted fog orbs plus a faint

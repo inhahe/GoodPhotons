@@ -1767,10 +1767,19 @@ mark the corresponding row in `gpu-fallbacks.md`.
       fallback) for those scenes before dispatch, so they never reach the BDPT path (CPU or GPU). The stale,
       now-unreachable per-material rejects in `cudaBdptSupported` were removed. True fluorescence/spot/env is a
       mode A/B/C/R/P feature on both CPU and GPU — not a GPU-BDPT closure item.
-- [ ] **M10. Spectral rainbow-phase media on device.** `cudaForwardSupported`/`cudaBackwardSupported`/
-      `cudaBdptSupported` all reject rainbow media (device only knows analytic HG). Upload the λ×µ CDF
-      (`rainbow.h`) + per-λ importance sampling into the device volume path. Relax the rainbow rejects across
-      forward, backward, and BDPT.
+- [x] **M10. Spectral rainbow-phase media on device — DONE (2026-07-23, 0.37.0).** The λ×µ phase table +
+      per-λ CDF (`rainbow.h`) is uploaded per-medium; unified device dispatch `dMedPhase`/`dMedPhaseSample`
+      (rainbow → bilinear `dRbEval` / binary-search CDF sample; HG → analytic lobe) replaces the raw
+      `hgPhase` calls across forward (deposit walk, `connectVolume`/`connectLensVolume`, specular-sphere
+      splat), backward (`bkNeeVolume` spot/area/env, `bkNeeEnvVolume`, `bkRadiance` scatter), and BDPT
+      (`dPhaseF`/`dPhasePdf`/`dMediumScatterF` + random walk). Rainbow rejects relaxed in
+      `cudaForwardSupported`/`cudaBackwardSupported`/`cudaBdptSupported`. **Validation:** isolated the rainbow
+      phase from a pre-existing, phase-independent GPU↔CPU media brightness discrepancy (see known-issues.md)
+      by comparing rainbow *and* a plain-HG control in every mode. In clean, well-converged **mode-D BDPT** the
+      rainbow gives GPU↔CPU B/A=2.41 and HG gives B/A=2.41 (identical to 3 s.f.) — the rainbow adds **zero**
+      bias beyond what HG already shows; forward-mode bulk median ratio is 1.02 (rainbow) / 1.00 (HG); visuals
+      show correct primary+secondary bows with spectral separation. The git diff also proves the HG BDPT path
+      is bit-for-bit unchanged by the refactor.
 - [ ] **M11. GRIN (gradient-index) media on device backward.** `cudaBackwardSupported` rejects GRIN (no
       Eikonal marcher in `bkRadiance`). Port the Eikonal ray-marcher to the device volume walk. Relax the
       `grin::sceneHasGrin` reject in backward (BDPT stays CPU — straight-segment MIS).
