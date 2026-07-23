@@ -56,7 +56,7 @@ Forward scope plus:
 | Feature | Why CPU today | Class |
 |---|---|---|
 | ~~Any environment light~~ | **DONE (M2, 2026-07-23)** — deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image via `dEnvRadiance`); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%. | ✅ |
-| **Final gather** (`g_pmFinalGather > 0`) | device does only the direct density estimate; final gather stays CPU (caller-gated, main.cpp:6034/6441) | **portable-hard, high value** (a second bounce of gather rays on device) |
+| ~~**Final gather** (`g_pmFinalGather > 0`)~~ | **DONE (M4, 2026-07-23)** — added device `dPhotonGatherSub` (specular walk → one-bounce density query folding `rho(y)*rho(vis)` per photon, + env-on-escape / specular-arrival emitter reflected off the visible point) and a `fgRays>0` branch in `dPhotonGather` (NEE direct via `bkNeeLight` + K cosine-hemisphere sub-rays); threaded `fgRays` through `kGather`→`renderPhotonMapSharedCuda` and dropped the `g_pmFinalGather==0` caller gates (main.cpp meter + flyby). Validated GPU==CPU mean 0.43%, background 0.98%, per-pixel diff √-scales 22%→11.5% at 4× spp (unbiased). | ✅ |
 | Physical-lens cameras | caller-gated | secondary |
 
 ### Composite P — main.cpp:2534
@@ -82,7 +82,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 1. ~~**Image-based env NEE in GPU backward** (M1)~~ — **DONE 2026-07-23.** Added `dEnvRadiance`/`dEnvPdf`, uploaded the illuminant table, wired the device env sampler into `bkNeeEnv`/`bkNeeEnvVolume` + MIS'd env-miss; dropped the `envMap` reject. Validated GPU==CPU to 0.14% at 8192 spp. Also unblocks mode P camera-side.
 2. ~~**Env term in the mode-M GPU gather** (M2)~~ — **DONE 2026-07-23.** Deposit already emits env photons (indirect); added env's direct term on gather-ray escape in `dPhotonGather` (constant + image env); dropped the `envIndex >= 0` reject. Validated GPU==CPU mean 0.18%, background 0.04%.
 3. ~~**GPU SPPM** (M3)~~ — **DONE 2026-07-23.** Resident device SPPM session reusing the mode-M deposit + a per-pixel visible-point/gather/update kernel trio; per-pixel progressive state stays on-device across passes. Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%).
-4. **Mode-M final gather on GPU** (M4) — high value, more work.
+4. ~~**Mode-M final gather on GPU** (M4)~~ — **DONE 2026-07-23.** Device `dPhotonGatherSub` (specular walk → one-bounce density query folding `rho(y)*rho(vis)` per photon; env/specular-emitter reflected off the visible point) + a `fgRays>0` branch in `dPhotonGather` (NEE direct + K cosine sub-rays); `fgRays` threaded through `kGather`/`renderPhotonMapSharedCuda`, `g_pmFinalGather==0` caller gates dropped. Validated GPU==CPU mean 0.43%, background 0.98%, per-pixel noise √-scales with spp.
 5. Longer tail: **per-hit BSDFs in GPU BDPT** (M9); **rainbow media** on device (M10); **GRIN marcher** on device backward (M11); **GPU VCM** (M12).
 
 ### Descoped by user (2026-07-23) — NOT scheduled

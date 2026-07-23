@@ -1736,9 +1736,15 @@ mark the corresponding row in `gpu-fallbacks.md`.
       background wall 0.3%, and the per-pixel diff shrinks 7.9%→5.4% as passes go 60→240 (independent-MC noise,
       not bias); images structurally identical incl. the floor caustic + refracted light. GPU ~4x the CPU
       pass rate at 256².
-- [ ] **M4. Mode-M final gather on GPU.** Device gather does only the direct density estimate; final gather
-      (`g_pmFinalGather > 0`) stays CPU (caller-gated, main.cpp:6034/6441). Port the secondary gather-ray
-      bounce to the device so `-pmfg` runs on the GPU. High value (final gather is the quality mode).
+- [x] **M4. Mode-M final gather on GPU.** DONE 2026-07-23. Added device `dPhotonGatherSub` (device twin of
+      `photonGatherSub`: follows specular surfaces, then at the first diffuse hit y does a radius density query
+      folding `rho(y)*rho(vis)` per photon wavelength; env-on-escape and specular-arrival emitters reflected off
+      the visible point) and a `fgRays>0` branch in `dPhotonGather` (NEE direct via `bkNeeLight` + K
+      cosine-hemisphere sub-rays). Threaded `fgRays` through `kGather` → `renderPhotonMapSharedCuda` → header,
+      and dropped the `g_pmFinalGather == 0` caller gates (main.cpp meter 6083 + flyby 6489) so `-pmfg` now runs
+      on the GPU. Validated GPU==CPU on `scenes/cornell.ftsl` (glass sphere + diffuse walls, `-pmfg 16/24`): mean
+      linear radiance 0.43%, background 0.98%, per-pixel diff √-scales 22%→11.5% at 4× spp (independent-MC noise,
+      not bias). Falls back to CPU for lens cameras / unsupported scenes exactly as the direct gather does.
 - [ ] **M9. Per-hit BSDFs in GPU BDPT (mode D).** `cudaBdptSupported` rejects every per-hit BSDF because the
       connection BSDF (`dBsdfF`/`dBsdfPdf`) has no `Hit` in scope, so it would bias MIS. Thread the `Hit`
       through `dConnect`/`dBsdfF`/`dBsdfPdf` and port the full set: diffuse-transmit + frosted/colored glass

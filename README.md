@@ -565,13 +565,15 @@ that converges to the same physical image.
   contact shadows and fine detail **sharp** while still smoothing indirect light, at
   roughly `K`× the per-sample cost (so pair it with fewer `-spp`). Directly-viewed
   emitters carry a little chromatic speckle at low spp. Best when many cameras share one
-  lighting solution. **GPU-accelerated** for the direct density query: the device
-  deposits the photon pass, hands the hits to the same grid builder, then gathers every
-  camera on the GPU from the one shared map — so a whole flythrough builds the map once
-  and renders each frame in device time. Environment lights (constant **and** image-based
-  lat-long HDR, M2) are handled on the GPU: the deposit emits env photons for the indirect
-  bounces and the device gather adds env's direct term on gather-ray escape. (A `-pmfg`
-  final gather still falls back to the CPU, as do unsupported-material scenes.) The built map can also be
+  lighting solution. **GPU-accelerated** for both the direct density query *and* the
+  `-pmfg` Jensen final gather: the device deposits the photon pass, hands the hits to the
+  same grid builder, then gathers every camera on the GPU from the one shared map — so a
+  whole flythrough builds the map once and renders each frame in device time. Environment
+  lights (constant **and** image-based lat-long HDR, M2) are handled on the GPU: the
+  deposit emits env photons for the indirect bounces and the device gather adds env's
+  direct term on gather-ray escape. The final gather (M4) runs its NEE direct term plus
+  the `K` cosine-hemisphere sub-rays' one-bounce density queries entirely on the device.
+  (Unsupported-material scenes and physical-lens cameras still fall back to the CPU.) The built map can also be
   **persisted to disk** with `-savemap <f>` and reloaded with `-loadmap <f>`: because it
   is view-independent, a reloaded map re-gathers new camera angles or a new gather radius
   **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
@@ -624,8 +626,8 @@ and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of
 the forward megakernel, **`D`** via its own GPU BDPT megakernel, **`R` (including the
 physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
 reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
-is within the backward-GPU scope — and the **`M` photon map** (direct density query),
-which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s
+is within the backward-GPU scope — and the **`M` photon map** (direct density query
+*and* `-pmfg` final gather), which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s
 backward reference (kept on the CPU as a stable ground truth), remain CPU-only. The
 composite `P` classifies its pixels once, then alternates forward and backward batches
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
@@ -646,9 +648,9 @@ stay non-resumable.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
   (spot/collimated lights; GRIN/rainbow media — mode `R` now runs fog,
-  fluorescence, and constant *and* image-based env lights on the device), for a
-  mode-`M` render that uses a `-pmfg` final gather, and for
-  fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
+  fluorescence, and constant *and* image-based env lights on the device), and for
+  fluorescent/oversized-mix forward scenes (mode `M`'s `-pmfg` final gather now runs
+  on the GPU too). Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous
   `density`-field fog — directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
   **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all

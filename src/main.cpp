@@ -6080,7 +6080,7 @@ static int run(int argc, char** argv) {
         // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
         // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
         // branch; any miss falls through to the per-frame loop below unchanged.
-        if (meterGpu && g_pmFinalGather == 0 && cudaPhotonMapSupported(scene)) {
+        if (meterGpu && cudaPhotonMapSupported(scene)) {
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
                 if (mc.mode != 'M')    allM = false;
@@ -6110,7 +6110,7 @@ static int run(int argc, char** argv) {
                     };
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
                                           diffraction, meterSpp, nullptr, &onFrame,
-                                          nullptr, nullptr, g_heroC);
+                                          nullptr, nullptr, g_heroC, g_pmFinalGather);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -6486,13 +6486,14 @@ static int run(int argc, char** argv) {
             const bool wantAuto = !std::strcmp(device, "auto");
             bool allPinhole = true;
             for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
-            if ((wantGpu || wantAuto) && g_pmFinalGather == 0 && allPinhole &&
+            if ((wantGpu || wantAuto) && allPinhole &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
                 std::printf("[camera] shared photon map (mode M) on %s: %zu cameras, %lld "
-                            "photons, radius %.4g (light=%s) ...\n",
-                            cudaDeviceName(), cams.size(), N, radius, lightLabel);
+                            "photons, radius %.4g (light=%s)%s ...\n",
+                            cudaDeviceName(), cams.size(), N, radius, lightLabel,
+                            g_pmFinalGather > 0 ? " [final gather]" : "");
                 EnergyReport e;
                 // Drive the live window (per the always-`-window` rule): the shared gather
                 // reports each frame's converging film here so the window shows it build up
@@ -6528,7 +6529,8 @@ static int run(int argc, char** argv) {
                                           diffraction, spp,
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
-                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC);
+                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
+                                          g_pmFinalGather);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,

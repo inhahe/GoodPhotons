@@ -120,7 +120,16 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `pX = cie(lambda)·power/pi` with NO area/nEmitted fold (those depend on the current
   per-pixel radius, applied at resolve) — unlike mode M, which folds them in. Validated
   GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background wall 0.3%, per-pixel
-  diff shrinking with passes). Since 0.26.0 it also does
+  diff shrinking with passes). Since 0.33.0 (M4) the mode-M **`-pmfg` Jensen final gather**
+  also runs on the device: `dPhotonGather` gained an `fgRays>0` branch (NEE direct term via
+  `bkNeeLight` + `K` cosine-hemisphere sub-rays), each sub-ray handled by `dPhotonGatherSub`
+  (device twin of `photonGatherSub`) — it follows specular surfaces, then at the first diffuse
+  hit y does a radius density query folding `rho(y)·rho(vis)` per photon wavelength (spectral
+  two-bounce colour bleed), plus env-on-escape / specular-arrival emitters reflected off the
+  visible point. `fgRays` is threaded through `kGather`→`renderPhotonMapSharedCuda` and the
+  `g_pmFinalGather==0` caller gates in `main.cpp` were dropped. Validated GPU==CPU on a Cornell
+  glass-sphere+diffuse-walls box (mean 0.43%, background 0.98%, per-pixel noise √-scaling with
+  spp — unbiased). Since 0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
   `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.

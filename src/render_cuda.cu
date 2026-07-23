@@ -6121,18 +6121,146 @@ kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
     }
 }
 
+// ----------------------- final-gather sub-ray (mode M, -pmfg) ----------------
+// Device twin of photonGatherSub (photonmap_render.h). One INDIRECT gather sub-ray shot from
+// a diffuse visible point (visHit/visMat): it follows specular surfaces (monochromatic at
+// `lambda`) exactly like dPhotonGather and terminates at
+//   * the first diffuse/translucent hit y -> a radius density query at y, each photon
+//     reflected off BOTH y (its material) AND the visible point (visMat) at the photon's
+//     wavelength (spectral two-bounce colour bleed). pX/pY/pZ already fold norm/pi, so the
+//     query needs no extra norm — just rho(y)*rho(vis) per photon;
+//   * a finite EMITTER reached AFTER a specular bounce -> a monochromatic (camera-lambda)
+//     sample reflected off the visible point (a straight hemisphere ray onto a light returns
+//     0: that direct term is supplied by NEE at the visible point, so counting it here would
+//     double-count — the specular-arrival gate mirrors backward.h);
+//   * the ENVIRONMENT on ANY escape -> a monochromatic sample reflected off the visible point.
+// Returns the XYZ radiance leaving the visible point toward the sub-ray origin for this one
+// sampled direction (the caller averages K). Because the sub-ray is cosine-weighted and the
+// visible BRDF is Lambertian, the cosine and 1/pi cancel to rho(vis), folded per photon
+// (diffuse hit) or applied once (specular-arrival emitter/env). Keep in sync with photonGatherSub.
+__device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, int diffraction,
+                                        DVec3 ro, DVec3 rd, Real lambda, double invPdfL,
+                                        const DHit& visHit, const DMaterial& visMat, DRng& rng,
+                                        double& oX, double& oY, double& oZ) {
+    oX = oY = oZ = 0.0;
+    double thr = 1.0;
+    bool specularSeen = false;                           // any specular bounce so far?
+    DMediumStack stk; stk.clear();
+    const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
+    const int maxBounce = 32;
+    for (int b = 0; b < maxBounce; ++b) {
+        DHit h = closestHit(sc, ro, rd);
+        if (h.valid) {                                   // Beer-Lambert in current medium
+            int cm = stk.topMat();
+            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        }
+        if (!h.valid) {                                  // escaped -> environment (direct off vis)
+            if (sc.envIndex >= 0) {
+                double envRad = (sc.env.scale != nullptr)
+                                    ? dEnvRadiance(sc.env, rd, lambda)
+                                    : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+                double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
+                double e = thr * rhoV * envRad * invPdfL;
+                oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
+            }
+            return;
+        }
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return;
+            mp = &sc.mats[child]; matId = child;
+        }
+        const DMaterial& m = *mp;
+
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0) {                                   // emitter
+            if (specularSeen) {                          // specular-direct: NEE can't reach it
+                double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
+                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL;
+                oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
+            }
+            return;                                       // else: direct handled by NEE at vis
+        }
+
+        if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            // Density estimate at y, folding the visible-point reflectance per photon wavelength.
+            float gx = 0.f, gy = 0.f, gz = 0.f;
+            int ix = (int)floor(((double)h.p.x - (double)pm.lo.x) / (double)pm.cellSize);
+            int iy = (int)floor(((double)h.p.y - (double)pm.lo.y) / (double)pm.cellSize);
+            int iz = (int)floor(((double)h.p.z - (double)pm.lo.z) / (double)pm.cellSize);
+            ix = min(max(ix, 0), pm.nx - 1);
+            iy = min(max(iy, 0), pm.ny - 1);
+            iz = min(max(iz, 0), pm.nz - 1);
+            for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= pm.nz) continue;
+              for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= pm.ny) continue;
+                for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= pm.nx) continue;
+                  int c = (cz * pm.ny + cy) * pm.nx + cx;
+                  for (int k = pm.cellStart[c]; k < pm.cellStart[c + 1]; ++k) {
+                      const DGatherPhoton& ph = pm.photons[k];
+                      DVec3 d = h.p - ph.pos;
+                      if (dot(d, d) > r2) continue;
+                      if (dot(ph.n, h.n) < (Real)0.5) continue;
+                      float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                      float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
+                      float w = rhoY * rhoV;
+                      gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
+                  }
+                }}}
+            oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
+            return;
+        }
+
+        switch (m.type) {                                // specular walk (monochromatic)
+            case D_MIRROR: {
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+            case D_GLOSSY: {
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                if (dot(o, h.n) <= 0) return;
+                ro = h.p + h.n * RAY_EPS; rd = o; break;
+            }
+            case D_DIELECTRIC: {
+                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+                ro = nro; rd = nrd; break;
+            }
+            case D_HALFMIRROR: {
+                Real r = clamp01(dReflectSlot(sc, m, h, lambda));
+                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else                   { ro = h.p + rd * RAY_EPS; }
+                break;
+            }
+            case D_FILTER: {
+                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                ro = h.p + rd * RAY_EPS; break;
+            }
+            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); break;
+            }
+        }
+        specularSeen = true;                             // only specular cases reach here
+        if (thr <= 0.0) return;
+    }
+}
+
 // ----------------------- photon-map camera gather (mode M) -------------------
-// Device twin of photonGather (photonmap_render.h, fgRays == 0 path). Follows a camera
-// ray through specular surfaces (monochromatic at the sampled `lambda`); at the first
-// diffuse / translucent hit it estimates reflected radiance by a radius density query
-// into the uploaded photon map, each photon reflected at ITS OWN wavelength so the
-// estimate is built directly in XYZ (returned via oX/oY/oZ). Directly-viewed emitters
-// and the environment (on gather-ray escape) are added as a monochromatic estimate at the
-// sampled lambda. No final gather (gated out by the caller); Beer-Lambert interior
-// absorption is tracked exactly like bkRadiance. Keep in sync with photonGather.
+// Device twin of photonGather (photonmap_render.h). Follows a camera ray through specular
+// surfaces (monochromatic at the sampled `lambda`); at the first diffuse / translucent hit it
+// estimates reflected radiance either by a DIRECT radius density query into the uploaded
+// photon map (fgRays == 0; each photon reflected at ITS OWN wavelength so the estimate is
+// built directly in XYZ) or, when final gather is enabled (fgRays > 0 on a Diffuse visible
+// point), by NEE direct lighting (bkNeeLight) plus K cosine-hemisphere gather sub-rays one
+// bounce into the map (dPhotonGatherSub). Directly-viewed emitters and the environment (on
+// gather-ray escape) are added as a monochromatic estimate at the sampled lambda. Beer-Lambert
+// interior absorption is tracked exactly like bkRadiance. Keep in sync with photonGather.
 __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int diffraction,
                                      DVec3 ro, DVec3 rd, Real lambda, double invPdfL, DRng& rng,
-                                     double& oX, double& oY, double& oZ) {
+                                     int fgRays, double& oX, double& oY, double& oZ) {
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
@@ -6184,6 +6312,32 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            if (fgRays > 0 && m.type == D_DIFFUSE) {
+                // Jensen final gather (device twin of photonGather's fgRays branch): decouples
+                // the directly-seen surface's sharpness from the gather radius by moving the
+                // density-estimate blur one bounce away (to y, inside dPhotonGatherSub).
+                //   (a) DIRECT lighting from finite emitters via low-variance NEE (bkNeeLight).
+                double rhoVis = (double)clamp01(dDiffuseRho(sc, m, h, lambda));
+                double direct = bkNeeLight(sc, h, (Real)rhoVis, invPdfL, lambda, rng);
+                double dcie = thr * direct;
+                oX += (double)cieX(lambda) * dcie;
+                oY += (double)cieY(lambda) * dcie;
+                oZ += (double)cieZ(lambda) * dcie;
+                //   (b) INDIRECT (+ env + specular-direct) via K cosine-weighted hemisphere
+                //       sub-rays, each querying the map ONE bounce away; the cosine/pdf and
+                //       Lambertian 1/pi cancel to rho(vis), folded inside dPhotonGatherSub.
+                double fx = 0.0, fy = 0.0, fz = 0.0;
+                for (int k = 0; k < fgRays; ++k) {
+                    DVec3 gro = h.p + h.n * RAY_EPS;
+                    DVec3 grd = cosineHemisphere(h.n, rng);
+                    double sx, sy, sz;
+                    dPhotonGatherSub(sc, pm, diffraction, gro, grd, lambda, invPdfL, h, m, rng, sx, sy, sz);
+                    fx += sx; fy += sy; fz += sz;
+                }
+                double inv = thr / (double)fgRays;
+                oX += fx * inv; oY += fy * inv; oZ += fz * inv;
+                return;
+            }
             // Radius density estimate at the visible point, accumulated in XYZ (each photon
             // folded at its own wavelength): L_r = (1/N) sum_p rho(l_p)/pi * Phi_p / (pi r^2).
             // Everything but rho(l_p) is baked into the record's pX/pY/pZ (see DGatherPhoton),
@@ -6256,7 +6410,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 // gather already returns XYZ, so (unlike kBackward) no cie(lambda) multiply is applied.
 __global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, double* hits,
                         long long totalSamples, long long chunkSpp, long long sppTotal,
-                        long long sampleBase, int resX, int diffraction,
+                        long long sampleBase, int resX, int diffraction, int fgRays,
                         unsigned long long seedBase) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -6277,7 +6431,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DCamera cam, double* film, dou
         dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
 
         double oX, oY, oZ;
-        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, oX, oY, oZ);
+        dPhotonGather(sc, pm, diffraction, ro, rd, lambda, invPdfL, rng, fgRays, oX, oY, oZ);
         size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], oX);
         atomicAdd(&film[o + 1], oY);
@@ -8219,7 +8373,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             bool diffraction, long long spp,
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
-                                            const char* mapLoad, const char* mapSave, int heroC) {
+                                            const char* mapLoad, const char* mapSave, int heroC,
+                                            int fgRays) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -8412,7 +8567,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             long long cs2 = (base + chunk <= spp) ? chunk : (spp - base);
             long long total = (long long)npix * cs2;
             kGather<<<2048, 128>>>(up.sc, dpm, hc, d_film, d_hits, total, cs2, spp, base,
-                                   resX[c], diffraction ? 1 : 0, seed);
+                                   resX[c], diffraction ? 1 : 0, fgRays, seed);
             cudaCheckKernel("photon-gather");
             // Live view: after a chunk, hand the host the frame-so-far so it can refresh the
             // window/preview. Throttle to ~10 Hz (a high-res gather chunks one spp at a time,
