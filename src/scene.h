@@ -302,6 +302,47 @@ struct Medium {
     // its peak value seeds densityMax. Takes precedence over the `density` formula.
     std::shared_ptr<VdbGrid> vdb;
 
+    // --- Optional volumetric blackbody EMISSION (fire) ----------------------
+    // When `temperature` is set (a second imported grid giving T in Kelvin per
+    // voxel, e.g. the "temperature" grid of a multi-grid fire `.vdb`), the medium
+    // EMITS thermal radiation: the local emission SOURCE radiance is
+    //   L_e(x,λ) = emissionScale · blackbodyEmissionRadiance(T(x), λ)
+    // added to the volume rendering equation as the emission term σ_a·L_e
+    // (Kirchhoff's law: the same soot that absorbs also radiates), so hot dense
+    // regions glow. This turns an imported fire `.vdb` into a self-illuminating
+    // volumetric emitter. Null `temperature` => no emission (unchanged media).
+    // Imported temperature grids typically store RELATIVE temperature in arbitrary
+    // units (e.g. this OpenVDB fire sample peaks at ~46, not ~1500 K), so we map the
+    // raw grid value to a physical Kelvin by peak-normalising: T(x) =
+    // emitKelvin · grid(x)/tempPeak. `emitKelvin` (grammar `emission_kelvin`) is the
+    // temperature of the HOTTEST voxel (default 1500 K — a yellow flame); cooler
+    // voxels scale down linearly (redder + dimmer, Wien + Stefan-Boltzmann). This is
+    // robust to whatever units the grid was authored in. `tempPeak` is the grid's raw
+    // maxVal, captured at load.
+    std::shared_ptr<VdbGrid> temperature;   // raw relative temperature grid (0 => cold)
+    double tempPeak    = 1.0;               // raw grid peak (for peak-normalisation)
+    double emitKelvin  = 1500.0;            // Kelvin of the hottest voxel
+    double emissionScale = 1.0;             // brightness multiplier on the Planck term
+
+    bool emissive() const { return (bool)temperature; }
+
+    // Physical temperature (Kelvin) at a world point; 0 outside the grid / cold.
+    double temperatureAt(const Vec3& p) const {
+        if (!temperature) return 0.0;
+        double raw = temperature->sample(p);
+        if (raw <= 0.0) return 0.0;
+        return emitKelvin * (raw / (tempPeak > 0.0 ? tempPeak : 1.0));
+    }
+    // Volumetric emission SOURCE radiance L_e(x,λ) (>= 0). This is the emitted
+    // radiance BEFORE the σ_a weighting of the RTE emission term; callers that
+    // want the full emission coefficient multiply by the local σ_a(x,λ).
+    double emissionAt(const Vec3& p, double lambda) const {
+        double T = temperatureAt(p);
+        if (T <= 0.0) return 0.0;
+        double Le = emissionScale * blackbodyEmissionRadiance(T, lambda);
+        return Le > 0.0 ? Le : 0.0;
+    }
+
     // --- Optional spatial bound (localized / per-object fog) ----------------
     // When `bounded`, the medium exists only inside a region: an axis-aligned box
     // [bmin,bmax] (`boundShape == Box`) or a sphere centered `bcenter` radius

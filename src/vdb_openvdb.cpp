@@ -31,6 +31,7 @@ extern "C" {
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include <memory>
 #include <string>
 #include <vector>
@@ -407,7 +408,21 @@ void readTransform(Cursor& c, double A[9], double T[3]) {
 
 }  // namespace
 
-bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err) {
+bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err,
+                     const std::string& wantName) {
+    // OpenVDB "unique names" append a record-separator (0x1e) + instance index to
+    // disambiguate duplicates; strip it to recover the authored grid name, and
+    // compare case-insensitively so `temperature`/`Temperature` both match.
+    auto baseName = [](std::string s) {
+        auto rs = s.find('\x1e'); if (rs != std::string::npos) s.resize(rs);
+        return s;
+    };
+    auto iequals = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+        return true;
+    };
     // Slurp the whole file (samples are a few MB; guarded against huge inputs).
     FILE* fp = std::fopen(path.c_str(), "rb");
     if (!fp) { err = "cannot open '" + path + "'"; return false; }
@@ -437,11 +452,12 @@ bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err) {
         if (fileVer < V_NODE_MASK_COMPRESSION)
             fail("legacy .vdb (pre-5.0) not supported — re-export with a modern OpenVDB");
 
-        // We bake the first float grid; scan descriptors for one whose type is a
-        // float tree (Tree_float_5_4_3 [+_HalfFloat]).
+        // Bake the requested float grid (or the first, when wantName is empty);
+        // scan descriptors for one whose type is a float tree (Tree_float_5_4_3
+        // [+_HalfFloat]) and, if a name was requested, whose name matches.
         for (uint32_t gi = 0; gi < gridCount; ++gi) {
-            (void)c.str();                        // unique name
-            std::string gtype = c.str();          // grid type
+            std::string gname = baseName(c.str());  // unique name (RS-suffix stripped)
+            std::string gtype = c.str();            // grid type
             bool fromHalf = false;
             const std::string half = "_HalfFloat";
             if (gtype.size() > half.size() &&
@@ -452,10 +468,25 @@ bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err) {
             if (fileVer >= V_GRID_INSTANCING) (void)c.str();   // instance parent
             int64_t gridPos = c.i64(); (void)c.i64(); int64_t endPos = c.i64();
 
+            // The grid descriptors are NOT contiguous in the stream: OpenVDB's writer
+            // lays out {descriptor, grid body} per grid, so the NEXT descriptor begins
+            // at THIS grid's endPos, not immediately after these offsets. When we skip a
+            // grid (name mismatch or non-float) we must therefore seek the cursor to
+            // endPos before reading the following descriptor, or it reads garbage.
+            // Name filter: when a specific grid is requested, skip the others.
+            if (!wantName.empty() && !iequals(gname, wantName)) {
+                if (gi + 1 == gridCount)
+                    fail("grid '" + wantName + "' not found in '" + path + "'");
+                c.p = (size_t)endPos;
+                continue;
+            }
             if (gtype != "Tree_float_5_4_3") {
+                if (!wantName.empty())
+                    fail("grid '" + wantName + "' is not a float grid (type '" + gtype + "')");
                 if (gi + 1 == gridCount)
                     fail("no float grid found (last grid type '" + gtype +
                          "'); only Tree_float_5_4_3 is supported");
+                c.p = (size_t)endPos;
                 continue;   // skip non-float grid, try the next descriptor
             }
 

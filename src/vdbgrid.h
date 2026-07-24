@@ -165,16 +165,23 @@ struct VdbGrid {
     }
 };
 
-// Load a sparse volume file, bake its first float grid into `out`. Dispatches on
-// the file's magic: a native OpenVDB `.vdb` (magic "VDB ") is parsed by
+// Load a sparse volume file, bake a float grid into `out`. Dispatches on the
+// file's magic: a native OpenVDB `.vdb` (magic "VDB ") is parsed by
 // loadOpenVDBGrid (vdb_openvdb.cpp, no NanoVDB), otherwise it is treated as an
 // (uncompressed) NanoVDB `.nvdb` and baked in vdbgrid.cpp (the only TU that
-// includes NanoVDB.h). Returns false and fills `err` on failure.
-bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err);
+// includes NanoVDB.h). When `wantName` is empty the FIRST float grid is baked
+// (density); otherwise the float grid whose name matches `wantName`
+// (case-insensitive) is selected — used to pull the "temperature" grid out of a
+// multi-grid fire `.vdb` alongside its "density" grid. Returns false and fills
+// `err` on failure (including a clear message when a requested grid is absent).
+bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err,
+                 const std::string& wantName = "");
 
 // Native OpenVDB `.vdb` reader (vdb_openvdb.cpp): parses the file container, tree
 // topology and BLOSC/ACTIVE_MASK/HalfFloat leaf buffers by hand (vendored LZ4 for
-// blosc's LZ4 codec) and bakes the first float grid into a dense VdbGrid. No
-// OpenVDB/NanoVDB dependency. Returns false and fills `err` on failure (including
-// a clear "re-export with LZ4" message for the unsupported blosc codecs).
-bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err);
+// blosc's LZ4 codec) and bakes a float grid into a dense VdbGrid. No
+// OpenVDB/NanoVDB dependency. `wantName` selects a named grid (empty => first
+// float grid). Returns false and fills `err` on failure (including a clear
+// "re-export with LZ4" message for the unsupported blosc codecs).
+bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err,
+                     const std::string& wantName = "");

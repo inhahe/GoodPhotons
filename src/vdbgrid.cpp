@@ -74,7 +74,8 @@ bool invert3x3(const double m[9], double out[9]) {
 
 } // namespace
 
-bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
+bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err,
+                 const std::string& wantName) {
     FILE* fp = std::fopen(path.c_str(), "rb");
     if (!fp) { err = "cannot open '" + path + "'"; return false; }
 
@@ -86,7 +87,7 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
         if (std::fread(&magic, 1, 8, fp) == 8 &&
             (magic & 0xFFFFFFFFull) == 0x56444220ull) {
             std::fclose(fp);
-            return loadOpenVDBGrid(path, out, err);
+            return loadOpenVDBGrid(path, out, err, wantName);
         }
         std::fseek(fp, 0, SEEK_SET);
     }
@@ -130,16 +131,44 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
         if (head.gridCount == 0) {
             std::fclose(fp); err = "no grids in '" + path + "'"; return false;
         }
-        nanovdb::io::FileMetaData meta{};
-        if (std::fread(&meta, 1, sizeof(meta), fp) != sizeof(meta)) {
-            std::fclose(fp); err = "truncated grid metadata: '" + path + "'"; return false;
+        // Walk the grids: take the first when wantName is empty, else the one whose
+        // name matches (case-insensitive), skipping the others' bodies.
+        auto iequalsAscii = [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+            return true;
+        };
+        bool found = false;
+        for (uint32_t gi = 0; gi < head.gridCount && !found; ++gi) {
+            nanovdb::io::FileMetaData meta{};
+            if (std::fread(&meta, 1, sizeof(meta), fp) != sizeof(meta)) {
+                std::fclose(fp); err = "truncated grid metadata: '" + path + "'"; return false;
+            }
+            std::string gname;
+            if (meta.nameSize) {
+                gname.resize(meta.nameSize);
+                if (std::fread(&gname[0], 1, (size_t)meta.nameSize, fp) != (size_t)meta.nameSize) {
+                    std::fclose(fp); err = "truncated grid name: '" + path + "'"; return false;
+                }
+                while (!gname.empty() && gname.back() == '\0') gname.pop_back();
+            }
+            if (!wantName.empty() && !iequalsAscii(gname, wantName)) {
+                std::fseek(fp, (long)meta.gridSize, SEEK_CUR);   // skip this grid body
+                continue;
+            }
+            gridSize = meta.gridSize;
+            gridMem = alignedAlloc((size_t)gridSize);
+            if (!gridMem || std::fread(gridMem, 1, (size_t)gridSize, fp) != gridSize) {
+                if (gridMem) alignedFree(gridMem);
+                std::fclose(fp); err = "truncated grid data: '" + path + "'"; return false;
+            }
+            found = true;
         }
-        if (meta.nameSize) std::fseek(fp, (long)meta.nameSize, SEEK_CUR);
-        gridSize = meta.gridSize;
-        gridMem = alignedAlloc((size_t)gridSize);
-        if (!gridMem || std::fread(gridMem, 1, (size_t)gridSize, fp) != gridSize) {
-            if (gridMem) alignedFree(gridMem);
-            std::fclose(fp); err = "truncated grid data: '" + path + "'"; return false;
+        if (!found) {
+            std::fclose(fp);
+            err = "grid '" + wantName + "' not found in '" + path + "'";
+            return false;
         }
     }
     std::fclose(fp);

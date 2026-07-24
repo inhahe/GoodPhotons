@@ -3224,6 +3224,11 @@ private:
                         fail("medium density: " + verr); return false;
                     }
                     med.vdb = grid;
+                    std::fprintf(stderr,
+                        "[vdb] density '%s': %dx%dx%d, world AABB [%.3g %.3g %.3g]..[%.3g %.3g %.3g], peak %.4g\n",
+                        path.c_str(), grid->nx, grid->ny, grid->nz,
+                        grid->wmin.x, grid->wmin.y, grid->wmin.z,
+                        grid->wmax.x, grid->wmax.y, grid->wmax.z, (double)grid->maxVal);
                     // Seed the bound from the grid's world AABB unless one is authored.
                     if (!med.bounded) {
                         med.bounded = true;
@@ -3234,9 +3239,10 @@ private:
                     double dmax = dblOf(b, "density_max", 0.0);
                     med.densityMax = (dmax > 0.0) ? dmax
                                                   : std::max(1e-6, (double)grid->maxVal * 1.05);
-                    L.scene.media.push_back(std::move(med));
-                    return true;
-                }
+                    // NOTE: fall through (no early return) so a `temperature vdb:` /
+                    // `emission` block below can add volumetric blackbody emission to
+                    // this same imported volume (fire).
+                } else {
                 std::vector<PatNode> prog;
                 if (w0.rfind("pattern:", 0) == 0) {
                     std::string nm = w0.substr(8);
@@ -3281,8 +3287,67 @@ private:
                     dmax = 1.3 * peak;
                 }
                 med.densityMax = (dmax > 0.0) ? dmax : 1.0;
+                }   // end else (formula density)
             }
         }
+
+        // ---- Optional volumetric blackbody EMISSION (fire) -----------------------
+        // `temperature vdb:"fire.vdb"` (or `vdb:fire.vdb`) imports a second grid
+        // giving per-voxel temperature in Kelvin; combined with `emission blackbody`
+        // it makes the medium a self-illuminating volumetric emitter (hot voxels
+        // glow, Planck-shaped by their temperature). `emission_scale <v>` scales the
+        // glow (default 1). A fire `.vdb` typically carries both a "density" and a
+        // "temperature" float grid, so the usual authoring is:
+        //     medium { density vdb:fire.vdb  temperature vdb:fire.vdb
+        //              emission blackbody  emission_scale 2.0 }
+        // where each `vdb:` selects the like-named grid out of the multi-grid file.
+        if (const Stmt* ts = find(b, "temperature")) {
+            if (ts->val.words.empty()) { fail("medium `temperature` needs a `vdb:<file>`"); return false; }
+            const std::string& w0 = ts->val.words[0];
+            if (!(w0 == "vdb:" || w0.rfind("vdb:", 0) == 0)) {
+                fail("medium `temperature` only supports an imported grid: `temperature vdb:<file>`");
+                return false;
+            }
+            std::string path = (w0 == "vdb:")
+                ? (ts->val.words.size() > 1 ? ts->val.words[1] : std::string())
+                : w0.substr(4);
+            if (path.empty()) { fail("medium `temperature vdb:` needs a file path"); return false; }
+            auto tgrid = std::make_shared<VdbGrid>();
+            std::string verr;
+            // Select the "temperature" grid by name out of the (possibly multi-grid) file.
+            if (!loadVdbGrid(path, *tgrid, verr, "temperature")) {
+                fail("medium temperature: " + verr); return false;
+            }
+            med.temperature = tgrid;
+            med.tempPeak = std::max(1e-6, (double)tgrid->maxVal);
+            std::fprintf(stderr,
+                "[vdb] temperature '%s': %dx%dx%d, world AABB [%.3g %.3g %.3g]..[%.3g %.3g %.3g], peak %.4gK\n",
+                path.c_str(), tgrid->nx, tgrid->ny, tgrid->nz,
+                tgrid->wmin.x, tgrid->wmin.y, tgrid->wmin.z,
+                tgrid->wmax.x, tgrid->wmax.y, tgrid->wmax.z, (double)tgrid->maxVal);
+            // If nothing else seeded the medium's bound, use the temperature grid's AABB.
+            if (!med.bounded) {
+                med.bounded = true;
+                med.boundShape = MediumBound::Box;
+                med.bmin = tgrid->wmin;
+                med.bmax = tgrid->wmax;
+            }
+        }
+        // `emission blackbody` (the only model today) turns emission on; it is also
+        // implied whenever a `temperature` grid is present. `emission_scale` tunes it.
+        if (const Stmt* es = find(b, "emission")) {
+            std::string kind = es->val.words.empty() ? std::string("blackbody") : es->val.words[0];
+            if (kind != "blackbody") {
+                fail("medium `emission " + kind + "` is not a known emission model (use `blackbody`)");
+                return false;
+            }
+            if (!med.temperature) {
+                fail("medium `emission blackbody` needs a `temperature vdb:<file>` grid to emit from");
+                return false;
+            }
+        }
+        med.emissionScale = dblOf(b, "emission_scale", med.emissionScale);
+        med.emitKelvin    = dblOf(b, "emission_kelvin", med.emitKelvin);
 
         // ---- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
         // `ior pattern:<name>` (a named pattern) or `ior "<expr>"` (inline infix
