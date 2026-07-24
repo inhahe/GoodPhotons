@@ -2037,7 +2037,34 @@ private:
             m.emit = spectrumParam(b, "emit", constantSpectrum(0.0));
             m.isLight = true;
         }
+        // Tangent-space NORMAL MAP (C6): `normal_map texture:<name> [strength <s>]`.
+        // Common to every material type. Binds a declared (linear-encoded) texture as
+        // the material's normal map and reads an optional perturbation strength (default
+        // 1). The shading normal is perturbed at closestHit via the surface TBN frame.
+        bindNormalTexture(b, m, L);
         return m;
+    }
+
+    // Bind a `normal_map texture:<name> [strength <s>]` on a material (C6). The value
+    // must reference a declared texture (loaded `encoding linear` — a normal map is raw
+    // vector data, not colour). Sets m.normalTex + m.normalStrength; warns if the map is
+    // not linear-encoded (a common authoring mistake that de-gammas the vectors). The
+    // optional `strength <s>` is a trailing token of the same statement.
+    void bindNormalTexture(const Block& b, Material& m, Loaded& L) {
+        const Stmt* s = find(b, "normal_map");
+        if (!s || s->val.words.empty()) return;
+        const std::string& w0 = s->val.words[0];
+        std::string nm = (w0.rfind("texture:", 0) == 0) ? w0.substr(8) : w0;  // bare name tolerated
+        auto it = textureIndex_.find(nm);
+        if (it == textureIndex_.end()) { fail("normal_map references unknown texture '" + nm + "'"); return; }
+        m.normalTex = it->second;
+        if (it->second >= 0 && it->second < (int)L.scene.textures.size() &&
+            L.scene.textures[it->second].encoding != TexEncoding::Linear)
+            std::fprintf(stderr, "[ftsl] warning: normal_map texture '%s' is not "
+                         "'encoding linear' — normal vectors will be de-gammaed\n", nm.c_str());
+        // Optional trailing `strength <s>` token on the normal_map statement.
+        for (size_t i = 1; i + 1 < s->val.words.size(); ++i)
+            if (s->val.words[i] == "strength") m.normalStrength = num(s->val.words[i + 1]);
     }
 
     // Second material pass: resolve a Mix material's `layer "name" weight` entries

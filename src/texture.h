@@ -124,6 +124,20 @@ struct Texture {
         return (c.x + c.y + c.z) * (1.0 / 3.0);
     }
 
+    // Tangent-space normal at (u,v) for normal mapping (C6). The image stores an
+    // encoded normal: RGB in [0,1] maps to a vector in [-1,1]^3 (the usual
+    // n = 2*c - 1). Normal maps carry raw vector data, so the texture MUST be loaded
+    // `encoding linear` (no sRGB de-gamma) — then `rgb` already holds the [0,1]
+    // components and we just remap+normalize. Returned in tangent space (x=U, y=V,
+    // z=surface normal); the caller rotates it into world via the TBN frame. Mirrored
+    // on the GPU by dTexNormalAt.
+    Vec3 sampleNormalTS(double u, double v) const {
+        Vec3 c = sampleRgb(u, v);
+        Vec3 n{2.0 * c.x - 1.0, 2.0 * c.y - 1.0, 2.0 * c.z - 1.0};
+        double l = std::sqrt(dot(n, n));
+        return (l > 1e-12) ? n * (1.0 / l) : Vec3{0, 0, 1};
+    }
+
     // Reflectance at (u,v,lambda): bilerp the JH coefficients (the standard
     // Jakob-Hanika interpolation) then evaluate the sigmoid. Requires buildReflCoeff().
     // Nearest-index palette lookup: the red channel (already LINEAR, 0..1) is the

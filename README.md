@@ -1528,6 +1528,19 @@ spectra, looked up nearest (CPU only; GPU falls back). A 2-child `mix` can take 
 **blend mask** (`weight_map texture:<name>`) that selects child 0 vs child 1 per hit.
 A scalar map on `ior` remains future work.
 
+Any material can also carry a **tangent-space normal map** — `normal_map
+texture:<name> strength <s>` — that perturbs the shading normal per hit without adding
+geometry, so a flat surface picks up per-texel highlights and self-shadowing. The map
+must be declared `encoding linear` (it stores raw XYZ vectors, not sRGB colour; the
+loader warns if it isn't). Per-triangle tangents are derived from the UV gradients
+(with a stored handedness sign), the sampled `[0,1]` texel is remapped to a
+`[-1,1]` vector, rotated through the surface TBN frame, and blended toward the
+geometric normal by `strength` (1.0 = full). Tangents follow mesh instances, and the
+perturbed normal is applied at the single intersection choke point so **every**
+renderer — backward, forward, BDPT, VCM, SPPM, photon-map — and both the CPU and GPU
+paths shade identically. See `scraps/ripple_test.ftsl` (a flat wall reading as
+corrugated under grazing light).
+
 A texture's albedo can also be **procedural in UV space**: in place of `file`, give
 three quoted ftsl expressions of the surface UV — `rgb "r(u,v)" "g(u,v)" "b(u,v)"`
 (the pattern infix grammar; variables `u v`, constant `pi`; each output clamped to

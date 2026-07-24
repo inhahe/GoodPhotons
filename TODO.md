@@ -757,7 +757,22 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       both backends with matching results (overall/torus/red-wall/green-wall means agree
       to <1%). glTF/GLB meshes that import their own materials are not auto-lit (bind an
       FTSL `emit` material) — noted in known-issues.
-- [ ] **C6 Mesh: tangent-space normal maps.**
+- [x] **C6 Mesh: tangent-space normal maps.**  **DONE 2026-07-24**.
+      A material may bind a normal-map texture (`normal_map texture:<name> strength <s>`); at every hit
+      the shading normal is perturbed by the tangent-space normal sampled from the map, rotated through
+      the surface TBN frame. Per-triangle tangents are built in `Tri::finalize()` via Lengyel's UV-gradient
+      method (Gram-Schmidt against the geometric normal + a stored `bitangentSign` for handedness); the
+      sphere path derives a longitude tangent. The perturbation is applied at the single CPU intersection
+      choke point (`Scene::applyNormalMap`, called from both `closestHit` and `closestHitLinear`) so ALL
+      CPU renderers (backward/forward/bdpt/vcm/sppm/photonmap/grin) get it for free, and at the matching
+      GPU choke point (`dApplyNormalMap` in `closestHit`). Tangents transform with instances
+      (`instanceHitToWorld` on both paths; the device uploads a per-instance `Wm` = toWorld linear).
+      Normal maps must be declared `encoding linear` (raw vector data, not sRGB colour) — the loader warns
+      otherwise. The device uploads the raw RGB only for textures actually used as normal maps
+      (`usedAsNormal` pass) to save memory. **Validated:** `scraps/ripple_test.ftsl` (a flat wall quad
+      textured with a strong horizontal-corrugation normal map under a grazing area light) renders clear
+      vertical light/dark banding; CPU and GPU outputs are numerically identical (col-profile std 6.11 vs
+      6.10, row std 3.43 vs 3.43, mean 7.888 vs 7.891) — proving the two paths perturb shading identically.
 - [x] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.  **DONE 2026-07-18**.
       Replaced Möller–Trumbore with the Woop/Benthin/Wald/Áfra watertight test (JCGT 2013) on BOTH the
       CPU double path (`src/geometry.h`) and the GPU float path (`src/render_cuda.cu`). Per-ray the test

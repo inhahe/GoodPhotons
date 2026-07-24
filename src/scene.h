@@ -83,6 +83,13 @@ struct Material {
     // the interpolated per-vertex UVs (no triplanar for scalar params yet).
     int roughnessTex = -1;
     int filmThicknessTex = -1;
+    // Tangent-space NORMAL MAP (C6): index into Scene::textures, or -1. When set, the
+    // shading normal at a hit is perturbed by the texel's tangent-space normal rotated
+    // through the surface TBN frame (see Scene::closestHit). `normalStrength` scales the
+    // tangential (x,y) perturbation — 0 disables, 1 is the authored map, >1 exaggerates.
+    // The bound texture must be `encoding linear` (a normal map is raw vector data).
+    int normalTex = -1;
+    double normalStrength = 1.0;
     // Procedural (math-driven) scalar drives (§4): index into Scene::patterns, or -1.
     // A bound pattern is evaluated at the hit point (x,y,z,f,normal,r) and OVERRIDES
     // the constant/texture value — this is how implicit surfaces (which carry no UVs)
@@ -1117,7 +1124,38 @@ struct Scene {
         Vec3 wng = normalize(inst.toWorld.applyNormal(lh.ng));
         lh.ng = wng;
         lh.n  = (dot(r.d, wn) < 0.0) ? wn : -wn;
+        // Map the surface tangent through the instance transform too (C6 normal maps
+        // on instanced meshes). The tangent is a direction, so it uses applyDir (not
+        // applyNormal); handedness (bitangentSign) is preserved for proper transforms.
+        Vec3 wt = inst.toWorld.applyDir(lh.tangent);
+        double wtl = std::sqrt(dot(wt, wt));
+        if (wtl > 1e-12) lh.tangent = wt * (1.0 / wtl);
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
+    }
+
+    // Perturb the shading normal by a bound tangent-space normal map (C6). Builds a
+    // TBN frame from the (ray-oriented) shading normal and the hit's surface tangent,
+    // rotates the sampled tangent-space normal into world, and replaces h.n. A no-op
+    // unless the hit's material carries a valid normalTex. Applied at the single
+    // closestHit choke point so every CPU renderer (backward, forward, BDPT, VCM,
+    // SPPM, photon map, GRIN) sees the perturbed normal identically.
+    void applyNormalMap(Hit& h) const {
+        if (!h.valid || h.matId < 0 || h.matId >= (int)mats.size()) return;
+        const Material& m = mats[h.matId];
+        if (m.normalTex < 0 || m.normalTex >= (int)textures.size()) return;
+        const Texture& tx = textures[m.normalTex];
+        if (!tx.valid()) return;
+        Vec3 tn = tx.sampleNormalTS(h.u, h.v);          // tangent-space normal
+        Vec3 N = h.n;                                   // oriented against the ray
+        Vec3 T = h.tangent - N * dot(N, h.tangent);     // re-orthogonalize per-hit
+        double tl = std::sqrt(dot(T, T));
+        if (tl < 1e-9) return;                          // degenerate frame: leave n as-is
+        T = T * (1.0 / tl);
+        Vec3 B = cross(N, T) * h.bitangentSign;
+        double s = m.normalStrength;
+        Vec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
+        double pl = std::sqrt(dot(pert, pert));
+        if (pl > 1e-12) h.n = pert * (1.0 / pl);
     }
 
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr) const {
@@ -1141,6 +1179,7 @@ struct Scene {
                 }
             }
         }, stats);
+        applyNormalMap(h);
         return h;
     }
 
@@ -1182,6 +1221,7 @@ struct Scene {
                 h = lh;
             }
         }
+        applyNormalMap(h);
         return h;
     }
 };

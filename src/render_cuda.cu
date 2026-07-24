@@ -244,6 +244,8 @@ struct DTexture {
     const double* coeff;   // 3*w*h Jakob-Hanika coefficients (albedo maps)
     const double* gray;    // w*h per-texel grayscale (mean linear RGB) for scalar maps
                            // (roughness/film-thickness, §9.4) — dTexScalarAt twin
+    const double* rgb;     // 3*w*h linear RGB, uploaded only for NORMAL-MAP textures
+                           // (C6) — dTexNormalAt twin (needs true vector direction)
 };
 
 struct DMaterial {
@@ -277,6 +279,13 @@ struct DMaterial {
     // BDPT kernel (M9: the per-hit point is threaded into dMatRoughness/dMatFilmThickness).
     int    roughnessTex;
     int    filmThicknessTex;
+    // Tangent-space NORMAL MAP (C6), device twin of Material::normalTex/normalStrength.
+    // >=0 => at a hit, perturb the shading normal by the texel's tangent-space normal
+    // (dTexNormalAt) rotated through the surface TBN frame; -1 => geometry normal.
+    // normalStrength scales the tangential perturbation. Applied in the device
+    // closestHit (dApplyNormalMap) so every GPU path sees it consistently.
+    int    normalTex;
+    double normalStrength;
     // Fluorescence (D_FLUORESCENT): fluoAbsorb is the baked excitation probability
     // epsilon(lambda); the dye re-radiates (quantum yield fluoYield) at a Stokes-
     // shifted lambda' drawn from the emission-SPD CDF slice [fluoCdfOffset,
@@ -388,7 +397,8 @@ struct DMediumStack {
     }
 };
 
-struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId; };
+struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
+                 DVec3 tangent; double bitangentSign; };  // C6 tangent frame for normal mapping
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
@@ -406,6 +416,9 @@ struct DInstance {
     // shading/geometric normal local -> world = (toWorld linear)^-T = transpose of
     // toWorld.inverse().m — precomputed on the host so the device does no inverse.
     double Nm[9];
+    // toWorld linear part (local -> world for plain DIRECTIONS): transforms the surface
+    // tangent for normal mapping on instanced meshes (C6). affDir(Wm, tangent).
+    double Wm[9];
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
 };
@@ -1451,6 +1464,7 @@ struct DHit {
     DVec3 p, n, ng;
     int matId, sensorId;
     Real u, v;   // interpolated surface texture coordinates
+    DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -1880,6 +1894,8 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     Real nl = dot(ns, ns);
     ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
     hit.n = (dot(rd, ns) < 0) ? ns : -ns;
+    hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
+    hit.bitangentSign = (Real)tri.bitangentSign;
     return true;
 }
 // Interface-preserving wrapper (builds the shear inline) for any one-off caller.
@@ -1906,6 +1922,11 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     Real ny = ng.y < (Real)-1 ? (Real)-1 : (ng.y > (Real)1 ? (Real)1 : ng.y);
     hit.u = (Real)0.5 + atan2(ng.z, ng.x) / (Real)(2.0 * DPI);
     hit.v = (Real)0.5 - asin(ny) / (Real)DPI;
+    // Longitude (east) tangent d/du, mirroring the host sphere path (C6).
+    DVec3 tg{-ng.z, (Real)0, ng.x};
+    Real tgl = sqrt(dot(tg, tg));
+    hit.tangent = (tgl > (Real)1e-9) ? tg * ((Real)1 / tgl) : DVec3{(Real)1, (Real)0, (Real)0};
+    hit.bitangentSign = (Real)1;
     return true;
 }
 __device__ static bool boxHit(const DNode& nd, const DVec3& ro, const DVec3& invD,
@@ -2028,6 +2049,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
     DVec3 wng = normalize(affDir(inst.Nm, lh.ng));
     lh.ng = wng;
     lh.n  = (dot(rd, wn) < 0) ? wn : -wn;
+    // Map the surface tangent through the instance's toWorld linear part (C6).
+    DVec3 wt = affDir(inst.Wm, lh.tangent);
+    Real wtl = sqrt(dot(wt, wt));
+    if (wtl > (Real)1e-12) lh.tangent = wt * ((Real)1 / wtl);
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
 
@@ -2036,6 +2061,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
 // only cares about "anything within d?" skips nearly the whole tree). Default BIG keeps
 // every existing call site's behaviour bit-identical. Used by dGrinMarch, whose per-step
 // query only consumes hits within one Eikonal step length.
+// Forward decl: the tangent-space normal-map perturbation (C6) is defined below with the
+// texture samplers (which depend on dWrapIndex), but is called from closestHit's tail.
+__device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
+
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_EPS, Real tCap = BIG) {
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
@@ -2084,6 +2113,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
             else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
+    dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
 }
 
@@ -3236,6 +3266,57 @@ __device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
     double a = tx.gray[(size_t)y0 * tx.w + x0] * (1 - fx) + tx.gray[(size_t)y0 * tx.w + x1] * fx;
     double b = tx.gray[(size_t)y1 * tx.w + x0] * (1 - fx) + tx.gray[(size_t)y1 * tx.w + x1] * fx;
     return a * (1 - fy) + b * fy;
+}
+
+// Tangent-space normal at (u,v) — device twin of Texture::sampleNormalTS (C6). Bilerps
+// the linear RGB, remaps [0,1]->[-1,1], normalizes. v flipped so v=0 is image bottom.
+__device__ static DVec3 dTexNormalAt(const DTexture& tx, Real u, Real v) {
+    if (!tx.rgb) return DVec3{(Real)0, (Real)0, (Real)1};
+    auto texel = [&](int x, int y) -> DVec3 {
+        size_t o = ((size_t)y * tx.w + x) * 3;
+        return DVec3{(Real)tx.rgb[o], (Real)tx.rgb[o + 1], (Real)tx.rgb[o + 2]};
+    };
+    DVec3 c;
+    if (tx.filter == 0) {   // Nearest
+        int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
+        int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
+        c = texel(x, y);
+    } else {
+        double tu = (double)u * tx.w - 0.5, tv = (1.0 - (double)v) * tx.h - 0.5;
+        double flx = floor(tu), fly = floor(tv);
+        double fx = tu - flx, fy = tv - fly;
+        int x0 = dWrapIndex((int)flx, tx.w, tx.wrap), x1 = dWrapIndex((int)flx + 1, tx.w, tx.wrap);
+        int y0 = dWrapIndex((int)fly, tx.h, tx.wrap), y1 = dWrapIndex((int)fly + 1, tx.h, tx.wrap);
+        DVec3 a = texel(x0, y0) * (Real)(1 - fx) + texel(x1, y0) * (Real)fx;
+        DVec3 b = texel(x0, y1) * (Real)(1 - fx) + texel(x1, y1) * (Real)fx;
+        c = a * (Real)(1 - fy) + b * (Real)fy;
+    }
+    DVec3 n{(Real)2 * c.x - (Real)1, (Real)2 * c.y - (Real)1, (Real)2 * c.z - (Real)1};
+    Real l = sqrt(dot(n, n));
+    return (l > (Real)1e-12) ? n * ((Real)1 / l) : DVec3{(Real)0, (Real)0, (Real)1};
+}
+
+// Perturb a hit's shading normal by a bound tangent-space normal map (C6), device twin
+// of Scene::applyNormalMap. Builds a TBN from the (ray-oriented) shading normal + the
+// hit tangent, rotates the sampled tangent-space normal into world, replaces h.n. Called
+// from the device closestHit choke point so every GPU path is consistent.
+__device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h) {
+    if (!h.valid || h.matId < 0) return;
+    const DMaterial& m = sc.mats[h.matId];
+    if (m.normalTex < 0 || m.normalTex >= sc.nTex) return;
+    const DTexture& tx = sc.textures[m.normalTex];
+    if (!tx.rgb) return;
+    DVec3 tn = dTexNormalAt(tx, h.u, h.v);
+    DVec3 N = h.n;
+    DVec3 T = h.tangent - N * dot(N, h.tangent);
+    Real tl = sqrt(dot(T, T));
+    if (tl < (Real)1e-9) return;
+    T = T * ((Real)1 / tl);
+    DVec3 B = cross(N, T) * h.bitangentSign;
+    Real s = (Real)m.normalStrength;
+    DVec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
+    Real pl = sqrt(dot(pert, pert));
+    if (pl > (Real)1e-12) h.n = pert * ((Real)1 / pl);
 }
 
 // ---- procedural pattern VM (device twin of pattern.h) ----------------------
@@ -7867,6 +7948,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.n0 = {t.n0.x, t.n0.y, t.n0.z};
         d.n1 = {t.n1.x, t.n1.y, t.n1.z};
         d.n2 = {t.n2.x, t.n2.y, t.n2.z};
+        d.tangent = {t.tangent.x, t.tangent.y, t.tangent.z};
+        d.bitangentSign = t.bitangentSign;
         d.matId = t.matId; d.sensorId = t.sensorId;
         return d;
     };
@@ -7936,6 +8019,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.Nm[0] = inv.m[0]; d.Nm[1] = inv.m[3]; d.Nm[2] = inv.m[6];
         d.Nm[3] = inv.m[1]; d.Nm[4] = inv.m[4]; d.Nm[5] = inv.m[7];
         d.Nm[6] = inv.m[2]; d.Nm[7] = inv.m[5]; d.Nm[8] = inv.m[8];
+        for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // tangent local->world (C6)
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }
     (void)haveInstances;
@@ -8070,6 +8154,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
         d.roughnessTex = m.roughnessTex;
         d.filmThicknessTex = m.filmThicknessTex;
+        d.normalTex = m.normalTex;
+        d.normalStrength = m.normalStrength;
         d.layerCount = (int)m.layerN.size();
         if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;
         for (int k = 0; k < d.layerCount; ++k) {
@@ -8300,7 +8386,14 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     }
 
     // --- reflectance textures (per-texel Jakob-Hanika coefficients) ---
+    // Which textures are bound as tangent-space normal maps (C6)? Only those need the
+    // full RGB direction uploaded (dTexNormalAt); everything else just needs coeff/gray.
+    std::vector<char> usedAsNormal(scene.textures.size(), 0);
+    for (const auto& m : scene.mats)
+        if (m.normalTex >= 0 && m.normalTex < (int)scene.textures.size())
+            usedAsNormal[m.normalTex] = 1;
     std::vector<DTexture> dtex;
+    size_t txIdx = 0;
     for (const auto& tx : scene.textures) {
         DTexture dt;
         dt.w = tx.w; dt.h = tx.h;
@@ -8328,7 +8421,20 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         } else {
             dt.gray = nullptr;
         }
+        // Full linear RGB, only for normal-map textures (C6): raw [0,1] vector data.
+        if (usedAsNormal[txIdx] && !tx.rgb.empty()) {
+            std::vector<double> rgb3(tx.rgb.size() * 3);
+            for (size_t i = 0; i < tx.rgb.size(); ++i) {
+                rgb3[3 * i + 0] = tx.rgb[i].x;
+                rgb3[3 * i + 1] = tx.rgb[i].y;
+                rgb3[3 * i + 2] = tx.rgb[i].z;
+            }
+            dt.rgb = (double*)keep(uploadVec(rgb3));
+        } else {
+            dt.rgb = nullptr;
+        }
         dtex.push_back(dt);
+        ++txIdx;
     }
     DTexture* d_tex     = dtex.empty()       ? nullptr : (DTexture*)keep(uploadVec(dtex));
     double*   d_fluoCdf = fluoCdfAll.empty() ? nullptr : (double*)keep(uploadVec(fluoCdfAll));

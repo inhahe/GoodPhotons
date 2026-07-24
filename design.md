@@ -96,7 +96,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`materials.h` / `pattern.h` / `texture.h` / `layered`** — BSDFs (diffuse,
   mirror, glossy, dielectric w/ nested IOR, diffuse-transmission, filter gels,
   fluorescence, layered), procedural patterns (POV-derived `pov_noise.h` /
-  `pov_functions.h`), UV texturing.
+  `pov_functions.h`), UV texturing. **Tangent-space normal maps** (`normal_map
+  texture:<name> strength <s>`): per-triangle tangents are built in `Tri::finalize()`
+  from the UV gradients (Gram-Schmidt vs the geometric normal + a stored
+  `bitangentSign`); `Scene::applyNormalMap` remaps the linear-`encoding` map's texel
+  to a `[-1,1]` vector and rotates it through the surface TBN frame. It is invoked at
+  the single intersection choke point (`closestHit`/`closestHitLinear` on the CPU,
+  `dApplyNormalMap` in the device `closestHit`) so every renderer and both devices
+  perturb shading identically; tangents transform with instances (`instanceHitToWorld`,
+  the device uploading a per-instance `Wm` = toWorld linear).
 - **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*` / `vdb_openvdb.cpp`** —
   participating media (bounded, density fields, superposition), HG + water-droplet
   (rainbow) phase functions, gradient-index bending, NanoVDB (`.nvdb`) + native OpenVDB
