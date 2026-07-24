@@ -2681,7 +2681,9 @@ def studio_env_pfm(path: Path) -> Path:
 
 def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
                 env_file: Optional[str] = None, transform: str = "drift",
-                material: str = "gold", shell: bool = False) -> Scene:
+                material: str = "gold", shell: bool = False,
+                shape: str = "sphere", box_size: Optional[float] = None,
+                stretch: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> Scene:
     """The lone thickened gyroid ball whose lattice is the morphing higher-D field.
 
     ``transform`` selects how the higher dimensions animate over the loop (see
@@ -2754,7 +2756,7 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
                 grad_xi = _pov_grad_bound(surface, values, nat_box)
             grad_bound = grad_xi * max(1e-6, sig_max)
             return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
-                                       env_file, mat_def)
+                                       env_file, mat_def, shape, box_size, stretch)
         # S6: the emitted field is f(M.p + b) under the per-frame affine remap.  Its gradient is
         # M^T grad f, so |grad| <= sigma_max(M) * |grad f| (inflate the marcher bound), and the
         # surface's *world* extent grows by 1/sigma_min(M) plus the |b| translation (enlarge the
@@ -2777,7 +2779,7 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
         # field and reused verbatim for the emitted `sheet`.
         grad_bound = _pov_grad_bound(surface, values, nat_box) * max(1e-6, sig_max)
         return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
-                                   env_file, mat_def)
+                                   env_file, mat_def, shape, box_size, stretch)
     # Thicken the surface into a solid sheet (showcase's abs(g) - 0.5).  Scale the
     # half-width by sqrt(M/3) so walls stay visible as extra oscillating dims add
     # amplitude (M=3 reproduces the classic 0.5).
@@ -2839,16 +2841,43 @@ def build_scene(v: Variant, *, t: float = 0.0, res=(480, 480), radius=None,
     rad = radius if radius is not None else _POV_DEFAULT_RADIUS   # TPMS keep the classic default
     box = rad * 1.05                                     # contained_by half-extent
     return _assemble_iso_scene(sheet, grad_bound, rad, box, rad, res,
-                               env_file, mat_def)
+                               env_file, mat_def, shape, box_size, stretch)
 
 
 def _assemble_iso_scene(sheet: str, grad_bound: float, radius: float, box: float,
-                        r: float, res, env_file: Optional[str], mat_def: str) -> Scene:
+                        r: float, res, env_file: Optional[str], mat_def: str,
+                        shape: str = "sphere", box_size: Optional[float] = None,
+                        stretch: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> Scene:
     """Build the shared studio scene: the isosurface ``function { expr sheet }`` clipped to a
-    ball of ``radius`` inside a ``box`` container with the given ``max_gradient``, plus the
-    material and studio (or flat-fallback) env light.  The gyroid/primitive and POV paths of
-    :func:`build_scene` differ only in how they derive ``sheet``/``grad_bound``, then hand off
-    here."""
+    ball (``shape='sphere'``, default) or an axis-aligned cube (``shape='box'``) inside a
+    ``box`` container with the given ``max_gradient``, plus the material and studio (or
+    flat-fallback) env light.  The gyroid/primitive and POV paths of :func:`build_scene`
+    differ only in how they derive ``sheet``/``grad_bound``, then hand off here.
+
+    The base clip size is ``radius`` for the sphere (its radius).  For the box, the base
+    half-extent is ``box_size/2`` when ``box_size`` is given, else the same ``radius`` (a cube
+    inscribing the ball's region).  ``stretch`` = ``(sx, sy, sz)`` then scales the clip and the
+    ``contained_by`` box per axis: a stretched sphere becomes an ``ellipsoid`` and a stretched
+    cube a rectangular box, with the container ``min``/``max`` and camera pull-back rescaled to
+    match.  Both non-uniform primitives stay Lipschitz-valid (the field builder folds the
+    per-axis radii into the leaf transform), so marching is hole-free."""
+    sx, sy, sz = stretch
+    if shape == "box":
+        he = (box_size * 0.5) if box_size is not None else radius   # base cube half-extent
+        hx, hy, hz = he * sx, he * sy, he * sz                      # per-axis half-extents
+        # FTSL box `size` is the full edge length per axis.
+        clip = f"        box {{ size {fmt(2.0 * hx)} {fmt(2.0 * hy)} {fmt(2.0 * hz)} }}\n"
+    else:
+        hx, hy, hz = radius * sx, radius * sy, radius * sz          # per-axis semi-axes
+        if sx == 1.0 and sy == 1.0 and sz == 1.0:
+            clip = f"        sphere {{ center 0 0 0  radius {fmt(radius)} }}\n"
+        else:                                                       # stretched sphere -> ellipsoid
+            clip = (f"        ellipsoid {{ center 0 0 0"
+                    f"  radius {fmt(hx)} {fmt(hy)} {fmt(hz)} }}\n")
+    # `contained_by` half-extents (per axis, 5% air) and camera pull-back on the largest axis.
+    bx, by, bz = hx * 1.05, hy * 1.05, hz * 1.05
+    r = max(hx, hy, hz)
+
     scene = Scene(Camera(eye=(0.0, 0.7 * r, 4.0 * r), look_at=(0, 0, 0),
                          up=(0, 1, 0), fov_y=36, mode="R", res=res))
 
@@ -2857,10 +2886,10 @@ def _assemble_iso_scene(sheet: str, grad_bound: float, radius: float, box: float
         '    material "surf"\n'
         "    intersect {\n"
         f'        function {{ expr "{sheet}" }}\n'
-        f"        sphere {{ center 0 0 0  radius {fmt(radius)} }}\n"
+        + clip +
         "    }\n"
-        f"    contained_by {{ min {fmt(-box)} {fmt(-box)} {fmt(-box)}"
-        f"  max {fmt(box)} {fmt(box)} {fmt(box)} }}\n"
+        f"    contained_by {{ min {fmt(-bx)} {fmt(-by)} {fmt(-bz)}"
+        f"  max {fmt(bx)} {fmt(by)} {fmt(bz)} }}\n"
         f"    max_gradient {fmt(grad_bound)}\n"
         "}")
 
@@ -3448,7 +3477,9 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
                clarity: Optional[float] = None, raster_iso: Optional[int] = None,
                raster_gpu: bool = False,
                preview: Optional["_PreviewWindow"] = None,
-               video_dir: Optional[Path] = None, shell: bool = False) -> Path:
+               video_dir: Optional[Path] = None, shell: bool = False,
+               shape: str = "sphere", box_size: Optional[float] = None,
+               stretch: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> Path:
     """Emit ``frames`` morphing scene files, render them, and assemble one video.
 
     The per-frame ``.ftsl``/``.png`` files land in ``frames_dir`` (its own subdirectory),
@@ -3474,7 +3505,8 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
         t = k / frames                                  # seamless loop: t in [0,1)
         _status(f"{label} | emit ftsl  frame {k + 1}/{frames}")
         scene = build_scene(v, t=t, res=size, radius=radius, env_file=env_file,
-                            transform=transform, material=material, shell=shell)
+                            transform=transform, material=material, shell=shell,
+                            shape=shape, box_size=box_size, stretch=stretch)
         body = scene.emit(Clock(t=t, frame=k, frames=frames, fps=fps),
                           Cache(), assets_dir=frames_dir, tag=f"{k:0{fw}d}")
         fp = frames_dir / f"{base}_{k:0{fw}d}.ftsl"
@@ -3503,6 +3535,17 @@ def make_video(frames_dir: Path, out_dir: Path, base: str, v: Variant, *, label:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _stretch_factor(spec: str) -> float:
+    """Parse a ``--stretch-{x,y,z}`` factor: a strictly-positive float."""
+    try:
+        v = float(spec)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--stretch: '{spec}' is not a number")
+    if not (v > 0.0):
+        raise argparse.ArgumentTypeError(f"--stretch: factor {v} must be > 0")
+    return v
+
 
 def _parse_size(spec: str) -> Tuple[int, int]:
     """Parse a ``--size`` value: ``N`` (square NxN) or ``WxH`` -> ``(W, H)``."""
@@ -3711,10 +3754,27 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("scene")
     g.add_argument("--threshold", type=float, default=0.0,
                    help="isosurface level set f = threshold (default 0; ~+/-0.7 thins the walls)")
+    g.add_argument("--shape", choices=("sphere", "box"), default="sphere",
+                   help="shape the surface is CSG-clipped to: 'sphere' (default; a ball) or "
+                        "'box' (an axis-aligned cube). Sized by --radius (sphere) / --box-size "
+                        "(box); the marching container and camera framing follow the shape.")
     g.add_argument("--radius", type=float, default=None,
-                   help="radius of the spherical container the surface fills (default: 1.3 for "
-                        "TPMS; a POV builtin auto-sizes to its own bounding box, so pass this only "
-                        "to override — e.g. to clip an unbounded shape like a paraboloid)")
+                   help="radius of the spherical clip/container the surface fills (default: 1.3 "
+                        "for TPMS; a POV builtin auto-sizes to its own bounding box, so pass this "
+                        "only to override — e.g. to clip an unbounded shape like a paraboloid). "
+                        "With --shape box and no --box-size, the cube's half-extent is this radius.")
+    g.add_argument("--box-size", type=float, default=None, metavar="S",
+                   help="full edge length of the --shape box cube (spans -S/2..S/2). Default: "
+                        "twice the sphere --radius (a cube inscribing the same region). Ignored "
+                        "unless --shape box.")
+    g.add_argument("--stretch-x", type=_stretch_factor, default=1.0, metavar="FX",
+                   help="factor to stretch the bounding box/sphere along X (default 1.0): scales "
+                        "the clip shape and the contained_by min/max on X. >1 elongates, <1 "
+                        "squashes; a stretched --shape sphere becomes an ellipsoid.")
+    g.add_argument("--stretch-y", type=_stretch_factor, default=1.0, metavar="FY",
+                   help="factor to stretch the bounding box/sphere along Y (default 1.0).")
+    g.add_argument("--stretch-z", type=_stretch_factor, default=1.0, metavar="FZ",
+                   help="factor to stretch the bounding box/sphere along Z (default 1.0).")
     g.add_argument("--shell", action="store_true",
                    help="render a POV surface hollow (a thin shell of --thickness half-width) "
                         "instead of a solid body; a few genuinely-thin surfaces (klein_bottle, "
@@ -4010,14 +4070,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                                env_file=env_file, transform=args.transform,
                                material=args.material, clarity=args.glass_clarity,
                                raster_iso=args.raster_iso, raster_gpu=args.raster_gpu,
-                               preview=preview, video_dir=video_outdir, shell=args.shell)
+                               preview=preview, video_dir=video_outdir, shell=args.shell,
+                               shape=args.shape, box_size=args.box_size,
+                               stretch=(args.stretch_x, args.stretch_y, args.stretch_z))
             made.append(video)
             _status_commit(f"{label} | done -> {video.name} ({args.frames} frames)")
         else:
             # No video: one static scene file (t=0) with the full comment header.
             scene = build_scene(v, t=0.0, res=size, radius=args.radius, env_file=env_file,
                                 transform=args.transform, material=args.material,
-                                shell=args.shell)
+                                shell=args.shell, shape=args.shape, box_size=args.box_size,
+                                stretch=(args.stretch_x, args.stretch_y, args.stretch_z))
             body = scene.emit(Clock(t=0.0), Cache(), assets_dir=outdir,
                               tag=f"{k:0{width}d}")
             fp = outdir / f"{base}.ftsl"
