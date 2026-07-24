@@ -248,13 +248,40 @@ def _describe_element(el: Any, oid: int, datasets: Dict[int, Any]) -> Dict[str, 
     return rec
 
 
+def _edge_param(node: Any, child: Any, index: int) -> str:
+    """Best-effort name of the **parameter** on ``node`` that ``child`` feeds (F5's
+    edge labels).  Loom nodes store their inputs as named attributes (``self.a``,
+    ``self.x``, ``self.amount``, …) — sometimes inside a list (``self.components``) —
+    so match the child by identity to the attribute it lives under.  Falls back to a
+    positional ``in<i>`` when the input is nested out of reach (e.g. on a sub-object)."""
+    try:
+        items = list(vars(node).items())
+    except TypeError:
+        items = []
+    for k, v in items:                       # a direct named input
+        if not k.startswith("_") and v is child:
+            return k
+    for k, v in items:                       # inside a list/tuple/dict input
+        if k.startswith("_"):
+            continue
+        if isinstance(v, (list, tuple)):
+            for i, e in enumerate(v):
+                if e is child:
+                    return f"{k}[{i}]"
+        elif isinstance(v, dict):
+            for kk, e in v.items():
+                if e is child:
+                    return f"{k}[{kk}]"
+    return f"in{index}"
+
+
 def _describe_dag(scene: Any) -> Dict[str, List[Dict[str, Any]]]:
     """Nodes (op + short label + stable id) and edges (child feeds parent) over
-    every modulator reachable from the scene.  Edge *parameter* labels are §F5's
-    job; here each edge is just ``{src, dst}`` (``src`` feeds ``dst``)."""
+    every modulator reachable from the scene.  Each edge is ``{src, dst, param}``
+    where ``src`` feeds ``dst`` through ``dst``'s ``param`` input (F5's link labels)."""
     from .scene import element_roots
     nodes: Dict[int, Dict[str, Any]] = {}
-    edges: List[Dict[str, int]] = []
+    edges: List[Dict[str, Any]] = []
     seen_edge = set()
     for el in scene._all_elements():
         try:
@@ -266,11 +293,12 @@ def _describe_dag(scene: Any) -> Dict[str, List[Dict[str, Any]]]:
                 if n.id not in nodes:
                     nodes[n.id] = {"id": n.id, "op": type(n).__name__,
                                    "label": _node_label(n)}
-                for c in n.children():
+                for idx, c in enumerate(n.children()):
                     key = (c.id, n.id)
                     if key not in seen_edge:
                         seen_edge.add(key)
-                        edges.append({"src": c.id, "dst": n.id})
+                        edges.append({"src": c.id, "dst": n.id,
+                                      "param": _edge_param(n, c, idx)})
     return {"nodes": list(nodes.values()), "edges": edges}
 
 

@@ -25,9 +25,13 @@ int runViewerGui(const std::string&) {
 
 #include "imgui.h"
 #include "implot.h"                // ImPlot: F3 strip charts
+#include "imnodes.h"               // imnodes: F5 modulator-DAG panel
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "third_party/json.h"      // minijson: the vendored JSON parser
+#include <map>
+#include <unordered_map>
+#include <functional>
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -638,6 +642,114 @@ static void drawScenePanel(const Sidecar& sc) {
 }
 
 // --------------------------------------------------------------------------
+// F5 — modulator-DAG panel (imnodes). Each node shows its op + stable id; each
+// edge is a link into the destination's labelled parameter pin (so you can read
+// which input of a node's function each upstream modulator feeds).
+// --------------------------------------------------------------------------
+struct DagNode { int id = 0; std::string op, label; };
+struct DagEdge { int src = 0, dst = 0; std::string param; };
+struct DagGraph {
+    std::vector<DagNode> nodes;
+    std::vector<DagEdge> edges;
+    bool laidOut = false;   // grid positions applied on the first frame only
+};
+
+// imnodes id namespaces (node ids from loom are small; keep pins/links clear of them)
+static const int DAG_OUT_BASE = 1 << 20;   // output pin id = base + node id
+static const int DAG_IN_BASE  = 1 << 21;   // input  pin id = base + edge index
+
+static DagGraph collectDag(const Sidecar& sc) {
+    DagGraph g;
+    const minijson::Value* dag = sc.root.find("dag");
+    if (!dag || !dag->isObject()) return g;
+    const minijson::Value* nodes = dag->find("nodes");
+    const minijson::Value* edges = dag->find("edges");
+    if (nodes && nodes->isArray())
+        for (const auto& n : nodes->arr) {
+            DagNode dn;
+            dn.id    = n.intAt("id", 0);
+            dn.op    = n.find("op") ? n.find("op")->asString("?") : "?";
+            dn.label = scalarStr(n.find("label"), "");
+            g.nodes.push_back(std::move(dn));
+        }
+    if (edges && edges->isArray())
+        for (const auto& e : edges->arr) {
+            DagEdge de;
+            de.src   = e.intAt("src", 0);
+            de.dst   = e.intAt("dst", 0);
+            de.param = scalarStr(e.find("param"), "in");
+            g.edges.push_back(std::move(de));
+        }
+    return g;
+}
+
+// Longest-path layering (level = max over incoming edges of src level + 1) so the
+// graph reads left→right from leaves (constants/oscillators) to the params they drive.
+static void layoutDag(DagGraph& g) {
+    std::unordered_map<int, std::vector<int>> incoming;  // dst -> [src...]
+    for (const auto& e : g.edges) incoming[e.dst].push_back(e.src);
+    std::unordered_map<int, int> level;
+    std::unordered_map<int, int> visiting;
+    std::function<int(int)> lvl = [&](int id) -> int {
+        auto it = level.find(id);
+        if (it != level.end()) return it->second;
+        if (visiting[id]) return 0;          // cycle guard (shouldn't happen in a DAG)
+        visiting[id] = 1;
+        int mx = 0;
+        auto in = incoming.find(id);
+        if (in != incoming.end())
+            for (int s : in->second) mx = std::max(mx, lvl(s) + 1);
+        visiting[id] = 0;
+        level[id] = mx;
+        return mx;
+    };
+    std::map<int, int> rowInLevel;
+    for (const auto& n : g.nodes) {
+        int L = lvl(n.id);
+        int row = rowInLevel[L]++;
+        ImNodes::SetNodeGridSpacePos(n.id, ImVec2((float)L * 230.0f, (float)row * 95.0f));
+    }
+}
+
+static void drawDagPanel(DagGraph& g) {
+    if (g.nodes.empty()) { ImGui::TextDisabled("(no modulator DAG)"); return; }
+    ImGui::TextDisabled("%d nodes, %d edges - drag to pan, scroll to zoom",
+                        (int)g.nodes.size(), (int)g.edges.size());
+    // per-node incoming edges (each becomes a labelled input pin)
+    std::unordered_map<int, std::vector<int>> inEdges;   // node id -> [edge index...]
+    for (int i = 0; i < (int)g.edges.size(); ++i) inEdges[g.edges[i].dst].push_back(i);
+
+    ImNodes::BeginNodeEditor();
+    if (!g.laidOut) layoutDag(g);   // must be inside Begin/EndNodeEditor
+    for (const auto& n : g.nodes) {
+        ImNodes::BeginNode(n.id);
+        ImNodes::BeginNodeTitleBar();
+        if (!n.label.empty() && n.label != n.op)
+            ImGui::Text("%s  #%d", n.op.c_str(), n.id);
+        else
+            ImGui::Text("%s #%d", n.op.c_str(), n.id);
+        ImNodes::EndNodeTitleBar();
+        if (!n.label.empty() && n.label != n.op)
+            ImGui::TextDisabled("= %s", n.label.c_str());
+        // one labelled input pin per incoming edge (the param it feeds)
+        auto it = inEdges.find(n.id);
+        if (it != inEdges.end())
+            for (int ei : it->second) {
+                ImNodes::BeginInputAttribute(DAG_IN_BASE + ei);
+                ImGui::TextUnformatted(g.edges[ei].param.c_str());
+                ImNodes::EndInputAttribute();
+            }
+        ImNodes::BeginOutputAttribute(DAG_OUT_BASE + n.id);
+        ImNodes::EndOutputAttribute();
+        ImNodes::EndNode();
+    }
+    for (int i = 0; i < (int)g.edges.size(); ++i)
+        ImNodes::Link(i, DAG_OUT_BASE + g.edges[i].src, DAG_IN_BASE + i);
+    ImNodes::EndNodeEditor();
+    g.laidOut = true;
+}
+
+// --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
 int runViewerGui(const std::string& sidecarPath) {
@@ -648,6 +760,7 @@ int runViewerGui(const std::string& sidecarPath) {
     }
     std::vector<CurveGeom> curves = collectCurves(sc);
     std::vector<StripSeries> strips = buildStrips(curves);
+    DagGraph dag = collectDag(sc);
 
     OrbitView view;
     for (const auto& c : curves) view.maxDim = std::max(view.maxDim, c.dim);
@@ -673,6 +786,7 @@ int runViewerGui(const std::string& sidecarPath) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();                // F3 strip charts
+    ImNodes::CreateContext();               // F5 modulator-DAG panel
     ImGui::GetIO().IniFilename = nullptr;   // don't litter an imgui.ini in the CWD
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
@@ -710,6 +824,12 @@ int runViewerGui(const std::string& sidecarPath) {
             drawObjectsPanel(sc);
         if (ImGui::CollapsingHeader("Datasets", ImGuiTreeNodeFlags_DefaultOpen))
             drawDatasetsPanel(sc);
+        if (ImGui::CollapsingHeader("Modulator DAG", ImGuiTreeNodeFlags_DefaultOpen)) {
+            // imnodes wants its own non-scrolling area (it pans on drag itself)
+            ImGui::BeginChild("dagpane", ImVec2(0, 360), true);
+            drawDagPanel(dag);
+            ImGui::EndChild();
+        }
         ImGui::EndChild();
 
         ImGui::SameLine();
@@ -740,6 +860,7 @@ int runViewerGui(const std::string& sidecarPath) {
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
+    ImNodes::DestroyContext();
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
     CleanupDeviceD3D();

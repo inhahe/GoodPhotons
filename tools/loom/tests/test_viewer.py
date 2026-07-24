@@ -211,12 +211,30 @@ def test_introspect_dag_nodes_and_edges():
     dag = d["dag"]
     ids = {n["id"] for n in dag["nodes"]}
     assert ids  # non-empty
-    # every edge references known nodes
+    # every edge references known nodes and carries a param label (F5)
     for e in dag["edges"]:
         assert e["src"] in ids and e["dst"] in ids
+        assert isinstance(e["param"], str) and e["param"]
     # the animated Sine node is present
     ops = {n["op"] for n in dag["nodes"]}
     assert "Sine" in ops
+
+
+def test_introspect_dag_edge_param_labels():
+    """F5: edges name the destination parameter the upstream node feeds — e.g. an
+    Add's two operands are labelled `a` and `b`, not just positional indices."""
+    from loom.signals import Sine
+    # (sine*2) + 1 : Add(Mul(Sine, 2), 1) → the Mul feeds Add.a, and Sine feeds Mul.a
+    sig = Sine(cycles=1) * 2.0 + 1.0
+    cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
+    sc = Scene(cam)
+    sc.add(Sphere((0, 0, 0), sig, "m"))
+    dag = introspect(sc)["dag"]
+    op_of = {n["id"]: n["op"] for n in dag["nodes"]}
+    # collect the param label used on each (op_src -> op_dst) edge
+    labelled = {(op_of[e["src"]], op_of[e["dst"]], e["param"]) for e in dag["edges"]}
+    assert ("Mul", "Add", "a") in labelled
+    assert ("Sine", "Mul", "a") in labelled
 
 
 def test_introspect_datasets_sorted_and_unique():

@@ -628,8 +628,12 @@ tools/loom/
   slider). **F3 is complete:** `tracked_path` datasets now also emit a `channels` array (each track
   sampled along the same curve parameter as the polyline), and the viewer compiles vendored **ImPlot** to
   draw **scroll-locked strip charts** below the 3-D pane — one per curve dimension + one per channel
-  component, sharing a linked X axis and a draggable index line wired to the 3-D index dot. Remaining §F
-  slices (F4–F7: the SweptMesh/imnodes/`-raster-gpu` panes) build on it.
+  component, sharing a linked X axis and a draggable index line wired to the 3-D index dot. **F5 is
+  complete:** `_describe_dag` tags every edge with the destination `param` it feeds (identity-matched to
+  the attribute the child is stored under), and the viewer compiles vendored **imnodes** to draw a
+  **Modulator DAG** panel — nodes titled `<op> #<id>`, one labelled input pin per incoming edge, longest-
+  path layering from leaves to driven params. Remaining §F slices (F4/F6/F7: the SweptMesh/scatter-grid/
+  `-raster-gpu` panes) build on it.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

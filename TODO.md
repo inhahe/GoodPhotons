@@ -1384,10 +1384,21 @@ replacement for the renderer or the primary editing tool.**
       during a slider drag so the UI stays responsive). If loom couldn't define textures this would add
       it — but loom already has `Texture`/`skin` (image) and `ProcTexture`/`func_skin` (formula, E1 DONE),
       so this consumes them.
-- [ ] **F5 — modulator-DAG panel (imnodes).** Introspect the signal DAG via loom's `walk()` and lay it
-      out well. Each node shows the **op/function that modulates it** and a **stable identifier**; each
-      **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
+- [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
+      and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
+      each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
       function refers to which upstream node.
+      - **loom side:** `_describe_dag` now tags every edge with a `param` label — the name of the input on
+        the destination node that the upstream child feeds, derived by identity-matching the child to the
+        attribute it's stored under (`a`/`b` for arithmetic operands, `cycles`/`phase`/`amp`/`bias` for a
+        `Sine`, `components[i]` for a `VecSignal`; positional `in<i>` only when nested out of reach). Tested
+        in `tools/loom/tests/test_viewer.py`.
+      - **C++ side:** vendored **imnodes** (`src/third_party/imnodes/`) is compiled into the ftrace target.
+        A **Modulator DAG** panel in the `-viewer` left column renders the graph with imnodes: each node is
+        a box titled `<op> #<id>` (with its constant/leaf value shown when distinct), one **labelled input
+        pin per incoming edge** (the param name), and one output pin; links connect upstream outputs into
+        those labelled inputs. A longest-path layering places leaves (constants/oscillators) on the left and
+        the params they drive on the right; pan/zoom to explore.
 - [ ] **F6 — scatter + grid field display & inspection.** **Scatter:** show the actual defined points
       (no volume fill) using the same 3-D-view/stereo mechanism, colored by a **channel selector
       (default)** or channels 0/1/2 → RGB; **click any point to inspect its location + all channel

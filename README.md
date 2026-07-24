@@ -2281,9 +2281,11 @@ with **index markers** along the curve, and supports **stereoscopic viewing** �
 anaglyph and wall-eyed / cross-eyed side-by-side, with an eye-separation slider. Below the
 3-D pane sit **scroll-locked strip charts** (ImPlot) — one per curve dimension and one per
 tacked-on `TrackedPath` channel; they share a linked X axis (paging scrolls them all
-together) and a draggable index line wired to the 3-D index dot. (Early stage: the
-`-raster-gpu` render pane and modulator-DAG graph are still in progress — see §F in
-`TODO.md`.)
+together) and a draggable index line wired to the 3-D index dot. A **Modulator DAG**
+panel (imnodes) lays out the scene's signal graph — each node titled `<op> #<id>` with
+one labelled input pin per incoming edge (the parameter that upstream node feeds), leaves
+on the left and the params they drive on the right. (Early stage: the `-raster-gpu` render
+pane and SweptMesh view are still in progress — see §F in `TODO.md`.)
 
 ---
 

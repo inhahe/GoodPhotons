@@ -42,8 +42,10 @@ add_executable(ftrace
     # --- vendored ImPlot (F3 strip charts), built on ImGui ---
     src/third_party/implot/implot.cpp
     src/third_party/implot/implot_items.cpp
+    # --- vendored imnodes (F5 modulator-DAG panel), built on ImGui ---
+    src/third_party/imnodes/imnodes.cpp
 )
-target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src/third_party/implot)
+target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src/third_party/implot src/third_party/imnodes)
 
 # The vendored GPDA engine + generated grammar are third-party/generated code;
 # don't hold them to ftrace's /W4 /permissive- bar (keeps the build-warning
@@ -56,6 +58,7 @@ if(MSVC)
         src/third_party/imgui/backends/imgui_impl_win32.cpp
         src/third_party/imgui/backends/imgui_impl_dx11.cpp
         src/third_party/implot/implot.cpp src/third_party/implot/implot_items.cpp
+        src/third_party/imnodes/imnodes.cpp
         PROPERTIES COMPILE_OPTIONS "/W0")
 endif()
 
