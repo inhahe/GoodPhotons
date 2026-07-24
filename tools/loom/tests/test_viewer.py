@@ -403,6 +403,53 @@ def test_viewer_model_rejects_non_callable():
 
 
 # --------------------------------------------------------------------------
+# §F4 — materials + textures in the sidecar (the texture-display blocker)
+# --------------------------------------------------------------------------
+
+def test_introspect_emits_materials_with_texture_binding():
+    from loom.scene import skin, func_skin, Sphere
+    sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    tex, mat = skin("hide", "textures/cow.png", roughness=0.3)
+    ptex, pmat = func_skin("stripes", "u", "v", "0.5+0.5*sin(2*pi*8*u)")
+    sc.add(tex, mat, ptex, pmat,
+           Sphere((0, 0, 0), 1.0, "hide"), Sphere((2, 0, 0), 1.0, "stripes"))
+    d = introspect(sc)
+    mats = {m["name"]: m for m in d["materials"]}
+    assert mats["hide"]["texture"] == "hide"       # resolved texture: binding
+    assert mats["hide"]["props"]["roughness"] == 0.3
+    assert mats["stripes"]["texture"] == "stripes"
+
+
+def test_introspect_emits_image_and_formula_textures():
+    from loom.scene import skin, func_skin
+    sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    sc.add(*skin("hide", "textures/cow.png"))
+    sc.add(*func_skin("stripes", "u", "v", "0.5+0.5*sin(2*pi*8*u)", res=256))
+    d = introspect(sc)
+    tex = {t["name"]: t for t in d["textures"]}
+    assert tex["hide"]["kind"] == "image"
+    assert tex["hide"]["file"] == "textures/cow.png"
+    assert tex["stripes"]["kind"] == "formula"
+    assert tex["stripes"]["r"] == "u" and tex["stripes"]["res"] == 256
+
+
+def test_introspect_material_animated_prop_evaluated_at_clock():
+    from loom.scene import Material, Sphere
+    from loom.signals import Sine
+    sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    sc.add(Material("m", "diffuse", roughness=Sine(cycles=1, amp=0.5, bias=0.5)),
+           Sphere((0, 0, 0), 1.0, "m"))
+    d = introspect(sc, clock=Clock.at_frame(0, 4))
+    rough = {m["name"]: m for m in d["materials"]}["m"]["props"]["roughness"]
+    assert isinstance(rough, (int, float))   # evaluated, not a Signal repr
+
+
+def test_session_reintrospection_carries_materials_and_textures():
+    ack = _session().handle({"cmd": "introspect"})
+    assert "materials" in ack["sidecar"] and "textures" in ack["sidecar"]
+
+
+# --------------------------------------------------------------------------
 # §F4/§F7 — the viewer↔loom live re-introspection channel
 # --------------------------------------------------------------------------
 

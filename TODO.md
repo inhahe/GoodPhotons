@@ -1408,9 +1408,14 @@ replacement for the renderer or the primary editing tool.**
       selector (grey / per-object tint / **UV checker**). Orbiting the 3 spatial dims is the **view-only
       re-projection** the rotation rule calls for. A swept-mesh scene opens on the Meshes tab by default
       (its spine curves still populate the Curves tab). Verified via PrintWindow screenshot.
-      - **Still open (deferred):** (1) **textures** (image *or* formula) — the UV checker is a
-        placeholder; real texture display needs **G5** (materials don't emit their `skin`/`func_skin`
-        texture into the sidecar yet). (2) **Re-tessellation when rotating *into* a parameter/extra
+      - **Still open (deferred):** (1) **textures** (image *or* formula). **Loom half DONE
+        2026-07-24** — the sidecar now emits a `materials` list (each material's `type`/`props` +
+        the `texture` skin it binds, animated props evaluated at the clock) and a `textures` list
+        (image `file`/encoding/filter/wrap, or formula `r`/`g`/`b`/`res` — `Texture` vs
+        `ProcTexture`), so the viewer finally sees *which* skin a mesh wears and where to get it.
+        4 new tests. **C++ half still open:** the Meshes tab must load the image (or bake the
+        `r/g/b` formula, the G5 procedural-skin path) into a D3D11 texture and sample it at the
+        mesh UVs instead of the UV-checker placeholder. (2) **Re-tessellation when rotating *into* a parameter/extra
         dimension** via a latest-wins off-thread job queue. **Loom half DONE 2026-07-24** — the
         viewer↔loom **live re-introspection channel** (`ViewerSession`/`serve_viewer` in
         `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process

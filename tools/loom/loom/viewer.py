@@ -361,6 +361,63 @@ def _edge_param(node: Any, child: Any, index: int) -> str:
     return f"in{index}"
 
 
+_TEXTURE_REF = "texture:"
+
+
+def _describe_texture(tex: Any) -> Dict[str, Any]:
+    """A texture/skin definition for the viewer (F4 texture display): an **image**
+    skin (``Texture`` → a file path the viewer loads) or a **formula/procedural**
+    skin (``ProcTexture`` → the three ``r/g/b`` UV expressions the viewer bakes, the
+    E1 procedural-skin path).  These are what the viewer needs to shade a mesh with
+    its authored surface detail instead of the flat/checker placeholder."""
+    from .scene import Texture, ProcTexture  # lazy
+    rec: Dict[str, Any] = {"name": getattr(tex, "name", None)}
+    if isinstance(tex, ProcTexture):
+        rec.update(kind="formula", r=tex.r, g=tex.g, b=tex.b, res=tex.res,
+                   filter=tex.filter, wrap=tex.wrap)
+    elif isinstance(tex, Texture):
+        rec.update(kind="image", file=tex.file, encoding=tex.encoding,
+                   filter=tex.filter, wrap=tex.wrap)
+    else:                                    # unknown skin kind — name only
+        rec["kind"] = type(tex).__name__.lower()
+    return rec
+
+
+def _prop_value(v: Any, clock: Optional[Clock]) -> Any:
+    """JSON-friendly value of a material prop: primitives verbatim; an animated
+    :class:`Signal` / :class:`VecSignal` evaluated at the clock (best-effort, so a
+    weird prop never sinks the sidecar)."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    try:
+        from .signals.core import Signal, Cache
+        from .signals.vector import VecSignal
+        from .ftsl_emit import num, vec3
+        c = clock if clock is not None else Clock.at_frame(0, 1)
+        if isinstance(v, VecSignal):
+            return list(vec3(v, c, Cache()))
+        if isinstance(v, Signal):
+            return num(v, c, Cache())
+    except Exception:
+        pass
+    return repr(v)
+
+
+def _describe_material(mat: Any, clock: Optional[Clock] = None) -> Dict[str, Any]:
+    """A material for the viewer: its ``type``, its props (serialised), and the
+    **texture** it binds (the skin name behind any ``texture:<name>`` prop — F4's
+    texture blocker, since the viewer only saw a bare material *name* before)."""
+    props: Dict[str, Any] = {}
+    texture = None
+    for k, v in getattr(mat, "props", {}).items():
+        if isinstance(v, str) and v.startswith(_TEXTURE_REF):
+            texture = v[len(_TEXTURE_REF):]
+        props[k] = _prop_value(v, clock)
+    return {"name": getattr(mat, "name", None),
+            "type": getattr(mat, "mtype", None),
+            "texture": texture, "props": props}
+
+
 def _describe_dag(scene: Any) -> Dict[str, List[Dict[str, Any]]]:
     """Nodes (op + short label + stable id) and edges (child feeds parent) over
     every modulator reachable from the scene.  Each edge is ``{src, dst, param}``
@@ -408,8 +465,11 @@ def introspect(scene: Any, *, clock: Optional[Clock] = None) -> Dict[str, Any]:
     geometry elements, Groups recursed, each linking the ``datasets`` it
     references by id); ``datasets`` (every :class:`PointPath` / :class:`TrackedPath`
     / :class:`Grid` / :class:`Scatter` reachable in the scene — paths also carry
-    their evaluated ``control_points`` + a sampled display ``polyline``); ``camera`` /
-    ``lights`` (minimal); and ``dag`` (the modulator graph — ``nodes`` + ``edges``).
+    their evaluated ``control_points`` + a sampled display ``polyline``);
+    ``materials`` (each material's ``type``/``props`` and the ``texture`` skin it
+    binds) + ``textures`` (image-file or formula skin definitions — so the viewer can
+    shade meshes with their authored surface detail, F4); ``camera`` / ``lights``
+    (minimal); and ``dag`` (the modulator graph — ``nodes`` + ``edges``).
     """
     datasets: Dict[int, Any] = {}
     objects = [_describe_element(el, i, datasets, clock)
@@ -427,6 +487,8 @@ def introspect(scene: Any, *, clock: Optional[Clock] = None) -> Dict[str, Any]:
         "frame": frame,
         "objects": objects,
         "datasets": ds_list,
+        "materials": [_describe_material(m, clock) for m in scene.materials],
+        "textures": [_describe_texture(t) for t in scene.textures],
         "camera": {"class": type(scene.camera).__name__,
                    "name": getattr(scene.camera, "name", None)},
         "lights": [{"kind": getattr(l, "kind", None),
