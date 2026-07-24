@@ -1107,7 +1107,26 @@ per-path carrier is left unqualified here.
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
 | `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
-| `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity` |
+| `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity`, **or `sky`** (analytic sky, below) |
+
+**Analytic physical sky.** An `env` light can synthesise a **Preetham daylight sky**
+instead of loading an HDRI — write `sky preetham` (or just supply `turbidity` /
+`sun_dir` / `sun_elevation`, which implies it). ftrace bakes an equirectangular sky
+image from the [Preetham et al. 2002] analytic model — a blue dome that whitens toward
+the horizon and the sun, plus a **spectrally attenuated solar disk** (a 5778 K blackbody
+extinguished by Rayleigh + Ångström-aerosol optical depth over the sun's air mass, so a
+low sun reddens into a proper orange sunset) — and feeds it through the same `EnvMap`
+pipeline as an image env, so it importance-samples, upsamples to spectra, and runs on
+both the CPU and GPU exactly like an HDRI. Parameters: `turbidity <t>` (≈2 clear
+deep-blue … ≈10 hazy/milky, default 2.5), the sun via either `sun_dir <x y z>` or
+`sun_elevation <deg>` + `sun_azimuth <deg>` (azimuth from +x toward +z), `ground_albedo
+<a>` (tints the below-horizon hemisphere, default 0.3), `intensity <s>` (scales the
+normalised mean sky luminance, default 1), `res <px>` (equirect width, height = res/2,
+default 1024), and `rotate <deg>`. Because the solar disk is physically ~10⁵× brighter
+than the sky (as in any real sunny HDRI), sun-lit diffuse surfaces are high-dynamic-range
+and benefit from a generous photon budget / higher `-noise` target in forward modes; the
+sky background itself is read directly and is noise-free. See `scraps/sky_test.ftsl`
+(daytime) and `scraps/sky_sunset.ftsl` (low-sun reddening).
 
 **Absolute power.** Any non-env light may author a real physical output —
 `power <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous

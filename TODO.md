@@ -1578,7 +1578,29 @@ ftrace's own language). Two follow-ups were captured:
     - [ ] **Still open:** other upsamplers (Smits 1999, Meng 2015, plain box/3-lobe) and a **named user mapping**
           — a `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
 
-- [ ] **K2 — Analytic physical sky (`turbidity`).** ftrace has **no** procedural sky: environment lighting is only
+- [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
+      analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or
+      sun_elevation/sun_azimuth)  ground_albedo a  intensity s  res px  rotate d }`. `src/sky.h`
+      (`generatePreethamSky`) evaluates the Perez five-parameter distribution for luminance Y and CIE xy (turbidity-
+      dependent coefficients + zenith Yz/xz/yz from the solar elevation), converts xyY→XYZ→linear-sRGB per texel, and
+      bakes an equirectangular sky image (row0=up, matching `EnvMap`'s convention). The **solar disk** is baked on top:
+      a 5778 K blackbody attenuated by Rayleigh (∝λ⁻⁴) + Ångström-aerosol (β from turbidity) optical depth over the
+      Kasten–Young air mass, integrated to XYZ and scaled to a physical clear-air disk luminance (~1.6e9 cd/m²·
+      transmittance) — so a low sun **reddens into a proper orange sunset automatically**. Magnitudes are physical,
+      then the whole image is normalised so the mean above-horizon sky luminance = `intensity`. Rather than a bespoke
+      construct, the sky is fed through `EnvMap::buildFromRgb` (refactored out of `EnvMap::load`), so it **reuses the
+      entire env pipeline**: luminance-importance sampling, per-texel Jakob–Hanika spectral upsampling, direct-view
+      background, and the GPU `DEnvMap` upload — an analytic sky lights the scene exactly like an HDRI on **both CPU
+      and GPU**. **Validated:** `scraps/sky_test.ftsl` (daytime — blue overhead 148/184/234, whitening toward the sun,
+      cool sky-lit ground; CPU and GPU byte-agree on the sky) and `scraps/sky_sunset.ftsl` (low sun — visible solar
+      disk on the horizon, strongly reddened orange sky with blue crushed by Rayleigh extinction). **Follow-up logged**
+      (known-issues): the physical solar disk is ~10⁵× the sky, so sun-lit diffuse surfaces are HDR and converge slowly
+      in forward modes (same as any sunny HDRI) — an efficient distant-directional-sun emitter (parallel forward
+      emission + backward NEE) would fix this and is the proper enhancement.
+
+  <details><summary>original K2 scope</summary>
+
+- ~~**K2 — Analytic physical sky (`turbidity`).**~~ ftrace has **no** procedural sky: environment lighting is only
       an image-based env map (`env { file … }`) or a constant-radiance env. `turbidity` (atmospheric haze: ~2 = clear
       deep-blue sky, ~10 = milky/hazy) only means something inside a physically-based **sky+sun** model
       (Preetham 2002 or Hošek-Wilkie 2012), which *generates directional radiance from a sun position* — i.e. it is
@@ -1589,6 +1611,8 @@ ftrace's own language). Two follow-ups were captured:
       first-class feature. This is the latter. Deferred as its own feature to greenlight on its own merits, not to be
       folded into reconciliation work. Bundles naturally with K1's illuminant upsample (the sky model wants proper
       emission spectra).
+
+  </details>
 
 - [x] **K3 — RGB→wavelength map for lights (single dominant λ).** *(DONE 2026-07-20, v0.10.0.)* Distinct from K1's *upsampling* (RGB → a full
       spectral power distribution): this maps an (r,g,b) colour to **one dominant wavelength** — a monochromatic /

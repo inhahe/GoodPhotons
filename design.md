@@ -105,6 +105,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `dApplyNormalMap` in the device `closestHit`) so every renderer and both devices
   perturb shading identically; tangents transform with instances (`instanceHitToWorld`,
   the device uploading a per-instance `Wm` = toWorld linear).
+- **`envmap.h` / `sky.h`** — infinite environment lighting. `EnvMap` turns an
+  equirectangular linear-RGB buffer into an importance-sampled directional emitter
+  (per-texel Jakob–Hanika spectral upsampling + a luminance·sinθ 2-D sampler);
+  `buildFromRgb` is the shared entry so both the image loader and analytic generators
+  use it. `sky.h` is the **Preetham analytic daylight sky**: the Perez five-parameter
+  distribution for luminance + CIE xy, scaled by turbidity/sun-elevation zenith values,
+  baked to an equirect image with a spectrally attenuated (Rayleigh + Ångström aerosol)
+  5778 K solar disk, then handed to `EnvMap::buildFromRgb` — so an analytic sky reuses
+  the entire env pipeline, including the GPU `DEnvMap` upload, for free. Magnitudes are
+  physical (the sun is ~10⁵× the sky) then normalised to a mean sky luminance of
+  `intensity`. (Efficient-directional-sun forward sampling is a logged follow-up.)
 - **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*` / `vdb_openvdb.cpp`** —
   participating media (bounded, density fields, superposition), HG + water-droplet
   (rainbow) phase functions, gradient-index bending, NanoVDB (`.nvdb`) + native OpenVDB

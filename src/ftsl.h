@@ -70,6 +70,7 @@
 #include "fbx.h"
 #include "upsample.h"
 #include "color.h"
+#include "sky.h"
 
 namespace ftsl {
 
@@ -3020,6 +3021,36 @@ private:
                 fail("env light: absolute `power`/`lumens` is not supported (the env's "
                      "phase-space weight depends on scene bounds); use `intensity` or "
                      "scale the `spd` instead"); return false;
+            }
+            // Analytic physical sky (Preetham): `sky preetham` / `kind preetham`, or
+            // simply the presence of `turbidity` / `sun_dir` / `sun_elevation`. Bakes
+            // an equirectangular Preetham daylight sky (with a spectrally attenuated
+            // solar disk) into an EnvMap, so it lights the scene exactly like an HDRI.
+            std::string kind = strOf(b, "kind"); if (kind.empty()) kind = strOf(b, "sky");
+            bool isSky = (kind == "preetham" || kind == "sky") ||
+                         find(b, "turbidity") || find(b, "sun_dir") || find(b, "sun_elevation");
+            if (isSky) {
+                Vec3 sunDir{0.3, 0.6, 0.2};
+                if (!vec3Of(b, "sun_dir", sunDir)) {
+                    // Elevation (deg above horizon) + azimuth (deg from +x toward +z).
+                    double el = dblOf(b, "sun_elevation", 45.0) * PI / 180.0;
+                    double az = dblOf(b, "sun_azimuth", 0.0) * PI / 180.0;
+                    sunDir = Vec3{std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)};
+                }
+                double turb = dblOf(b, "turbidity", 2.5);
+                double gAlb = dblOf(b, "ground_albedo", 0.3);
+                double inten = dblOf(b, "intensity", 1.0);
+                int res = (int)dblOf(b, "res", 1024.0);
+                if (res < 16) res = 16; if (res > 8192) res = 8192;
+                int sw = res, sh = res / 2;
+                std::vector<Vec3> img = sky::generatePreethamSky(sw, sh, sunDir, turb, gAlb, inten);
+                auto map = std::make_shared<EnvMap>();
+                std::string eerr;
+                if (!map->buildFromRgb(img, sw, sh, dblOf(b, "rotate", 0.0), 1.0, eerr)) {
+                    fail("env sky: " + eerr); return false;
+                }
+                L.scene.addEnvLight(std::move(map), binWidth_);
+                return true;
             }
             std::string file = strOf(b, "file");
             if (!file.empty()) {

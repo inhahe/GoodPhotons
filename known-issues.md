@@ -5,6 +5,24 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT — OPEN (2026-07-24): analytic sky (K2) bakes the physical solar disk into the env, so sun-lit surfaces converge slowly in forward modes
+
+The Preetham sky (`src/sky.h`, `light env { sky preetham … }`) bakes the solar disk into the
+equirectangular `EnvMap` at its **physical** magnitude (~10⁵× the mean sky luminance). Directly-viewed
+sky (including the sun) is read from the env background and is noise-free, and the diffuse sky dome
+converges normally, but **sun-lit diffuse surfaces are high-dynamic-range** and pick up firefly/shot
+noise that needs a large photon budget to denoise in the forward modes (A/B/C) — e.g. `scraps/sky_test.ftsl`
+at 400×400 did not reach 4% noise in thousands of GPU batches, while the sky itself was clean (CPU==GPU,
+std 2.8). This is **the same limitation ftrace has with any sunny HDRI** (a small ultra-bright env
+feature), not specific to the sky — it is consistent with the "lights like an HDRI" design, so it ships
+as-is. **Proper fix:** add a first-class **distant directional sun** emitter (a new `EmitterShape`) that
+emits *parallel* photons across the scene's projected cross-section in forward mode (every photon enters
+the scene, none wasted) and is next-event-estimated within its angular cone in the backward/MIS paths,
+with the sky dome (no baked hard disk) carrying only skylight. That separates the ~10⁵× sun from the env
+importance sampler and makes daylight scenes converge like any single-light scene. Requires touching the
+emitter enum + forward emission (`render.h`), backward NEE (`backward.h`), and the GPU mirror
+(`render_cuda.cu` `DEmitter` + emission + NEE) — a real feature, logged here until built.
+
 ### TECH-DEBT — DONE (2026-07-23): GPU VCM (mode U) downloads the whole light-vertex slab every pass (memory + PCIe overhead scales with resolution)
 
 **Resolved 2026-07-23 (0.39.1)** by implementing exactly proper-fix option (a): compaction and the
