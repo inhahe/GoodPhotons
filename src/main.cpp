@@ -148,6 +148,7 @@
 #include "mesh.h"
 #include "ftsl.h"
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
+#include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
 #ifdef HAVE_CUDA
@@ -3517,6 +3518,7 @@ static void printHelp(const char* prog) {
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
+"  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -h | --help           show this help and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
@@ -6772,6 +6774,17 @@ int main(int argc, char** argv) {
     // window closed" BSOD). Draining + resetting here closes that window.
     int rc;
     try {
+        // Native loom viewer (-viewer <sidecar.json>): open the ImGui/D3D11 GUI on a
+        // scene-introspection sidecar instead of rendering. Short-circuits the renderer.
+        for (int i = 1; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
+                    return 1;
+                }
+                return runViewerGui(argv[i + 1]);
+            }
+        }
         // Resident preview server (-serve): keep the process alive and re-render each
         // scene path streamed on stdin. Find the -in value slot to swap per frame.
         bool serve = false;

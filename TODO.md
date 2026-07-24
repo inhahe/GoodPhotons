@@ -1330,15 +1330,30 @@ replacement for the renderer or the primary editing tool.**
         (`tests/test_viewer.py`): contract loader (missing/non-callable/custom-name), clock passing/param
         forwarding, object kinds + dataset linking, path/grid/scatter coverage, DAG node/edge integrity,
         ViewerModel scene/introspect/declared-params/from-file/save-sidecar. 972 loom green.
-      - **Remaining (C++ host):** the selectable object list + panes are F2–F7 on the ImGui/ImPlot/imnodes +
-        `-raster-gpu` viewer. Recommended backend **Win32 + Direct3D 11** (ftrace is already Win32 → no new
-        windowing dep; mature CUDA↔D3D11 interop; a first cut can upload `kIsoPreview`'s host RGB to a dynamic
-        texture, with zero-copy interop as a later optimization).
-- [ ] **F2 — N-D curve 3-D view.** Show an N-D curve by picking **3 of N** dims to display. **Rotating
+      - **C++ host STARTED (F2 slice B):** the viewer is a **`-viewer <sidecar.json>`** mode of the ftrace
+        binary — **Win32 + Direct3D 11 + Dear ImGui** (vendored `src/third_party/imgui/`, added to the
+        `ftrace` CMake target, dispatched from `main()` → `src/viewer_gui.cpp`). It reads the sidecar via the
+        vendored `minijson` parser and shows the Scene/Objects/Datasets panels + a curve pane. ImPlot &
+        imnodes are vendored but not yet compiled (reserved for F3/F5). Remaining panes are F2 slice C + F3–F7.
+- [~] **F2 — N-D curve 3-D view.** Show an N-D curve by picking **3 of N** dims to display. **Rotating
       the displayed dims = a view-only transform** (no recompute); **rotating into other dims = recompute
       the projection.** Index markers along the curve show curve progression. **Stereoscopic viewing:**
       wall-eyed (L|R) and cross-eyed (R|L) side-by-side, plus **red-cyan anaglyph** — using the §I
       off-axis stereo machinery (shared with the renderer's still/movie stereo).
+      - **Slice A (loom) DONE** — the introspection sidecar now carries real curve geometry: every
+        path/tracked_path dataset gets `control_points` (the animated control points at the frame's clock)
+        and a display `polyline` (96 samples via the same `eval_curve` midpoint-quadratic-Bezier the engine
+        uses; a closed spine repeats its first point to wrap). Tested in `tools/loom/tests/test_viewer.py`.
+      - **Slice B (C++ host) DONE** — the native viewer now exists as a **`-viewer <sidecar.json>`** mode of
+        the ftrace binary (Dear ImGui + Win32 + Direct3D 11; vendored under `src/third_party/imgui/`, wired
+        into the `ftrace` CMake target, dispatched from `main()` in `src/viewer_gui.cpp`). It reads the F1/F2
+        sidecar with the vendored `minijson` parser and shows a Scene summary (camera/frame/lights/DAG
+        counts), an **Objects** table (name/kind/material/linked-dataset-ids), a **Datasets** table
+        (id/kind/detail), and a right-hand **curve pane** that draws every dataset's sampled polyline (with
+        control-point markers) in a drag-to-orbit / wheel-to-zoom orthographic projection.
+      - **Slice C (C++) TODO** — the real N-D pane: pick **3 of N** dims, view-only vs recompute rotation,
+        index markers along the curve; then the stereoscopic modes (wall-eyed / cross-eyed / anaglyph),
+        sharing the §I off-axis stereo machinery.
 - [ ] **F3 — scroll-locked strip charts (ImPlot).** Below the 3-D pane, one strip chart **per curve
       dimension** and one **per tacked-on channel** (TrackedCurve). Shared index markers along the bottom
       cross-reference the 3-D index dot. **All charts scroll left/right together (scroll-locked, never

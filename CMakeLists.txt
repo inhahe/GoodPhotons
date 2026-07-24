@@ -31,8 +31,16 @@ add_executable(ftrace
     src/third_party/ufbx.c   # vendored single-file FBX parser (MIT / public-domain), compiled as C
     src/gpda/tokenized.cpp        # vendored GPDA parser engine (J3c grammar-validation shim)
     src/gpda/ftsl_scene.gen.cpp   # GENERATED (loom.grammar.emit_cpp): shared .ftsl grammar graph + lexer table
+    src/viewer_gui.cpp            # -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
+    # --- vendored Dear ImGui core + Win32/D3D11 backends (the -viewer GUI) ---
+    src/third_party/imgui/imgui.cpp
+    src/third_party/imgui/imgui_draw.cpp
+    src/third_party/imgui/imgui_tables.cpp
+    src/third_party/imgui/imgui_widgets.cpp
+    src/third_party/imgui/backends/imgui_impl_win32.cpp
+    src/third_party/imgui/backends/imgui_impl_dx11.cpp
 )
-target_include_directories(ftrace PRIVATE src src/gpda)
+target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui)
 
 # The vendored GPDA engine + generated grammar are third-party/generated code;
 # don't hold them to ftrace's /W4 /permissive- bar (keeps the build-warning
@@ -40,7 +48,17 @@ target_include_directories(ftrace PRIVATE src src/gpda)
 if(MSVC)
     set_source_files_properties(
         src/gpda/tokenized.cpp src/gpda/ftsl_scene.gen.cpp src/third_party/lz4.c
+        src/third_party/imgui/imgui.cpp src/third_party/imgui/imgui_draw.cpp
+        src/third_party/imgui/imgui_tables.cpp src/third_party/imgui/imgui_widgets.cpp
+        src/third_party/imgui/backends/imgui_impl_win32.cpp
+        src/third_party/imgui/backends/imgui_impl_dx11.cpp
         PROPERTIES COMPILE_OPTIONS "/W0")
+endif()
+
+# The -viewer GUI links Direct3D 11 (+ DXGI). These import libs ship with the
+# Windows SDK, so no extra dependency — just name them on Windows.
+if(WIN32)
+    target_link_libraries(ftrace PRIVATE d3d11 dxgi d3dcompiler dwmapi)
 endif()
 
 # --- Optional CUDA backend (GPU forward light tracer, model B) ---------------

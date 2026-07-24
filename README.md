@@ -2270,6 +2270,15 @@ drive any renderer).
 See **[`tools/loom/README.md`](tools/loom/README.md)** for the tour, and
 `tools/loom/DESIGN.md` for the architecture.
 
+**Native viewer (`-viewer`).** ftrace doubles as loom's native scene viewer:
+`ftrace -viewer <scene.viewer.json>` opens a Dear ImGui / Direct3D 11 window on a loom
+**scene-introspection sidecar** (written by `loom.viewer.ViewerModel.save_sidecar`). It
+shows the scene's objects, datasets, camera/lights and modulator-DAG summary, and draws
+each curve dataset's sampled polyline in an orbitable 3-D pane — a structural view of the
+Python model with no browser/WebGL round-trip. (Early stage: the object/dataset/curve
+panes are up; the live `-raster-gpu` render pane, strip charts and DAG graph are in
+progress — see §F in `TODO.md`.)
+
 ---
 
 ## Known issues & roadmap
