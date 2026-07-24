@@ -1620,8 +1620,13 @@ ftrace's own language). Two follow-ups were captured:
           wired through `evalSpectrum` (`ftsl.h`) and mirrored in loom (`BoxSpec`, with tests). Validated by
           `-checkupsample` (box section, err <0.02, all reflectances clamped `[0,1]`). Reflectance upsampler →
           host-side bake, no GPU change.
-    - [ ] **Still open:** further upsamplers (Meng 2015) and a **named user mapping** — a
-          `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
+    - [ ] **Still open:** **Meng 2015** upsampler — BLOCKED on the paper's published precomputed
+          spectrum table (external data we don't vendor); an approximate reimplementation wouldn't be
+          faithful, so this waits on sourcing that asset. *(The **named user mapping** is effectively
+          covered: `spectrum "name" = <expr>` already registers a reusable named spectrum referenced via
+          `spectrum:name` (ftsl.h ~335/1239), and the new `rgb`/`rgbsmits`/`rgbbox`/`rgbillum`/`rgbline`
+          heads are exactly named `(r,g,b)->spectrum` functions — so the only residual is a user-supplied
+          custom basis, which is low-value given the built-ins and left out unless a scene needs it.)*
 
 - [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
       analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or
