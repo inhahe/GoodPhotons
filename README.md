@@ -35,11 +35,20 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
   **density fields** — either formula-defined blobs with soft edges *or* imported
-  **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
+  **OpenVDB `.vdb` / NanoVDB `.nvdb` volumes** (`density vdb:<file>`, read by a
+  built-in reader that dispatches on the file magic) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU) **and the backward reference (mode
   `R`) on both CPU and GPU** (GPU backward runs homogeneous *and* heterogeneous
   media natively, including spectral **rainbow-phase** media, and **gradient-index
   (GRIN) media** on the backward reference now run on GPU too).
+- **Volumetric blackbody emission ("fire")** — a medium with a `temperature vdb:`
+  grid + `emission blackbody` turns its hot voxels into a self-illuminating,
+  isotropic **volume emitter**: the flame glows (Planckian, temperature-hue-shifted)
+  and lights the rest of the scene with **no external light**. Multi-grid `.vdb`
+  files (the official OpenVDB *fire* sample's `density` + `temperature` grids) are
+  selected **by grid name**; `emission_kelvin`/`emission_scale` tune the colour
+  temperature and glow. Forward **CPU** (modes A/B/C, V/P forward layers); `-device
+  gpu`/`auto` falls back to the CPU for these scenes (GPU mirror pending).
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward

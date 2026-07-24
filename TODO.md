@@ -732,7 +732,7 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       (sparse) vs CPU (dense) energy balance identical (absorbed 0.0294 both). A one-line
       `[vdb] sparse device grid: …` footprint report prints once per grid. *(Host RAM still keeps the dense
       lattice for the CPU sampler; a sparse host representation is a possible future RAM win.)*
-- [~] **C3 VDB: fp16 + emission/temperature grids** (fire).
+- [x] **C3 VDB: fp16 + emission/temperature grids** (fire). **DONE 2026-07-24** (fp16 + forward-CPU fire).
       - [x] **fp16 dense-grid storage — DONE 2026-07-24.** The baked dense lattice (`VdbGrid::data`)
         is now `std::vector<uint16_t>` half-floats instead of `float`, halving host RAM and GPU VRAM
         for every imported `.vdb`/`.nvdb` volume. `vdbgrid.h` gains portable IEEE-754 binary16↔binary32
@@ -745,9 +745,31 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
         dependency, HIP-safe). Validated on the native smoke plume (`scraps/vdb_smoke_native.ftsl`):
         CPU vs GPU energy balance identical (absorbed 0.0294 both) and plume-region mean colour agrees
         to ~0.05% relative — within Monte-Carlo noise — confirming both half-decoders are correct.
-      - [ ] **emission/temperature grids (fire)** — still open. Density-only today. A hot-voxel
-        volumetric emitter (position-sampled photon emission from an emission/temperature grid across
-        forward CPU+GPU+backward NEE) is a large addition on the order of a new light type; not yet built.
+      - [x] **emission/temperature grids (fire) — DONE 2026-07-24 (forward CPU).** A medium may now
+        carry a `temperature vdb:<path>` grid + `emission blackbody` (+ `emission_kelvin`/`emission_scale`),
+        turning its hot voxels into a self-illuminating isotropic volume emitter. Multi-grid `.vdb` files
+        (the official OpenVDB *fire* sample: one `density` + one `temperature` float grid) are selected
+        **by grid name** — `loadOpenVDBGrid`/`loadVdbGrid`/vdbgrid.cpp take a `wantName` and the OpenVDB
+        reader now seeks each descriptor to the previous grid's `endPos` (descriptors are interleaved with
+        bodies, NOT contiguous — this was the bug that made the 2nd grid fail to load). `spectrum.h` adds
+        `blackbodyRadiance`/`blackbodyEmissionRadiance` (Planck normalised to a 6500 K/560 nm reference,
+        preserving physical T⁴ + Wien hue). `scene.h` `Medium` gains `temperature`/`tempPeak`/`emitKelvin`/
+        `emissionScale` + `emissive()`/`temperatureAt()`/`emissionAt()` (peak-normalised T=emitKelvin·raw/
+        tempPeak, default 1500 K); `Scene` gains `EmissiveVolume` + `finalizeEmissiveVolumes()` (a 20k-sample
+        Monte-Carlo estimate of each grid's mean emission `meanKe` and selection `power`=4π·V·meanKe·Δλ, plus
+        `totalEmissionPower`). Forward `tracePhoton` (render.h) picks emitter-vs-fire birth by power
+        (`grandTotal=totalPower+totalEmissionPower`; short-circuits with NO extra RNG when there are no
+        emissive volumes, so every non-fire scene stays bit-identical), and a fire photon is born at a
+        uniform AABB point + uniform λ + isotropic direction carrying **β=grandTotal·κ_e(x,λ)/meanKe** —
+        derived so the isotropic `1/(4π)/(dist²·Ω)` direct splat (`connectEmissionVolume`/
+        `connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission line-integral exactly.
+        The "scene has no light" guard (ftsl.h) now accepts an emissive volume. Validated on the official
+        fire sample (`scraps/vdb_fire.ftsl`, `png/vdb_fire.png`): the flame glows self-lit with the correct
+        red-edge/hot-core shape and no external light. **Still open:** the GPU forward mirror (device
+        genPhoton has no volume-birth branch + `DMedium` no temperature grid, so `cudaForwardSupported`
+        rejects emissive-volume scenes → `-device gpu`/`auto` falls back to CPU) and blackbody-λ importance
+        sampling to cut the per-photon spectral colour noise — both logged in known-issues.md. (Backward
+        R/V is N/A: it treats media as one homogeneous haze and never samples the grid.)
 - [x] **C4 VDB: native `.vdb` front-end** — DONE. `loadVdbGrid` dispatches on the file magic; a
       self-contained OpenVDB reader (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dep) parses the file
       container, `float 5_4_3` tree topology and BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand,

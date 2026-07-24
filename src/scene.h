@@ -826,6 +826,61 @@ struct Scene {
     EmissionSampler emitSampler;
     double emitG = 0.0;
 
+    // --- Volumetric blackbody emitters (fire) --------------------------------
+    // Any medium carrying a `temperature` grid is ALSO a self-illuminating
+    // isotropic volume emitter. Forward tracing treats each as a pseudo-emitter:
+    // with probability totalEmissionPower/(totalPower+totalEmissionPower) a photon
+    // is born inside the volume (uniform position in the grid's world AABB, uniform
+    // wavelength, isotropic direction) carrying beta = grandTotal·κ_e(x,λ)/meanKe,
+    // where κ_e = the medium's emissionAt(). The `power`/`meanKe` are estimated at
+    // build() by Monte-Carlo sampling the emission field; `power` only tunes the
+    // photon light-vs-fire split (it cancels in the physics), so the absolute fire
+    // brightness is set purely by emissionAt (i.e. by `emission_scale`).
+    struct EmissiveVolume {
+        int    mediumIndex = -1;
+        Vec3   bmin{0,0,0}, bmax{0,0,0};   // uniform-sampling AABB (temperature grid)
+        double meanKe = 0.0;               // mean emissionAt over bbox×band (β normaliser)
+        double power  = 0.0;               // 4π·V·meanKe·Δλ (selection weight)
+    };
+    std::vector<EmissiveVolume> emissiveVolumes;
+    double totalEmissionPower = 0.0;
+
+    // Estimate each emissive medium's mean emission and selection power. Called by
+    // build() after finalizeEmitters(). Cheap Monte-Carlo over the grid AABB × band.
+    void finalizeEmissiveVolumes() {
+        emissiveVolumes.clear();
+        totalEmissionPower = 0.0;
+        const double lamMin = LAMBDA_MIN, lamMax = LAMBDA_MAX, dLam = lamMax - lamMin;
+        for (size_t mi = 0; mi < media.size(); ++mi) {
+            const Medium& m = media[mi];
+            if (!m.emissive() || !m.temperature) continue;
+            const VdbGrid& g = *m.temperature;
+            Vec3 lo = g.wmin, hi = g.wmax;
+            double V = (hi.x-lo.x) * (hi.y-lo.y) * (hi.z-lo.z);
+            if (V <= 0.0) continue;
+            // Stratified-ish MC of emissionAt over the AABB × spectral band.
+            Pcg32 rng(0x1234abcdu ^ (uint32_t)mi, 0x9e3779b9u);
+            const int NS = 20000;
+            double sum = 0.0;
+            for (int s = 0; s < NS; ++s) {
+                Vec3 p{ lo.x + (hi.x-lo.x)*rng.uniform(),
+                        lo.y + (hi.y-lo.y)*rng.uniform(),
+                        lo.z + (hi.z-lo.z)*rng.uniform() };
+                double lam = lamMin + dLam * rng.uniform();
+                sum += m.emissionAt(p, lam);
+            }
+            double meanKe = sum / NS;
+            if (meanKe <= 0.0) continue;   // grid is entirely cold → no emission
+            EmissiveVolume ev;
+            ev.mediumIndex = (int)mi;
+            ev.bmin = lo; ev.bmax = hi;
+            ev.meanKe = meanKe;
+            ev.power = 4.0 * PI * V * meanKe * dLam;
+            totalEmissionPower += ev.power;
+            emissiveVolumes.push_back(ev);
+        }
+    }
+
     // Environment lighting. envIndex is the index into `emitters` of the single Env
     // emitter (or -1 if none). The scene bounding sphere (sceneCenter, sceneRadius,
     // from the BVH root) sizes forward env photon emission. `envMap` is non-null for
@@ -1082,6 +1137,7 @@ struct Scene {
                           * emitters[envIndex].spdFn(lam);
         }
         finalizeEmitters();
+        finalizeEmissiveVolumes();
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 

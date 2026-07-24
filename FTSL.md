@@ -809,15 +809,18 @@ medium {
   absorption and scattering together), so only the *amount* of fog varies in space,
   not its color.
 - **`density vdb:<path>`** — instead of a formula, sample the density from an imported
-  **NanoVDB** volume. `<path>` is an **unquoted** bareword path to a `.nvdb` file
-  (uncompressed, float grid): `density vdb:scraps/cloud.nvdb`. Convert a `.vdb` to
-  `.nvdb` with OpenVDB's `nanovdb_convert` (or generate a test asset with
-  `scraps/make_nvdb.cpp`). On load the grid is baked into a dense lattice + world→index
-  transform and sampled trilinearly — the *same* sampler on CPU and GPU. The grid's world
-  AABB auto-seeds the medium **bound** and its peak value the **majorant**, so no `bounds`
-  or `density_max` is needed (either still overrides). Values scale `sigma_t` just like the
-  formula form, so dial optical thickness with `sigma_t`. Only float grids; the dense bake
-  is memory-capped (see `known-issues.md`).
+  volume. `<path>` is an **unquoted** bareword path to either a native **OpenVDB** `.vdb`
+  file (read directly by the built-in reader — see §C4/known-issues for the supported blosc
+  codecs) **or** a **NanoVDB** `.nvdb` file (uncompressed, float grid): e.g.
+  `density vdb:scraps/cloud.nvdb` or `density vdb:scraps/_fire.vdb`. The loader dispatches on
+  the file magic, so no manual conversion is needed; `nanovdb_convert` (or `scraps/make_nvdb.cpp`)
+  still produces a `.nvdb` if you prefer. When a file holds **several** grids, the one whose
+  name matches the field is selected — `density vdb:fire.vdb` pulls the grid named `density`.
+  On load the grid is baked into a dense fp16 lattice + world→index transform and sampled
+  trilinearly — the *same* sampler on CPU and GPU. The grid's world AABB auto-seeds the medium
+  **bound** and its peak value the **majorant**, so no `bounds` or `density_max` is needed
+  (either still overrides). Values scale `sigma_t` just like the formula form, so dial optical
+  thickness with `sigma_t`. Only float grids; the dense bake is memory-capped (see `known-issues.md`).
 - **`density_max <v>`** — the delta/ratio-tracking majorant (an upper bound on the
   density over the region). If omitted it is auto-estimated on a 24³ grid over
   `bounds` (×1.3 safety), so a heterogeneous medium needs either a `bounds` box or an
@@ -842,6 +845,50 @@ to before.
 > P composite treat the medium as a single global homogeneous haze and **ignore** `density`
 > and `bounds` (the renderer warns when you do this). Render heterogeneous fog for those
 > modes with a forward mode instead.
+
+### Volumetric blackbody emission ("fire")
+
+A medium can also **emit** light: give it a `temperature` grid and an `emission` model and
+its hot voxels self-illuminate, so a flame glows with *no external light at all*.
+
+- **`temperature vdb:<path>`** — a second grid (same `.vdb`/`.nvdb` reader as `density`)
+  whose values drive the emission. A multi-grid `.vdb` (the official OpenVDB *fire* sample
+  carries both a `density` soot field and a `temperature` field in one file) is selected
+  **by grid name**: `temperature vdb:fire.vdb` pulls the grid literally named `temperature`
+  while `density vdb:fire.vdb` pulls `density`. The grid's own world AABB auto-seeds the
+  medium bound if none is set.
+- **`emission blackbody`** — make the hot voxels radiate as a Planckian blackbody,
+  hue-shifted by temperature (Wien) at the physical T⁴ magnitude (Stefan–Boltzmann),
+  normalised to a 6500 K / 560 nm reference so magnitudes stay tame. Requires a
+  `temperature` grid (else the loader errors).
+- **`emission_kelvin <K>`** — the temperature (Kelvin) assigned to the *hottest* voxel; the
+  grid is peak-normalised so every voxel's colour scales from this (default **1500**, a warm
+  orange flame). Fire `.vdb` temperature grids store arbitrary *relative* units, so this is
+  what sets the absolute colour temperature.
+- **`emission_scale <s>`** — a plain brightness multiplier on the emitted radiance
+  (default **1**). Dial the flame's overall glow with this.
+
+```
+# Self-illuminating fire — the emissive volume is the only light in the scene.
+medium {
+    sigma_t 8   albedo 0.5   g 0.3
+    density     vdb:fire.vdb        # soot: absorbs / scatters
+    temperature vdb:fire.vdb        # hot field: drives the glow
+    emission    blackbody
+    emission_kelvin 1500
+    emission_scale  4
+}
+```
+
+> **Mode support:** volumetric emission is a **forward-CPU** feature (modes **A/B/C** and the
+> forward layers of V/P). Each emissive medium becomes an isotropic volume emitter: photons are
+> born inside it (position-sampled over the temperature grid's AABB, wavelength-sampled across
+> the band) carrying the local Planck radiance, so the fire both shows directly *and lights the
+> rest of the scene* (soot self-scatter, nearby walls). An emissive volume counts as the scene's
+> light, so a fire needs no separate `light` block. The **GPU** forward tracer does not yet carry
+> the volume-birth branch, so `-device gpu`/`auto` **falls back to the CPU** for any scene with an
+> emissive volume (see `known-issues.md`). The backward reference (R/V) treats media as a single
+> homogeneous haze and never sees the grid, so render fire with a forward mode.
 
 ---
 

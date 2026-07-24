@@ -5,6 +5,37 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT — OPEN (2026-07-24): volumetric blackbody emission ("fire", C3) is forward-CPU-only — no GPU mirror
+
+The emissive-volume path (a `medium` with a `temperature vdb:` grid + `emission blackbody`) runs only on
+the **CPU forward** tracer (modes A/B/C, V/P forward layers). `cudaForwardSupported()` (render_cuda.cu)
+now returns **false** for any scene whose media include an `emissive()` medium, so `-device gpu`/`auto`
+**falls back to the CPU** (verified: `scraps/vdb_fire.ftsl` prints `auto -> CPU (… emissive 'fire'
+volume)` and renders correctly; without the gate the device `genPhoton` crashed with an illegal memory
+access because an emissive-only scene has `nEmitters==0` and indexed `sc.emitters[0]` out of bounds).
+**Proper fix (GPU mirror):** (1) add temperature/emission to `DMedium` — either a second sparse fp16
+brick grid (reuse the density brick uploader) or reuse the density grid + emission params
+(`emissionScale`/`emitKelvin`/`tempPeak`); (2) upload `Scene::emissiveVolumes` + `totalEmissionPower` into
+`DScene` (a `DEmissiveVolume[]` with `bmin/bmax/meanKe/power/mediumIndex`); (3) port `blackbodyEmissionRadiance`
++ `emissionAt` to the device; (4) add the volume-birth branch to `genPhoton` (power-weighted emitter-vs-fire
+split, uniform AABB point + uniform λ + isotropic dir, `β=grandTotal·κ_e/meanKe`) and an isotropic
+`connectEmissionVolume`/`connectEmissionLensVolume` device splat; (5) drop the `emissive()` clause from
+`cudaForwardSupported`. Mirrors the CPU code in `render.h` (`tracePhoton` volume-birth branch +
+`connectEmissionVolume`/`camSplatEmissionAll`) and `scene.h` (`EmissiveVolume`/`finalizeEmissiveVolumes`).
+
+### TECH-DEBT — OPEN (2026-07-24): fire emission uses uniform-λ sampling → per-photon spectral colour speckle
+
+A fire photon draws its wavelength **uniformly** over the spectral band, then carries
+`β = grandTotal·κ_e(x,λ)/meanKe`. Because a warm blackbody (default 1500 K) is heavily red-weighted, a
+green/blue photon is rare but still lands with a non-trivial β, so a partly-converged fire shows coloured
+(notably green) speckle in its hot core that only averages out to the correct orange with many samples.
+This is **variance, not bias** — the estimator is unbiased and the image converges correctly. **Proper fix:**
+importance-sample λ from a representative blackbody (e.g. Planck at `emitKelvin`) instead of uniformly, and
+divide β by the new pdf: `β = grandTotal·κ_e/(meanKe·Δλ·p(λ))`. When `p(λ) ∝ κ_e`-shape, β becomes nearly
+constant across λ and the colour noise collapses. Needs a small per-scene blackbody-CDF over the band
+(built in `finalizeEmissiveVolumes`) sampled in `tracePhoton`'s volume-birth branch (and mirrored on the GPU
+when that lands). Lives in `render.h` (volume-birth λ draw) + `scene.h` (the CDF).
+
 ### TECH-DEBT — OPEN (2026-07-24): analytic sky (K2) bakes the physical solar disk into the env, so sun-lit surfaces converge slowly in forward modes
 
 The Preetham sky (`src/sky.h`, `light env { sky preetham … }`) bakes the solar disk into the

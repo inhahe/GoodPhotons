@@ -838,9 +838,15 @@ public:
         for (const Block* mb : mediaBlocks) { if (!addMedium(*mb, L)) return false; }
         // A scene is lit if it has an explicit `light` block OR any emitter was
         // registered implicitly — e.g. an emissive mesh (a material with `emit` bound
-        // to a mesh registers a Mesh area light in addMesh).
-        if (!haveLight && L.scene.emitters.empty()) {
-            fail("scene has no light: add a 'light' block or an emissive ('emit') mesh");
+        // to a mesh registers a Mesh area light in addMesh) — OR it contains a
+        // self-illuminating volume (a medium with a `temperature` grid + `emission`),
+        // i.e. "fire": the hot voxels are the only light source.
+        bool haveVolumeEmission = false;
+        for (const Medium& m : L.scene.media)
+            if (m.emissive()) { haveVolumeEmission = true; break; }
+        if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission) {
+            fail("scene has no light: add a 'light' block, an emissive ('emit') mesh, "
+                 "or an emissive volume ('temperature' + 'emission blackbody')");
             return false;
         }
         // Catch errors recorded via fail() inside add* helpers that returned true

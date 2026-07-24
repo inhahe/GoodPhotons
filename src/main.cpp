@@ -2566,8 +2566,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
-                              "palette, parametric record, or oversized multilayer/mix "
-                              "material)";
+                              "palette, parametric record, oversized multilayer/mix "
+                              "material, or an emissive 'fire' volume)";
             if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else {

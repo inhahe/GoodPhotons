@@ -7934,6 +7934,13 @@ bool cudaForwardSupported(const Scene& scene) {
     // env (lat-long map: the 2D luminance CDF, per-texel JH coeff/scale, and mean
     // coeff/scale are uploaded, and the sampler/reweight are ported to the device) are
     // supported (increments 1b and 2c).
+    // Volumetric blackbody emission ("fire": a medium with a `temperature` grid +
+    // `emission`) is CPU-forward-only for now — the device genPhoton has no volume-birth
+    // branch and DMedium carries no temperature grid, so a scene containing an emissive
+    // volume falls back to the CPU forward tracer (which fully supports it). Without this
+    // gate an emissive-only scene (nEmitters==0) also indexes sc.emitters[0] out of
+    // bounds on-device. See known-issues.md (GPU fire).
+    for (const Medium& m : scene.media) if (m.emissive()) return false;
     return true;
 }
 

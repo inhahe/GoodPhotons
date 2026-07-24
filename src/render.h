@@ -665,6 +665,61 @@ struct Renderer {
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
+    // Model B camera splat for a VOLUME EMISSION vertex (blackbody "fire"). Identical
+    // geometry to connectVolume, but the in-scatter term albedo*phase is replaced by
+    // isotropic emission 1/(4π): the hot voxel radiates equally in all directions, so
+    // there is no incoming direction and no phase. `beta` already carries the emission
+    // strength (grandTotal·κ_e(x,λ)/meanKe); the /(dist²·Ω) converts the volume-birth
+    // integral into the emission line-integral seen by the pixel. Fog transmittance
+    // still applies (the flame's own soot self-absorbs its glow).
+    void connectEmissionVolume(const Scene& scene, const Camera& cam, Film& film,
+                               const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        Vec3 toCam = cam.eye - p;
+        double dist = length(toCam);
+        Vec3 wdir = toCam / dist;
+        int px, py; double cosCam, dist2;
+        if (!cam.project(p, px, py, cosCam, dist2)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        double omega = cam.pixelSolidAngle(cosCam);
+        double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
+        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Model A (finite-lens) camera splat for a volume emission vertex. As
+    // connectLensVolume, with the albedo*phase in-scatter term replaced by the isotropic
+    // 1/(4π) emission term.
+    void connectEmissionLensVolume(const Scene& scene, const Camera& cam, Film& film,
+                                   const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        double R = cam.apertureR;
+        double rr = R * std::sqrt(rng.uniform());
+        double a  = 2.0 * PI * rng.uniform();
+        Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        Vec3 toA = A - p;
+        double dist = length(toA);
+        if (dist < 1e-9) return;
+        Vec3 wdir = toA / dist;
+        double cosLens = -dot(wdir, cam.w);
+        if (cosLens <= 1e-6) return;
+        int px, py;
+        if (!cam.lensImage(A, wdir, px, py)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
+        contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Splat a volume-emission vertex to every camera (pinhole B or finite lens A).
+    void camSplatEmissionAll(const Scene& scene, const CamTarget* cams, int nCam,
+                             const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        for (int c = 0; c < nCam; ++c)
+            if (cams[c].cam && cams[c].film) {
+                if (lensMode) connectEmissionLensVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
+                else          connectEmissionVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
+            }
+    }
+
     // Route a camera connection to the pinhole (model B) or the finite lens (model A).
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                   const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
@@ -1319,11 +1374,62 @@ struct Renderer {
         // selection] reproduces each emitter's true power (unbiased). For a single
         // emitter selectEmitter() draws no randomness, keeping the RNG stream (and
         // thus the image) bit-identical to the pre-multi-light engine.
+        // A photon is born on a surface/environment EMITTER or inside a volumetric
+        // blackbody EMITTER ("fire"). grandTotal folds both power pools; the class is
+        // chosen with probability proportional to power (P(fire)=totalEmissionPower/
+        // grandTotal) and the photon carries beta=grandTotal so E[beta] reproduces each
+        // source's true power (unbiased carry-total scheme). When there are no emissive
+        // volumes the `&&` short-circuits WITHOUT drawing an RNG, so ordinary scenes stay
+        // bit-for-bit identical to the pre-fire engine.
+        const double grandTotal = scene.totalPower + scene.totalEmissionPower;
+        if (grandTotal <= 0.0) return;
+        Vec3 origin, dir;
+        double lambda, beta;
+        const bool volumeBirth = !scene.emissiveVolumes.empty() &&
+                                 (rng.uniform() * grandTotal < scene.totalEmissionPower);
+        if (volumeBirth) {
+            // --- Volumetric blackbody birth (fire) ---
+            // Select an emissive volume proportional to its power (linear CDF walk).
+            double r = rng.uniform() * scene.totalEmissionPower;
+            int vi = 0;
+            for (; vi + 1 < (int)scene.emissiveVolumes.size(); ++vi) {
+                r -= scene.emissiveVolumes[vi].power;
+                if (r <= 0.0) break;
+            }
+            const Scene::EmissiveVolume& ev = scene.emissiveVolumes[vi];
+            const Medium& fm = scene.media[ev.mediumIndex];
+            // Uniform position in the grid AABB and uniform wavelength over the band.
+            // beta = grandTotal·κ_e(x,λ)/meanKe reproduces the emission line-integral
+            // when splatted with the isotropic 1/(4π)/(dist²·Ω) direct term (derived).
+            origin = Vec3{ ev.bmin.x + (ev.bmax.x - ev.bmin.x) * rng.uniform(),
+                           ev.bmin.y + (ev.bmax.y - ev.bmin.y) * rng.uniform(),
+                           ev.bmin.z + (ev.bmax.z - ev.bmin.z) * rng.uniform() };
+            lambda = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * rng.uniform();
+            double ke = fm.emissionAt(origin, lambda);
+            beta = (ev.meanKe > 0.0) ? grandTotal * ke / ev.meanKe : 0.0;
+            e.emitted += beta;
+            if (beta <= 0.0) return;             // cold voxel: nothing to emit or transport
+            // Isotropic emission direction.
+            double z = 1.0 - 2.0 * rng.uniform();
+            double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
+            double phi = 2.0 * PI * rng.uniform();
+            dir = Vec3{ sr * std::cos(phi), sr * std::sin(phi), z };
+            // Direct-visibility emission splat (the flame seen directly by the camera).
+            if (nCam > 0 && !forwardCatch)
+                camSplatEmissionAll(scene, cams, nCam, origin, lambda, beta, rng);
+            // Fall through to the shared transport loop so the emitted light also
+            // illuminates the rest of the scene (self-scatter in the soot, walls, etc.).
+        } else {
+        // Power-weighted emitter selection: photon selects emitter k with prob
+        // power_k/totalPower and carries beta = totalPower, so E[beta over the
+        // selection] reproduces each emitter's true power (unbiased). For a single
+        // emitter selectEmitter() draws no randomness, keeping the RNG stream (and
+        // thus the image) bit-identical to the pre-multi-light engine.
         if (scene.emitters.empty()) return;
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 origin, emitN, dir;
+        Vec3 emitN;
         double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
         double envPdfW = 0.0;                    // env: solid-angle pdf of the sampled dir
         if (em.shape == EmitterShape::Spot) {
@@ -1369,11 +1475,13 @@ struct Renderer {
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
         double pdfL = 0.0;
-        double lambda = em.spd.sample(rng, pdfL);
+        lambda = em.spd.sample(rng, pdfL);
         if (pdfL <= 0) return;
-        // Single emitter: beta = its own power (== old lightEmitIntegral*area*PI).
-        // Multiple: beta = totalPower (see selection note above).
-        double beta = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
+        // Single emitter (no fire): beta = its own power (== old lightEmitIntegral*
+        // area*PI). Multiple emitters: beta = totalPower. When fire volumes coexist the
+        // emitter class carries grandTotal (carry-total split, see above).
+        beta = !scene.emissiveVolumes.empty() ? grandTotal
+             : ((scene.emitters.size() == 1) ? em.power : scene.totalPower);
         beta *= spotW;   // exactly 1.0 for non-spot emitters (no bit change)
         // Image env: replace the flat power with the directional estimator. The base
         // beta carries the mean env power; multiply by L(dir,lambda)/(4pi*pdfW*mean)
@@ -1395,6 +1503,7 @@ struct Renderer {
             camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
         }
+        }   // end emitter-birth branch
 
         Ray ray{origin + dir * 1e-6, dir};
         // Nested-dielectric medium stack: the solids the photon is currently inside.
