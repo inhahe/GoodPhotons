@@ -1,12 +1,14 @@
 """§F1 — the loom↔viewer data contract: load_build + scene introspection sidecar."""
 
 import json
+import sys
 import textwrap
 
 import pytest
 
 from loom.viewer import (
     SIDECAR_VERSION, load_build, build_scene, introspect, ViewerModel,
+    ViewerSession, serve_viewer,
 )
 from loom.signals.core import Clock
 from loom.scene import Scene, Camera, Material, Sphere, Light, tube
@@ -398,3 +400,115 @@ def test_viewer_model_save_sidecar_roundtrips(tmp_path):
 def test_viewer_model_rejects_non_callable():
     with pytest.raises(TypeError):
         ViewerModel(42)
+
+
+# --------------------------------------------------------------------------
+# §F4/§F7 — the viewer↔loom live re-introspection channel
+# --------------------------------------------------------------------------
+
+def _session():
+    return ViewerSession(ViewerModel(build))
+
+
+def test_session_introspect_inline_returns_sidecar():
+    ack = _session().handle({"cmd": "introspect"})
+    assert ack["ok"] is True
+    assert ack["sidecar"]["version"] == SIDECAR_VERSION
+    assert ack["sidecar"]["objects"]
+
+
+def test_session_introspect_reflects_clock_and_params():
+    ack = _session().handle({
+        "cmd": "introspect",
+        "clock": {"frame": 1, "frames": 4},
+        "params": {"radius": 0.3},
+    })
+    d = ack["sidecar"]
+    assert d["frame"] == {"frame": 1, "frames": 4}
+    # the SweptMesh is re-derived, carrying its tessellated geometry
+    worm = next(o for o in d["objects"] if o.get("name") == "worm")
+    assert worm["mesh"]["vertices"]
+
+
+def test_session_reintrospection_tracks_a_changing_param():
+    # different params must yield different geometry — the whole point of the
+    # live channel over a frozen sidecar. The SweptMesh's tube radius scales its
+    # tessellated vertices, so re-introspecting at a new radius moves them.
+    sess = _session()
+    a = sess.handle({"cmd": "introspect", "params": {"radius": 0.12}})
+    b = sess.handle({"cmd": "introspect", "params": {"radius": 0.40}})
+    va = next(o for o in a["sidecar"]["objects"] if o["kind"] == "swept_mesh")["mesh"]["vertices"]
+    vb = next(o for o in b["sidecar"]["objects"] if o["kind"] == "swept_mesh")["mesh"]["vertices"]
+    assert va != vb
+
+
+def test_session_introspect_out_writes_sidecar_file(tmp_path):
+    out = str(tmp_path / "live.viewer.json")
+    ack = _session().handle({"cmd": "introspect", "out": out})
+    assert ack == {"ok": True, "out": out}
+    with open(out) as f:
+        d = json.load(f)
+    assert d["version"] == SIDECAR_VERSION
+
+
+def test_session_params_advertises_declared_controls():
+    ack = _session().handle({"cmd": "params"})
+    assert ack["ok"] is True
+    assert ack["params"] == {"radius": 0.12}
+
+
+def test_session_unknown_cmd_and_errors_dont_crash():
+    assert _session().handle({"cmd": "nope"})["ok"] is False
+    # a bad param surfaces as an error ack, not an exception
+    bad = _session().handle({"cmd": "introspect", "clock": {"frames": "abc"}})
+    assert bad["ok"] is False and "error" in bad
+
+
+def test_serve_viewer_stdio_loop_roundtrips():
+    import io
+    reqs = "\n".join([
+        json.dumps({"cmd": "params"}),
+        json.dumps({"cmd": "introspect", "clock": {"frame": 0, "frames": 2}}),
+        json.dumps({"cmd": "quit"}),
+        json.dumps({"cmd": "introspect"}),   # after quit — must be ignored
+    ]) + "\n"
+    out = io.StringIO()
+    serve_viewer(_session(), io.StringIO(reqs), out)
+    lines = [json.loads(x) for x in out.getvalue().splitlines()]
+    assert len(lines) == 3                    # loop stops after quit
+    assert lines[0]["params"] == {"radius": 0.12}
+    assert lines[1]["sidecar"]["objects"]
+    assert lines[2] == {"ok": True, "bye": True}
+
+
+def test_serve_viewer_reports_bad_json_without_stopping():
+    import io
+    reqs = "not json\n" + json.dumps({"cmd": "quit"}) + "\n"
+    out = io.StringIO()
+    serve_viewer(_session(), io.StringIO(reqs), out)
+    lines = [json.loads(x) for x in out.getvalue().splitlines()]
+    assert lines[0]["ok"] is False and "bad json" in lines[0]["error"]
+    assert lines[1]["bye"] is True
+
+
+def test_viewer_main_smoke(tmp_path, capsys):
+    import loom.viewer as vmod
+    path = _write_scene_file(tmp_path, """
+        from loom.scene import Scene, Camera, Sphere, Material
+        def build(clock=None, *, r=1.0):
+            sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+            sc.add(Material("m", "diffuse"), Sphere((0, 0, 0), r, "m"))
+            return sc
+    """)
+    import io
+    orig = sys.stdin
+    sys.stdin = io.StringIO(json.dumps({"cmd": "params"}) + "\n"
+                            + json.dumps({"cmd": "quit"}) + "\n")
+    try:
+        rc = vmod.main([path, "r=3.0"])
+    finally:
+        sys.stdin = orig
+    assert rc == 0
+    outlines = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.strip()]
+    assert outlines[0]["params"] == {"r": 1.0}   # declared default, not the seed
+    assert outlines[-1]["bye"] is True

@@ -425,7 +425,7 @@ tools/loom/
     anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
-    viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1)
+    viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1) + live re-introspection server (F4/F7)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
   tests/                    unit tests (cycle detection, closed-curve seamlessness, slicer)
 ```

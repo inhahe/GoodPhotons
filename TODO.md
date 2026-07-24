@@ -1411,9 +1411,15 @@ replacement for the renderer or the primary editing tool.**
       - **Still open (deferred):** (1) **textures** (image *or* formula) — the UV checker is a
         placeholder; real texture display needs **G5** (materials don't emit their `skin`/`func_skin`
         texture into the sidecar yet). (2) **Re-tessellation when rotating *into* a parameter/extra
-        dimension** via a latest-wins off-thread job queue — architecturally blocked: the static-sidecar
-        viewer has no live loom eval, so it can't re-bake geometry. Needs the viewer↔loom live channel
-        (the `PreviewServer`↔`ftrace -serve` pipe) wired for on-demand re-introspection first.
+        dimension** via a latest-wins off-thread job queue. **Loom half DONE 2026-07-24** — the
+        viewer↔loom **live re-introspection channel** (`ViewerSession`/`serve_viewer` in
+        `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process
+        holds a `ViewerModel` and answers newline-delimited-JSON `introspect {clock,params}` requests
+        with a fresh sidecar (the thing the frozen sidecar can't do), mirroring `loom.anim.serve_live`
+        in the viewer→loom direction. 9 new tests (`tests/test_viewer.py`, 1004 loom green). **C++ half
+        still open** (best done with the user present): wire the `-viewer` GUI to spawn that process and
+        request re-introspection on rotate/scrub, feeding the new geometry through a latest-wins job
+        queue. Same channel unblocks F7's live field edit.
 - [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
       and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
       each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's

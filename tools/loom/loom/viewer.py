@@ -506,7 +506,132 @@ def _atomic_write_text(path: str, text: str) -> None:
         raise
 
 
+# ===========================================================================
+# the viewer↔loom live re-introspection channel  (§F4 / §F7)
+# ===========================================================================
+
+class ViewerSession:
+    """The loom side of the viewer↔loom **live re-introspection channel** (§F4/§F7).
+
+    The C++ ``-viewer`` GUI normally reads a **static** sidecar loom wrote once, so
+    it can *display* geometry but can't **re-derive** it — rotating into a parameter
+    dimension, scrubbing time, or editing a field all need geometry re-baked, which
+    the frozen JSON can't do (the architecturally-blocked half of F4's off-thread
+    re-tessellation and F7's live field edit).  This session holds a **resident**
+    :class:`ViewerModel` and answers the viewer's requests to re-introspect the
+    scene at a new clock / parameter values, handing back a fresh sidecar.
+
+    It processes one message ``dict`` and returns an ack ``dict``; the transport
+    (:func:`serve_viewer`, a newline-delimited-JSON stdio pipe) is separate, so the
+    protocol is unit-testable with in-memory data — mirroring
+    :class:`loom.anim.LiveSession` in the viewer→loom (re-introspection) direction.
+    Messages (``cmd``):
+
+    * ``introspect`` — ``{clock?:{frame,frames,open}, params?:{…}, out?:"path"}``:
+      re-derive the scene at that clock/params and introspect it.  With ``out`` the
+      sidecar JSON is written there (atomically) and the ack is ``{ok, out}``; else
+      the sidecar dict rides back inline as ``{ok, sidecar}``.
+    * ``params`` — ack ``{ok, params}``: the build's declared keyword controls
+      (name→default), so the viewer can build its parameter UI.
+    * ``quit`` — stop the serve loop; ack ``{ok, bye:true}``.
+    """
+
+    def __init__(self, model: ViewerModel) -> None:
+        self.model = model
+
+    def handle(self, msg: dict) -> dict:
+        cmd = msg.get("cmd")
+        try:
+            if cmd == "introspect":
+                return self._introspect(msg)
+            if cmd == "params":
+                return {"ok": True, "params": self.model.declared_params()}
+            if cmd == "quit":
+                return {"ok": True, "bye": True}
+            return {"ok": False, "error": f"unknown cmd {cmd!r}"}
+        except Exception as e:  # report, don't crash the pipe loop
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @staticmethod
+    def _clock(spec: Optional[dict]) -> Optional[Clock]:
+        if not spec:
+            return None
+        frame = int(spec.get("frame", 0))
+        frames = int(spec.get("frames", 1))
+        return Clock.at_frame(frame, frames, loop=not spec.get("open", False))
+
+    def _introspect(self, msg: dict) -> dict:
+        clock = self._clock(msg.get("clock"))
+        params = {str(k): v for k, v in (msg.get("params") or {}).items()}
+        sidecar = self.model.introspect(clock, **params)
+        out = msg.get("out")
+        if out:
+            _atomic_write_text(out, json.dumps(sidecar, indent=2))
+            return {"ok": True, "out": out}
+        return {"ok": True, "sidecar": sidecar}
+
+
+def serve_viewer(session: ViewerSession, in_stream=None, out_stream=None) -> None:
+    """Run the newline-delimited-JSON message loop over the given streams (default
+    the process's ``stdin``/``stdout``): read one JSON object per line, dispatch to
+    ``session.handle``, write one JSON ack per line, and stop after a ``quit`` (or
+    EOF).  Mirrors :func:`loom.anim.serve_live` and :class:`loom.PreviewServer`'s
+    one-message-per-line stdio convention, in the viewer→loom direction."""
+    in_stream = sys.stdin if in_stream is None else in_stream
+    out_stream = sys.stdout if out_stream is None else out_stream
+    for line in in_stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as e:
+            ack = {"ok": False, "error": f"bad json: {e}"}
+        else:
+            ack = session.handle(msg)
+        out_stream.write(json.dumps(ack) + "\n")
+        out_stream.flush()
+        if ack.get("bye"):
+            break
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry: ``python -m loom.viewer <scene.py> [name=value …]`` loads the
+    build and runs the resident re-introspection server (:func:`serve_viewer`) on
+    stdin/stdout.  ``key=value`` args seed the model's initial params (parsed as
+    JSON when possible, else kept as strings)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="loom.viewer",
+        description="Resident loom re-introspection server for the C++ -viewer GUI.")
+    parser.add_argument("scene", help="path to a loom scene file exposing build()")
+    parser.add_argument("--func", default="build",
+                        help="build callable name (default: build)")
+    parser.add_argument("param", nargs="*",
+                        help="initial params as name=value (value parsed as JSON)")
+    ns = parser.parse_args(argv)
+
+    params: Dict[str, Any] = {}
+    for item in ns.param:
+        if "=" not in item:
+            parser.error(f"param {item!r} is not name=value")
+        k, v = item.split("=", 1)
+        try:
+            params[k] = json.loads(v)
+        except json.JSONDecodeError:
+            params[k] = v
+
+    model = ViewerModel.from_file(ns.scene, func=ns.func, **params)
+    serve_viewer(ViewerSession(model))
+    return 0
+
+
 __all__ = [
     "SIDECAR_VERSION", "load_build", "build_scene", "introspect",
-    "ViewerModel",
+    "ViewerModel", "ViewerSession", "serve_viewer", "main",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

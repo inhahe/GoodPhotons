@@ -706,22 +706,38 @@ API, so it would require coupling to scipy's private compiled internals
 the small scatter sizes loom fields realistically use. `neighbors=` (local k-NN RBF) still
 mitigates cost for large point sets.
 
-### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
-**Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)
-can *reference* an existing NanoVDB grid via `density="vdb:<path>"`, but loom has no way to
-*generate* a `.nvdb` from a Python field or to wrap OpenVDB's tooling.
-
-- **What it would be.** A `loom` helper that bakes a loom `SpatialExpr` / `Grid` density field
-  into a NanoVDB `FloatGrid` on disk (dense or sparse), so a procedural cloud authored in loom
-  could ship as a real sparse asset instead of an inline `density "<expr>"`. Optionally a thin
-  wrapper over OpenVDB's `nanovdb_convert` for `.vdb → .nvdb`.
-- **Why we skip it now.** The procedural path already covers loom's sweet spot: an animated
-  density formula emits straight into `medium { density "<expr>" }` and renders unbiased on CPU
-  and GPU (validated by `scraps/_volume_test.py`). Baking to voxels only helps when a field is
-  too costly to evaluate per-sample or must interop with external VDB assets — neither is a
-  current need. The engine already imports `.nvdb` (`scraps/make_nvdb.cpp` makes test assets).
-- **When to revisit.** When a loom scene needs a genuinely sparse, prebaked cloud (huge extent,
-  expensive field, or sharing an asset with a DCC pipeline).
+### MOSTLY DONE (E4, 2026-07-24): loom VDB read/write — `loom.vdbio` (was DEFERRED 2026-07-18)
+**Status: the generator/reader is built (roadmap §E4); a few format variants remain open.**
+Originally deferred; superseded by `tools/loom/loom/vdbio.py`, a **loom-native OpenVDB `.vdb`
+encoder+decoder** (no OpenVDB/NanoVDB dependency — ftrace's reader is under our control too):
+- **Write:** `write_vdb` / `write_volume` / `bake_field` serialise dense `<f4` lattices to a
+  multi-grid `.vdb` ftrace ingests directly (`density vdb:<path>`). Codecs: full float32, **ZIP**
+  (zlib, interchange-only — ftrace is LZ4-only), **blosc** (LZ4+byte-shuffle, read by *both* loom
+  and ftrace → usable on the render path), and **half-float** (`Tree_float_5_4_3_HalfFloat`, read
+  by ftrace via the type suffix).
+- **Read:** `read_vdb` parses the ACTIVE_MASK/full/half/ZIP/blosc value codecs and the
+  axis-aligned transform maps real DCC tools emit (ScaleTranslate/UniformScaleTranslate/
+  UniformScale/Scale/Translation), validated against genuine third-party files
+  (`scraps/_smoke.vdb` Houdini blosc smoke, `_fire.vdb`, `_sphere.vdb`/`_cube.vdb` level sets).
+  Reader is numpy-vectorised (~20 s → 2.8 s on the four real samples).
+- **Still open (E4 leftovers, not yet built):**
+  1. **Rotated `AffineMap`/`UnitaryMap` grids** — currently *rejected* (a rotated transform can't
+     land samples on a dense axis-aligned array without resampling). Would need a resample-to-lattice
+     step on read.
+  2. **Vec3 grids** (`Tree_vec3s_5_4_3`, e.g. velocity/colour fields) — reader handles scalar
+     `Tree_float_5_4_3` only. **Note:** ftrace's volume path also ingests scalar float only
+     (`src/vdb_openvdb.cpp` rejects non-`Tree_float_5_4_3`), and none of the sample `.vdb`s carry
+     Vec3 data, so this is loom-completeness-only with no render-path consumer and no real file to
+     validate against — low priority until a concrete use appears.
+  3. **NanoVDB `.nvdb` ingest in loom** — loom `Volume` can *reference* a `.nvdb` for ftrace
+     (`density="vdb:<path>"`), and ftrace imports `.nvdb` natively, but `loom.vdbio` reads/writes
+     OpenVDB `.vdb` only (not the NanoVDB container).
+  4. **Sparse-storage transforms + sparse↔dense resampling** — `vdbio` reads a sparse `.vdb` into a
+     *dense* numpy array; the field-domain transforms E4 envisioned (N-D rotate-and-slice, warps,
+     resample between sparse and dense backings) are not implemented — only straight read/write.
+- **When to revisit each:** (1)/(4) when a DCC asset arrives with a rotated or genuinely-sparse
+  transform loom must keep; (2) when a loom or ftrace feature actually consumes a vector volume;
+  (3) if loom needs to author the NanoVDB container directly rather than via ftrace's importer.
 
 ### DEFERRED (2026-07-18): `PatOp::MatMulAdd` — a fused matrix·vec+offset pattern opcode (future optimization)
 **Status: intentionally not built. This is an optimization of an already-working path, not a
