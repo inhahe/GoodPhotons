@@ -1152,6 +1152,36 @@ in that site's axis set). **Open q (defer to scheduling):** the concrete `Animat
 how axis-set inference/annotation is represented in the loom struct + the on-disk projection; where the
 explicit reduction node and the video node sit in that taxonomy.
 
+**FOUNDATION DONE 2026-07-24 (`loom.axes`).** The deferred open-q (concrete node taxonomy + axis-set
+representation) is resolved with a small additive node set that sits *on top of* the existing scalar
+`Signal` DAG (no churn — all 891 prior tests stay green; 912 total now). An **`AxSignal`** is a pure
+function of a **point** (a `dict[str, float]` mapping axis names → coords) and carries `.axes`
+(`frozenset[str]`, its free variables). The four E5 pillars are implemented and tested
+(`tests/test_axes.py`, 21 tests):
+- **Axis-set inference + broadcast/pointwise** — `Ax(name)` coordinate leaves, `AConst` (axes ∅),
+  `AFn`/arithmetic compose with `axes = union(children)`. Evaluating at a point with *extra* axes ignores
+  them (broadcast, implicit); a *missing* required axis errors. Shared axes combine pointwise; the illegal
+  cross-`t` op is inexpressible (a node only ever sees the current point). No `t`-influences-`t` detector,
+  no spatial/temporal type split — exactly as the design demands.
+- **pin/mod edges + target-declared neutrals** — `Target(kind, [Binding(source, mode, gain)], base)` with
+  `kind ∈ {ADDITIVE (neutral 0, y+=g·x), GAIN (neutral 1, y*=x**g), BIPOLAR (neutral ½, ½-centred clamped)}`;
+  `mode='mod'` accumulates toward the neutral, `mode='pin'` is last-write-wins (gain blends). The target
+  declares its normalization, not the edge — so "mod" is one authoring mode resolving to the domain-correct
+  operator.
+- **sample/select grammar** — `Sample(fn, arg)` is the continuous `curve(t)` form (binds the curve's param
+  axis to `arg`, so `axes = arg.axes` and it broadcasts); `.comp(i)` picks a component (`curve(t).y`);
+  `select(items, i)` is the discrete constant `R.chan[i]` selector.
+- **The one cross-axis node** — `Reduce(body, axis, samples, op)` (`sum|mean|min|max|integral`) is the only
+  node that reads other points along an axis; `axes = body.axes - {axis}`. Explicit by construction; a plain
+  `AFn` can never smuggle in a cross-index read. (The cross-`t` "video node" already lives in `loom.xvideo`.)
+- **Bridge** — `Lift(signal)` wraps any legacy `{t}`-typed `Signal` into the axis layer, so the new model
+  composes with the whole existing DAG; `detect_signal_cycle`/`walk` duck-type over axial nodes too.
+
+**Still open (follow-ups):** folding the existing clock-parameterized interp curves (`LoopCurve`,
+`FieldCurve`, records) so `Sample` binds *their* param axis directly (rather than a plain callable);
+the on-disk `.ftsl` projection of axis annotations; and routing scene value-sites (E2's scene variables)
+through `Target`. These are additive on top of the `loom.axes` core.
+
 ### E6 — Quick mesh viewer: open a bare mesh in a ready-lit scene  ✅ DONE 2026-07-21  *(ftrace; user-proposed 2026-07-19)*
 **Shipped.** A bare positional mesh path — `ftrace model.glb` (also `.obj`/`.gltf`/`.fbx`/`.stl`/`.ply`) —
 now wraps the mesh in a synthesized auto-lit FTSL scene (neutral clay fallback material under a soft

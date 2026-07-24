@@ -36,6 +36,11 @@ from .mcubes import mesh_field
 from .vdbio import (
     write_vdb, read_vdb, bake_field, write_volume, VolumeGrid,
 )
+from .axes import (
+    AxSignal, Ax, AConst, Lift, AFn, Sample, select, Reduce,
+    Binding, Target, combine, as_ax,
+    ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S, AXIS_U, AXIS_V,
+)
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
     waves, checker, rings, blobs,
@@ -97,6 +102,9 @@ __all__ = [
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
     "mesh_field",
     "write_vdb", "read_vdb", "bake_field", "write_volume", "VolumeGrid",
+    "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
+    "Binding", "Target", "combine", "as_ax",
+    "ADDITIVE", "GAIN", "BIPOLAR", "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
     "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",

@@ -421,6 +421,7 @@ tools/loom/
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
     vdbio.py                bake a field to a dense grid + write/read .vdb (E4 write)
+    axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce (E5 core)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
@@ -565,6 +566,21 @@ tools/loom/
   (`scraps/make_loom_vdb.py` → `scraps/loom_smoke.vdb`, rendered by `scraps/loom_vdb.ftsl`;
   sparse device path `1000/1000 bricks active`, energy `sum/emitted=1.000000`). Still open: the
   general *read* side (arbitrary `.vdb`/`.nvdb`, blosc/half) and sparse-storage transforms.
+- **E5 (foundation) — Axis-typed signals (one influence model).** ✅ done (`loom/axes.py`). Resolves E5's
+  deferred open-q (node taxonomy + axis-set representation) with a small additive layer *on top of* the
+  scalar `Signal` DAG (no churn; 891 prior tests stay green). An `AxSignal` is a pure function of a **point**
+  (`dict[str,float]`, axis→coord) carrying `.axes` (`frozenset[str]`, its free variables). Composition unions
+  axes ⇒ **broadcast** on unshared axes is implicit (a `{t}` node ignores a point's `s`), **pointwise** on
+  shared ones, and the illegal cross-`t` op is *inexpressible* (no detector, no spatial/temporal type split).
+  Nodes: `Ax`/`AConst`/`Lift` (bridge a legacy `{t}` `Signal`) leaves; `AFn`+arithmetic; `Sample(fn,arg)`
+  (continuous `curve(t)`) + `.comp(i)` (`curve(t).y`) + `select(items,i)` (discrete `R.chan[i]`); the **only**
+  cross-axis node `Reduce(body,axis,samples,op)` (`axes = body.axes − {axis}`, explicit); and the pin/mod edge
+  model `Target(kind,[Binding(source,mode,gain)],base)` with target-declared neutrals (`ADDITIVE` 0 / `GAIN` 1
+  / `BIPOLAR` ½). Reuses `alloc_id`/`children`/`detect_signal_cycle`/`walk`. Tests: `tests/test_axes.py` (21:
+  axis inference, broadcast-shifts-whole-curve, sample/select, reduce sum/mean/min/max/integral, pin/mod
+  neutrals, cycle-detect over axial nodes). Follow-ups: fold clock-parameterized interp curves/records so
+  `Sample` binds their param axis directly, the `.ftsl` projection of axis annotations, and routing scene
+  value-sites (E2) through `Target`.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
