@@ -41,6 +41,9 @@ from .axes import (
     Binding, Target, combine, as_ax,
     ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S, AXIS_U, AXIS_V,
 )
+from .anim import (
+    CurveDrive, ChannelBinding, MODE_FLYBY, MODE_ANIMATION,
+)
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
     waves, checker, rings, blobs,
@@ -105,6 +108,7 @@ __all__ = [
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
     "Binding", "Target", "combine", "as_ax",
     "ADDITIVE", "GAIN", "BIPOLAR", "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V",
+    "CurveDrive", "ChannelBinding", "MODE_FLYBY", "MODE_ANIMATION",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
     "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",

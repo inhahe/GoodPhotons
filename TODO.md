@@ -994,6 +994,34 @@ user's design:
     decoupled/restartable processes are wanted); config over the **sidecar file**. Decide the final wire
     format when E2 is scheduled.
 
+**SLICE 1 DONE 2026-07-24 (`loom.anim`).** The channel-a config model + its sidecar projection + the
+channel-b value fan-out — the pure-Python go-between core, resolving OPEN Q1/Q2 (config lives in a loom
+struct with a JSON sidecar; the go-between is loom). Built on the E5 influence model (`loom.axes`), so E2
+value-routing *is* the E5 pin/mod edge model — the "E5 unifies E2/E4" tie-in made concrete. Pieces:
+- **`CurveDrive(dims, points, bindings, *, mode, closed, name)`** — the authoritative in-memory config:
+  dimension count, static starting control `points` (each a `dims`-tuple; point *modulation is out* per the
+  design — the editor owns the time axis), and `ChannelBinding` associations. `mode ∈ {MODE_FLYBY,
+  MODE_ANIMATION}`. Validates point dims and channel ranges.
+- **`ChannelBinding(channel, target, mode, gain, kind)`** — one channel→scene-variable edge; `mode`
+  (`pin`/`mod`), `gain`, and quantity `kind` (`ADDITIVE`/`GAIN`/`BIPOLAR`) are the E5 edge attributes.
+- **Sidecar round-trip** — `to_dict`/`from_dict` + `save`/`load` (versioned JSON, **atomic** temp-file +
+  `os.replace` so the editor never reads a half-written config; "scene proposes, editor disposes" —
+  associations round-trip through this file).
+- **`sample(t)`** — uniform Catmull-Rom over the control points (loom-side preview/tests; ftrace's editor is
+  the sampling authority in a live session), interpolating knots, closed-wrap or clamped-open.
+- **`apply(values, bases)`** / **`frame(t, bases)`** — fan the current sampled channel values out to
+  `{target: value}` via the bindings: several channels co-driving one target compose through an E5 `Target`
+  of the declared kind (domain-correct accumulate), with an optional authored `base` per target.
+
+19 tests (`tests/test_anim.py`: construction/validation, sidecar faithfulness + atomic write + version guard,
+Catmull-Rom knot/linear/closed/clamp, pin/mod/bipolar fan-out, multi-channel-one-target, base offset).
+**Remaining E2 slices:** (2) the live-value **stdio-pipe** channel between the editor (C++) and loom
+(extend the `loom.PreviewServer` precedent — editor pushes scrub values → loom emits that frame's `.ftsl`);
+(3) generalize ftrace's C++ `camera_curve` **editor** to seed from / write back the sidecar and target
+arbitrary scene variables (the interactive part). Also still to wire: routing a resolved `{target: value}`
+map into a `Scene` at emit (the binding targets are currently free-form strings; slice 2/3 pins the naming
+to real scene value-sites).
+
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
 models — (1) emit one sample value per time tick, vs. (2) random-access a sample array (`buf[t] += v`,
