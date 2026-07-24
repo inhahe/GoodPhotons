@@ -86,8 +86,8 @@ def build_scene(res=(480, 480)) -> Scene:
                              placement=_orbit(R, 0.0, i / n)))
 
     scene = Scene(Camera(
-        eye=(0.0, 2.6, 6.4), look_at=(0, 0, 0), up=(0, 1, 0),
-        fov_y=40, mode="R", res=res))
+        eye=(0.0, 1.1, 6.4), look_at=(0, 0, 0), up=(0, 1, 0),
+        fov_y=42, mode="R", res=res))
     scene.add(
         Material("shell_a", "diffuse", reflect="rgb 0.85 0.55 0.30"),
         Material("shell_b", "diffuse", reflect="rgb 0.35 0.65 0.85"),
@@ -95,14 +95,15 @@ def build_scene(res=(480, 480)) -> Scene:
         Material("shell_d", "diffuse", reflect="rgb 0.80 0.45 0.75"),
         Material("wall", "diffuse", reflect=0.72),
         room,
-        # an open-topped box room so the orbiting balls are lit from above.
+        # a bright open-fronted, open-topped-lit box so the orbiting balls are lit
+        # (front left open for the camera; a broad area light on the ceiling).
         Raw('quad { origin -3 -1.6 -3  u 6 0 0  v 0 0 6  material "wall" }'),   # floor
+        Raw('quad { origin -3  2.0 -3  u 6 0 0  v 0 0 6  material "wall" }'),   # ceiling
         Raw('quad { origin -3 -1.6 -3  u 6 0 0  v 0 3.6 0  material "wall" }'), # back
-        Raw('quad { origin -3 -1.6  3  u 6 0 0  v 0 3.6 0  material "wall" }'), # front
         Raw('quad { origin -3 -1.6 -3  u 0 0 6  v 0 3.6 0  material "wall" }'), # left
         Raw('quad { origin  3 -1.6 -3  u 0 0 6  v 0 3.6 0  material "wall" }'), # right
         Light("area",
-              origin="-1.4 1.95 -1.4", u="2.8 0 0", v="0 0 2.8",
+              origin="-2.2 1.98 -2.2", u="4.4 0 0", v="0 0 4.4",
               normal="0 -1 0", spd="preset:bb6500"),
     )
     return scene

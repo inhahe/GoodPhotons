@@ -758,8 +758,8 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       render-checked. **Scope now:** baked triangle geometry + normals + first UV set. **Not yet
       consumed** (follow-ups, logged in known-issues): FBX materials, skinning/blend-shapes, animation,
       multiple UV sets, per-face materials.
-- [ ] **C9 Alembic (`.abc`) import** — heavy SDK (Imath + HDF5/Ogawa); **deferred**, decide if an
-      OBJ/glTF/FBX sequence suffices before taking the build weight.
+- [~] **C9 Alembic (`.abc`) import** — **DON'T DO FOR NOW (user, 2026-07-24).** Heavy SDK (Imath +
+      HDF5/Ogawa); an OBJ/glTF/FBX sequence suffices for now. Revisit only if a real `.abc` asset needs it.
 
 ---
 
