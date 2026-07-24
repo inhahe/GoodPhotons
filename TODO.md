@@ -1131,22 +1131,29 @@ Validated: loom round-trip is **bit-exact** (full float32, no lossy step); 6 tes
 field to `scraps/loom_smoke.vdb`, and `scraps/loom_vdb.ftsl` renders it on both CPU and GPU (sparse device
 path `1000/1000 bricks active`, energy `sum/emitted=1.000000`).
 
-**READ codecs — half + ZIP DONE 2026-07-24 (`loom.vdbio`).** First slice of the general read side: loom now
-reads *and* writes the two stdlib-only OpenVDB codecs beyond the plain full-float subset (no external dep):
-- **half-float** (`write_vdb(..., half=True)` / `write_volume(..., half=True)`) — 16-bit voxels, grid type
-  `Tree_float_5_4_3_HalfFloat`. Halves the file and is **read directly by ftrace** (which flags half by the
-  type suffix) and any OpenVDB tool. `read_vdb` decodes it (`np.float16`→float64). Cross-validated: ftrace
-  ingests `scraps/loom_smoke_half.vdb` (`peak 0.9174`, matching loom's full-float 0.9165 at half precision;
-  1.16 MB vs 2.19 MB).
-- **ZIP** (`write_vdb(..., zip=True)`) — each value buffer zlib-deflated with OpenVDB's int64 length prefix
-  (negative = stored uncompressed). **Bit-exact** round-trip through `read_vdb` and any OpenVDB tool; *not*
-  read by ftrace (LZ4-only) so it's for interchange, not the render path.
-- The codec layer mirrors ftrace's `io::readData`/`readCompressedValues` (`src/vdb_openvdb.cpp`); default
-  output (both off) stays **byte-for-byte** the original file (test-asserted). 6 new tests (988 loom green).
+**READ codecs — half + ZIP + blosc + diagonal maps DONE 2026-07-24 (`loom.vdbio`).** The general read side:
+loom now reads (and writes) the OpenVDB value codecs and axis-aligned transform maps real DCC tools emit —
+**validated against genuine third-party files** (`scraps/_smoke.vdb` Houdini blosc smoke, `_fire.vdb`
+density+temperature, `_sphere.vdb`/`_cube.vdb` UniformScaleMap level sets all read):
+- **half-float** (`half=True`) — 16-bit voxels, grid type `Tree_float_5_4_3_HalfFloat`. Halves the file and
+  is **read directly by ftrace** (which flags half by the type suffix). Cross-validated: ftrace ingests
+  `scraps/loom_smoke_half.vdb` (`peak 0.9174` vs loom 0.9165; 1.16 MB vs 2.19 MB) and renders it.
+- **ZIP** (`zip=True`) — value buffers zlib-deflated (OpenVDB int64 length prefix, negative = uncompressed).
+  **Bit-exact** round-trip; read by any OpenVDB tool but *not* ftrace (LZ4-only) → interchange-only.
+- **blosc** (`blosc=True`) — the DCC-standard codec. **Read** via the installed `blosc` package (handles
+  BloscLZ/LZ4/Zlib/Zstd + shuffle — the full range; soft dep, clear install hint if absent). **Written** as
+  LZ4 + byte-shuffle so it's read by **both** loom and ftrace → usable on the render path. Cross-validated:
+  ftrace ingests `scraps/loom_smoke_blosc.vdb` (`peak 0.9173`) and reads the real Houdini `_smoke.vdb`.
+- **Transform maps**: ScaleTranslate/UniformScaleTranslate/UniformScale/Scale/Translation (the diagonal,
+  axis-aligned maps that keep samples on a regular lattice); a rotated `AffineMap` is rejected (can't land on
+  a dense axis-aligned array). OpenVDB `0x1e` unique-name suffixes are stripped.
+- The codec/map layer mirrors ftrace's `io::readData`/`readCompressedValues`/`readTransform`
+  (`src/vdb_openvdb.cpp`); default output stays **byte-for-byte** the original file (test-asserted). The
+  reader's per-voxel mask-expand + dense-fill loops were **vectorised** (numpy `unpackbits` + boolean scatter,
+  bit-identical) — reading all four real samples dropped ~20 s → 2.8 s. 13 new tests (995 loom green).
 
-**Still open:** **blosc**-compressed grids (the common DCC codec — Houdini/Blender default; `read_vdb` raises
-`NotImplementedError`, needs the `blosc` package or a loom LZ4 decoder); arbitrary transform maps beyond
-ScaleTranslate; **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; and resampling sparse↔dense.
+**Still open:** rotated `AffineMap`; **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; and
+resampling sparse↔dense.
 
 ### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,

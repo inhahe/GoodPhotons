@@ -204,6 +204,65 @@ def test_write_volume_threads_codec_flags():
     assert arr.max() > 0.5           # gaussian peak survived the round-trip
 
 
+def test_zip_and_blosc_mutually_exclusive():
+    v = _blob(16, 16, 16)
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(ValueError):
+            vdbio.write_vdb(os.path.join(d, "x.vdb"),
+                            [vdbio.VolumeGrid("density", v, box)],
+                            zip=True, blosc=True)
+
+
+# ---- blosc codec (the DCC-standard codec; needs the `blosc` package) --------
+blosc = pytest.importorskip("blosc")
+
+
+def test_blosc_roundtrip_is_bit_exact_and_smaller():
+    vol = _blob()
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    sub, _, _ = _positive_subbox(vol)
+    plain, _, size_plain = _rt(vol, box)
+    arr, _, size_bl = _rt(vol, box, blosc=True)
+    assert float(np.abs(arr - sub).max()) == 0.0      # LZ4 is lossless
+    assert float(np.abs(arr - plain).max()) == 0.0
+    assert size_bl < size_plain
+
+
+def test_blosc_half_together_is_close():
+    vol = _blob()
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    sub, _, _ = _positive_subbox(vol)
+    arr, _, _ = _rt(vol, box, blosc=True, half=True)
+    assert arr.shape == sub.shape
+    assert float(np.abs(arr - sub).max()) < 2e-3
+
+
+# ---- real third-party sample files (validate against genuine DCC output) ---
+# These live in scraps/ (git-ignored) on the dev machine; skip where absent.
+# tests/ → loom/ → tools/ → repo-root, then scraps/
+_SCRAPS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))), "scraps")
+
+
+@pytest.mark.parametrize("fname,grids", [
+    ("_smoke.vdb", {"density"}),          # blosc-compressed (Houdini smoke)
+    ("_fire.vdb", {"density", "temperature"}),  # multi-grid, unique-name suffix
+    ("_sphere.vdb", {"ls_sphere"}),       # UniformScaleMap level set
+    ("_cube.vdb", {"ls_cube"}),           # UniformScaleMap level set
+])
+def test_reads_real_sample_vdb(fname, grids):
+    path = os.path.join(_SCRAPS, fname)
+    if not os.path.exists(path):
+        pytest.skip(f"sample {fname} not present")
+    back = vdbio.read_vdb(path)
+    assert set(back) == grids
+    for name, (arr, box6) in back.items():
+        assert arr.ndim == 3 and min(arr.shape) > 0
+        assert float(arr.max()) > 0.0
+        assert box6[3] > box6[0] and box6[4] > box6[1] and box6[5] > box6[2]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
