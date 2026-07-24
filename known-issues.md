@@ -5,31 +5,32 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH-DEBT — OPEN (2026-07-23): GPU VCM (mode U) downloads the whole light-vertex slab every pass (memory + PCIe overhead scales with resolution)
+### TECH-DEBT — DONE (2026-07-23): GPU VCM (mode U) downloads the whole light-vertex slab every pass (memory + PCIe overhead scales with resolution)
+
+**Resolved 2026-07-23 (0.39.1)** by implementing exactly proper-fix option (a): compaction and the
+merge-grid build now run **entirely on-device** (thrust `exclusive_scan`/`inclusive_scan` over
+`lvCount` → `pathBegin`/`pathEnd`, a scatter kernel packs the slab into a tight compact array, a
+float bbox `transform_reduce` + `kVcmCellKey` + **stable** `sort_by_key` + `lower_bound` reproduce
+`VcmGrid::build`'s counting sort type-for-type). Only a single 4-byte vertex count crosses PCIe per
+pass (was ~69 MB down + ~27 MB up at 256², plus per-pass cudaMalloc/Free churn — now grow-only
+buffers + a thrust arena allocator, zero steady-state device mallocs). The stable sort preserves the
+host counting sort's exact output order and the grid geometry repeats the host float/double mixed
+expressions, so the result is **byte-identical PNGs** vs the 0.39.0 baseline (validated on
+`cornell.ftsl` mode U). The SPPM session got the same treatment (photon grid built on-device, cie
+fold via double device twins of `color.h` — one ±1/255 pixel in 65,536 from CUDA-vs-MSVC `exp` ulp).
+
+<details><summary>Original entry (for context)</summary>
 
 Logged while implementing M12 (GPU VCM, `VcmSession` in render_cuda.cu). The device stores each
 light subpath's connectible vertices into a **per-path slab** `lvSlab[i·vcmCap + k]` (one fixed
 `vcmCap = maxDepth = 8`-vertex slice per pixel, chosen to avoid cross-thread atomics), and each
 pass `vcmSessionPass` **downloads the entire slab plus the per-path counts** and compacts it on
 the host into contiguous per-path ranges before rebuilding the merge grid and uploading it back —
-mirroring the SPPM session's download-photons-then-host-build pattern. This is correct and matches
-the CPU exactly (validated GPU==CPU on `absolute.ftsl`: mean luminance ratio 0.9993), but it has
-two costs that grow with resolution:
+mirroring the SPPM session's download-photons-then-host-build pattern. Costs: slab memory
+`npix · vcmCap · sizeof(DVcmLV)` (~64 MB at 256², ~1 GB at 1024²) and the full slab copied
+device→host every pass plus compacted array + grid host→device.
 
-- **Memory:** the slab is `npix · vcmCap · sizeof(DVcmLV)` (~128 B/vertex) = ~64 MB at 256², ~256 MB
-  at 512², ~1 GB at 1024². Fine on a 4090 at validation resolutions, but a large render could exhaust
-  device memory.
-- **Per-pass PCIe traffic:** the full slab is copied device→host every pass regardless of how few
-  slots are actually filled (most pixels store far fewer than `vcmCap` vertices), plus the compacted
-  array + grid are copied host→device — so a high pass count pays this round-trip repeatedly.
-
-**Proper fix (if ever warranted):** either (a) compact on-device (a prefix-sum over `lvCount` to
-pack vertices into a tight array, then download only the filled prefix — or skip the download
-entirely and build the grid on-device with a device counting sort), or (b) size the slab from a
-cheap first-pass occupancy estimate instead of the worst-case `vcmCap`. Deferred because the simple
-download-and-host-build is correct, matches the SPPM path, and is comfortably within budget at the
-resolutions VCM is used at today. Repro: render any mode-U scene `-device gpu` at increasing `-res`
-and watch device memory / per-pass time.
+</details>
 
 ### TECH-DEBT — OPEN (2026-07-23): mode-R GPU GRIN has a small bent-region float-vs-double residual (does not converge with spp)
 

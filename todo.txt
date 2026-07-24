@@ -20,16 +20,24 @@ we can have options to ignore certain things in the scene that would slow it dow
 then:
 Opus: Make sure the GPU version of the new RGB raytracer, in both ignoring features mode and not ignoring features mode, is fully implemented on GPU
 Opus: Go through all the rendering modes and see if any of them have CPU fallbacks for unsupported features that could be implemented in GPU mode.
-^ doing
-When Opus finishes, tell it: Update the .md file you wrote explaining all the various CPU fallbacks to reflect the new GPU support additions.
-Fable: The backward raytracer was made to support more features on the GPU path, and a new RGB-mode backward raytracer was made, with options to ignore certain scene features for speed. Optimize the GPU-intensive spots for the new features in the GPU path for the old backward raytracer and also the CPU- and GPU-intensive spots for the new RGB backward raytracer, CPU and GPU modes, and when you're done, show me speedup percentages.
-Fable: Also, we did 
+^ done
+
+--
+
+Fable: 
+You are now running model Fable 5.
+The backward raytracer was made to support more features on the GPU path, and a new RGB-mode backward raytracer was made, with options to ignore certain scene features for speed. 
+Also, we did 
 Image-based env NEE in GPU backward — sampler already on device, just wire it into bkNeeEnv. Also unblocks mode P camera-side.
 Env term in the mode-M GPU gather — small kernel addition, unblocks env-lit photon maps.
 GPU SPPM — reuses existing deposit + gather kernels; biggest quality-mode win.
 Mode-M final gather on GPU — high value, more work.
 Longer tail: rainbow media on device, GPU BDPT per-hit BSDFs, GRIN marcher, GPU VCM.
+
+Optimize the GPU-intensive spots for the new features in the GPU path for the old backward raytracer and also the CPU- and GPU-intensive spots for the new RGB backward raytracer, CPU and GPU modes, and the GPU-intensive spots of the five other things that were modified. You've already optimized these, but their new modifications may need optimizing.
+When you're done, show me speedup percentages for the specific features you optimized.
 --
+^ doing
 
 when rendering a flyby / multiple cameras, make sure the terminal shows which stages of the render are being shared between frames (or if none are) and whether grainy noise is shared between cameras, since these seem to differ according to which mode is used
 

@@ -2501,13 +2501,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // Mode R has its own GPU support check: the backward reference megakernel
             // (with the physical mesh-lens as a ray-gen front-end) covers area/sphere/
             // cylinder Lambertian AND point-spot lights, textured/specular materials,
-            // participating media (homog+heterog), fluorescence, and BOTH a constant
-            // and an image-based env light (M1). Collimated beams, GRIN / rainbow media
-            // still fall back to the CPU backward tracer.
+            // participating media (homog+heterog, incl. rainbow phase — M10), GRIN
+            // marching (M11), fluorescence, and BOTH a constant and an image-based env
+            // light (M1). Collimated beams still fall back to the CPU backward tracer.
             if (!cudaBackwardSupported(scene, cam)) {
                 const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(collimated light, GRIN or "
-                                  "rainbow/dispersive media, or a lens deeper than the "
+                                  "(collimated light, or a lens deeper than the "
                                   "device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
@@ -2517,10 +2516,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             cudaDeviceName());
             }
         } else if (!gpuForwardMode) {
-            // Modes M (shared/flyby gather) and S (SPPM) run their OWN device gating in their
-            // dispatch blocks below, so don't claim "CPU-only" here — that would be wrong for
-            // an S render that then picks the GPU. Stay quiet and let the mode decide.
-            if (mode != 'M' && mode != 'S') {
+            // Modes M (shared/flyby gather), S (SPPM) and U (VCM) run their OWN device gating
+            // in their dispatch blocks below, so don't claim "CPU-only" here — that would be
+            // wrong for an S/U render that then picks the GPU. Stay quiet and let the mode decide.
+            if (mode != 'M' && mode != 'S' && mode != 'U') {
                 const char* why = "unsupported mode - CPU-only path";
                 if (wantGpu) std::fprintf(stderr,
                     "[device] GPU can't accelerate this render: %s; using CPU\n", why);

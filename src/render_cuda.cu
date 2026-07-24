@@ -53,6 +53,27 @@
 #include <math.h>
 #include <float.h>
 
+// Thrust (CCCL under CUDA, rocThrust under HIP — same headers/namespaces) provides the
+// device scan/sort/search primitives for the ON-DEVICE VCM/SPPM grid builds: exclusive_scan
+// (per-path vertex offsets), stable_sort_by_key (cell-id counting-sort twin — stable radix
+// sort reproduces the host counting sort's exact order), lower_bound (cellStart offsets),
+// and transform_reduce (bbox / max-radius reductions). FT_THRUST_PAR(alloc) is the
+// backend-parallel execution policy carrying our arena allocator so thrust's temporary
+// storage stops churning cudaMalloc/cudaFree every pass.
+#include <thrust/execution_policy.h>
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/sequence.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/binary_search.h>
+#include <thrust/iterator/counting_iterator.h>
+#if defined(FTRACE_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+  #define FT_THRUST_PAR(alloc) thrust::hip::par(alloc)
+#else
+  #define FT_THRUST_PAR(alloc) thrust::cuda::par(alloc)
+#endif
+
 #include "render_cuda.h"
 #include "render_progress.h"
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
@@ -1981,13 +2002,18 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
 
+// `tCap` bounds the search: only hits with t < tCap are found (h.t and the traversal
+// tMax both start there, so every primitive/box test prunes against it — a caller that
+// only cares about "anything within d?" skips nearly the whole tree). Default BIG keeps
+// every existing call site's behaviour bit-identical. Used by dGrinMarch, whose per-step
+// query only consumes hits within one Eikonal step length.
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
-                                   Real tmin = RAY_EPS) {
-    DHit h; h.t = BIG; h.valid = false; h.matId = 0; h.sensorId = -1;
+                                   Real tmin = RAY_EPS, Real tCap = BIG) {
+    DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
     if (sc.nNodes == 0) return h;
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
     const DTriShear sh = makeTriShear(rd);
-    Real tMax = BIG;
+    Real tMax = tCap;
     // Push-time slab tests + pop-time scalar prune (see blasClosest).
     int stack[64]; Real tStack[64]; int sp = 0;
     Real tRoot;
@@ -2064,11 +2090,13 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
             const DMedium& md = sc.media[mi];
             if (md.enabled && md.iorN > 0 && dMedInside(md, cro)) { gm = mi; break; }
         }
-        DHit hs = closestHit(sc, cro, crd);
-        double dS = hs.valid ? (double)hs.t : 1e30;
         if (gm < 0) {
             // Outside any GRIN region: jump to the nearest GRIN entry before the next
-            // surface, else stop (straight-ray body takes over).
+            // surface, else stop (straight-ray body takes over). This branch needs the
+            // full-range closest hit (dS bounds the entry search) but runs only at
+            // region entries, not per Eikonal step.
+            DHit hs = closestHit(sc, cro, crd);
+            double dS = hs.valid ? (double)hs.t : 1e30;
             double bestTa = 1e30; int bestM = -1;
             for (int mi = 0; mi < sc.mediaN; ++mi) {
                 const DMedium& md = sc.media[mi];
@@ -2083,6 +2111,18 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
         }
         const DMedium& g = sc.media[gm];
         double ds = g.iorStep;
+        // Inside a GRIN region the ONLY question is "surface within one step?", so cap
+        // the whole BVH walk at one step length: tcap is the smallest Real STRICTLY
+        // greater than ds, making "found under the cap" ⟺ "(double)t <= ds" — exactly
+        // the uncapped acceptance below, while pruning essentially the entire tree on
+        // each of the up-to-10^5 Eikonal steps a ray spends inside the lens.
+        Real tcap = (Real)ds;
+#if FTRACE_GPU_FP32
+        if ((double)tcap <= ds) tcap = nextafterf(tcap, FLT_MAX);
+#else
+        tcap = nextafter(tcap, DBL_MAX);
+#endif
+        DHit hs = closestHit(sc, cro, crd, RAY_EPS, tcap);
         if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
@@ -6184,9 +6224,13 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         if (Le <= 0.0) return 0.0;
         DVec3 wo = normalize(eye[t - 2].p - pt.p);
-        double cosSurf, f; DVec3 o;
+        // Cheap sidedness/terminator rejects and the shadow ray run FIRST; the BSDF/phase
+        // eval (texture fetches, lobe math) is deferred until the connection is known
+        // unoccluded. occluded() consumes no RNG and the eval is deterministic, so the
+        // reorder is bit-identical — it only skips work for shadowed connections.
+        double cosSurf, stG = 1.0; DVec3 o;
         if (pt.type == BV_MEDIUM) {
-            cosSurf = 1.0; f = dMediumScatterF(sc, pt, wo, wi, lambda); o = pt.p;
+            cosSurf = 1.0; o = pt.p;
         } else {
             cosSurf = ddot(pt.ns, wi);
             // Two-sided eye vertex may connect to the light through its transmit lobe (back
@@ -6196,18 +6240,18 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // Geometric-hemisphere softening on the eye/radiance vertex (matches CPU bdpt.h):
             // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1);
             // skipped for two-sided (transmissive) materials.
-            double stG = 1.0;
             if (!twoSided) {
                 DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
                 stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
                 if (stG <= 0.0) return 0.0;
             }
-            f = dBsdfF(sc, pt, wo, wi, lambda) * stG;
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
-        if (f <= 0.0) return 0.0;
         if (occluded(sc, o, wi, (Real)(dist - 2e-6))) return 0.0;
+        double f = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, lambda)
+                                          : dBsdfF(sc, pt, wo, wi, lambda) * stG;
+        if (f <= 0.0) return 0.0;
         double pdfChoice = em.power / sc.totalPower;
         double pdfA = pdfChoice / em.area;
         if (pdfA <= 0.0) return 0.0;
@@ -6227,9 +6271,13 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         DVec3 woE = normalize(eye[t - 2].p - pt.p);
         DVec3 woL = normalize(light[s - 2].p - qs.p);
         // Each endpoint is a surface (BSDF, cosine) or a medium (phase*albedo, cos=1).
-        double cosE, cosL, fE, fL; DVec3 o;
+        // Cheap sidedness/terminator rejects and the shadow ray run FIRST; both endpoint
+        // BSDF/phase evals (texture fetches, lobe math) are deferred until the connection
+        // is known unoccluded. occluded() consumes no RNG and the evals are deterministic,
+        // so the reorder is bit-identical — it only skips work for shadowed connections.
+        double cosE, cosL, stGE = 1.0, stGL = 1.0; DVec3 o, ngoQ;
         if (pt.type == BV_MEDIUM) {
-            cosE = 1.0; fE = dMediumScatterF(sc, pt, woE, w, lambda); o = pt.p;
+            cosE = 1.0; o = pt.p;
         } else {
             cosE = ddot(pt.ns, w);
             // Two-sided eye endpoint may connect on its back hemisphere (transmit lobe);
@@ -6239,19 +6287,15 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
             // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1);
             // skipped for two-sided (transmissive) materials.
-            double stGE = 1.0;
             if (!twoSidedE) {
                 DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
                 stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
                 if (stGE <= 0.0) return 0.0;
             }
-            fE = dBsdfF(sc, pt, woE, w, lambda) * stGE;
             double sgn = ddot(pt.ng, w) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
-        if (qs.type == BV_MEDIUM) {
-            cosL = 1.0; fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
-        } else {
+        if (qs.type != BV_MEDIUM) {
             cosL = ddot(qs.ns, w * (Real)-1);
             // Two-sided light endpoint may connect on its back hemisphere (transmit lobe).
             bool twoSidedL = dTwoSidedType(sc.mats[qs.matId].type);
@@ -6259,12 +6303,24 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
             // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1);
             // skipped for two-sided (transmissive) materials.
-            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
-            double stGL = 1.0;
+            ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             if (!twoSidedL) {
                 stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
                 if (stGL <= 0.0) return 0.0;
             }
+        } else {
+            cosL = 1.0;
+        }
+        if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
+        double fE, fL;
+        if (pt.type == BV_MEDIUM) {
+            fE = dMediumScatterF(sc, pt, woE, w, lambda);
+        } else {
+            fE = dBsdfF(sc, pt, woE, w, lambda) * stGE;
+        }
+        if (qs.type == BV_MEDIUM) {
+            fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
+        } else {
             fL = dBsdfF(sc, qs, woL, w * (Real)-1, lambda) * stGL;
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
@@ -6272,7 +6328,6 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
         }
         if (fE <= 0.0 || fL <= 0.0) return 0.0;
-        if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, w, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosE) * fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr;
@@ -7136,25 +7191,29 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                         if (sideOk && cosAtCamera > 1e-9) {
                             int px, py; Real cc, d2c;
                             if (cam.project(h.p, px, py, cc, d2c)) {
-                                DVertex vt = dVertFromHit(h, matId);
-                                double f = dBsdfF(sc, vt, wo, wcam, lambda);
-                                f *= (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                                // Shadow ray first, BSDF eval after (bit-identical: no RNG
+                                // in either; skips the eval for occluded splats).
                                 double sgn = ddot(h.ng, wcam) >= 0.0 ? 1.0 : -1.0;
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                if (f > 0.0 && !occluded(sc, oo, wcam, (Real)(distc - 2e-6))) {
-                                    double bsdfRevPdfW = dBsdfPdf(sc, vt, wcam, wo, lambda);
-                                    double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
-                                    double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
-                                    double imgToSurf = imgToSolid * fabs(cosToCamera) / dist2c;
-                                    double wLight = (imgToSurf / ctx.nLightPaths) *
-                                                    (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
-                                    double misW = 1.0 / (wLight + 1.0);
-                                    double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
-                                    if (contrib > 0.0) {
-                                        size_t o2 = ((size_t)py * resX + px) * 3;
-                                        atomicAdd(&splat[o2 + 0], cieLx * contrib);
-                                        atomicAdd(&splat[o2 + 1], cieLy * contrib);
-                                        atomicAdd(&splat[o2 + 2], cieLz * contrib);
+                                if (!occluded(sc, oo, wcam, (Real)(distc - 2e-6))) {
+                                    DVertex vt = dVertFromHit(h, matId);
+                                    double f = dBsdfF(sc, vt, wo, wcam, lambda);
+                                    f *= (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                                    if (f > 0.0) {
+                                        double bsdfRevPdfW = dBsdfPdf(sc, vt, wcam, wo, lambda);
+                                        double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
+                                        double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
+                                        double imgToSurf = imgToSolid * fabs(cosToCamera) / dist2c;
+                                        double wLight = (imgToSurf / ctx.nLightPaths) *
+                                                        (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
+                                        double misW = 1.0 / (wLight + 1.0);
+                                        double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
+                                        if (contrib > 0.0) {
+                                            size_t o2 = ((size_t)py * resX + px) * 3;
+                                            atomicAdd(&splat[o2 + 0], cieLx * contrib);
+                                            atomicAdd(&splat[o2 + 1], cieLy * contrib);
+                                            atomicAdd(&splat[o2 + 2], cieLz * contrib);
+                                        }
                                     }
                                 }
                             }
@@ -7302,12 +7361,16 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                             double stG = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(wiL, h.n, ngoCam);
                             bool sideOk = twoSidedCam ? (cosToLight != 0.0) : (cosToLight > 0.0 && stG > 0.0);
                             if (cosAtLight > 0.0 && sideOk) {
-                                double f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
+                                // Cheap gates + shadow ray first, BSDF eval after (bit-
+                                // identical: no RNG in either; skips the eval when shadowed).
                                 double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
                                 double sgn = ddot(h.ng, wiL) >= 0.0 ? 1.0 : -1.0;
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                if (f > 0.0 && Le > 0.0 && em.area > 0.0 &&
-                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6))) {
+                                double f = 0.0;
+                                if (Le > 0.0 && em.area > 0.0 &&
+                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6)))
+                                    f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
+                                if (f > 0.0) {
                                     double pdfChoice = em.power / sc.totalPower;
                                     double invArea = 1.0 / em.area;
                                     double directPdfW = invArea * dist2 / cosAtLight;
@@ -7348,6 +7411,15 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     bool camSide = twoSidedCam ? (cosCam != 0.0) : (cosCam > 0.0 && stGCam > 0.0);
                     bool litSide = twoSidedLit ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
                     if (!camSide || !litSide) continue;
+                    // Occlusion FIRST: the shadow ray kills most connections in a
+                    // typical scene, and it is far cheaper than the 2x dBsdfF +
+                    // 4x dBsdfPdf + MIS block below. No RNG is consumed in this
+                    // loop and occluded() has no side effects, so hoisting the
+                    // test is bit-identical — it only skips work for connections
+                    // that contributed nothing anyway.
+                    double sgn = ddot(h.ng, w) >= 0.0 ? 1.0 : -1.0;
+                    DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
+                    if (occluded(sc, oo, w, (Real)(distc - 2e-6))) continue;
                     DVertex lvt = dVertFromLV(lv);
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
                     double fLit = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lambda);
@@ -7362,9 +7434,6 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     double wLight = camDirPdfA * (ctx.misVmWeight + lv.dVCM + lv.dVC * litRevPdfW);
                     double wCamera = litDirPdfA * (ctx.misVmWeight + dVCM + dVC * camRevPdfW);
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
-                    double sgn = ddot(h.ng, w) >= 0.0 ? 1.0 : -1.0;
-                    DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                    if (occluded(sc, oo, w, (Real)(distc - 2e-6))) continue;
                     double Gt = fabs(cosCam) * fabs(cosLit) / dist2;
                     double contrib = misW * Gt * fCam * fLit * beta * lv.beta;
                     if (contrib > 0.0) { rx += cieCx * contrib; ry += cieCy * contrib; rz += cieCz * contrib; }
@@ -7436,6 +7505,135 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         accum[i * 3 + 0] += rx + sxl;
         accum[i * 3 + 1] += ry + syl;
         accum[i * 3 + 2] += rz + szl;
+    }
+}
+
+// ================= device: on-device grid builds (VCM / SPPM sessions) =================
+// Kernels + thrust functors that move the per-pass VCM/SPPM photon-grid construction onto
+// the device. Each piece is an EXACT-arithmetic mirror of the host build it replaces
+// (vcm.h VcmGrid::build twin in vcmSessionPass / photonmap.h PhotonMap::build), so the
+// consuming kernels see bit-identical inputs in the identical order: min/max reductions
+// are order-independent and exact; the cell-key kernels repeat the host's float/double
+// mixed expressions type-for-type; and a STABLE sort by cell id equals a counting sort's
+// output order (both keep original index order within a cell).
+
+// Double-precision CIE twins (exact color.h mirror; the float `cieX` above serves the Real
+// transport path). Used by kSppmGatherConvert: the host build computed cie{X,Y,Z}(lambda)
+// in double and rounded cie*power/pi to float ONCE. CUDA's double exp() is within 1 ulp of
+// the host's, and that last-ulp double wobble is absorbed by the final float rounding
+// (~2^-28 odds per value of landing on a rounding boundary), so the stored floats match.
+__device__ static double gaussPiece64(double x, double mu, double s1, double s2) {
+    double t = (x - mu) * ((x < mu) ? s1 : s2);
+    return exp(-0.5 * t * t);
+}
+__device__ static double cieX64(double w) {
+    return 0.362 * gaussPiece64(w, 442.0, 0.0624, 0.0374)
+         + 1.056 * gaussPiece64(w, 599.8, 0.0264, 0.0323)
+         - 0.065 * gaussPiece64(w, 501.1, 0.0490, 0.0382);
+}
+__device__ static double cieY64(double w) {
+    return 0.821 * gaussPiece64(w, 568.8, 0.0213, 0.0247)
+         + 0.286 * gaussPiece64(w, 530.9, 0.0613, 0.0322);
+}
+__device__ static double cieZ64(double w) {
+    return 1.217 * gaussPiece64(w, 437.0, 0.0845, 0.0278)
+         + 0.681 * gaussPiece64(w, 459.0, 0.0385, 0.0725);
+}
+
+// Float AABB carried through thrust::transform_reduce. min/max are exact and commute with
+// the host's float->double promotion, so the reduced bounds equal the host loop's bounds.
+struct BboxF { float mnx, mny, mnz, mxx, mxy, mxz; };
+struct LvToBboxF {
+    HD BboxF operator()(const DVcmLV& v) const {
+        return BboxF{(float)v.p.x, (float)v.p.y, (float)v.p.z,
+                     (float)v.p.x, (float)v.p.y, (float)v.p.z};
+    }
+};
+struct PhToBboxF {
+    HD BboxF operator()(const DPhoton& p) const {
+        return BboxF{(float)p.pos.x, (float)p.pos.y, (float)p.pos.z,
+                     (float)p.pos.x, (float)p.pos.y, (float)p.pos.z};
+    }
+};
+struct BboxMergeF {
+    HD BboxF operator()(const BboxF& a, const BboxF& b) const {
+        return BboxF{fminf(a.mnx, b.mnx), fminf(a.mny, b.mny), fminf(a.mnz, b.mnz),
+                     fmaxf(a.mxx, b.mxx), fmaxf(a.mxy, b.mxy), fmaxf(a.mxz, b.mxz)};
+    }
+};
+// SPPM rMax: radius[i] where the visible point is valid, else 0 (max-reduced; exact).
+struct SppmRMaxF {
+    const double* radius; const unsigned char* valid;
+    HD double operator()(long long i) const { return valid[i] ? radius[i] : 0.0; }
+};
+// Plain max functor (thrust::maximum is deprecated in CCCL 3.x, and naming it makes nvcc
+// echo cub source context that MSBuild's canonical-error regex misparses as an error).
+struct MaxD { HD double operator()(double a, double b) const { return a < b ? b : a; } };
+
+// Scatter each light path's stored slab vertices into the compact array at its scanned
+// offset (device twin of the old host compaction loop; per-path order preserved).
+__global__ void kVcmCompactScatter(const DVcmLV* slab, const int* lvCount, const int* pathBegin,
+                                   DVcmLV* compact, int npix, int vcmCap) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < npix; i += stride) {
+        int cnt = lvCount[i], b = pathBegin[i];
+        const DVcmLV* src = slab + (size_t)i * vcmCap;
+        for (int k = 0; k < cnt; ++k) compact[b + k] = src[k];
+    }
+}
+
+// Cell id per compacted light vertex. Mirrors the former host build EXPRESSION-FOR-
+// EXPRESSION: positions and gLo are Real (float), so the subtraction happens in float;
+// the divide promotes to double; floor/clamp in double/int. Identical bit results.
+__global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell,
+                            int gnx, int gny, int gnz, int* key) {
+    int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        int ix = (int)floor((lv[i].p.x - gLo.x) / cell);
+        int iy = (int)floor((lv[i].p.y - gLo.y) / cell);
+        int iz = (int)floor((lv[i].p.z - gLo.z) / cell);
+        ix = min(max(ix, 0), gnx - 1);
+        iy = min(max(iy, 0), gny - 1);
+        iz = min(max(iz, 0), gnz - 1);
+        key[i] = (iz * gny + iy) * gnx + ix;
+    }
+}
+
+// Cell id per deposited photon (PhotonMap::cellCoord twin). The host converted DPhoton's
+// float position to a double Vec3 BEFORE the all-double cell math, so promote first.
+__global__ void kSppmCellKey(const DPhoton* ph, long long n, double lox, double loy, double loz,
+                             double cellSize, int gnx, int gny, int gnz, int* key) {
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride) {
+        int ix = (int)floor(((double)ph[i].pos.x - lox) / cellSize);
+        int iy = (int)floor(((double)ph[i].pos.y - loy) / cellSize);
+        int iz = (int)floor(((double)ph[i].pos.z - loz) / cellSize);
+        ix = min(max(ix, 0), gnx - 1);
+        iy = min(max(iy, 0), gny - 1);
+        iz = min(max(iz, 0), gnz - 1);
+        key[i] = (iz * gny + iy) * gnx + ix;      // int math, as in PhotonMap::cellIndex
+    }
+}
+
+// Deposit record -> gather record, in sorted (cell-contiguous) order: out[i] converts
+// ph[order[i]] (the stable sort's permutation == the host counting sort's). pos/n copy
+// float-for-float (the host round-tripped float->double->float, which is exact); the
+// cie*power/pi fold repeats the host's double math (see cieX64 note).
+__global__ void kSppmGatherConvert(const DPhoton* ph, const int* order, long long n,
+                                   DGatherPhoton* out) {
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride) {
+        const DPhoton p = ph[order[i]];
+        DGatherPhoton g;
+        g.pos = p.pos;
+        g.n   = p.n;
+        const double l = (double)p.lambda;
+        const double w = (double)p.power * (1.0 / DPI);
+        g.pX = (float)(cieX64(l) * w);
+        g.pY = (float)(cieY64(l) * w);
+        g.pZ = (float)(cieZ64(l) * w);
+        g.lambda = p.lambda;
+        out[i] = g;
     }
 }
 
@@ -9372,13 +9570,57 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     return out;
 }
 
+// ================= host: device-scratch reuse (VCM / SPPM sessions) =================
+// thrust algorithms allocate temporary device storage per call; by default that is a
+// cudaMalloc/cudaFree pair EVERY call, which (with the sessions' own per-pass buffer
+// churn) profiled at ~10% of per-pass API time. This bump arena keeps grow-only blocks
+// alive across passes: alloc() carves from existing blocks (first-fit) and cudaMallocs
+// only on a new high-water mark; deallocate is a no-op; reset() rewinds the offsets at
+// the start of each pass. Steady state: zero device malloc/free per pass.
+struct ThrustArena {
+    struct Block { char* p; size_t cap, off; };
+    std::vector<Block> blocks;
+    void reset() { for (Block& b : blocks) b.off = 0; }
+    char* alloc(size_t n) {
+        n = (n + 255) & ~(size_t)255;                    // 256-byte aligned carves
+        for (Block& b : blocks)
+            if (b.cap - b.off >= n) { char* r = b.p + b.off; b.off += n; return r; }
+        Block nb{}; nb.cap = n; nb.off = n;
+        CUDA_CHECK(cudaMalloc(&nb.p, nb.cap));
+        blocks.push_back(nb);
+        return nb.p;
+    }
+    void release() { for (Block& b : blocks) cudaFree(b.p); blocks.clear(); }
+};
+// Minimal Allocator facade over the arena for FT_THRUST_PAR(alloc).
+struct ThrustArenaAlloc {
+    using value_type = char;
+    ThrustArena* arena;
+    char* allocate(std::ptrdiff_t n) { return arena->alloc((size_t)n); }
+    void deallocate(char*, size_t) {}
+};
+
+// Grow-only device buffer: (re)allocates only when `need` exceeds the current capacity
+// (1.5x growth), so per-pass session buffers stop churning cudaMalloc/cudaFree.
+template <class T>
+static void ensureDevCap(T*& p, size_t& cap, size_t need) {
+    if (need <= cap) return;
+    if (p) { cudaFree(p); p = nullptr; }
+    size_t newCap = cap + cap / 2;
+    if (newCap < need) newCap = need;
+    CUDA_CHECK(cudaMalloc(&p, newCap * sizeof(T)));
+    cap = newCap;
+}
+
 // ============================ GPU SPPM (mode S) ============================
 // Resident device SPPM session: keeps per-pixel progressive state (tau/radius/nAcc/directSum)
 // on the device across passes, so the mode-S driver in main.cpp calls one pass per iteration
 // and resolves the current radiance whenever it wants a preview/checkpoint frame. Each pass
 // (1) resamples camera visible points (kSppmVisiblePoint), (2) deposits a bounded photon set
-// via the SAME forward tracer as mode M, builds the grid on the host at the largest current
-// per-pixel radius, and (3) gathers + progressively updates every pixel (kSppmGather).
+// via the SAME forward tracer as mode M into a persistent grow-only buffer, builds the photon
+// grid ON DEVICE at the largest current per-pixel radius (exact PhotonMap::build mirror —
+// stable sort == counting sort, so the gather sees identical photon order), and (3) gathers +
+// progressively updates every pixel (kSppmGather). No photon ever round-trips to the host.
 struct SppmSession {
     DUpload up;
     gpu::DCamera cam{};
@@ -9393,6 +9635,13 @@ struct SppmSession {
     unsigned long long* d_depCount = nullptr;
     double* d_energy = nullptr;
     EnergyReport energy{};
+    // Grow-only device scratch for the on-device photon grid build (no per-pass malloc):
+    gpu::DPhoton* d_photons = nullptr;       size_t photonsCap = 0;   // deposit buffer (records)
+    gpu::DGatherPhoton* d_gather = nullptr;  size_t gatherCap = 0;    // sorted gather records
+    int* d_cellKey   = nullptr;              size_t cellKeyCap = 0;
+    int* d_order     = nullptr;              size_t orderCap = 0;
+    int* d_cellStart = nullptr;              size_t cellStartCap = 0; // entries (nCells+1)
+    ThrustArena arena;                        // thrust temp storage (sort/scan/reduce)
 };
 
 bool cudaSppmSupported(const Scene& scene) {
@@ -9444,11 +9693,12 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
                                      s->maxBounce, vpSeed, passIdx + 1);
     cudaCheckKernel("sppm-visible-point");
 
-    // (2) Forward deposit into a bounded map (device), download, host-build the grid at the
-    // largest current per-pixel radius, upload. seedBase = cumulative emitted (fresh set).
-    PhotonMap pm;
-    pm.nEmitted = photonsPerPass;
-    const size_t PM_CHUNK = 4u << 20;
+    // (2) Forward deposit into a bounded, PERSISTENT grow-only device buffer (photonsPerPass
+    // is constant across a run, so after the first pass this never reallocates). seedBase =
+    // cumulative emitted (fresh set). The grid is then built ENTIRELY ON DEVICE — the old
+    // path downloaded every photon record, counting-sorted + CIE-filled on the host, and
+    // uploaded the sorted records + grid (~100 MB down + ~90 MB up per pass, ~45% memcpy +
+    // ~10% malloc of API time under nsys, plus dominant host convert/sort wall time).
     auto depositLaunch = [&](DPhoton* buf, unsigned long long capv) {
         CUDA_CHECK(cudaMemset(s->d_depCount, 0, sizeof(unsigned long long)));
         CUDA_CHECK(cudaMemset(s->d_energy, 0, 5 * sizeof(double)));
@@ -9458,23 +9708,31 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
                       (unsigned long long)s->emittedTotal, /*wavefront*/false, CAM_B, s->heroC);
     };
     unsigned long long cap = (unsigned long long)((double)photonsPerPass * 2.5) + (1ull << 20);
-    { size_t freeB = 0, totalB = 0;
-      if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
-          unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
-          if (cap > fit) cap = fit; } }
-    DPhoton* d_photons = nullptr;
-    while (cap >= (1ull << 20) &&
-           cudaMalloc(&d_photons, (size_t)cap * sizeof(DPhoton)) != cudaSuccess) {
-        cudaGetLastError(); d_photons = nullptr; cap >>= 1;
+    if (cap > s->photonsCap) {
+        { size_t freeB = 0, totalB = 0;
+          if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+              // Budget half the free VRAM, counting what the current buffer already holds.
+              unsigned long long fit = (unsigned long long)(
+                  (freeB + s->photonsCap * sizeof(DPhoton)) / 2 / sizeof(DPhoton));
+              if (cap > fit) cap = fit; } }
+        if (cap > s->photonsCap) {
+            if (s->d_photons) { cudaFree(s->d_photons); s->d_photons = nullptr; s->photonsCap = 0; }
+            while (cap >= (1ull << 20) &&
+                   cudaMalloc(&s->d_photons, (size_t)cap * sizeof(DPhoton)) != cudaSuccess) {
+                cudaGetLastError(); s->d_photons = nullptr; cap >>= 1;
+            }
+            if (s->d_photons) s->photonsCap = cap;
+        }
     }
     unsigned long long nDep = 0;
-    if (d_photons) {
-        depositLaunch(d_photons, cap);
+    if (s->d_photons) {
+        depositLaunch(s->d_photons, s->photonsCap);
         CUDA_CHECK(cudaMemcpy(&nDep, s->d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        if (nDep > cap) {                                // undershot: rerun at exact size
-            cudaFree(d_photons); d_photons = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
-            depositLaunch(d_photons, nDep);
+        if (nDep > s->photonsCap) {                      // undershot: regrow, rerun at exact size
+            cudaFree(s->d_photons); s->d_photons = nullptr; s->photonsCap = 0;
+            CUDA_CHECK(cudaMalloc(&s->d_photons, (size_t)nDep * sizeof(DPhoton)));
+            s->photonsCap = nDep;
+            depositLaunch(s->d_photons, nDep);
             unsigned long long nFill = 0;
             CUDA_CHECK(cudaMemcpy(&nFill, s->d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
             if (nFill < nDep) nDep = nFill;
@@ -9482,82 +9740,88 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     } else {
         depositLaunch(nullptr, 0);                       // count-only sizing pass
         CUDA_CHECK(cudaMemcpy(&nDep, s->d_depCount, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        if (nDep > 0) { CUDA_CHECK(cudaMalloc(&d_photons, (size_t)nDep * sizeof(DPhoton)));
-                        depositLaunch(d_photons, nDep); }
+        if (nDep > 0) { CUDA_CHECK(cudaMalloc(&s->d_photons, (size_t)nDep * sizeof(DPhoton)));
+                        s->photonsCap = nDep;
+                        depositLaunch(s->d_photons, nDep); }
     }
-    if (nDep > 0 && d_photons) {
-        pm.photons.resize((size_t)nDep);
-        std::vector<DPhoton> stage;
-        for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
-            size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
-            stage.resize(cnt);
-            CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton), cudaMemcpyDeviceToHost));
-            for (size_t i = 0; i < cnt; ++i) {
-                const DPhoton& d = stage[i]; Photon& p = pm.photons[off + i];
-                p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
-                p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
-                p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
-                p.power = d.power; p.lambda = d.lambda;
-            }
-        }
-    }
-    if (d_photons) cudaFree(d_photons);
     double energy[5] = {0,0,0,0,0};
     CUDA_CHECK(cudaMemcpy(energy, s->d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
     s->energy.emitted += energy[0]; s->energy.absorbed += energy[1]; s->energy.sensor += energy[2];
     s->energy.escaped += energy[3]; s->energy.residual += energy[4];
 
+    s->arena.reset();
+    ThrustArenaAlloc tal{&s->arena};
+    auto pol = FT_THRUST_PAR(tal);
+
     // rMax = largest radius over VALID pixels (grid built there so every pixel's — never
-    // larger — radius stays inside the 3x3x3 neighbourhood). Mirrors CPU sppmPass.
-    std::vector<double> radii(s->npix);
-    std::vector<unsigned char> valid(s->npix);
-    CUDA_CHECK(cudaMemcpy(radii.data(), s->st.radius, s->npix * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(valid.data(), s->st.vpValid, s->npix * sizeof(unsigned char), cudaMemcpyDeviceToHost));
-    double rMax = 0.0;
-    for (size_t i = 0; i < s->npix; ++i) if (valid[i]) rMax = std::max(rMax, radii[i]);
+    // larger — radius stays inside the 3x3x3 neighbourhood). Mirrors CPU sppmPass; a device
+    // max-reduce is order-independent, so it yields the host loop's exact double.
+    double rMax = thrust::transform_reduce(pol,
+        thrust::counting_iterator<long long>(0),
+        thrust::counting_iterator<long long>((long long)s->npix),
+        SppmRMaxF{s->st.radius, s->st.vpValid}, 0.0, MaxD{});
     if (rMax <= 0.0) rMax = 1e-4;
-    pm.build(rMax);
-    s->emittedTotal += pm.nEmitted;
+    s->emittedTotal += photonsPerPass;
     s->passes += 1;
 
-    // Upload the SPPM photon record: pX/pY/pZ = cie(lambda)*power/pi (NO area/nEmitted fold;
-    // those depend on the current per-pixel radius, applied at resolve). Then gather+update.
+    // On-device grid build — exact PhotonMap::build mirror (photonmap.h): same half-cell
+    // bbox padding, same promoted-double cell coords, and a stable sort by cell id that
+    // reproduces the host counting sort's exact photon order. kSppmGatherConvert then
+    // folds cie(lambda)*power/pi into each record (NO area/nEmitted fold; those depend on
+    // the current per-pixel radius, applied at resolve). Then gather + progressive update.
+    const double cellSize = (rMax > 0.0) ? rMax : 1e-6;
+    double lox = 0.0, loy = 0.0, loz = 0.0;
+    int gnx = 1, gny = 1, gnz = 1;
     DPhotonMap dpm{};
-    dpm.lo = DVec3(pm.lo.x, pm.lo.y, pm.lo.z);
-    dpm.cellSize = (Real)pm.cellSize; dpm.radius = (Real)pm.radius;
-    dpm.nx = pm.nx; dpm.ny = pm.ny; dpm.nz = pm.nz;
     dpm.photons = nullptr;
-    DGatherPhoton* d_sorted = nullptr;
-    if (!pm.photons.empty()) {
-        const double fold = 1.0 / DPI;
-        size_t n = pm.photons.size();
-        CUDA_CHECK(cudaMalloc(&d_sorted, n * sizeof(DGatherPhoton)));
-        std::vector<DGatherPhoton> stage;
-        for (size_t off = 0; off < n; off += PM_CHUNK) {
-            size_t cnt = std::min(PM_CHUNK, n - off);
-            stage.resize(cnt);
-            for (size_t i = 0; i < cnt; ++i) {
-                const Photon& p = pm.photons[off + i]; const Vec3& ci = pm.cie[off + i];
-                DGatherPhoton& d = stage[i];
-                d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
-                d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
-                const double w = (double)p.power * fold;
-                d.pX = (float)(ci.x * w); d.pY = (float)(ci.y * w); d.pZ = (float)(ci.z * w);
-                d.lambda = p.lambda;
-            }
-            CUDA_CHECK(cudaMemcpy(d_sorted + off, stage.data(), cnt * sizeof(DGatherPhoton), cudaMemcpyHostToDevice));
-        }
-        dpm.photons = d_sorted;
+    if (nDep > 0) {
+        const size_t n = (size_t)nDep;
+        BboxF bb = thrust::transform_reduce(pol,
+            thrust::device_pointer_cast(s->d_photons),
+            thrust::device_pointer_cast(s->d_photons + n),
+            PhToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
+            BboxMergeF{});
+        // The host build promoted float positions to double BEFORE the bbox/pad math;
+        // min/max commute with that promotion, so these are the same doubles.
+        lox = (double)bb.mnx - cellSize * 0.5;
+        loy = (double)bb.mny - cellSize * 0.5;
+        loz = (double)bb.mnz - cellSize * 0.5;
+        const double ex = ((double)bb.mxx - lox) + cellSize * 0.5;
+        const double ey = ((double)bb.mxy - loy) + cellSize * 0.5;
+        const double ez = ((double)bb.mxz - loz) + cellSize * 0.5;
+        gnx = std::max(1, (int)std::ceil(ex / cellSize));
+        gny = std::max(1, (int)std::ceil(ey / cellSize));
+        gnz = std::max(1, (int)std::ceil(ez / cellSize));
+        const long long nCells = (long long)gnx * gny * gnz;
+        ensureDevCap(s->d_cellKey, s->cellKeyCap, n);
+        ensureDevCap(s->d_order,   s->orderCap,   n);
+        kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lox, loy, loz, cellSize,
+                                    gnx, gny, gnz, s->d_cellKey);
+        cudaCheckKernel("sppm-cellkey");
+        thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
+        thrust::sequence(pol, tOrd, tOrd + n);
+        thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
+        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1);
+        thrust::lower_bound(pol, tKey, tKey + n,
+                            thrust::counting_iterator<int>(0),
+                            thrust::counting_iterator<int>((int)(nCells + 1)),
+                            thrust::device_pointer_cast(s->d_cellStart));
+        ensureDevCap(s->d_gather, s->gatherCap, n);
+        kSppmGatherConvert<<<2048, 128>>>(s->d_photons, s->d_order, (long long)n, s->d_gather);
+        cudaCheckKernel("sppm-gather-convert");
+        dpm.photons = s->d_gather;
+    } else {
+        ensureDevCap(s->d_cellStart, s->cellStartCap, 2);
+        CUDA_CHECK(cudaMemset(s->d_cellStart, 0, 2 * sizeof(int)));
     }
-    int* d_cellStart = (int*)uploadVec(pm.cellStart);
-    dpm.cellStart = d_cellStart;
+    dpm.lo = DVec3(lox, loy, loz);
+    dpm.cellSize = (Real)cellSize; dpm.radius = (Real)rMax;
+    dpm.nx = gnx; dpm.ny = gny; dpm.nz = gnz;
+    dpm.cellStart = s->d_cellStart;
 
     // (3) Gather + progressive update.
     kSppmGather<<<2048, 128>>>(s->up.sc, dpm, s->st, s->resX, s->resY, alpha);
     cudaCheckKernel("sppm-gather");
-
-    if (d_sorted)    cudaFree(d_sorted);
-    if (d_cellStart) cudaFree(d_cellStart);
 }
 
 // Resolve the current accumulated state into `out` (radiance L, exactly like CPU sppmResolve).
@@ -9584,6 +9848,12 @@ void sppmSessionEnd(SppmSession* s) {
     cudaFree(s->st.tau); cudaFree(s->st.directSum); cudaFree(s->st.nAcc);
     cudaFree(s->st.vpThr); cudaFree(s->st.radius); cudaFree(s->st.vpValid); cudaFree(s->st.vpHit);
     cudaFree(s->d_film); cudaFree(s->d_depCount); cudaFree(s->d_energy);
+    if (s->d_photons)   cudaFree(s->d_photons);
+    if (s->d_gather)    cudaFree(s->d_gather);
+    if (s->d_cellKey)   cudaFree(s->d_cellKey);
+    if (s->d_order)     cudaFree(s->d_order);
+    if (s->d_cellStart) cudaFree(s->d_cellStart);
+    s->arena.release();
     freeUpload(s->up);
     delete s;
 }
@@ -9591,14 +9861,18 @@ void sppmSessionEnd(SppmSession* s) {
 // ============================ host: VCM / UPS session (mode U) ============================
 // Resident device VCM session mirroring vcm.h's vcmPass orchestration. Each pass: (1) launch
 // kVcmLight — one light subpath per pixel stores its connectible vertices into a per-path slab
-// (avoids cross-thread atomics) and splats connect-to-camera contributions; (2) download the
-// slab + per-path counts and compact host-side into contiguous per-path ranges (so strategy
-// (c)'s same-lambda vertex connection reads its PAIRED light path); (3) build the uniform hash
-// grid over the compacted vertices (counting sort, cell = merge radius — a byte-for-byte mirror
-// of vcm.h VcmGrid::build); (4) upload compact vertices + grid + path ranges; (5) launch
-// kVcmCamera — one camera subpath per pixel does emission/NEE/connection/merge and adds this
-// pass's radiance (camera result + light splat) into the persistent `accum` sum. Resolve
-// divides accum by the pass count. Validated statistically against the CPU (independent MC).
+// (avoids cross-thread atomics) and splats connect-to-camera contributions; (2) compact the
+// slab ON DEVICE into contiguous per-path ranges (exclusive-scan the counts -> pathBegin/End,
+// scatter — so strategy (c)'s same-lambda vertex connection reads its PAIRED light path);
+// (3) build the uniform hash grid over the compacted vertices ON DEVICE (bbox reduce + cell
+// keys + STABLE sort by cell id + vectorized lower_bound — arithmetic-exact twin of the vcm.h
+// VcmGrid::build counting sort, including its output order); (4) launch kVcmCamera — one
+// camera subpath per pixel does emission/NEE/connection/merge and adds this pass's radiance
+// (camera result + light splat) into the persistent `accum` sum. Resolve divides accum by the
+// pass count. Only ~30 bytes (vertex total + bbox) cross the PCIe bus per pass — the original
+// host round trip moved the whole slab down and the compacted grid back up every pass.
+// Validated statistically against the CPU (independent MC) and byte-identically against the
+// host-build implementation it replaced.
 struct VcmSession {
     DUpload up;
     gpu::DCamera cam{};
@@ -9615,17 +9889,14 @@ struct VcmSession {
     double* d_accum   = nullptr;       // npix*3 (running SUM over passes)
     gpu::Real* d_lamBuf = nullptr;     // npix   (per-path wavelength, shared light<->camera)
     double* d_invLam  = nullptr;       // npix   (invPdfLambda; <=0 marks "no valid wavelength")
-    int*    d_pathBegin = nullptr;     // npix
+    int*    d_pathBegin = nullptr;     // npix (device-scanned per-pass)
     int*    d_pathEnd   = nullptr;     // npix
-    // Rebuilt each pass (freed + re-malloc'd, sizes vary):
-    gpu::DVcmLV* d_lvCompact = nullptr;
-    int*    d_cellStart = nullptr;
-    int*    d_order     = nullptr;
-    // Host staging (reused across passes to avoid churn):
-    std::vector<gpu::DVcmLV> hSlab;    // downloaded slab
-    std::vector<int>    hCount;        // downloaded counts
-    std::vector<gpu::DVcmLV> hCompact; // compacted vertices (path order)
-    std::vector<int>    hPathBegin, hPathEnd;
+    // Grow-only device scratch for the on-device compaction + grid build (no per-pass malloc):
+    gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
+    int*    d_cellKey   = nullptr;      size_t cellKeyCap = 0;
+    int*    d_order     = nullptr;      size_t orderCap = 0;
+    int*    d_cellStart = nullptr;      size_t cellStartCap = 0;  // entries (nCells+1)
+    ThrustArena arena;                  // thrust temp storage (scan/sort/reduce)
 };
 
 bool cudaVcmSupported(const Scene& scene) {
@@ -9658,10 +9929,6 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     CUDA_CHECK(cudaMalloc(&s->d_pathBegin, np * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   np * sizeof(int)));
     CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
-    s->hSlab.resize(np * (size_t)s->vcmCap);
-    s->hCount.resize(np);
-    s->hPathBegin.resize(np);
-    s->hPathEnd.resize(np);
     return s;
 }
 
@@ -9693,79 +9960,68 @@ void vcmSessionPass(VcmSession* s, double radius) {
                              s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
     cudaCheckKernel("vcm-light");
 
-    // (2) Download the slab + counts and compact host-side into contiguous per-path ranges.
-    CUDA_CHECK(cudaMemcpy(s->hSlab.data(), s->d_lvSlab,
-                          np * (size_t)s->vcmCap * sizeof(DVcmLV), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(s->hCount.data(), s->d_lvCount, np * sizeof(int), cudaMemcpyDeviceToHost));
-    std::vector<DVcmLV>& compact = s->hCompact;
-    compact.clear();
-    { size_t tot = 0; for (size_t i = 0; i < np; ++i) tot += (size_t)std::max(0, s->hCount[i]);
-      compact.reserve(tot); }
-    for (size_t i = 0; i < np; ++i) {
-        int cnt = s->hCount[i];
-        s->hPathBegin[i] = (int)compact.size();
-        for (int k = 0; k < cnt; ++k) compact.push_back(s->hSlab[i * (size_t)s->vcmCap + k]);
-        s->hPathEnd[i] = (int)compact.size();
+    // (2) Compact the slab ON DEVICE into contiguous per-path ranges: exclusive-scan the
+    // per-path vertex counts into pathBegin and inclusive-scan them into pathEnd
+    // (pathEnd[i] = pathBegin[i] + count[i]; integer scans are exact in any order).
+    // Only the 4-byte vertex total comes back to the host.
+    s->arena.reset();
+    ThrustArenaAlloc tal{&s->arena};
+    auto pol = FT_THRUST_PAR(tal);
+    thrust::device_ptr<int> tCount(s->d_lvCount), tBegin(s->d_pathBegin), tEnd(s->d_pathEnd);
+    thrust::exclusive_scan(pol, tCount, tCount + np, tBegin);
+    thrust::inclusive_scan(pol, tCount, tCount + np, tEnd);
+    int nLVi = 0;
+    CUDA_CHECK(cudaMemcpy(&nLVi, s->d_pathEnd + (np - 1), sizeof(int), cudaMemcpyDeviceToHost));
+    const size_t nLV = (size_t)((nLVi > 0) ? nLVi : 0);
+    if (nLV > 0) {
+        ensureDevCap(s->d_lvCompact, s->lvCompactCap, nLV);
+        kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvCount, s->d_pathBegin,
+                                          s->d_lvCompact, (int)np, s->vcmCap);
+        cudaCheckKernel("vcm-compact");
     }
 
-    // (3) Build the uniform hash grid over the compacted light vertices (mirror
-    // vcm.h VcmGrid::build: counting sort, cell = merge radius).
-    const size_t nLV = compact.size();
+    // (3) Build the uniform hash grid over the compacted light vertices ON DEVICE (twin of
+    // vcm.h VcmGrid::build). The grid geometry repeats the former host math type-for-type
+    // (float mins/maxes, double pads, float-subtract/double-divide cell coords), and the
+    // STABLE sort by cell id equals the counting sort's output order, so kVcmCamera visits
+    // vertices in the identical sequence -> bit-identical merge sums.
     double cell = radius;
     DVec3 gLo(0, 0, 0); int gnx = 1, gny = 1, gnz = 1;
-    std::vector<int> cellStart, order;
     if (nLV == 0) {
-        cellStart.assign(2, 0);
+        ensureDevCap(s->d_cellStart, s->cellStartCap, 2);
+        CUDA_CHECK(cudaMemset(s->d_cellStart, 0, 2 * sizeof(int)));
     } else {
-        DVec3 mn = compact[0].p, mx = compact[0].p;
-        for (const DVcmLV& lv : compact) {
-            mn.x = std::min(mn.x, lv.p.x); mn.y = std::min(mn.y, lv.p.y); mn.z = std::min(mn.z, lv.p.z);
-            mx.x = std::max(mx.x, lv.p.x); mx.y = std::max(mx.y, lv.p.y); mx.z = std::max(mx.z, lv.p.z);
-        }
-        gLo = DVec3(mn.x - cell * 0.5, mn.y - cell * 0.5, mn.z - cell * 0.5);
-        DVec3 ext(mx.x - gLo.x + cell * 0.5, mx.y - gLo.y + cell * 0.5, mx.z - gLo.z + cell * 0.5);
+        BboxF bb = thrust::transform_reduce(pol,
+            thrust::device_pointer_cast(s->d_lvCompact),
+            thrust::device_pointer_cast(s->d_lvCompact + nLV),
+            LvToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
+            BboxMergeF{});
+        gLo = DVec3(bb.mnx - cell * 0.5, bb.mny - cell * 0.5, bb.mnz - cell * 0.5);
+        DVec3 ext(bb.mxx - gLo.x + cell * 0.5, bb.mxy - gLo.y + cell * 0.5, bb.mxz - gLo.z + cell * 0.5);
         gnx = std::max(1, (int)std::ceil(ext.x / cell));
         gny = std::max(1, (int)std::ceil(ext.y / cell));
         gnz = std::max(1, (int)std::ceil(ext.z / cell));
         const long long nCells = (long long)gnx * gny * gnz;
-        std::vector<int> cellOf(nLV);
-        cellStart.assign((size_t)nCells + 1, 0);
-        auto cellCoord = [&](const DVec3& p, int& ix, int& iy, int& iz) {
-            ix = (int)std::floor((p.x - gLo.x) / cell);
-            iy = (int)std::floor((p.y - gLo.y) / cell);
-            iz = (int)std::floor((p.z - gLo.z) / cell);
-            ix = std::min(std::max(ix, 0), gnx - 1);
-            iy = std::min(std::max(iy, 0), gny - 1);
-            iz = std::min(std::max(iz, 0), gnz - 1);
-        };
-        for (size_t i = 0; i < nLV; ++i) {
-            int ix, iy, iz; cellCoord(compact[i].p, ix, iy, iz);
-            int c = (iz * gny + iy) * gnx + ix; cellOf[i] = c; ++cellStart[c + 1];
-        }
-        for (long long c = 0; c < nCells; ++c) cellStart[c + 1] += cellStart[c];
-        order.assign(nLV, 0);
-        std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < nLV; ++i) order[cursor[cellOf[i]]++] = (int)i;
+        ensureDevCap(s->d_cellKey, s->cellKeyCap, nLV);
+        ensureDevCap(s->d_order,   s->orderCap,   nLV);
+        kVcmCellKey<<<2048, 128>>>(s->d_lvCompact, (int)nLV, gLo, cell, gnx, gny, gnz,
+                                   s->d_cellKey);
+        cudaCheckKernel("vcm-cellkey");
+        thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
+        thrust::sequence(pol, tOrd, tOrd + nLV);
+        thrust::stable_sort_by_key(pol, tKey, tKey + nLV, tOrd);
+        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1);
+        thrust::lower_bound(pol, tKey, tKey + nLV,
+                            thrust::counting_iterator<int>(0),
+                            thrust::counting_iterator<int>((int)(nCells + 1)),
+                            thrust::device_pointer_cast(s->d_cellStart));
     }
-
-    // (4) Upload compacted vertices + grid + path ranges (fresh per-pass buffers).
-    if (s->d_lvCompact) { cudaFree(s->d_lvCompact); s->d_lvCompact = nullptr; }
-    if (s->d_cellStart) { cudaFree(s->d_cellStart); s->d_cellStart = nullptr; }
-    if (s->d_order)     { cudaFree(s->d_order);     s->d_order = nullptr; }
-    if (nLV > 0) {
-        CUDA_CHECK(cudaMalloc(&s->d_lvCompact, nLV * sizeof(DVcmLV)));
-        CUDA_CHECK(cudaMemcpy(s->d_lvCompact, compact.data(), nLV * sizeof(DVcmLV), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&s->d_order, nLV * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(s->d_order, order.data(), nLV * sizeof(int), cudaMemcpyHostToDevice));
-    }
-    CUDA_CHECK(cudaMalloc(&s->d_cellStart, cellStart.size() * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(s->d_cellStart, cellStart.data(), cellStart.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(s->d_pathBegin, s->hPathBegin.data(), np * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(s->d_pathEnd,   s->hPathEnd.data(),   np * sizeof(int), cudaMemcpyHostToDevice));
 
     DVcmGrid grid{};
-    grid.lv = s->d_lvCompact; grid.nLV = (int)nLV;
-    grid.cellStart = s->d_cellStart; grid.order = s->d_order;
+    grid.lv = (nLV > 0) ? s->d_lvCompact : nullptr;
+    grid.nLV = (int)nLV;
+    grid.cellStart = s->d_cellStart;
+    grid.order = (nLV > 0) ? s->d_order : nullptr;
     grid.lo = gLo; grid.cell = cell; grid.nx = gnx; grid.ny = gny; grid.nz = gnz;
 
     // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
@@ -9801,8 +10057,10 @@ void vcmSessionEnd(VcmSession* s) {
     cudaFree(s->d_lvSlab); cudaFree(s->d_lvCount); cudaFree(s->d_splat); cudaFree(s->d_accum);
     cudaFree(s->d_lamBuf); cudaFree(s->d_invLam); cudaFree(s->d_pathBegin); cudaFree(s->d_pathEnd);
     if (s->d_lvCompact) cudaFree(s->d_lvCompact);
+    if (s->d_cellKey)   cudaFree(s->d_cellKey);
     if (s->d_cellStart) cudaFree(s->d_cellStart);
     if (s->d_order)     cudaFree(s->d_order);
+    s->arena.release();
     freeUpload(s->up);
     delete s;
 }
