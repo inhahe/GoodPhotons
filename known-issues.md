@@ -5,23 +5,27 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH-DEBT — OPEN (2026-07-24): volumetric blackbody emission ("fire", C3) is forward-CPU-only — no GPU mirror
+### TECH-DEBT — DONE (2026-07-24, v0.49.0): volumetric blackbody emission ("fire", C3) now runs on the GPU forward tracer
 
-The emissive-volume path (a `medium` with a `temperature vdb:` grid + `emission blackbody`) runs only on
-the **CPU forward** tracer (modes A/B/C, V/P forward layers). `cudaForwardSupported()` (render_cuda.cu)
-now returns **false** for any scene whose media include an `emissive()` medium, so `-device gpu`/`auto`
-**falls back to the CPU** (verified: `scraps/vdb_fire.ftsl` prints `auto -> CPU (… emissive 'fire'
-volume)` and renders correctly; without the gate the device `genPhoton` crashed with an illegal memory
-access because an emissive-only scene has `nEmitters==0` and indexed `sc.emitters[0]` out of bounds).
-**Proper fix (GPU mirror):** (1) add temperature/emission to `DMedium` — either a second sparse fp16
-brick grid (reuse the density brick uploader) or reuse the density grid + emission params
-(`emissionScale`/`emitKelvin`/`tempPeak`); (2) upload `Scene::emissiveVolumes` + `totalEmissionPower` into
-`DScene` (a `DEmissiveVolume[]` with `bmin/bmax/meanKe/power/mediumIndex`); (3) port `blackbodyEmissionRadiance`
-+ `emissionAt` to the device; (4) add the volume-birth branch to `genPhoton` (power-weighted emitter-vs-fire
-split, uniform AABB point + uniform λ + isotropic dir, `β=grandTotal·κ_e/meanKe`) and an isotropic
-`connectEmissionVolume`/`connectEmissionLensVolume` device splat; (5) drop the `emissive()` clause from
-`cudaForwardSupported`. Mirrors the CPU code in `render.h` (`tracePhoton` volume-birth branch +
-`connectEmissionVolume`/`camSplatEmissionAll`) and `scene.h` (`EmissiveVolume`/`finalizeEmissiveVolumes`).
+**Was:** the emissive-volume path (a `medium` with a `temperature vdb:` grid + `emission blackbody`) ran only
+on the **CPU forward** tracer; `cudaForwardSupported()` returned false for any `emissive()` medium so
+`-device gpu`/`auto` fell back to the CPU (without the gate the device `genPhoton` crashed indexing
+`sc.emitters[0]` on an emissive-only scene with `nEmitters==0`).
+
+**Fix (shipped v0.49.0):** full GPU mirror in `render_cuda.cu`. (1) The VDB brick sampler was refactored into
+a reusable `DVdbGrid` + `dVdbSample()` (density path unchanged, bit-for-bit) and `DMedium` now carries a
+second `tempGrid` + `emissive`/`emitKelvin`/`tempPeak`/`emissionScale`. (2) `DScene` gained a
+`DEmissiveVolume[]` (`mediumIndex`/`bmin`/`bmax`/`meanKe`/`power` + the per-volume Planck-λ CDF `lamCdf`) plus
+`totalEmissionPower`, uploaded from `Scene::emissiveVolumes`. (3) `dBlackbodyEmissionRadiance` /
+`dMedTemperatureAt` / `dMedEmissionAt` port the host emission field. (4) `genPhoton` got a volume-birth branch
+(power-weighted emitter-vs-fire split with NO extra RNG when there are no volumes → non-fire scenes
+unperturbed; uniform-AABB point, λ importance-sampled from `lamCdf`, isotropic dir,
+`β=grandTotal·κ_e/(meanKe·Δλ·p(λ))`) and an isotropic `connectEmissionVolume`/`connectEmissionLensVolume` +
+`camSplatEmissionAll` device splat. (5) The `emissive()` clause was dropped from `cudaForwardSupported`.
+Fire scenes always have media so the hero path (gated on `mediaN==0`) never runs; an emissive-only scene never
+indexes `sc.emitters` because `volumeBirth` is always true when `totalPower==0`. **Verified:** `-device gpu`
+on `scraps/vdb_fire.ftsl` renders without crashing and matches the CPU flame shape/colour in distribution;
+the refactored density path (`scraps/vdb_cloud.ftsl`) still renders correctly with `sum/emitted=1.000000`.
 
 ### TECH-DEBT — DONE (2026-07-24): fire emission now importance-samples λ from a blackbody → collapses the magnitude speckle
 

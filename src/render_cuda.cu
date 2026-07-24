@@ -487,6 +487,26 @@ struct DImplicit {
 // pattern.h (POD, uploaded verbatim) — no device-specific node type is needed.
 struct DPattern { int off, n; };   // slice into DScene::patNodes
 
+// A NATIVE SPARSE brick grid: the device twin of host VdbGrid, uploaded as a bricked
+// sparse lattice (ROADMAP C2). The dense lattice is partitioned into B^3 bricks; only
+// bricks with a nonzero voxel are uploaded, so VRAM scales with occupied volume, not
+// the bounding box. `brickIndex[(k>>sh)*by*bx + (j>>sh)*bx + (i>>sh)]` gives the brick's
+// slot (or -1 => value 0); the voxel lives at `brickData[slot*B^3 + ((k&mask)*B +
+// (j&mask))*B + (i&mask)]`. `dVdbSample` trilinearly samples it, bit-for-bit like the
+// host VdbGrid::sample (the stencil is clamped to [0,n-1] before any lookup). Used for
+// BOTH the density multiplier and the emissive-volume temperature field.
+struct DVdbGrid {
+    const int32_t*   brickIndex;   // bx*by*bz brick slots (or -1); null => grid absent
+    const uint16_t*  brickData;    // active*B^3 fp16 voxels
+    int              bx, by, bz;   // brick-grid dimensions
+    int              brickB;       // brick edge length (power of two)
+    int              brickShift;   // log2(B): brick = idx>>shift, local = idx&(B-1)
+    int              nx, ny, nz;   // dense lattice dims
+    double           ainv[9];      // world->index linear map (row-major 3x3)
+    DVec3            w0;            // world position of index origin (0,0,0)
+    DVec3            imin;          // integer min-corner of the baked lattice
+};
+
 struct DMedium {
     int    enabled;
     double sigma_a[SPEC_N];
@@ -503,24 +523,21 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
-    // --- Optional imported .nvdb volume, uploaded as a NATIVE SPARSE brick grid ---
-    // When `vdbBrickData` is non-null the density multiplier is TRILINEARLY sampled
-    // from a bricked sparse lattice (ROADMAP C2) instead of the pattern VM; takes
-    // precedence. The dense lattice is partitioned into B^3 bricks; only bricks with
-    // a nonzero voxel are uploaded, so VRAM scales with occupied volume, not the
-    // bounding box. `vdbBrickIndex[(k>>sh)*by*bx + (j>>sh)*bx + (i>>sh)]` gives the
-    // brick's slot (or -1 => density 0); the voxel lives at `vdbBrickData[slot*B^3
-    // + ((k&mask)*B + (j&mask))*B + (i&mask)]`. Samples bit-for-bit like the dense
-    // grid (the trilinear stencil is clamped to [0,n-1] before any lookup).
-    const int32_t*   vdbBrickIndex;   // bx*by*bz brick slots (or -1); null => no vdb
-    const uint16_t*  vdbBrickData;    // active*B^3 fp16 voxels
-    int              vdbBx, vdbBy, vdbBz;   // brick-grid dimensions
-    int              vdbBrickB;             // brick edge length (power of two)
-    int              vdbBrickShift;         // log2(B): brick = idx>>shift, local = idx&(B-1)
-    int              vdbNx, vdbNy, vdbNz;
-    double           vdbAinv[9];      // world->index linear map (row-major 3x3)
-    DVec3            vdbW0;            // world position of index origin (0,0,0)
-    DVec3            vdbImin;          // integer min-corner of the baked lattice
+    // --- Optional imported .nvdb/.vdb volume, uploaded as a NATIVE SPARSE brick grid ---
+    // When `densGrid.brickData` is non-null the density multiplier is TRILINEARLY
+    // sampled from the sparse lattice (ROADMAP C2) instead of the pattern VM; takes
+    // precedence. See DVdbGrid.
+    DVdbGrid         densGrid;        // density field (brickData null => none)
+    // --- Optional volumetric blackbody EMISSION ("fire", ROADMAP C3) ---------------
+    // When `emissive` a temperature field (tempGrid) drives self-illuminated blackbody
+    // emission: T(x) = emitKelvin * tempGrid(x)/tempPeak (peak-normalised, robust to
+    // whatever units the grid was authored in), and the emission source radiance is
+    // emissionScale * blackbodyEmissionRadiance(T, lambda). Mirrors host Medium.
+    int              emissive;        // 1 => temperature-driven blackbody emission
+    DVdbGrid         tempGrid;        // raw relative temperature field
+    double           emitKelvin;      // Kelvin of the hottest voxel
+    double           tempPeak;        // raw temperature-grid peak (for peak-normalisation)
+    double           emissionScale;   // brightness multiplier on the Planck term
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field
     DVec3            bmin, bmax;
@@ -689,6 +706,21 @@ struct DEnvMap {
 // of the shared recDrivers PatNode pool holding the stop's per-hit expression program.
 struct DRecScalarStop { double pos; int exprOff; int exprN; };
 
+// One emissive ("fire") volume (device twin of Scene::EmissiveVolume, ROADMAP C3). A
+// photon born inside carries beta = grandTotal*emissionAt(x,lambda)/(meanKe*dLam*p(lambda)),
+// with the position uniform in [bmin,bmax] and lambda importance-sampled from `lamCdf`
+// (a Planck-at-emitKelvin per-nm CDF, `lamN`+1 entries, step `lamStep`; pdf per nm =
+// binMass/step). meanKe/power are MC-estimated on the host (finalizeEmissiveVolumes).
+struct DEmissiveVolume {
+    int    mediumIndex;
+    DVec3  bmin, bmax;
+    double meanKe;
+    double power;
+    const double* lamCdf;   // lamN+1 normalised CDF over [LAMBDA_MIN,LAMBDA_MAX]
+    int           lamN;     // number of bins
+    double        lamStep;  // bin width in nm
+};
+
 struct DScene {
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
@@ -744,6 +776,10 @@ struct DScene {
     double           emitG;
     const DMedium*   media;    // participating media array (superposed); null if none
     int              mediaN;   // number of media (0 => vacuum)
+    // Volumetric blackbody emission ("fire", ROADMAP C3). Photon birth splits emitter-
+    // vs-fire by power: grandTotal = totalPower + totalEmissionPower. Null/0 => no fire.
+    const DEmissiveVolume* emissiveVolumes; int emissiveVolN;
+    double           totalEmissionPower;
     int              hasGrin;  // 1 => some enabled medium carries an `ior` (GRIN) field.
                                // Gates the per-bounce Eikonal march (grin::sceneHasGrin twin);
                                // 0 keeps ordinary scenes bit-identical (march never entered).
@@ -1153,6 +1189,47 @@ __device__ static inline float dHalfBitsToFloat(uint16_t h) {
     float f; memcpy(&f, &bits, sizeof(f)); return f;
 }
 
+// Trilinearly sample a sparse brick grid at a world point (>= 0; 0 outside the lattice).
+// Device twin of VdbGrid::sample — bit-for-bit with the host (stencil clamped to
+// [0,n-1]). Shared by the density multiplier and the emissive temperature field.
+__device__ static double dVdbSample(const DVdbGrid& g, const DVec3& p) {
+    double rx = (double)p.x - g.w0.x, ry = (double)p.y - g.w0.y, rz = (double)p.z - g.w0.z;
+    double fi = g.ainv[0]*rx + g.ainv[1]*ry + g.ainv[2]*rz - g.imin.x;
+    double fj = g.ainv[3]*rx + g.ainv[4]*ry + g.ainv[5]*rz - g.imin.y;
+    double fk = g.ainv[6]*rx + g.ainv[7]*ry + g.ainv[8]*rz - g.imin.z;
+    int nx = g.nx, ny = g.ny, nz = g.nz;
+    if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
+        fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
+    double ffi = floor(fi), ffj = floor(fj), ffk = floor(fk);
+    int i0 = (int)ffi, j0 = (int)ffj, k0 = (int)ffk;
+    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+    int i0c = cl(i0, nx-1), i1c = cl(i0+1, nx-1);
+    int j0c = cl(j0, ny-1), j1c = cl(j0+1, ny-1);
+    int k0c = cl(k0, nz-1), k1c = cl(k0+1, nz-1);
+    double tx = fi - ffi, ty = fj - ffj, tz = fk - ffk;
+    tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
+    ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
+    tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
+    const int32_t*  BI = g.brickIndex;
+    const uint16_t* BD = g.brickData;
+    const int  sh = g.brickShift, mask = g.brickB - 1;
+    const int  bxN = g.bx, byN = g.by;
+    const size_t B3 = (size_t)g.brickB * g.brickB * g.brickB;
+    auto AT = [&](int i, int j, int k) -> double {
+        int slot = BI[(((size_t)(k>>sh))*byN + (j>>sh))*bxN + (i>>sh)];
+        if (slot < 0) return 0.0;
+        int li = i & mask, lj = j & mask, lk = k & mask;
+        return (double)dHalfBitsToFloat(BD[(size_t)slot*B3 + ((size_t)lk*g.brickB + lj)*g.brickB + li]);
+    };
+    double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
+    double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
+    double c01 = AT(i0c,j0c,k1c)*(1-tx) + AT(i1c,j0c,k1c)*tx;
+    double c11 = AT(i0c,j1c,k1c)*(1-tx) + AT(i1c,j1c,k1c)*tx;
+    double c0 = c00*(1-ty) + c10*ty, c1 = c01*(1-ty) + c11*ty;
+    double v = c0*(1-tz) + c1*tz;
+    return v > 0.0 ? v : 0.0;
+}
+
 // Dimensionless density multiplier at a world point (>= 0). Device twin of
 // Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
 // For an implicit bound the multiplier is 0 outside the field (medium absent there).
@@ -1162,50 +1239,44 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
-    // Imported .nvdb volume: trilinearly sample the uploaded sparse brick grid
-    // (device twin of VdbGrid::sample). Takes precedence over the pattern-VM density.
-    if (m.vdbBrickData) {
-        double rx = (double)p.x - m.vdbW0.x, ry = (double)p.y - m.vdbW0.y, rz = (double)p.z - m.vdbW0.z;
-        double fi = m.vdbAinv[0]*rx + m.vdbAinv[1]*ry + m.vdbAinv[2]*rz - m.vdbImin.x;
-        double fj = m.vdbAinv[3]*rx + m.vdbAinv[4]*ry + m.vdbAinv[5]*rz - m.vdbImin.y;
-        double fk = m.vdbAinv[6]*rx + m.vdbAinv[7]*ry + m.vdbAinv[8]*rz - m.vdbImin.z;
-        int nx = m.vdbNx, ny = m.vdbNy, nz = m.vdbNz;
-        if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
-            fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
-        double ffi = floor(fi), ffj = floor(fj), ffk = floor(fk);
-        int i0 = (int)ffi, j0 = (int)ffj, k0 = (int)ffk;
-        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
-        int i0c = cl(i0, nx-1), i1c = cl(i0+1, nx-1);
-        int j0c = cl(j0, ny-1), j1c = cl(j0+1, ny-1);
-        int k0c = cl(k0, nz-1), k1c = cl(k0+1, nz-1);
-        double tx = fi - ffi, ty = fj - ffj, tz = fk - ffk;
-        tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
-        ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
-        tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
-        const int32_t*  BI = m.vdbBrickIndex;
-        const uint16_t* BD = m.vdbBrickData;
-        const int  sh = m.vdbBrickShift, mask = m.vdbBrickB - 1;
-        const int  bxN = m.vdbBx, byN = m.vdbBy;
-        const size_t B3 = (size_t)m.vdbBrickB * m.vdbBrickB * m.vdbBrickB;
-        auto AT = [&](int i, int j, int k) -> double {
-            int slot = BI[(((size_t)(k>>sh))*byN + (j>>sh))*bxN + (i>>sh)];
-            if (slot < 0) return 0.0;
-            int li = i & mask, lj = j & mask, lk = k & mask;
-            return (double)dHalfBitsToFloat(BD[(size_t)slot*B3 + ((size_t)lk*m.vdbBrickB + lj)*m.vdbBrickB + li]);
-        };
-        double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
-        double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
-        double c01 = AT(i0c,j0c,k1c)*(1-tx) + AT(i1c,j0c,k1c)*tx;
-        double c11 = AT(i0c,j1c,k1c)*(1-tx) + AT(i1c,j1c,k1c)*tx;
-        double c0 = c00*(1-ty) + c10*ty, c1 = c01*(1-ty) + c11*ty;
-        double v = c0*(1-tz) + c1*tz;
-        return v > 0.0 ? v : 0.0;
-    }
+    // Imported .nvdb/.vdb volume: trilinearly sample the uploaded sparse brick grid.
+    // Takes precedence over the pattern-VM density.
+    if (m.densGrid.brickData) return dVdbSample(m.densGrid, p);
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
                             0.0, 0.0, 0.0, r, 0.0, 0.0);
     return d > 0.0 ? d : 0.0;
+}
+
+// Planck spectral radiance at temperature `kelvin`, wavelength `lambdaNm` (device twin
+// of blackbodyRadiance, spectrum.h). Kept in double so the exp stays accurate.
+__device__ static double dBlackbodyRadiance(double kelvin, double lambdaNm) {
+    const double h = 6.62607015e-34, c = 2.99792458e8, kb = 1.380649e-23;
+    double l = lambdaNm * 1e-9;
+    double e = exp((h * c) / (l * kb * kelvin)) - 1.0;
+    return (2.0 * h * c * c) / (pow(l, 5.0) * e);
+}
+// Planck radiance normalised against the fixed 6500 K / 560 nm reference (device twin
+// of blackbodyEmissionRadiance). kRef is a compile-time-derivable constant here.
+__device__ static double dBlackbodyEmissionRadiance(double kelvin, double lambdaNm) {
+    const double kRef = dBlackbodyRadiance(6500.0, 560.0);   // matches host kRef exactly
+    return dBlackbodyRadiance(kelvin, lambdaNm) / kRef;
+}
+// Physical temperature (Kelvin) at a world point; 0 outside the grid / cold. Device twin
+// of Medium::temperatureAt (peak-normalised T = emitKelvin * raw/tempPeak).
+__device__ static double dMedTemperatureAt(const DMedium& m, const DVec3& p) {
+    if (!m.emissive || !m.tempGrid.brickData) return 0.0;
+    double raw = dVdbSample(m.tempGrid, p);
+    if (raw <= 0.0) return 0.0;
+    return m.emitKelvin * (raw / (m.tempPeak > 0.0 ? m.tempPeak : 1.0));
+}
+// Volumetric emission SOURCE radiance L_e(x,lambda) (>= 0). Device twin of
+// Medium::emissionAt: emissionScale * blackbodyEmissionRadiance(T(x), lambda).
+__device__ static double dMedEmissionAt(const DMedium& m, const DVec3& p, double lambda) {
+    double T = dMedTemperatureAt(m, p);
+    if (T <= 0.0) return 0.0;
+    return m.emissionScale * dBlackbodyEmissionRadiance(T, lambda);
 }
 
 // Clip ray (o + t*dir, t in [t0,t1]) to the medium bound. Device twin of
@@ -2754,6 +2825,55 @@ __device__ static void splatVolumeAll(const DScene& sc, const DMedium& med, cons
     }
 }
 
+// Isotropic volumetric-EMISSION splat (fire) — device twin of Renderer::connectEmission-
+// Volume (render.h). Like connectVolume but the albedo*phase is replaced by the isotropic
+// 1/(4pi): a fire voxel radiates equally in all directions, so the direct term is
+// beta*(1/4pi)/(dist^2*pixelSolidAngle)*transmittance. No incoming direction is needed.
+__device__ static void connectEmissionVolume(const DScene& sc, const DCamera& cam,
+                                             double* film, double* hits,
+                                             const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    DVec3 toCam = cam.eye - p;
+    Real dist = length(toCam);
+    DVec3 wdir = toCam / dist;
+    int px, py; Real cosCam, dist2;
+    if (!cam.project(p, px, py, cosCam, dist2)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
+    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+// Model A (finite-lens) isotropic emission splat — device twin of connectEmissionLensVolume.
+// As connectLensVolume but albedo*phase -> 1/(4pi).
+__device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera& cam,
+                                                 double* film, double* hits,
+                                                 const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosLens = -dot(wdir, cam.w);
+    if (cosLens <= (Real)1e-6) return;
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+__device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, int camMode,
+                                            const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connectEmissionVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
+        else if (camMode == CAM_A) connectEmissionLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
+    }
+}
+
 // ==================== analytic specular sphere connection ====================
 // Device twin of Renderer::connectSpecularSphere / connectSpecularSphereInside
 // (render.h). Restores the paths the SDS limitation makes black: mode B can
@@ -3224,6 +3344,20 @@ __device__ static int selectEmitter(const DScene& sc, double u) {
     int lo = 0, hi = sc.nEmitters - 1;
     while (lo < hi) { int mid = (lo + hi) / 2; if (sc.emitCdf[mid] < u) lo = mid + 1; else hi = mid; }
     return lo;
+}
+
+// Invert an emissive volume's Planck-shaped wavelength CDF at uniform u in [0,1).
+// Device twin of EmissionSampler::sampleAt (spectrum.h): returns lambda (nm) and sets
+// pdf = per-nm density = binMass/step. Mirrors the host bit-for-bit.
+__device__ static double dEmissionSampleLambda(const DEmissiveVolume& ev, double u, double& pdf) {
+    const double* cdf = ev.lamCdf;
+    int lo = 0, hi = ev.lamN;   // cdf has lamN+1 entries
+    while (lo + 1 < hi) { int mid = (lo + hi) / 2; (cdf[mid] <= u ? lo : hi) = mid; }
+    double c0 = cdf[lo], c1 = cdf[lo + 1];
+    double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
+    double w = LAMBDA_MIN + (lo + frac) * ev.lamStep;
+    pdf = (c1 - c0) / ev.lamStep;
+    return w;
 }
 
 // --- image-environment device sampling / evaluation (mirror src/envmap.h) --------
@@ -3844,6 +3978,47 @@ enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted) {
+    // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
+    // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
+    // test short-circuits (drawing NO extra RNG) when there are no emissive volumes, so
+    // every non-fire scene stays bit-identical to before.
+    const double grandTotal = sc.totalPower + sc.totalEmissionPower;
+    if (grandTotal <= 0.0) return false;
+    const bool volumeBirth = (sc.emissiveVolN > 0) &&
+                             ((double)rng.uniform() * grandTotal < sc.totalEmissionPower);
+    if (volumeBirth) {
+        // Power-weighted emissive-volume selection.
+        double r = (double)rng.uniform() * sc.totalEmissionPower;
+        int vi = 0;
+        for (; vi + 1 < sc.emissiveVolN; ++vi) { r -= sc.emissiveVolumes[vi].power; if (r <= 0.0) break; }
+        const DEmissiveVolume ev = sc.emissiveVolumes[vi];
+        const DMedium& fm = sc.media[ev.mediumIndex];
+        // Uniform position in the grid AABB; lambda importance-sampled from the volume's
+        // Planck-at-emitKelvin CDF. beta = grandTotal*ke/(meanKe*dLam*p(lambda)) so the
+        // isotropic 1/(4pi)/(dist^2*Omega) splat reproduces the emission line-integral
+        // (host twin: render.h tracePhoton volume-birth branch).
+        DVec3 origin = DVec3{ (Real)(ev.bmin.x + (ev.bmax.x - ev.bmin.x) * (double)rng.uniform()),
+                              (Real)(ev.bmin.y + (ev.bmax.y - ev.bmin.y) * (double)rng.uniform()),
+                              (Real)(ev.bmin.z + (ev.bmax.z - ev.bmin.z) * (double)rng.uniform()) };
+        double pdfLam = 0.0;
+        double lam = dEmissionSampleLambda(ev, (double)rng.uniform(), pdfLam);
+        lambda = (Real)lam;
+        double ke = dMedEmissionAt(fm, origin, lam);
+        const double dLamE = LAMBDA_MAX - LAMBDA_MIN;
+        beta = (Real)((ev.meanKe > 0.0 && pdfLam > 0.0)
+                      ? grandTotal * ke / (ev.meanKe * dLamE * pdfLam) : 0.0);
+        eEmitted += beta;
+        if (beta <= (Real)0) return false;   // cold voxel: nothing to emit or transport
+        // Isotropic emission direction.
+        double z = 1.0 - 2.0 * (double)rng.uniform();
+        double sr = sqrt(fmax(0.0, 1.0 - z * z));
+        double phi = 2.0 * DPI * (double)rng.uniform();
+        DVec3 dir = DVec3{ (Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z };
+        // Direct-visibility emission splat (the flame seen directly by the camera).
+        camSplatEmissionAll(sc, cs, camMode, origin, lambda, beta, rng);
+        ro = origin + dir * RAY_EPS; rd = dir;
+        return true;
+    }
     // Power-weighted emitter selection (single emitter draws no randomness).
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter em = sc.emitters[ei];
@@ -3894,7 +4069,11 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     Real pdfL = 0;
     lambda = sampleLambda(sc, em, rng, pdfL);
     if (pdfL <= 0) return false;
-    beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
+    // When emissive volumes exist the emitter-vs-fire split already consumed the
+    // totalPower/grandTotal factor, so a chosen emitter photon carries the full
+    // grandTotal (host twin: render.h). Otherwise the ordinary emitter scaling.
+    beta = (Real)((sc.emissiveVolN > 0) ? grandTotal
+                  : ((sc.nEmitters == 1) ? em.power : sc.totalPower));
     beta *= spotW;                                   // exactly 1 for non-spot
     // Image env: reweight so the photon carries the radiance actually arriving
     // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
@@ -7935,12 +8114,11 @@ bool cudaForwardSupported(const Scene& scene) {
     // coeff/scale are uploaded, and the sampler/reweight are ported to the device) are
     // supported (increments 1b and 2c).
     // Volumetric blackbody emission ("fire": a medium with a `temperature` grid +
-    // `emission`) is CPU-forward-only for now — the device genPhoton has no volume-birth
-    // branch and DMedium carries no temperature grid, so a scene containing an emissive
-    // volume falls back to the CPU forward tracer (which fully supports it). Without this
-    // gate an emissive-only scene (nEmitters==0) also indexes sc.emitters[0] out of
-    // bounds on-device. See known-issues.md (GPU fire).
-    for (const Medium& m : scene.media) if (m.emissive()) return false;
+    // `emission`, ROADMAP C3) is now supported on-device: the temperature field is
+    // uploaded as a sparse brick grid, DScene carries the emissive-volume table + per-
+    // volume Planck-λ CDF, and genPhoton has a volume-birth branch + isotropic emission
+    // splat mirroring the CPU tracer. An emissive-only scene (nEmitters==0) never indexes
+    // sc.emitters because volumeBirth is always true when totalPower==0.
     return true;
 }
 
@@ -8511,6 +8689,49 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // Participating media array (superposed). Each medium's density program is uploaded
     // separately; then the flat DMedium array is uploaded once. Empty => media=null, mediaN=0.
     {
+        // Upload a host VdbGrid as a NATIVE SPARSE brick grid (ROADMAP C2) into a DVdbGrid.
+        // Shared by the density field and the emissive-volume temperature field. An empty
+        // grid leaves DVdbGrid inert (brickData=null, identity transform). `label` tags the
+        // once-per-grid VRAM report.
+        auto uploadVdbGrid = [&](const VdbGrid& g, DVdbGrid& out, const char* label) {
+            const int B = 8;
+            std::vector<int32_t> bidx; std::vector<uint16_t> bdata; int bx, by, bz;
+            int nActive = g.buildBricks(B, bx, by, bz, bidx, bdata);
+            out.brickIndex = (const int32_t*)keep(uploadVec(bidx));
+            out.brickData  = (const uint16_t*)keep(uploadVec(bdata));
+            out.bx = bx; out.by = by; out.bz = bz;
+            out.brickB = B; out.brickShift = 3;   // 3 == log2(8)
+            out.nx = g.nx; out.ny = g.ny; out.nz = g.nz;
+            for (int k = 0; k < 9; ++k) out.ainv[k] = g.ainv[k];
+            out.w0   = {g.w0.x, g.w0.y, g.w0.z};
+            out.imin = {g.imin.x, g.imin.y, g.imin.z};
+            size_t denseB  = (size_t)g.nx * g.ny * g.nz * sizeof(uint16_t);
+            size_t sparseB = bdata.size() * sizeof(uint16_t) + bidx.size() * sizeof(int32_t);
+            int nBricks = bx * by * bz;
+            // The scene is re-uploaded on every progressive refresh; report each distinct
+            // grid's sparse footprint only once to avoid log spam.
+            static std::vector<const void*> reportedVdb;
+            const void* vkey = (const void*)&g;
+            bool seen = false;
+            for (const void* p : reportedVdb) if (p == vkey) { seen = true; break; }
+            if (!seen) {
+                reportedVdb.push_back(vkey);
+                std::fprintf(stderr,
+                    "[vdb] sparse device grid (%s): %d/%d bricks active (%.1f%%), "
+                    "%.1f MB -> %.1f MB VRAM (%.1fx)\n",
+                    label, nActive, nBricks, nBricks ? 100.0 * nActive / nBricks : 0.0,
+                    denseB / 1048576.0, sparseB / 1048576.0,
+                    sparseB ? (double)denseB / sparseB : 1.0);
+            }
+        };
+        auto clearVdbGrid = [](DVdbGrid& out) {
+            out.brickIndex = nullptr; out.brickData = nullptr;
+            out.bx = out.by = out.bz = 0;
+            out.brickB = 0; out.brickShift = 0;
+            out.nx = out.ny = out.nz = 0;
+            for (int k = 0; k < 9; ++k) out.ainv[k] = (k % 4 == 0) ? 1.0 : 0.0;
+            out.w0 = {0,0,0}; out.imin = {0,0,0};
+        };
         std::vector<DMedium> dmeds(scene.media.size());
         for (size_t i = 0; i < scene.media.size(); ++i) {
             const Medium& m = scene.media[i];
@@ -8523,48 +8744,17 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
-            // Imported .nvdb volume: upload a NATIVE SPARSE brick grid (ROADMAP C2).
-            // The dense lattice is partitioned into B^3 bricks; only occupied bricks
-            // reach the device, so VRAM tracks filled volume, not the bounding box.
-            if (m.vdb && !m.vdb->empty()) {
-                const VdbGrid& g = *m.vdb;
-                const int B = 8;
-                std::vector<int32_t> bidx; std::vector<uint16_t> bdata; int bx, by, bz;
-                int nActive = g.buildBricks(B, bx, by, bz, bidx, bdata);
-                dm.vdbBrickIndex = (const int32_t*)keep(uploadVec(bidx));
-                dm.vdbBrickData  = (const uint16_t*)keep(uploadVec(bdata));
-                dm.vdbBx = bx; dm.vdbBy = by; dm.vdbBz = bz;
-                dm.vdbBrickB = B; dm.vdbBrickShift = 3;   // 3 == log2(8)
-                dm.vdbNx = g.nx; dm.vdbNy = g.ny; dm.vdbNz = g.nz;
-                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = g.ainv[k];
-                dm.vdbW0   = {g.w0.x, g.w0.y, g.w0.z};
-                dm.vdbImin = {g.imin.x, g.imin.y, g.imin.z};
-                size_t denseB  = (size_t)g.nx * g.ny * g.nz * sizeof(uint16_t);
-                size_t sparseB = bdata.size() * sizeof(uint16_t) + bidx.size() * sizeof(int32_t);
-                int nBricks = bx * by * bz;
-                // The scene is re-uploaded on every progressive refresh; report the
-                // sparse footprint only once per distinct grid to avoid log spam.
-                static std::vector<const void*> reportedVdb;
-                const void* vkey = (const void*)m.vdb.get();
-                bool seen = false;
-                for (const void* p : reportedVdb) if (p == vkey) { seen = true; break; }
-                if (!seen) {
-                    reportedVdb.push_back(vkey);
-                    std::fprintf(stderr,
-                        "[vdb] sparse device grid: %d/%d bricks active (%.1f%%), "
-                        "%.1f MB -> %.1f MB VRAM (%.1fx)\n",
-                        nActive, nBricks, nBricks ? 100.0 * nActive / nBricks : 0.0,
-                        denseB / 1048576.0, sparseB / 1048576.0,
-                        sparseB ? (double)denseB / sparseB : 1.0);
-                }
-            } else {
-                dm.vdbBrickIndex = nullptr; dm.vdbBrickData = nullptr;
-                dm.vdbBx = dm.vdbBy = dm.vdbBz = 0;
-                dm.vdbBrickB = 0; dm.vdbBrickShift = 0;
-                dm.vdbNx = dm.vdbNy = dm.vdbNz = 0;
-                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = (k % 4 == 0) ? 1.0 : 0.0;
-                dm.vdbW0 = {0,0,0}; dm.vdbImin = {0,0,0};
-            }
+            // Imported .nvdb/.vdb volume: upload a NATIVE SPARSE brick grid (ROADMAP C2).
+            if (m.vdb && !m.vdb->empty()) uploadVdbGrid(*m.vdb, dm.densGrid, "density");
+            else                          clearVdbGrid(dm.densGrid);
+            // Volumetric blackbody emission ("fire", ROADMAP C3): upload the temperature
+            // field + emission params so the device genPhoton can birth fire photons.
+            dm.emissive = (m.emissive() && m.temperature && !m.temperature->empty()) ? 1 : 0;
+            if (dm.emissive) uploadVdbGrid(*m.temperature, dm.tempGrid, "temperature");
+            else             clearVdbGrid(dm.tempGrid);
+            dm.emitKelvin    = m.emitKelvin;
+            dm.tempPeak      = m.tempPeak;
+            dm.emissionScale = m.emissionScale;
             dm.bounded  = m.bounded ? 1 : 0;
             dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
                           : (m.boundShape == MediumBound::Implicit) ? 2 : 0;
@@ -8601,6 +8791,25 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
         sc.hasGrin = grin::sceneHasGrin(scene) ? 1 : 0;   // gate for dGrinMarch (host twin)
+        // Emissive "fire" volumes (ROADMAP C3): upload the AABB/meanKe/power + the per-
+        // volume Planck-at-emitKelvin wavelength CDF, and the total emission power for the
+        // emitter-vs-fire birth split. Empty => emissiveVolumes=null, totalEmissionPower=0.
+        std::vector<DEmissiveVolume> devs(scene.emissiveVolumes.size());
+        for (size_t v = 0; v < scene.emissiveVolumes.size(); ++v) {
+            const Scene::EmissiveVolume& ev = scene.emissiveVolumes[v];
+            DEmissiveVolume& d = devs[v];
+            d.mediumIndex = ev.mediumIndex;
+            d.bmin = {ev.bmin.x, ev.bmin.y, ev.bmin.z};
+            d.bmax = {ev.bmax.x, ev.bmax.y, ev.bmax.z};
+            d.meanKe = ev.meanKe;
+            d.power  = ev.power;
+            d.lamCdf  = (const double*)keep(uploadVec(ev.lamSampler.cdf));
+            d.lamN    = (int)ev.lamSampler.cdf.size() - 1;   // cdf has N+1 entries
+            d.lamStep = ev.lamSampler.step;
+        }
+        sc.emissiveVolumes    = devs.empty() ? nullptr : (const DEmissiveVolume*)keep(uploadVec(devs));
+        sc.emissiveVolN       = (int)devs.size();
+        sc.totalEmissionPower = scene.totalEmissionPower;
     }
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};

@@ -143,9 +143,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   β is constant across λ, collapsing the colour-magnitude speckle (uniform p=1/Δλ recovers the plain
   β=grandTotal·κ_e/meanKe). The isotropic `1/(4π)/(dist²·Ω)` splat
   (`connectEmissionVolume`/`connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission
-  line-integral. **Forward CPU only** (A/B/C, V/P forward layers): `cudaForwardSupported()` rejects
-  emissive-volume scenes so the GPU falls back to CPU (GPU mirror is logged in `known-issues.md`; the
-  backward reference never samples the grid).
+  line-integral. **Forward CPU AND GPU** (A/B/C, V/P forward layers): the GPU mirror lives in
+  `render_cuda.cu` — the VDB brick sampler is factored into a reusable `DVdbGrid`/`dVdbSample`, `DMedium`
+  gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume Planck-λ CDF)
+  and `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
+  `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
+  The backward reference (mode R/V) never samples the grid — it treats media as one homogeneous haze.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.

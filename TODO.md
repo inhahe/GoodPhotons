@@ -768,10 +768,14 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
         colour-magnitude speckle collapses (v0.48.1; uniform p=1/Δλ recovers the plain β=grandTotal·κ_e/meanKe).
         The "scene has no light" guard (ftsl.h) now accepts an emissive volume. Validated on the official
         fire sample (`scraps/vdb_fire.ftsl`, `png/vdb_fire.png`): the flame glows self-lit with the correct
-        red-edge/hot-core shape and no external light. **Still open:** the GPU forward mirror (device
-        genPhoton has no volume-birth branch + `DMedium` no temperature grid, so `cudaForwardSupported`
-        rejects emissive-volume scenes → `-device gpu`/`auto` falls back to CPU), logged in known-issues.md.
-        (Backward R/V is N/A: it treats media as one homogeneous haze and never samples the grid.)
+        red-edge/hot-core shape and no external light. **GPU mirror DONE (v0.49.0):** `render_cuda.cu`
+        factors the VDB brick sampler into a reusable `DVdbGrid`/`dVdbSample` (density path bit-for-bit),
+        `DMedium` gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume
+        Planck-λ CDF) + `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
+        `connectEmissionVolume`/`camSplatEmissionAll` device splat; `cudaForwardSupported` no longer rejects
+        fire. Verified `-device gpu` matches the CPU flame in distribution and the density path still
+        conserves energy (`scraps/vdb_cloud.ftsl`, sum/emitted=1.0). (Backward R/V is N/A: it treats media as
+        one homogeneous haze and never samples the grid.)
 - [x] **C4 VDB: native `.vdb` front-end** — DONE. `loadVdbGrid` dispatches on the file magic; a
       self-contained OpenVDB reader (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dep) parses the file
       container, `float 5_4_3` tree topology and BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand,
