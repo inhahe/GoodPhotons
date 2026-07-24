@@ -164,6 +164,30 @@ def test_introspect_swept_mesh_carries_tessellated_geometry():
         assert len(f) == 3 and all(0 <= i < nv for i in f)
 
 
+def test_introspect_iso_mesh_carries_marching_cubes_geometry():
+    """F7 (MC fallback): an iso_mesh object carries its marching-cubes triangle
+    mesh (vertices + 0-based faces) baked at the clock, so the Meshes tab can draw
+    the isosurface without a GPU raymarch."""
+    from loom import X, Y, Z, IsoMesh
+    from loom.scene import Scene, Camera
+    cam = Camera(eye=(0, 0, 3), look_at=(0, 0, 0))
+    sc = Scene(cam)
+    sphere = X * X + Y * Y + Z * Z + (-(0.6 * 0.6))   # unit-ish sphere field
+    sc.add(IsoMesh(sphere, bounds=1.0, res=20, iso=0.0, material="skin", name="ball"))
+    d = introspect(sc)
+    iso = [o for o in d["objects"] if o["kind"] == "iso_mesh"][0]
+    m = iso["mesh"]
+    assert len(m["vertices"]) > 100 and all(len(v) == 3 for v in m["vertices"])
+    nv = len(m["vertices"])
+    assert len(m["faces"]) > 100
+    for f in m["faces"]:
+        assert len(f) == 3 and all(0 <= i < nv for i in f)
+    # baked at iso=0 -> vertices lie near radius 0.6
+    import math
+    rad = [math.sqrt(sum(c * c for c in v)) for v in m["vertices"]]
+    assert abs(sum(rad) / len(rad) - 0.6) < 0.05
+
+
 def test_introspect_open_swept_mesh_face_count():
     """An open ribbon (open spine + open profile) skins (n-1) spans x (k-1) edges."""
     from loom.scene import Scene, Camera, ribbon

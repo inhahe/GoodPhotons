@@ -1422,11 +1422,19 @@ replacement for the renderer or the primary editing tool.**
       shown collapse to a chosen lattice index). Tabs auto-hide when their kind is absent so the
       present one is default-selected. VERSION → 0.54.0. Verified via PrintWindow screenshot.
       *(No glyphs yet — points only, as speced; deferred as a later polish.)*
-- [ ] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** Show a loom
-      isosurface in the 3-D pane by **raymarching it through `-raster-gpu`** (primary path — the whole
-      reason for the native viewer; lets the user *modify* the isosurface and see it re-evaluated fast
-      with no re-tessellation). Keep the existing marching-cubes mesh (`mcubes.mesh_field` / `IsoMesh`)
-      only as an **optional static-rotate fallback**. Textures via **G5**.
+- [~] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** ✅ MC-mesh
+      **fallback done** 2026-07-24. `_describe_element` now bakes each `IsoMesh`'s scalar field to a
+      marching-cubes triangle mesh at the clock (`_iso_mesh_geometry` → `mcubes.mesh_field`) and emits
+      it under the object's `mesh` key — so the **existing Meshes tab draws the isosurface with zero C++
+      changes** (it renders any object carrying a `mesh`). Verified with a torus isosurface
+      (6.1k verts / 12.2k tris) — smooth shaded surface, orbit/wireframe/colour all work. 1 new test.
+      No VERSION bump (loom-only; the shipped `ftrace.exe` already renders `mesh` keys).
+      - **Still open (the primary path):** raymarching the isosurface **through `-raster-gpu`** — the
+        whole reason for the native viewer, letting the user *modify* the field and see it re-evaluated
+        fast with no re-tessellation. That needs the loom field **expression** (an ftsl `function { expr }`
+        string, which `Isosurface.emit` already produces) emitted into the sidecar, then compiled into a
+        D3D11 pixel-shader sphere-tracer in the viewer (or driven over the `ftrace -serve` pipe). Large;
+        the MC mesh is the working stand-in until then. Textures via **G5**.
 
 ---
 

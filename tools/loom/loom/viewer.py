@@ -224,6 +224,22 @@ def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
             "uvs": uvs, "rings": n, "profile_count": k}
 
 
+def _iso_mesh_geometry(im: Any, clock: Optional[Clock]) -> Dict[str, Any]:
+    """Bake an :class:`~loom.scene.IsoMesh`'s scalar field to a triangle mesh at
+    ``clock`` via marching cubes (F7's MC-mesh fallback path) — the same bake
+    ``IsoMesh.emit`` does, but returned as plain lists so the viewer's Meshes tab
+    can draw it.  ``vertices`` are world-space 3-vectors and ``faces`` 0-based index
+    triples; marching cubes has no natural UVs, so none are emitted."""
+    from . import mcubes as _mc
+    from .signals.core import Cache
+    clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+    verts, faces = _mc.mesh_field(
+        im.field, bounds=im.bounds, res=im.res, iso=im.iso,
+        clock=clk, cache=Cache(), adaptive=im.adaptive, coarse=im.coarse)
+    return {"vertices": [list(v) for v in verts],
+            "faces": [list(f) for f in faces], "iso": im.iso}
+
+
 def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, Any]:
     d: Dict[str, Any] = {"id": obj.id, "kind": kind}
     if kind == "path":
@@ -279,7 +295,7 @@ def _datasets_in(el: Any, out: Dict[int, Any]) -> List[int]:
 def _describe_element(el: Any, oid: int, datasets: Dict[int, Any],
                       clock: Optional[Clock] = None) -> Dict[str, Any]:
     cls = type(el).__name__
-    from .scene import Group, SweptMesh  # lazy
+    from .scene import Group, SweptMesh, IsoMesh  # lazy
     kind = {
         "Sphere": "sphere", "Beads": "beads", "SweptMesh": "swept_mesh",
         "IsoMesh": "iso_mesh", "Raw": "raw", "Group": "group", "Volume": "volume",
@@ -309,6 +325,11 @@ def _describe_element(el: Any, oid: int, datasets: Dict[int, Any],
             try:
                 rec["mesh"] = _swept_mesh_geometry(el, clock)
             except Exception as exc:      # never let one bad mesh sink the sidecar
+                rec["mesh_error"] = str(exc)
+        elif isinstance(el, IsoMesh):
+            try:
+                rec["mesh"] = _iso_mesh_geometry(el, clock)
+            except Exception as exc:      # skimage missing / empty surface, etc.
                 rec["mesh_error"] = str(exc)
     return rec
 

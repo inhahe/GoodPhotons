@@ -2292,9 +2292,10 @@ position and every channel value, and for N-D grids **per-extra-dim slice slider
 the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
 surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
 lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker
-colouring; orbiting spins the existing tessellation (view-only). (Early stage: real mesh
-textures and the `-raster-gpu` isosurface render pane are still in progress — see §F in
-`TODO.md`.)
+colouring; orbiting spins the existing tessellation (view-only). `IsoMesh` isosurfaces are
+baked to a marching-cubes mesh and shown in the same Meshes tab. (Early stage: real mesh
+textures and the `-raster-gpu` field-raymarch isosurface path are still in progress — see §F
+in `TODO.md`.)
 
 ---
 

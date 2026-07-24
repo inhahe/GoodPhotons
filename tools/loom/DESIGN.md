@@ -644,7 +644,11 @@ tools/loom/
   (orbiting is view-only). Deferred F4 pieces: real image/formula **textures** (needs materials to emit
   their `skin`/`func_skin` into the sidecar — G5) and **off-thread re-tessellation when rotating into a
   parameter dim** (needs a live viewer↔loom channel, since the static sidecar can't re-bake geometry).
-  Remaining §F slice (F7: `-raster-gpu`/isosurface pane) builds on it.
+  **F7's MC-mesh fallback is complete:** `_describe_element` bakes each `IsoMesh`'s field to a
+  marching-cubes mesh (`_iso_mesh_geometry`→`mcubes.mesh_field`) into the object's `mesh` key, so the
+  existing Meshes tab draws the isosurface with no C++ change. F7's **primary path** — raymarching the
+  field *expression* through `-raster-gpu` (a D3D11 sphere-tracer, no re-tessellation) — remains the one
+  big open §F piece.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
