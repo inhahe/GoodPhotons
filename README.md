@@ -1633,10 +1633,16 @@ the balance heuristic is a partition of unity so the estimator stays unbiased re
 The backward reference (R/V) and the P composite treat the medium as a single global homogeneous haze
 and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
 
-**Imported volumes (`.nvdb`).** Instead of a formula, point the density field at a real
-sparse volume: `density vdb:<path.nvdb>` imports a NanoVDB **FloatGrid** (the compact,
-GPU-friendly form of an OpenVDB volume — convert a `.vdb` with OpenVDB's `nanovdb_convert`,
-uncompressed). On load the grid is **baked into a dense lattice** plus a world→index affine,
+**Imported volumes (`.nvdb` / `.vdb`).** Instead of a formula, point the density field at a
+real sparse volume: `density vdb:<path>` imports either a NanoVDB **FloatGrid** (`.nvdb`, the
+compact GPU-friendly form) **or a native OpenVDB `.vdb`** directly — the loader dispatches on
+the file magic. The native `.vdb` path is a **self-contained reader** (no OpenVDB/NanoVDB
+dependency): it parses the file container, tree topology (`float 5_4_3`) and
+BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand, decoding blosc's **LZ4** codec with a
+vendored single-file LZ4. (Other blosc codecs — BloscLZ/Zlib/Zstd — and ZIP are reported with
+a clear "re-export with LZ4" message; validated bit-for-bit against python-blosc on the
+official OpenVDB smoke/sphere/cube samples.) On load the grid is **baked into a dense lattice**
+plus a world→index affine,
 so the *identical* trilinear sampler runs on the CPU and the GPU (`dMedDensityAt` reads the
 uploaded lattice) and any affine map (translation/scale/rotation) is honored. The grid's
 world AABB auto-seeds the medium bound and its peak value the delta-tracking majorant — so

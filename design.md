@@ -79,9 +79,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   mirror, glossy, dielectric w/ nested IOR, diffuse-transmission, filter gels,
   fluorescence, layered), procedural patterns (POV-derived `pov_noise.h` /
   `pov_functions.h`), UV texturing.
-- **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*`** —
+- **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*` / `vdb_openvdb.cpp`** —
   participating media (bounded, density fields, superposition), HG + water-droplet
-  (rainbow) phase functions, gradient-index bending, NanoVDB density import.
+  (rainbow) phase functions, gradient-index bending, NanoVDB (`.nvdb`) + native OpenVDB
+  (`.vdb`, self-contained BLOSC/LZ4 reader) density import.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.

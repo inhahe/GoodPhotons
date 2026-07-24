@@ -78,6 +78,19 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
     FILE* fp = std::fopen(path.c_str(), "rb");
     if (!fp) { err = "cannot open '" + path + "'"; return false; }
 
+    // Dispatch on magic: a native OpenVDB `.vdb` begins with the int64 magic
+    // 0x56444220 ("VDB "). Delegate those to the hand-rolled OpenVDB reader (no
+    // NanoVDB); everything else falls through to the NanoVDB `.nvdb` path below.
+    {
+        uint64_t magic = 0;
+        if (std::fread(&magic, 1, 8, fp) == 8 &&
+            (magic & 0xFFFFFFFFull) == 0x56444220ull) {
+            std::fclose(fp);
+            return loadOpenVDBGrid(path, out, err);
+        }
+        std::fseek(fp, 0, SEEK_SET);
+    }
+
     // Disambiguate the two accepted layouts the same way NanoVDB's own reader does:
     // read the first 40 bytes as GridData; if that looks like a valid grid the file
     // is a RAW grid buffer, otherwise it is a FILE CONTAINER (FileHeader, then

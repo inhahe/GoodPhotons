@@ -70,7 +70,16 @@ struct VdbGrid {
     }
 };
 
-// Load a .nvdb (uncompressed NanoVDB) file, bake its first FloatGrid into `out`.
-// Returns false and fills `err` on failure. Implemented in vdbgrid.cpp (the only
-// TU that includes NanoVDB.h).
+// Load a sparse volume file, bake its first float grid into `out`. Dispatches on
+// the file's magic: a native OpenVDB `.vdb` (magic "VDB ") is parsed by
+// loadOpenVDBGrid (vdb_openvdb.cpp, no NanoVDB), otherwise it is treated as an
+// (uncompressed) NanoVDB `.nvdb` and baked in vdbgrid.cpp (the only TU that
+// includes NanoVDB.h). Returns false and fills `err` on failure.
 bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err);
+
+// Native OpenVDB `.vdb` reader (vdb_openvdb.cpp): parses the file container, tree
+// topology and BLOSC/ACTIVE_MASK/HalfFloat leaf buffers by hand (vendored LZ4 for
+// blosc's LZ4 codec) and bakes the first float grid into a dense VdbGrid. No
+// OpenVDB/NanoVDB dependency. Returns false and fills `err` on failure (including
+// a clear "re-export with LZ4" message for the unsupported blosc codecs).
+bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err);

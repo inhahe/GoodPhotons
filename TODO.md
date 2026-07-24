@@ -722,8 +722,13 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
 - [ ] **C2 VDB: native sparse device sampler.** Today the NanoVDB grid is baked to a **dense** float
       lattice for the device sampler; a native sparse GPU sampler is the follow-up.
 - [ ] **C3 VDB: fp16 + emission/temperature grids** (fire) — currently float density grids only.
-- [ ] **C4 VDB: native `.vdb` front-end** — validated against a downloaded official OpenVDB sample
-      (only `.nvdb` is ingested today; `.vdb→.nvdb` is a manual step).
+- [x] **C4 VDB: native `.vdb` front-end** — DONE. `loadVdbGrid` dispatches on the file magic; a
+      self-contained OpenVDB reader (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dep) parses the file
+      container, `float 5_4_3` tree topology and BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand,
+      decoding blosc's LZ4 codec with a vendored single-file LZ4. Validated bit-for-bit against
+      python-blosc on the official OpenVDB smoke/sphere/cube samples and render-validated
+      (`scraps/vdb_smoke_native.ftsl`). Other blosc codecs (BloscLZ/Zlib/Zstd) + ZIP report a clear
+      "re-export with LZ4" message — see known-issues.md.
 - [ ] **C5 Mesh: emissive triangles** (mesh area lights).
 - [ ] **C6 Mesh: tangent-space normal maps.**
 - [x] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.  **DONE 2026-07-18**.

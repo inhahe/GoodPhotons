@@ -2354,27 +2354,42 @@ correctly on **both** backends.
   optical-depth accumulation along connection rays through dielectrics. Deferred until a
   dispersive-caustic VCM render demands it.
 
-### `.nvdb` volume import (`density vdb:<file>`): dense bake, float-only, uncompressed
+### `.nvdb` / `.vdb` volume import (`density vdb:<file>`): dense bake, float-only
 - **What:** `medium { density vdb:cloud.nvdb }` imports a NanoVDB FloatGrid (`src/vdbgrid.cpp`,
-  the only TU that includes the vendored `NanoVDB.h`). On load the sparse grid is **baked into a
-  dense float lattice** covering its active index-space bounding box (`VdbGrid`, `src/vdbgrid.h`).
-  A CPU+GPU-shared trilinear sampler reads that lattice.
+  the only TU that includes the vendored `NanoVDB.h`) **or a native OpenVDB `.vdb`**
+  (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dependency). `loadVdbGrid` dispatches on the file
+  magic (`"VDB "` → the native reader, else the NanoVDB path). On load the sparse grid is
+  **baked into a dense float lattice** covering its active index-space bounding box (`VdbGrid`,
+  `src/vdbgrid.h`). A CPU+GPU-shared trilinear sampler reads that lattice.
+- **Native `.vdb` reader:** parses the file container (header, grid descriptor, per-grid
+  compression/metadata/transform), the `float 5_4_3` tree topology, and BLOSC+ACTIVE_MASK+
+  HalfFloat leaf/tile buffers by hand. Blosc's **LZ4** codec is decoded with a vendored
+  single-file LZ4 (`src/third_party/lz4.*`) plus a compact reimplementation of blosc1's
+  chunk/block/byte-shuffle framing — validated **bit-for-bit against python-blosc** on the
+  official OpenVDB smoke/sphere/cube samples (`scraps/_vdb_parse.py` reproduces the parse with
+  read-position exactness). Render-validated: `scraps/vdb_smoke_native.ftsl` shows the smoke
+  plume.
 - **Limitations:**
   1. **Dense memory** — RAM/VRAM scales with the index-space AABB (nx·ny·nz·4 bytes), not the
      active voxel count, so a large but mostly-empty sparse volume can blow up. A safety cap
      (512 M voxels) rejects pathological grids with a clear error rather than OOM-ing.
-  2. **Float grids only** — non-float builds (Fp4/Fp8/Fp16/level-set index grids) are rejected
-     with a message. Convert to a float fog volume first.
-  3. **Uncompressed `.nvdb` only** — Blosc/ZIP-compressed files are rejected (we deliberately
-     don't vendor zlib/blosc). Re-export uncompressed (`nanovdb_convert`, or NanoVDB's
-     `writeUncompressedGrids`).
+  2. **Float grids only** — non-float NanoVDB builds (Fp4/Fp8/Fp16/level-set index grids) and
+     non-`Tree_float_5_4_3` `.vdb` grids are rejected with a message. Convert to a float fog
+     volume first.
+  3. **`.nvdb`: uncompressed only** — Blosc/ZIP-compressed `.nvdb` files are rejected (we
+     deliberately don't vendor zlib/blosc for NanoVDB). Re-export uncompressed. **`.vdb`: LZ4
+     blosc only** — the native reader decodes blosc **LZ4** (Houdini's and OpenVDB `-l lz4`
+     default) but not blosc **BloscLZ / Zlib / Zstd** or standalone **ZIP**; those are reported
+     with a clear "re-export with LZ4" message. Vendoring zstd/zlib for the other codecs is a
+     follow-up if an asset needs it.
   4. **Quoted path not accepted** — the FTSL value grammar takes one bareword token, so the path
      must be unquoted: `density vdb:scraps/cloud.nvdb` (no spaces). A quoted `vdb:"..."` form
      would need a small `parseValue` change to consume a trailing String.
   5. No emission/temperature grids (fire), no motion-blur/velocity grids.
-- **Proper fix (if needed):** a native NanoVDB **sparse** device accessor (sample the tree
-  directly on CPU+GPU instead of baking dense) to drop the memory cost and support huge volumes;
-  fp16 dense option; a second float grid for blackbody emission. Deferred until an asset needs it.
+- **Proper fix (if needed):** a native **sparse** device accessor (sample the tree directly on
+  CPU+GPU instead of baking dense) to drop the memory cost and support huge volumes; fp16 dense
+  option; a second float grid for blackbody emission; the remaining blosc codecs. Deferred until
+  an asset needs it.
 
 ### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
 - **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward

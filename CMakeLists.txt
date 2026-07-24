@@ -25,6 +25,8 @@ add_executable(ftrace
     src/stb_image_impl.cpp   # compiles vendored stb_image (texture load) + stb_image_write (PNG/JPG output) once
     src/livewindow.cpp       # -window live-preview OS window (Win32 GDI; no-op stub off Windows)
     src/vdbgrid.cpp          # confines vendored NanoVDB.h to one TU; bakes .nvdb -> dense fog grid
+    src/vdb_openvdb.cpp      # native OpenVDB .vdb reader (no OpenVDB/NanoVDB dep); bakes .vdb -> dense fog grid
+    src/third_party/lz4.c    # vendored single-file LZ4 (BSD) for blosc LZ4 decode in the .vdb reader
     src/fbx_load.cpp         # FBX mesh loader (bridge over vendored ufbx); confines ufbx.h to one TU
     src/third_party/ufbx.c   # vendored single-file FBX parser (MIT / public-domain), compiled as C
     src/gpda/tokenized.cpp        # vendored GPDA parser engine (J3c grammar-validation shim)
@@ -37,7 +39,7 @@ target_include_directories(ftrace PRIVATE src src/gpda)
 # signal about our own code).
 if(MSVC)
     set_source_files_properties(
-        src/gpda/tokenized.cpp src/gpda/ftsl_scene.gen.cpp
+        src/gpda/tokenized.cpp src/gpda/ftsl_scene.gen.cpp src/third_party/lz4.c
         PROPERTIES COMPILE_OPTIONS "/W0")
 endif()
 
