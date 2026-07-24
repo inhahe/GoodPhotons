@@ -1590,8 +1590,18 @@ ftrace's own language). Two follow-ups were captured:
           mirrored in loom's spectrum grammar (`IllumSpec`). The Gauss-Newton solver was refactored into a shared
           `fitSigmoid()` so reflectance and illuminant fits share bit-identical arithmetic. Validated by
           `scraps/illum_test.ftsl` → `png/illum_test.png`.
-    - [ ] **Still open:** other upsamplers (Smits 1999, Meng 2015, plain box/3-lobe) and a **named user mapping**
-          — a `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
+    - [x] **Smits 1999 upsampler landed** *(2026-07-24, v0.45.0).* The classic tabulated Smits RGB→reflectance
+          basis is in `upsample.h` (`SmitsBasis` — seven basis spectra white/C M Y/R G B at 10 samples over
+          [380,720] nm; `smitsCombine` does the additive white+secondary+primary decomposition, clamped to a
+          physical `[0,1]` reflectance; `rgbToReflectanceSmits` linearly interpolates in λ). Surface: **head
+          keywords** `rgbsmits`/`hsvsmits`/`hslsmits` (parallel to the `…illum`/`…line` heads), wired through
+          `evalSpectrum` (`ftsl.h`) and mirrored in loom's spectrum grammar (`SmitsSpec` in
+          `tools/loom/loom/grammar/spectrum.py`, with tests). Validated by `-checkupsample` (Smits round-trips
+          sRGB to <0.07 max, all reflectances in [0,1]) and a render (`scraps/smits_test.ftsl`, Smits vs
+          Jakob-Hanika panels side by side). A reflectance upsampler, so no GPU change (upsampling is a host-side
+          bake into the spectral tables).
+    - [ ] **Still open:** further upsamplers (Meng 2015, plain box/3-lobe) and a **named user mapping** — a
+          `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
 
 - [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
       analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or

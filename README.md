@@ -953,6 +953,13 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   broadband source, not a monochromatic spike, so it reads as a natural coloured light
   rather than a laser line. Meant for **lights** (`spd rgbillum 1 0.6 0.2`); accepted
   anywhere a spectrum is.
+- **`rgbsmits r g b`** (also `hsvsmits …`, `hslsmits …`) — the classic **Smits 1999**
+  RGB→reflectance upsampler: the colour is decomposed additively over seven tabulated
+  basis reflectances (white / C M Y / R G B) sampled at 10 wavelengths. A **selectable,
+  lower-fidelity alternative** to the default `rgb` (Jakob–Hanika) fit — cheaper and
+  historically standard, but rounds sRGB back to within only ~0.07 (vs `rgb`'s <0.001).
+  Produces a valid `[0,1]` reflectance, so it's a *material* upsampler like `rgb`; offered
+  for comparison / when a scene wants the Smits basis specifically.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
   **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
   (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —

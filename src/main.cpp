@@ -922,12 +922,32 @@ static int checkUpsample() {
     }
     bool passD = illumErr < 2e-3;
 
-    bool pass = passA && passB && passW && passC && passD;
+    // (e) Smits 1999 reflectance upsample round-trips: build the tabulated basis
+    // reflectance, integrate under D65 through the CIE observer, and compare to the
+    // input. Smits is an approximate classic (lower fidelity than Jakob-Hanika), so
+    // the tolerance is deliberately looser — this just guards gross regressions.
+    double smitsErr = 0.0; bool smitsPhysical = true;
+    for (const C& c : tests) {
+        Spectrum spd = rgbToReflectanceSmits(c.r, c.g, c.b);
+        for (int i = 0; i < B.N; ++i) {
+            double s = spd(B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) smitsPhysical = false;
+        }
+        Vec3 lin = reflectanceToLinearSrgbD65(spd);
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        smitsErr = std::max(smitsErr, e);
+        std::printf("[checkupsample] smits %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+    bool passE = smitsPhysical && smitsErr < 0.20;   // approximate by design
+
+    bool pass = passA && passB && passW && passC && passD && passE;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
     std::printf("[checkupsample] mid-grey round-trip = %.6f  (%s)\n", greyErr, passC ? "ok" : "BAD");
     std::printf("[checkupsample] illuminant round-trip max error = %.5f  (%s)\n", illumErr, passD ? "ok" : "BAD");
+    std::printf("[checkupsample] smits round-trip max error = %.5f (<0.20 expected)  (%s)\n", smitsErr, passE ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

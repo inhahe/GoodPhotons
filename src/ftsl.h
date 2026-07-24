@@ -1185,12 +1185,16 @@ private:
         // of `rgb`, right for coloured lights (`spd rgbillum 1 0.6 0.2`). Meant for lights;
         // accepted anywhere a spectrum is. (Head keywords, not trailing modifiers, because
         // the parser stops a value at the next bareword.)
+        // The `…smits` heads (`rgbsmits`/`hsvsmits`/`hslsmits`) take the classic
+        // Smits 1999 RGB→reflectance basis instead of the default Jakob-Hanika fit
+        // — a selectable, lower-fidelity alternative upsampler (K1).
         {
             bool isLine  = (h == "rgbline"  || h == "hsvline"  || h == "hslline");
             bool isIllum = (h == "rgbillum" || h == "hsvillum" || h == "hslillum");
-            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum) {
+            bool isSmits = (h == "rgbsmits" || h == "hsvsmits" || h == "hslsmits");
+            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum || isSmits) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = (isLine || isIllum) ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum || isSmits) ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1200,6 +1204,7 @@ private:
                     return rgbToLineEmission(c.x, c.y, c.z, sigma);
                 }
                 if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
+                if (isSmits) return rgbToReflectanceSmits(c.x, c.y, c.z);
                 return rgbToReflectanceJH(c.x, c.y, c.z);
             }
         }

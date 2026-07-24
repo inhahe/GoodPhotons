@@ -26,6 +26,9 @@ The accepted forms — exactly ftrace's ``evalSpectrum`` (``src/ftsl.h`` ~1106) 
 * the Jakob-Hanika *illuminant* heads **`rgbillum r g b`** / **`hsvillum …`** /
   **`hslillum …`** → a smooth full-spectrum *emission* SPD reproducing the colour under
   the bare observer (:class:`IllumSpec`), the emitter analogue of ``rgb``;
+* the Smits 1999 reflectance heads **`rgbsmits r g b`** / **`hsvsmits …`** /
+  **`hslsmits …`** → the colour upsampled via the classic tabulated Smits basis
+  (:class:`SmitsSpec`), a selectable lower-fidelity alternative to ``rgb``;
 * a library **reference** — ``glass:`` / ``metal:`` / ``reflectance:`` / ``filter:``
   / ``preset:`` / ``file:`` / ``spectrum:`` followed by a name / path;
 * a **record channel reference** used as a constant — ``RECORD.channel[i]`` or
@@ -52,6 +55,8 @@ _COLOR_HEADS = ("rgb", "hsv", "hsl")
 _LINE_HEADS = {"rgbline": "rgb", "hsvline": "hsv", "hslline": "hsl"}
 # The Jakob-Hanika illuminant (full-spectrum emission) heads (K1): `rgbillum r g b`, etc.
 _ILLUM_HEADS = {"rgbillum": "rgb", "hsvillum": "hsv", "hslillum": "hsl"}
+# The Smits 1999 reflectance upsampler heads (K1): `rgbsmits r g b`, etc.
+_SMITS_HEADS = {"rgbsmits": "rgb", "hsvsmits": "hsv", "hslsmits": "hsl"}
 _LIB_PREFIXES = ("glass:", "metal:", "reflectance:", "filter:", "preset:",
                  "file:", "spectrum:")
 
@@ -129,6 +134,18 @@ class IllumSpec:
     whose integral under the bare CIE observer reproduces the colour — ftrace's
     ``rgbToIlluminantJH`` / K1, the emitter analogue of :class:`ColorSpec`.  A *head
     keyword* (not a trailing modifier) for the same parser reason as :class:`LineSpec`."""
+    space: str
+    comps: Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class SmitsSpec:
+    """The Smits 1999 reflectance form ``rgbsmits r g b`` (and ``hsvsmits``/
+    ``hslsmits``): the colour upsampled to a reflectance via ftrace's classic
+    tabulated Smits basis (``rgbToReflectanceSmits`` / K1) — a selectable,
+    lower-fidelity alternative to the default Jakob-Hanika :class:`ColorSpec`.  A
+    *head keyword* (not a trailing modifier) for the same parser reason as
+    :class:`LineSpec`."""
     space: str
     comps: Tuple[float, float, float]
 
@@ -233,6 +250,11 @@ def parse_spectrum(text: str):
         space = _ILLUM_HEADS[head]
         _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
         return IllumSpec(space, comps)
+    if head in _SMITS_HEADS:
+        # `rgbsmits r g b` (hsvsmits/hslsmits) → Smits 1999 reflectance upsample.
+        space = _SMITS_HEADS[head]
+        _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
+        return SmitsSpec(space, comps)
     if head in _COLOR_HEADS:
         space, comps = as_color(text, default_space=head)
         return ColorSpec(space, comps)

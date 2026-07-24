@@ -253,6 +253,58 @@ inline DomWL rgbToDominantWavelength(double r, double g, double b) {
     return out;   // no crossing found (degenerate) -> defaults
 }
 
+// --- Smits 1999 RGB->reflectance basis ------------------------------------
+// Brian Smits, "An RGB-to-Spectrum Conversion for Reflectances" (1999): seven
+// tabulated basis reflectances (white / C M Y / R G B) sampled at 10 wavelengths
+// evenly spanning [380,720] nm. An RGB triple is decomposed additively —
+// white·min + one secondary + one primary — so the reconstruction stays smooth
+// and (unlike a naive box) round-trips RGB reasonably. Classic, cheaper and
+// lower-fidelity than Jakob-Hanika; offered as a selectable alternative (K1).
+struct SmitsBasis {
+    static constexpr int N = 10;
+    double lam[N];
+    double white[N], cyan[N], magenta[N], yellow[N], red[N], green[N], blue[N];
+    SmitsBasis() {
+        const double W[N]  = {1.0000,1.0000,0.9999,0.9993,0.9992,0.9998,1.0000,1.0000,1.0000,1.0000};
+        const double C[N]  = {0.9710,0.9426,1.0007,1.0007,1.0007,1.0007,0.1564,0.0000,0.0000,0.0000};
+        const double M[N]  = {1.0000,1.0000,0.9685,0.2229,0.0000,0.0458,0.8369,1.0000,1.0000,0.9959};
+        const double Y[N]  = {0.0001,0.0000,0.1088,0.6651,1.0000,1.0000,0.9996,0.9586,0.9685,0.9840};
+        const double R[N]  = {0.1012,0.0515,0.0000,0.0000,0.0000,0.0000,0.8325,1.0149,1.0149,1.0149};
+        const double G[N]  = {0.0000,0.0000,0.0273,0.7937,1.0000,0.9418,0.1719,0.0000,0.0000,0.0025};
+        const double B[N]  = {1.0000,1.0000,0.8916,0.3323,0.0000,0.0000,0.0003,0.0369,0.0483,0.0496};
+        for (int i = 0; i < N; ++i) {
+            lam[i] = 380.0 + (720.0 - 380.0) * i / (N - 1);
+            white[i]=W[i]; cyan[i]=C[i]; magenta[i]=M[i]; yellow[i]=Y[i];
+            red[i]=R[i]; green[i]=G[i]; blue[i]=B[i];
+        }
+    }
+};
+inline const SmitsBasis& smitsBasis() { static SmitsBasis b; return b; }
+
+// Additive Smits decomposition of a clamped RGB triple into the 10-sample lattice.
+inline std::array<double, SmitsBasis::N> smitsCombine(double r, double g, double b) {
+    const SmitsBasis& B = smitsBasis();
+    std::array<double, SmitsBasis::N> ret{};   // value-initialised to 0
+    auto add = [&](const double* basis, double w) {
+        for (int i = 0; i < SmitsBasis::N; ++i) ret[i] += w * basis[i];
+    };
+    if (r <= g && r <= b) {
+        add(B.white, r);
+        if (g <= b) { add(B.cyan, g - r);    add(B.blue,  b - g); }
+        else        { add(B.cyan, b - r);    add(B.green, g - b); }
+    } else if (g <= r && g <= b) {
+        add(B.white, g);
+        if (r <= b) { add(B.magenta, r - g); add(B.blue,  b - r); }
+        else        { add(B.magenta, b - g); add(B.red,   r - b); }
+    } else {
+        add(B.white, b);
+        if (r <= g) { add(B.yellow, r - b);  add(B.green, g - r); }
+        else        { add(B.yellow, g - b);  add(B.red,   r - g); }
+    }
+    for (auto& v : ret) v = std::clamp(v, 0.0, 1.0);   // guarantee a physical reflectance
+    return ret;
+}
+
 } // namespace upsample
 
 // Build a near-monochromatic *emission* Spectrum from a linear-sRGB triple: a
@@ -272,6 +324,25 @@ inline Spectrum rgbToLineEmission(double r, double g, double b, double sigmaOver
     double sigma = (sigmaOverride > 0.0) ? sigmaOverride
                                          : 5.0 + 125.0 * (1.0 - d.purity);
     return gaussianBand(d.lambda, sigma, 1.0);
+}
+
+// Build a reflectance Spectrum from a linear-sRGB triple (Smits 1999). The 10
+// tabulated samples are combined additively then linearly interpolated in λ;
+// outside [380,720] nm the endpoint value is held.
+inline Spectrum rgbToReflectanceSmits(double r, double g, double b) {
+    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    auto vals = upsample::smitsCombine(r, g, b);
+    const upsample::SmitsBasis& B = upsample::smitsBasis();
+    std::array<double, upsample::SmitsBasis::N> lam;
+    for (int i = 0; i < upsample::SmitsBasis::N; ++i) lam[i] = B.lam[i];
+    return [vals, lam](double w) -> double {
+        const int N = upsample::SmitsBasis::N;
+        if (w <= lam[0])     return vals[0];
+        if (w >= lam[N - 1]) return vals[N - 1];
+        int i = 0; while (i < N - 1 && w > lam[i + 1]) ++i;
+        double t = (w - lam[i]) / (lam[i + 1] - lam[i]);
+        return vals[i] * (1.0 - t) + vals[i + 1] * t;
+    };
 }
 
 // Build a reflectance Spectrum from a linear-sRGB triple (Jakob-Hanika fit).
