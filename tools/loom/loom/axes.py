@@ -37,11 +37,16 @@ declares its quantity kind (additive / gain / bipolar) and hence its neutral
 element and accumulate operator (:class:`Target`, :func:`combine`).
 
 One sample/select grammar (records, curves, grids, scatters): sample with
-``(...)`` (continuous, interpolated → :class:`Sample`), index with ``[...]``
-(discrete constant selector → :func:`select`), pick a component with ``.name``
-(→ :meth:`AxSignal.comp`).  ``curve(t)`` yields a value *at the current t*, so
-it broadcasts across the target's other axes and lands on the free side by
-construction.
+``(...)`` (continuous, interpolated → :func:`sample` / :class:`Sample`), index
+with ``[...]`` (discrete constant selector → :func:`select`), pick a component
+with ``.name`` (→ :meth:`AxSignal.comp`).  ``curve(t)`` yields a value *at the
+current t*, so it broadcasts across the target's other axes and lands on the
+free side by construction.  :func:`sample` folds loom's own clock-parameterized
+producers into that grammar — a :class:`~loom.interp.LoopCurve` / other curve
+(:class:`CurveSample`, which threads the clock axis so an animated spatial curve
+types as ``{s, t}``) and a :class:`~loom.record.Record` (:class:`RecordSample`,
+a static ``{driver}`` LUT) — so the caller binds a real curve's parameter axis
+directly instead of pre-baking a bare callable that could not see the clock.
 """
 
 from __future__ import annotations
@@ -288,6 +293,102 @@ class Sample(AxSignal):
         return self.fn(p)
 
 
+class CurveSample(AxSignal):
+    """Sample a **clock-parameterized loom curve** at a bound parameter axis.
+
+    ``curve`` is any loom curve exposing ``.sample(u, clock, cache) -> value``
+    (a :class:`~loom.interp.LoopCurve`, a :class:`~loom.interp.TrackedCurve`
+    track, a :class:`~loom.interp.FieldCurve` position, …).  ``arg`` binds the
+    curve's own parameter axis — write ``CurveSample(loop, Ax('s'))`` for the
+    ``curve(s)`` form.  Unlike a plain :class:`Sample` over a bare callable, this
+    threads the **clock axis** (default ``'t'``) into the curve's control-point
+    Signals, so an *animated* spatial curve is correctly typed ``{s, t}`` (its
+    shape moves over time) while a static one just broadcasts trivially over
+    ``t``.  The result is whatever ``.sample`` returns (a vector for a position
+    curve); pick a component with :meth:`AxSignal.comp` (``curve(s).y``).
+    """
+
+    def __init__(self, curve, arg: Numeric, *, clock_axis: str = AXIS_T,
+                 loop: bool = True) -> None:
+        super().__init__()
+        if not callable(getattr(curve, "sample", None)):
+            raise TypeError(
+                "CurveSample needs a loom curve with .sample(u, clock, cache)")
+        self.curve = curve
+        self.arg = as_ax(arg)
+        self.clock_axis = str(clock_axis)
+        self.loop = bool(loop)
+        self.axes = self.arg.axes | {self.clock_axis}
+
+    def children(self):
+        # thread the loom curve node in too (its control points are part of the
+        # DAG); the axis-layer walk duck-types over loom Signals, as Lift does.
+        return (self.arg, self.curve)
+
+    def _eval(self, point: Point):
+        u = self.arg._eval(point)
+        clk = Clock(t=float(point[self.clock_axis]), loop=self.loop)
+        v = self.curve.sample(u, clk)
+        return tuple(v) if isinstance(v, list) else v
+
+
+class RecordSample(AxSignal):
+    """Sample a loom :class:`~loom.record.Record` channel at a bound driver axis.
+
+    A Record is a **static** LUT keyed by a driver in ``[lo, hi]`` (no clock), so
+    ``arg`` binds that driver axis and the result's axes are exactly ``arg``'s —
+    this is the record leaf of the shared sample grammar (``R(driver).chan``).
+    Scalar channels return a float; vector channels a tuple (pick a component
+    with :meth:`AxSignal.comp`).  Colour / expression channels are rejected by
+    the underlying :meth:`Record.sample_vec`.
+    """
+
+    def __init__(self, record, channel: str, arg: Numeric) -> None:
+        super().__init__()
+        if not callable(getattr(record, "sample_vec", None)):
+            raise TypeError("RecordSample needs a loom Record (with .sample_vec)")
+        self.record = record
+        self.channel = str(channel)
+        self.arg = as_ax(arg)
+        self.axes = self.arg.axes
+
+    def children(self):
+        return (self.arg,)
+
+    def _eval(self, point: Point):
+        d = self.arg._eval(point)
+        vec = self.record.sample_vec(self.channel, d)
+        return vec[0] if len(vec) == 1 else tuple(vec)
+
+
+def sample(obj, arg: Numeric, *, channel: Optional[str] = None,
+           clock_axis: str = AXIS_T, loop: bool = True) -> AxSignal:
+    """The unified continuous ``obj(arg)`` sample — one grammar over every loom
+    value producer, binding ``obj``'s own parameter axis to ``arg``:
+
+    - a **loom Record** (has ``.sample_vec``) → :class:`RecordSample` (needs
+      ``channel=``; static LUT, axes = ``arg``'s);
+    - a **clock-parameterized loom curve** (has ``.sample(u, clock, cache)``) →
+      :class:`CurveSample` (threads ``clock_axis``, so animated ⇒ ``{s, t}``);
+    - a **plain callable** of one scalar → :class:`Sample` (the low-level form).
+
+    This is the fold that lets the sample grammar bind a real loom curve's param
+    axis directly rather than forcing the caller to pre-bake a bare callable
+    (which could not thread the clock the curve's control points depend on).
+    """
+    if callable(getattr(obj, "sample_vec", None)):          # a Record
+        if channel is None:
+            raise ValueError("sampling a Record needs channel=<name>")
+        return RecordSample(obj, channel, arg)
+    if callable(getattr(obj, "sample", None)):              # a clock-param curve
+        return CurveSample(obj, arg, clock_axis=clock_axis, loop=loop)
+    if callable(obj):                                        # a bare callable
+        return Sample(obj, arg)
+    raise TypeError(
+        "sample(obj, …): obj must be a loom Record, a loom curve with "
+        ".sample(u, clock, cache), or a plain callable")
+
+
 def select(items: Sequence[Numeric], i: int) -> AxSignal:
     """Discrete constant selector ``items[i]`` — the ``R.chan[i]`` / ``[...]``
     form.  ``i`` is a fixed Python int (last-write-wins constant), not an axis;
@@ -462,6 +563,7 @@ def combine(kind: str, bindings: Sequence[Binding],
 
 __all__ = [
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
+    "CurveSample", "RecordSample", "sample",
     "Binding", "Target", "combine", "as_ax",
     "ADDITIVE", "GAIN", "BIPOLAR",
     "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V", "Point",

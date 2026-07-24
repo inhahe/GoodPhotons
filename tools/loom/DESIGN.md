@@ -578,11 +578,13 @@ tools/loom/
   (continuous `curve(t)`) + `.comp(i)` (`curve(t).y`) + `select(items,i)` (discrete `R.chan[i]`); the **only**
   cross-axis node `Reduce(body,axis,samples,op)` (`axes = body.axes − {axis}`, explicit); and the pin/mod edge
   model `Target(kind,[Binding(source,mode,gain)],base)` with target-declared neutrals (`ADDITIVE` 0 / `GAIN` 1
-  / `BIPOLAR` ½). Reuses `alloc_id`/`children`/`detect_signal_cycle`/`walk`. Tests: `tests/test_axes.py` (21:
-  axis inference, broadcast-shifts-whole-curve, sample/select, reduce sum/mean/min/max/integral, pin/mod
-  neutrals, cycle-detect over axial nodes). Follow-ups: fold clock-parameterized interp curves/records so
-  `Sample` binds their param axis directly, the `.ftsl` projection of axis annotations, and routing scene
-  value-sites (E2) through `Target`.
+  / `BIPOLAR` ½). Reuses `alloc_id`/`children`/`detect_signal_cycle`/`walk`. **Follow-up 1 done** — the
+  sample grammar now folds loom's own clock-parameterized producers: `CurveSample(curve,arg,*,clock_axis='t')`
+  binds a `LoopCurve`/`FieldCurve`/`TrackedCurve`'s param axis *and* threads the clock (so an animated spatial
+  curve is honestly `{s,t}`, a static one broadcasts over `t`); `RecordSample(record,channel,arg)` binds a
+  `Record`'s static driver axis (`{driver}`, no clock); and `sample(obj,arg,…)` dispatches by duck-type. Both
+  thread the loom node into the axis-layer `walk` like `Lift`. Tests: `tests/test_axes.py` (30). Remaining
+  follow-ups: the `.ftsl` projection of axis annotations, and routing scene value-sites (E2) through `Target`.
 - **E2 (slices 1–2) — N-D curve → scene-variable go-between.** ✅ done (`loom/anim.py`). The channel-a config
   model + JSON sidecar + channel-b value fan-out — the pure-Python core of the animation go-between (resolves
   E2 OPEN Q1/Q2: config in a loom struct with a serialized sidecar; go-between = loom). `CurveDrive(dims,

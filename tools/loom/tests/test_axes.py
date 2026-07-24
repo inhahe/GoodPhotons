@@ -18,9 +18,11 @@ import pytest  # noqa: E402
 
 from loom.axes import (  # noqa: E402
     Ax, AConst, Lift, AFn, Sample, select, Reduce, Binding, Target, combine,
+    CurveSample, RecordSample, sample,
     ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S,
 )
-from loom.signals.core import Const, TimeFn, detect_signal_cycle, walk  # noqa: E402
+from loom.signals.core import Const, TimeFn, Clock, detect_signal_cycle, walk  # noqa: E402
+from loom import PointPath, LoopCurve, Sine, vec, Record  # noqa: E402
 
 
 # ---- axis-set inference ----------------------------------------------------
@@ -110,6 +112,95 @@ def test_select_is_discrete_constant():
     assert select(items, 0).axes == {"s"}
     with pytest.raises(IndexError):
         select(items, 5)
+
+
+# ---- fold: real loom curves / records bound into the sample grammar --------
+
+def _square_path():
+    return PointPath([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], closed=True)
+
+
+def test_curve_sample_static_is_st_typed_but_broadcasts_t():
+    # a static spatial LoopCurve: sampling at param s is {s, t}, but the value
+    # doesn't actually move with t (control points are constant → broadcast).
+    curve = LoopCurve(_square_path(), 0.0)
+    node = CurveSample(curve, Ax("s"))
+    assert node.axes == {"s", "t"}
+    v0, v1 = node.eval(s=0.3, t=0.0), node.eval(s=0.3, t=0.7)
+    assert v0 == v1                                    # static ⇒ same for every t
+    assert v0 == curve.sample(0.3, Clock(t=0.0))       # matches the curve itself
+
+
+def test_curve_sample_animated_is_genuinely_st():
+    # animate one control point over t → the sampled shape moves with time.
+    pp = PointPath([vec(Sine(), 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+                   closed=True)
+    curve = LoopCurve(pp, 0.0)
+    node = CurveSample(curve, Ax("s"))
+    assert node.eval(s=0.0, t=0.0) != node.eval(s=0.0, t=0.25)
+
+
+def test_curve_sample_component_pick():
+    curve = LoopCurve(_square_path(), 0.0)
+    y = CurveSample(curve, Ax("s")).comp(1)
+    assert y.axes == {"s", "t"}
+    assert abs(y.eval(s=0.6, t=0.0) - curve.sample(0.6, Clock(t=0.0))[1]) < 1e-12
+
+
+def test_curve_sample_custom_clock_axis():
+    # the clock axis is configurable (e.g. bind the shape-clock to 'u').
+    curve = LoopCurve(_square_path(), 0.0)
+    node = CurveSample(curve, Ax("s"), clock_axis="u")
+    assert node.axes == {"s", "u"}
+    with pytest.raises(ValueError):
+        node.eval(s=0.5)                               # 'u' now required
+
+
+def test_record_sample_is_driver_typed_and_static():
+    rec = Record.from_channels("R", 0.0, 1.0, [("h", ["0.0", "1.0"])])
+    node = RecordSample(rec, "h", Ax("s"))
+    assert node.axes == {"s"}                           # static LUT, no clock
+    assert abs(node.eval(s=0.0) - 0.0) < 1e-12
+    assert abs(node.eval(s=0.5) - 0.5) < 1e-12
+    assert abs(node.eval(s=1.0) - 1.0) < 1e-12
+
+
+def test_record_sample_vector_component():
+    rec = Record.from_channels("R", 0.0, 1.0,
+                               [("p", [["0.0", "0.0"], ["2.0", "4.0"]])])
+    node = RecordSample(rec, "p", Ax("s"))
+    assert node.comp(1).eval(s=0.5) == 2.0              # midpoint of 0..4
+
+
+def test_sample_dispatch_picks_the_right_node():
+    curve = LoopCurve(_square_path(), 0.0)
+    rec = Record.from_channels("R", 0.0, 1.0, [("h", ["0.0", "1.0"])])
+    assert isinstance(sample(curve, Ax("s")), CurveSample)
+    assert isinstance(sample(rec, Ax("s"), channel="h"), RecordSample)
+    assert isinstance(sample(lambda p: p * 2, Ax("t")), Sample)
+    with pytest.raises(ValueError):
+        sample(rec, Ax("s"))                            # Record needs channel=
+    with pytest.raises(TypeError):
+        sample(123, Ax("s"))                            # not sampleable
+
+
+def test_curve_sample_composes_with_reduce_over_s():
+    # a mean over s of a curve's x component is a cross-index op → {t} scalar.
+    curve = LoopCurve(_square_path(), 0.0)
+    x = CurveSample(curve, Ax("s")).comp(0)
+    red = Reduce(x, "s", samples=8, op="mean")
+    assert red.axes == {"t"}
+    expect = sum(curve.sample(i / 7.0, Clock(t=0.0))[0] for i in range(8)) / 8.0
+    assert red.eval(t=0.0) == pytest.approx(expect)
+
+
+def test_curve_sample_walk_reaches_control_points():
+    # the loom curve node threads into the axis-layer walk (like Lift), so a
+    # cycle through a control point is still catchable.
+    curve = LoopCurve(_square_path(), 0.0)
+    node = CurveSample(curve, Ax("s"))
+    ids = {n.id for n in walk(node)}
+    assert curve.id in ids and curve.path.id in ids
 
 
 # ---- Reduce: the only cross-axis node -------------------------------------

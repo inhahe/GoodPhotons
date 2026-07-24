@@ -38,6 +38,7 @@ from .vdbio import (
 )
 from .axes import (
     AxSignal, Ax, AConst, Lift, AFn, Sample, select, Reduce,
+    CurveSample, RecordSample, sample,
     Binding, Target, combine, as_ax,
     ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S, AXIS_U, AXIS_V,
 )
@@ -110,6 +111,7 @@ __all__ = [
     "mesh_field",
     "write_vdb", "read_vdb", "bake_field", "write_volume", "VolumeGrid",
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
+    "CurveSample", "RecordSample", "sample",
     "Binding", "Target", "combine", "as_ax",
     "ADDITIVE", "GAIN", "BIPOLAR", "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V",
     "CurveDrive", "ChannelBinding", "MODE_FLYBY", "MODE_ANIMATION",

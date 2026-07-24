@@ -1248,10 +1248,21 @@ function of a **point** (a `dict[str, float]` mapping axis names → coords) and
 - **Bridge** — `Lift(signal)` wraps any legacy `{t}`-typed `Signal` into the axis layer, so the new model
   composes with the whole existing DAG; `detect_signal_cycle`/`walk` duck-type over axial nodes too.
 
-**Still open (follow-ups):** folding the existing clock-parameterized interp curves (`LoopCurve`,
-`FieldCurve`, records) so `Sample` binds *their* param axis directly (rather than a plain callable);
-the on-disk `.ftsl` projection of axis annotations; and routing scene value-sites (E2's scene variables)
-through `Target`. These are additive on top of the `loom.axes` core.
+**FOLLOW-UP 1 DONE 2026-07-24 (`loom.axes`).** Folded the existing clock-parameterized interp curves and
+records into the sample grammar so it binds *their* param axis directly rather than forcing a pre-baked bare
+callable (which could not thread the clock the control points depend on). Pieces: **`CurveSample(curve, arg,
+*, clock_axis='t', loop=True)`** wraps any loom curve exposing `.sample(u, clock, cache)` (`LoopCurve`,
+`TrackedCurve` tracks, `FieldCurve` position) — `arg` binds the curve's param axis and the node *additionally*
+depends on the clock axis, so an **animated** spatial curve types as `{s,t}` (its shape moves over time) while
+a static one broadcasts trivially over `t`; **`RecordSample(record, channel, arg)`** binds a `Record`'s driver
+axis (a static `{driver}` LUT — no clock, via `Record.sample_vec`); and a unified **`sample(obj, arg, …)`**
+dispatcher picks `RecordSample` / `CurveSample` / `Sample` by duck-type (Record needs `channel=`). Both new
+nodes thread the loom curve/record into the axis-layer `walk` (like `Lift`), so a cycle through a control point
+stays catchable. 9 new tests (`tests/test_axes.py`, 30 total; static-broadcast vs genuine-`{s,t}`, component
+pick, custom clock axis, record scalar/vector, dispatch, `Reduce`-over-`s` compose, walk reaches control
+points). 1023 loom green.
+**Still open (follow-ups):** the on-disk `.ftsl` projection of axis annotations; and routing scene value-sites
+(E2's scene variables) through `Target`. These are additive on top of the `loom.axes` core.
 
 ### E6 — Quick mesh viewer: open a bare mesh in a ready-lit scene  ✅ DONE 2026-07-21  *(ftrace; user-proposed 2026-07-19)*
 **Shipped.** A bare positional mesh path — `ftrace model.glb` (also `.obj`/`.gltf`/`.fbx`/`.stl`/`.ply`) —
