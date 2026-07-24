@@ -206,6 +206,42 @@ def test_introspect_tracked_path_channels():
     assert all(len(s) == 2 for s in chans["aim"]["samples"])
 
 
+def test_introspect_grid_carries_field_geometry():
+    """F6: a grid dataset carries its fixed lattice axis coordinates and the flat
+    C-order value grid (one channel-vector per node), evaluated at the clock."""
+    d = introspect(build())
+    grid = [ds for ds in d["datasets"] if ds["kind"] == "grid"][0]
+    # 2x2 lattice → 2 axes, each with 2 coords
+    assert len(grid["axes"]) == 2
+    assert all(len(ax) == 2 for ax in grid["axes"])
+    # flat values in C order, each a 1-list (scalar field), matching [0,1,2,3]
+    assert grid["values"] == [[0.0], [1.0], [2.0], [3.0]]
+
+
+def test_introspect_scatter_carries_field_geometry():
+    """F6: a scatter dataset carries its sample positions and channel values."""
+    d = introspect(build())
+    scat = [ds for ds in d["datasets"] if ds["kind"] == "scatter"][0]
+    assert scat["points"] == [[0.0, 0.0], [1.0, 1.0]]
+    assert scat["values"] == [[1.0], [2.0]]
+
+
+def test_introspect_vector_scatter_field_geometry():
+    """F6: a vector-valued scatter emits multi-component value vectors."""
+    from loom.data import Scatter
+    from loom.scene import Scene, Camera, Sphere
+    from loom.signals import vec
+    cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
+    sc = Scene(cam)
+    scat = Scatter([((0.0, 0.0), vec(1.0, 0.0, 0.0)),
+                    ((1.0, 0.0), vec(0.0, 1.0, 0.0))], channels=["r", "g", "b"])
+    sc.add(Sphere((0, 0, 0), scat(0.5, 0.0).channel(0), "m"))
+    d = introspect(sc)
+    ds = [x for x in d["datasets"] if x["kind"] == "scatter"][0]
+    assert ds["is_vector"] is True and ds["value_dim"] == 3
+    assert ds["values"] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+
+
 def test_introspect_dag_nodes_and_edges():
     d = introspect(build())
     dag = d["dag"]

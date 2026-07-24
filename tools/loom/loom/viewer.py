@@ -174,6 +174,17 @@ def _track_channels(tp: Any, clock: Optional[Clock]) -> List[Dict[str, Any]]:
     return out
 
 
+def _value_at(v: Any, clk: Clock) -> List[float]:
+    """Evaluate a Grid/Scatter value node at ``clk`` and normalise it to a plain
+    ``list[float]`` channel-vector — a scalar Signal becomes a 1-list, a VecSignal
+    becomes its component list — so the sidecar's field data is uniform regardless of
+    scalar-vs-vector."""
+    r = v.at(clk)
+    if isinstance(r, (list, tuple)):
+        return [float(x) for x in r]
+    return [float(r)]
+
+
 def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, Any]:
     d: Dict[str, Any] = {"id": obj.id, "kind": kind}
     if kind == "path":
@@ -185,14 +196,23 @@ def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, 
         d.update(_curve_geometry(obj.path, clock))
         d["channels"] = _track_channels(obj, clock)
     elif kind == "grid":
+        clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
         d.update(ndim=obj.ndim, shape=list(obj.shape),
                  lo=list(obj.lo), hi=list(obj.hi),
                  value_dim=obj.value_dim, is_vector=obj.is_vector,
                  channels=list(obj.channels) if obj.channels else None)
+        # per-axis sample coordinates (the fixed lattice positions) and the flat
+        # C-order value grid (one channel-vector per lattice node), evaluated at clk.
+        d["axes"] = [obj.axis_coords(a) for a in range(obj.ndim)]
+        d["values"] = [_value_at(v, clk) for v in obj.values]
     elif kind == "scatter":
+        clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
         d.update(dim=obj.dim, count=len(obj),
                  value_dim=obj.value_dim, is_vector=obj.is_vector,
                  channels=list(obj.channels) if obj.channels else None)
+        # sample positions (domain coords) and their channel-vector values at clk.
+        d["points"] = [list(p.at(clk)) for p in obj.positions]
+        d["values"] = [_value_at(v, clk) for v in obj.values]
     return d
 
 
