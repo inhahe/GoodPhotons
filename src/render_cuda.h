@@ -299,6 +299,32 @@ long long sppmSessionPasses(const SppmSession* s);
 long long sppmSessionEmitted(const SppmSession* s);
 void sppmSessionEnd(SppmSession* s);
 
+// ---- GPU VCM / UPS (mode U) ------------------------------------------------------------
+// Resident device VCM session mirroring vcm.h's vcmPass. Each pass traces one light + one
+// camera subpath per pixel, combining BDPT vertex CONNECTIONS with photon-map vertex MERGING
+// under one balance-heuristic MIS. Light vertices are stored into a per-path slab on the
+// device, downloaded and compacted host-side into contiguous per-path ranges, and a uniform
+// hash grid (cell = merge radius) is built over them (byte-for-byte mirror of vcm.h
+// VcmGrid::build); the camera kernel then does emission/NEE/connection/merge and accumulates
+// the running per-pixel sum. Resolve divides by the pass count. Validated statistically
+// against the CPU (independent MC).
+struct VcmSession;   // opaque; lives in render_cuda.cu
+// True when the scene is device-bakeable for VCM: the BDPT device scope (mode D) PLUS a
+// no-participating-media restriction (mode U is surfaces-only). Pinhole cameras only
+// (cam.project) — the caller gates the camera choice.
+bool cudaVcmSupported(const Scene& scene);
+// Returns nullptr if CUDA is unavailable or the scene is out of scope. `maxDepth` (<1 =>
+// default 8) is the full path length in edges (also the per-light-subpath stored-vertex cap).
+VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
+                            bool diffraction, int maxDepth);
+// Run one VCM pass at the given merge `radius` (the caller shrinks it per the progressive
+// schedule r_i = R0 * i^((alpha-1)/2)), accumulating into the resident per-pixel sum.
+void vcmSessionPass(VcmSession* s, double radius);
+// Resolve the current accumulated state into `out` (running average = accum / passes).
+void vcmSessionResolve(VcmSession* s, Film& out);
+long long vcmSessionPasses(const VcmSession* s);
+void vcmSessionEnd(VcmSession* s);
+
 // True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
 // (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),
 // and a non-physical camera (dGenRay handles pinhole + fisheye/panoramic; a mesh-lens

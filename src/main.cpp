@@ -2800,6 +2800,53 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         int maxDepth = 8;   // full path length in edges
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
+#ifdef HAVE_CUDA
+        // GPU VCM (M12): resident device session mirroring vcm.h's vcmPass. Each pass traces
+        // one light + one camera subpath per pixel, combining BDPT vertex connections with
+        // photon-map vertex merging under one balance-heuristic MIS; light vertices are stored
+        // in a per-path slab, downloaded + compacted host-side, and gridded (cell = radius),
+        // then the camera kernel does emission/NEE/connection/merge. Pinhole cameras only and
+        // the BDPT-supported, media-free scene scope; anything else falls through to the CPU.
+        {
+            const bool wantGpu  = !std::strcmp(device, "gpu");
+            const bool wantAuto = !std::strcmp(device, "auto");
+            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+                cudaAvailable() && cudaVcmSupported(scene)) {
+                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth);
+                if (sess) {
+                    std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
+                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s) ...\n",
+                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel);
+                    auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+                        Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+                        for (long long pass = 0; pass < passTarget; ++pass) {
+                            double it = (double)(vcmSessionPasses(sess) + 1);
+                            double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
+                            if (radius <= 0.0) radius = R0;
+                            vcmSessionPass(sess, radius);
+                            vcmSessionResolve(sess, disp);
+                            long long passes = vcmSessionPasses(sess);
+                            for (auto& v : disp.xyz) v = v * (double)passes;   // undone by /sppDone
+                            if (p->report(disp, passes, passes >= passTarget)) break;
+                        }
+                        return disp;
+                    };
+                    int rc = runSppProgressive(outPath, spp, manualExposure, exposureAnchor,
+                                               scene.absolute, timeBudgetSec, noiseTarget,
+                                               runForever, intervalSec, preview,
+                                               renderChunked, res, resY);
+                    vcmSessionEnd(sess);
+                    return rc;
+                }
+                std::fprintf(stderr, "[device] VCM GPU session failed to start; using CPU\n");
+            } else if (wantGpu) {
+                const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
+                                : !cudaAvailable()     ? "no CUDA device found"
+                                : "a GPU-unsupported scene feature";
+                std::fprintf(stderr, "[device] mode U GPU path unavailable (%s); using CPU\n", why);
+            }
+        }
+#endif
         std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
                     "%d CPU threads (maxDepth=%d, light=%s) ...\n",
                     R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel);

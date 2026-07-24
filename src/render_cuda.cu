@@ -6874,6 +6874,571 @@ __global__ void kSppmResolve(DSppmState st, double* film, int resX, int resY,
     }
 }
 
+// ============================ device: VCM / UPS (mode U) ============================
+// Device twin of vcm.h. VCM combines BDPT vertex CONNECTIONS with photon-map vertex
+// MERGING under one balance-heuristic MIS. Per pass: (1) kVcmLight traces one light
+// subpath per pixel, stores its connectible vertices into a per-path slab and splats its
+// connect-to-camera (t=1) contributions; the host compacts the slab in path order and
+// builds a uniform hash grid over ALL light vertices (cell = merge radius). (2) kVcmCamera
+// traces one camera subpath per pixel doing emission (s=0), NEE (s=1), vertex connection to
+// the PAIRED light subpath, and merging from the grid; it accumulates the pass image into
+// the persistent `accum` sum. The resolve divides by the pass count. Mirrors SmallVCM's
+// dVCM/dVC/dVM bookkeeping (misArrival / misScatter inlined; Mis(x)=x, so the wrappers are
+// dropped). Scope (gated in cudaVcmSupported): surfaces only, area/sphere Lambertian lights,
+// rectilinear pinhole camera, NO participating media (media.empty()).
+
+// One stored light-subpath vertex (device twin of vcm.h LightVertex). Stores INDICES + the
+// per-hit texcoords (u,v) so textured/patterned/record BSDFs evaluate per-hit like M9's BDPT.
+struct DVcmLV {
+    DVec3  p, ns, ng, wo;
+    double beta;
+    double dVCM, dVC, dVM;
+    double cx, cy, cz;     // cie(lambda) cached at store time (bit-identical per gather)
+    float  lambda;
+    int    matId, edges;
+    Real   u, v;
+};
+
+// Uniform hash grid over the compacted light vertices (device twin of vcm.h VcmGrid). `lv`
+// is the compact array in path order; `order` holds indices into it in cell-contiguous order.
+struct DVcmGrid {
+    const DVcmLV* lv;       // compact light-vertex array (path order)
+    int    nLV;
+    const int* cellStart;   // nCells+1
+    const int* order;       // nLV vertex indices, cell-contiguous
+    DVec3  lo;
+    double cell;            // == merge radius
+    int    nx, ny, nz;
+};
+
+// Per-pass constants (device twin of vcm.h PassCtx; media/diffraction handled elsewhere).
+struct DVcmCtx {
+    double radius, nLightPaths, misVcWeight, misVmWeight, vmNorm, imagePlaneDist;
+    int    maxDepth;
+};
+
+// Reconstruct a minimal DVertex for the per-hit BSDF helpers (dBsdfF / dBsdfPdf reconstruct a
+// DHit from it — they read p/ns/ng/matId/u/v).
+__device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
+    DVertex v; v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
+    v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
+    v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; return v;
+}
+__device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
+    DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
+    v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
+    v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; return v;
+}
+
+// Sample a scattering continuation at a surface vertex (device twin of vcm.h scatterSample).
+// Returns wi/betaFactor/pdfW/pdfRevW/cosThetaOut/delta/terminate. Uses per-hit slots
+// (dReflectSlot / dMatRoughness / dDiffuseRho) so it matches the CPU VCM exactly. Media are
+// out of scope; `stk` still resolves the nested-dielectric exterior IOR (dDielectricStep).
+__device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const DHit& h,
+                                   const DVec3& rd, Real lambda, DRng& rng, int matId,
+                                   DMediumStack& stk, int diffraction,
+                                   DVec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
+                                   double& cosThetaOut, bool& delta, bool& terminate) {
+    DVertex vt = dVertFromHit(h, matId);
+    const DVec3& ns = h.n;
+    DVec3 wo = normalize(rd * (Real)-1);
+    wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
+    delta = false; terminate = false;
+    switch (m.type) {
+        case D_DIFFUSE:
+        case D_FLUORESCENT: {
+            wi = cosineHemisphere(ns, rng);
+            if (dot(wi, ns) <= 0) { terminate = true; break; }
+            double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
+            pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
+            pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
+            betaFactor = rho;
+            if (rho <= 0) terminate = true;
+            break;
+        }
+        case D_GLOSSY: {
+            DVec3 mdir = reflectv(rd, ns);
+            wi = sampleGlossy(mdir, dMatRoughness(sc, m, h), rng);
+            if (dot(wi, ns) <= 0) { terminate = true; break; }
+            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
+            pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
+            betaFactor = r;
+            if (r <= 0 || pdfW <= 0) terminate = true;
+            break;
+        }
+        case D_DIFFUSETRANSMIT: {
+            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+            double tot = rhoR + rhoT;
+            if (tot <= 0.0) { terminate = true; break; }
+            if (rng.uniform() * tot < rhoR) wi = cosineHemisphere(ns, rng);
+            else                            wi = cosineHemisphere(ns * (Real)-1, rng);
+            pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
+            pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
+            betaFactor = tot;
+            if (pdfW <= 0) terminate = true;
+            break;
+        }
+        case D_MIRROR: {
+            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            wi = reflectv(rd, ns); betaFactor = r; delta = true;
+            if (r <= 0) terminate = true;
+            break;
+        }
+        case D_DIELECTRIC: {
+            DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+            wi = nrd; betaFactor = 1.0; delta = true;
+            break;
+        }
+        case D_HALFMIRROR: {
+            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            if (rng.uniform() < r) wi = reflectv(rd, ns); else wi = rd;
+            betaFactor = 1.0; delta = true;
+            break;
+        }
+        case D_FILTER: {
+            double t = clamp01(specLookup(m.transmit, lambda));
+            wi = rd; betaFactor = t; delta = true;
+            if (t <= 0) terminate = true;
+            break;
+        }
+        case D_THINFILM: {
+            DVec3 nro, nrd;
+            if (!thinFilmInterface(sc, m, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+            wi = nrd; betaFactor = 1.0; delta = true;
+            break;
+        }
+        case D_MULTILAYER: {
+            DVec3 nro, nrd;
+            if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+            wi = nrd; betaFactor = 1.0; delta = true;
+            break;
+        }
+        case D_GRATING: {
+            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            if (r <= 0) { terminate = true; break; }
+            DVec3 nro, nrd;
+            if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { terminate = true; break; }
+            wi = nrd; betaFactor = r; delta = true;
+            break;
+        }
+        default: terminate = true; break;
+    }
+    if (!terminate) cosThetaOut = fabs(ddot(wi, ns));
+}
+
+// Phase 1: one light subpath per pixel. Stores connectible vertices into the per-path slab
+// `lvSlab[i*vcmCap + k]` (count in `lvCount[i]`), splats connect-to-camera contributions into
+// `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength (shared with the
+// camera path) into lamBuf/invLamBuf. Device twin of vcm.h traceLightSubpath.
+__global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
+                          DVcmLV* lvSlab, int* lvCount, double* splat,
+                          Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
+                          unsigned long long seedBase, long long passIdx) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    long long npix = (long long)resX * resY;
+    for (long long i = g; i < npix; i += G) {
+        lvCount[i] = 0;
+        unsigned long long s = (unsigned long long)i * 0x9E3779B97F4A7C15ULL
+                             + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
+        DRng rng; rng.seed(s * 2 + 55, seedBase ^ s);
+
+        double pdfL = 0.0;
+        Real lambda = dSampleSceneLambda(sc, rng, pdfL);
+        double invPdfLambda = (pdfL > 0.0) ? dInvPdfLambda(sc, lambda) : 0.0;
+        lamBuf[i] = lambda; invLamBuf[i] = invPdfLambda;
+        if (invPdfLambda <= 0.0) continue;
+        if (sc.nEmitters == 0 || sc.totalPower <= 0.0) continue;
+
+        int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+        const DEmitter& em = sc.emitters[ei];
+        if (em.shape == 2 || em.shape == 3 || em.collimated) continue;
+        Real u1 = rng.uniform(), u2 = rng.uniform();
+        DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        if (Le <= 0.0) continue;
+        double pdfChoice = em.power / sc.totalPower;
+        double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
+        if (pdfPos <= 0.0 || pdfChoice <= 0.0) continue;
+
+        DVec3 dir = cosineHemisphere(nOut, rng);
+        double cosLight = ddot(nOut, dir);
+        if (cosLight <= 0.0) continue;
+        double pdfDirW = cosLight / DPI;
+        double emissionPdfW = pdfPos * pdfDirW * pdfChoice;
+        if (emissionPdfW <= 0.0) continue;
+        double directPdfW = pdfChoice * pdfPos;
+
+        double beta = Le * cosLight / emissionPdfW;
+        double dVCM = directPdfW / emissionPdfW;
+        double dVC  = cosLight / emissionPdfW;
+        double dVM  = dVC * ctx.misVcWeight;
+
+        double cieLx = (double)cieX(lambda), cieLy = (double)cieY(lambda), cieLz = (double)cieZ(lambda);
+        DMediumStack stk; stk.clear();
+        DVec3 prevP = y;
+        DVec3 ro = y + nOut * (Real)1e-6;
+        DVec3 rd = dir;
+        int stored = 0;
+
+        for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
+            DHit h = closestHit(sc, ro, rd);
+            if (!h.valid) break;                          // escaped (no env in scope)
+            {                                             // colored-glass Beer-Lambert (delta chains)
+                int cm = stk.topMat();
+                double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
+                if (a > 0.0) beta *= exp(-a * (double)h.t);
+            }
+            double dist = h.t;
+            DVec3 rdCur = rd;
+            double cosThetaIn = fabs(ddot(h.n, rdCur * (Real)-1));
+            if (cosThetaIn <= 1e-9) break;
+
+            const DMaterial* mp = &sc.mats[h.matId];
+            int matId = h.matId;
+            if (mp->type == D_MIX) {
+                int c = dMixResolveChild(sc, *mp, h, rng.uniform());
+                if (c < 0) break;
+                mp = &sc.mats[c]; matId = c;
+            }
+            if (dEmitterForMat(sc, matId) >= 0) break;    // light subpath doesn't scatter off emitters
+
+            // misArrival(dist, cosThetaIn)
+            dVCM *= dist * dist; dVCM /= cosThetaIn; dVC /= cosThetaIn; dVM /= cosThetaIn;
+
+            DVec3 wo = normalize(prevP - h.p);
+            DVec3 ngo = (ddot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * (Real)-1;
+
+            if (dConnectibleType(mp->type)) {
+                if (stored < vcmCap) {
+                    DVcmLV lv;
+                    lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
+                    lv.beta = beta; lv.lambda = (float)lambda;
+                    lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
+                    lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
+                    lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v;
+                    lvSlab[i * vcmCap + stored] = lv;
+                    stored++;
+                }
+                // Connect this vertex to the pinhole camera (t=1 light-image splat).
+                if (!cam.hasLens && edges + 1 <= ctx.maxDepth) {
+                    DVec3 toCam = cam.eye - h.p;
+                    double dist2c = ddot(toCam, toCam);
+                    if (dist2c > 1e-12) {
+                        double distc = sqrt(dist2c);
+                        DVec3 wcam = toCam * (Real)(1.0 / distc);
+                        double cosToCamera = ddot(h.n, wcam);
+                        bool twoSided = dTwoSidedType(mp->type);
+                        double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, h.n, ngo);
+                        bool sideOk = twoSided ? (cosToCamera != 0.0) : (cosToCamera > 0.0 && stG > 0.0);
+                        double cosAtCamera = ddot(cam.w, wcam * (Real)-1);
+                        if (sideOk && cosAtCamera > 1e-9) {
+                            int px, py; Real cc, d2c;
+                            if (cam.project(h.p, px, py, cc, d2c)) {
+                                DVertex vt = dVertFromHit(h, matId);
+                                double f = dBsdfF(sc, vt, wo, wcam, lambda);
+                                f *= (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                                double sgn = ddot(h.ng, wcam) >= 0.0 ? 1.0 : -1.0;
+                                DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
+                                if (f > 0.0 && !occluded(sc, oo, wcam, (Real)(distc - 2e-6))) {
+                                    double bsdfRevPdfW = dBsdfPdf(sc, vt, wcam, wo, lambda);
+                                    double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
+                                    double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
+                                    double imgToSurf = imgToSolid * fabs(cosToCamera) / dist2c;
+                                    double wLight = (imgToSurf / ctx.nLightPaths) *
+                                                    (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
+                                    double misW = 1.0 / (wLight + 1.0);
+                                    double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
+                                    if (contrib > 0.0) {
+                                        size_t o2 = ((size_t)py * resX + px) * 3;
+                                        atomicAdd(&splat[o2 + 0], cieLx * contrib);
+                                        atomicAdd(&splat[o2 + 1], cieLy * contrib);
+                                        atomicAdd(&splat[o2 + 2], cieLz * contrib);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (edges == ctx.maxDepth) break;
+
+            DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+            dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
+                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate);
+            if (terminate || betaFactor <= 0.0) break;
+            if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
+
+            // misScatter(delta, cosThetaOut, pdfW, pdfRevW)
+            if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
+            else {
+                double t = cosThetaOut / pdfW;
+                dVC = t * (dVC * pdfRevW + dVCM + ctx.misVmWeight);
+                dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + 1.0);
+                dVCM = 1.0 / pdfW;
+            }
+            beta *= betaFactor;
+            if (!delta) beta *= (double)dShadingAdjointCorr(wo, normalize(wi), h.n, ngo);
+            prevP = h.p;
+            double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
+            ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
+            rd = normalize(wi);
+        }
+        lvCount[i] = stored;
+    }
+}
+
+// Phase 3: one camera subpath per pixel. Does emission (s=0), NEE (s=1), vertex connection to
+// the PAIRED light subpath [pathBegin[i],pathEnd[i]) and merging over the grid, then adds this
+// pass's per-pixel radiance (camera result + the light splat) into the persistent `accum` sum.
+// Device twin of vcm.h traceCameraSubpath. `grid.lv` is the compact light-vertex array.
+__global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx, DVcmGrid grid,
+                           const int* pathBegin, const int* pathEnd, const double* splat,
+                           double* accum, const Real* lamBuf, const double* invLamBuf,
+                           int resX, int resY, unsigned long long seedBase, long long passIdx) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long G = (long long)gridDim.x * blockDim.x;
+    long long npix = (long long)resX * resY;
+    for (long long i = g; i < npix; i += G) {
+        double sxl = splat[i * 3 + 0], syl = splat[i * 3 + 1], szl = splat[i * 3 + 2];
+        double invPdfLambda = invLamBuf[i];
+        if (invPdfLambda <= 0.0) {                         // no valid wavelength: only the splat
+            accum[i * 3 + 0] += sxl; accum[i * 3 + 1] += syl; accum[i * 3 + 2] += szl;
+            continue;
+        }
+        Real lambda = lamBuf[i];
+        int px = (int)(i % resX), py = (int)(i / resX);
+        unsigned long long s = (unsigned long long)i * 0xC2B2AE3D27D4EB4FULL
+                             + (unsigned long long)passIdx * 0xA24BAED4963EE407ULL;
+        DRng rng; rng.seed(s * 2 + 77, seedBase ^ s);
+
+        double rx = 0, ry = 0, rz = 0;
+        double cieCx = (double)cieX(lambda), cieCy = (double)cieY(lambda), cieCz = (double)cieZ(lambda);
+
+        DVec3 ro, rd;
+        Real jx = rng.uniform(), jy = rng.uniform();
+        dGenRay(cam, px, py, jx, jy, ro, rd);
+        double cosAtCamera = ddot(rd, cam.w);
+        if (cosAtCamera <= 1e-9) {
+            accum[i * 3 + 0] += sxl; accum[i * 3 + 1] += syl; accum[i * 3 + 2] += szl;
+            continue;
+        }
+        double cameraPdfW = ctx.imagePlaneDist * ctx.imagePlaneDist /
+                            (cosAtCamera * cosAtCamera * cosAtCamera);
+        double beta = 1.0;
+        double dVCM = ctx.nLightPaths / cameraPdfW;
+        double dVC = 0.0, dVM = 0.0;
+        DMediumStack stk; stk.clear();
+        DVec3 prevP = cam.eye;
+
+        for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
+            DHit h = closestHit(sc, ro, rd);
+            if (!h.valid) break;                          // no env in scope
+            {
+                int cm = stk.topMat();
+                double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
+                if (a > 0.0) beta *= exp(-a * (double)h.t);
+            }
+            double dist = h.t;
+            DVec3 rdCur = rd;
+            double cosThetaIn = fabs(ddot(h.n, rdCur * (Real)-1));
+            if (cosThetaIn <= 1e-9) break;
+
+            const DMaterial* mp = &sc.mats[h.matId];
+            int matId = h.matId;
+            if (mp->type == D_MIX) {
+                int c = dMixResolveChild(sc, *mp, h, rng.uniform());
+                if (c < 0) break;
+                mp = &sc.mats[c]; matId = c;
+            }
+
+            // misArrival(dist, cosThetaIn)
+            dVCM *= dist * dist; dVCM /= cosThetaIn; dVC /= cosThetaIn; dVM /= cosThetaIn;
+
+            DVec3 wo = normalize(prevP - h.p);
+
+            // (a) Emission (s=0).
+            int li = dEmitterForMat(sc, matId);
+            if (li >= 0) {
+                double cosLight = ddot(h.ng, wo);
+                if (cosLight > 0.0) {
+                    double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
+                    if (Le > 0.0) {
+                        double misW = 1.0;
+                        const DEmitter& em = sc.emitters[li];
+                        if (em.area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
+                            double pdfChoice = em.power / sc.totalPower;
+                            double directPdfA = pdfChoice / em.area;
+                            double emissionPdfW = pdfChoice * cosLight / DPI;
+                            double wCamera = directPdfA * dVCM + emissionPdfW * dVC;
+                            misW = 1.0 / (1.0 + wCamera);
+                        }
+                        double e = beta * Le * misW;
+                        rx += cieCx * e; ry += cieCy * e; rz += cieCz * e;
+                    }
+                }
+                break;                                    // can't scatter off a light
+            }
+
+            if (dConnectibleType(mp->type)) {
+                DVertex vt = dVertFromHit(h, matId);
+                DVec3 ngoCam = (ddot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * (Real)-1;
+                bool twoSidedCam = dTwoSidedType(mp->type);
+
+                // (b) NEE (s=1) — connect to a freshly sampled light point.
+                if (edges + 1 <= ctx.maxDepth && sc.nEmitters > 0 && sc.totalPower > 0.0) {
+                    int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+                    const DEmitter& em = sc.emitters[ei];
+                    if (!(em.shape == 2 || em.shape == 3 || em.collimated)) {
+                        Real u1 = rng.uniform(), u2 = rng.uniform();
+                        DVec3 yL, nL; emitterSamplePoint(em, u1, u2, yL, nL);
+                        DVec3 toL = yL - h.p; double dist2 = ddot(toL, toL);
+                        if (dist2 > 1e-12) {
+                            double distL = sqrt(dist2); DVec3 wiL = toL * (Real)(1.0 / distL);
+                            double cosAtLight = ddot(nL, wiL * (Real)-1);
+                            double cosToLight = ddot(h.n, wiL);
+                            double stG = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(wiL, h.n, ngoCam);
+                            bool sideOk = twoSidedCam ? (cosToLight != 0.0) : (cosToLight > 0.0 && stG > 0.0);
+                            if (cosAtLight > 0.0 && sideOk) {
+                                double f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
+                                double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+                                double sgn = ddot(h.ng, wiL) >= 0.0 ? 1.0 : -1.0;
+                                DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
+                                if (f > 0.0 && Le > 0.0 && em.area > 0.0 &&
+                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6))) {
+                                    double pdfChoice = em.power / sc.totalPower;
+                                    double invArea = 1.0 / em.area;
+                                    double directPdfW = invArea * dist2 / cosAtLight;
+                                    double emissionPdfW = invArea * cosAtLight / DPI;
+                                    double bsdfDirPdfW = dBsdfPdf(sc, vt, wo, wiL, lambda);
+                                    double bsdfRevPdfW = dBsdfPdf(sc, vt, wiL, wo, lambda);
+                                    double wLight = bsdfDirPdfW / (pdfChoice * directPdfW);
+                                    double wCamera = (emissionPdfW * fabs(cosToLight) /
+                                                      (directPdfW * cosAtLight)) *
+                                                     (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
+                                    double misW = 1.0 / (wLight + 1.0 + wCamera);
+                                    double contrib = misW * fabs(cosToLight) /
+                                                     (pdfChoice * directPdfW) * Le * f;
+                                    if (contrib > 0.0) {
+                                        double e = beta * contrib;
+                                        rx += cieCx * e; ry += cieCy * e; rz += cieCz * e;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // (c) Vertex connection to the PAIRED light subpath's stored vertices.
+                int pb = pathBegin[i], pe = pathEnd[i];
+                for (int j = pb; j < pe; ++j) {
+                    const DVcmLV& lv = grid.lv[j];
+                    if (edges + lv.edges + 1 > ctx.maxDepth) continue;
+                    DVec3 dv = lv.p - h.p; double dist2 = ddot(dv, dv);
+                    if (dist2 <= 1e-12) continue;
+                    double distc = sqrt(dist2); DVec3 w = dv * (Real)(1.0 / distc);
+                    double cosCam = ddot(h.n, w);
+                    double cosLit = ddot(lv.ns, w * (Real)-1);
+                    DVec3 ngoLit = (ddot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * (Real)-1;
+                    bool twoSidedLit = dTwoSidedType(sc.mats[lv.matId].type);
+                    double stGCam = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(w, h.n, ngoCam);
+                    double stGLit = twoSidedLit ? 1.0 : (double)dShadowTerminatorG(w * (Real)-1, lv.ns, ngoLit);
+                    bool camSide = twoSidedCam ? (cosCam != 0.0) : (cosCam > 0.0 && stGCam > 0.0);
+                    bool litSide = twoSidedLit ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
+                    if (!camSide || !litSide) continue;
+                    DVertex lvt = dVertFromLV(lv);
+                    double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
+                    double fLit = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lambda);
+                    fLit *= (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
+                    if (fCam <= 0.0 || fLit <= 0.0) continue;
+                    double camDirPdfW = dBsdfPdf(sc, vt, wo, w, lambda);
+                    double camRevPdfW = dBsdfPdf(sc, vt, w, wo, lambda);
+                    double litDirPdfW = dBsdfPdf(sc, lvt, lv.wo, w * (Real)-1, lambda);
+                    double litRevPdfW = dBsdfPdf(sc, lvt, w * (Real)-1, lv.wo, lambda);
+                    double camDirPdfA = camDirPdfW * fabs(cosLit) / dist2;
+                    double litDirPdfA = litDirPdfW * fabs(cosCam) / dist2;
+                    double wLight = camDirPdfA * (ctx.misVmWeight + lv.dVCM + lv.dVC * litRevPdfW);
+                    double wCamera = litDirPdfA * (ctx.misVmWeight + dVCM + dVC * camRevPdfW);
+                    double misW = 1.0 / (wLight + 1.0 + wCamera);
+                    double sgn = ddot(h.ng, w) >= 0.0 ? 1.0 : -1.0;
+                    DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
+                    if (occluded(sc, oo, w, (Real)(distc - 2e-6))) continue;
+                    double Gt = fabs(cosCam) * fabs(cosLit) / dist2;
+                    double contrib = misW * Gt * fCam * fLit * beta * lv.beta;
+                    if (contrib > 0.0) { rx += cieCx * contrib; ry += cieCy * contrib; rz += cieCz * contrib; }
+                }
+
+                // (d) Vertex merging — gather nearby light vertices from ALL paths (XYZ estimate).
+                if (ctx.vmNorm > 0.0 && grid.nLV > 0) {
+                    double mx = 0, my = 0, mz = 0;
+                    double r2 = ctx.radius * ctx.radius;
+                    int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
+                    int iy = (int)floor(((double)h.p.y - grid.lo.y) / grid.cell);
+                    int iz = (int)floor(((double)h.p.z - grid.lo.z) / grid.cell);
+                    ix = min(max(ix, 0), grid.nx - 1);
+                    iy = min(max(iy, 0), grid.ny - 1);
+                    iz = min(max(iz, 0), grid.nz - 1);
+                    for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= grid.nz) continue;
+                      for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= grid.ny) continue;
+                        for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= grid.nx) continue;
+                          int c = (cz * grid.ny + cy) * grid.nx + cx;
+                          for (int k = grid.cellStart[c]; k < grid.cellStart[c + 1]; ++k) {
+                              int idx = grid.order[k];
+                              const DVcmLV& lv = grid.lv[idx];
+                              DVec3 d = h.p - lv.p;
+                              if (ddot(d, d) > r2) continue;
+                              if (edges + lv.edges > ctx.maxDepth) continue;
+                              DVec3 wMerge = lv.wo;
+                              Real lam = (Real)lv.lambda;
+                              double fCam = dBsdfF(sc, vt, wo, wMerge, lam);
+                              if (fCam <= 0.0) continue;
+                              double denom = fabs(ddot(wMerge, ngoCam));
+                              double gcorr = (denom <= 1e-8) ? 1.0 : fabs(ddot(wMerge, h.n)) / denom;
+                              fCam *= gcorr;
+                              double camDirPdfW = dBsdfPdf(sc, vt, wo, wMerge, lam);
+                              double camRevPdfW = dBsdfPdf(sc, vt, wMerge, wo, lam);
+                              double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * camDirPdfW;
+                              double wCamera = dVCM * ctx.misVcWeight + dVM * camRevPdfW;
+                              double misW = 1.0 / (wLight + 1.0 + wCamera);
+                              double wgt = misW * fCam * lv.beta;
+                              mx += lv.cx * wgt; my += lv.cy * wgt; mz += lv.cz * wgt;
+                          }
+                    }}}
+                    double bn = beta * ctx.vmNorm;
+                    rx += mx * bn; ry += my * bn; rz += mz * bn;
+                }
+            }
+
+            if (edges == ctx.maxDepth) break;
+
+            DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+            dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
+                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate);
+            if (terminate || betaFactor <= 0.0) break;
+            if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
+
+            if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
+            else {
+                double t = cosThetaOut / pdfW;
+                dVC = t * (dVC * pdfRevW + dVCM + ctx.misVmWeight);
+                dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + 1.0);
+                dVCM = 1.0 / pdfW;
+            }
+            beta *= betaFactor;                           // camera side: no adjoint on continuation
+            prevP = h.p;
+            double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
+            ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
+            rd = normalize(wi);
+        }
+
+        accum[i * 3 + 0] += rx + sxl;
+        accum[i * 3 + 1] += ry + syl;
+        accum[i * 3 + 2] += rz + szl;
+    }
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
@@ -9019,6 +9584,225 @@ void sppmSessionEnd(SppmSession* s) {
     cudaFree(s->st.tau); cudaFree(s->st.directSum); cudaFree(s->st.nAcc);
     cudaFree(s->st.vpThr); cudaFree(s->st.radius); cudaFree(s->st.vpValid); cudaFree(s->st.vpHit);
     cudaFree(s->d_film); cudaFree(s->d_depCount); cudaFree(s->d_energy);
+    freeUpload(s->up);
+    delete s;
+}
+
+// ============================ host: VCM / UPS session (mode U) ============================
+// Resident device VCM session mirroring vcm.h's vcmPass orchestration. Each pass: (1) launch
+// kVcmLight — one light subpath per pixel stores its connectible vertices into a per-path slab
+// (avoids cross-thread atomics) and splats connect-to-camera contributions; (2) download the
+// slab + per-path counts and compact host-side into contiguous per-path ranges (so strategy
+// (c)'s same-lambda vertex connection reads its PAIRED light path); (3) build the uniform hash
+// grid over the compacted vertices (counting sort, cell = merge radius — a byte-for-byte mirror
+// of vcm.h VcmGrid::build); (4) upload compact vertices + grid + path ranges; (5) launch
+// kVcmCamera — one camera subpath per pixel does emission/NEE/connection/merge and adds this
+// pass's radiance (camera result + light splat) into the persistent `accum` sum. Resolve
+// divides accum by the pass count. Validated statistically against the CPU (independent MC).
+struct VcmSession {
+    DUpload up;
+    gpu::DCamera cam{};
+    int resX = 0, resY = 0;
+    size_t npix = 0;
+    int  diffraction = 0;
+    int  maxDepth = 8;
+    int  vcmCap = 8;              // max stored connectible vertices per light subpath (== maxDepth)
+    long long passes = 0;
+    // Persistent (allocated once in Begin):
+    gpu::DVcmLV* d_lvSlab = nullptr;   // npix * vcmCap
+    int*    d_lvCount = nullptr;       // npix
+    double* d_splat   = nullptr;       // npix*3 (this pass's connect-to-camera XYZ)
+    double* d_accum   = nullptr;       // npix*3 (running SUM over passes)
+    gpu::Real* d_lamBuf = nullptr;     // npix   (per-path wavelength, shared light<->camera)
+    double* d_invLam  = nullptr;       // npix   (invPdfLambda; <=0 marks "no valid wavelength")
+    int*    d_pathBegin = nullptr;     // npix
+    int*    d_pathEnd   = nullptr;     // npix
+    // Rebuilt each pass (freed + re-malloc'd, sizes vary):
+    gpu::DVcmLV* d_lvCompact = nullptr;
+    int*    d_cellStart = nullptr;
+    int*    d_order     = nullptr;
+    // Host staging (reused across passes to avoid churn):
+    std::vector<gpu::DVcmLV> hSlab;    // downloaded slab
+    std::vector<int>    hCount;        // downloaded counts
+    std::vector<gpu::DVcmLV> hCompact; // compacted vertices (path order)
+    std::vector<int>    hPathBegin, hPathEnd;
+};
+
+bool cudaVcmSupported(const Scene& scene) {
+    // VCM reuses the BDPT device scope (per-hit BSDFs, area/sphere Lambertian lights, no
+    // fluorescence/layered/spot/env/collimated, no GRIN) PLUS a NO-media restriction: the CPU
+    // vcm.h path handles surfaces only (participating media are out of mode-U scope entirely,
+    // guarded by vcmUnsupportedFeature), and the device kernels place no medium vertices, so a
+    // scene with any medium must stay on the CPU. Pinhole cameras only (dGenRay / cam.project);
+    // the caller gates the camera.
+    return cudaBdptSupported(scene) && scene.media.empty();
+}
+
+VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
+                            bool diffraction, int maxDepth) {
+    if (!cudaAvailable() || !cudaVcmSupported(scene)) return nullptr;
+    VcmSession* s = new VcmSession();
+    s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
+    s->diffraction = diffraction ? 1 : 0;
+    s->maxDepth = (maxDepth > 0) ? maxDepth : 8;
+    s->vcmCap = s->maxDepth;
+    buildUploadScene(scene, s->up);
+    s->cam = bakeCamera(scene, cam, resX, resY, s->up);
+    const size_t np = s->npix;
+    CUDA_CHECK(cudaMalloc(&s->d_lvSlab,  np * (size_t)s->vcmCap * sizeof(gpu::DVcmLV)));
+    CUDA_CHECK(cudaMalloc(&s->d_lvCount, np * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s->d_splat,   np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_accum,   np * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  np * sizeof(gpu::Real)));
+    CUDA_CHECK(cudaMalloc(&s->d_invLam,  np * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_pathBegin, np * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   np * sizeof(int)));
+    CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
+    s->hSlab.resize(np * (size_t)s->vcmCap);
+    s->hCount.resize(np);
+    s->hPathBegin.resize(np);
+    s->hPathEnd.resize(np);
+    return s;
+}
+
+// Run one VCM pass at the given merge `radius`.
+void vcmSessionPass(VcmSession* s, double radius) {
+    using namespace gpu;
+    const long long passIdx = s->passes;                 // 0-based index of THIS pass
+    const int W = s->resX, H = s->resY;
+    const size_t np = s->npix;
+    if (radius <= 0.0) radius = 1e-6;
+
+    // Per-pass MIS constants (device twin of vcm.h PassCtx).
+    DVcmCtx ctx{};
+    ctx.radius = radius;
+    ctx.nLightPaths = (double)np;
+    double etaVCM = DPI * radius * radius * ctx.nLightPaths;
+    ctx.misVcWeight = (etaVCM > 0.0) ? 1.0 / etaVCM : 0.0;
+    ctx.misVmWeight = etaVCM;
+    ctx.vmNorm      = (etaVCM > 0.0) ? 1.0 / etaVCM : 0.0;
+    ctx.imagePlaneDist = (double)W / (2.0 * s->cam.tanHalfX);
+    ctx.maxDepth = s->maxDepth;
+
+    // (1) Light pass — zero the per-pass splat, then trace one light subpath per pixel.
+    CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
+    unsigned long long seedL = 0xD1B54A32D192ED03ULL
+                             ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
+    kVcmLight<<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+                             s->d_lvSlab, s->d_lvCount, s->d_splat,
+                             s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+    cudaCheckKernel("vcm-light");
+
+    // (2) Download the slab + counts and compact host-side into contiguous per-path ranges.
+    CUDA_CHECK(cudaMemcpy(s->hSlab.data(), s->d_lvSlab,
+                          np * (size_t)s->vcmCap * sizeof(DVcmLV), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(s->hCount.data(), s->d_lvCount, np * sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<DVcmLV>& compact = s->hCompact;
+    compact.clear();
+    { size_t tot = 0; for (size_t i = 0; i < np; ++i) tot += (size_t)std::max(0, s->hCount[i]);
+      compact.reserve(tot); }
+    for (size_t i = 0; i < np; ++i) {
+        int cnt = s->hCount[i];
+        s->hPathBegin[i] = (int)compact.size();
+        for (int k = 0; k < cnt; ++k) compact.push_back(s->hSlab[i * (size_t)s->vcmCap + k]);
+        s->hPathEnd[i] = (int)compact.size();
+    }
+
+    // (3) Build the uniform hash grid over the compacted light vertices (mirror
+    // vcm.h VcmGrid::build: counting sort, cell = merge radius).
+    const size_t nLV = compact.size();
+    double cell = radius;
+    DVec3 gLo(0, 0, 0); int gnx = 1, gny = 1, gnz = 1;
+    std::vector<int> cellStart, order;
+    if (nLV == 0) {
+        cellStart.assign(2, 0);
+    } else {
+        DVec3 mn = compact[0].p, mx = compact[0].p;
+        for (const DVcmLV& lv : compact) {
+            mn.x = std::min(mn.x, lv.p.x); mn.y = std::min(mn.y, lv.p.y); mn.z = std::min(mn.z, lv.p.z);
+            mx.x = std::max(mx.x, lv.p.x); mx.y = std::max(mx.y, lv.p.y); mx.z = std::max(mx.z, lv.p.z);
+        }
+        gLo = DVec3(mn.x - cell * 0.5, mn.y - cell * 0.5, mn.z - cell * 0.5);
+        DVec3 ext(mx.x - gLo.x + cell * 0.5, mx.y - gLo.y + cell * 0.5, mx.z - gLo.z + cell * 0.5);
+        gnx = std::max(1, (int)std::ceil(ext.x / cell));
+        gny = std::max(1, (int)std::ceil(ext.y / cell));
+        gnz = std::max(1, (int)std::ceil(ext.z / cell));
+        const long long nCells = (long long)gnx * gny * gnz;
+        std::vector<int> cellOf(nLV);
+        cellStart.assign((size_t)nCells + 1, 0);
+        auto cellCoord = [&](const DVec3& p, int& ix, int& iy, int& iz) {
+            ix = (int)std::floor((p.x - gLo.x) / cell);
+            iy = (int)std::floor((p.y - gLo.y) / cell);
+            iz = (int)std::floor((p.z - gLo.z) / cell);
+            ix = std::min(std::max(ix, 0), gnx - 1);
+            iy = std::min(std::max(iy, 0), gny - 1);
+            iz = std::min(std::max(iz, 0), gnz - 1);
+        };
+        for (size_t i = 0; i < nLV; ++i) {
+            int ix, iy, iz; cellCoord(compact[i].p, ix, iy, iz);
+            int c = (iz * gny + iy) * gnx + ix; cellOf[i] = c; ++cellStart[c + 1];
+        }
+        for (long long c = 0; c < nCells; ++c) cellStart[c + 1] += cellStart[c];
+        order.assign(nLV, 0);
+        std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
+        for (size_t i = 0; i < nLV; ++i) order[cursor[cellOf[i]]++] = (int)i;
+    }
+
+    // (4) Upload compacted vertices + grid + path ranges (fresh per-pass buffers).
+    if (s->d_lvCompact) { cudaFree(s->d_lvCompact); s->d_lvCompact = nullptr; }
+    if (s->d_cellStart) { cudaFree(s->d_cellStart); s->d_cellStart = nullptr; }
+    if (s->d_order)     { cudaFree(s->d_order);     s->d_order = nullptr; }
+    if (nLV > 0) {
+        CUDA_CHECK(cudaMalloc(&s->d_lvCompact, nLV * sizeof(DVcmLV)));
+        CUDA_CHECK(cudaMemcpy(s->d_lvCompact, compact.data(), nLV * sizeof(DVcmLV), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&s->d_order, nLV * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(s->d_order, order.data(), nLV * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMalloc(&s->d_cellStart, cellStart.size() * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(s->d_cellStart, cellStart.data(), cellStart.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s->d_pathBegin, s->hPathBegin.data(), np * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s->d_pathEnd,   s->hPathEnd.data(),   np * sizeof(int), cudaMemcpyHostToDevice));
+
+    DVcmGrid grid{};
+    grid.lv = s->d_lvCompact; grid.nLV = (int)nLV;
+    grid.cellStart = s->d_cellStart; grid.order = s->d_order;
+    grid.lo = gLo; grid.cell = cell; grid.nx = gnx; grid.ny = gny; grid.nz = gnz;
+
+    // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
+    unsigned long long seedC = 0xC2B2AE3D27D4EB4FULL
+                             ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL);
+    kVcmCamera<<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+                              s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
+                              s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
+    cudaCheckKernel("vcm-camera");
+
+    s->passes += 1;
+}
+
+// Resolve the running average image (accum / passes) into `out`, exactly like vcmResolve.
+void vcmSessionResolve(VcmSession* s, Film& out) {
+    const size_t np = s->npix;
+    std::vector<double> accum(np * 3);
+    CUDA_CHECK(cudaMemcpy(accum.data(), s->d_accum, np * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    if (out.resX != s->resX || out.resY != s->resY || out.xyz.empty()) {
+        out.resX = s->resX; out.resY = s->resY; out.alloc();
+    }
+    double inv = (s->passes > 0) ? 1.0 / (double)s->passes : 0.0;
+    for (size_t i = 0; i < np; ++i) {
+        out.xyz[i]  = Vec3(accum[i * 3 + 0] * inv, accum[i * 3 + 1] * inv, accum[i * 3 + 2] * inv);
+        out.hits[i] = 1.0;
+    }
+}
+
+long long vcmSessionPasses(const VcmSession* s) { return s ? s->passes : 0; }
+
+void vcmSessionEnd(VcmSession* s) {
+    if (!s) return;
+    cudaFree(s->d_lvSlab); cudaFree(s->d_lvCount); cudaFree(s->d_splat); cudaFree(s->d_accum);
+    cudaFree(s->d_lamBuf); cudaFree(s->d_invLam); cudaFree(s->d_pathBegin); cudaFree(s->d_pathEnd);
+    if (s->d_lvCompact) cudaFree(s->d_lvCompact);
+    if (s->d_cellStart) cudaFree(s->d_cellStart);
+    if (s->d_order)     cudaFree(s->d_order);
     freeUpload(s->up);
     delete s;
 }

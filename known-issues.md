@@ -5,6 +5,32 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT — OPEN (2026-07-23): GPU VCM (mode U) downloads the whole light-vertex slab every pass (memory + PCIe overhead scales with resolution)
+
+Logged while implementing M12 (GPU VCM, `VcmSession` in render_cuda.cu). The device stores each
+light subpath's connectible vertices into a **per-path slab** `lvSlab[i·vcmCap + k]` (one fixed
+`vcmCap = maxDepth = 8`-vertex slice per pixel, chosen to avoid cross-thread atomics), and each
+pass `vcmSessionPass` **downloads the entire slab plus the per-path counts** and compacts it on
+the host into contiguous per-path ranges before rebuilding the merge grid and uploading it back —
+mirroring the SPPM session's download-photons-then-host-build pattern. This is correct and matches
+the CPU exactly (validated GPU==CPU on `absolute.ftsl`: mean luminance ratio 0.9993), but it has
+two costs that grow with resolution:
+
+- **Memory:** the slab is `npix · vcmCap · sizeof(DVcmLV)` (~128 B/vertex) = ~64 MB at 256², ~256 MB
+  at 512², ~1 GB at 1024². Fine on a 4090 at validation resolutions, but a large render could exhaust
+  device memory.
+- **Per-pass PCIe traffic:** the full slab is copied device→host every pass regardless of how few
+  slots are actually filled (most pixels store far fewer than `vcmCap` vertices), plus the compacted
+  array + grid are copied host→device — so a high pass count pays this round-trip repeatedly.
+
+**Proper fix (if ever warranted):** either (a) compact on-device (a prefix-sum over `lvCount` to
+pack vertices into a tight array, then download only the filled prefix — or skip the download
+entirely and build the grid on-device with a device counting sort), or (b) size the slab from a
+cheap first-pass occupancy estimate instead of the worst-case `vcmCap`. Deferred because the simple
+download-and-host-build is correct, matches the SPPM path, and is comfortably within budget at the
+resolutions VCM is used at today. Repro: render any mode-U scene `-device gpu` at increasing `-res`
+and watch device memory / per-pass time.
+
 ### TECH-DEBT — OPEN (2026-07-23): mode-R GPU GRIN has a small bent-region float-vs-double residual (does not converge with spp)
 
 Logged while validating M11 (GRIN Eikonal marcher on the GPU backward path). The device

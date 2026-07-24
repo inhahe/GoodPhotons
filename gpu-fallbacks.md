@@ -111,7 +111,7 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
 | Mode | File | Portability |
 |---|---|---|
 | ~~**S — SPPM**~~ | `sppm_render.h` | **DONE (M3, 2026-07-23)** — resident device SPPM session (`SppmSession`): per-pixel `tau`/`radius`/`nAcc`/`directSum` stay on-device across passes; each pass reuses the mode-M forward deposit + a per-pixel visible-point/gather/update kernel trio (`kSppmVisiblePoint`/`kSppmGather`/`kSppmResolve`). Wired into main.cpp mode-S (`-device gpu/auto`). Validated GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background 0.3%, per-pixel diff shrinks with passes). ✅ |
-| **U — VCM/UPS** (vertex connection + merging) | `vcm.h` | **portable-hard, lowest priority**: needs GPU BDPT correctness *and* photon merging under one MIS weight. |
+| ~~**U — VCM/UPS**~~ (vertex connection + merging) | `vcm.h` | **DONE (M12, 2026-07-23, 0.39.0)** — resident device `VcmSession` mirroring `vcmPass`: `kVcmLight` traces one light subpath/pixel into a per-path slab (+ connect-to-camera splats), the host compacts it into per-path ranges and counting-sort-builds the merge grid (cell = radius), then `kVcmCamera` does emission/NEE/paired-path connection/grid merge under one balance-heuristic MIS. Reuses M9's device BDPT BSDFs + M3's device grid; gate `cudaBdptSupported && media.empty()` (surfaces-only, pinhole only). Wired into main.cpp mode-U (`-device gpu/auto`). Validated GPU==CPU on `absolute.ftsl` (fixed-gain radiance) at 500 passes: mean luminance ratio 0.9993, per-channel bias ≤0.5%, per-pixel median 3.0% at the MC noise floor. ✅ |
 
 ---
 
@@ -136,7 +136,17 @@ Just defers to `cudaForwardSupported`; no independent fallbacks.
    backends bend identically; a small bent-region float(GPU)-vs-double(CPU) residual (~2.7% disc on linear,
    up to ~17% on a strong radial caustic, does not converge with spp) is documented in known-issues.md as the
    accepted device float-precision envelope amplified through the lens.
-8. Longer tail: **GPU VCM** (M12, mode U).
+8. ~~**GPU VCM** (M12, mode U)~~ — **DONE 2026-07-23 (0.39.0).** Resident device `VcmSession` mirroring
+   `vcmPass`: per-pass `kVcmLight` (light subpaths → per-path vertex slab + connect-to-camera splats) →
+   host compaction into per-path ranges + counting-sort grid build (cell = radius) → `kVcmCamera`
+   (emission/NEE/paired-path connection/grid merge under one balance-heuristic MIS) accumulating the running
+   sum. Reuses M9's device BDPT BSDFs (`dBsdfF`/`dBsdfPdf`/`DVertex`) + M3's device grid pattern; gate
+   `cudaBdptSupported && media.empty()` (surfaces-only, pinhole only). Validated GPU==CPU on `absolute.ftsl`
+   (Cornell + dielectric sphere, fixed-gain absolute mode) at 500 passes: mean linear-luminance ratio 0.9993
+   (−0.07%), per-channel bias ≤0.5%, per-pixel median rel error 3.0% at the ~4.5% independent-MC noise floor.
+
+**All scheduled GPU-fallback-closure work (M1–M4, M9–M12) is now complete.** The only modes/features left on
+the CPU are those descoped by the user or left on CPU by design (below).
 
 ### Descoped by user (2026-07-23) — NOT scheduled
 Left on their current CPU/spectral fallbacks: **indexed-spectral palette maps** on device forward,

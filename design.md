@@ -137,7 +137,27 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   visible point. `fgRays` is threaded through `kGather`→`renderPhotonMapSharedCuda` and the
   `g_pmFinalGather==0` caller gates in `main.cpp` were dropped. Validated GPU==CPU on a Cornell
   glass-sphere+diffuse-walls box (mean 0.43%, background 0.98%, per-pixel noise √-scaling with
-  spp — unbiased). Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
+  spp — unbiased). Since 0.39.0 (M12) there is a resident **GPU VCM/UPS** session (mode `U`,
+  `VcmSession`, `cudaVcmSupported == cudaBdptSupported && media.empty()` — surfaces-only, pinhole
+  only) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
+  storing connectible vertices into a **per-path slab** (`lvSlab[i·vcmCap+k]`, no cross-thread
+  atomics) and splatting the connect-to-camera (t=1) light-image contributions (atomic into a
+  per-pass double buffer); (2) the host downloads the slab + per-path counts and compacts them into
+  contiguous per-path ranges (`pathBegin/pathEnd`) so the same-λ vertex CONNECTION reads its PAIRED
+  light subpath exactly (single-wavelength spectral BDPT); (3) counting-sort-builds the uniform hash
+  grid over the compacted vertices (cell = merge radius — a byte-for-byte host mirror of
+  `VcmGrid::build`, reusing the M3 device-grid query layout); (4) `kVcmCamera` traces one camera
+  subpath per pixel doing emission (s=0) / NEE (s=1) / paired-path vertex connection (c) / grid merge
+  from ALL paths (d) under one **balance-heuristic** MIS (SmallVCM `dVCM`/`dVC`/`dVM` bookkeeping,
+  misArrival/misScatter inlined with Mis=identity), accumulating the running per-pixel XYZ sum
+  (camera radiance + the light splat); the resolve divides by the pass count. Reuses M9's device BDPT
+  BSDFs (`dBsdfF`/`dBsdfPdf`/`DVertex`); `dVcmScatter` is the device twin of `scatterSample`. The
+  merge builds the density estimate in XYZ (cie(λ) per merged light vertex, other paths' λ) exactly
+  like modes M/S. main.cpp mode-U mirrors mode-S (auto/gpu device, radius schedule
+  `r_i=R0·i^((α−1)/2)`). Validated GPU==CPU on `absolute.ftsl` (Cornell + dielectric sphere,
+  fixed-gain absolute mode to bypass per-image auto-exposure) at 500 passes: mean linear-luminance
+  ratio 0.9993 (−0.07%), per-channel bias ≤0.5% (R −0.43%, G −0.06%, B +0.20%), per-pixel median rel
+  error 3.0% at the ~4.5% independent-MC noise floor — no systematic bias. Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
   surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords
   (`u,v`) and `dVertHit` reconstructs a minimal `DHit`, so `dBsdfF`/`dBsdfPdf` and the random
   walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the

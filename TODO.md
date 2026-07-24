@@ -1789,8 +1789,24 @@ mark the corresponding row in `gpu-fallbacks.md`.
       (linear lens): SSIM 0.99, Pearson 0.99, both bend identically; a small bent-region float-vs-double
       residual (~2.7% disc linear, up to ~17% on a strong radial caustic, non-converging) is logged in
       known-issues.md as the accepted device-float envelope amplified through the lens.
-- [ ] **M12. GPU VCM (mode U).** Currently CPU-only (`vcm.h`). Largest/last: needs GPU BDPT correctness
-      (from M9) plus photon merging under one MIS weight. Reuse M3's device SPPM merge + GPU BDPT connect.
+- [x] **M12. GPU VCM (mode U).** *(DONE 2026-07-23, 0.39.0.)* Ported the CPU VCM/UPS (`vcm.h`) to the
+      device as a resident `VcmSession` (render_cuda.cu) mirroring `vcmPass`. Each pass: (1) `kVcmLight`
+      traces one light subpath per pixel, storing connectible vertices into a per-path slab (no cross-thread
+      atomics) + splatting connect-to-camera (t=1) contributions; (2) the host downloads the slab + per-path
+      counts and compacts into contiguous per-path ranges (so the same-λ vertex CONNECTION reads its PAIRED
+      light subpath); (3) builds the uniform hash grid over the compacted vertices (counting sort, cell =
+      merge radius — a byte-for-byte mirror of `VcmGrid::build`); (4) `kVcmCamera` traces one camera subpath
+      per pixel doing emission (s=0) / NEE (s=1) / paired-path connection (c) / grid merge (d), accumulating
+      the running per-pixel sum; resolve divides by the pass count. Reuses M9's device BDPT BSDFs
+      (`dBsdfF`/`dBsdfPdf`/`DVertex`) and M3's device grid pattern; `dVcmScatter` is the device twin of
+      `scatterSample`; misArrival/misScatter are inlined (Mis=identity, balance heuristic). Gate
+      `cudaVcmSupported = cudaBdptSupported && media.empty()` (mode U is surfaces-only; pinhole cameras only).
+      main.cpp mode-U GPU branch mirrors mode-S (auto/gpu device, radius schedule `r_i=R0·i^((α-1)/2)`).
+      Validated GPU==CPU statistically on `scenes/absolute.ftsl` (Cornell + dielectric sphere, fixed-gain
+      absolute mode to bypass per-image auto-exposure) at 500 passes: mean linear-luminance ratio 0.9993
+      (−0.07%), per-channel bias all within ±0.5% (R −0.43%, G −0.06%, B +0.20%), per-pixel median rel error
+      3.0% sitting at the ~4.5% independent-MC noise floor — no systematic bias. Slab-download memory scaling
+      (~vcmCap·npix·128 B) is logged in known-issues.md.
 
 **Descoped by user (2026-07-23) — not scheduled:** indexed-spectral palette maps on device forward,
 Layered material on device, participating media in the RGB fast path, and textured/record albedo in the

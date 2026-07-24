@@ -49,8 +49,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   (its straight-line connection geometry would be biased — use `A`/`B`/`C` or `R`).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
   BDPT references (`R`/`D`), the **view-independent photon map** (`M`, shared
-  across a whole camera flythrough), and **stochastic progressive photon mapping**
-  (`S`, a resident per-pixel SPPM session), megakernel or wavefront, with CPU fallback.
+  across a whole camera flythrough), **stochastic progressive photon mapping**
+  (`S`, a resident per-pixel SPPM session), and **VCM/UPS** (`U`, a resident
+  vertex connection + merging session), megakernel or wavefront, with CPU fallback.
 - **Whole camera flybys in one render** — some modes amortise a *single* light
   transport pass across an entire moving-camera shot. The **view-independent photon
   map** (mode `M`) is built **once** from one forward photon pass, then reused to
@@ -180,7 +181,7 @@ paths they can capture at all**.
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
-| `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
+| `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
 
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
 > and *camera motion* before committing to a full render, `-raster` skips light
