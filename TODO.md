@@ -1015,12 +1015,34 @@ value-routing *is* the E5 pin/mod edge model — the "E5 unifies E2/E4" tie-in m
 
 19 tests (`tests/test_anim.py`: construction/validation, sidecar faithfulness + atomic write + version guard,
 Catmull-Rom knot/linear/closed/clamp, pin/mod/bipolar fan-out, multi-channel-one-target, base offset).
-**Remaining E2 slices:** (2) the live-value **stdio-pipe** channel between the editor (C++) and loom
-(extend the `loom.PreviewServer` precedent — editor pushes scrub values → loom emits that frame's `.ftsl`);
-(3) generalize ftrace's C++ `camera_curve` **editor** to seed from / write back the sidecar and target
-arbitrary scene variables (the interactive part). Also still to wire: routing a resolved `{target: value}`
-map into a `Scene` at emit (the binding targets are currently free-form strings; slice 2/3 pins the naming
-to real scene value-sites).
+**SLICE 2 DONE 2026-07-24 (`loom.anim`).** Named animatable slots + the editor↔loom live-value channel,
+resolving the slice-1 "how does a binding target name a real scene value-site" open item via **option (b):
+named `RefSignal`-style slots** (no emit-path change). Pieces:
+- **`Slot(name, default)`** — a `Signal` leaf holding a mutable current value. Drop it anywhere a scene
+  parameter accepts a `Signal` (a material prop, a transform field, a signal-valued isosurface param, …);
+  because it *is* a Signal the scene's `roots()`/`walk`/`emit` machinery discovers and bakes it per frame,
+  so binding-by-name needs zero change to the emit grammar. `default` doubles as the authored `mod` base.
+  The one controlled escape from clock-purity: its value is *pushed* by the live channel, not computed from
+  the clock — so each scrub frame is emitted with a **fresh** `Cache` (a stale cache pins the old value).
+- **`collect_slots(scene)`** — walks every modulator in the scene (`_all_elements` → `element_roots` →
+  `walk`) and groups the `Slot`s by name.
+- **`SceneDriver(scene, drive, *, bases, strict)`** — binds a `CurveDrive`'s fan-out to the scene's named
+  slots. `set_values(values)` fans channels out (each slot's `default` is the target's `mod` base unless
+  overridden) and pushes each resolved value into its same-named slots; `emit_frame(values, clock)` does
+  that then emits with a fresh cache. `strict` raises on a target with no matching slot (typo'd binding
+  fails loudly).
+- **`LiveSession(driver)` / `serve_live(session, in, out)`** — the loom side of E2 channel-b: a
+  newline-delimited-JSON stdio message loop (the `loom.PreviewServer` precedent, editor→loom direction).
+  Commands: `frame` (set values or `sample` at `t`, emit that frame's `.ftsl` to `out`), `config` (return
+  the sidecar dict to seed the editor), `bindings`/`points` (editor disposes — replace the associations /
+  control points), `save`, `quit`. Each command is a pure `dict`→`dict` `handle()` so the protocol is
+  unit-testable without a real pipe; errors are reported in the ack, never crash the loop.
+
+23 tests (`tests/test_anim_live.py`: slot value/stale-cache semantics, discovery + same-name grouping,
+driver base defaults/override/strict, set_values fan-out + mod-on-base, emit-frame fresh-cache, every
+LiveSession command + bad-input acks, `serve_live` stop-on-quit + bad-json).
+**Remaining E2 slice:** (3) generalize ftrace's C++ `camera_curve` **editor** to seed from / write back the
+sidecar and target arbitrary scene variables (the interactive C++ part — best done with the user present).
 
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output

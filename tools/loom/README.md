@@ -57,7 +57,7 @@ tools/loom/
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature) + read back
 │   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar
-│   ├── anim.py      N-D curve → scene-variable go-between: config + JSON sidecar + value fan-out
+│   ├── anim.py      N-D curve → scene-variable go-between: config + JSON sidecar + value fan-out + named slots + live pipe
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
 │   ├── transform.py per-object Transform (translate/rotate/scale/skew, animatable) → ftsl group{}; dataset inverse-map

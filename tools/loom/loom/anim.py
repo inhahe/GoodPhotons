@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .axes import AConst, Binding, Target, ADDITIVE, GAIN, BIPOLAR
+from .signals.core import Signal, Clock, Cache
 
 # Authoring modes (chosen up front; for most render modes the distinction is free).
 MODE_FLYBY = "flyby"          # sampled channels collapse to camera pose at time t
@@ -278,7 +279,209 @@ def _catmull(p0: float, p1: float, p2: float, p3: float, u: float) -> float:
     )
 
 
+# ===========================================================================
+# Slice 2 — named animatable slots + the editor↔loom live-value channel
+# ===========================================================================
+
+class Slot(Signal):
+    """A **named animatable value-site**: a Signal leaf holding a mutable current
+    value that a :class:`CurveDrive` / the editor sets per frame.
+
+    Drop a ``Slot`` anywhere a scene parameter accepts a :class:`Signal`
+    (a material roughness, an isosurface threshold via a signal-valued param, a
+    transform field, …).  Because it *is* a Signal, the scene's ``roots()``/
+    ``walk`` machinery discovers it and ``emit`` bakes its current value each
+    frame — so binding by name (option **b**, loom's ``RefSignal``-style handle)
+    needs no change to the emit path.  This is the one controlled escape from
+    clock-purity: the value is pushed by the live channel, not computed from the
+    clock, so always emit each scrub frame with a **fresh** :class:`Cache` (the
+    :class:`SceneDriver` does).  ``default`` doubles as the authored base a
+    ``mod`` binding accumulates on top of.
+    """
+
+    def __init__(self, name: str, default: float = 0.0) -> None:
+        super().__init__()
+        self.name = str(name)
+        self.default = float(default)
+        self.value = float(default)
+
+    def set(self, v: float) -> None:
+        self.value = float(v)
+
+    def reset(self) -> None:
+        self.value = self.default
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        return self.value
+
+
+def collect_slots(scene) -> Dict[str, List[Slot]]:
+    """Walk every modulator in ``scene`` and group its :class:`Slot`s by name."""
+    from .scene import element_roots  # lazy: scene.py is heavy / avoid import cycle
+    from .signals.core import walk
+    found: Dict[str, List[Slot]] = {}
+    for el in scene._all_elements():
+        for r in element_roots(el):
+            for n in walk(r):
+                if isinstance(n, Slot):
+                    found.setdefault(n.name, []).append(n)
+    return found
+
+
+class SceneDriver:
+    """Bind a :class:`CurveDrive`'s fan-out to a :class:`Scene`'s named
+    :class:`Slot`s and emit one ``.ftsl`` per scrub frame.
+
+    Each driven ``target`` sets every same-named ``Slot``; a target with no slot
+    is ignored unless ``strict`` (then construction raises, so a typo'd binding
+    fails loudly).  A slot's ``default`` is used as the ``mod`` base for its
+    target unless overridden in ``bases``.
+    """
+
+    def __init__(self, scene, drive: CurveDrive, *,
+                 bases: Optional[Dict[str, float]] = None,
+                 strict: bool = False) -> None:
+        self.scene = scene
+        self.drive = drive
+        self.slots = collect_slots(scene)
+        # authored base per target = slot default, overridable by `bases`
+        self.bases: Dict[str, float] = {}
+        for target, slots in self.slots.items():
+            self.bases[target] = slots[0].default
+        if bases:
+            self.bases.update(bases)
+        if strict:
+            missing = [t for t in drive.targets() if t not in self.slots]
+            if missing:
+                raise ValueError(f"CurveDrive targets have no Slot in the scene: {missing}")
+
+    def set_values(self, values: Sequence[float]) -> Dict[str, float]:
+        """Fan ``values`` out through the drive and push each into its slots.
+        Returns the resolved ``{target: value}`` map."""
+        resolved = self.drive.apply(values, self.bases)
+        for target, v in resolved.items():
+            for slot in self.slots.get(target, ()):
+                slot.set(v)
+        return resolved
+
+    def emit_frame(self, values: Sequence[float], clock: Clock, *,
+                   assets_dir=None, tag: str = "") -> str:
+        """Push ``values`` then emit the scene at ``clock`` with a **fresh**
+        cache (slot values are mutable state outside the clock)."""
+        self.set_values(values)
+        return self.scene.emit(clock, Cache(), assets_dir=assets_dir, tag=tag)
+
+
+class LiveSession:
+    """The loom side of the editor↔loom **live-value channel** (E2 channel-b).
+
+    Processes one editor message (a ``dict``) and returns an ack ``dict``; the
+    transport (a newline-delimited-JSON stdio pipe — :func:`serve_live` — or a
+    socket) is separate, so the protocol is unit-testable with in-memory data.
+    Messages (``cmd``):
+
+    * ``frame`` — ``{values:[…] | t:float, frame:int, frames:int, out:"path.ftsl"}``:
+      set the channel values (or ``sample`` at ``t``), emit that frame's
+      ``.ftsl`` to ``out``; ack ``{ok, out, targets}``.
+    * ``config`` — ack ``{ok, config}`` (the sidecar dict, to seed the editor).
+    * ``bindings`` — ``{bindings:[…]}``: replace the associations (editor
+      disposes); ack ``{ok}``.
+    * ``points`` — ``{points:[…]}``: replace the static control points; ack ``{ok}``.
+    * ``save`` — ``{path}``: persist the sidecar; ack ``{ok}``.
+    * ``quit`` — stop the serve loop; ack ``{ok, bye:true}``.
+    """
+
+    def __init__(self, driver: SceneDriver) -> None:
+        self.driver = driver
+        self.drive = driver.drive
+
+    def handle(self, msg: dict) -> dict:
+        cmd = msg.get("cmd")
+        try:
+            if cmd == "frame":
+                return self._frame(msg)
+            if cmd == "config":
+                return {"ok": True, "config": self.drive.to_dict()}
+            if cmd == "bindings":
+                self.drive.bindings = [ChannelBinding.from_dict(b)
+                                       for b in msg["bindings"]]
+                for b in self.drive.bindings:
+                    if b.channel >= self.drive.dims:
+                        raise ValueError(f"binding channel {b.channel} >= dims")
+                return {"ok": True}
+            if cmd == "points":
+                pts = [tuple(float(c) for c in p) for p in msg["points"]]
+                for p in pts:
+                    if len(p) != self.drive.dims:
+                        raise ValueError("point dim mismatch")
+                if len(pts) < 2:
+                    raise ValueError("need >= 2 points")
+                self.drive.points = pts
+                return {"ok": True}
+            if cmd == "save":
+                self.drive.save(msg["path"])
+                return {"ok": True}
+            if cmd == "quit":
+                return {"ok": True, "bye": True}
+            return {"ok": False, "error": f"unknown cmd {cmd!r}"}
+        except Exception as e:  # report, don't crash the pipe loop
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _frame(self, msg: dict) -> dict:
+        if "values" in msg:
+            values = [float(v) for v in msg["values"]]
+        else:
+            values = list(self.drive.sample(float(msg.get("t", 0.0))))
+        k = int(msg.get("frame", 0))
+        frames = int(msg.get("frames", 1))
+        clock = Clock.at_frame(k, frames, loop=not msg.get("open", False))
+        text = self.driver.emit_frame(values, clock, tag=f"{k:04d}")
+        out = msg.get("out")
+        if out:
+            _atomic_write_text(out, text)
+        resolved = self.driver.set_values(values)  # for the ack (already applied)
+        return {"ok": True, "out": out, "frame": k, "targets": resolved}
+
+
+def serve_live(session: LiveSession, in_stream, out_stream) -> None:
+    """Run the newline-delimited-JSON message loop over the given streams
+    (default the process's ``stdin``/``stdout``).  Reads one JSON object per
+    line, dispatches to ``session.handle``, writes one JSON ack per line, and
+    stops after a ``quit`` (or EOF).  Mirrors :class:`loom.PreviewServer`'s
+    one-message-per-line stdio convention, in the editor→loom direction."""
+    for line in in_stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as e:
+            ack = {"ok": False, "error": f"bad json: {e}"}
+        else:
+            ack = session.handle(msg)
+        out_stream.write(json.dumps(ack) + "\n")
+        out_stream.flush()
+        if ack.get("bye"):
+            break
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 __all__ = [
     "CurveDrive", "ChannelBinding",
     "MODE_FLYBY", "MODE_ANIMATION", "SIDECAR_VERSION",
+    "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",
 ]

@@ -43,6 +43,7 @@ from .axes import (
 )
 from .anim import (
     CurveDrive, ChannelBinding, MODE_FLYBY, MODE_ANIMATION,
+    Slot, collect_slots, SceneDriver, LiveSession, serve_live,
 )
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
@@ -109,6 +110,7 @@ __all__ = [
     "Binding", "Target", "combine", "as_ax",
     "ADDITIVE", "GAIN", "BIPOLAR", "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V",
     "CurveDrive", "ChannelBinding", "MODE_FLYBY", "MODE_ANIMATION",
+    "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
     "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",

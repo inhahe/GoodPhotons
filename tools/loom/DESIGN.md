@@ -422,7 +422,7 @@ tools/loom/
     mcubes.py               marching cubes: bake a field to a mesh (M7)
     vdbio.py                bake a field to a dense grid + write/read .vdb (E4 write)
     axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce (E5 core)
-    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out (E2 s1)
+    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
@@ -582,7 +582,7 @@ tools/loom/
   neutrals, cycle-detect over axial nodes). Follow-ups: fold clock-parameterized interp curves/records so
   `Sample` binds their param axis directly, the `.ftsl` projection of axis annotations, and routing scene
   value-sites (E2) through `Target`.
-- **E2 (slice 1) — N-D curve → scene-variable go-between.** ✅ done (`loom/anim.py`). The channel-a config
+- **E2 (slices 1–2) — N-D curve → scene-variable go-between.** ✅ done (`loom/anim.py`). The channel-a config
   model + JSON sidecar + channel-b value fan-out — the pure-Python core of the animation go-between (resolves
   E2 OPEN Q1/Q2: config in a loom struct with a serialized sidecar; go-between = loom). `CurveDrive(dims,
   points, bindings, mode, closed)` holds the dimension count, the static starting control points (point
@@ -592,10 +592,19 @@ tools/loom/
   versioned JSON with an **atomic** temp+`os.replace` write ("scene proposes, editor disposes" round-trip).
   `sample(t)` is a uniform Catmull-Rom (loom-side preview; ftrace's editor is the live sampling authority);
   `apply(values, bases)`/`frame(t)` fan the sampled channels out to `{target: value}`, composing
-  multi-channel targets through an E5 `Target` of the declared kind. Tests: `tests/test_anim.py` (19).
-  Remaining slices: (2) the editor↔loom live-value **stdio-pipe** channel (extend `PreviewServer`), and (3)
-  the interactive ftrace `camera_curve` **editor** generalization (seed from / write back the sidecar, drive
-  arbitrary scene variables); plus wiring a resolved `{target:value}` map into a `Scene` at emit.
+  multi-channel targets through an E5 `Target` of the declared kind.
+  **Slice 2** resolves "how a binding target names a real scene value-site" via **named animatable slots**
+  (option b, `RefSignal`-style): a `Slot(name, default)` *is* a `Signal`, so dropping it in any signal-valued
+  scene param means the scene's own `roots()`/`walk`/`emit` discovers and bakes it — zero emit-path change.
+  `collect_slots(scene)` groups slots by name; `SceneDriver(scene, drive, bases, strict)` fans a `CurveDrive`
+  out into the named slots (`set_values` pushes, `emit_frame` emits with a **fresh** `Cache` since a slot's
+  value is pushed, not clock-derived) and its `default` doubles as the target's `mod` base. `LiveSession` +
+  `serve_live(session, in, out)` are the editor↔loom **live-value channel**: a newline-delimited-JSON stdio
+  loop (the `PreviewServer` precedent, editor→loom direction) with `frame`/`config`/`bindings`/`points`/
+  `save`/`quit` commands, each a pure `dict`→`dict` `handle()` so the protocol is unit-testable without a
+  pipe. Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (23).
+  Remaining slice: (3) the interactive ftrace `camera_curve` **editor** generalization (seed from / write
+  back the sidecar, drive arbitrary scene variables) — the C++ part, best done with the user present.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
