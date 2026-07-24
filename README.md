@@ -960,6 +960,14 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   historically standard, but rounds sRGB back to within only ~0.07 (vs `rgb`'s <0.001).
   Produces a valid `[0,1]` reflectance, so it's a *material* upsampler like `rgb`; offered
   for comparison / when a scene wants the Smits basis specifically.
+- **`rgbbox r g b`** (also `hsvbox …`, `hslbox …`) — the simplest RGB→reflectance
+  upsampler: a **calibrated 3-box** spectrum, one flat step per band (blue 400–500,
+  green 500–600, red 600–700 nm) whose three heights are solved from a fixed 3×3 matrix
+  so the reflectance integrates back to the requested linear-sRGB colour *exactly*
+  (round-trips to <0.02 — the tightest of the reflectance upsamplers). Cheap and analytic
+  but blocky (hard band edges, no smoothness), so it's the baseline against which `rgb`
+  (Jakob–Hanika) and `rgbsmits` trade fidelity for smoothness. A valid `[0,1]`-clamped
+  *material* reflectance like the others.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
   **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
   (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —

@@ -941,13 +941,32 @@ static int checkUpsample() {
     }
     bool passE = smitsPhysical && smitsErr < 0.20;   // approximate by design
 
-    bool pass = passA && passB && passW && passC && passD && passE;
+    // (f) Plain calibrated 3-box reflectance round-trips: since the band heights are
+    // solved from the inverse response matrix, unsaturated colours reconstruct nearly
+    // exactly; saturated ones clamp (heights in [0,1]) and drift. Guards the calibration.
+    double boxErr = 0.0; bool boxPhysical = true;
+    for (const C& c : tests) {
+        Spectrum spd = rgbToReflectanceBox(c.r, c.g, c.b);
+        for (int i = 0; i < B.N; ++i) {
+            double s = spd(B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) boxPhysical = false;
+        }
+        Vec3 lin = reflectanceToLinearSrgbD65(spd);
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        boxErr = std::max(boxErr, e);
+        std::printf("[checkupsample] box   %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+    bool passF = boxPhysical && boxErr < 0.30;   // crude basis; saturated colours clamp
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
     std::printf("[checkupsample] mid-grey round-trip = %.6f  (%s)\n", greyErr, passC ? "ok" : "BAD");
     std::printf("[checkupsample] illuminant round-trip max error = %.5f  (%s)\n", illumErr, passD ? "ok" : "BAD");
     std::printf("[checkupsample] smits round-trip max error = %.5f (<0.20 expected)  (%s)\n", smitsErr, passE ? "ok" : "BAD");
+    std::printf("[checkupsample] box round-trip max error = %.5f (<0.30 expected)  (%s)\n", boxErr, passF ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

@@ -305,6 +305,48 @@ inline std::array<double, SmitsBasis::N> smitsCombine(double r, double g, double
     return ret;
 }
 
+// --- Plain 3-box RGB->reflectance ------------------------------------------
+// The simplest possible upsampler: three fixed rectangular reflectance bands
+// (B [400,500), G [500,600), R [600,700) nm). Rather than dumping r,g,b straight
+// into the boxes (which would badly mis-reproduce the colour), the three band
+// heights are *calibrated* — each unit band's response under D65 through the CIE
+// observer is precomputed as a column of a 3x3, and its inverse maps a target
+// linear-sRGB triple to the heights that reconstruct it. So a plain box still
+// round-trips as well as a 3-primary basis can (heights clamped to [0,1], so very
+// saturated colours degrade gracefully). Cheapest option; sharp band edges make
+// it handy for testing dispersion/spectral response (K1).
+struct BoxBasis {
+    static constexpr double edges[4] = {400.0, 500.0, 600.0, 700.0};   // B, G, R
+    double Minv[9];   // linear-sRGB target -> (hBlue, hGreen, hRed)
+    BoxBasis() {
+        const Basis& B = basis();
+        double M[9];   // columns: linear-sRGB response of each unit band
+        for (int band = 0; band < 3; ++band) {
+            double lo = edges[band], hi = edges[band + 1];
+            double X = 0, Y = 0, Z = 0;
+            for (int i = 0; i < B.N; ++i) {
+                if (B.lam[i] >= lo && B.lam[i] < hi) { X += B.wX[i]; Y += B.wY[i]; Z += B.wZ[i]; }
+            }
+            Vec3 lin = xyzToLinearSrgb(Vec3{X, Y, Z});
+            M[0 * 3 + band] = lin.x; M[1 * 3 + band] = lin.y; M[2 * 3 + band] = lin.z;
+        }
+        // 3x3 inverse (cofactor / determinant); identity fallback if singular.
+        double d = M[0]*(M[4]*M[8]-M[5]*M[7]) - M[1]*(M[3]*M[8]-M[5]*M[6]) + M[2]*(M[3]*M[7]-M[4]*M[6]);
+        if (std::fabs(d) < 1e-12) { for (int i = 0; i < 9; ++i) Minv[i] = (i % 4 == 0) ? 1.0 : 0.0; return; }
+        double id = 1.0 / d;
+        Minv[0] =  (M[4]*M[8]-M[5]*M[7]) * id;
+        Minv[1] = -(M[1]*M[8]-M[2]*M[7]) * id;
+        Minv[2] =  (M[1]*M[5]-M[2]*M[4]) * id;
+        Minv[3] = -(M[3]*M[8]-M[5]*M[6]) * id;
+        Minv[4] =  (M[0]*M[8]-M[2]*M[6]) * id;
+        Minv[5] = -(M[0]*M[5]-M[2]*M[3]) * id;
+        Minv[6] =  (M[3]*M[7]-M[4]*M[6]) * id;
+        Minv[7] = -(M[0]*M[7]-M[1]*M[6]) * id;
+        Minv[8] =  (M[0]*M[4]-M[1]*M[3]) * id;
+    }
+};
+inline const BoxBasis& boxBasis() { static BoxBasis b; return b; }
+
 } // namespace upsample
 
 // Build a near-monochromatic *emission* Spectrum from a linear-sRGB triple: a
@@ -342,6 +384,23 @@ inline Spectrum rgbToReflectanceSmits(double r, double g, double b) {
         int i = 0; while (i < N - 1 && w > lam[i + 1]) ++i;
         double t = (w - lam[i]) / (lam[i + 1] - lam[i]);
         return vals[i] * (1.0 - t) + vals[i + 1] * t;
+    };
+}
+
+// Build a reflectance Spectrum from a linear-sRGB triple (plain calibrated 3-box).
+// Three rectangular bands whose heights are solved to reproduce the colour under
+// D65; heights clamped to [0,1]. Zero outside [400,700) nm.
+inline Spectrum rgbToReflectanceBox(double r, double g, double b) {
+    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    const upsample::BoxBasis& BB = upsample::boxBasis();
+    std::array<double, 3> h;
+    for (int i = 0; i < 3; ++i)
+        h[i] = std::clamp(BB.Minv[i*3+0]*r + BB.Minv[i*3+1]*g + BB.Minv[i*3+2]*b, 0.0, 1.0);
+    return [h](double w) -> double {
+        if (w >= 400.0 && w < 500.0) return h[0];   // blue band
+        if (w >= 500.0 && w < 600.0) return h[1];   // green band
+        if (w >= 600.0 && w < 700.0) return h[2];   // red band
+        return 0.0;
     };
 }
 

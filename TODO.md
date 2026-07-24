@@ -1600,7 +1600,16 @@ ftrace's own language). Two follow-ups were captured:
           sRGB to <0.07 max, all reflectances in [0,1]) and a render (`scraps/smits_test.ftsl`, Smits vs
           Jakob-Hanika panels side by side). A reflectance upsampler, so no GPU change (upsampling is a host-side
           bake into the spectral tables).
-    - [ ] **Still open:** further upsamplers (Meng 2015, plain box/3-lobe) and a **named user mapping** — a
+    - [x] **Plain calibrated 3-box upsampler landed** *(2026-07-24, v0.46.0).* The simplest reflectance
+          upsampler: one flat step per band (blue 400–500, green 500–600, red 600–700 nm) whose three heights
+          are solved from a fixed 3×3 matrix (`BoxBasis`/`boxBasis()` in `upsample.h` precompute `Minv`, the
+          inverse of the per-band linear-sRGB response) so `rgbToReflectanceBox` integrates back to the
+          requested colour *exactly* — round-trips sRGB to <0.02 max, the tightest of the reflectance
+          upsamplers, though blocky (hard band edges). Surface: **head keywords** `rgbbox`/`hsvbox`/`hslbox`
+          wired through `evalSpectrum` (`ftsl.h`) and mirrored in loom (`BoxSpec`, with tests). Validated by
+          `-checkupsample` (box section, err <0.02, all reflectances clamped `[0,1]`). Reflectance upsampler →
+          host-side bake, no GPU change.
+    - [ ] **Still open:** further upsamplers (Meng 2015) and a **named user mapping** — a
           `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
 
 - [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**

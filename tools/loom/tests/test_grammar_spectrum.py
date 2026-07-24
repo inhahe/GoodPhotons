@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from loom.grammar.spectrum import (  # noqa: E402
-    Band, Blackbody, ColorSpec, Const, IllumSpec, Ior, LibRef, LineSpec,
+    Band, Blackbody, BoxSpec, ColorSpec, Const, IllumSpec, Ior, LibRef, LineSpec,
     NamedWall, RecordRef, SmitsSpec, WhiteWall, as_spectrum, parse_spectrum,
 )
 from loom.grammar.values import ShapeError  # noqa: E402
@@ -133,6 +133,20 @@ def test_smits_heads_parse():
 def test_smits_head_wrong_arity_is_shape_error():
     with pytest.raises(ShapeError):
         parse_spectrum("rgbsmits 0 1")         # needs 3 components
+
+
+# ---- plain 3-box reflectance heads (K1) ------------------------------------
+
+def test_box_heads_parse():
+    # `rgbbox r g b` (and hsvbox/hslbox) → BoxSpec
+    assert parse_spectrum("rgbbox 0.8 0.1 0.1") == BoxSpec("rgb", (0.8, 0.1, 0.1))
+    assert parse_spectrum("hsvbox 0.1 0.8 0.9") == BoxSpec("hsv", (0.1, 0.8, 0.9))
+    assert parse_spectrum("hslbox 0.6 0.7 0.5") == BoxSpec("hsl", (0.6, 0.7, 0.5))
+
+
+def test_box_head_wrong_arity_is_shape_error():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgbbox 0 1")           # needs 3 components
 
 
 # ---- untagged bare colour is NOT a spectrum (matches ftrace) ---------------
