@@ -150,6 +150,30 @@ def _curve_geometry(path: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     return {"control_points": cps, "polyline": poly}
 
 
+def _track_channels(tp: Any, clock: Optional[Clock]) -> List[Dict[str, Any]]:
+    """Sample each of a :class:`TrackedPath`'s tacked-on tracks along the **same**
+    seamless curve parameter the display polyline uses, so the viewer's strip charts
+    (F3) line up sample-for-sample with the 3-D curve.  Each channel record carries
+    the track ``name``, its ``dim``, whether it was authored ``scalar``, and a
+    ``samples`` list (one ``dim``-vector per polyline sample — scalar tracks give
+    1-vectors).  A closed path repeats the first sample to match the closed polyline."""
+    clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+    n = _POLYLINE_SAMPLES
+    out: List[Dict[str, Any]] = []
+    for name, pts in tp.tracks.items():
+        # evaluate each control point's track value at the clock, then ride the same
+        # curve interpolation the main point uses (identical u samples).
+        cps = [tuple(vs.at(clk)) for vs in pts]
+        samples = [list(eval_curve(cps, k / n, tp.closed)) for k in range(n)]
+        if tp.closed:
+            samples.append(list(samples[0]))
+        out.append({"name": name,
+                    "dim": len(cps[0]) if cps else 0,
+                    "scalar": bool(tp.is_scalar(name)),
+                    "samples": samples})
+    return out
+
+
 def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, Any]:
     d: Dict[str, Any] = {"id": obj.id, "kind": kind}
     if kind == "path":
@@ -159,6 +183,7 @@ def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, 
         d.update(dim=obj.dim, closed=obj.closed, count=len(obj),
                  tracks=list(obj.tracks.keys()))
         d.update(_curve_geometry(obj.path, clock))
+        d["channels"] = _track_channels(obj, clock)
     elif kind == "grid":
         d.update(ndim=obj.ndim, shape=list(obj.shape),
                  lo=list(obj.lo), hi=list(obj.hi),

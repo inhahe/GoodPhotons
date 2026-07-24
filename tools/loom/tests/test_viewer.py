@@ -181,6 +181,31 @@ def test_introspect_open_path_polyline_not_wrapped(tmp_path):
     assert path["polyline"][0] != path["polyline"][-1]
 
 
+def test_introspect_tracked_path_channels():
+    """F3: a tracked_path dataset carries its tacked-on tracks sampled along the
+    same curve parameter as the display polyline (one strip-chart series each)."""
+    from loom.data import TrackedPath
+    from loom.scene import Beads
+    tp = TrackedPath([(0, 0, 0), (1, 1, 1), (2, 0, 0), (0, 2, 0)],
+                     tracks={"speed": [1.0, 2.0, 3.0, 4.0],           # scalar track
+                             "aim": [(1, 0), (0, 1), (-1, 0), (0, -1)]},  # 2-D vector
+                     closed=True)
+    cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
+    sc = Scene(cam)
+    sc.add(Beads(tp, count=4, radius=0.1, material="m"))
+    d = introspect(sc)
+    tpd = [ds for ds in d["datasets"] if ds["kind"] == "tracked_path"][0]
+    assert set(tpd["tracks"]) == {"speed", "aim"}
+    chans = {c["name"]: c for c in tpd["channels"]}
+    assert chans["speed"]["scalar"] is True and chans["speed"]["dim"] == 1
+    assert chans["aim"]["scalar"] is False and chans["aim"]["dim"] == 2
+    # closed → samples wrap (first repeated), matching the polyline length
+    assert len(chans["speed"]["samples"]) == 96 + 1
+    assert chans["speed"]["samples"][0] == chans["speed"]["samples"][-1]
+    assert all(len(s) == 1 for s in chans["speed"]["samples"])
+    assert all(len(s) == 2 for s in chans["aim"]["samples"])
+
+
 def test_introspect_dag_nodes_and_edges():
     d = introspect(build())
     dag = d["dag"]

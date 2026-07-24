@@ -24,6 +24,7 @@ int runViewerGui(const std::string&) {
 #include <algorithm>
 
 #include "imgui.h"
+#include "implot.h"                // ImPlot: F3 strip charts
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "third_party/json.h"      // minijson: the vendored JSON parser
@@ -173,6 +174,16 @@ struct Sidecar {
     }
 };
 
+// A tacked-on channel (TrackedPath track) sampled along the curve parameter — the
+// source for F3's per-channel strip charts. Stored flat, `dim` scalars per sample.
+struct ChannelGeom {
+    std::string        name;
+    int                dim    = 1;
+    bool               scalar = true;
+    std::vector<float> samp;         // flat, dim scalars per sample
+    int                n      = 0;   // number of samples (matches the polyline)
+};
+
 // A curve dataset kept at full N-D. Points are stored flat, `dim` scalars each,
 // so the viewer can pick any 3 of N dims to display (§F2's 3-of-N projection).
 struct CurveGeom {
@@ -183,6 +194,7 @@ struct CurveGeom {
     int                polyN  = 0;   // number of polyline points
     std::vector<float> ctrl;         // flat, dim scalars per control point
     int                ctrlN  = 0;   // number of control points
+    std::vector<ChannelGeom> channels;  // tracked-path tacked-on channels (F3)
 };
 
 // Pull a flat N-D array out of a JSON array-of-arrays. Every row is padded/kept to
@@ -224,6 +236,18 @@ static std::vector<CurveGeom> collectCurves(const Sidecar& sc) {
         g.dim    = dim;
         g.polyN  = flattenPtsND(poly, g.poly, dim);
         g.ctrlN  = flattenPtsND(d.find("control_points"), g.ctrl, dim);
+        // tracked-path channels (F3): each track sampled along the same parameter
+        const minijson::Value* chans = d.find("channels");
+        if (chans && chans->isArray()) {
+            for (const auto& ch : chans->arr) {
+                ChannelGeom cg;
+                cg.name   = scalarStr(ch.find("name"), "");
+                cg.dim    = std::max(1, ch.intAt("dim", 1));
+                cg.scalar = ch.find("scalar") ? ch.find("scalar")->asBool(true) : true;
+                cg.n      = flattenPtsND(ch.find("samples"), cg.samp, cg.dim);
+                g.channels.push_back(std::move(cg));
+            }
+        }
         curves.push_back(std::move(g));
     }
     return curves;
@@ -246,6 +270,7 @@ struct OrbitView {
     float index = 0.0f;             // 0..1 position of the highlighted index marker
     int   stereo = STEREO_MONO;     // mono / anaglyph / side-by-side
     float sep    = 0.10f;           // stereo eye-yaw separation (radians)
+    double sx0 = 0.0, sx1 = 1.0;    // shared/linked X range for the F3 strip charts
 };
 
 // Project a 3-vector (already the 3 selected dims, centered) to screen space, with
@@ -422,6 +447,87 @@ static void drawCurvePane(const std::vector<CurveGeom>& curves, OrbitView& view)
 }
 
 // --------------------------------------------------------------------------
+// F3 — scroll-locked strip charts (ImPlot). One chart per curve dimension and
+// one per tacked-on channel component, all sharing a linked X axis (paging
+// scrolls every chart together) and a draggable shared index marker.
+// --------------------------------------------------------------------------
+struct StripSeries {
+    std::string        label;
+    std::vector<float> x;   // normalized curve parameter 0..1 (so charts align)
+    std::vector<float> y;
+};
+
+static std::vector<StripSeries> buildStrips(const std::vector<CurveGeom>& curves) {
+    std::vector<StripSeries> out;
+    int ci = 0;
+    for (const auto& c : curves) {
+        std::string cid = "#" + (c.id.empty() ? std::to_string(ci) : c.id);
+        // one series per spatial dimension of the polyline
+        for (int d = 0; d < c.dim; ++d) {
+            StripSeries s;
+            s.label = cid + " d" + std::to_string(d);
+            s.x.resize(c.polyN); s.y.resize(c.polyN);
+            for (int i = 0; i < c.polyN; ++i) {
+                s.x[i] = c.polyN > 1 ? (float)i / (c.polyN - 1) : 0.0f;
+                s.y[i] = c.poly[(size_t)i * c.dim + d];
+            }
+            out.push_back(std::move(s));
+        }
+        // one series per tacked-on channel component
+        for (const auto& ch : c.channels) {
+            for (int comp = 0; comp < ch.dim; ++comp) {
+                StripSeries s;
+                s.label = cid + " " + ch.name;
+                if (ch.dim > 1) s.label += "[" + std::to_string(comp) + "]";
+                s.x.resize(ch.n); s.y.resize(ch.n);
+                for (int i = 0; i < ch.n; ++i) {
+                    s.x[i] = ch.n > 1 ? (float)i / (ch.n - 1) : 0.0f;
+                    s.y[i] = ch.samp[(size_t)i * ch.dim + comp];
+                }
+                out.push_back(std::move(s));
+            }
+        }
+        ++ci;
+    }
+    return out;
+}
+
+static void drawStripCharts(const std::vector<StripSeries>& strips, OrbitView& view) {
+    if (strips.empty()) {
+        ImGui::TextDisabled("(no per-dimension / channel series to chart)");
+        return;
+    }
+    ImGui::TextUnformatted("Strip charts - scroll-locked; drag the yellow index line");
+    int n = (int)strips.size();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    // fill when few charts, but never below a readable height (child then scrolls)
+    float rowH = std::max(70.0f, avail.y / n);
+    ImVec4 lineCol(0.47f, 0.78f, 1.0f, 1.0f);
+    for (int i = 0; i < n; ++i) {
+        const StripSeries& s = strips[i];
+        std::string title = s.label + "##strip" + std::to_string(i);
+        ImPlotFlags pf = ImPlotFlags_NoLegend | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText;
+        if (ImPlot::BeginPlot(title.c_str(), ImVec2(-1, rowH - 6), pf)) {
+            // link the X axis across every chart → they scroll/zoom together
+            ImPlot::SetupAxisLinks(ImAxis_X1, &view.sx0, &view.sx1);
+            ImPlotAxisFlags xf = ImPlotAxisFlags_NoGridLines |
+                                 (i == n - 1 ? 0 : ImPlotAxisFlags_NoTickLabels);
+            ImPlot::SetupAxes(nullptr, nullptr, xf, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Once);
+            ImPlotSpec spec;
+            spec.LineColor  = lineCol;
+            spec.LineWeight = 1.4f;
+            ImPlot::PlotLine(s.label.c_str(), s.x.data(), s.y.data(), (int)s.x.size(), spec);
+            // the shared index marker (bidirectional with the 3-D pane's index dot)
+            double idx = view.index;
+            if (ImPlot::DragLineX(9001, &idx, ImVec4(1.0f, 0.94f, 0.3f, 1.0f), 1.5f))
+                view.index = (float)std::min(1.0, std::max(0.0, idx));
+            ImPlot::EndPlot();
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The panels
 // --------------------------------------------------------------------------
 static void drawObjectsPanel(const Sidecar& sc) {
@@ -541,6 +647,7 @@ int runViewerGui(const std::string& sidecarPath) {
         return 1;
     }
     std::vector<CurveGeom> curves = collectCurves(sc);
+    std::vector<StripSeries> strips = buildStrips(curves);
 
     OrbitView view;
     for (const auto& c : curves) view.maxDim = std::max(view.maxDim, c.dim);
@@ -565,6 +672,7 @@ int runViewerGui(const std::string& sidecarPath) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext();                // F3 strip charts
     ImGui::GetIO().IniFilename = nullptr;   // don't litter an imgui.ini in the CWD
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
@@ -606,7 +714,18 @@ int runViewerGui(const std::string& sidecarPath) {
 
         ImGui::SameLine();
         ImGui::BeginChild("right", ImVec2(0, 0), true);
-        drawCurvePane(curves, view);
+        if (!strips.empty()) {
+            // curve pane on top, scroll-locked strip charts below
+            float paneH = ImGui::GetContentRegionAvail().y * 0.58f;
+            ImGui::BeginChild("curvepane", ImVec2(0, paneH), false);
+            drawCurvePane(curves, view);
+            ImGui::EndChild();
+            ImGui::BeginChild("stripcharts", ImVec2(0, 0), false);
+            drawStripCharts(strips, view);
+            ImGui::EndChild();
+        } else {
+            drawCurvePane(curves, view);
+        }
         ImGui::EndChild();
 
         ImGui::End();
@@ -621,6 +740,7 @@ int runViewerGui(const std::string& sidecarPath) {
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
     CleanupDeviceD3D();
     DestroyWindow(hwnd);

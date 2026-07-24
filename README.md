@@ -2278,9 +2278,12 @@ each curve dataset in a full **N-D curve pane** — a structural view of the Pyt
 no browser/WebGL round-trip. The pane orbits (drag) and zooms (wheel), picks **any 3 of the
 curve's N dimensions** to map to screen X/Y/Z (view-only re-projection), marks progression
 with **index markers** along the curve, and supports **stereoscopic viewing** — red-cyan
-anaglyph and wall-eyed / cross-eyed side-by-side, with an eye-separation slider. (Early
-stage: the object/dataset/curve panes are up; the live `-raster-gpu` render pane, strip
-charts and DAG graph are in progress — see §F in `TODO.md`.)
+anaglyph and wall-eyed / cross-eyed side-by-side, with an eye-separation slider. Below the
+3-D pane sit **scroll-locked strip charts** (ImPlot) — one per curve dimension and one per
+tacked-on `TrackedPath` channel; they share a linked X axis (paging scrolls them all
+together) and a draggable index line wired to the 3-D index dot. (Early stage: the
+`-raster-gpu` render pane and modulator-DAG graph are still in progress — see §F in
+`TODO.md`.)
 
 ---
 

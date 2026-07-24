@@ -1361,11 +1361,21 @@ replacement for the renderer or the primary editing tool.**
         side-by-side, with an eye-separation slider; each eye re-renders the same curve at a small yaw offset
         (anaglyph tints the two eyes red/cyan and overlays them; wall/cross split the canvas into two
         half-width viewports). Shares the §I off-axis stereo idea.
-- [ ] **F3 — scroll-locked strip charts (ImPlot).** Below the 3-D pane, one strip chart **per curve
-      dimension** and one **per tacked-on channel** (TrackedCurve). Shared index markers along the bottom
-      cross-reference the 3-D index dot. **All charts scroll left/right together (scroll-locked, never
-      individually)** to page through the whole curve. Hover/click on a chart cross-highlights the 3-D
+- [x] **F3 — scroll-locked strip charts (ImPlot).** ✅ 2026-07-24 Below the 3-D pane, one strip chart
+      **per curve dimension** and one **per tacked-on channel** (TrackedCurve). Shared index markers along
+      the bottom cross-reference the 3-D index dot. **All charts scroll left/right together (scroll-locked,
+      never individually)** to page through the whole curve. Hover/click on a chart cross-highlights the 3-D
       index dot and vice-versa.
+      - **loom side:** the sidecar's `tracked_path` datasets now carry a `channels` array — each track
+        (`speed`, `aim`, …) sampled along the **same** curve parameter as the display polyline (scalar
+        tracks → 1-vectors, vector tracks → N-vectors; closed paths wrap), so the strip charts line up
+        sample-for-sample with the 3-D curve. Tested in `tools/loom/tests/test_viewer.py`.
+      - **C++ side:** vendored **ImPlot** (`src/third_party/implot/`) is now compiled into the ftrace
+        target. The `-viewer` right pane splits into the 3-D curve pane (top) and a stack of strip charts
+        (bottom): one per polyline dimension **d0…dN** plus one per channel component. All charts share a
+        **linked X axis** (`SetupAxisLinks`) so panning/zooming any one pages them all together, and each
+        carries a **draggable yellow index line** wired bidirectionally to the 3-D pane's index dot
+        (dragging a chart line moves the dot; the index slider moves every line).
 - [ ] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** Tessellate the
       SweptMesh and show it in the 3-D pane with **any texture it defines (image *or* formula** — needs
       **G5**). **Rotation rule:** rotating an isometry of the 3 displayed spatial dims = **view-only**
