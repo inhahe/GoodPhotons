@@ -2274,10 +2274,13 @@ See **[`tools/loom/README.md`](tools/loom/README.md)** for the tour, and
 `ftrace -viewer <scene.viewer.json>` opens a Dear ImGui / Direct3D 11 window on a loom
 **scene-introspection sidecar** (written by `loom.viewer.ViewerModel.save_sidecar`). It
 shows the scene's objects, datasets, camera/lights and modulator-DAG summary, and draws
-each curve dataset's sampled polyline in an orbitable 3-D pane — a structural view of the
-Python model with no browser/WebGL round-trip. (Early stage: the object/dataset/curve
-panes are up; the live `-raster-gpu` render pane, strip charts and DAG graph are in
-progress — see §F in `TODO.md`.)
+each curve dataset in a full **N-D curve pane** — a structural view of the Python model with
+no browser/WebGL round-trip. The pane orbits (drag) and zooms (wheel), picks **any 3 of the
+curve's N dimensions** to map to screen X/Y/Z (view-only re-projection), marks progression
+with **index markers** along the curve, and supports **stereoscopic viewing** — red-cyan
+anaglyph and wall-eyed / cross-eyed side-by-side, with an eye-separation slider. (Early
+stage: the object/dataset/curve panes are up; the live `-raster-gpu` render pane, strip
+charts and DAG graph are in progress — see §F in `TODO.md`.)
 
 ---
 

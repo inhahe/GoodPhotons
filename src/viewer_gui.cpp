@@ -173,25 +173,39 @@ struct Sidecar {
     }
 };
 
-// A curve dataset flattened to draw-ready 3-D polylines.
+// A curve dataset kept at full N-D. Points are stored flat, `dim` scalars each,
+// so the viewer can pick any 3 of N dims to display (§F2's 3-of-N projection).
 struct CurveGeom {
-    std::string              id;
-    bool                     closed = false;
-    std::vector<float>       poly;   // flat xyz triples (sampled polyline)
-    std::vector<float>       ctrl;   // flat xyz triples (control points)
+    std::string        id;
+    bool               closed = false;
+    int                dim    = 3;   // dimensionality of each stored point
+    std::vector<float> poly;         // flat, dim scalars per sampled point
+    int                polyN  = 0;   // number of polyline points
+    std::vector<float> ctrl;         // flat, dim scalars per control point
+    int                ctrlN  = 0;   // number of control points
 };
 
-// Pull a flat xyz array out of a JSON array-of-arrays; pads/truncates to 3.
-static void flattenPts(const minijson::Value* a, std::vector<float>& out) {
+// Pull a flat N-D array out of a JSON array-of-arrays. Every row is padded/kept to
+// `dim` scalars (dim = the widest row seen). Returns the row count.
+static int flattenPtsND(const minijson::Value* a, std::vector<float>& out, int dim) {
     out.clear();
-    if (!a || !a->isArray()) return;
+    if (!a || !a->isArray()) return 0;
     for (const auto& p : a->arr) {
-        float xyz[3] = {0, 0, 0};
-        if (p.isArray())
-            for (int k = 0; k < 3 && k < (int)p.arr.size(); ++k)
-                xyz[k] = (float)p.arr[k].asNumber(0.0);
-        out.push_back(xyz[0]); out.push_back(xyz[1]); out.push_back(xyz[2]);
+        for (int k = 0; k < dim; ++k) {
+            float v = 0.0f;
+            if (p.isArray() && k < (int)p.arr.size()) v = (float)p.arr[k].asNumber(0.0);
+            out.push_back(v);
+        }
     }
+    return (int)a->arr.size();
+}
+
+static int rowWidth(const minijson::Value* a) {
+    int w = 0;
+    if (a && a->isArray())
+        for (const auto& p : a->arr)
+            if (p.isArray()) w = std::max(w, (int)p.arr.size());
+    return w;
 }
 
 // Collect every dataset that carries polyline geometry (paths / tracked paths).
@@ -205,8 +219,11 @@ static std::vector<CurveGeom> collectCurves(const Sidecar& sc) {
         CurveGeom g;
         g.id     = scalarStr(d.find("id"), "");
         g.closed = d.find("closed") ? d.find("closed")->asBool(false) : false;
-        flattenPts(poly, g.poly);
-        flattenPts(d.find("control_points"), g.ctrl);
+        int dim  = std::max({ 3, rowWidth(poly), rowWidth(d.find("control_points")),
+                              d.intAt("dim", 0) });
+        g.dim    = dim;
+        g.polyN  = flattenPtsND(poly, g.poly, dim);
+        g.ctrlN  = flattenPtsND(d.find("control_points"), g.ctrl, dim);
         curves.push_back(std::move(g));
     }
     return curves;
@@ -218,17 +235,25 @@ static std::vector<CurveGeom> collectCurves(const Sidecar& sc) {
 // Curve pane: a simple orthographic projection drawn with ImDrawList.
 // (Slice C generalizes this to 3-of-N dim selection, rotation, and stereo.)
 // --------------------------------------------------------------------------
+enum StereoMode { STEREO_MONO = 0, STEREO_ANAGLYPH, STEREO_WALL, STEREO_CROSS };
+
 struct OrbitView {
     float yaw   = 0.6f;   // radians
     float pitch = 0.4f;
     float zoom  = 1.0f;
+    int   dx = 0, dy = 1, dz = 2;   // which of the N dims map to screen X/Y/Z
+    int   maxDim = 3;               // widest curve dimensionality in the scene
+    float index = 0.0f;             // 0..1 position of the highlighted index marker
+    int   stereo = STEREO_MONO;     // mono / anaglyph / side-by-side
+    float sep    = 0.10f;           // stereo eye-yaw separation (radians)
 };
 
-static ImVec2 project(const float* p, const OrbitView& v, ImVec2 center, float scale) {
-    // rotate about Y (yaw) then X (pitch), orthographic drop of Z
-    float cy = std::cos(v.yaw),   sy = std::sin(v.yaw);
-    float cx = std::cos(v.pitch), sx = std::sin(v.pitch);
-    float x = p[0], y = p[1], z = p[2];
+// Project a 3-vector (already the 3 selected dims, centered) to screen space, with
+// an extra yaw offset for the stereo eye separation.
+static ImVec2 project3(float x, float y, float z, const OrbitView& v, float yawOff,
+                       ImVec2 center, float scale) {
+    float cy = std::cos(v.yaw + yawOff), sy = std::sin(v.yaw + yawOff);
+    float cx = std::cos(v.pitch),        sx = std::sin(v.pitch);
     float x1 =  cy * x + sy * z;
     float z1 = -sy * x + cy * z;
     float y1 =  cx * y - sx * z1;
@@ -236,8 +261,47 @@ static ImVec2 project(const float* p, const OrbitView& v, ImVec2 center, float s
                   center.y - y1 * scale * v.zoom);
 }
 
+// Pull the 3 selected dims out of a flat N-D point, minus the centering offset.
+static void pick3(const float* p, int dim, const OrbitView& v, const float* mid,
+                  float& x, float& y, float& z) {
+    x = (v.dx < dim ? p[v.dx] : 0.0f) - mid[0];
+    y = (v.dy < dim ? p[v.dy] : 0.0f) - mid[1];
+    z = (v.dz < dim ? p[v.dz] : 0.0f) - mid[2];
+}
+
 static void drawCurvePane(const std::vector<CurveGeom>& curves, OrbitView& view) {
-    ImGui::TextUnformatted("Curves (orthographic preview — drag to orbit, wheel to zoom)");
+    // ---- controls: 3-of-N dim pickers + index marker slider ----
+    ImGui::TextUnformatted("Curves - drag to orbit, wheel to zoom");
+    if (view.maxDim > 3) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(showing 3 of %d dims)", view.maxDim);
+    }
+    auto dimCombo = [&](const char* label, int& sel) {
+        ImGui::SetNextItemWidth(70);
+        std::string cur = "d" + std::to_string(sel);
+        if (ImGui::BeginCombo(label, cur.c_str())) {
+            for (int k = 0; k < view.maxDim; ++k) {
+                std::string it = "d" + std::to_string(k);
+                if (ImGui::Selectable(it.c_str(), sel == k)) sel = k;
+            }
+            ImGui::EndCombo();
+        }
+    };
+    dimCombo("X", view.dx); ImGui::SameLine();
+    dimCombo("Y", view.dy); ImGui::SameLine();
+    dimCombo("Z", view.dz); ImGui::SameLine();
+    ImGui::SetNextItemWidth(150);
+    ImGui::SliderFloat("index", &view.index, 0.0f, 1.0f, "%.3f");
+    // stereo controls
+    ImGui::SetNextItemWidth(150);
+    const char* modes[] = { "mono", "anaglyph (R/cyan)", "wall-eyed L|R", "cross-eyed R|L" };
+    ImGui::Combo("stereo", &view.stereo, modes, 4);
+    if (view.stereo != STEREO_MONO) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150);
+        ImGui::SliderFloat("sep", &view.sep, 0.0f, 0.4f, "%.3f rad");
+    }
+
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -255,47 +319,106 @@ static void drawCurvePane(const std::vector<CurveGeom>& curves, OrbitView& view)
     if (view.zoom < 0.05f) view.zoom = 0.05f;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
-    dl->AddRectFilled(origin, ImVec2(origin.x + avail.x, origin.y + avail.y),
-                      IM_COL32(18, 18, 22, 255));
+    ImVec2 br(origin.x + avail.x, origin.y + avail.y);
+    dl->AddRectFilled(origin, br, IM_COL32(18, 18, 22, 255));
+    dl->PushClipRect(origin, br, true);
 
-    // auto-fit scale from the union bounds of all curves
+    // auto-fit scale from the union bounds of the 3 selected dims
     float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    int seldim[3] = { view.dx, view.dy, view.dz };
     for (const auto& c : curves)
-        for (size_t i = 0; i + 2 < c.poly.size(); i += 3)
-            for (int k = 0; k < 3; ++k) {
-                lo[k] = std::min(lo[k], c.poly[i + k]);
-                hi[k] = std::max(hi[k], c.poly[i + k]);
-            }
+        for (int i = 0; i < c.polyN; ++i) {
+            const float* p = &c.poly[(size_t)i * c.dim];
+            for (int k = 0; k < 3; ++k)
+                if (seldim[k] < c.dim) {
+                    lo[k] = std::min(lo[k], p[seldim[k]]);
+                    hi[k] = std::max(hi[k], p[seldim[k]]);
+                }
+        }
     float ext = 1.0f;
-    for (int k = 0; k < 3; ++k) ext = std::max(ext, hi[k] - lo[k]);
-    float scale = 0.4f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
-    // recenter data about its midpoint
+    for (int k = 0; k < 3; ++k) if (hi[k] > lo[k]) ext = std::max(ext, hi[k] - lo[k]);
     float mid[3] = { 0, 0, 0 };
-    for (int k = 0; k < 3; ++k) mid[k] = 0.5f * (lo[k] + hi[k]);
+    for (int k = 0; k < 3; ++k) if (hi[k] >= lo[k]) mid[k] = 0.5f * (lo[k] + hi[k]);
 
     const ImU32 palette[] = {
         IM_COL32(120, 200, 255, 255), IM_COL32(255, 180, 120, 255),
         IM_COL32(160, 255, 160, 255), IM_COL32(255, 140, 200, 255),
     };
-    int ci = 0;
-    for (const auto& c : curves) {
-        ImU32 col = palette[ci % 4]; ++ci;
-        ImVec2 prev; bool have = false;
-        for (size_t i = 0; i + 2 < c.poly.size(); i += 3) {
-            float p[3] = { c.poly[i] - mid[0], c.poly[i+1] - mid[1], c.poly[i+2] - mid[2] };
-            ImVec2 s = project(p, view, center, scale);
-            if (have) dl->AddLine(prev, s, col, 1.6f);
-            prev = s; have = true;
+
+    // Draw all curves for one eye into one sub-viewport. `tint != 0` forces a single
+    // colour (anaglyph); otherwise each curve uses the palette. `yawOff` is the eye
+    // separation. `center`/`scale` are per-viewport so side-by-side splits the canvas.
+    auto drawEye = [&](ImVec2 center, float scale, float yawOff, ImU32 tint) {
+        int ci = 0;
+        for (const auto& c : curves) {
+            ImU32 col = tint ? tint : palette[ci % 4]; ++ci;
+            ImVec2 prev; bool have = false;
+            for (int i = 0; i < c.polyN; ++i) {
+                float x, y, z;
+                pick3(&c.poly[(size_t)i * c.dim], c.dim, view, mid, x, y, z);
+                ImVec2 s = project3(x, y, z, view, yawOff, center, scale);
+                if (have) dl->AddLine(prev, s, col, 1.6f);
+                prev = s; have = true;
+            }
+            ImU32 dotc = tint ? tint : IM_COL32(90, 90, 110, 255);
+            int markers = 8;
+            for (int m = 0; m <= markers; ++m) {
+                if (c.closed && m == markers) break;
+                int i = (int)((float)m / markers * (c.polyN - 1) + 0.5f);
+                if (i < 0 || i >= c.polyN) continue;
+                float x, y, z;
+                pick3(&c.poly[(size_t)i * c.dim], c.dim, view, mid, x, y, z);
+                ImVec2 s = project3(x, y, z, view, yawOff, center, scale);
+                dl->AddCircleFilled(s, 2.2f, dotc);
+            }
+            if (c.polyN > 0) {   // highlighted index dot
+                int i = (int)(view.index * (c.polyN - 1) + 0.5f);
+                i = std::max(0, std::min(c.polyN - 1, i));
+                float x, y, z;
+                pick3(&c.poly[(size_t)i * c.dim], c.dim, view, mid, x, y, z);
+                ImVec2 s = project3(x, y, z, view, yawOff, center, scale);
+                ImU32 hc = tint ? tint : IM_COL32(255, 240, 80, 255);
+                dl->AddCircleFilled(s, 4.5f, hc);
+                dl->AddCircle(s, 6.5f, tint ? tint : IM_COL32(255, 240, 80, 160), 0, 1.5f);
+            }
+            ImU32 sq = tint ? tint : IM_COL32(255, 255, 255, 220);
+            for (int i = 0; i < c.ctrlN; ++i) {   // control points
+                float x, y, z;
+                pick3(&c.ctrl[(size_t)i * c.dim], c.dim, view, mid, x, y, z);
+                ImVec2 s = project3(x, y, z, view, yawOff, center, scale);
+                dl->AddRectFilled(ImVec2(s.x - 2, s.y - 2), ImVec2(s.x + 2, s.y + 2), sq);
+            }
         }
-        // control points as small squares
-        for (size_t i = 0; i + 2 < c.ctrl.size(); i += 3) {
-            float p[3] = { c.ctrl[i] - mid[0], c.ctrl[i+1] - mid[1], c.ctrl[i+2] - mid[2] };
-            ImVec2 s = project(p, view, center, scale);
-            dl->AddRectFilled(ImVec2(s.x - 2, s.y - 2), ImVec2(s.x + 2, s.y + 2),
-                              IM_COL32(255, 255, 255, 220));
+    };
+
+    const ImU32 RED  = IM_COL32(230, 40, 40, 255);
+    const ImU32 CYAN = IM_COL32(40, 220, 220, 255);
+    float half = view.sep * 0.5f;
+    if (view.stereo == STEREO_MONO) {
+        ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
+        float scale = 0.4f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
+        drawEye(center, scale, 0.0f, 0);
+    } else if (view.stereo == STEREO_ANAGLYPH) {
+        ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
+        float scale = 0.4f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
+        drawEye(center, scale, -half, RED);   // left eye  -> red
+        drawEye(center, scale, +half, CYAN);  // right eye -> cyan
+    } else {  // side-by-side: split the canvas into two half-width viewports
+        float hw = avail.x * 0.5f;
+        float scale = 0.4f * std::min(hw, avail.y) / (0.5f * ext + 1e-3f);
+        ImVec2 cL(origin.x + hw * 0.5f,        origin.y + avail.y * 0.5f);
+        ImVec2 cR(origin.x + hw + hw * 0.5f,   origin.y + avail.y * 0.5f);
+        dl->AddLine(ImVec2(origin.x + hw, origin.y), ImVec2(origin.x + hw, br.y),
+                    IM_COL32(60, 60, 70, 255));
+        if (view.stereo == STEREO_WALL) {     // L|R
+            drawEye(cL, scale, -half, 0);
+            drawEye(cR, scale, +half, 0);
+        } else {                              // cross-eyed R|L
+            drawEye(cL, scale, +half, 0);
+            drawEye(cR, scale, -half, 0);
         }
     }
+    dl->PopClipRect();
 }
 
 // --------------------------------------------------------------------------
@@ -419,12 +542,16 @@ int runViewerGui(const std::string& sidecarPath) {
     }
     std::vector<CurveGeom> curves = collectCurves(sc);
 
+    OrbitView view;
+    for (const auto& c : curves) view.maxDim = std::max(view.maxDim, c.dim);
+
     // --- window ---
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
                        GetModuleHandle(nullptr), nullptr, nullptr, nullptr,
                        nullptr, L"FtraceViewer", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"ftrace \xF0\x9F\xAA\x9F loom viewer",
+    std::wstring title = utf8ToWide("ftrace \xF0\x9F\xAA\x9F loom viewer");  // 🪟
+    HWND hwnd = CreateWindowW(wc.lpszClassName, title.c_str(),
                               WS_OVERLAPPEDWINDOW, 80, 80, 1280, 800,
                               nullptr, nullptr, wc.hInstance, nullptr);
     if (!CreateDeviceD3D(hwnd)) {
@@ -443,7 +570,6 @@ int runViewerGui(const std::string& sidecarPath) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    OrbitView view;
     bool done = false;
     while (!done) {
         MSG msg;

@@ -620,10 +620,12 @@ tools/loom/
   Tests: `tests/test_viewer.py` (22, incl. the F2-slice-A curve geometry). **F2 slice A (loom)** extends the
   sidecar so every path/tracked_path dataset carries real geometry: `control_points` (animated control points
   at the frame's clock) + a display `polyline` (96 samples through the engine's own `eval_curve`, closed
-  spines wrapping). **The C++ host now exists** as a **`-viewer <sidecar.json>`** mode of the ftrace binary
-  (Win32 + Direct3D 11 + Dear ImGui, `src/viewer_gui.cpp`): it reads the sidecar with ftrace's vendored
-  `minijson` and shows Scene/Objects/Datasets panels + an orbitable curve pane. Remaining §F slices (F2
-  slice C's 3-of-N dim view + stereo, F3–F7 the ImPlot/imnodes/`-raster-gpu` panes) build on it.
+  spines wrapping). **F2 is complete:** the C++ host is a **`-viewer <sidecar.json>`** mode of the ftrace
+  binary (Win32 + Direct3D 11 + Dear ImGui, `src/viewer_gui.cpp`): it reads the sidecar with ftrace's
+  vendored `minijson` and shows Scene/Objects/Datasets panels + the full N-D curve pane — a **3-of-N dim
+  picker** (view-only re-projection over the curve's full N-D coordinates), **index markers** along the
+  curve, and **stereo** (mono / red-cyan anaglyph / wall-eyed L|R / cross-eyed R|L, with an eye-separation
+  slider). Remaining §F slices (F3–F7: the ImPlot/imnodes/`-raster-gpu` panes) build on it.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
