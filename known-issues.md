@@ -23,18 +23,25 @@ split, uniform AABB point + uniform λ + isotropic dir, `β=grandTotal·κ_e/mea
 `cudaForwardSupported`. Mirrors the CPU code in `render.h` (`tracePhoton` volume-birth branch +
 `connectEmissionVolume`/`camSplatEmissionAll`) and `scene.h` (`EmissiveVolume`/`finalizeEmissiveVolumes`).
 
-### TECH-DEBT — OPEN (2026-07-24): fire emission uses uniform-λ sampling → per-photon spectral colour speckle
+### TECH-DEBT — DONE (2026-07-24): fire emission now importance-samples λ from a blackbody → collapses the magnitude speckle
 
-A fire photon draws its wavelength **uniformly** over the spectral band, then carries
-`β = grandTotal·κ_e(x,λ)/meanKe`. Because a warm blackbody (default 1500 K) is heavily red-weighted, a
-green/blue photon is rare but still lands with a non-trivial β, so a partly-converged fire shows coloured
-(notably green) speckle in its hot core that only averages out to the correct orange with many samples.
-This is **variance, not bias** — the estimator is unbiased and the image converges correctly. **Proper fix:**
-importance-sample λ from a representative blackbody (e.g. Planck at `emitKelvin`) instead of uniformly, and
-divide β by the new pdf: `β = grandTotal·κ_e/(meanKe·Δλ·p(λ))`. When `p(λ) ∝ κ_e`-shape, β becomes nearly
-constant across λ and the colour noise collapses. Needs a small per-scene blackbody-CDF over the band
-(built in `finalizeEmissiveVolumes`) sampled in `tracePhoton`'s volume-birth branch (and mirrored on the GPU
-when that lands). Lives in `render.h` (volume-birth λ draw) + `scene.h` (the CDF).
+**Was:** a fire photon drew its wavelength **uniformly** over the band and carried
+`β = grandTotal·κ_e(x,λ)/meanKe`. Because a warm blackbody (default 1500 K) is heavily red-weighted, the
+per-photon β varied wildly with the κ_e *magnitude* across λ, so a partly-converged fire showed coloured
+(notably green) speckle in its hot core.
+
+**Fix (shipped v0.48.1):** each `EmissiveVolume` now carries an `EmissionSampler lamSampler` built in
+`finalizeEmissiveVolumes()` from `blackbody(emitKelvin)` (a per-nm CDF over the band). The volume-birth branch
+in `render.h` draws `λ = ev.lamSampler.sample(rng, pdfLam)` and weights
+`β = grandTotal·κ_e/(meanKe·Δλ·p(λ))`. For a voxel at `emitKelvin`, `κ_e ∝ Planck(emitKelvin) = p(λ)·integral`,
+so β is **exactly constant** across λ — the κ_e magnitude variance is removed entirely (cooler voxels get a
+mild residual, always <1). Unbiased for any `p(λ)>0`; uniform `p=1/Δλ` recovers the old estimator. Verified
+side-by-side: the old uniform render (more converged) is riddled with green specks; the importance-sampled
+render (less converged) is markedly cleaner and red-orange throughout.
+
+**Residual (inherent, not a bug):** the CIE-*shape* variance remains — a rare green-λ photon is still a
+full-brightness green dot because its colour is `CIE(λ)`. This is intrinsic to per-photon spectral splatting and
+only shrinks with more samples (or full hero-wavelength XYZ splatting). Left as-is; converges correctly.
 
 ### TECH-DEBT — OPEN (2026-07-24): analytic sky (K2) bakes the physical solar disk into the env, so sun-lit surfaces converge slowly in forward modes
 

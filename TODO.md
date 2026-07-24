@@ -760,16 +760,18 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
         `totalEmissionPower`). Forward `tracePhoton` (render.h) picks emitter-vs-fire birth by power
         (`grandTotal=totalPower+totalEmissionPower`; short-circuits with NO extra RNG when there are no
         emissive volumes, so every non-fire scene stays bit-identical), and a fire photon is born at a
-        uniform AABB point + uniform λ + isotropic direction carrying **β=grandTotal·κ_e(x,λ)/meanKe** —
-        derived so the isotropic `1/(4π)/(dist²·Ω)` direct splat (`connectEmissionVolume`/
-        `connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission line-integral exactly.
+        uniform AABB point + isotropic direction with **λ importance-sampled from `blackbody(emitKelvin)`**
+        (per-volume `EmissionSampler lamSampler`, built in `finalizeEmissiveVolumes`), carrying
+        **β=grandTotal·κ_e(x,λ)/(meanKe·Δλ·p(λ))** — derived so the isotropic `1/(4π)/(dist²·Ω)` direct splat
+        (`connectEmissionVolume`/`connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission
+        line-integral exactly, and (for a voxel at emitKelvin) β is constant across λ so the spectral
+        colour-magnitude speckle collapses (v0.48.1; uniform p=1/Δλ recovers the plain β=grandTotal·κ_e/meanKe).
         The "scene has no light" guard (ftsl.h) now accepts an emissive volume. Validated on the official
         fire sample (`scraps/vdb_fire.ftsl`, `png/vdb_fire.png`): the flame glows self-lit with the correct
         red-edge/hot-core shape and no external light. **Still open:** the GPU forward mirror (device
         genPhoton has no volume-birth branch + `DMedium` no temperature grid, so `cudaForwardSupported`
-        rejects emissive-volume scenes → `-device gpu`/`auto` falls back to CPU) and blackbody-λ importance
-        sampling to cut the per-photon spectral colour noise — both logged in known-issues.md. (Backward
-        R/V is N/A: it treats media as one homogeneous haze and never samples the grid.)
+        rejects emissive-volume scenes → `-device gpu`/`auto` falls back to CPU), logged in known-issues.md.
+        (Backward R/V is N/A: it treats media as one homogeneous haze and never samples the grid.)
 - [x] **C4 VDB: native `.vdb` front-end** — DONE. `loadVdbGrid` dispatches on the file magic; a
       self-contained OpenVDB reader (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dep) parses the file
       container, `float 5_4_3` tree topology and BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand,

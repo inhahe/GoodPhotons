@@ -137,12 +137,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   each grid's mean emission `meanKe` + selection `power`=4π·V·meanKe·Δλ into `Scene::emissiveVolumes`
   (+`totalEmissionPower`). Forward `tracePhoton` (`render.h`) splits birth emitter-vs-fire by power
   (`grandTotal=totalPower+totalEmissionPower`; no extra RNG when there are no emissive volumes, so
-  non-fire scenes stay bit-identical); a fire photon is born uniform-in-AABB, uniform-λ, isotropic-dir
-  carrying **β=grandTotal·κ_e/meanKe**, and the isotropic `1/(4π)/(dist²·Ω)` splat
+  non-fire scenes stay bit-identical); a fire photon is born uniform-in-AABB, isotropic-dir, with λ
+  **importance-sampled from `blackbody(emitKelvin)`** via a per-volume `EmissionSampler lamSampler` (built
+  in `finalizeEmissiveVolumes`), carrying **β=grandTotal·κ_e/(meanKe·Δλ·p(λ))** — for a voxel at emitKelvin
+  β is constant across λ, collapsing the colour-magnitude speckle (uniform p=1/Δλ recovers the plain
+  β=grandTotal·κ_e/meanKe). The isotropic `1/(4π)/(dist²·Ω)` splat
   (`connectEmissionVolume`/`connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission
   line-integral. **Forward CPU only** (A/B/C, V/P forward layers): `cudaForwardSupported()` rejects
-  emissive-volume scenes so the GPU falls back to CPU (GPU mirror + blackbody-λ importance sampling
-  are logged in `known-issues.md`; the backward reference never samples the grid).
+  emissive-volume scenes so the GPU falls back to CPU (GPU mirror is logged in `known-issues.md`; the
+  backward reference never samples the grid).
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.

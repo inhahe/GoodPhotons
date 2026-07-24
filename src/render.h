@@ -1398,15 +1398,22 @@ struct Renderer {
             }
             const Scene::EmissiveVolume& ev = scene.emissiveVolumes[vi];
             const Medium& fm = scene.media[ev.mediumIndex];
-            // Uniform position in the grid AABB and uniform wavelength over the band.
-            // beta = grandTotal·κ_e(x,λ)/meanKe reproduces the emission line-integral
-            // when splatted with the isotropic 1/(4π)/(dist²·Ω) direct term (derived).
+            // Uniform position in the grid AABB; wavelength importance-sampled from a
+            // representative blackbody (Planck at emitKelvin) via ev.lamSampler.
+            // beta = grandTotal·κ_e(x,λ)/(meanKe·Δλ·p(λ)) reproduces the emission
+            // line-integral when splatted with the isotropic 1/(4π)/(dist²·Ω) direct
+            // term (derived). With p(λ) uniform (=1/Δλ) this collapses to the plain
+            // grandTotal·κ_e/meanKe; matching p(λ) to the Planck shape makes β nearly
+            // constant across the band, killing the spectral colour speckle.
             origin = Vec3{ ev.bmin.x + (ev.bmax.x - ev.bmin.x) * rng.uniform(),
                            ev.bmin.y + (ev.bmax.y - ev.bmin.y) * rng.uniform(),
                            ev.bmin.z + (ev.bmax.z - ev.bmin.z) * rng.uniform() };
-            lambda = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * rng.uniform();
+            double pdfLam = 0.0;
+            lambda = ev.lamSampler.sample(rng, pdfLam);
             double ke = fm.emissionAt(origin, lambda);
-            beta = (ev.meanKe > 0.0) ? grandTotal * ke / ev.meanKe : 0.0;
+            const double dLamE = LAMBDA_MAX - LAMBDA_MIN;
+            beta = (ev.meanKe > 0.0 && pdfLam > 0.0)
+                 ? grandTotal * ke / (ev.meanKe * dLamE * pdfLam) : 0.0;
             e.emitted += beta;
             if (beta <= 0.0) return;             // cold voxel: nothing to emit or transport
             // Isotropic emission direction.

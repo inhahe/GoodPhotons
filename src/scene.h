@@ -841,6 +841,11 @@ struct Scene {
         Vec3   bmin{0,0,0}, bmax{0,0,0};   // uniform-sampling AABB (temperature grid)
         double meanKe = 0.0;               // mean emissionAt over bbox×band (β normaliser)
         double power  = 0.0;               // 4π·V·meanKe·Δλ (selection weight)
+        // Blackbody wavelength importance sampler (at the medium's peak temperature,
+        // emitKelvin). Sampling λ ~ Planck(emitKelvin) instead of uniformly makes the
+        // per-photon β nearly constant across λ — collapsing the spectral colour
+        // speckle a uniform draw leaves in the hot core (variance-only; unbiased).
+        EmissionSampler lamSampler;
     };
     std::vector<EmissiveVolume> emissiveVolumes;
     double totalEmissionPower = 0.0;
@@ -876,6 +881,10 @@ struct Scene {
             ev.bmin = lo; ev.bmax = hi;
             ev.meanKe = meanKe;
             ev.power = 4.0 * PI * V * meanKe * dLam;
+            // Build the λ importance sampler from a representative blackbody at the
+            // medium's peak temperature. Sampling λ ~ Planck(emitKelvin) makes the
+            // per-photon β nearly constant across the band (collapses colour speckle).
+            ev.lamSampler.build(blackbody(m.emitKelvin), 1.0);
             totalEmissionPower += ev.power;
             emissiveVolumes.push_back(ev);
         }
