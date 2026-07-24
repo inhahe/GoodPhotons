@@ -55,6 +55,7 @@ tools/loom/
 │   ├── spatial.py   spatial expression DSL (X, Y, Z, T + math) → ftsl `expr` strings
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
+│   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature) + read back
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
 │   ├── transform.py per-object Transform (translate/rotate/scale/skew, animatable) → ftsl group{}; dataset inverse-map

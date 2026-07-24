@@ -420,6 +420,7 @@ tools/loom/
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
+    vdbio.py                bake a field to a dense grid + write/read .vdb (E4 write)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
@@ -546,6 +547,24 @@ tools/loom/
   accuracy, 2-manifold edges, adaptive==dense, fewer evals, empty-box, callable+SpatialExpr,
   morphing field, IsoMesh emit/static-cache/roots). Demo: `examples/mesh_bake.py` (a breathing
   smooth-min metaball union baked per frame; still validated in ftrace).
+- **E4 (write side) — Volume output to `.vdb`.** ✅ done (`loom/vdbio.py`). Bake any loom
+  field to a dense lattice and serialise it as a **loom-native OpenVDB `.vdb`** grid that
+  ftrace ingests directly (`density vdb:<path>` / `temperature vdb:<path>`). Format is the
+  uncompressed subset ftrace's own reader (`src/vdb_openvdb.cpp`) accepts: `Tree_float_5_4_3`,
+  `COMPRESS_ACTIVE_MASK` only (no blosc/ZIP/half), full float32, `ScaleTranslateMap` matching
+  numpy `linspace` endpoint-inclusive bakes — so **no OpenVDB/NanoVDB dependency** on either
+  end. API: `write_vdb(path, [VolumeGrid(name, values, box), …])` (multi-grid dense writer;
+  positive voxels vectorised into 8³ leaves under Internal<4>/<5>, empty leaves dropped),
+  `bake_field(field, box, res)` (field/isosurface/callable → dense `<f4` + world box, reusing
+  the `mcubes` samplers), `write_volume(path, *, box, res, **fields)` (bake several named fields
+  over one box/res → named grids, e.g. a `density`+`temperature` fire pair), and `read_vdb(path)`
+  (parses back loom's own written subset for round-tripping — **not** arbitrary third-party
+  `.vdb`). Round-trip is **bit-exact** (full float32). Tests: `tests/test_vdbio.py` (bit-exact
+  round-trip, world-box↔linspace positions, multi-grid named selection, sparse-empty-leaf drop,
+  duplicate-name rejection, bake+write). Cross-validated through ftrace on CPU+GPU
+  (`scraps/make_loom_vdb.py` → `scraps/loom_smoke.vdb`, rendered by `scraps/loom_vdb.ftsl`;
+  sparse device path `1000/1000 bricks active`, energy `sum/emitted=1.000000`). Still open: the
+  general *read* side (arbitrary `.vdb`/`.nvdb`, blosc/half) and sparse-storage transforms.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

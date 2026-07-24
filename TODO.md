@@ -1061,6 +1061,29 @@ and vice-versa). **Open q (defer to scheduling):** on-disk formats for the write
 ftrace's ingest; dense raw/`.vdb`?), and whether sparse-write goes through an OpenVDB/NanoVDB dependency
 or a loom-native sparse encoder.
 
+**WRITE side — DONE 2026-07-24 (`loom.vdbio`).** The open format question resolved to a **loom-native
+OpenVDB `.vdb` encoder** (no NanoVDB/OpenVDB dependency on either end — I control ftrace's reader too):
+uncompressed **`Tree_float_5_4_3`**, `COMPRESS_ACTIVE_MASK` only (no blosc/ZIP/half), full float32, a
+`ScaleTranslateMap` transform matching numpy `linspace` endpoint-inclusive bakes. `tools/loom/loom/vdbio.py`
+adds:
+- **`write_vdb(path, [VolumeGrid(name, values, box), …])`** — serialise one or more dense `<f4` lattices
+  to a multi-grid `.vdb` ftrace ingests directly (`density vdb:<path>` / `temperature vdb:<path>`). Positive
+  voxels are vectorised into 8³ leaves under Internal<4>/<5> nodes; empty leaves are dropped (sparse).
+- **`bake_field(field, box, res)`** — discretise any loom field/isosurface/callable to a dense `<f4` grid +
+  world box (reuses the `mcubes` samplers), and **`write_volume(path, *, box, res, **fields)`** — bake each
+  named field over a shared box/res and write them as named grids in one file (e.g. a `density`+`temperature`
+  fire pair).
+- **`read_vdb(path)`** — parses back exactly loom's own written subset (`{name: (dense_array, box6)}`) for
+  round-tripping; it does **not** yet handle blosc/ZIP/half/other maps (that's the general read side, still
+  open).
+
+Validated: loom round-trip is **bit-exact** (full float32, no lossy step); 6 tests in `tests/test_vdbio.py`
+(891 loom green); and cross-validated end-to-end through ftrace — `scraps/make_loom_vdb.py` bakes a smoke
+field to `scraps/loom_smoke.vdb`, and `scraps/loom_vdb.ftsl` renders it on both CPU and GPU (sparse device
+path `1000/1000 bricks active`, energy `sum/emitted=1.000000`). **Still open:** the general *read* side
+(ingest arbitrary third-party `.vdb`/`.nvdb`, incl. blosc/half), sparse-storage transforms, and
+resampling sparse↔dense.
+
 ### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
 and does t-influencing-t break?" question collapses into **one** model: every value-producing node in the
