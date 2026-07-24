@@ -1376,14 +1376,23 @@ replacement for the renderer or the primary editing tool.**
         **linked X axis** (`SetupAxisLinks`) so panning/zooming any one pages them all together, and each
         carries a **draggable yellow index line** wired bidirectionally to the 3-D pane's index dot
         (dragging a chart line moves the dot; the index slider moves every line).
-- [ ] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** Tessellate the
-      SweptMesh and show it in the 3-D pane with **any texture it defines (image *or* formula** — needs
-      **G5**). **Rotation rule:** rotating an isometry of the 3 displayed spatial dims = **view-only**
-      transform (just spin the existing mesh, no re-tessellate); rotating **into a parameter/extra
-      dimension** = **re-tessellate off the UI thread** via a **latest-wins job queue** (drop stale bakes
-      during a slider drag so the UI stays responsive). If loom couldn't define textures this would add
-      it — but loom already has `Texture`/`skin` (image) and `ProcTexture`/`func_skin` (formula, E1 DONE),
-      so this consumes them.
+- [~] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** ✅ core done
+      2026-07-24 (VERSION 0.55.0). Slice A (loom, `b13122f`): each `swept_mesh` object record now
+      carries a `mesh` key with the tessellated triangle mesh at the clock — `vertices` (flat
+      3-vectors), `faces` (0-based index triples), per-vertex `uvs` (u along spine, v around profile),
+      `rings`/`profile_count` — mirroring `SweptMesh.emit`'s `sweep_rings`+`skin_rings` without writing
+      an OBJ. 2 new tests. Slice B (C++ viewer): a **Meshes tab** (`collectMeshes`/`drawMeshPane`,
+      `MeshView`) draws the surface as a **shaded, depth-sorted (painter's-algorithm) triangle mesh** in
+      a 3-D orbit pane, with **flat two-sided lambert shading**, a **wireframe** overlay, and a colour
+      selector (grey / per-object tint / **UV checker**). Orbiting the 3 spatial dims is the **view-only
+      re-projection** the rotation rule calls for. A swept-mesh scene opens on the Meshes tab by default
+      (its spine curves still populate the Curves tab). Verified via PrintWindow screenshot.
+      - **Still open (deferred):** (1) **textures** (image *or* formula) — the UV checker is a
+        placeholder; real texture display needs **G5** (materials don't emit their `skin`/`func_skin`
+        texture into the sidecar yet). (2) **Re-tessellation when rotating *into* a parameter/extra
+        dimension** via a latest-wins off-thread job queue — architecturally blocked: the static-sidecar
+        viewer has no live loom eval, so it can't re-bake geometry. Needs the viewer↔loom live channel
+        (the `PreviewServer`↔`ftrace -serve` pipe) wired for on-demand re-introspection first.
 - [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
       and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
       each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's

@@ -2289,8 +2289,12 @@ on the left and the params they drive on the right. A **Fields tab** renders `Gr
 positions reconstructed from the fixed lattice), coloured either by a **heatmap of a
 selectable channel** or by **channels 0/1/2 → RGB**; **click any point to inspect** its
 position and every channel value, and for N-D grids **per-extra-dim slice sliders** collapse
-the dims you're not viewing to a chosen lattice index. (Early stage: the `-raster-gpu` render
-pane and SweptMesh view are still in progress — see §F in `TODO.md`.)
+the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
+surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
+lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker
+colouring; orbiting spins the existing tessellation (view-only). (Early stage: real mesh
+textures and the `-raster-gpu` isosurface render pane are still in progress — see §F in
+`TODO.md`.)
 
 ---
 

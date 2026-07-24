@@ -637,8 +637,14 @@ tools/loom/
   1-lists) — and the viewer's **Fields tab** (`collectFields`/`drawFieldPane`) renders those sample points
   in the shared 3-D orbit view (grid node positions reconstructed from axes+shape in C-order), with 3-of-N
   dim pickers, a heatmap-channel / ch0·1·2→RGB colour selector, click-to-inspect, and per-extra-dim slice
-  sliders for N-D grids. Remaining §F slices (F4/F7: the SweptMesh + `-raster-gpu`/isosurface panes) build
-  on it.
+  sliders for N-D grids. **F4 core is complete:** `_describe_element` emits each `SweptMesh`'s tessellated
+  `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock), and the viewer's
+  **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, painter's-depth-sorted triangle
+  surface with two-sided lambert lighting, a wireframe overlay, and grey/per-object/UV-checker colouring
+  (orbiting is view-only). Deferred F4 pieces: real image/formula **textures** (needs materials to emit
+  their `skin`/`func_skin` into the sidecar — G5) and **off-thread re-tessellation when rotating into a
+  parameter dim** (needs a live viewer↔loom channel, since the static sidecar can't re-bake geometry).
+  Remaining §F slice (F7: `-raster-gpu`/isosurface pane) builds on it.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

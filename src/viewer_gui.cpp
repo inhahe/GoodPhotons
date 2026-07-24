@@ -346,6 +346,57 @@ static std::vector<FieldGeom> collectFields(const Sidecar& sc) {
     return fields;
 }
 
+// --------------------------------------------------------------------------
+// F4 — SweptMesh tessellated geometry. Each swept_mesh object carries a `mesh`
+// key (vertices / faces / uvs) baked by loom; the viewer draws it as a shaded,
+// depth-sorted triangle surface in a 3-D orbit pane.
+// --------------------------------------------------------------------------
+struct MeshGeom {
+    std::string        id, name, material;
+    std::vector<float> verts;   // flat xyz (3 per vertex)
+    int                nverts = 0;
+    std::vector<int>   faces;   // flat index triples
+    int                nfaces = 0;
+    std::vector<float> uvs;     // flat uv (2 per vertex), may be empty
+};
+
+static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
+    std::vector<MeshGeom> meshes;
+    const minijson::Value* objs = sc.arr("objects");
+    if (!objs) return meshes;
+    // objects may nest (Groups) — walk recursively
+    std::function<void(const minijson::Value&)> visit = [&](const minijson::Value& o) {
+        if (const minijson::Value* ch = o.find("children"); ch && ch->isArray())
+            for (const auto& c : ch->arr) visit(c);
+        const minijson::Value* m = o.find("mesh");
+        if (!m || !m->isObject()) return;
+        MeshGeom g;
+        g.id       = scalarStr(o.find("id"), "");
+        g.name     = scalarStr(o.find("name"), "");
+        g.material = scalarStr(o.find("material"), "");
+        if (const minijson::Value* v = m->find("vertices"); v && v->isArray())
+            for (const auto& p : v->arr) {
+                for (int k = 0; k < 3; ++k)
+                    g.verts.push_back(p.isArray() && k < (int)p.arr.size()
+                                          ? (float)p.arr[k].asNumber(0.0) : 0.0f);
+            }
+        g.nverts = (int)g.verts.size() / 3;
+        if (const minijson::Value* f = m->find("faces"); f && f->isArray())
+            for (const auto& t : f->arr)
+                if (t.isArray() && t.arr.size() >= 3)
+                    for (int k = 0; k < 3; ++k) g.faces.push_back(t.arr[k].asInt(0));
+        g.nfaces = (int)g.faces.size() / 3;
+        if (const minijson::Value* u = m->find("uvs"); u && u->isArray())
+            for (const auto& p : u->arr)
+                for (int k = 0; k < 2; ++k)
+                    g.uvs.push_back(p.isArray() && k < (int)p.arr.size()
+                                        ? (float)p.arr[k].asNumber(0.0) : 0.0f);
+        meshes.push_back(std::move(g));
+    };
+    for (const auto& o : objs->arr) visit(o);
+    return meshes;
+}
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -822,6 +873,144 @@ static void drawFieldPane(const std::vector<FieldGeom>& fields, FieldView& view)
 }
 
 // --------------------------------------------------------------------------
+// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, depth-sorted
+// triangle mesh. Orbiting the 3 spatial dims is a view-only re-projection (no
+// re-tessellation, exactly as the F4 rule specifies for isometries of the shown
+// dims). Colour: flat lambert shading, per-object tint, or a UV checker.
+// --------------------------------------------------------------------------
+struct MeshView {
+    float yaw = 0.6f, pitch = 0.4f, zoom = 1.0f;
+    bool  shade = true;         // flat lambert lighting
+    bool  wire = false;         // wireframe overlay
+    int   colorBy = 0;          // 0 = grey, 1 = per-object tint, 2 = UV checker
+};
+
+static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view) {
+    ImGui::TextUnformatted("Meshes - drag to orbit, wheel to zoom (view-only re-projection)");
+    ImGui::Checkbox("shade", &view.shade); ImGui::SameLine();
+    ImGui::Checkbox("wireframe", &view.wire); ImGui::SameLine();
+    ImGui::SetNextItemWidth(150);
+    const char* cmodes[] = { "grey", "per-object tint", "UV checker" };
+    ImGui::Combo("colour", &view.colorBy, cmodes, 3);
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.y < 80.0f) avail.y = 80.0f;
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("mesh_canvas", avail);
+    bool hovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        view.yaw   += d.x * 0.01f;
+        view.pitch += d.y * 0.01f;
+    }
+    if (hovered) { float w = ImGui::GetIO().MouseWheel; if (w != 0.0f) view.zoom *= (1.0f + w * 0.1f); }
+    if (view.zoom < 0.05f) view.zoom = 0.05f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 br(origin.x + avail.x, origin.y + avail.y);
+    dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
+    dl->PushClipRect(origin, br, true);
+
+    // shared rotation basis: rotate each world vertex to (X screen-right, Y up, Z toward viewer)
+    float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
+    float cx = std::cos(view.pitch), sx = std::sin(view.pitch);
+    auto rot = [&](float x, float y, float z, float& X, float& Y, float& Z) {
+        float x1 =  cy * x + sy * z;
+        float z1 = -sy * x + cy * z;
+        X = x1;
+        Y = cx * y - sx * z1;
+        Z = sx * y + cx * z1;   // depth toward viewer
+    };
+
+    // union bounds (centre + extent) over all meshes
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (const auto& m : meshes)
+        for (int i = 0; i < m.nverts; ++i)
+            for (int k = 0; k < 3; ++k) {
+                float v = m.verts[(size_t)i * 3 + k];
+                lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v);
+            }
+    float ext = 1.0f;
+    for (int k = 0; k < 3; ++k) if (hi[k] > lo[k]) ext = std::max(ext, hi[k] - lo[k]);
+    float mid[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; ++k) if (hi[k] >= lo[k]) mid[k] = 0.5f * (lo[k] + hi[k]);
+    ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
+    float scale = 0.42f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
+
+    const ImU32 tints[] = {
+        IM_COL32(150, 190, 235, 255), IM_COL32(235, 175, 130, 255),
+        IM_COL32(160, 225, 165, 255), IM_COL32(225, 155, 200, 255),
+    };
+
+    // rotate every vertex once, project to screen + keep depth
+    struct SV { ImVec2 s; float d; float X, Y, Z; };
+    // collect all triangles across meshes into one depth-sorted list (painter's algo)
+    struct Tri { int mi; ImVec2 a, b, c; float depth; float shade; float ua, va, ub, vb, uc, vc; };
+    std::vector<Tri> tris;
+    std::vector<std::vector<SV>> proj(meshes.size());
+    for (size_t mi = 0; mi < meshes.size(); ++mi) {
+        const MeshGeom& m = meshes[mi];
+        proj[mi].resize(m.nverts);
+        for (int i = 0; i < m.nverts; ++i) {
+            float X, Y, Z;
+            rot(m.verts[(size_t)i*3+0] - mid[0], m.verts[(size_t)i*3+1] - mid[1],
+                m.verts[(size_t)i*3+2] - mid[2], X, Y, Z);
+            SV sv;
+            sv.X = X; sv.Y = Y; sv.Z = Z; sv.d = Z;
+            sv.s = ImVec2(center.x + X * scale * view.zoom, center.y - Y * scale * view.zoom);
+            proj[mi][i] = sv;
+        }
+        for (int f = 0; f < m.nfaces; ++f) {
+            int ia = m.faces[(size_t)f*3+0], ib = m.faces[(size_t)f*3+1], ic = m.faces[(size_t)f*3+2];
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= m.nverts || ib >= m.nverts || ic >= m.nverts) continue;
+            const SV& A = proj[mi][ia]; const SV& B = proj[mi][ib]; const SV& C = proj[mi][ic];
+            // face normal in rotated space -> Z component = facing the viewer
+            float ux = B.X - A.X, uy = B.Y - A.Y, uz = B.Z - A.Z;
+            float vx = C.X - A.X, vy = C.Y - A.Y, vz = C.Z - A.Z;
+            float nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+            float nl = std::sqrt(nx*nx + ny*ny + nz*nz) + 1e-9f;
+            float facing = nz / nl;                       // -1..1, +1 = toward viewer
+            Tri t;
+            t.mi = (int)mi;
+            t.a = A.s; t.b = B.s; t.c = C.s;
+            t.depth = (A.d + B.d + C.d) / 3.0f;
+            t.shade = 0.30f + 0.70f * std::fabs(facing);  // two-sided lambert
+            if ((int)m.uvs.size() >= 2 * m.nverts) {
+                t.ua = m.uvs[(size_t)ia*2]; t.va = m.uvs[(size_t)ia*2+1];
+                t.ub = m.uvs[(size_t)ib*2]; t.vb = m.uvs[(size_t)ib*2+1];
+                t.uc = m.uvs[(size_t)ic*2]; t.vc = m.uvs[(size_t)ic*2+1];
+            } else { t.ua = t.va = t.ub = t.vb = t.uc = t.vc = 0.0f; }
+            tris.push_back(t);
+        }
+    }
+    // back-to-front so nearer triangles overdraw farther ones
+    std::sort(tris.begin(), tris.end(), [](const Tri& p, const Tri& q){ return p.depth < q.depth; });
+
+    for (const Tri& t : tris) {
+        ImU32 base;
+        if (view.colorBy == 1)        base = tints[t.mi % 4];
+        else if (view.colorBy == 2) {  // UV checker at the triangle centroid
+            float u = (t.ua + t.ub + t.uc) / 3.0f, v = (t.va + t.vb + t.vc) / 3.0f;
+            int cu = (int)std::floor(u * 8.0f), cv = (int)std::floor(v * 8.0f);
+            bool on = ((cu + cv) & 1) != 0;
+            base = on ? IM_COL32(210, 210, 220, 255) : IM_COL32(90, 95, 110, 255);
+        } else                        base = IM_COL32(180, 185, 195, 255);
+        float s = view.shade ? t.shade : 1.0f;
+        int r = (int)(((base >> IM_COL32_R_SHIFT) & 0xFF) * s);
+        int g = (int)(((base >> IM_COL32_G_SHIFT) & 0xFF) * s);
+        int b = (int)(((base >> IM_COL32_B_SHIFT) & 0xFF) * s);
+        dl->AddTriangleFilled(t.a, t.b, t.c, IM_COL32(r, g, b, 255));
+        if (view.wire)
+            dl->AddTriangle(t.a, t.b, t.c, IM_COL32(30, 30, 36, 120), 1.0f);
+    }
+    dl->PopClipRect();
+
+    int totalTris = 0, totalV = 0;
+    for (const auto& m : meshes) { totalTris += m.nfaces; totalV += m.nverts; }
+    ImGui::Text("%d mesh(es), %d verts, %d tris", (int)meshes.size(), totalV, totalTris);
+}
+
+// --------------------------------------------------------------------------
 // The panels
 // --------------------------------------------------------------------------
 static void drawObjectsPanel(const Sidecar& sc) {
@@ -1052,11 +1241,13 @@ int runViewerGui(const std::string& sidecarPath) {
     std::vector<StripSeries> strips = buildStrips(curves);
     DagGraph dag = collectDag(sc);
     std::vector<FieldGeom> fields = collectFields(sc);
+    std::vector<MeshGeom> meshes = collectMeshes(sc);
 
     OrbitView view;
     for (const auto& c : curves) view.maxDim = std::max(view.maxDim, c.dim);
     FieldView fview;
     for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+    MeshView mview;
 
     // --- window ---
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
@@ -1086,6 +1277,7 @@ int runViewerGui(const std::string& sidecarPath) {
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     bool done = false;
+    bool firstFrame = true;   // one-shot: default-select the primary geometry tab
     while (!done) {
         MSG msg;
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -1130,8 +1322,9 @@ int runViewerGui(const std::string& sidecarPath) {
         // Curves and Fields each get a tab. A tab is shown only when its kind is
         // present, so whichever exists is the default-selected one (no empty tabs).
         bool haveCurves = !curves.empty();
+        bool curvesTab = haveCurves || (fields.empty() && meshes.empty());
         if (ImGui::BeginTabBar("rightTabs")) {
-            if ((haveCurves || fields.empty()) && ImGui::BeginTabItem("Curves")) {
+            if (curvesTab && ImGui::BeginTabItem("Curves")) {
                 if (!strips.empty()) {
                     float paneH = ImGui::GetContentRegionAvail().y * 0.58f;
                     ImGui::BeginChild("curvepane", ImVec2(0, paneH), false);
@@ -1149,6 +1342,15 @@ int runViewerGui(const std::string& sidecarPath) {
                 drawFieldPane(fields, fview);
                 ImGui::EndTabItem();
             }
+            if (!meshes.empty()) {
+                // a swept-mesh scene is "about" its surface, so open on Meshes even
+                // though the internal spine curves also populate the Curves tab
+                ImGuiTabItemFlags mf = firstFrame ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem("Meshes", nullptr, mf)) {
+                    drawMeshPane(meshes, mview);
+                    ImGui::EndTabItem();
+                }
+            }
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
@@ -1161,6 +1363,7 @@ int runViewerGui(const std::string& sidecarPath) {
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRTV, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(1, 0);  // vsync
+        firstFrame = false;
     }
 
     ImGui_ImplDX11_Shutdown();
