@@ -142,6 +142,43 @@ def test_introspect_swept_mesh_links_its_dataset():
     assert set(swept["datasets"]) <= ds_ids
 
 
+def test_introspect_swept_mesh_carries_tessellated_geometry():
+    """F4: a swept_mesh object carries its tessellated triangle mesh — vertices,
+    0-based face index triples, per-vertex UVs, and the ring/profile lattice shape —
+    so the viewer's 3-D pane can draw the surface without re-running loom."""
+    d = introspect(build())
+    swept = [o for o in d["objects"] if o["kind"] == "swept_mesh"][0]
+    m = swept["mesh"]
+    n, k = m["rings"], m["profile_count"]
+    assert n == swept["count"]
+    # closed spine + closed profile tube: n rings x k profile pts
+    assert len(m["vertices"]) == n * k
+    assert all(len(v) == 3 for v in m["vertices"])
+    assert len(m["uvs"]) == n * k
+    assert all(len(uv) == 2 for uv in m["uvs"])
+    # closed both ways -> 2 tris per quad over n spans x k edges
+    assert len(m["faces"]) == 2 * n * k
+    # faces index valid vertices (0-based)
+    nv = len(m["vertices"])
+    for f in m["faces"]:
+        assert len(f) == 3 and all(0 <= i < nv for i in f)
+
+
+def test_introspect_open_swept_mesh_face_count():
+    """An open ribbon (open spine + open profile) skins (n-1) spans x (k-1) edges."""
+    from loom.scene import Scene, Camera, ribbon
+    from loom.data import PointPath
+    cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
+    sc = Scene(cam)
+    sc.add(ribbon(PointPath([(0, 0, 0), (1, 0, 0), (2, 1, 0)], closed=False),
+                  width=0.3, count=8, closed_spine=False, material="m"))
+    d = introspect(sc)
+    swept = [o for o in d["objects"] if o["kind"] == "swept_mesh"][0]
+    m = swept["mesh"]
+    n, k = m["rings"], m["profile_count"]
+    assert len(m["faces"]) == 2 * (n - 1) * (k - 1)
+
+
 def test_introspect_datasets_cover_path_grid_scatter():
     d = introspect(build())
     kinds = {ds["kind"] for ds in d["datasets"]}

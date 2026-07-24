@@ -185,6 +185,45 @@ def _value_at(v: Any, clk: Clock) -> List[float]:
     return [float(r)]
 
 
+def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
+    """Tessellate a :class:`~loom.scene.SweptMesh` at ``clock`` into the triangle
+    mesh the viewer's 3-D pane draws (F4).  Mirrors ``SweptMesh.emit`` — sample the
+    spine, sweep the profile into rings, skin them — but returns the geometry as
+    plain lists instead of writing an OBJ: ``vertices`` (flat 3-vectors), ``faces``
+    (0-based index triples), ``uvs`` (per-vertex ``(u, v)`` from the ring/profile
+    lattice; ``u`` along the spine, ``v`` around the profile), plus ``rings``/
+    ``profile_count`` so the viewer knows the lattice shape."""
+    import math
+    from . import sweep as _sweep
+    from .signals.core import Cache
+    clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+    cache = Cache()
+
+    def _num(v):
+        return float(v.at(clk, cache)) if hasattr(v, "at") else float(v)
+
+    n = sm.count
+    pts = [sm.spine.sample(k / n, clk, cache) for k in range(n)]
+    base_sc, base_tw = _num(sm.scale), _num(sm.twist)
+    turns = _num(sm.turns)
+    scales, twists = [], []
+    for k in range(n):
+        u = k / n
+        mult = sm.scale_profile(u) if sm.scale_profile is not None else 1.0
+        scales.append(base_sc * mult)
+        twists.append(base_tw + turns * 2.0 * math.pi * u)
+    rings = _sweep.sweep_rings(pts, sm.profile, scales, twists, sm.closed_spine)
+    verts, faces = _sweep.skin_rings(rings, sm.closed_spine, sm.closed_profile)
+    k = len(sm.profile)
+    # per-vertex UVs from the (ring i, profile j) lattice; wrap divisor for closed
+    ud = n if sm.closed_spine else max(1, n - 1)
+    vd = k if sm.closed_profile else max(1, k - 1)
+    uvs = [[i / ud, j / vd] for i in range(n) for j in range(k)]
+    return {"vertices": [list(v) for v in verts],
+            "faces": [list(f) for f in faces],
+            "uvs": uvs, "rings": n, "profile_count": k}
+
+
 def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, Any]:
     d: Dict[str, Any] = {"id": obj.id, "kind": kind}
     if kind == "path":
@@ -237,9 +276,10 @@ def _datasets_in(el: Any, out: Dict[int, Any]) -> List[int]:
     return ids
 
 
-def _describe_element(el: Any, oid: int, datasets: Dict[int, Any]) -> Dict[str, Any]:
+def _describe_element(el: Any, oid: int, datasets: Dict[int, Any],
+                      clock: Optional[Clock] = None) -> Dict[str, Any]:
     cls = type(el).__name__
-    from .scene import Group  # lazy
+    from .scene import Group, SweptMesh  # lazy
     kind = {
         "Sphere": "sphere", "Beads": "beads", "SweptMesh": "swept_mesh",
         "IsoMesh": "iso_mesh", "Raw": "raw", "Group": "group", "Volume": "volume",
@@ -258,13 +298,18 @@ def _describe_element(el: Any, oid: int, datasets: Dict[int, Any]) -> Dict[str, 
             rec[attr] = v
     if isinstance(el, Group):
         rec["children"] = [
-            _describe_element(c, f"{oid}.{j}", datasets)
+            _describe_element(c, f"{oid}.{j}", datasets, clock)
             for j, c in enumerate(el.children)
         ]
     else:
         ds = _datasets_in(el, datasets)
         if ds:
             rec["datasets"] = ds
+        if isinstance(el, SweptMesh):
+            try:
+                rec["mesh"] = _swept_mesh_geometry(el, clock)
+            except Exception as exc:      # never let one bad mesh sink the sidecar
+                rec["mesh_error"] = str(exc)
     return rec
 
 
@@ -346,7 +391,7 @@ def introspect(scene: Any, *, clock: Optional[Clock] = None) -> Dict[str, Any]:
     ``lights`` (minimal); and ``dag`` (the modulator graph — ``nodes`` + ``edges``).
     """
     datasets: Dict[int, Any] = {}
-    objects = [_describe_element(el, i, datasets)
+    objects = [_describe_element(el, i, datasets, clock)
                for i, el in enumerate(scene.elements)]
     # datasets reachable from camera / materials / lights too (not just geometry)
     for extra in (*scene.materials, *scene.lights, scene.camera):
