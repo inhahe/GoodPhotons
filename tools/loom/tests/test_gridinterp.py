@@ -165,6 +165,37 @@ def test_on_outside_vec_field_wrap():
     assert abs(vf.channel("a").at(_clk()) - 0.5) < 1e-12
 
 
+def test_on_outside_extrapolate_linear():
+    # a linear ramp continues past both boundary cells with slope preserved.
+    g = _grid1d([0.0, 1.0, 2.0, 3.0])          # value == coord on [0,3], slope 1
+    def e(x):
+        return GridField(g, vec(x), on_outside="extrapolate").at(_clk())
+    assert abs(e(-1.0) - (-1.0)) < 1e-12       # extend below: 0 - 1
+    assert abs(e(-2.5) - (-2.5)) < 1e-12
+    assert abs(e(4.0) - 4.0) < 1e-12           # extend above: 3 + 1
+    assert abs(e(6.25) - 6.25) < 1e-12
+    # inside the domain it matches clamp/linear exactly
+    assert abs(e(1.5) - 1.5) < 1e-12
+
+
+def test_on_outside_extrapolate_differs_from_clamp():
+    g = _grid1d([0.0, 1.0, 2.0, 3.0])
+    clamp = GridField(g, vec(9.0), on_outside="clamp").at(_clk())
+    extrap = GridField(g, vec(9.0), on_outside="extrapolate").at(_clk())
+    assert clamp == 3.0                        # edge-extend pins to boundary sample
+    assert extrap > 3.0                        # extrapolation keeps rising
+
+
+def test_on_outside_extrapolate_cubic_ramp():
+    # Catmull-Rom reproduces a linear ramp, and extrapolate keeps it linear off-edge.
+    vals = [2.0 * i + 1.0 for i in range(5)]
+    g = _grid1d(vals)
+    for x in (-1.5, 5.5):
+        got = GridField(g, vec(x), interp="cubic",
+                        on_outside="extrapolate").at(_clk())
+        assert abs(got - (2.0 * x + 1.0)) < 1e-9, (x, got)
+
+
 def test_on_outside_unknown_rejected():
     g = _grid1d([0.0, 1.0, 2.0])
     with pytest.raises(ValueError):

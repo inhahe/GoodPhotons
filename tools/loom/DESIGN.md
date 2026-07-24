@@ -177,7 +177,9 @@ output can feed another modulator — "it's just another function"):
 2. **`GridField`** — grid interpolation → a value anywhere in the volume.
    `interp="linear"` (default, N-linear) or `interp="cubic"` (separable Catmull-Rom
    / tricubic; smoother C1, may overshoot). Boundary phantoms are linearly
-   extrapolated so cubic reproduces linear ramps to the edge.
+   extrapolated so cubic reproduces linear ramps to the edge. Out-of-domain policy
+   `on_outside="clamp"` (default, edge-extend) / `"raise"` / `"wrap"` (periodic fold)
+   / `"extrapolate"` (linearly extend off the boundary cell).
 3. **`ScatterField`** — Shepard inverse-distance interpolation of scatter values
    (robust, C0, flattens toward the mean far from samples).
 3b. **`RbfScatterField`** — radial-basis interpolation (`scipy.interpolate.RBFInterpolator`,

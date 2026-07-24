@@ -1271,8 +1271,11 @@ raise `query dim != grid ndim`, and `FieldCurve` builds the field eagerly), so n
       where the curve must stay inside the box.
 - [x] **`"wrap"`** — periodic fold (period `hi-lo`; sample `n-1` aliases `0`), for both linear and
       Catmull-Rom stencils. Apt for a gyroid (2π-periodic) → seamless tour.
-- [ ] optional **`"extrapolate"`** — linear extrapolation off the boundary cell. **Deferred** (not needed
-      yet; the cubic phantom-point machinery already exists if we want it).
+- [x] optional **`"extrapolate"`** — linear extrapolation off the boundary cell. **DONE 2026-07-24**
+      (`tools/loom/loom/interp.py`): `_cell_base_frac` returns an *unclamped* fraction (`f<0` below,
+      `f>1` above) on the boundary cell, so the linear stencil extends the edge cell's slope instead of
+      edge-extending; cubic reuses the same unclamped fraction through the existing phantom-point machinery
+      (reproduces linear ramps off-edge exactly). 3 tests in `test_gridinterp.py`.
 - [x] Re-raise the `FieldCurve` dimension-mismatch `ValueError` with FieldCurve context (names the curve's
       dim). *(J1 complete bar the optional extrapolate mode.)*
 
