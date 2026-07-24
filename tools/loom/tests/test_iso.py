@@ -69,6 +69,44 @@ def test_sphere_container_and_open():
     assert "open on" in txt
 
 
+def test_placement_zero_is_byte_identical():
+    # default placement (origin) must emit exactly like the un-placed form.
+    a = _emit(gyroid_surface(freq=1.0, material="m"), Clock(t=0.0))
+    b = _emit(gyroid_surface(freq=1.0, placement=(0.0, 0.0, 0.0), material="m"),
+              Clock(t=0.0))
+    assert a == b
+
+
+def test_placement_offsets_frame_and_container():
+    iso = gyroid_surface(freq=1.0, placement=(2.0, 0.0, 0.0), material="m",
+                         container="box",
+                         bounds=((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)))
+    txt = _emit(iso, Clock(t=0.0))
+    # the coordinate frame shifts: x becomes (x-(2))
+    assert "(x-(2))" in txt, txt
+    # and the container box moves with it: min x = -1+2 = 1, max x = 1+2 = 3
+    assert "min 1 -1 -1" in txt, txt
+    assert "max 3 1 1" in txt, txt
+
+
+def test_sphere_placement_moves_center():
+    iso = Isosurface("schwarz_p", freq=1.0, container="sphere",
+                     center=(0, 0, 0), radius=3.0,
+                     placement=(1.0, 2.0, -1.0), material="m")
+    txt = _emit(iso, Clock(t=0.0))
+    assert "center 1 2 -1" in txt, txt
+
+
+def test_placement_animatable():
+    # a Signal-driven placement should move the surface over time.
+    iso = gyroid_surface(freq=1.0,
+                         placement=vec(Sine(cycles=1, amp=3.0), 0.0, 0.0),
+                         material="m")
+    a = _emit(iso, Clock(t=0.1))
+    b = _emit(iso, Clock(t=0.35))
+    assert a != b, "an animated placement should move the surface"
+
+
 def test_scene_check_cycles_ok():
     s = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0), res=(16, 16)))
     rot = rotations(3, [(0, 1, Sine(cycles=1, amp=1.0))])

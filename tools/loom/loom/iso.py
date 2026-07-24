@@ -25,7 +25,7 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 
 from .signals.core import Signal, Const, Number, TimeFn
 from .signals.vector import VecSignal
-from .mathnd import Mat
+from .mathnd import Mat, Affine
 from .ftsl_emit import EmitCtx, num, fmt
 from .scene import Element
 
@@ -84,15 +84,49 @@ def _mat3_at(m: Optional[Mat], clock, cache) -> Tuple[Tuple[float, float, float]
                  for i in range(3))  # type: ignore[return-value]
 
 
-def _coord_expr(freq: float, row: Sequence[float], drift: float) -> str:
-    """One transformed coordinate: ``freq*(a*x + b*y + c*z) + drift`` as ftsl text.
+def _shift(var: str, p: float) -> str:
+    """``var`` shifted by placement ``p``: ``x`` when ``p==0`` (byte-identical to the
+    un-placed form), else ``(x-(p))`` with the offset parenthesized."""
+    return var if p == 0.0 else f"({var}-({fmt(p)}))"
 
-    Each numeric coefficient is parenthesized so no ``+-`` adjacency ever reaches
-    the expression parser (``(1)*x+(-0.5)*y`` is well-formed; ``1*x+-0.5*y`` risks
-    tripping the shunting-yard)."""
+
+def _coord_expr(freq: float, row: Sequence[float], drift: float,
+                place: Sequence[float] = (0.0, 0.0, 0.0)) -> str:
+    """One transformed coordinate: ``freq*(a*(x-px) + b*(y-py) + c*(z-pz)) + drift``.
+
+    ``place`` offsets the coordinate frame so the pattern origin sits at ``place``
+    (the J2 placement).  Each numeric coefficient is parenthesized so no ``+-``
+    adjacency ever reaches the expression parser (``(1)*x+(-0.5)*y`` is well-formed;
+    ``1*x+-0.5*y`` risks tripping the shunting-yard).  With ``place == (0,0,0)`` the
+    output is byte-identical to the un-placed form."""
     a, b, c = row
-    lin = f"({fmt(a)})*x+({fmt(b)})*y+({fmt(c)})*z"
+    px, py, pz = place
+    lin = (f"({fmt(a)})*{_shift('x', px)}+({fmt(b)})*{_shift('y', py)}"
+           f"+({fmt(c)})*{_shift('z', pz)}")
     return f"({fmt(freq)}*({lin})+({fmt(drift)}))"
+
+
+# --- small numeric 3x3 helpers (parent-frame composition at a baked frame) ---
+
+Vec3 = Tuple[float, float, float]
+Mat3 = Tuple[Vec3, Vec3, Vec3]
+
+
+def _m3_transpose(A: Mat3) -> Mat3:
+    return tuple(tuple(A[j][i] for j in range(3)) for i in range(3))  # type: ignore
+
+
+def _m3_mul(A: Mat3, B: Mat3) -> Mat3:
+    return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3))
+                 for i in range(3))  # type: ignore
+
+
+def _m3_apply(A: Mat3, v: Sequence[float]) -> Vec3:
+    return tuple(sum(A[i][k] * v[k] for k in range(3)) for i in range(3))  # type: ignore
+
+
+def _v3_add(a: Sequence[float], b: Sequence[float]) -> Vec3:
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +146,17 @@ class Isosurface(Element):
     The surface is clipped to ``container``: a box (``bounds`` = (min, max)) or a
     ``"sphere"`` (``center``/``radius``) — a sphere reads the unavoidable cut of a
     space-filling surface as a rounded edge instead of hard box facets.
+
+    ``placement`` (animatable :class:`VecSignal`, default origin) positions the
+    surface: the coordinate frame is read as ``M·(x − placement)`` **and** the
+    ``contained_by`` box/sphere is translated by ``placement``, so the container
+    tracks the pattern as the blob drifts/tumbles around a room over the loop.  A
+    parent :class:`~loom.mathnd.Affine` frame (set by a :class:`Room`) composes on
+    top: the frame's rotation folds into ``M`` and its translation into the world
+    placement (the room frame should be **rigid** — rotations + translation, as
+    :func:`loom.rotations` produces — since the fold assumes an orthonormal linear
+    part).  A box container under a rotating room emits the conservative world
+    axis-aligned bounding box of the rotated local box.
     """
 
     def __init__(self, field: Union[str, FieldFn], *,
@@ -119,6 +164,7 @@ class Isosurface(Element):
                  threshold: Union[Signal, Number] = 0.0,
                  drift: Union[VecSignal, Sequence] = (0.0, 0.0, 0.0),
                  rotation: Optional[Mat] = None,
+                 placement: Union[VecSignal, Sequence] = (0.0, 0.0, 0.0),
                  material: str = "default",
                  container: str = "box",
                  bounds: Tuple[Sequence[float], Sequence[float]] =
@@ -134,6 +180,8 @@ class Isosurface(Element):
         self.threshold = threshold
         self.drift = drift if isinstance(drift, VecSignal) else VecSignal.of(drift)
         self.rotation = rotation
+        self.placement = (placement if isinstance(placement, VecSignal)
+                          else VecSignal.of(placement))
         self.material = material
         self.container = container
         self.bounds = (tuple(float(c) for c in bounds[0]),
@@ -144,9 +192,11 @@ class Isosurface(Element):
         self.method = method
         self.open = bool(open)
         self.name = name
+        # a transient parent Affine frame, set by an enclosing Room during its emit.
+        self._parent: Optional[Affine] = None
 
     def roots(self):
-        out = [self.drift]
+        out = [self.drift, self.placement]
         for v in (self.freq, self.threshold):
             if isinstance(v, (Signal, VecSignal)):
                 out.append(v)
@@ -164,9 +214,35 @@ class Isosurface(Element):
         f = num(self.freq, clock, cache)
         thr = num(self.threshold, clock, cache)
         d = self.drift.at(clock, cache)
-        cx = _coord_expr(f, M[0], d[0])
-        cy = _coord_expr(f, M[1], d[1])
-        cz = _coord_expr(f, M[2], d[2])
+        p = tuple(float(c) for c in self.placement.at(clock, cache))   # local placement
+        mn, mx = self.bounds
+        cc = self.center
+        if self._parent is not None:                  # fold the room frame in
+            Plin = _mat3_at(self._parent.linear, clock, cache)
+            Poff = tuple(float(c) for c in self._parent.offset.at(clock, cache))
+            M = _m3_mul(M, _m3_transpose(Plin))       # M_eff = M · Pᵀ
+            # container corners are authored relative to local placement -> world via P
+            if self.container == "sphere":
+                cc = _v3_add(_m3_apply(Plin, _v3_add(cc, p)), Poff)
+            else:
+                # conservative world AABB of the rotated, placed local box
+                xs, ys, zs = [], [], []  # type: ignore[var-annotated]
+                for bx in (mn[0], mx[0]):
+                    for by in (mn[1], mx[1]):
+                        for bz in (mn[2], mx[2]):
+                            wx, wy, wz = _v3_add(
+                                _m3_apply(Plin, (bx + p[0], by + p[1], bz + p[2])), Poff)
+                            xs.append(wx); ys.append(wy); zs.append(wz)
+                mn = (min(xs), min(ys), min(zs))
+                mx = (max(xs), max(ys), max(zs))
+            p = _v3_add(_m3_apply(Plin, p), Poff)      # p_eff = P·p_local + T
+        else:
+            # no parent: container authored relative to placement -> translate by p
+            mn = _v3_add(mn, p); mx = _v3_add(mx, p)
+            cc = _v3_add(cc, p)
+        cx = _coord_expr(f, M[0], d[0], p)
+        cy = _coord_expr(f, M[1], d[1], p)
+        cz = _coord_expr(f, M[2], d[2], p)
         # context-aware templates (PovFn) bake their params; plain FieldFns don't
         field_expr = (self.field.build(cx, cy, cz, ctx)
                       if hasattr(self.field, "build")
@@ -177,11 +253,9 @@ class Isosurface(Element):
         lines.append(f'    material "{self.material}"')
         lines.append(f'    function {{ expr "{expr}" }}')
         if self.container == "sphere":
-            cc = self.center
             lines.append(f'    contained_by {{ sphere {{ center {fmt(cc[0])} '
                          f'{fmt(cc[1])} {fmt(cc[2])}  radius {fmt(self.radius)} }} }}')
         else:
-            mn, mx = self.bounds
             lines.append(f'    contained_by {{ min {fmt(mn[0])} {fmt(mn[1])} {fmt(mn[2])}'
                          f'  max {fmt(mx[0])} {fmt(mx[1])} {fmt(mx[2])} }}')
         if self.max_gradient > 0.0:
