@@ -126,6 +126,84 @@ def test_duplicate_names_rejected():
                                    vdbio.VolumeGrid("density", v, box)])
 
 
+# ---- codec variants (E4 read side: half / ZIP) ----------------------------
+
+def _rt(vol, box, **kw):
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "g.vdb")
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", vol, box)], **kw)
+        size = os.path.getsize(path)
+        arr, box6 = vdbio.read_vdb(path)["density"]
+    return arr, box6, size
+
+
+def test_default_output_unchanged_by_new_codec_params():
+    # The new half/zip params default off → byte-for-byte the original file.
+    vol = _blob()
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    with tempfile.TemporaryDirectory() as d:
+        p0 = os.path.join(d, "a.vdb")
+        p1 = os.path.join(d, "b.vdb")
+        vdbio.write_vdb(p0, [vdbio.VolumeGrid("density", vol, box)])
+        vdbio.write_vdb(p1, [vdbio.VolumeGrid("density", vol, box)],
+                        half=False, zip=False)
+        assert open(p0, "rb").read() == open(p1, "rb").read()
+
+
+def test_zip_roundtrip_is_bit_exact_and_smaller():
+    vol = _blob()
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    sub, _, _ = _positive_subbox(vol)
+    plain, _, size_plain = _rt(vol, box)
+    arr, _, size_zip = _rt(vol, box, zip=True)
+    # ZIP is lossless: identical values to the uncompressed read…
+    assert float(np.abs(arr - sub).max()) == 0.0
+    assert float(np.abs(arr - plain).max()) == 0.0
+    # …and the smooth blob compresses (this field is very zippable).
+    assert size_zip < size_plain
+
+
+def test_half_roundtrip_is_close_and_smaller():
+    vol = _blob()
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    sub, _, _ = _positive_subbox(vol)
+    _, _, size_plain = _rt(vol, box)
+    arr, _, size_half = _rt(vol, box, half=True)
+    assert arr.shape == sub.shape
+    # half-float: ~3 significant digits, values in [0,1] here → abs err ~<1e-3.
+    assert float(np.abs(arr - sub).max()) < 2e-3
+    assert size_half < size_plain            # 16-bit voxels → smaller file
+
+
+def test_half_and_zip_together():
+    vol = _blob()
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    sub, _, _ = _positive_subbox(vol)
+    arr, _, _ = _rt(vol, box, half=True, zip=True)
+    assert arr.shape == sub.shape
+    assert float(np.abs(arr - sub).max()) < 2e-3
+
+
+def test_half_grid_type_carries_suffix():
+    vol = _blob(16, 16, 16)
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "h.vdb")
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", vol, box)], half=True)
+        raw = open(path, "rb").read()
+    # ftrace flags half by the grid-type suffix, not metadata.
+    assert b"Tree_float_5_4_3_HalfFloat" in raw
+
+
+def test_write_volume_threads_codec_flags():
+    dens = sexp(-4.0 * (X * X + Y * Y + Z * Z))
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "fire.vdb")
+        vdbio.write_volume(path, box=1.5, res=32, half=True, zip=True, density=dens)
+        arr, _ = vdbio.read_vdb(path)["density"]
+    assert arr.max() > 0.5           # gaussian peak survived the round-trip
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -14,12 +14,14 @@ The file is a real OpenVDB container for the standard ``float 5_4_3`` tree
 (RootNode → Internal<5> → Internal<4> → Leaf<3>), matched **exactly** to
 ftrace's hand-rolled reader (``src/vdb_openvdb.cpp``):
 
-* **compression = ACTIVE_MASK only** — value buffers store just the active
-  (positive) voxels, inactive voxels restore to the tree background (0).  There
-  is **no blosc/LZ4 or ZIP** compression, so no codec dependency is needed on
-  either side; the value bytes are raw little-endian ``float32``.
-* **full float** storage (not the optional 16-bit HalfFloat), grid type
-  ``Tree_float_5_4_3``.
+* **ACTIVE_MASK** compression — value buffers store just the active (positive)
+  voxels, inactive voxels restore to the tree background (0).  Optionally the
+  active bytes are additionally **ZIP** (zlib) deflated (``zip=True``) — read by
+  :func:`read_vdb` and any OpenVDB tool, though *not* by ftrace (LZ4-only); use
+  it for interchange, not the render path.
+* **full float** storage by default, or optional 16-bit **half-float** storage
+  (``half=True``, grid type ``Tree_float_5_4_3_HalfFloat``) — half the file,
+  read directly by ftrace and every OpenVDB tool, ~3 significant digits.
 * a **ScaleTranslateMap** transform, so index ``i`` maps to world
   ``x0 + i·(x1-x0)/(n-1)`` — i.e. the grid samples span the box corners
   inclusively, matching loom's ``numpy.linspace`` bake and ftrace's sampler.
@@ -29,15 +31,17 @@ dense-baking anyway), so a compact field yields a compact file.  Intended for
 **non-negative scalar fields** (fog density, blackbody temperature); a signed
 field's negative lobe is not represented.
 
-The companion :func:`read_vdb` parses back the exact subset this module writes
-(for round-trip tests and a light loom-side read); it does **not** decode the
-blosc/half/ZIP variants real DCC tools emit — ftrace's C++ reader handles those.
+The companion :func:`read_vdb` parses back everything this module writes
+(ACTIVE_MASK / full-float / half / ZIP, over a ScaleTranslate map); it does
+**not** yet decode **blosc**-compressed grids (the common DCC codec — needs a
+blosc decoder; ftrace's C++ reader handles blosc-LZ4).
 """
 
 from __future__ import annotations
 
 import io
 import struct
+import zlib
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 __all__ = ["write_vdb", "read_vdb", "bake_field", "write_volume", "VolumeGrid"]
@@ -48,14 +52,20 @@ _FILE_VERSION = 224            # ≥ 222 (node-mask compression) / ≥ 218 (uuid
 _LIB_MAJOR = 8
 _LIB_MINOR = 1
 _UUID = "00000000-0000-0000-0000-000000000000"   # 36 ASCII chars
+_COMPRESS_ZIP = 0x1            # value buffers zlib-deflated (int64 length prefix)
 _COMPRESS_ACTIVE_MASK = 0x2
+_COMPRESS_BLOSC = 0x4         # value buffers blosc1-framed (read: needs `blosc`)
 _META_NO_MASK_OR_INACTIVE = 0  # NO_MASK_OR_INACTIVE_VALS: inactive → background
 _GRID_TYPE = "Tree_float_5_4_3"
+_HALF_SUFFIX = "_HalfFloat"   # grid-type suffix flagging 16-bit half storage
 
 Box = Tuple[float, float, float, float, float, float]
 
 
 # ---- little helpers -------------------------------------------------------
+_pairs = zip   # keep the builtin reachable where the ``zip=`` kwarg shadows it
+
+
 def _w_str(buf: io.BytesIO, s: str) -> None:
     b = s.encode("ascii")
     buf.write(struct.pack("<I", len(b)))
@@ -67,6 +77,35 @@ def _mask_bytes(nbits: int, bit_indices) -> bytes:
     for b in bit_indices:
         m[b >> 3] |= (1 << (b & 7))
     return bytes(m)
+
+
+def _value_bytes(np, vals, half: bool) -> bytes:
+    """Serialise a leaf's active values as raw float32 or half (uint16) bytes."""
+    a = np.asarray(vals, dtype="<f4")
+    if half:
+        return a.astype("<f2").tobytes()
+    return a.tobytes()
+
+
+def _write_codec(buf: io.BytesIO, raw: bytes, compression: int) -> None:
+    """Write a value buffer honouring the grid compression (OpenVDB io::writeData).
+
+    ZIP wraps the bytes with an int64 length prefix: a **negative** prefix means
+    the bytes are stored uncompressed (compression didn't shrink them), matching
+    OpenVDB's convention and ftrace's reader.  Only ever called for a non-empty
+    buffer (inactive tile arrays store zero values → no codec bytes)."""
+    if compression & _COMPRESS_BLOSC:
+        raise NotImplementedError("write_vdb: blosc output not supported (use zip/half)")
+    if compression & _COMPRESS_ZIP:
+        comp = zlib.compress(raw)
+        if len(comp) < len(raw):
+            buf.write(struct.pack("<q", len(comp)))
+            buf.write(comp)
+        else:                                   # negative → stored uncompressed
+            buf.write(struct.pack("<q", -len(raw)))
+            buf.write(raw)
+    else:
+        buf.write(raw)
 
 
 # ---- tree node containers -------------------------------------------------
@@ -158,7 +197,7 @@ def _write_internal_topology(buf: io.BytesIO, node: _Node, numValues: int,
 
 
 def _write_internal_buffers(buf: io.BytesIO, node: _Node,
-                            child_is_leaf: bool) -> None:
+                            child_is_leaf: bool, compression: int, half: bool) -> None:
     import numpy as np
     # readInternalBuffers recurses child-internals first, then child-leaves.
     if child_is_leaf:
@@ -166,13 +205,14 @@ def _write_internal_buffers(buf: io.BytesIO, node: _Node,
             leaf: _Leaf = node.children[off]
             buf.write(_mask_bytes(512, leaf.offs))          # valueMask again
             buf.write(struct.pack("<b", _META_NO_MASK_OR_INACTIVE))
-            buf.write(np.asarray(leaf.vals, dtype="<f4").tobytes())
+            _write_codec(buf, _value_bytes(np, leaf.vals, half), compression)
     else:
         for off in sorted(node.children):
-            _write_internal_buffers(buf, node.children[off], True)
+            _write_internal_buffers(buf, node.children[off], True, compression, half)
 
 
-def _serialize_body(vol, box: Box) -> bytes:
+def _serialize_body(vol, box: Box, compression: int = _COMPRESS_ACTIVE_MASK,
+                    half: bool = False) -> bytes:
     nx, ny, nz = vol.shape
     x0, y0, z0, x1, y1, z1 = (float(v) for v in box)
 
@@ -184,7 +224,7 @@ def _serialize_body(vol, box: Box) -> bytes:
     sx, sy, sz = _scale(x0, x1, nx), _scale(y0, y1, ny), _scale(z0, z1, nz)
 
     body = io.BytesIO()
-    body.write(struct.pack("<I", _COMPRESS_ACTIVE_MASK))
+    body.write(struct.pack("<I", compression))
     body.write(struct.pack("<I", 0))                        # grid metamap: empty
     # transform: ScaleTranslateMap (world = scale·index + translation)
     _w_str(body, "ScaleTranslateMap")
@@ -205,7 +245,7 @@ def _serialize_body(vol, box: Box) -> bytes:
         body.write(struct.pack("<3i", *i5o))               # top-node origin
         _write_internal_topology(body, tops[i5o], 32768, False)
     for i5o in sorted(tops):
-        _write_internal_buffers(body, tops[i5o], False)
+        _write_internal_buffers(body, tops[i5o], False, compression, half)
     return body.getvalue()
 
 
@@ -227,11 +267,24 @@ class VolumeGrid:
         self.box: Box = b  # type: ignore[assignment]
 
 
-def write_vdb(path: str, grids: Sequence[VolumeGrid]) -> str:
+def write_vdb(path: str, grids: Sequence[VolumeGrid], *,
+              half: bool = False, zip: bool = False) -> str:
     """Write one or more :class:`VolumeGrid` to ``path`` as a single ``.vdb``.
 
     Returns ``path``.  Grid names must be unique; ftrace selects a grid by name
-    (``density vdb:<path>`` picks the ``density`` grid, etc.)."""
+    (``density vdb:<path>`` picks the ``density`` grid, etc.).
+
+    ``half``  store voxels as 16-bit half-floats (grid type gains the
+              ``_HalfFloat`` suffix).  Halves the file and is read directly by
+              ftrace and any OpenVDB tool; the trade-off is ~3-decimal-digit
+              precision (fine for fog density / temperature).
+    ``zip``   zlib-deflate each value buffer (OpenVDB ``COMPRESS_ZIP``).  Read
+              back by :func:`read_vdb` and any OpenVDB tool, but **not** by
+              ftrace's built-in reader (which supports blosc-LZ4, not ZIP) — use
+              it for interchange / round-tripping, not the render path.
+
+    The default (both off) is byte-for-byte the original ACTIVE_MASK / full-float
+    output, so existing files and ftrace reads are unaffected."""
     grids = list(grids)
     if not grids:
         raise ValueError("write_vdb: no grids given")
@@ -239,7 +292,9 @@ def write_vdb(path: str, grids: Sequence[VolumeGrid]) -> str:
     if len(set(names)) != len(names):
         raise ValueError(f"write_vdb: duplicate grid names {names}")
 
-    bodies = [_serialize_body(g.values, g.box) for g in grids]
+    compression = _COMPRESS_ACTIVE_MASK | (_COMPRESS_ZIP if zip else 0)
+    bodies = [_serialize_body(g.values, g.box, compression, half) for g in grids]
+    gtype = _GRID_TYPE + (_HALF_SUFFIX if half else "")
 
     # header
     hdr = io.BytesIO()
@@ -256,10 +311,10 @@ def write_vdb(path: str, grids: Sequence[VolumeGrid]) -> str:
     # descriptors carry absolute file offsets; lay them out sequentially.
     pos = len(header)
     descriptors: List[bytes] = []
-    for g, body in zip(grids, bodies):
+    for g, body in _pairs(grids, bodies):
         d = io.BytesIO()
         _w_str(d, g.name)
-        _w_str(d, _GRID_TYPE)
+        _w_str(d, gtype)
         _w_str(d, "")                                       # instance parent
         # placeholder offsets patched below
         desc_prefix = d.getvalue()
@@ -274,7 +329,7 @@ def write_vdb(path: str, grids: Sequence[VolumeGrid]) -> str:
 
     with open(path, "wb") as f:
         f.write(header)
-        for desc, body in zip(descriptors, bodies):
+        for desc, body in _pairs(descriptors, bodies):
             f.write(desc)
             f.write(body)
     return path
@@ -310,7 +365,8 @@ def bake_field(field, box, res, clock=None, cache=None):
     return np.ascontiguousarray(vol, dtype="<f4"), box6
 
 
-def write_volume(path: str, *, box, res, clock=None, cache=None, **fields) -> str:
+def write_volume(path: str, *, box, res, clock=None, cache=None,
+                 half: bool = False, zip: bool = False, **fields) -> str:
     """Bake one or more named fields over a shared ``box``/``res`` and write a
     multi-grid ``.vdb``.
 
@@ -330,7 +386,7 @@ def write_volume(path: str, *, box, res, clock=None, cache=None, **fields) -> st
     for name, field in fields.items():
         vol, box6 = bake_field(field, box, res, clock=clock, cache=cache)
         grids.append(VolumeGrid(name, vol, box6))
-    return write_vdb(path, grids)
+    return write_vdb(path, grids, half=half, zip=zip)
 
 
 # ---- reader (round-trip / light loom-side read of THIS module's output) ---
@@ -370,19 +426,46 @@ def _bit_on(mask: bytes, n: int) -> bool:
     return bool((mask[n >> 3] >> (n & 7)) & 1)
 
 
-def _read_values(c: _Cur, dest_count: int, value_mask: bytes, background: float):
+def _read_codec(c: _Cur, nbytes: int, compression: int) -> bytes:
+    """Read one value buffer honouring the grid compression (OpenVDB io::readData).
+
+    A ZIP/BLOSC buffer is prefixed by an int64: negative means the ``|prefix|``
+    bytes that follow are stored uncompressed, positive is the compressed length."""
+    if compression & _COMPRESS_BLOSC:
+        raise NotImplementedError(
+            "read_vdb: blosc-compressed .vdb not supported yet "
+            "(re-export uncompressed/zip/half, or add the 'blosc' package)")
+    if compression & _COMPRESS_ZIP:
+        ncomp = struct.unpack("<q", c.take(8))[0]
+        if ncomp <= 0:
+            return c.take(-ncomp)                           # stored uncompressed
+        raw = zlib.decompress(c.take(ncomp))
+        if len(raw) != nbytes:
+            raise ValueError("read_vdb: zip-decompressed size mismatch")
+        return raw
+    return c.take(nbytes)
+
+
+def _read_values(c: _Cur, dest_count: int, value_mask: bytes, background: float,
+                 compression: int = _COMPRESS_ACTIVE_MASK, from_half: bool = False):
     import numpy as np
     metadata = c.i8()                                       # file ver ≥ 222
     inactive0 = background if metadata == 0 else -background
     if metadata in (2, 4, 5):
-        inactive0 = c.f32()
+        inactive0 = c.f32()                                 # always full float
         if metadata == 5:
             c.f32()
     if metadata in (3, 4, 5):
         c.take(dest_count // 8)                             # selection mask
     temp_count = _popcount(value_mask) if metadata != 6 else dest_count
-    raw = c.take(temp_count * 4)
-    temp = np.frombuffer(raw, dtype="<f4")
+    if temp_count == 0:                                     # no codec bytes written
+        temp = np.zeros(0, dtype=np.float64)
+    elif from_half:
+        raw = _read_codec(c, temp_count * 2, compression)
+        temp = np.frombuffer(raw, dtype="<f2").astype(np.float64)
+    else:
+        raw = _read_codec(c, temp_count * 4, compression)
+        temp = np.frombuffer(raw, dtype="<f4").astype(np.float64)
     if metadata == 6:
         return np.array(temp, dtype=np.float64)
     dest = np.full(dest_count, inactive0, dtype=np.float64)
@@ -394,9 +477,12 @@ def _read_values(c: _Cur, dest_count: int, value_mask: bytes, background: float)
 
 
 def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
-    """Parse a ``.vdb`` written by :func:`write_vdb` back into
-    ``{name: (dense_array, box6)}``.  Handles only the ACTIVE_MASK / full-float /
-    ScaleTranslateMap subset this module emits (not blosc/half/ZIP)."""
+    """Parse a ``.vdb`` back into ``{name: (dense_array, box6)}``.
+
+    Reads the ACTIVE_MASK, **half-float** (``_HalfFloat`` grid type) and **ZIP**
+    (``COMPRESS_ZIP``, zlib) variants over a ScaleTranslate/UniformScaleTranslate
+    map.  Blosc-compressed grids raise :class:`NotImplementedError` (they need a
+    blosc decoder — ftrace's C++ reader handles blosc-LZ4)."""
     import numpy as np
     with open(path, "rb") as f:
         buf = f.read()
@@ -420,11 +506,13 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
         if file_ver >= 216:
             c.string()                                      # instance parent
         grid_pos = c.i64(); c.i64(); end_pos = c.i64()
-        if gtype != _GRID_TYPE:
+        from_half = gtype.endswith(_HALF_SUFFIX)
+        base_type = gtype[:-len(_HALF_SUFFIX)] if from_half else gtype
+        if base_type != _GRID_TYPE:
             c.p = end_pos
             continue
         g = _Cur(buf, grid_pos)
-        g.u32()                                             # compression
+        compression = g.u32()                               # compression flags
         for _ in range(g.u32()):                            # grid metamap
             g.skip_meta()
         map_type = g.string()
@@ -448,7 +536,8 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
             mb = num_values // 8
             child_mask = gg.take(mb)
             value_mask = gg.take(mb)
-            _read_values(gg, num_values, value_mask, background)
+            _read_values(gg, num_values, value_mask, background,
+                         compression, from_half)
             mask = (1 << log2dim) - 1
             kids = []
             for off in range(num_values):
@@ -482,7 +571,8 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
                 if kind == "leaf":
                     origin, _vm = rest
                     vm = g.take(64)
-                    vals = _read_values(g, 512, vm, background)
+                    vals = _read_values(g, 512, vm, background,
+                                        compression, from_half)
                     leaves.append((origin, vm, vals))
 
         for r in roots:
