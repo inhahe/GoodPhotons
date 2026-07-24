@@ -174,7 +174,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog = nullptr,
                                             const std::function<bool(int, const Film&)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
-                                            int heroC = 1);
+                                            int heroC = 1, int fgRays = 0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
@@ -198,10 +198,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
-// v1 scope: no participating media, no environment light, only area/sphere/cylinder
-// Lambertian emitters (no spot/env/collimated), no fluorescence, and a lens no deeper
-// than the device cap (D_MAXLENS). Textured albedo IS supported. When false, the
-// caller must use the CPU backward tracer (which has no such restrictions).
+// Current scope: participating media (homogeneous + heterogeneous, incl. spectral-rainbow
+// Airy phase; minus GRIN), fluorescence, a CONSTANT environment light, textured albedo, and
+// area/sphere/cylinder Lambertian + point-spot emitters; a lens no deeper than the device
+// cap (D_MAXLENS). Image-based env, collimated beams and GRIN media fall back to the CPU tracer.
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
 // GPU backward reference trace (mode R). Renders `spp` samples per pixel at the given
@@ -216,9 +216,114 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // progress / request an early stop. A null `prog` renders all spp in one launch (the
 // historical path). Either way the result is bit-identical for a given spp (the RNG is
 // seeded on the global sample index, so chunking never changes the image).
+// maxBounce (< 1 => leave the device default of 32) caps the backward path depth
+// (-max-bounce); directOnly (-direct-only) renders direct + specular recursion only.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
-                        const SppProgress* prog = nullptr);
+                        const SppProgress* prog = nullptr,
+                        int maxBounce = 32, bool directOnly = false);
+
+// True if this scene + camera can be rendered by the FAST RGB backward megakernel
+// (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer
+// that carries a linear-sRGB throughput and produces a full-colour image in ONE walk
+// per sample. Scope is narrower than cudaBackwardSupported — no participating media,
+// no dispersion-dependent materials (thin-film / grating / multilayer / layered /
+// fluorescence), only constant (untextured, non-record) per-material reflectance, no
+// image env / collimated emitters. When false the caller falls back to the spectral
+// backward (renderBackwardCuda) or the CPU tracer.
+bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam);
+
+// Fast RGB backward trace (mode R `-rgb`). Same spp/chunk/checkpoint conventions and
+// film accumulation as renderBackwardCuda, but each sample does a single colour walk
+// (no wavelength dimension), so a clean colour image converges far faster. A neutral
+// (spectrally flat) scene matches the spectral estimator's absolute luminance; colour
+// carries the Option-B metamerism approximation. Requires cudaBackwardRGBSupported();
+// otherwise returns an empty film.
+Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int resY,
+                           long long spp, bool diffraction,
+                           const SppProgress* prog = nullptr,
+                           int maxBounce = 32, bool directOnly = false);
+
+// ---- Resident fast-RGB backward PREVIEW session (interactive -explore) ----------------
+// The batch renderBackwardRGBCuda re-uploads the whole scene, re-bakes the camera, allocs
+// films, launches, downloads and frees on every call — fine for one shot, wasteful when an
+// interactive viewer wants to progressively converge a still while the camera holds, then
+// re-aim and start over on the next move. A session makes the scene bake RESIDENT: begin()
+// uploads the (already ignore-flag-stripped) scene and allocs a persistent SUM film ONCE;
+// setCamera() re-bakes just the pinhole camera (cheap POD) and zeroes the film to start a
+// fresh accumulation; accumulate() launches kBackwardRGB adding `spp` more samples into the
+// resident film (running total, distinct RNG streams per batch); download() fetches the
+// running SUM (the caller divides by samples() and tone-maps via filmToRgb8, exactly as the
+// batch path does); end() frees. Scene-ignore flags need no special handling — they mutate
+// the Scene host-side before begin(), so the baked device scene already reflects them.
+struct BackwardRGBSession;   // opaque; lives in render_cuda.cu
+// Returns nullptr if CUDA is unavailable. `maxBounce` (<1 => device default 32) and
+// `directOnly` are the Stage-3 knobs, baked into the resident DScene. The scene must pass
+// cudaBackwardRGBSupported() for the chosen camera(s); callers gate on that first.
+BackwardRGBSession* backwardRGBSessionBegin(const Scene& scene, int resX, int resY,
+                                            int maxBounce = 32, bool directOnly = false);
+// Re-aim: bake `cam` into the resident scene and reset the accumulation (samples()->0).
+void backwardRGBSessionSetCamera(BackwardRGBSession* s, const Camera& cam);
+// Trace `spp` more samples-per-pixel into the resident SUM film; returns the new running
+// total spp. `diffraction` matches the batch path's flag (unused by the RGB walk today).
+long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, bool diffraction);
+// Download the running SUM film (xyz + hits) into `out` (already alloc'd at resX*resY).
+void backwardRGBSessionDownload(BackwardRGBSession* s, Film& out);
+// Samples-per-pixel accumulated since the last setCamera() (0 right after a re-aim).
+long long backwardRGBSessionSamples(const BackwardRGBSession* s);
+void backwardRGBSessionEnd(BackwardRGBSession* s);
+
+// ---- GPU SPPM (mode S) ----------------------------------------------------------------
+// Resident device SPPM session: keeps per-pixel progressive state (tau / radius / nAcc /
+// directSum + this pass's visible point) on the device across passes, so the mode-S driver
+// calls one pass per iteration and resolves the current radiance whenever it wants a
+// preview / checkpoint frame. Each pass (1) resamples camera visible points, (2) deposits a
+// bounded photon set via the SAME forward tracer as mode M and host-builds the grid at the
+// largest current per-pixel radius, and (3) gathers + progressively updates every pixel.
+// Device twin of sppm_render.h; validated statistically against the CPU (independent MC).
+struct SppmSession;   // opaque; lives in render_cuda.cu
+// True when the scene is device-bakeable for SPPM: same scope as the photon map (mode M,
+// which now includes constant + image env). Pinhole cameras only (dGenRay) — the caller
+// gates the camera choice.
+bool cudaSppmSupported(const Scene& scene);
+// Returns nullptr if CUDA is unavailable or the scene is out of scope. `R0` is the initial
+// per-pixel gather radius, `maxBounce` (<1 => device default 32) the specular-walk cap.
+SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
+                              double R0, bool diffraction, int maxBounce, int heroC);
+// Run one SPPM pass: resample visible points, deposit `photonsPerPass` fresh photons, gather
+// at each pixel's current radius, and apply the shared-statistics radius/flux update.
+void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha);
+// Resolve the current accumulated state into `out` (radiance L, exactly like sppmResolve).
+void sppmSessionResolve(SppmSession* s, Film& out);
+long long sppmSessionPasses(const SppmSession* s);
+long long sppmSessionEmitted(const SppmSession* s);
+void sppmSessionEnd(SppmSession* s);
+
+// ---- GPU VCM / UPS (mode U) ------------------------------------------------------------
+// Resident device VCM session mirroring vcm.h's vcmPass. Each pass traces one light + one
+// camera subpath per pixel, combining BDPT vertex CONNECTIONS with photon-map vertex MERGING
+// under one balance-heuristic MIS. Light vertices are stored into a per-path slab on the
+// device, downloaded and compacted host-side into contiguous per-path ranges, and a uniform
+// hash grid (cell = merge radius) is built over them (byte-for-byte mirror of vcm.h
+// VcmGrid::build); the camera kernel then does emission/NEE/connection/merge and accumulates
+// the running per-pixel sum. Resolve divides by the pass count. Validated statistically
+// against the CPU (independent MC).
+struct VcmSession;   // opaque; lives in render_cuda.cu
+// True when the scene is device-bakeable for VCM: the BDPT device scope (mode D) PLUS a
+// no-participating-media restriction (mode U is surfaces-only). Pinhole cameras only
+// (cam.project) — the caller gates the camera choice.
+bool cudaVcmSupported(const Scene& scene);
+// Returns nullptr if CUDA is unavailable or the scene is out of scope. `maxDepth` (<1 =>
+// default 8) is the full path length in edges (also the per-light-subpath stored-vertex cap).
+VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
+                            bool diffraction, int maxDepth);
+// Run one VCM pass at the given merge `radius` (the caller shrinks it per the progressive
+// schedule r_i = R0 * i^((alpha-1)/2)), accumulating into the resident per-pixel sum.
+void vcmSessionPass(VcmSession* s, double radius);
+// Resolve the current accumulated state into `out` (running average = accum / passes).
+void vcmSessionResolve(VcmSession* s, Film& out);
+long long vcmSessionPasses(const VcmSession* s);
+void vcmSessionEnd(VcmSession* s);
 
 // True if this scene + camera can be rendered by the GPU isosurface PREVIEW kernel
 // (G2, `-raster-gpu`): a usable CUDA device, a POD-bakeable scene (cudaForwardSupported),

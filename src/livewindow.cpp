@@ -85,6 +85,7 @@ struct LiveWindow::Impl {
     bool                 resetReq = false;          // '0' / Home pressed since last drain (one-shot)
     bool                 printReq = false;          // 'P' pressed since last drain (one-shot)
     bool                 collideReq = false;        // 'C' pressed since last drain (one-shot)
+    bool                 traceReq = false;          // 'T' pressed since last drain (one-shot)
     // Held-key throttle state — atomics so WM_KEYUP on the UI thread and drainNav on the
     // render thread can race freely without the inMtx.
     std::atomic<bool>    keyFwd{false};             // Space / '+' currently held -> fly forward
@@ -509,6 +510,8 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                         { std::lock_guard<std::mutex> lk(self->inMtx); self->printReq = true; } break;
                     case 'C':
                         { std::lock_guard<std::mutex> lk(self->inMtx); self->collideReq = true; } break;
+                    case 'T':
+                        { std::lock_guard<std::mutex> lk(self->inMtx); self->traceReq = true; } break;
                     default: break;
                 }
             }
@@ -682,7 +685,7 @@ NavInput LiveWindow::drainNav() {
     // Accumulated wheel notches + one-shot edges: read-and-clear under the lock.
     n.wheel = impl_->wheelAcc; n.wheelSpeed = impl_->wheelSpeedAcc;
     n.reset  = impl_->resetReq; n.print = impl_->printReq;
-    n.cycleCollide = impl_->collideReq;
+    n.cycleCollide = impl_->collideReq; n.toggleTrace = impl_->traceReq;
     // Control-panel outputs: one-shot button edges (read-and-clear) + current input values.
     n.togglePath = impl_->pathReq;  n.togglePlay = impl_->playReq;  n.scrubTo = impl_->scrubReq;
     n.stride = impl_->strideVal;    n.camPerSec = impl_->rateVal;   n.rateMode = impl_->rateModeVal;
@@ -693,7 +696,7 @@ NavInput LiveWindow::drainNav() {
     // Paint-mode outputs: persistent checkbox state + one-shot Flat edge.
     n.paintMode = impl_->paintVal;  n.speedReset = impl_->flatReq;
     impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
-    impl_->resetReq = impl_->printReq = impl_->collideReq = false;
+    impl_->resetReq = impl_->printReq = impl_->collideReq = impl_->traceReq = false;
     impl_->pathReq = impl_->playReq = false;
     impl_->scrubReq = -1;
     impl_->recReq = impl_->addReq = impl_->insReq = impl_->delReq = impl_->saveReq = false;

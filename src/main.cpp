@@ -1090,6 +1090,17 @@ static double g_vcmAlpha = 0.75;
 // single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
 static int g_heroC = hero::kHeroC;
 
+// Scene-ignore render params (Stage 3), set once at arg-parse and read by the tracer
+// wrappers (like g_heroC). g_maxBounceOverride < 0 leaves each tracer's own default
+// (32); >= 1 caps the path-depth loop and is honoured UNIVERSALLY (forward B, backward
+// R/RGB, BDPT, photon/SPPM, P). g_directOnly renders direct lighting + specular recursion
+// only (no diffuse indirect bounce) — a Whitted-style near-1-spp preview — in the CAMERA
+// path tracers where it is well-defined: backward R, the RGB fast path, and the backward
+// camera side of the P composite. The forward light tracer (B) and the photon /
+// bidirectional modes (M/S/D) honour maxBounce but ignore directOnly.
+static int  g_maxBounceOverride = -1;
+static bool g_directOnly = false;
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -1248,6 +1259,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
         r.useHero = heroOn; r.heroC = g_heroC;
+        if (g_maxBounceOverride >= 1) r.maxBounce = g_maxBounceOverride;
         // Photon i draws from its own stream keyed by the ABSOLUTE photon index
         // seedBase+i (seedBase = cumulative photons of earlier batches), so the traced
         // set is independent of batch splits and thread count (see rng.h seedUnit).
@@ -1306,6 +1318,7 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = false; r.lensMode = lensMode; r.diffraction = diffraction;
         r.useHero = heroOn; r.heroC = g_heroC; r.beamGather = beamGather;
+        if (g_maxBounceOverride >= 1) r.maxBounce = g_maxBounceOverride;
         // Identical per-photon seeding to renderForward (absolute index seedBase+i via
         // seedUnit). For model B this keeps each camera's shared film bit-identical to
         // its standalone single-camera render at the same seedBase; for model A the
@@ -1349,6 +1362,8 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
+        if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
+        br.directOnly = g_directOnly;
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
     };
@@ -2284,7 +2299,8 @@ static int runCompositeProgressive(
             if (gpuBackward) {
                 SppProgress bp; bp.sampleBase = acc.spp;   // mixes into the device seed
                 bp.report = [](const Film&, long long, bool) { return false; };
-                r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp);
+                r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
+                                       g_maxBounceOverride, g_directOnly);
             } else
 #endif
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
@@ -2361,7 +2377,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool wantCheckpointFlag = false, bool runForever = false,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
-                     double* exposureAnchor = nullptr) {
+                     double* exposureAnchor = nullptr, bool rgbBackward = false,
+                     int maxBounceOverride = -1, bool directOnly = false) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
@@ -2419,9 +2436,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
     // the forward layer of the mode-P composite) AND the backward tracer (mode R, and
-    // the mode-P camera-side layer) when the scene is within the backward-GPU v1 scope
-    // (renderBackwardCuda / cudaBackwardSupported — no fog/env/spot/collimated/
-    // fluorescence); otherwise the backward layer falls back to the CPU. Mode V keeps
+    // the mode-P camera-side layer) when the scene is within the backward-GPU scope
+    // (renderBackwardCuda / cudaBackwardSupported — Lambertian/textured/specular,
+    // point-spot lights, participating media, fluorescence, and a constant env light;
+    // image-based env, collimated beams and GRIN/rainbow media still fall back to the
+    // CPU backward tracer); otherwise the backward layer falls back to the CPU. Mode V keeps
     // its backward reference on the CPU by design. Fisheye/panoramic lenses run on the
     // GPU too (the device camera's project()/pixelSolidAngle() port the analytic
     // projection remap) for the pinhole-splat modes (B/V/P).
@@ -2481,12 +2500,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         } else if (gpuBackwardMode) {
             // Mode R has its own GPU support check: the backward reference megakernel
             // (with the physical mesh-lens as a ray-gen front-end) covers area/sphere/
-            // cylinder Lambertian lights and textured/specular materials, but not fog,
-            // env light, spot/collimated lights, or fluorescence (v1 scope).
+            // cylinder Lambertian AND point-spot lights, textured/specular materials,
+            // participating media (homog+heterog), fluorescence, and BOTH a constant
+            // and an image-based env light (M1). Collimated beams, GRIN / rainbow media
+            // still fall back to the CPU backward tracer.
             if (!cudaBackwardSupported(scene, cam)) {
                 const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(fog, env light, spot/collimated light, fluorescence, "
-                                  "or a lens deeper than the device cap)";
+                                  "(collimated light, GRIN or "
+                                  "rainbow/dispersive media, or a lens deeper than the "
+                                  "device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -2495,10 +2517,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             cudaDeviceName());
             }
         } else if (!gpuForwardMode) {
-            const char* why = "unsupported mode - CPU-only path";
-            if (wantGpu) std::fprintf(stderr,
-                "[device] GPU can't accelerate this render: %s; using CPU\n", why);
-            else         std::printf("[device] auto -> CPU (%s)\n", why);
+            // Modes M (shared/flyby gather) and S (SPPM) run their OWN device gating in their
+            // dispatch blocks below, so don't claim "CPU-only" here — that would be wrong for
+            // an S render that then picks the GPU. Stay quiet and let the mode decide.
+            if (mode != 'M' && mode != 'S') {
+                const char* why = "unsupported mode - CPU-only path";
+                if (wantGpu) std::fprintf(stderr,
+                    "[device] GPU can't accelerate this render: %s; using CPU\n", why);
+                else         std::printf("[device] auto -> CPU (%s)\n", why);
+            }
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, or oversized multilayer/mix "
@@ -2539,13 +2566,33 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the physical lens), CPU otherwise — both chunk internally.
     if (mode == 'R') {
         const bool gpuBackward = useGpu;
-        std::printf("mode R: backward reference at %dx%d on %s (light=%s) ...\n",
+        // Fast RGB backward (-rgb): the non-spectral Option-B previewer. Only on the GPU
+        // and only when the scene is within its reduced scope; otherwise fall back to the
+        // spectral backward (a warning is printed so the flag isn't silently ignored).
+        bool rgbFast = false;
+#ifdef HAVE_CUDA
+        if (rgbBackward) {
+            if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
+            else std::fprintf(stderr, "[render] -rgb (fast RGB backward) not applicable to this "
+                                      "render (%s); using the spectral backward tracer\n",
+                              gpuBackward ? "scene outside the RGB fast-path scope"
+                                          : "RGB fast path is GPU-only");
+        }
+#else
+        if (rgbBackward)
+            std::fprintf(stderr, "[render] -rgb ignored: built without CUDA (RGB fast path is GPU-only)\n");
+#endif
+        std::printf("mode R: backward %s at %dx%d on %s (light=%s) ...\n",
+                    rgbFast ? "RGB fast preview" : "reference",
                     res, resY,
                     gpuBackward ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                     lightLabel);
         auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-            if (gpuBackward) return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p);
+            if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p,
+                                                           g_maxBounceOverride, g_directOnly);
+            if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p,
+                                                        g_maxBounceOverride, g_directOnly);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -2669,6 +2716,50 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     if (mode == 'S') {
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
+#ifdef HAVE_CUDA
+        // GPU SPPM (M3): per-pixel progressive state (tau/radius/nAcc/directSum + this pass's
+        // visible point) stays resident on the device across passes; each pass deposits a
+        // bounded photon set with the SAME forward tracer as mode M, host-builds the grid at
+        // the largest current radius, and gathers on the device. Pinhole cameras only (dGenRay)
+        // and the photon-map-supported scene scope; anything else falls through to the CPU.
+        {
+            const bool wantGpu  = !std::strcmp(device, "gpu");
+            const bool wantAuto = !std::strcmp(device, "auto");
+            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+                cudaAvailable() && cudaSppmSupported(scene)) {
+                SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
+                                                     /*maxBounce*/32, g_heroC);
+                if (sess) {
+                    std::printf("mode S: SPPM on %s — %lld photons/pass, R0=%.4g, alpha=%.2f "
+                                "at %dx%d (light=%s) ...\n",
+                                cudaDeviceName(), N, R0, g_sppmAlpha, res, resY, lightLabel);
+                    auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+                        Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+                        for (long long pass = 0; pass < passTarget; ++pass) {
+                            sppmSessionPass(sess, N, g_sppmAlpha);
+                            sppmSessionResolve(sess, disp);
+                            long long passes = sppmSessionPasses(sess);
+                            for (auto& v : disp.xyz) v = v * (double)passes;   // undone by /sppDone
+                            if (p->report(disp, passes, passes >= passTarget)) break;
+                        }
+                        return disp;
+                    };
+                    int rc = runSppProgressive(outPath, spp, manualExposure, exposureAnchor,
+                                               scene.absolute, timeBudgetSec, noiseTarget,
+                                               runForever, intervalSec, preview,
+                                               renderChunked, res, resY);
+                    sppmSessionEnd(sess);
+                    return rc;
+                }
+                std::fprintf(stderr, "[device] SPPM GPU session failed to start; using CPU\n");
+            } else if (wantGpu) {
+                const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
+                                : !cudaAvailable()     ? "no CUDA device found"
+                                : "a GPU-unsupported scene feature";
+                std::fprintf(stderr, "[device] mode S GPU path unavailable (%s); using CPU\n", why);
+            }
+        }
+#endif
         std::printf("mode S: SPPM — %lld photons/pass, R0=%.4g, alpha=%.2f at %dx%d on "
                     "%d CPU threads (light=%s) ...\n",
                     N, R0, g_sppmAlpha, res, resY, nThreads, lightLabel);
@@ -2709,6 +2800,53 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         int maxDepth = 8;   // full path length in edges
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
+#ifdef HAVE_CUDA
+        // GPU VCM (M12): resident device session mirroring vcm.h's vcmPass. Each pass traces
+        // one light + one camera subpath per pixel, combining BDPT vertex connections with
+        // photon-map vertex merging under one balance-heuristic MIS; light vertices are stored
+        // in a per-path slab, downloaded + compacted host-side, and gridded (cell = radius),
+        // then the camera kernel does emission/NEE/connection/merge. Pinhole cameras only and
+        // the BDPT-supported, media-free scene scope; anything else falls through to the CPU.
+        {
+            const bool wantGpu  = !std::strcmp(device, "gpu");
+            const bool wantAuto = !std::strcmp(device, "auto");
+            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+                cudaAvailable() && cudaVcmSupported(scene)) {
+                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth);
+                if (sess) {
+                    std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
+                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s) ...\n",
+                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel);
+                    auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
+                        Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
+                        for (long long pass = 0; pass < passTarget; ++pass) {
+                            double it = (double)(vcmSessionPasses(sess) + 1);
+                            double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
+                            if (radius <= 0.0) radius = R0;
+                            vcmSessionPass(sess, radius);
+                            vcmSessionResolve(sess, disp);
+                            long long passes = vcmSessionPasses(sess);
+                            for (auto& v : disp.xyz) v = v * (double)passes;   // undone by /sppDone
+                            if (p->report(disp, passes, passes >= passTarget)) break;
+                        }
+                        return disp;
+                    };
+                    int rc = runSppProgressive(outPath, spp, manualExposure, exposureAnchor,
+                                               scene.absolute, timeBudgetSec, noiseTarget,
+                                               runForever, intervalSec, preview,
+                                               renderChunked, res, resY);
+                    vcmSessionEnd(sess);
+                    return rc;
+                }
+                std::fprintf(stderr, "[device] VCM GPU session failed to start; using CPU\n");
+            } else if (wantGpu) {
+                const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
+                                : !cudaAvailable()     ? "no CUDA device found"
+                                : "a GPU-unsupported scene feature";
+                std::fprintf(stderr, "[device] mode U GPU path unavailable (%s); using CPU\n", why);
+            }
+        }
+#endif
         std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
                     "%d CPU threads (maxDepth=%d, light=%s) ...\n",
                     R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel);
@@ -3302,7 +3440,17 @@ static void printHelp(const char* prog) {
 "  -beams|-photonbeams   decorrelated photon-beams gather for shared multi-camera flybys\n"
 "                        (single-scatter volumetrics; CPU or GPU; kills frozen speckle)\n"
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
+"  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
+"                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
 "  -t <n>                CPU thread count\n"
+"\n"
+"Scene-ignore (faster preview — strip expensive features, like the rasterizer):\n"
+"  -no-media             drop all participating media (haze/fog/volumes)\n"
+"  -no-env               remove the environment (sky/IBL) light\n"
+"  -no-fluoro            demote fluorescent materials to plain diffuse\n"
+"  -max-bounce <n>       cap path depth at n bounces (default 32)\n"
+"  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
+"                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -3316,7 +3464,7 @@ static void printHelp(const char* prog) {
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
-"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter)\n"
+"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T for a live path-traced preview\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
 "\n"
@@ -3426,6 +3574,13 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
+    bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
+    // Scene-ignore flags (Stage 3): rasterizer-style feature stripping for a faster
+    // preview. noMedia/noEnv/noFluoro mutate the scene (Scene::applyIgnoreFlags);
+    // maxBounceOverride caps path depth (<0 = leave the tracer default of 32);
+    // directOnly renders direct lighting + specular recursion only (no diffuse indirect).
+    bool noMedia = false, noEnv = false, noFluoro = false, directOnly = false;
+    int  maxBounceOverride = -1;
     const char* cameraSel = nullptr; // -camera <name>|<pathbase>|all|#N|near=X,Y,Z (FTSL multi-camera select)
     bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
@@ -3688,6 +3843,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
+        else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
+        else if (!std::strcmp(argv[i], "-no-media") || !std::strcmp(argv[i], "-nomedia")) noMedia = true;
+        else if (!std::strcmp(argv[i], "-no-env") || !std::strcmp(argv[i], "-noenv")) noEnv = true;
+        else if (!std::strcmp(argv[i], "-no-fluoro") || !std::strcmp(argv[i], "-nofluoro")) noFluoro = true;
+        else if (!std::strcmp(argv[i], "-direct-only") || !std::strcmp(argv[i], "-directonly")) directOnly = true;
+        else if (!std::strcmp(argv[i], "-max-bounce") && i + 1 < argc) maxBounceOverride = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-time") && i + 1 < argc) timeBudgetSec = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-noise") && i + 1 < argc) noiseTarget = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-forever")) runForever = true;
@@ -3863,6 +4024,22 @@ static int run(int argc, char** argv) {
         }
         scene.media.push_back(std::move(fog));
     }
+
+    // Scene-ignore flags (Stage 3): strip expensive features for a faster preview,
+    // "like the rasterizer does". Applied after all scene construction (incl. -fog)
+    // so it sees the final scene. Pure mutation; maxBounce / directOnly are render
+    // params threaded into runRender below.
+    if (noMedia || noEnv || noFluoro) {
+        std::string removed = scene.applyIgnoreFlags(noMedia, noEnv, noFluoro);
+        if (!removed.empty())
+            std::printf("[ignore] stripped: %s\n", removed.c_str());
+    }
+    // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
+    // g_heroC), so every render (incl. the meter pre-pass) honours them.
+    g_maxBounceOverride = maxBounceOverride;
+    g_directOnly = directOnly;
+    if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
+    if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test
@@ -4976,8 +5153,8 @@ static int run(int argc, char** argv) {
             // instead of spinning the view off-screen. (Translation stays feedback-locked
             // per-frame below — that's the collision-safety part; rotating in place can never
             // fling the eye through geometry, so it has no reason to be frame-locked.)
-            const double kYaw   = 1.6;               // max yaw   rad/sec at full pointer deflection
-            const double kPitch = 1.2;               // max pitch rad/sec at full pointer deflection
+            const double kYaw   = 2.6;               // max yaw   rad/sec (~150 deg/s) at full pointer deflection
+            const double kPitch = 2.0;               // max pitch rad/sec (~115 deg/s) at full pointer deflection
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
             auto rotAxis = [](const Vec3& v, const Vec3& axis, double ang) -> Vec3 {
                 double c = std::cos(ang), s = std::sin(ang);
@@ -5374,6 +5551,7 @@ static int run(int argc, char** argv) {
               "         look:   move the mouse off-centre to steer — offset from centre = turn rate (centre holds still); cursor stays visible; leave the window to stop\n"
               "         step:   Ctrl + mouse wheel = bigger/smaller step (now %.3g u; travel scales with render speed)\n"
               "         collide: C cycles wall collision (now: %s) — slide along walls / stop dead / noclip\n"
+              "         trace:  T toggles a live PATH-TRACED preview (fast RGB backward) — holds still to converge, re-aims on move (GPU, if the scene is in RGB scope)\n"
               "         panel:  Clip / Reset buttons below the image%s\n"
               "         editor: Rec records your flight into a camera_curve; +Pt appends the current pose;\n"
               "                 Ins inserts at the scrub point; Del removes the nearest point; Save writes a camera_curve block\n"
@@ -5386,6 +5564,63 @@ static int run(int argc, char** argv) {
             std::fflush(stdout);
 
             bool changed = true;   // render one frame immediately
+            // ---- GPU clock keep-warm (fixes the "bursty explorer feels slow" problem) --
+            // The explorer re-renders ONE frame per camera move, then idle-sleeps. On a
+            // discrete GPU the driver's DVFS reads that bursty, low-duty submission pattern
+            // as "idle" and parks the card in its lowest power state (measured on an RTX
+            // 4090: P8 @ 210 MHz vs a 2520-2760 MHz boost under load — a ~13x clock drop,
+            // and ~33x slower for a first cold frame once first-frame allocs are added).
+            // So each fresh mouse-look burst pays a cold-clock penalty until a second or two
+            // of continuous motion finally ramps the clocks — exactly the "slow, then
+            // suddenly fast, then slow again after relaunch" the card's power management
+            // produces. To keep exploration responsive we hold the GPU warm during an
+            // ACTIVE session: for a short grace window after the last real interaction we
+            // keep submitting GPU render work (which is what the driver needs to hold the
+            // boost clock) even when the frame hasn't changed, WITHOUT touching the display.
+            // Once the user is truly idle past the grace window we fall back to the passive
+            // sleep and let the card power all the way down. warmOne() reuses rasterOne but
+            // discards its result — it exists purely to keep the clocks up. GPU only.
+            auto lastActiveT = clock::now();
+            const double kWarmGraceSec = 2.5;   // hold clocks this long after the last move
+            // A warm-only frame fires only once the user has genuinely PAUSED — i.e. after
+            // `idleFor` passes this gap. During an active scrub/mouse drag the sub-frame gaps
+            // between input events stay under it, so a warm frame never lands between two
+            // events and can't steal the loop slot that samples the next scrub position (that
+            // stolen slot was the timeline "chunking" by several cameras per drag). Once past
+            // the gap (a real pause) warm frames run CONTINUOUSLY to actually hold the boost
+            // clock — a sparse rate-limited trickle was measured too weak (card stayed at P8).
+            const double kWarmGapSec = 0.10;
+            bool gpuWarmKeep = false;
+#ifdef HAVE_CUDA
+            gpuWarmKeep = (gpuRaster != nullptr);   // only meaningful on the discrete GPU path
+#endif
+            // ---- Interactive PATH-TRACED preview (fast RGB backward), toggled with 'T' ----
+            // The explorer normally shows the flat-shaded raster (instant, for navigation).
+            // Press 'T' to instead progressively PATH-TRACE the current view with the fast RGB
+            // backward tracer (Stage 2) into a resident GPU session: while the camera holds
+            // still the image converges in place; the instant it moves we drop back to the
+            // responsive raster and re-aim the session. The scene-ignore flags (-no-media/-env/
+            // -fluoro, -max-bounce, -direct-only) already apply — they mutated the Scene before
+            // this session bakes it, and the depth/Whitted knobs are passed into begin(). GPU
+            // only, and only when the scene+camera are inside the fast-RGB scope.
+            bool  traceMode  = false;             // 'T' toggle: path-traced preview vs. flat raster
+            bool  traceAvail = false;             // scene+camera in fast-RGB scope on this GPU
+            bool  traceDirty = true;              // camera moved -> re-aim + restart accumulation
+            double traceAnchor = 0.0;             // locked auto-exposure anchor for the current pose (0 = recompute)
+            const long long kTraceBatchSpp = 4;   // spp accumulated per idle iteration (responsive batches)
+            const long long kTraceCapSpp   = 4096;// stop refining once this converged (idle after)
+#ifdef HAVE_CUDA
+            BackwardRGBSession* traceSess = nullptr;   // resident RGB-backward preview (lazy)
+            int   traceResX = 0, traceResY = 0;        // session film size (recreated on a resize)
+            Film  traceFilm;                           // scratch download film (lazily sized)
+            if (gpuRaster != nullptr)
+                traceAvail = cudaBackwardRGBSupported(scene, rc0.cam);   // same scope the batch -rgb uses
+            if (traceAvail)
+                std::printf("[viewer] press 'T' for a live path-traced preview (fast RGB backward)\n");
+            else
+                std::printf("[viewer] path-trace preview ('T') unavailable (scene/camera outside fast-RGB GPU scope)\n");
+            std::fflush(stdout);
+#endif
             while (!g_liveWin->closed() && !g_stopRequested) {
                 // Match the render resolution to the live window: a user resize re-renders
                 // at the new size (smaller = faster, larger = crisper).
@@ -5439,15 +5674,36 @@ static int run(int argc, char** argv) {
                     collide = (CollideMode)((collide + 1) % 3);
                     std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
                 }
-                // Reset: in free flight, restore the authored eye + look direction; while
-                // locked to the path, jump back to the start of the timeline and pause.
-                if (nav.reset) {
-                    if (pathMode) { pathPos = 0.0; playing = false; }
-                    else {
-                        eye = eye0; fwd = norml(tgt0 - eye0);
-                        lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
-                        if (lookDist < 1e-4) lookDist = sceneR;
+                // T toggles the live path-traced (fast RGB backward) preview vs. flat raster.
+                if (nav.toggleTrace) {
+                    if (!traceAvail) {
+                        std::printf("[viewer] path-trace preview unavailable (scene/camera outside fast-RGB GPU scope)\n");
+                    } else {
+                        traceMode = !traceMode;
+                        traceDirty = true;   // restart accumulation at the current pose
+                        changed = true;      // repaint immediately (raster if off; re-aim if on)
+                        std::printf("[viewer] path-trace preview %s\n",
+                                    traceMode ? "ON (fast RGB backward)" : "OFF (raster)");
                     }
+                    std::fflush(stdout);
+                }
+                // Reset is the reliable "put me back to a normal, steerable state" escape:
+                // ALWAYS return to free flight at the authored pose. Previously, resetting
+                // while locked to the path only rewound the timeline but LEFT you locked —
+                // with mouse-look suspended — so a user who got locked (e.g. by an accidental
+                // click on the timeline slider, which snaps+locks onto the path) was stuck:
+                // the view wouldn't steer and Reset didn't help. Now Reset also RELEASES the
+                // path lock (and stops playback), so it dependably restores free-flight look.
+                // Rewinding-while-locked is still available via the timeline / Play-from-top.
+                if (nav.reset) {
+                    if (pathMode) {
+                        pathMode = false; playing = false;
+                        std::printf("[viewer] path lock OFF (reset -> free flight)\n"); std::fflush(stdout);
+                    }
+                    pathPos = 0.0;
+                    eye = eye0; fwd = norml(tgt0 - eye0);
+                    lookDist = std::sqrt(dot(tgt0 - eye0, tgt0 - eye0));
+                    if (lookDist < 1e-4) lookDist = sceneR;
                     changed = true;
                 }
 
@@ -5604,15 +5860,75 @@ static int run(int argc, char** argv) {
                 }
 
                 Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
-                if (changed) {
+                // A real, display-changing frame vs a GPU keep-warm-only frame. `changed`
+                // is set by any actual input; a keep-warm frame renders solely to hold the
+                // boost clock during the grace window and never touches the window/overlay.
+                bool active = changed || nav.any() || playing;
+                if (active) lastActiveT = clock::now();
+                double idleFor = std::chrono::duration<double>(clock::now() - lastActiveT).count();
+                // Warm-only frame: hold the boost clock, but ONLY during a genuine pause
+                // (idleFor past the gap) and never during an active drag — so it can't steal
+                // the slot that samples the next scrub position (the timeline-"chunking" bug).
+                bool warmOnly = gpuWarmKeep && !changed &&
+                                idleFor >= kWarmGapSec && idleFor < kWarmGraceSec;
+                // `tracingNow` is set below when the path-traced preview is actively refining
+                // this idle pose; it suppresses the raster warm-frame and the idle sleep so the
+                // image keeps converging (the accumulate() launch already holds the GPU warm).
+                bool tracingNow = false;
+#ifdef HAVE_CUDA
+                if (traceMode && traceAvail) {
+                    Camera c; c.projection = proj;
+                    c.lookAt(eye, tgt, rUp, rFov, VW, VH);
+                    // (Re)create the resident session on first use or after a resize.
+                    if (!traceSess || traceResX != VW || traceResY != VH) {
+                        if (traceSess) backwardRGBSessionEnd(traceSess);
+                        traceSess = backwardRGBSessionBegin(scene, VW, VH, g_maxBounceOverride, g_directOnly);
+                        traceResX = VW; traceResY = VH;
+                        traceFilm.resX = VW; traceFilm.resY = VH; traceFilm.alloc();
+                        traceDirty = true;
+                    }
+                    if (changed) {
+                        // Camera moved: show the responsive raster and mark the trace stale.
+                        std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                        drawOverlay(c, VW, VH, img);
+                        g_liveWin->update(VW, VH, img);
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                            ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
+                        traceDirty = true;
+                        changed = false;
+                    } else if (traceSess) {
+                        // Idle: re-aim on the first still frame after a move, then keep adding
+                        // sample batches until the pose is well converged.
+                        if (traceDirty) {
+                            backwardRGBSessionSetCamera(traceSess, c);
+                            traceAnchor = 0.0;   // re-lock auto-exposure for the new pose
+                            traceDirty = false;
+                        }
+                        if (backwardRGBSessionSamples(traceSess) < kTraceCapSpp) {
+                            long long spp = backwardRGBSessionAccumulate(traceSess, kTraceBatchSpp, /*diffraction*/false);
+                            backwardRGBSessionDownload(traceSess, traceFilm);
+                            std::vector<uint8_t> img = filmToRgb8(traceFilm, (double)spp, ev,
+                                                                  scene.absolute, &traceAnchor);
+                            drawOverlay(c, VW, VH, img);
+                            g_liveWin->update(VW, VH, img);
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  path-trace " +
+                                                std::to_string(spp) + " spp  eye(" + fmt3(eye) + ")");
+                            tracingNow = (spp < kTraceCapSpp);   // more to refine -> keep spinning
+                        }
+                    }
+                }
+#endif
+                if (!traceMode && (changed || warmOnly)) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     std::vector<uint8_t> img =
                         rasterOne(c, VW, VH, ev, autoExp, nullptr);
-                    drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
-                    g_liveWin->update(VW, VH, img);
-                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
-                                        ")  dir(" + fmt3(fwd) + ")");
+                    if (changed) {   // only a real change repaints the window
+                        drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
+                        g_liveWin->update(VW, VH, img);
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                            ")  dir(" + fmt3(fwd) + ")");
+                    }
                     changed = false;
                 }
                 if (nav.print) {
@@ -5641,12 +5957,22 @@ static int run(int argc, char** argv) {
                         if (std::fabs(sp - lastSpdSent) > 5e-3) { g_liveWin->setSpeedLabel(sp); lastSpdSent = sp; }
                     }
                 }
-                // Sleep only when truly idle; while a throttle key is held, the mouse is
-                // steering, or the path is auto-playing we loop at full raster speed for
-                // smooth continuous motion.
-                if (!nav.any() && !playing)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                // Sleep policy. While a throttle key is held, the mouse is steering, or the
+                // path is auto-playing we loop at full raster speed for smooth motion. A
+                // warm-only frame already ran the GPU this iteration (continuous during a
+                // pause to hold the clock) so it never sleeps. Otherwise: inside the grace
+                // window we take only a SHORT 3 ms nap — short enough that the next scrub/
+                // drag event drains promptly (the timeline tracks the thumb without chunking)
+                // yet not a busy spin; past the grace window we sleep the full idle interval
+                // and let the card power down.
+                if (!nav.any() && !playing && !warmOnly && !tracingNow) {
+                    bool inGrace = gpuWarmKeep && idleFor < kWarmGraceSec;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(inGrace ? 3 : 15));
+                }
             }
+#ifdef HAVE_CUDA
+            if (traceSess) backwardRGBSessionEnd(traceSess);   // free the resident preview session
+#endif
             g_stopRequested = 1;   // window closed → done
         }
 #ifdef HAVE_CUDA
@@ -5713,7 +6039,8 @@ static int run(int argc, char** argv) {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
-                    mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
+                                            g_maxBounceOverride, g_directOnly);
                     onGpu = true;
                 }
 #endif
@@ -5761,7 +6088,8 @@ static int run(int argc, char** argv) {
                 bool refGpu = false;
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
-                    ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction);
+                    ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
+                                             g_maxBounceOverride, g_directOnly);
                     refGpu = true;
                 }
 #endif
@@ -5799,7 +6127,7 @@ static int run(int argc, char** argv) {
         // + up to kMeterMax full-res CPU gathers) is the pre-pass that used to take tens
         // of minutes while the GPU idled. Gated exactly like runSharedPhotonMap's GPU
         // branch; any miss falls through to the per-frame loop below unchanged.
-        if (meterGpu && g_pmFinalGather == 0 && cudaPhotonMapSupported(scene)) {
+        if (meterGpu && cudaPhotonMapSupported(scene)) {
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
                 if (mc.mode != 'M')    allM = false;
@@ -5829,7 +6157,7 @@ static int run(int argc, char** argv) {
                     };
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
                                           diffraction, meterSpp, nullptr, &onFrame,
-                                          nullptr, nullptr, g_heroC);
+                                          nullptr, nullptr, g_heroC, g_pmFinalGather);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -6205,13 +6533,14 @@ static int run(int argc, char** argv) {
             const bool wantAuto = !std::strcmp(device, "auto");
             bool allPinhole = true;
             for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
-            if ((wantGpu || wantAuto) && g_pmFinalGather == 0 && allPinhole &&
+            if ((wantGpu || wantAuto) && allPinhole &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
                 std::printf("[camera] shared photon map (mode M) on %s: %zu cameras, %lld "
-                            "photons, radius %.4g (light=%s) ...\n",
-                            cudaDeviceName(), cams.size(), N, radius, lightLabel);
+                            "photons, radius %.4g (light=%s)%s ...\n",
+                            cudaDeviceName(), cams.size(), N, radius, lightLabel,
+                            g_pmFinalGather > 0 ? " [final gather]" : "");
                 EnergyReport e;
                 // Drive the live window (per the always-`-window` rule): the shared gather
                 // reports each frame's converging film here so the window shows it build up
@@ -6247,7 +6576,8 @@ static int run(int argc, char** argv) {
                                           diffraction, spp,
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
-                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC);
+                                          g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
+                                          g_pmFinalGather);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
@@ -6299,7 +6629,8 @@ static int run(int argc, char** argv) {
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
-                           preview, intervalSec, noiseTarget, wavefront, anchor);
+                           preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward,
+                           maxBounceOverride, directOnly);
         if (rv != 0) return rv;
     }
 

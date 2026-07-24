@@ -1,4 +1,36 @@
 
+"cudaBackwardSupported rejects participating media (fog/haze), environment lights, fluorescence, and spot/collimated emitters." 
+By this do you mean that the CPU mode does those things, but the GPU mode doesn't?
+
+We render one wavelength per sample (spectral), so a colored image needs many spectral samples where POV-Ray resolves RGB in one. That's an inherent 3–30× sampling disadvantage baked into the physically-spectral design.
+
+Mode R is brute-force unbiased path tracing — full GI, up to 32 bounces, noise ∝ 1/√spp. POV-Ray's default is deterministic Whitted shading (direct light + sharp reflection/refraction) with adaptive AA — it "converges in one pass." POV-Ray's radiosity/photons/media are opt-in and also slow.
+
+gallery_settled has heterogeneous volumetric media (VDB/isosurface-bounded fog + global haze) with per-ray free-flight sampling. That's the actual killer — POV-Ray doing equivalent media wouldn't be interactive either.
+
+"okay, let's implement all the cpu features in the gpu mode too. but i also want a renderer that does RGB so we can do it much faster. my original intention for the backward renderer was for it to be very fast. 
+
+for these two things:
+Mode R is brute-force unbiased path tracing — full GI, up to 32 bounces, noise ∝ 1/√spp. POV-Ray's default is deterministic Whitted shading (direct light + sharp reflection/refraction) with adaptive AA — it "converges in one pass." POV-Ray's radiosity/photons/media are opt-in and also slow.
+
+gallery_settled has heterogeneous volumetric media (VDB/isosurface-bounded fog + global haze) with per-ray free-flight sampling. That's the actual killer — POV-Ray doing equivalent media wouldn't be interactive either.
+
+we can have options to ignore certain things in the scene that would slow it down similarly to how the rasterizer does."
+^ doing
+then:
+Opus: Make sure the GPU version of the new RGB raytracer, in both ignoring features mode and not ignoring features mode, is fully implemented on GPU
+Opus: Go through all the rendering modes and see if any of them have CPU fallbacks for unsupported features that could be implemented in GPU mode.
+^ doing
+When Opus finishes, tell it: Update the .md file you wrote explaining all the various CPU fallbacks to reflect the new GPU support additions.
+Fable: The backward raytracer was made to support more features on the GPU path, and a new RGB-mode backward raytracer was made, with options to ignore certain scene features for speed. Optimize the GPU-intensive spots for the new features in the GPU path for the old backward raytracer and also the CPU- and GPU-intensive spots for the new RGB backward raytracer, CPU and GPU modes, and when you're done, show me speedup percentages.
+Fable: Also, we did 
+Image-based env NEE in GPU backward — sampler already on device, just wire it into bkNeeEnv. Also unblocks mode P camera-side.
+Env term in the mode-M GPU gather — small kernel addition, unblocks env-lit photon maps.
+GPU SPPM — reuses existing deposit + gather kernels; biggest quality-mode win.
+Mode-M final gather on GPU — high value, more work.
+Longer tail: rainbow media on device, GPU BDPT per-hit BSDFs, GRIN marcher, GPU VCM.
+--
+
 when rendering a flyby / multiple cameras, make sure the terminal shows which stages of the render are being shared between frames (or if none are) and whether grainy noise is shared between cameras, since these seem to differ according to which mode is used
 
 --

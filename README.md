@@ -36,16 +36,22 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
   **density fields** — either formula-defined blobs with soft edges *or* imported
   **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
-  tracking on the forward modes (CPU and GPU).
+  tracking on the forward modes (CPU and GPU) **and the backward reference (mode
+  `R`) on both CPU and GPU** (GPU backward runs homogeneous *and* heterogeneous
+  media natively, including spectral **rainbow-phase** media, and **gradient-index
+  (GRIN) media** on the backward reference now run on GPU too).
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward
   light tracer (modes `A`/`B`/`C`, CPU **and GPU**) and the backward reference
-  (mode `R`, CPU); BDPT (`D`) refuses GRIN scenes (its straight-line connection
-  geometry would be biased — use `A`/`B`/`C` or `R`).
+  (mode `R`, CPU **and GPU** — the device runs the same Eikonal marcher, matching
+  the CPU to the device float-precision envelope); BDPT (`D`) refuses GRIN scenes
+  (its straight-line connection geometry would be biased — use `A`/`B`/`C` or `R`).
 - **CUDA GPU backend** for the forward pinhole splat (mode `B`), the backward and
-  BDPT references (`R`/`D`), and the **view-independent photon map** (`M`, shared
-  across a whole camera flythrough), megakernel or wavefront, with CPU fallback.
+  BDPT references (`R`/`D`), the **view-independent photon map** (`M`, shared
+  across a whole camera flythrough), **stochastic progressive photon mapping**
+  (`S`, a resident per-pixel SPPM session), and **VCM/UPS** (`U`, a resident
+  vertex connection + merging session), megakernel or wavefront, with CPU fallback.
 - **Whole camera flybys in one render** — some modes amortise a *single* light
   transport pass across an entire moving-camera shot. The **view-independent photon
   map** (mode `M`) is built **once** from one forward photon pass, then reused to
@@ -63,9 +69,9 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   across the flyby, correct per-view angle, clean non-frozen grain). It deliberately
   drops the multiple-scatter haze wash, so the bow is actually *crisper* than the
   shared baseline. Runs on **both CPU and GPU** (the per-camera in-scatter resample is
-  ported to the CUDA forward tracer; spectral-rainbow-phase media are still CPU-tabulated
-  and fall back to CPU). Rainbows/fogbows/glories are single scatter, so this loses
-  nothing that matters for them.
+  ported to the CUDA forward tracer, and spectral-rainbow-phase media now run on the GPU
+  too — the λ×µ Airy phase table is uploaded per-medium). Rainbows/fogbows/glories are
+  single scatter, so this loses nothing that matters for them.
 - **Interactive flypath viewer & editor** — the live `-window` viewer doubles as a
   **camera-curve editor**: author a real `camera_curve` flypath *by flying it* —
   record / insert / delete / steer control points, paint per-point speed and look
@@ -174,8 +180,8 @@ paths they can capture at all**.
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
-| `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU |
-| `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU |
+| `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
+| `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
 
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
 > and *camera motion* before committing to a full render, `-raster` skips light
@@ -326,8 +332,10 @@ paths they can capture at all**.
 > **Control panel (below the image).** The live window reserves a strip under the
 > preview for on-screen controls, so you don't have to remember key bindings. Two
 > buttons are always present: **Clip** (cycles the same `slide` → `stop` → `noclip`
-> collision modes as `C`, showing the current mode) and **Reset** (jumps back to the
-> start — the authored camera in free flight, or frame 0 of the path when locked).
+> collision modes as `C`, showing the current mode) and **Reset** (a dependable escape:
+> **releases any path-lock and returns to the authored camera in free flight**, so
+> mouse-look always works again afterwards — handy if you accidentally locked onto the
+> path by clicking the timeline).
 > When you entered via `-explore` / `-fly` on a **multi-frame flyby**, the panel also
 > gains the flyby's **camera-path timeline** and its controls:
 >
@@ -497,9 +505,23 @@ that converges to the same physical image.
   fluorescent tracer). GPU-accelerated (its own backward megakernel, which also drives
   the **physical multi-element lens** camera on the GPU). It gets **noisy on caustics**
   (light focused through glass/water is hard to find backward). *GPU scope:* the
-  megakernel covers area/sphere/cylinder Lambertian lights and all the
-  specular/textured materials; scenes using fog, environment lights, spot/collimated
-  lights, or fluorescence fall back to the CPU tracer automatically.
+  megakernel covers area/sphere/cylinder Lambertian **and point-spot** lights, all the
+  specular/textured materials, **participating media** (homogeneous + heterogeneous),
+  **fluorescence** and **both constant *and* image-based (lat-long HDR) environment
+  lights** (env-NEE + MIS'd env-miss, at surface *and* fog vertices — the image env is
+  importance-sampled on-device from its luminance CDF; **spectral rainbow-phase media**
+  and **gradient-index (GRIN) media** — the same Eikonal marcher as the CPU — also run
+  on-device now); scenes using collimated beams still fall back to the CPU tracer
+  automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
+  sampling one wavelength per sample it carries an RGB throughput triple and does one
+  intersection walk per full-colour sample, so a clean colour image converges much
+  faster. Materials bake to a per-material linear-RGB albedo and emitters/env to a
+  linear-RGB radiance at scene build; achromatic specular uses a 550 nm representative
+  wavelength. On spectrally-flat scenes it matches the spectral backward's absolute
+  luminance to noise; colour scenes carry an Option-B approximation (no dispersion /
+  thin-film / spectral fluorescence). `-rgb` falls back to the spectral backward (with a
+  warning) on scenes outside its scope (media, image-env, textured/record albedo, exotic
+  materials).
 - **`V` — validate.** Runs `B` and `R` and reports their residual; a correctness
   check, not a production renderer (roughly twice the work).
 - **`P` — composite (fills in what `B` misses).** Uses fast forward `B` for
@@ -546,11 +568,15 @@ that converges to the same physical image.
   contact shadows and fine detail **sharp** while still smoothing indirect light, at
   roughly `K`× the per-sample cost (so pair it with fewer `-spp`). Directly-viewed
   emitters carry a little chromatic speckle at low spp. Best when many cameras share one
-  lighting solution. **GPU-accelerated** for the direct density query: the device
-  deposits the photon pass, hands the hits to the same grid builder, then gathers every
-  camera on the GPU from the one shared map — so a whole flythrough builds the map once
-  and renders each frame in device time (a `-pmfg` final gather still falls back to the
-  CPU, as do env-lit or unsupported-material scenes). The built map can also be
+  lighting solution. **GPU-accelerated** for both the direct density query *and* the
+  `-pmfg` Jensen final gather: the device deposits the photon pass, hands the hits to the
+  same grid builder, then gathers every camera on the GPU from the one shared map — so a
+  whole flythrough builds the map once and renders each frame in device time. Environment
+  lights (constant **and** image-based lat-long HDR, M2) are handled on the GPU: the
+  deposit emits env photons for the indirect bounces and the device gather adds env's
+  direct term on gather-ray escape. The final gather (M4) runs its NEE direct term plus
+  the `K` cosine-hemisphere sub-rays' one-bounce density queries entirely on the device.
+  (Unsupported-material scenes and physical-lens cameras still fall back to the CPU.) The built map can also be
   **persisted to disk** with `-savemap <f>` and reloaded with `-loadmap <f>`: because it
   is view-independent, a reloaded map re-gathers new camera angles or a new gather radius
   **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
@@ -568,8 +594,12 @@ that converges to the same physical image.
   directly. `-n` is photons **per pass**, `-spp` is the **number of passes** (or use a
   `-time`/`-noise`/`-forever` budget); the radius-shrink rate is `-sppmalpha` (default
   `0.7`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`. A single pass reduces
-  exactly to mode `M`. CPU only. *Cost:* many passes to converge; the running preview
-  starts blurry (large radius) and sharpens as the radius shrinks.
+  exactly to mode `M`. GPU-accelerated (`-device gpu`/`auto`): a resident device SPPM
+  session keeps every pixel's progressive state (flux/radius/count + this pass's visible
+  point) on the GPU across passes and reuses the mode-`M` deposit + an on-device
+  gather/update — same scope as the GPU photon map (pinhole cameras); otherwise it runs on
+  the CPU. *Cost:* many passes to converge; the running preview starts blurry (large
+  radius) and sharpens as the radius shrinks.
 - **`U` — VCM/UPS (the "have it all" estimator).** Vertex Connection and Merging
   (Georgiev et al. 2012, a.k.a. Unified Path Sampling): each pass traces a **light
   subpath and a camera subpath per pixel**, and combines **every** BDPT-style vertex
@@ -599,8 +629,8 @@ and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of
 the forward megakernel, **`D`** via its own GPU BDPT megakernel, **`R` (including the
 physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
 reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
-is within the backward-GPU scope — and the **`M` photon map** (direct density query),
-which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s
+is within the backward-GPU scope — and the **`M` photon map** (direct density query
+*and* `-pmfg` final gather), which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s
 backward reference (kept on the CPU as a stable ground truth), remain CPU-only. The
 composite `P` classifies its pixels once, then alternates forward and backward batches
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
@@ -617,28 +647,39 @@ stay non-resumable.
   `A`/`B`/`C` on a non-fluorescent scene, mode `D`'s BDPT megakernel, mode `R`'s
   backward megakernel — including the physical-lens camera — both layers of the
   mode-`P` composite, or mode `M`'s shared photon map with the direct density query
-  on a non-env, pinhole scene); otherwise the CPU. Prints its choice.
+  on a pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (env/spot/collimated lights, fluorescence; any fog for `R`), for a mode-`M` render
-  that uses a `-pmfg` final gather or an env light, and for
-  fluorescent/oversized-mix forward scenes. Mode `D`'s GPU BDPT megakernel renders
+  (spot/collimated lights; GRIN media in mode `D` BDPT — mode `R` now runs fog, spectral
+  **rainbow-phase** media, **GRIN gradient-index bending**, fluorescence, and constant *and*
+  image-based env lights on the device), and for
+  fluorescent/oversized-mix forward scenes (mode `M`'s `-pmfg` final gather now runs
+  on the GPU too). Mode `D`'s GPU BDPT megakernel renders
   **all** participating media — haze, superposed, bounded, and heterogeneous
   `density`-field fog — directly on the device. Implicit surfaces / `isosurface`, **procedural patterns**, and
   **dielectric translucency** (frosting + Beer–Lambert colored-glass tint) are all
   GPU-accelerated now — the device sphere-traces the same field expressions, runs the
   same pattern VM, and threads the interior-absorption medium through both the forward
-  and backward tracers. GPU **BDPT** (mode `D`) still falls back for any pattern-driven
-  material *or* frosted/colored glass, whose per-hit BSDF its MIS kernel can't yet
-  reproduce. **Parametric records** (a material's slots driven by a per-hit driver
-  sampling a named LUT bank — see *Parametric records* below) run on the **GPU forward
-  and backward tracers for both the reflect/albedo and roughness slots** (constant stop
-  selectors bake into the device material; per-hit driven reflect uploads the record's
-  baked LUT + driver program, and a driven scalar/roughness slot uploads each stop's
-  compiled expression + driver — both sampled on-device by exact twins of the CPU
-  sampler). **Any** record-bound scene still falls back on GPU **BDPT** (mode `D`) —
-  its MIS connection BSDF has no per-hit surface point to evaluate the driver. The
-  fallback is automatic. `cpu` is fully deterministic and is used for reference/validation baselines.
+  and backward tracers. GPU **BDPT** (mode `D`) now threads the **per-hit surface point**
+  (texcoords stored on each path vertex, reconstructed into a `Hit` for the connection
+  BSDF) so textured/patterned/record-driven diffuse albedo & glossy reflect, per-hit
+  glossy roughness + thin-film maps, mix blend masks, Beer–Lambert **colored-glass**
+  interior absorption, **diffuse-transmit** (two-sided Lambertian — both lobes +
+  back-hemisphere connections), and **frosted (rough) glass** (stochastic-delta lobe jitter
+  by per-hit roughness) all render **on-device** with MIS-consistent densities — the GPU
+  BDPT scope now matches the CPU BDPT exactly (no per-material fallback). (Fluorescence,
+  layered stacks, and spot/env/collimated lights aren't a GPU limitation — BDPT can't render
+  them on *any* backend, so mode `D` refuses or drops to mode `B` for those scenes on both
+  CPU and GPU; use mode B/P/R for them. GRIN media keep an in-scope mode-`D` scene on
+  the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
+  material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
+  records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
+  reflect/albedo and roughness slots** (constant stop selectors bake into the device
+  material; per-hit driven reflect uploads the record's baked LUT + driver program, and a
+  driven scalar/roughness slot uploads each stop's compiled expression + driver — both
+  sampled on-device by exact twins of the CPU sampler; mode `D`'s connection BSDF
+  reconstructs the per-hit point to sample the driver). The fallback is automatic. `cpu`
+  is fully deterministic and is used for reference/validation baselines.
 - **`-wavefront` vs. the default megakernel** (GPU forward renders only). Both run
   identical, exactly energy-conserving physics. The **megakernel** runs each
   photon's whole path in one thread and is usually fastest on **shallow, uniform
@@ -763,7 +804,7 @@ Declared with `material "name" { type <type> … }`.
 | Type | Description | Key parameters |
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
-| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). CPU only. Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
+| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). Both lobes and the back-hemisphere connections run **on the GPU in mode D** (BDPT, M9). Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
 | `dielectric` | Refractive glass with dispersion, optional **frosting**, **colored-glass tint** and **nested-dielectric priority** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption; `priority <N>` (integer) disambiguates overlapping dielectrics — see below |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
@@ -809,7 +850,8 @@ two physically-motivated translucency controls (both compose with dispersion):
   spectrum (e.g. `absorb gaussian center=470 sigma=60 amp=14` for amber). Interior
   absorption is threaded through all three CPU transport loops (forward, backward,
   BDPT); see `scenes/translucency.ftsl`. *(GPU: forward + backward `R` accelerate both
-  frosting and colored-glass tint; mode-`D` BDPT still falls back to the CPU.)*
+  frosting and colored-glass tint; mode-`D` BDPT now runs colored glass **and** frosted
+  (rough) glass on-device too (M9).)*
 
 **Nested dielectrics (`priority`).** When two glass/liquid solids overlap — a glass
 ice cube in a whisky, a lens cemented to another, a coating flush against a body — the
@@ -857,9 +899,10 @@ sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled 
 Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
 is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
 A record driving the **reflect/albedo** *or* **roughness** slot runs on the **GPU**
-forward and backward tracers (the LUT/stop programs + driver upload to the device and
-are sampled by device twins of the CPU sampler); any record-bound scene still falls back
-on **GPU BDPT** (mode `D`). Fallback is automatic. See FTSL.md §7.5 for the full grammar.
+forward, backward, **and BDPT (`D`)** tracers (the LUT/stop programs + driver upload to
+the device and are sampled by device twins of the CPU sampler; mode `D`'s connection BSDF
+reconstructs the per-hit point to sample the driver). Fallback is automatic. See FTSL.md
+§7.5 for the full grammar.
 
 ---
 
@@ -1507,9 +1550,10 @@ Bind a pattern anywhere a scalar `texture:<name>` map is accepted, using
 weight makes the *material itself* — colour **and** BSDF type — vary from point to
 point (checkerboard of red vs green diffuse, noise-selected metal vs glass, …). See
 `scenes/procedural.ftsl`. *(GPU: patterns run on the device forward and backward
-paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT is the
-exception — its MIS kernel falls back to the CPU for any pattern or frosted/colored
-glass.)*
+paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
+(mode `D`) now runs pattern-driven diffuse albedo / glossy reflect & roughness, thin-film
+maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device too
+(per-hit point threaded through its MIS kernel).)*
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`
@@ -1534,9 +1578,9 @@ secondary), **Alexander's dark band**, and **supernumerary arcs**. Features are 
 default; block knobs (`droplet_um`, `secondary`, `supernumerary`, `strength`,
 `forward_g`, `secondary_ratio`) tune or disable them — small drops broaden toward a
 white **fogbow**. Point the camera at the antisolar point with a distant sun behind it
-and keep the fog thin (single-scatter regime). Evaluated by the CPU tracers (forward
-A/B/C, backward R, BDPT D); a rainbow-phase scene automatically falls back to the CPU
-on the GPU backend (the device volume path is HG-only). See FTSL.md §12.
+and keep the fog thin (single-scatter regime). Evaluated on **both CPU and GPU** across
+forward A/B/C, backward R, and BDPT D — the λ×µ Airy phase table + per-λ CDF is uploaded
+per-medium and importance-sampled on the device (no CPU fallback). See FTSL.md §12.
 
 **Multiple, overlapping media.** Author as many `medium` blocks as you like — they
 coexist as independent regions (e.g. two differently-tinted fog orbs plus a faint
@@ -1604,7 +1648,7 @@ volumes are bounded by a safety cap; a native sparse device sampler is a future
 optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
 `density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
-**Gradient-index (GRIN) media — bending light *(experimental, mode `R` only)*.** Give a
+**Gradient-index (GRIN) media — bending light.** Give a
 medium an `ior "<expr over x y z r>"` field (or `ior pattern:<name>`) and it becomes a
 **gradient-index region**: rays that enter its `bounds{}` no longer travel straight — they
 **bend continuously**, integrating the Eikonal ray equation `d/ds(n·dr/ds)=∇n` with a
@@ -1612,10 +1656,12 @@ small symplectic march step (`ior_step <v>`, default 1/64 of the smallest bound 
 This makes mirages, hot-air shimmer, and **gradient lenses that focus/warp with no glass
 surface at all**. E.g. `medium { bounds { center 0 0 2 radius 0.9 } ior "1.6 - 0.6*(sqrt(x*x+y*y+(z-2)*(z-2))/0.9)" }`
 is a radial index ball (n=1.6 core → 1.0 rim) that visibly lenses a checkerboard behind it
-(`scenes/grin_lens.ftsl`). **Currently only the CPU backward tracer (mode `R`) bends GRIN
-rays** — the forward modes (A/B/C), BDPT `D`, and all GPU paths still trace these regions
-straight (they ignore `ior`), so render a GRIN scene with `-mode R -device cpu` for now.
-Wiring the Eikonal march through the other tracers/GPU is tracked in `known-issues.md`.
+(`scenes/grin_lens.ftsl`). GRIN bending runs on the **forward light tracer (modes `A`/`B`/`C`)
+and the backward reference (mode `R`), on both CPU and GPU** — all share one symplectic
+marcher (the GPU carries its running Eikonal state in double to match the CPU; a small
+bent-region float-vs-double residual on the GPU is noted in `known-issues.md`). Only **BDPT
+(mode `D`)** still refuses GRIN (its straight-line connection geometry would be biased) — use
+`A`/`B`/`C` or `R` for a GRIN scene.
 
 **Authoring media procedurally (loom).** The [loom toolkit](tools/loom/README.md) emits
 these `medium {}` blocks from a `loom.Volume(...)`: `sigma_t` / `albedo` / `g` are
@@ -2045,6 +2091,19 @@ add-on), this doubles as a Blender → FTSL path.
 | `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, and `V`; **number of passes** for SPPM (`S`) and VCM (`U`) |
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 
+**Scene-ignore (speed knobs)** — rasterizer-style flags that strip or cap expensive
+scene features so a render (especially the backward camera modes `R`/`P`, and the fast
+`-rgb` path) runs faster. The three strip flags mutate the scene once at load and print an
+`[ignore] stripped: …` summary; `-max-bounce` / `-direct-only` are render parameters.
+
+| Flag | Meaning |
+|---|---|
+| `-no-media` / `-nomedia` | Drop all participating-media volumes (fog / homogeneous / heterogeneous). Also un-gates the fast `-rgb` backward, which otherwise falls back to spectral on any medium. |
+| `-no-env` / `-noenv` | Remove the environment light (constant or image-based): the scene renders against black, and the emitter CDF is rebuilt without it. |
+| `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
+| `-max-bounce <N>` | Cap path depth at `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, and the photon modes). Default is the tracer's own cap (32). |
+| `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
+
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
 the composite `P`, and the photon modes `M`/`S`/`U`), on both CPU and GPU. `-resume` /
@@ -2066,7 +2125,7 @@ alone can't restore, so they are not disk-resumable.
 | `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
-| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. |
+| `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `T` = live path-traced preview (see below), `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. **`T` — live path-traced preview:** toggles the still view between the flat raster (default, instant) and a **progressively path-traced** image rendered with the fast **RGB backward** tracer (the Stage-2 `-rgb` walk). While the camera holds still the image **converges in place** (the window title shows the accumulated `spp`); the moment you move it drops back to the responsive raster and **re-aims**, so navigation stays fluid while a paused view refines to a real render. GPU-only, and available when the scene+camera are inside the fast-RGB scope (same scope as `-rgb`); the scene-ignore flags (`-no-media`/`-no-env`/`-no-fluoro`, `-max-bounce`, `-direct-only`) apply to it too, so you can strip/cap the scene for a faster preview. |
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |

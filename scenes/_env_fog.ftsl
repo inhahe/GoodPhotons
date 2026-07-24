@@ -1,0 +1,37 @@
+# Constant-env + homogeneous fog Cornell — validation scene for the GPU-vs-CPU backward
+# VOLUME env path (bkNeeEnvVolume env-NEE at fog scattering vertices, plus the HG-phase
+# contBsdfPdf env-miss MIS on rays that scatter in fog and then escape the open top).
+# Open-topped box lit ONLY by a constant sky env, filled with haze; no area light.
+# The GPU backward (mode R) and CPU backward must converge to the SAME image.
+#
+#   ftrace -in scenes/_env_fog.ftsl -mode R -n 512 -o png/_envfog_gpu.png
+#   ftrace -in scenes/_env_fog.ftsl -mode R -device cpu -n 512 -o png/_envfog_cpu.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+# (ceiling omitted — open to the sky)
+
+sphere { center 0.4 0.25 0.45   radius 0.22   material white }
+
+# Homogeneous global haze (unbounded; treated as backwardMedium() by mode R). g=0.6
+# exercises the HG-phase sign in both bkNeeEnvVolume and the env-miss contBsdfPdf MIS.
+medium { sigma_t 0.6   albedo 0.85   g 0.6 }
+
+light env { spd preset:d65 }
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

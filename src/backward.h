@@ -51,6 +51,13 @@
 
 struct BackwardRenderer {
     int maxBounce = 32;
+    // Direct-only (Whitted) preview (CLI -direct-only): after a non-specular
+    // (diffuse / diffuse-transmit / fluorescent-elastic / fog-scatter) vertex does its
+    // direct-lighting NEE, terminate instead of spawning the indirect continuation.
+    // Specular chains (mirror / dielectric / glossy / filter) still recurse, so the
+    // image keeps sharp reflections/refractions and direct+specular caustics but drops
+    // diffuse GI — converging in ~1 spp. Left false = full unbiased path tracing.
+    bool directOnly = false;
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
     int  heroC = hero::kHeroC;  // wavelengths bundled per camera path when hero is on
                                 // (runtime -heroc N, clamped to [1, kHeroMax]; 1 = single-λ)
@@ -496,6 +503,7 @@ struct BackwardRenderer {
                         }
                     }
                 }
+                if (directOnly) return false;                // Whitted: no indirect (elastic or fluoro)
                 double wFluo = gOut * rhoFluo;               // natural indirect-fluoro weight
                 double pF = (wFluo > 0.0) ? std::min(std::max(0.0, 1.0 - rhoEl), wFluo) : 0.0;
                 double u = rng.uniform();
@@ -529,6 +537,7 @@ struct BackwardRenderer {
                 L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                if (directOnly) return false;            // Whitted: no diffuse indirect
                 double u = rng.uniform();
                 if (u < rhoR) {                          // reflect continuation (front)
                     Vec3 wOut = cosineHemisphere(h.n, rng);
@@ -549,6 +558,7 @@ struct BackwardRenderer {
                 L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache);
                 if (scene.envIndex >= 0)   // env-NEE toward the sky (MIS'd on miss)
                     L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng);
+                if (directOnly) return false;   // Whitted: no diffuse indirect
                 // Russian roulette on the albedo (throughput unchanged on survival).
                 if (rng.uniform() >= rho) return false;
                 Vec3 wOut = cosineHemisphere(h.n, rng);
@@ -618,6 +628,7 @@ struct BackwardRenderer {
                         L += thr * neeVolume(scene, p, ray.d, lambda, invPdfLambda, rng, spdCache);
                         if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                             L += thr * neeEnvVolume(scene, p, ray.d, lambda, invPdfLambda, rng);
+                        if (directOnly) return L;  // Whitted: single-scatter only, no indirect
                         if (rng.uniform() >= scene.backwardMedium().albedo(lambda)) return L; // absorbed
                         Vec3 wOut = scene.backwardMedium().phaseSample(ray.d, lambda, rng, contBsdfPdf);
                         ray = Ray{p, wOut};
@@ -807,6 +818,7 @@ struct BackwardRenderer {
                     neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                    if (directOnly) { finish(); return; }        // Whitted: no diffuse indirect
                     double sumHero = rhoR[0] + rhoT[0];
                     double u = rng.uniform();
                     if (u < rhoR[0]) {                           // reflect (front)
@@ -848,6 +860,7 @@ struct BackwardRenderer {
                     neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
+                    if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
                     double rhoHero = rho[0];
                     if (rng.uniform() >= rhoHero) { finish(); return; }   // hero RR absorb
                     for (int i = 1; i < nUp; ++i) thr[i] *= rho[i] / rhoHero;  // secondary reweight

@@ -5,6 +5,136 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT — OPEN (2026-07-23): GPU VCM (mode U) downloads the whole light-vertex slab every pass (memory + PCIe overhead scales with resolution)
+
+Logged while implementing M12 (GPU VCM, `VcmSession` in render_cuda.cu). The device stores each
+light subpath's connectible vertices into a **per-path slab** `lvSlab[i·vcmCap + k]` (one fixed
+`vcmCap = maxDepth = 8`-vertex slice per pixel, chosen to avoid cross-thread atomics), and each
+pass `vcmSessionPass` **downloads the entire slab plus the per-path counts** and compacts it on
+the host into contiguous per-path ranges before rebuilding the merge grid and uploading it back —
+mirroring the SPPM session's download-photons-then-host-build pattern. This is correct and matches
+the CPU exactly (validated GPU==CPU on `absolute.ftsl`: mean luminance ratio 0.9993), but it has
+two costs that grow with resolution:
+
+- **Memory:** the slab is `npix · vcmCap · sizeof(DVcmLV)` (~128 B/vertex) = ~64 MB at 256², ~256 MB
+  at 512², ~1 GB at 1024². Fine on a 4090 at validation resolutions, but a large render could exhaust
+  device memory.
+- **Per-pass PCIe traffic:** the full slab is copied device→host every pass regardless of how few
+  slots are actually filled (most pixels store far fewer than `vcmCap` vertices), plus the compacted
+  array + grid are copied host→device — so a high pass count pays this round-trip repeatedly.
+
+**Proper fix (if ever warranted):** either (a) compact on-device (a prefix-sum over `lvCount` to
+pack vertices into a tight array, then download only the filled prefix — or skip the download
+entirely and build the grid on-device with a device counting sort), or (b) size the slab from a
+cheap first-pass occupancy estimate instead of the worst-case `vcmCap`. Deferred because the simple
+download-and-host-build is correct, matches the SPPM path, and is comfortably within budget at the
+resolutions VCM is used at today. Repro: render any mode-U scene `-device gpu` at increasing `-res`
+and watch device memory / per-pass time.
+
+### TECH-DEBT — OPEN (2026-07-23): mode-R GPU GRIN has a small bent-region float-vs-double residual (does not converge with spp)
+
+Logged while validating M11 (GRIN Eikonal marcher on the GPU backward path). The device
+marcher `dGrinMarch` (render_cuda.cu:2040) is algorithmically byte-identical to the CPU
+`grin::march` (grin.h) and accumulates its running (ro,rd) in **double** to mirror the CPU
+ground truth, so both backends bend rays by the same large amount and the images are
+structurally near-identical (SSIM ≈ 0.99, Pearson ≈ 0.99 on the linear-gradient validator).
+**But** a small *systematic* (non-noise) rel-error survives inside the **bent lens region**:
+
+| scene (`scraps/`) | disc rel-err | periphery rel-err | converges with spp? |
+|---|---|---|---|
+| `grin_lin.ftsl` (smooth linear `1.35-0.35*y`) | ~2.7% | ~0.7% | **disc does NOT** (2.90%→2.69% from 400→1600 spp); periphery halves (1.2%→0.69% = pure noise) |
+| `grin_val.ftsl` (strong radial caustic) | ~17% | ~1.7% | disc stays high; caustic amplifies it |
+
+Root cause (measured, not guessed): the device geometry/BLAS + `dMed*` queries run in
+**float** (Real=float, FTRACE_GPU_FP32) while the CPU is double. Through a gradient-index
+lens the ray→image map is magnified, so a sub-pixel float difference in the marched trajectory
+lands the warped high-contrast checker edge a fraction of a pixel away from the CPU — averaging
+to ~2.6% over the disc, scaling to ~17% in the caustic-heavy radial case. Accumulating the
+running Eikonal state in double (already done) does NOT remove it — the residual enters via the
+float geometry queries, and the same queries on the *straight-ray* periphery show ~zero bias
+(they converge to 0.69%), so it is pure lens amplification, not a marcher-logic error. A
+separate pre-existing global ~1.2× mode-R float-GPU vs double-CPU exposure difference exists
+even with NO medium and is folded into this (both are the device-float regime).
+
+Not a correctness bug (both backends bend correctly and agree structurally); it is the accepted
+GPU float-precision envelope showing up amplified in the bent region. **Proper fix (if ever
+warranted):** run the device geometry/BLAS intersection for GRIN-marched rays in double, or
+supersample the bent region on GPU — high cost for a sub-pixel edge placement difference, so
+deferred. Repro: render `scraps/grin_lin.ftsl -mode R` on `-device gpu` and `-device cpu`, then
+`python scraps/grin_residual.py png/grin_lin_gpu.png png/grin_lin_cpu.png` (watch disc rel-err
+vs spp).
+
+### BUG — OPEN (2026-07-23): GPU vs CPU participating-media brightness disagree systematically across modes (phase-independent, pre-existing)
+
+Discovered while statistically validating M10 (rainbow media on device). For a bounded
+homogeneous fog scene (`scraps/rb_val_lowvar.ftsl` / `rb_val_hg.ftsl`, absolute exposure so
+GPU and CPU share a FIXED gain), the GPU and CPU converge to **different overall brightness**
+for the SAME mode/scene — and the gap is **phase-independent** (a plain-HG control shows the
+same factor as a rainbow medium), so it is **not** an M10 rainbow bug:
+
+| mode | GPU↔CPU B/A (CPU/GPU), rainbow | HG control | notes |
+|---|---|---|---|
+| B (forward photon) | ~1.25 (median 1.02) | ~1.58 (median 1.00) | firefly-heavy; **bulk medians agree**, but the image *mean* and the `[energy]` line disagree |
+| D (BDPT) | **2.41 uniform** (median 2.44, p10=1.48…p90=4.27) | **2.41 uniform** | cleanest signal: well-converged (~3% noise), low firefly tail, uniform shift across *every* percentile ⇒ real systematic factor, not noise |
+| R (backward ref) | ~1000× (CPU near-black) | ~1000× | mode R forces media to a single GLOBAL homogeneous haze; camera embedded in fog renders lit-fog+bow on GPU but near-black on CPU ⇒ CPU mode-R likely mishandles camera-inside-global-haze in-scatter/NEE |
+
+Corroborating engine diagnostic: at albedo 0.5 (slab optical depth ~0.16) forward mode prints
+`[energy] absorbed=0.1516` on GPU vs `absorbed=0.0008` on CPU — a ~190× gap. GPU's ~0.15 is the
+physically-expected single-pass absorbed fraction; **CPU appears to barely absorb via medium
+albedo**, which would also make CPU *brighter* (consistent with B/A>1 in modes B and D). So the
+direction hints the **CPU** may be the wrong one (under-absorbing / an accounting-vs-transport
+mismatch) — but it could equally be the GPU BDPT missing volume connection strategies (which
+would make GPU dimmer). **Needs investigation to determine which backend is correct.**
+
+Scope: affects ALL GPU participating media (HG and rainbow alike); pre-existing (M10's git diff
+leaves the HG BDPT phase path bit-for-bit unchanged, yet HG still shows the 2.41×). Repro:
+`ftrace scraps/rb_val_hg.ftsl -mode D -o ppm/x_gpu.ppm -device gpu -noise 3` and again with
+`-device cpu`, then `python scraps/rb_robust_compare.py ppm/x_gpu.ppm 6 ppm/x_cpu.ppm 6`.
+Proper fix: reconcile the two backends' medium collision/absorption + BDPT volume-connection
+strategies so GPU==CPU converges to B/A≈1.0; likely a forward-medium albedo-absorption
+accounting fix on CPU and/or a missing GPU-BDPT volume strategy.
+
+### PERF — DONE (2026-07-23): interactive `-explore`/`-fly` felt intermittently slow (GPU parked in its idle power state between mouse-look bursts)
+
+Users reported the GPU rasterizer explorer being slow right after launch on
+`scenes/gallery_settled.ftsl`, then "suddenly fast" after moving around for a second or
+two in the *same* window (no resize, no restart), then slow again on a fresh `-explore`
+relaunch. This was NOT a rasterizer regression — `-raster-bench 200` on that scene reports
+**3.91 ms/frame (255 fps)** at 1440×810 warm, so the kernels are fast (the 92% speedup a
+prior session landed is real). The intermittency was **GPU DVFS**: the explorer re-renders
+ONE frame per camera move, then idle-sleeps 15 ms, so the NVIDIA driver reads the bursty,
+low-duty submission pattern as "idle" and parks the card in its lowest power state. Measured
+live on an RTX 4090 with `nvidia-smi`: **P8 @ 210 MHz idle vs P0/P2 @ 2520–2760 MHz under
+sustained load — a ~13× clock drop**, and ~33× slower for a first cold frame once
+first-frame allocations are added (an early interactive frame timed at ~130 ms / 7.6 fps vs
+3.9 ms warm). Only a second or two of *continuous* motion built enough sustained load to
+ramp the clocks — exactly the "slow → suddenly fast → slow again after relaunch" pattern.
+
+**Fix (main.cpp, explorer loop):** a GPU clock keep-warm grace window. For `kWarmGraceSec`
+(2.5 s) after the last real interaction, the loop keeps submitting GPU render work even when
+the frame hasn't changed — a "warm-only" `rasterOne` whose result is discarded and never
+touches the window/overlay — and skips the idle sleep, so the driver holds the boost clock
+through an active exploration session. Once the user is idle past the grace window the loop
+falls back to the passive 15 ms sleep and lets the card power all the way down. Gated on the
+discrete-GPU path (`gpuRaster != nullptr`); the CPU rasterizer is unaffected. Net effect:
+mouse-look no longer pays the cold-clock penalty on every fresh burst.
+
+**Follow-up (2026-07-23, 0.22.1): the first cut of the keep-warm made the timeline slider
+chunk.** The initial version rendered a discarded warm frame on *every* non-changed loop
+iteration during the 2.5 s grace window. During an active scrub drag, whenever `drainNav`
+briefly returned no new thumb position, the loop burned a full ~4 ms `rasterOne` warm frame
+while the user's thumb kept moving — so the next drain jumped several cameras ahead. Whether
+a warm frame landed in that gap was timing-dependent, so the timeline "chunked" by N cameras
+per drag *intermittently*, toggling within one session (reported after the keep-warm landed).
+Root cause: the warm frame stole the loop slot that would otherwise have sampled the next
+scrub position. Fix (final, 0.22.1): gate the warm frame on `kWarmGapSec` (0.10 s) of `idleFor`
+so it fires ONLY after a genuine pause — during an active drag the sub-frame gaps between input
+events stay under the gap, so warm frames are fully suppressed and every loop slot samples the
+next scrub position (smooth tracking, no chunk). Once past the gap (a real pause) warm frames
+run *continuously* to actually hold the boost clock; an intermediate attempt to rate-limit them
+to a 0.12 s trickle was measured too weak — the card stayed at P8 (210 MHz), defeating the
+keep-warm. Between events inside the gap the loop naps 3 ms (prompt drain, no busy spin).
+
 ### BUG — DONE (2026-07-22): a group-scaled collimated beam lit only half its footprint (offset by half its width from the aim point)
 
 A group-scaled `light collimated { ... }` illuminated only one half of its `w×w`
@@ -1444,6 +1574,22 @@ negligible; the audit is just strict about it.
 _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
 ## Tech debt
+
+### Fast RGB backward (`-rgb`) omits media + textured/record albedo — 2026-07-23
+The Stage-2 fast RGB backward path (`renderBackwardRGBCuda`/`bkRadianceRGB` in
+`src/render_cuda.cu`, selected by `-rgb` on mode R) is a deliberately-reduced Option-B
+tracer. Its scope gate `cudaBackwardRGBSupported` currently rejects (falls back to the
+spectral backward with a warning): (a) **participating media** — the RGB walk has no
+volume collision / NEE / Beer-Lambert leg yet, unlike the spectral `bkRadiance`; (b)
+**textured / record-driven reflectance** (`reflectTex>=0`, `recBindingFor(REC_SLOT_REFLECT)`)
+— the per-material RGB albedo is a single baked triple, so spatially-varying albedo isn't
+represented. Proper fixes: port `dMediaSampleCollision`/`bkNeeVolume`/`dMediaTransmittance`
+into `bkRadianceRGB` carrying the RGB `beta` (bake a 3-tap RGB `sigma_a`/`sigma_s` per
+medium, already have `rgbAbsorb` precedent); and sample the reflectance texture per hit
+into a linear-RGB albedo (reuse the forward `specLookup`→XYZ→RGB bake path at runtime).
+Also deferred: image-based env and collimated beams (shared with the spectral backward's
+own deferrals, Stage 1d). None are correctness bugs — the gate routes unsupported scenes
+to the exact spectral tracer — just missing fast-path coverage.
 
 ### Mesh repair exists (`tools/repair_mesh.py`); isosurface cap-at-polygonise still TODO — 2026-07-14 — MESH PART DONE
 `-check-watertight` DETECTS non-airtight geometry and **`tools/repair_mesh.py`** now FIXES meshes

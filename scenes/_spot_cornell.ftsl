@@ -1,0 +1,37 @@
+# Spotlight Cornell box — validation scene for GPU-vs-CPU backward point-spot NEE.
+# A single point spotlight aimed down at the floor + spheres (no area light / env /
+# media), so the GPU backward (mode R) and CPU backward must converge to the SAME
+# image. Exercises the bkNeeLight / bkNeeVolume point-spot branch and the spotOmega
+# geomWeight in dInvPdfLambda.
+#
+#   ftrace -in scenes/_spot_cornell.ftsl -mode R -n 512 -o png/_spot_gpu.png
+#   ftrace -in scenes/_spot_cornell.ftsl -mode R -device cpu -n 512 -o png/_spot_cpu.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.35 0.25 0.45   radius 0.22   material white }
+sphere { center 0.72 0.18 0.55   radius 0.15   material white }
+
+light spot {
+    origin 0.5 0.95 0.5   dir 0 -1 0   inner_angle 18   outer_angle 32
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}
