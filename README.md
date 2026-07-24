@@ -1694,9 +1694,10 @@ BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand, decoding blosc's **LZ4** codec
 vendored single-file LZ4. (Other blosc codecs — BloscLZ/Zlib/Zstd — and ZIP are reported with
 a clear "re-export with LZ4" message; validated bit-for-bit against python-blosc on the
 official OpenVDB smoke/sphere/cube samples.) On load the grid is **baked into a dense lattice**
-plus a world→index affine,
+(stored as **fp16 half-floats** to halve host RAM and GPU VRAM — density fields tolerate half
+precision's ~0.05% error easily) plus a world→index affine,
 so the *identical* trilinear sampler runs on the CPU and the GPU (`dMedDensityAt` reads the
-uploaded lattice) and any affine map (translation/scale/rotation) is honored. The grid's
+uploaded lattice, decoding each half value inline) and any affine map (translation/scale/rotation) is honored. The grid's
 world AABB auto-seeds the medium bound and its peak value the delta-tracking majorant — so
 `medium { sigma_t 40  albedo 0.9  density vdb:cloud.nvdb }` is all it takes to light an
 imported cloud. Values are treated as a dimensionless density multiplier on `sigma_t`, so

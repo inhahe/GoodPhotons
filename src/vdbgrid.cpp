@@ -196,7 +196,7 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
 
     out.nx = nx; out.ny = ny; out.nz = nz;
     out.imin = Vec3(lo[0], lo[1], lo[2]);
-    out.data.assign((size_t)voxels, 0.0f);
+    out.data.assign((size_t)voxels, floatToHalfBits(0.0f));
 
     auto acc = grid->getAccessor();
     float mx = 0.0f;
@@ -205,10 +205,12 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
     for (int i = 0; i < nx; ++i) {
         float v = acc.getValue(nanovdb::Coord(lo[0] + i, lo[1] + j, lo[2] + k));
         if (v < 0.0f) v = 0.0f;             // density must be >= 0
-        out.data[(size_t(k) * ny + j) * nx + i] = v;
+        out.data[(size_t(k) * ny + j) * nx + i] = floatToHalfBits(v);
         if (v > mx) mx = v;
     }
-    out.maxVal = mx;
+    // fp16 rounding can nudge a stored value above the exact max by up to one
+    // half-ULP; bump the majorant so it stays a valid delta/ratio-tracking bound.
+    out.maxVal = mx * 1.001f;
 
     auto wb = grid->worldBBox();
     out.wmin = Vec3(wb.min()[0], wb.min()[1], wb.min()[2]);

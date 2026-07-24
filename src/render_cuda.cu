@@ -506,7 +506,7 @@ struct DMedium {
     // --- Optional imported .nvdb volume baked to a dense grid (mirrors VdbGrid) ---
     // When `vdbData` is non-null the density multiplier is TRILINEARLY sampled from
     // this uploaded dense lattice instead of the pattern VM; takes precedence.
-    const float*     vdbData;         // nx*ny*nz values, index [(k*ny+j)*nx+i] (or null)
+    const uint16_t*  vdbData;         // nx*ny*nz fp16 values, index [(k*ny+j)*nx+i] (or null)
     int              vdbNx, vdbNy, vdbNz;
     double           vdbAinv[9];      // world->index linear map (row-major 3x3)
     DVec3            vdbW0;            // world position of index origin (0,0,0)
@@ -1119,6 +1119,30 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
                                     const PatNode* exprPool);
 
+// IEEE-754 binary16 -> binary32 (device twin of halfBitsToFloat in vdbgrid.h).
+// The uploaded VDB lattice is fp16; this decodes it in the hot density sampler.
+// Portable bit math (no cuda_fp16 dependency, HIP-safe).
+__device__ static inline float dHalfBitsToFloat(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t man  = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) { bits = sign; }
+        else {
+            exp = 1;
+            while ((man & 0x400u) == 0) { man <<= 1; --exp; }
+            man &= 0x3FFu;
+            bits = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (man << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (man << 13);
+    }
+    float f; memcpy(&f, &bits, sizeof(f)); return f;
+}
+
 // Dimensionless density multiplier at a world point (>= 0). Device twin of
 // Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
 // For an implicit bound the multiplier is 0 outside the field (medium absent there).
@@ -1148,9 +1172,9 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
         tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
         ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
         tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
-        const float* D = m.vdbData;
+        const uint16_t* D = m.vdbData;
         auto AT = [&](int i, int j, int k) -> double {
-            return (double)D[((size_t)k * ny + j) * nx + i];
+            return (double)dHalfBitsToFloat(D[((size_t)k * ny + j) * nx + i]);
         };
         double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
         double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
@@ -8478,7 +8502,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             // Imported .nvdb volume: upload the baked dense grid + world->index affine.
             if (m.vdb && !m.vdb->empty()) {
                 const VdbGrid& g = *m.vdb;
-                dm.vdbData = (const float*)keep(uploadVec(g.data));
+                dm.vdbData = (const uint16_t*)keep(uploadVec(g.data));
                 dm.vdbNx = g.nx; dm.vdbNy = g.ny; dm.vdbNz = g.nz;
                 for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = g.ainv[k];
                 dm.vdbW0   = {g.w0.x, g.w0.y, g.w0.z};

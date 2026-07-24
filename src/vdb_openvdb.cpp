@@ -556,12 +556,12 @@ bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err) {
 
             out.nx = (int)nx; out.ny = (int)ny; out.nz = (int)nz;
             out.imin = Vec3((double)lo[0], (double)lo[1], (double)lo[2]);
-            out.data.assign((size_t)voxels, 0.0f);
+            out.data.assign((size_t)voxels, floatToHalfBits(0.0f));
             float mx = 0.0f;
             auto put = [&](long long x, long long y, long long z, float v) {
                 long long i = x - lo[0], j = y - lo[1], k = z - lo[2];
                 if (i < 0 || j < 0 || k < 0 || i >= nx || j >= ny || k >= nz) return;
-                out.data[((size_t)k * ny + j) * nx + i] = v;
+                out.data[((size_t)k * ny + j) * nx + i] = floatToHalfBits(v);
                 if (v > mx) mx = v;
             };
             // active constant tiles first, then leaves (leaves are the fine detail)
@@ -580,7 +580,10 @@ bool loadOpenVDBGrid(const std::string& path, VdbGrid& out, std::string& err) {
                         lf->origin[2] + (off & 7), v);
                 }
             }
-            out.maxVal = mx;
+            // fp16 round-to-nearest can nudge a stored value above the exact max by
+            // up to one half-ULP (~2^-11 rel); bump the majorant so it stays a valid
+            // upper bound for delta/ratio tracking.
+            out.maxVal = mx * 1.001f;
 
             // world→index affine + world AABB of the active box.
             if (!invert3x3(A, out.ainv)) fail("degenerate grid transform");

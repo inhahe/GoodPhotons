@@ -12,6 +12,58 @@
 #include "linalg.h"
 #include <vector>
 #include <string>
+#include <cstdint>
+#include <cstring>
+
+// IEEE-754 binary16 (half) <-> binary32 (float) conversion. The dense VDB
+// lattice is stored as fp16 to halve host RAM and GPU VRAM for large volumes
+// (density fields tolerate the ~0.05% relative error of half precision easily).
+// Round-to-nearest-even on store; full subnormal/inf handling both ways. The GPU
+// device sampler (render_cuda.cu) mirrors these with matching __device__ inlines.
+inline float halfBitsToFloat(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t man  = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;                          // +/- 0
+        } else {                                  // subnormal half -> normal float
+            exp = 1;
+            while ((man & 0x400u) == 0) { man <<= 1; --exp; }
+            man &= 0x3FFu;
+            bits = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (man << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (man << 13);  // inf / nan
+    } else {
+        bits = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (man << 13);
+    }
+    float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+}
+
+inline uint16_t floatToHalfBits(float f) {
+    uint32_t bits; std::memcpy(&bits, &f, sizeof(bits));
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xFFu) - 127 + 15;
+    uint32_t man  = bits & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;     // too small -> signed zero
+        man |= 0x800000u;                         // restore implicit 1
+        int shift = 14 - exp;
+        uint32_t half = man >> shift;
+        uint32_t rem = man & ((1u << shift) - 1u);
+        uint32_t halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (half & 1u))) half++;
+        return (uint16_t)(sign | half);
+    } else if (exp >= 0x1F) {
+        return (uint16_t)(sign | 0x7C00u);        // overflow -> inf
+    }
+    uint16_t half = (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
+    uint32_t rem = man & 0x1FFFu;                 // round-to-nearest-even
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) half++;  // carry into exp is correct
+    return half;
+}
 
 // A dense scalar volume baked from a .nvdb FloatGrid. Values are stored on the
 // grid's own integer voxel lattice covering its active index bounding box; a
@@ -20,7 +72,7 @@
 // baked box reads 0 (the medium simply does not exist there).
 struct VdbGrid {
     int nx = 0, ny = 0, nz = 0;         // dense lattice dimensions
-    std::vector<float> data;            // nx*ny*nz values, index [(k*ny + j)*nx + i]
+    std::vector<uint16_t> data;         // nx*ny*nz fp16 values, index [(k*ny + j)*nx + i]
     double ainv[9] = {1,0,0, 0,1,0, 0,0,1}; // world->index linear map (row-major 3x3)
     Vec3   w0{0,0,0};                   // world position of index origin (0,0,0)
     Vec3   imin{0,0,0};                 // integer min-corner of the baked lattice
@@ -57,7 +109,7 @@ struct VdbGrid {
         if (ty < 0) ty = 0; else if (ty > 1) ty = 1;
         if (tz < 0) tz = 0; else if (tz > 1) tz = 1;
         auto at = [&](int i, int j, int k) -> double {
-            return (double)data[(size_t(k) * ny + j) * nx + i];
+            return (double)halfBitsToFloat(data[(size_t(k) * ny + j) * nx + i]);
         };
         double c00 = at(i0,j0,k0)*(1-tx) + at(i1,j0,k0)*tx;
         double c10 = at(i0,j1,k0)*(1-tx) + at(i1,j1,k0)*tx;

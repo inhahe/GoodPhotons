@@ -119,7 +119,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*` / `vdb_openvdb.cpp`** —
   participating media (bounded, density fields, superposition), HG + water-droplet
   (rainbow) phase functions, gradient-index bending, NanoVDB (`.nvdb`) + native OpenVDB
-  (`.vdb`, self-contained BLOSC/LZ4 reader) density import.
+  (`.vdb`, self-contained BLOSC/LZ4 reader) density import. Imported volumes are baked to a
+  dense lattice stored as **fp16 half-floats** (`halfBitsToFloat`/`floatToHalfBits` in
+  `vdbgrid.h`, mirrored by a `__device__` decoder in `render_cuda.cu`) to halve host/GPU memory.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.

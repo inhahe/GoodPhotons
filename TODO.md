@@ -721,7 +721,22 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       known-issues.md.*
 - [ ] **C2 VDB: native sparse device sampler.** Today the NanoVDB grid is baked to a **dense** float
       lattice for the device sampler; a native sparse GPU sampler is the follow-up.
-- [ ] **C3 VDB: fp16 + emission/temperature grids** (fire) — currently float density grids only.
+- [~] **C3 VDB: fp16 + emission/temperature grids** (fire).
+      - [x] **fp16 dense-grid storage — DONE 2026-07-24.** The baked dense lattice (`VdbGrid::data`)
+        is now `std::vector<uint16_t>` half-floats instead of `float`, halving host RAM and GPU VRAM
+        for every imported `.vdb`/`.nvdb` volume. `vdbgrid.h` gains portable IEEE-754 binary16↔binary32
+        helpers (`halfBitsToFloat`/`floatToHalfBits`, round-to-nearest-even, full subnormal/inf
+        handling); both bake sites (`vdb_openvdb.cpp`, `vdbgrid.cpp`) store `floatToHalfBits(v)` and
+        the trilinear samplers (`VdbGrid::sample`) decode via `halfBitsToFloat`. The majorant `maxVal`
+        is bumped ×1.001 so half-rounding can't push a stored value above the delta/ratio-tracking
+        bound. GPU: `DMedium::vdbData` is `const uint16_t*`, uploaded as-is, with a matching
+        `__device__ dHalfBitsToFloat` in the hot density sampler (portable bit math, no cuda_fp16
+        dependency, HIP-safe). Validated on the native smoke plume (`scraps/vdb_smoke_native.ftsl`):
+        CPU vs GPU energy balance identical (absorbed 0.0294 both) and plume-region mean colour agrees
+        to ~0.05% relative — within Monte-Carlo noise — confirming both half-decoders are correct.
+      - [ ] **emission/temperature grids (fire)** — still open. Density-only today. A hot-voxel
+        volumetric emitter (position-sampled photon emission from an emission/temperature grid across
+        forward CPU+GPU+backward NEE) is a large addition on the order of a new light type; not yet built.
 - [x] **C4 VDB: native `.vdb` front-end** — DONE. `loadVdbGrid` dispatches on the file magic; a
       self-contained OpenVDB reader (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dep) parses the file
       container, `float 5_4_3` tree topology and BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand,
