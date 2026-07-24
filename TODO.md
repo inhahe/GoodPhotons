@@ -1287,22 +1287,24 @@ the container moves but the pattern does not follow. (A translation is *expressi
 loom already has the affine machinery to fix this cleanly: `mathnd.Affine` (`linear @ x + offset`, both
 animatable, composable) and `spatial._offset`.
 
-**Decision (the two missing primitives):**
-- [ ] **Placement on `Isosurface`** — a `center`/`Affine` that offsets **both** the coordinate frame
-      (`freq*(M·(x − center))+drift`) **and** the `contained_by` box/sphere, animatable, so a blob can
-      drift/tumble around the room over the loop.
-- [ ] **`Room`/`Group` `Element`** — owns a child list + an animatable `Affine` frame, emits each child with
-      the composed placement (`room_frame ∘ child_placement`), namespaces child names (`room/gyroidA`) so
-      the emitted `isosurface "…"` names don't collide; may emit the shell (box / 6 planes) + shared
-      materials/lights.
-- [ ] **Driver pattern / factory** — refactor `gyroid_nd.py` to expose a factory (`make_gyroid(**params) ->
-      Isosurface`); a new driver script builds a `Room`, instances the factory N times with different
-      params/materials, and assigns each a placement (static, on a closed `LoopCurve`, or from a
-      `VecGridField`/`Scatter` of placements).
-- **Caveats to design in:** seamless loop (translations on *closed* curves, rotations by integer turns,
-  drift by 2π·k); overlap (separate `contained_by` boxes keep blobs disjoint & cheap; union/blend is a
-  CSG question ftrace-side); validate ftrace stays efficient with many overlapping sphere-traced
-  isosurface containers.
+**Decision (the two missing primitives):** — **J2 DONE (2026-07-24).**
+- [x] **Placement on `Isosurface`** — added an animatable `placement` `VecSignal` that offsets **both** the
+      coordinate frame (`freq*(M·(x − placement))+drift`) **and** the `contained_by` box/sphere; a transient
+      `_parent` `Affine` (set by an enclosing `Room`) folds a room frame in (`M_eff = M·Pᵀ`,
+      `p_eff = P·p_local + T`, box → conservative world AABB). `placement=(0,0,0)` is byte-identical to the
+      un-placed emission. (`iso.py`; tests in `test_iso.py`.)
+- [x] **`Room`/`Group` `Element`** — `loom.Room` owns a child list + an animatable rigid `Affine` frame;
+      on emit it hands each child the composed frame as its `_parent` (`room_frame ∘ child_placement`),
+      namespaces child names (`hall/gyroidA`, stacking for nested rooms), and restores child state after.
+      (Shared materials/lights + shell are authored in the driver, not the Room, keeping it a pure group.)
+- [x] **Driver pattern / factory** — `examples/room_of_gyroids.py` exposes `make_gyroid(**params) ->
+      Isosurface` and a driver that instances four different minimal surfaces on a *closed* circular orbit
+      inside a slowly-tumbling `Room`. (Left the 4124-line CLI `gyroid_nd.py` untouched — it predates the
+      Room API and isn't a clean factory; the new focused example is the canonical J2 driver.)
+- **Caveats handled:** seamless loop verified (frame48==frame0 with closed-curve orbits + integer-turn room
+  rotation + 2π drift). Overlap kept cheap via separate sphere containers; CSG union/blend remains an
+  ftrace-side question (not needed here). *(Not yet stress-tested: many (dozens+) overlapping sphere-traced
+  containers in one frame — validate ftrace throughput if a driver ever instances that many.)*
 
 ### J3 — Port the FTSL **parametric-record** data structure into loom (large; the user's real ask)
 **Clarified intent (2026-07-19).** *Not* loom's existing `Grid`/`Scatter`. The user wants a **loom twin of

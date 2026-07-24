@@ -270,6 +270,21 @@ by the Layer-2 slicer (rotate/scale/shear/drift, or true N-D slice if the functi
 declares ≥4 inputs). Parameters (frequency, threshold, N-D rotation angles, slice
 anchor) are all `Animatable`.
 
+**Placement (J2).** An `Isosurface` carries an animatable `placement` `VecSignal`
+(default origin). It offsets **both** the coordinate frame (read as `freq*(M·(x −
+placement)) + drift`) **and** the `contained_by` box/sphere, so the container tracks
+the pattern as a blob drifts/tumbles around a scene over the loop (`placement=(0,0,0)`
+stays byte-identical to the un-placed emission). A `Room`/`Group` element gathers
+several placed isosurfaces under one animatable rigid `Affine` frame `P`; on emit it
+folds `P` into each child (frame's rotation into `M` as `M_eff = M·Pᵀ`, its translation
+into the world placement `p_eff = P·p_local + T`), namespaces child names (`room/child`,
+stacking for nested rooms), and emits a box container under a rotating room as the
+conservative world AABB of the rotated local box. The frame must stay **rigid**
+(orthonormal linear part) since the fold assumes `Pᵀ` inverts `P`; seamlessness comes
+from translating on *closed* curves and rotating by integer turns. Factory pattern:
+`make_gyroid(**params) -> Isosurface` + a `Room` driver (see
+`examples/room_of_gyroids.py`).
+
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.
 over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property animate.
