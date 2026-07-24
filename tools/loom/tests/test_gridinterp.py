@@ -171,5 +171,89 @@ def test_on_outside_unknown_rejected():
         GridField(g, vec(0.5), on_outside="reflect")
 
 
+# ---------------------------------------------------------------------------
+# lo/hi defaults + broadcast + scalar-hi uniform-lattice derivation
+# ---------------------------------------------------------------------------
+
+def test_lo_default_is_zero_hi_default_is_index_lattice():
+    # lo omitted -> all-zeros; hi omitted -> unit-spacing index lattice (hi=shape-1),
+    # so a query coordinate equals a sample index.
+    g = Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5])
+    assert g.lo == (0.0, 0.0)
+    assert g.hi == (1.0, 2.0)                       # shape-1 per axis
+    # coordinate == index: (1,2) is the last corner -> value 5
+    assert g.sample(1.0, 2.0) == 5.0
+    assert g.sample(0.0, 1.0) == 1.0               # exactly sample [0,1]
+
+
+def test_lo_scalar_broadcasts():
+    g = Grid(shape=(2, 2), values=[0, 1, 2, 3], lo=0.5, hi=(1.5, 1.5))
+    assert g.lo == (0.5, 0.5)
+
+
+def test_hi_scalar_derives_uniform_lattice():
+    # scalar hi pins axis 0 and derives the rest as ONE spacing h on every axis.
+    g = Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5], lo=0.0, hi=1.0)
+    # h = (1-0)/(2-1) = 1 ; hi[1] = 0 + 1*(3-1) = 2  -> box [0,1]x[0,2]
+    assert g.hi == (1.0, 2.0)
+    # uniform spacing => sample coords are the same on both axes
+    assert g.axis_coords(0) == [0.0, 1.0]
+    assert g.axis_coords(1) == [0.0, 1.0, 2.0]
+
+
+def test_hi_length1_sequence_same_as_scalar():
+    a = Grid(shape=(2, 4), values=list(range(8)), lo=0.0, hi=3.0)
+    b = Grid(shape=(2, 4), values=list(range(8)), lo=0.0, hi=(3.0,))
+    assert a.hi == b.hi
+
+
+def test_hi_full_tuple_is_verbatim():
+    g = Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5], lo=(0, 0), hi=(1, 1))
+    assert g.hi == (1.0, 1.0)                       # deliberately anisotropic cells
+
+
+def test_bad_lo_hi_length_rejected():
+    with pytest.raises(ValueError):
+        Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5], lo=(0, 0, 0))
+    with pytest.raises(ValueError):
+        Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5], hi=(1, 1, 1))
+
+
+# ---------------------------------------------------------------------------
+# __call__ / sample() sugar (ftsl-style n(x,y))
+# ---------------------------------------------------------------------------
+
+def test_call_matches_explicit_gridfield():
+    g = Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5], lo=(0, 0), hi=(1, 1))
+    # scalar-args form and vec form both equal the explicit GridField
+    want = GridField(g, vec(0.5, 0.5)).at(_clk())
+    assert g(0.5, 0.5).at(_clk()) == want
+    assert g(vec(0.5, 0.5)).at(_clk()) == want
+    assert want == 2.5
+
+
+def test_call_passes_interp_and_outside_kwargs():
+    g = _grid1d([0.0, 1.0, 4.0, 9.0])
+    assert g(1.5, interp="cubic").at(_clk()) == GridField(
+        g, vec(1.5), interp="cubic").at(_clk())
+    assert g(99.0, on_outside="clamp").at(_clk()) == 9.0
+
+
+def test_sample_eager_scalar_and_vector():
+    g = Grid(shape=(2, 3), values=[0, 1, 2, 3, 4, 5], lo=(0, 0), hi=(1, 1))
+    assert g.sample(0.5, 0.5) == 2.5               # no clock needed (static grid)
+    gv = Grid(shape=(2,), values=[vec(0.0, 10.0), vec(2.0, 20.0)], lo=(0,), hi=(1,))
+    assert gv.sample(0.5) == (1.0, 15.0)
+
+
+def test_call_dispatches_vector_grid():
+    from loom import VecGridField
+    gv = Grid(shape=(2,), values=[vec(0.0, 10.0), vec(2.0, 20.0)],
+              lo=(0,), hi=(1,), channels=("a", "b"))
+    f = gv(0.5)
+    assert isinstance(f, VecGridField)
+    assert f.channel("b").at(_clk()) == 15.0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -224,30 +224,97 @@ class TrackedPath:
         return tuple(kids)
 
 
+def _query_of(query: tuple):
+    """Interpret a dataset-call argument list into a query the field builders accept.
+
+    ``ds(x, y)`` → components ``(x, y)``; ``ds(vec(...))`` / ``ds([x, y])`` → the given
+    vector/sequence verbatim; ``ds(x)`` (a lone scalar, a 1-D field) → the 1-tuple
+    ``(x,)`` (so it is NOT mistaken for an already-assembled vector)."""
+    if len(query) == 1:
+        a = query[0]
+        return a if isinstance(a, (VecSignal, list, tuple)) else query
+    return query
+
+
+def _resolve_lo(lo, ndim: int) -> Tuple[float, ...]:
+    """Normalize a ``lo`` corner: ``None`` → all-zeros; a scalar → broadcast to every
+    axis; a sequence → per-axis (length must match ``ndim``)."""
+    if lo is None:
+        return tuple(0.0 for _ in range(ndim))
+    if isinstance(lo, (int, float)):
+        return tuple(float(lo) for _ in range(ndim))
+    seq = tuple(float(x) for x in lo)
+    if len(seq) != ndim:
+        raise ValueError(f"lo has {len(seq)} values but grid is {ndim}-D")
+    return seq
+
+
+def _resolve_hi(hi, lo: Tuple[float, ...], shape: Tuple[int, ...]) -> Tuple[float, ...]:
+    """Normalize a ``hi`` corner.
+
+    - ``None`` → a **unit-spacing index lattice** (``hi[a] = lo[a] + shape[a]-1``), so a
+      query coordinate equals a sample index (spacing 1 on every axis).
+    - a scalar (or a length-1 sequence) → the **axis-0 upper corner**; every other axis
+      is derived to make a **uniform lattice** (one spacing ``h`` on all axes, so the
+      interpolated field is geometrically isotropic):
+      ``h = (hi - lo[0]) / (shape[0]-1)``, ``hi[a] = lo[a] + h·(shape[a]-1)``.
+    - a full sequence → per-axis corners verbatim (the exact box; allows deliberately
+      anisotropic cells).
+    """
+    ndim = len(shape)
+    if hi is None:
+        return tuple(lo[a] + (shape[a] - 1) for a in range(ndim))
+    if isinstance(hi, (int, float)):
+        scalar = float(hi)
+    else:
+        seq = tuple(float(x) for x in hi)
+        if len(seq) == 1:
+            scalar = seq[0]
+        elif len(seq) != ndim:
+            raise ValueError(f"hi has {len(seq)} values but grid is {ndim}-D")
+        else:
+            return seq
+    h = (scalar - lo[0]) / (shape[0] - 1)          # uniform lattice spacing
+    return tuple(lo[a] + h * (shape[a] - 1) for a in range(ndim))
+
+
 class Grid(_Transformable):
     """N-D scalar-or-vector values on a **regular, fixed** lattice.
 
-    ``shape`` is the number of samples per axis (arbitrary rarity).  ``lo``/``hi``
-    are the domain corners.  ``values`` is a flat, C-order list of length
-    ``prod(shape)`` of Signals (scalar field) or VecSignals (vector field).
+    ``shape`` is the number of samples per axis (arbitrary rarity).  ``values`` is a
+    flat, C-order list of length ``prod(shape)`` of Signals (scalar field) or VecSignals
+    (vector field).
+
+    ``lo``/``hi`` place the lattice in space and are both optional/broadcastable:
+
+    - ``lo`` — ``None`` (default) → all-zeros; a scalar → broadcast to every axis; a
+      sequence → per-axis corners.
+    - ``hi`` — ``None`` (default) → a unit-spacing index lattice (``lo[a]+shape[a]-1``);
+      a scalar (or length-1) → the axis-0 upper corner with the other axes derived as a
+      **uniform lattice** (single isotropic spacing); a full sequence → the exact box.
 
     The lattice **positions are deliberately fixed** — that regular structure is the
     whole point of a Grid (it buys the fast separable N-linear interpolation).  Only
     the *values* at those positions are modulable.  If you want moving sample
     *positions*, that is exactly what :class:`Scatter` is for.
+
+    Call the grid like a function of position — ``grid(x, y)`` (or ``grid(vec(x, y))``)
+    — to build the interpolating field :class:`~loom.interp.GridField` /
+    :class:`~loom.interp.VecGridField` (a Signal, matching ftsl's ``n(x,y)``), or
+    :meth:`sample` for an eager numeric read at an explicit point.
     """
 
-    def __init__(self, shape: Sequence[int], lo: Sequence[float],
-                 hi: Sequence[float], values: Iterable[Union[Signal, VecSignal, Number]],
-                 *, channels: Optional[Sequence[str]] = None):
+    def __init__(self, shape: Sequence[int],
+                 values: Iterable[Union[Signal, VecSignal, Number]],
+                 *, lo: Optional[Union[float, Sequence[float]]] = None,
+                 hi: Optional[Union[float, Sequence[float]]] = None,
+                 channels: Optional[Sequence[str]] = None):
         self.shape: Tuple[int, ...] = tuple(int(s) for s in shape)
         if any(s < 2 for s in self.shape):
             raise ValueError("each grid axis needs >= 2 samples")
         self.ndim = len(self.shape)
-        if len(lo) != self.ndim or len(hi) != self.ndim:
-            raise ValueError("lo/hi must match grid ndim")
-        self.lo = tuple(float(x) for x in lo)
-        self.hi = tuple(float(x) for x in hi)
+        self.lo = _resolve_lo(lo, self.ndim)
+        self.hi = _resolve_hi(hi, self.lo, self.shape)
         n = 1
         for s in self.shape:
             n *= s
@@ -268,6 +335,27 @@ class Grid(_Transformable):
     @property
     def id(self) -> int:
         return self._id
+
+    def __call__(self, *query, interp: str = "linear", on_outside: str = "clamp"):
+        """Sample this grid as a field of position: ``grid(x, y)`` (scalars or Signals)
+        or ``grid(vec(...))`` → a :class:`~loom.interp.GridField` (scalar grid) or
+        :class:`~loom.interp.VecGridField` (vector grid), a Signal node in the DAG.  This
+        mirrors ftsl's ``n(x,y)`` expression form; call ``.at(clock)`` to evaluate it, or
+        use :meth:`sample` for an eager number."""
+        from .interp import GridField, VecGridField   # lazy: avoid data<->interp cycle
+        Field = VecGridField if self.is_vector else GridField
+        return Field(self, _query_of(query), interp=interp, on_outside=on_outside)
+
+    def sample(self, *query, clock=None, interp: str = "linear",
+               on_outside: str = "clamp"):
+        """Eagerly read the grid at an explicit query point: returns a ``float`` (scalar
+        grid) or a component ``tuple`` (vector grid).  ``clock`` defaults to a static
+        frame-0 clock (fine for non-animated grids); pass one to evaluate animated
+        values at a specific frame."""
+        from .signals.core import Clock
+        field = self(*query, interp=interp, on_outside=on_outside)
+        clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+        return field.at(clk)
 
     def flat_index(self, idx: Sequence[int]) -> int:
         if len(idx) != self.ndim:
@@ -290,7 +378,12 @@ class Grid(_Transformable):
 
 
 class Scatter(_Transformable):
-    """N-D values at arbitrary positions (positions animatable too)."""
+    """N-D values at arbitrary positions (positions animatable too).
+
+    Like :class:`Grid`, a Scatter is callable as a field of position —
+    ``scatter(x, y)`` (or ``scatter(vec(x, y))``) builds the interpolating
+    :class:`~loom.interp.ScatterField` / :class:`~loom.interp.VecScatterField` Signal
+    (ftsl-style ``n(x,y)``); :meth:`sample` reads it eagerly."""
 
     def __init__(self, samples: Iterable[Tuple[Vecish, Union[Signal, VecSignal, Number]]],
                  *, channels: Optional[Sequence[str]] = None):
@@ -315,6 +408,25 @@ class Scatter(_Transformable):
 
     def channel_index(self, channel: Union[int, str]) -> int:
         return _resolve_channel(self.channels, self.value_dim, channel)
+
+    def __call__(self, *query, power: float = 2.0, eps: float = 1e-9):
+        """Sample this scatter set as a field of position: ``scatter(x, y)`` (scalars or
+        Signals) or ``scatter(vec(...))`` → a :class:`~loom.interp.ScatterField` (scalar)
+        or :class:`~loom.interp.VecScatterField` (vector), a Signal node (Shepard
+        inverse-distance, exponent ``power``).  Mirrors ftsl's ``n(x,y)``; call
+        ``.at(clock)`` to evaluate, or use :meth:`sample` for an eager number."""
+        from .interp import ScatterField, VecScatterField  # lazy: avoid data<->interp cycle
+        Field = VecScatterField if self.is_vector else ScatterField
+        return Field(self, _query_of(query), power=power, eps=eps)
+
+    def sample(self, *query, clock=None, power: float = 2.0, eps: float = 1e-9):
+        """Eagerly read the scatter field at an explicit query point: returns a ``float``
+        (scalar) or a component ``tuple`` (vector).  ``clock`` defaults to a static
+        frame-0 clock; pass one to evaluate animated samples at a specific frame."""
+        from .signals.core import Clock
+        field = self(*query, power=power, eps=eps)
+        clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+        return field.at(clk)
 
     def __len__(self) -> int:
         return len(self.positions)

@@ -130,6 +130,21 @@ def test_vec_scatter_exact_at_samples():
     assert VecScatterField(sc, vec(1.0, 0.0)).at(_clk(0.0)) == (2.0, 20.0)
 
 
+def test_scatter_call_and_sample_sugar():
+    # scalar Scatter: __call__ builds a ScatterField, sample() reads it eagerly
+    sc = Scatter([(vec(0.0, 0.0), 1.0), (vec(1.0, 0.0), 2.0), (vec(0.0, 1.0), 3.0)])
+    assert sc(0.0, 0.0).at(_clk(0.0)) == ScatterField(sc, vec(0.0, 0.0)).at(_clk(0.0))
+    assert sc.sample(0.0, 0.0) == 1.0             # coincident with a sample, no clock
+    assert sc(vec(1.0, 0.0)).at(_clk(0.0)) == 2.0
+    # vector Scatter: __call__ dispatches to VecScatterField
+    scv = Scatter([(vec(0.0, 0.0), vec(1.0, 10.0)), (vec(1.0, 0.0), vec(2.0, 20.0))],
+                  channels=("m", "n"))
+    f = scv(0.0, 0.0)
+    assert isinstance(f, VecScatterField)
+    assert f.channel("n").at(_clk(0.0)) == 10.0
+    assert scv.sample(1.0, 0.0) == (2.0, 20.0)
+
+
 def test_vec_scatter_channel_matches_scalar():
     samples_pos = [vec(0.0, 0.0), vec(1.0, 0.0), vec(0.0, 1.0), vec(1.0, 1.0)]
     m = [1.0, 2.0, 3.0, 4.0]

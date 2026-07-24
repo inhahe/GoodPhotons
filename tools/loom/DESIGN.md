@@ -139,7 +139,15 @@ value that loops back is caught:
    fixed**. That regular structure is the whole point of a Grid — it is what buys
    the fast **separable N-linear interpolation** — so animating node positions is
    explicitly *not* a Grid feature. If you want moving sample *positions*, that is
-   exactly what **Scatter** is for.
+   exactly what **Scatter** is for. Constructor is `Grid(shape, values, *, lo=None,
+   hi=None, channels=None)` (essential data first; placement keyword-only). **`lo`/`hi`
+   are optional and broadcastable**: `lo=None`→all-zeros, `lo=<scalar>`→broadcast;
+   `hi=None`→a unit-spacing index lattice (`hi[a]=lo[a]+shape[a]-1`, so a coordinate
+   equals a sample index), `hi=<scalar>` (or length-1)→pins **axis 0** and derives every
+   other axis as a **uniform lattice** — one isotropic spacing `h=(hi-lo[0])/(shape[0]-1)`,
+   `hi[a]=lo[a]+h·(shape[a]-1)` (the mathematically pure "single lattice constant" reading,
+   so the interpolated field is geometrically isotropic; a full `hi` tuple gives the exact
+   box, including deliberately anisotropic cells).
 3. **Scatter** — N-D values at arbitrary positions (no lattice). **Both** the
    sample **positions** (each a `VecSignal`) **and** their **values** are modulable,
    so a scatter point can drift *and* pulse; `ScatterField` re-reads every position
@@ -173,6 +181,16 @@ output can feed another modulator — "it's just another function"):
    convex-hull extrapolation. Rebuilt **only when the sampled positions/values actually
    change** (change-detection cache in `_RbfEngine`): a static field builds once and is
    reused verbatim across the whole animation even as the query moves.
+
+**Datasets are callable as a field of position** (sugar that mirrors ftsl's `n(x,y)`):
+`grid(x, y)` / `scatter(x, y)` — scalar args, `Signal`s, or a single `vec(...)` — builds
+the matching interpolator node (`GridField`/`VecGridField` or `ScatterField`/
+`VecScatterField`), a lazy `Signal` you evaluate with `.at(clock)`; `interp=`/`on_outside=`
+(grid) and `power=`/`eps=` (scatter) pass through. `ds.sample(x, y[, clock=...])` is the
+**eager** form — it builds the field and evaluates it in one call, returning a `float`
+(scalar) or component `tuple` (vector), defaulting to a static frame-0 clock so a
+non-animated dataset reads with no ceremony. (`__call__` lazily imports from `interp` to
+sidestep the `data`↔`interp` cycle, the same pattern `_Transformable.transformed` uses.)
 
 Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
 with named `channels=`). `VecGridField` / `VecScatterField` / `VecRbfScatterField`
