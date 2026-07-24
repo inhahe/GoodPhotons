@@ -139,9 +139,14 @@ value that loops back is caught:
    fixed**. That regular structure is the whole point of a Grid — it is what buys
    the fast **separable N-linear interpolation** — so animating node positions is
    explicitly *not* a Grid feature. If you want moving sample *positions*, that is
-   exactly what **Scatter** is for. Constructor is `Grid(shape, values, *, lo=None,
-   hi=None, channels=None)` (essential data first; placement keyword-only). **`lo`/`hi`
-   are optional and broadcastable**: `lo=None`→all-zeros, `lo=<scalar>`→broadcast;
+   exactly what **Scatter** is for. Constructor is `Grid(values, *, shape=None,
+   lo=None, hi=None, channels=None)` (values first; everything else keyword-only).
+   **`shape` is optional** — the *nesting of `values` carries it*: `[[0 1 2][3 4 5]]`
+   is a `(2, 3)` grid, no `shape=` needed. Bare `list`/`tuple`s always mean *axes*;
+   a stored **vector** value is a `vec(...)` (never a bare list), so a nested grid of
+   `vec`s is a vector grid. A flat list is 1-D unless you pass `shape=` to fold it
+   (`Grid([0,1,2,3,4,5], shape=(2,3))`); ragged nesting is rejected (use **Scatter**).
+   **`lo`/`hi` are optional and broadcastable**: `lo=None`→all-zeros, `lo=<scalar>`→broadcast;
    `hi=None`→a unit-spacing index lattice (`hi[a]=lo[a]+shape[a]-1`, so a coordinate
    equals a sample index), `hi=<scalar>` (or length-1)→pins **axis 0** and derives every
    other axis as a **uniform lattice** — one isotropic spacing `h=(hi-lo[0])/(shape[0]-1)`,

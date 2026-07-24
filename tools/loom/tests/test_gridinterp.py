@@ -220,6 +220,56 @@ def test_bad_lo_hi_length_rejected():
 
 
 # ---------------------------------------------------------------------------
+# shape inference from nested values (shape= is optional)
+# ---------------------------------------------------------------------------
+
+def test_shape_inferred_from_nested_2d():
+    # nesting carries the lattice shape; no shape= needed.
+    g = Grid([[0, 1, 2], [3, 4, 5]])
+    assert g.shape == (2, 3)
+    assert g.sample(1.0, 2.0) == 5.0          # last corner (index lattice default)
+    # identical to the explicit-shape flat form
+    assert g.shape == Grid([0, 1, 2, 3, 4, 5], shape=(2, 3)).shape
+
+
+def test_flat_values_are_1d_by_default():
+    g = Grid([0.0, 1.0, 2.0, 3.0])
+    assert g.shape == (4,)
+    assert g.sample(2.0) == 2.0
+
+
+def test_explicit_shape_folds_flat_list():
+    g = Grid([0, 1, 2, 3, 4, 5], shape=(2, 3))
+    assert g.shape == (2, 3)
+    assert g.sample(0.0, 1.0) == 1.0
+
+
+def test_shape_inferred_3d_nested():
+    g = Grid([[[0, 1], [2, 3]], [[4, 5], [6, 7]]])
+    assert g.shape == (2, 2, 2)
+    assert g.sample(1.0, 1.0, 1.0) == 7.0
+
+
+def test_shape_inferred_vector_grid_nested():
+    # bare lists are axes; vec(...) is a stored value → a 2x2 grid of 2-vectors.
+    g = Grid([[vec(0.0, 10.0), vec(1.0, 11.0)],
+              [vec(2.0, 12.0), vec(3.0, 13.0)]])
+    assert g.shape == (2, 2)
+    assert g.is_vector and g.value_dim == 2
+    assert g.sample(1.0, 1.0) == (3.0, 13.0)
+
+
+def test_ragged_nested_values_rejected():
+    with pytest.raises(ValueError):
+        Grid([[0, 1, 2], [3, 4]])             # rows of differing length
+
+
+def test_explicit_shape_mismatch_rejected():
+    with pytest.raises(ValueError):
+        Grid([0, 1, 2, 3, 4], shape=(2, 3))   # 5 values, 6 slots
+
+
+# ---------------------------------------------------------------------------
 # __call__ / sample() sugar (ftsl-style n(x,y))
 # ---------------------------------------------------------------------------
 

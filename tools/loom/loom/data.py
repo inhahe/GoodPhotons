@@ -278,12 +278,60 @@ def _resolve_hi(hi, lo: Tuple[float, ...], shape: Tuple[int, ...]) -> Tuple[floa
     return tuple(lo[a] + h * (shape[a] - 1) for a in range(ndim))
 
 
+def _is_grid_leaf(v) -> bool:
+    """True if ``v`` is a grid *value* (a leaf), not a structural axis container.
+
+    Vectors are :class:`VecSignal` (built with ``vec(...)``), and scalars are
+    numbers / :class:`Signal`\\ s — none of which are bare ``list``/``tuple``\\ s.  So a
+    bare ``list`` or ``tuple`` in a values tree always denotes a **grid axis**, never a
+    stored value.  (To store a vector value, wrap the components in ``vec(...)``.)
+    """
+    return not isinstance(v, (list, tuple))
+
+
+def _flatten_nested(values) -> Tuple[Tuple[int, ...], list]:
+    """Flatten a possibly-nested values container to ``(shape, flat_C_order_list)``.
+
+    The nesting itself carries the lattice ``shape`` — a flat list is 1-D, a
+    list-of-rows is 2-D (``[[a b c][d e f]]`` → shape ``(2, 3)``), and so on — so an
+    explicit ``shape=`` is redundant when the data is written out structurally.  The
+    nesting must be **rectangular**: every sibling subtree must share a shape, else the
+    grid is ragged and a :class:`Scatter` is the right container instead.
+    """
+    def rec(node) -> Tuple[Tuple[int, ...], list]:
+        if _is_grid_leaf(node):
+            return (), [node]
+        children = list(node)
+        if not children:
+            raise ValueError("grid axis has zero length")
+        flat: list = []
+        first: Optional[Tuple[int, ...]] = None
+        for c in children:
+            s, f = rec(c)
+            if first is None:
+                first = s
+            elif s != first:
+                raise ValueError(
+                    f"ragged grid values: rows have differing shapes ({first} vs {s}) "
+                    "— a Grid lattice must be rectangular (use Scatter for ragged data)")
+            flat.extend(f)
+        return (len(children),) + (first or ()), flat
+
+    return rec(list(values))
+
+
 class Grid(_Transformable):
     """N-D scalar-or-vector values on a **regular, fixed** lattice.
 
-    ``shape`` is the number of samples per axis (arbitrary rarity).  ``values`` is a
-    flat, C-order list of length ``prod(shape)`` of Signals (scalar field) or VecSignals
-    (vector field).
+    ``values`` holds the samples, as Signals (scalar field) or VecSignals (vector
+    field).  It may be written **nested** — ``[[0 1 2][3 4 5]]`` — in which case the
+    nesting *is* the shape (here ``(2, 3)``); no ``shape=`` is needed because the data
+    already makes the lattice obvious.  A flat list is read as 1-D unless you pass an
+    explicit ``shape=`` to fold it into N-D (``Grid([0,1,2,3,4,5], shape=(2, 3))``).
+    Bare lists always mean *axes*; to store a vector value wrap it in ``vec(...)``.
+
+    ``shape`` (keyword, optional) — samples per axis; inferred from the nesting when
+    omitted.  Give it only to reshape a flat list, or to assert an expected shape.
 
     ``lo``/``hi`` place the lattice in space and are both optional/broadcastable:
 
@@ -304,12 +352,14 @@ class Grid(_Transformable):
     :meth:`sample` for an eager numeric read at an explicit point.
     """
 
-    def __init__(self, shape: Sequence[int],
-                 values: Iterable[Union[Signal, VecSignal, Number]],
-                 *, lo: Optional[Union[float, Sequence[float]]] = None,
+    def __init__(self, values: Iterable[Union[Signal, VecSignal, Number]],
+                 *, shape: Optional[Sequence[int]] = None,
+                 lo: Optional[Union[float, Sequence[float]]] = None,
                  hi: Optional[Union[float, Sequence[float]]] = None,
                  channels: Optional[Sequence[str]] = None):
-        self.shape: Tuple[int, ...] = tuple(int(s) for s in shape)
+        inferred_shape, flat = _flatten_nested(values)
+        self.shape: Tuple[int, ...] = (
+            inferred_shape if shape is None else tuple(int(s) for s in shape))
         if any(s < 2 for s in self.shape):
             raise ValueError("each grid axis needs >= 2 samples")
         self.ndim = len(self.shape)
@@ -318,11 +368,10 @@ class Grid(_Transformable):
         n = 1
         for s in self.shape:
             n *= s
-        vals = list(values)
-        if len(vals) != n:
-            raise ValueError(f"expected {n} values, got {len(vals)}")
+        if len(flat) != n:
+            raise ValueError(f"expected {n} values, got {len(flat)}")
         self.values: List[Union[Signal, VecSignal]] = [
-            v if isinstance(v, (Signal, VecSignal)) else as_signal(v) for v in vals
+            v if isinstance(v, (Signal, VecSignal)) else as_signal(v) for v in flat
         ]
         self.value_dim, self.is_vector = _infer_value_dim(self.values)
         self.channels = _check_channels(channels, self.value_dim)

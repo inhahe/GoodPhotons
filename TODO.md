@@ -96,6 +96,57 @@ Origin tags point at the authoritative design text for each item.
     * These land with **N-D scatterpoint + N-D grid datatypes ported into ftrace** (mirroring loom's `data.Grid` /
       scatter + `interp.py` curves) — see the loom→ftrace data-port item. Grammar first (shared `.epeg`), then the
       C++ front-end at the J3c port, then the runtime sampler.
+    * **STATUS (2026-07-24 audit): NOT implemented.** Only *design intent* lives here; there is **no grammar,
+      reducer, or runtime** for the trailing axis-label tuple or the rebinding below. What *is* built is the
+      surrounding value/spectrum/binding grammar + the J3c validation shim (see the Progress notes above) — none of
+      which is the array-call syntax. The loom side now has the building block: a callable N-D `Grid`/`Scatter`
+      (`grid(x, y)` / `grid.sample(...)`, `data.py`), so the Python half of the sampler exists.
+    * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
+      trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
+      `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its
+      user:
+      - **Material-side (the array already names its own axis).** `reflect [0 1](u)` bakes the consumed coordinate
+        into the material: the reflectance is `[0 1]` sampled at the surface `u`. The material's author has spent
+        the axis; a user of the material supplies nothing.
+      - **User-side (a bare array, axis left open).** A material may expose an array parameter *un-called*
+        — `reflect [0 1]` — declaring "this is a 1-D array, you pick what drives it." Whoever *instantiates* the
+        material then completes it by calling it: `reflect [0 1](u)` (or `(v)`, `(x)`, a record channel, …). A bare
+        array with no call is an **unsaturated** value — legal to declare, an error to actually *render* until some
+        site saturates it.
+      - **Rebinding an already-named axis: `(a=u)`.** If the material *did* name an axis — say it declared the
+        parameter with a formal axis `a` (`reflect [0 1](a)`) — a user who wants to feed a *different* driver than
+        the formal name uses the **keyword form** `(a=u)`: "bind my `u` to the array's `a` axis." Positional `(u)`
+        rebinds the sole/next axis; keyword `(a=u)` targets a named one (needed once there are ≥2 axes, e.g.
+        `(a=u, b=v)`). This is ordinary call-site argument binding — positional or by-name — lifted onto the
+        array-sample. Semantics to pin when built: whether a formal axis name is a *binding site* (rebindable) vs a
+        *literal coordinate source* (fixed), and the error when a bare array reaches the renderer unsaturated.
+    * **Grammar sketch (shared `.epeg`, one production reused by array / grid / scatter).** The axis tuple hangs off
+      any value; args are positional coords or `name=coord` rebinds:
+      ```
+      sampled   = value axistuple?
+      axistuple = '(' arg (',' arg)* ')'
+      arg       = NAME '=' coord      # keyword rebind  (a=u)
+                | coord                # positional      (u)
+      coord     = NAME | NUMBER | value   # an axis driver: a var (u/v/x), a constant, or a nested sampled value
+      ```
+      Notes: `value` is the existing context-free array/vec tree (`values.py`); `axistuple` is optional, so an
+      un-called array stays a plain `value` (the *unsaturated* case). `coord` allowing a nested `sampled` gives
+      composition (`n( m(u), v )`). Reuse the **same** `axistuple` on the N-D grid and scatter element grammars so
+      literal-array / grid / scatter all sample identically.
+    * **Carry loom's constructor conveniences into the ftsl grid/scatter datatype** (already shipped in loom
+      `data.py`, port them alongside the datatype):
+      - **`shape=` is redundant when the data is nested.** The nesting *is* the shape — `[[0 1 2][3 4 5]]` is a
+        `(2, 3)` grid — so the grid element must infer shape from the value tree and only need an explicit shape to
+        fold a *flat* list. (This is also exactly why `[[0,1,2][3,4,5][6,7,8]]` reads as a 2-D grid above.) Bare
+        `[...]` always means an axis; a stored **vector** sample is a `vec(...)`/tagged colour, never a bare list.
+      - **`lo`/`hi` domain shortcuts (optional + broadcastable).** The sample lattice's world box need not be spelled
+        in full: `lo` omitted → all-zeros; `lo=<scalar>` → broadcast to every axis. `hi` omitted → a **unit-spacing
+        index lattice** (`hi[a]=lo[a]+shape[a]-1`, so a query coordinate equals a sample index); `hi=<scalar>` (or a
+        length-1 tuple) → pins **axis 0** and derives every other axis as a **uniform lattice** (one isotropic
+        spacing `h=(hi-lo[0])/(shape[0]-1)`, `hi[a]=lo[a]+h·(shape[a]-1)` — the mathematically pure "single lattice
+        constant" reading, keeping the interpolated field geometrically isotropic); a full `hi` tuple → the exact box
+        (allows deliberately anisotropic cells). Whatever surface syntax the grid element grows for domain must offer
+        these same defaults so common grids stay terse.
   - **ADDENDUM — case-insensitive *keywords* (future intent, 2026-07-20; user).** The user wants FTSL keywords to
     (maybe, later) be **case-insensitive** — but **only keywords** (block kinds, property names, enum/mode values,
     spectrum/colour heads like `rgb`/`blackbody`/`gaussian`), **never custom identifiers** (record/material/light
