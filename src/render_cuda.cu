@@ -503,10 +503,20 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
-    // --- Optional imported .nvdb volume baked to a dense grid (mirrors VdbGrid) ---
-    // When `vdbData` is non-null the density multiplier is TRILINEARLY sampled from
-    // this uploaded dense lattice instead of the pattern VM; takes precedence.
-    const uint16_t*  vdbData;         // nx*ny*nz fp16 values, index [(k*ny+j)*nx+i] (or null)
+    // --- Optional imported .nvdb volume, uploaded as a NATIVE SPARSE brick grid ---
+    // When `vdbBrickData` is non-null the density multiplier is TRILINEARLY sampled
+    // from a bricked sparse lattice (ROADMAP C2) instead of the pattern VM; takes
+    // precedence. The dense lattice is partitioned into B^3 bricks; only bricks with
+    // a nonzero voxel are uploaded, so VRAM scales with occupied volume, not the
+    // bounding box. `vdbBrickIndex[(k>>sh)*by*bx + (j>>sh)*bx + (i>>sh)]` gives the
+    // brick's slot (or -1 => density 0); the voxel lives at `vdbBrickData[slot*B^3
+    // + ((k&mask)*B + (j&mask))*B + (i&mask)]`. Samples bit-for-bit like the dense
+    // grid (the trilinear stencil is clamped to [0,n-1] before any lookup).
+    const int32_t*   vdbBrickIndex;   // bx*by*bz brick slots (or -1); null => no vdb
+    const uint16_t*  vdbBrickData;    // active*B^3 fp16 voxels
+    int              vdbBx, vdbBy, vdbBz;   // brick-grid dimensions
+    int              vdbBrickB;             // brick edge length (power of two)
+    int              vdbBrickShift;         // log2(B): brick = idx>>shift, local = idx&(B-1)
     int              vdbNx, vdbNy, vdbNz;
     double           vdbAinv[9];      // world->index linear map (row-major 3x3)
     DVec3            vdbW0;            // world position of index origin (0,0,0)
@@ -1152,9 +1162,9 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
-    // Imported .nvdb volume: trilinearly sample the uploaded dense grid (device twin
-    // of VdbGrid::sample). Takes precedence over the pattern-VM density formula.
-    if (m.vdbData) {
+    // Imported .nvdb volume: trilinearly sample the uploaded sparse brick grid
+    // (device twin of VdbGrid::sample). Takes precedence over the pattern-VM density.
+    if (m.vdbBrickData) {
         double rx = (double)p.x - m.vdbW0.x, ry = (double)p.y - m.vdbW0.y, rz = (double)p.z - m.vdbW0.z;
         double fi = m.vdbAinv[0]*rx + m.vdbAinv[1]*ry + m.vdbAinv[2]*rz - m.vdbImin.x;
         double fj = m.vdbAinv[3]*rx + m.vdbAinv[4]*ry + m.vdbAinv[5]*rz - m.vdbImin.y;
@@ -1172,9 +1182,16 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
         tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
         ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
         tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
-        const uint16_t* D = m.vdbData;
+        const int32_t*  BI = m.vdbBrickIndex;
+        const uint16_t* BD = m.vdbBrickData;
+        const int  sh = m.vdbBrickShift, mask = m.vdbBrickB - 1;
+        const int  bxN = m.vdbBx, byN = m.vdbBy;
+        const size_t B3 = (size_t)m.vdbBrickB * m.vdbBrickB * m.vdbBrickB;
         auto AT = [&](int i, int j, int k) -> double {
-            return (double)dHalfBitsToFloat(D[((size_t)k * ny + j) * nx + i]);
+            int slot = BI[(((size_t)(k>>sh))*byN + (j>>sh))*bxN + (i>>sh)];
+            if (slot < 0) return 0.0;
+            int li = i & mask, lj = j & mask, lk = k & mask;
+            return (double)dHalfBitsToFloat(BD[(size_t)slot*B3 + ((size_t)lk*m.vdbBrickB + lj)*m.vdbBrickB + li]);
         };
         double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
         double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
@@ -8499,16 +8516,44 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
-            // Imported .nvdb volume: upload the baked dense grid + world->index affine.
+            // Imported .nvdb volume: upload a NATIVE SPARSE brick grid (ROADMAP C2).
+            // The dense lattice is partitioned into B^3 bricks; only occupied bricks
+            // reach the device, so VRAM tracks filled volume, not the bounding box.
             if (m.vdb && !m.vdb->empty()) {
                 const VdbGrid& g = *m.vdb;
-                dm.vdbData = (const uint16_t*)keep(uploadVec(g.data));
+                const int B = 8;
+                std::vector<int32_t> bidx; std::vector<uint16_t> bdata; int bx, by, bz;
+                int nActive = g.buildBricks(B, bx, by, bz, bidx, bdata);
+                dm.vdbBrickIndex = (const int32_t*)keep(uploadVec(bidx));
+                dm.vdbBrickData  = (const uint16_t*)keep(uploadVec(bdata));
+                dm.vdbBx = bx; dm.vdbBy = by; dm.vdbBz = bz;
+                dm.vdbBrickB = B; dm.vdbBrickShift = 3;   // 3 == log2(8)
                 dm.vdbNx = g.nx; dm.vdbNy = g.ny; dm.vdbNz = g.nz;
                 for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = g.ainv[k];
                 dm.vdbW0   = {g.w0.x, g.w0.y, g.w0.z};
                 dm.vdbImin = {g.imin.x, g.imin.y, g.imin.z};
+                size_t denseB  = (size_t)g.nx * g.ny * g.nz * sizeof(uint16_t);
+                size_t sparseB = bdata.size() * sizeof(uint16_t) + bidx.size() * sizeof(int32_t);
+                int nBricks = bx * by * bz;
+                // The scene is re-uploaded on every progressive refresh; report the
+                // sparse footprint only once per distinct grid to avoid log spam.
+                static std::vector<const void*> reportedVdb;
+                const void* vkey = (const void*)m.vdb.get();
+                bool seen = false;
+                for (const void* p : reportedVdb) if (p == vkey) { seen = true; break; }
+                if (!seen) {
+                    reportedVdb.push_back(vkey);
+                    std::fprintf(stderr,
+                        "[vdb] sparse device grid: %d/%d bricks active (%.1f%%), "
+                        "%.1f MB -> %.1f MB VRAM (%.1fx)\n",
+                        nActive, nBricks, nBricks ? 100.0 * nActive / nBricks : 0.0,
+                        denseB / 1048576.0, sparseB / 1048576.0,
+                        sparseB ? (double)denseB / sparseB : 1.0);
+                }
             } else {
-                dm.vdbData = nullptr;
+                dm.vdbBrickIndex = nullptr; dm.vdbBrickData = nullptr;
+                dm.vdbBx = dm.vdbBy = dm.vdbBz = 0;
+                dm.vdbBrickB = 0; dm.vdbBrickShift = 0;
                 dm.vdbNx = dm.vdbNy = dm.vdbNz = 0;
                 for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = (k % 4 == 0) ? 1.0 : 0.0;
                 dm.vdbW0 = {0,0,0}; dm.vdbImin = {0,0,0};

@@ -1711,15 +1711,19 @@ a clear "re-export with LZ4" message; validated bit-for-bit against python-blosc
 official OpenVDB smoke/sphere/cube samples.) On load the grid is **baked into a dense lattice**
 (stored as **fp16 half-floats** to halve host RAM and GPU VRAM — density fields tolerate half
 precision's ~0.05% error easily) plus a world→index affine,
-so the *identical* trilinear sampler runs on the CPU and the GPU (`dMedDensityAt` reads the
-uploaded lattice, decoding each half value inline) and any affine map (translation/scale/rotation) is honored. The grid's
+so the *identical* trilinear sampler runs on the CPU and the GPU and any affine map
+(translation/scale/rotation) is honored. On the **GPU the lattice is uploaded as a native
+sparse brick grid** (8³ bricks; only bricks with a nonzero voxel reach the device, plus a small
+int32 brick-index), so **VRAM scales with occupied volume, not the bounding box** — a mostly-empty
+plume can drop to a fraction of the dense footprint (a startup line reports the ratio). The sparse
+sampler is bit-for-bit identical to the dense one. The grid's
 world AABB auto-seeds the medium bound and its peak value the delta-tracking majorant — so
 `medium { sigma_t 40  albedo 0.9  density vdb:cloud.nvdb }` is all it takes to light an
 imported cloud. Values are treated as a dimensionless density multiplier on `sigma_t`, so
-you still dial the optical thickness with `sigma_t`. Only **float** grids are supported and
-the bake is **dense** (memory ~ the grid's index-space bounding box), so very large sparse
-volumes are bounded by a safety cap; a native sparse device sampler is a future
-optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
+you still dial the optical thickness with `sigma_t`. Only **float** grids are supported; the
+host bake is **dense** (host RAM ~ the grid's index-space bounding box, bounded by a safety cap)
+while the **GPU sampler is natively sparse** (bricked, see above). Works in the forward modes
+(A/B/C) and BDPT `D` on CPU and GPU, exactly like a
 `density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
 **Gradient-index (GRIN) media — bending light.** Give a

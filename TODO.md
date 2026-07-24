@@ -719,8 +719,19 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       GPU caveat (separate, lesser item): the shared GPU mode-M path still falls back to CPU when
       `-pmfg` is set — porting the final-gather sub-ray pass to CUDA is future work, tracked in
       known-issues.md.*
-- [ ] **C2 VDB: native sparse device sampler.** Today the NanoVDB grid is baked to a **dense** float
-      lattice for the device sampler; a native sparse GPU sampler is the follow-up.
+- [x] **C2 VDB: native sparse device sampler.** **DONE 2026-07-24 (v0.47.0).** The GPU no longer uploads
+      the dense lattice; instead the baked grid is partitioned into **8³ bricks** and only bricks holding a
+      nonzero voxel reach the device, so VRAM tracks *occupied volume* rather than the bounding box.
+      `VdbGrid::buildBricks(B, …)` (`vdbgrid.h`) emits a compact `brickIndex` (bx·by·bz int32 slots, −1 for an
+      empty brick) plus contiguous `brickData` (B³ fp16 voxels per active brick); the uploader
+      (`render_cuda.cu`) uploads those two arrays and the device sampler `dMedDensityAt` does a per-corner
+      brick lookup (`brickIndex[(k≫3)·by·bx + (j≫3)·bx + (i≫3)]`, then `brickData[slot·512 + (lk·8+lj)·8+li]`).
+      **Bit-for-bit identical** to the dense sampler — the trilinear stencil is clamped to [0,n-1] before any
+      lookup, so per-brick padding voxels are never addressed. Validated on the smoke plume
+      (`scraps/vdb_smoke_native.ftsl`): 3074/5488 bricks active (56 %), 5.3 MB → 3.0 MB VRAM (1.7×), and GPU
+      (sparse) vs CPU (dense) energy balance identical (absorbed 0.0294 both). A one-line
+      `[vdb] sparse device grid: …` footprint report prints once per grid. *(Host RAM still keeps the dense
+      lattice for the CPU sampler; a sparse host representation is a possible future RAM win.)*
 - [~] **C3 VDB: fp16 + emission/temperature grids** (fire).
       - [x] **fp16 dense-grid storage — DONE 2026-07-24.** The baked dense lattice (`VdbGrid::data`)
         is now `std::vector<uint16_t>` half-floats instead of `float`, halving host RAM and GPU VRAM

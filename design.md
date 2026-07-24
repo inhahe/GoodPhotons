@@ -122,6 +122,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`.vdb`, self-contained BLOSC/LZ4 reader) density import. Imported volumes are baked to a
   dense lattice stored as **fp16 half-floats** (`halfBitsToFloat`/`floatToHalfBits` in
   `vdbgrid.h`, mirrored by a `__device__` decoder in `render_cuda.cu`) to halve host/GPU memory.
+  The GPU sampler is **natively sparse**: `VdbGrid::buildBricks` partitions the lattice into 8³
+  bricks and uploads only occupied bricks + an int32 brick-index (empty brick → density 0), so
+  VRAM scales with filled volume, not the bounding box — bit-for-bit identical to the dense
+  sampler (the trilinear stencil is clamped before lookup). The host keeps the dense lattice.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.

@@ -120,6 +120,49 @@ struct VdbGrid {
         double v = c0*(1-tz) + c1*tz;
         return v > 0.0 ? v : 0.0;
     }
+
+    // Partition the dense lattice into B^3 bricks for the native sparse GPU
+    // sampler (ROADMAP C2). Only bricks holding at least one nonzero voxel are
+    // emitted: `brickIndex` (bx*by*bz int32s) maps a brick coordinate to its slot
+    // in `brickData` (contiguous B^3 fp16 voxels per active brick), or -1 for an
+    // all-empty brick that the device sampler reads as density 0. B must be a
+    // power of two. The result samples BIT-FOR-BIT identically to dense `data`:
+    // the trilinear stencil is always clamped to [0,n-1] before lookup, so the
+    // per-brick padding voxels (beyond nx/ny/nz when a dim isn't a multiple of B)
+    // are never addressed. Returns the number of active bricks.
+    int buildBricks(int B, int& bx, int& by, int& bz,
+                    std::vector<int32_t>& brickIndex,
+                    std::vector<uint16_t>& brickData) const {
+        bx = (nx + B - 1) / B; by = (ny + B - 1) / B; bz = (nz + B - 1) / B;
+        brickIndex.assign((size_t)bx * by * bz, -1);
+        const size_t B3 = (size_t)B * B * B;
+        int active = 0;
+        // Pass 1: flag bricks with any nonzero voxel, assign compact slots.
+        for (int bk = 0; bk < bz; ++bk)
+        for (int bj = 0; bj < by; ++bj)
+        for (int bi = 0; bi < bx; ++bi) {
+            bool any = false;
+            for (int lk = 0; lk < B && !any; ++lk) { int k = bk*B+lk; if (k>=nz) break;
+              for (int lj = 0; lj < B && !any; ++lj) { int j = bj*B+lj; if (j>=ny) break;
+                for (int li = 0; li < B; ++li) { int i = bi*B+li; if (i>=nx) break;
+                  if (data[((size_t)k*ny + j)*nx + i] != 0) { any = true; break; } } } }
+            if (any) brickIndex[((size_t)bk*by + bj)*bx + bi] = active++;
+        }
+        // Pass 2: copy voxels into their brick slot (padding voxels stay 0).
+        brickData.assign((size_t)active * B3, 0);
+        for (int bk = 0; bk < bz; ++bk)
+        for (int bj = 0; bj < by; ++bj)
+        for (int bi = 0; bi < bx; ++bi) {
+            int slot = brickIndex[((size_t)bk*by + bj)*bx + bi];
+            if (slot < 0) continue;
+            uint16_t* dst = &brickData[(size_t)slot * B3];
+            for (int lk = 0; lk < B; ++lk) { int k = bk*B+lk; if (k>=nz) continue;
+              for (int lj = 0; lj < B; ++lj) { int j = bj*B+lj; if (j>=ny) continue;
+                for (int li = 0; li < B; ++li) { int i = bi*B+li; if (i>=nx) continue;
+                  dst[((size_t)lk*B + lj)*B + li] = data[((size_t)k*ny + j)*nx + i]; } } }
+        }
+        return active;
+    }
 };
 
 // Load a sparse volume file, bake its first float grid into `out`. Dispatches on
