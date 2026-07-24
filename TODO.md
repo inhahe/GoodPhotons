@@ -1399,12 +1399,20 @@ replacement for the renderer or the primary editing tool.**
         pin per incoming edge** (the param name), and one output pin; links connect upstream outputs into
         those labelled inputs. A longest-path layering places leaves (constants/oscillators) on the left and
         the params they drive on the right; pan/zoom to explore.
-- [ ] **F6 — scatter + grid field display & inspection.** **Scatter:** show the actual defined points
-      (no volume fill) using the same 3-D-view/stereo mechanism, colored by a **channel selector
-      (default)** or channels 0/1/2 → RGB; **click any point to inspect its location + all channel
-      values**; glyphs later. **Grid:** show a **3-D slice** with **sliders for the extra dims**; same
-      click-to-inspect. Coloring must handle **multi-valued** points (hence the channel selector, not a
-      single fixed mapping).
+- [x] **F6 — scatter + grid field display & inspection.** ✅ 2026-07-24 Slice A (loom,
+      `dea2abd`): `_describe_dataset` now emits real field geometry — scatter `points` (sample
+      positions) + `values` (per-sample channel-vectors), grid `axes` (per-axis lattice coords) +
+      flat C-order `values`; scalar values normalised to 1-lists so the C++ side sees uniform
+      channel-vectors. 3 new tests (grid geometry, scalar scatter, vector-rgb scatter). Slice B
+      (C++ viewer): a new **Fields tab** in the right pane (`drawFieldPane`/`collectFields`,
+      `FieldView`) renders scatter/grid sample points in the shared 3-D orbit view (grid node
+      positions reconstructed from axes+shape in C-order), **3-of-N dim pickers**, a **colour
+      selector** (heatmap of a chosen channel — with a channel slider for multi-valued fields — or
+      **ch0/1/2 → RGB**), **click-to-inspect** (nearest projected point within 14 px → prints its
+      position + every channel value), and **per-extra-dim slice sliders** for N-D grids (dims not
+      shown collapse to a chosen lattice index). Tabs auto-hide when their kind is absent so the
+      present one is default-selected. VERSION → 0.54.0. Verified via PrintWindow screenshot.
+      *(No glyphs yet — points only, as speced; deferred as a later polish.)*
 - [ ] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** Show a loom
       isosurface in the 3-D pane by **raymarching it through `-raster-gpu`** (primary path — the whole
       reason for the native viewer; lets the user *modify* the isosurface and see it re-evaluated fast

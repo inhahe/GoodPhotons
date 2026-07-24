@@ -632,8 +632,13 @@ tools/loom/
   complete:** `_describe_dag` tags every edge with the destination `param` it feeds (identity-matched to
   the attribute the child is stored under), and the viewer compiles vendored **imnodes** to draw a
   **Modulator DAG** panel — nodes titled `<op> #<id>`, one labelled input pin per incoming edge, longest-
-  path layering from leaves to driven params. Remaining §F slices (F4/F6/F7: the SweptMesh/scatter-grid/
-  `-raster-gpu` panes) build on it.
+  path layering from leaves to driven params. **F6 is complete:** `_describe_dataset` now emits real field
+  geometry — scatter `points`+`values`, grid `axes`+flat C-order `values` (scalar values normalised to
+  1-lists) — and the viewer's **Fields tab** (`collectFields`/`drawFieldPane`) renders those sample points
+  in the shared 3-D orbit view (grid node positions reconstructed from axes+shape in C-order), with 3-of-N
+  dim pickers, a heatmap-channel / ch0·1·2→RGB colour selector, click-to-inspect, and per-extra-dim slice
+  sliders for N-D grids. Remaining §F slices (F4/F7: the SweptMesh + `-raster-gpu`/isosurface panes) build
+  on it.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

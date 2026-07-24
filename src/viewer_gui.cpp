@@ -257,6 +257,95 @@ static std::vector<CurveGeom> collectCurves(const Sidecar& sc) {
     return curves;
 }
 
+// --------------------------------------------------------------------------
+// F6 — scatter + grid field datasets. Both collapse to a common form: a list of
+// sample points (each an N-D position + a channel-vector value). A grid also keeps
+// its per-axis coordinates + shape so extra dims beyond the 3 shown can be sliced.
+// --------------------------------------------------------------------------
+struct FieldPoint {
+    std::vector<float> pos;    // dim scalars
+    std::vector<float> val;    // valueDim channel scalars
+    std::vector<int>   idx;    // per-axis lattice index (grid only; empty for scatter)
+};
+struct FieldGeom {
+    std::string              id;
+    std::string              kind;       // "scatter" | "grid"
+    int                      dim = 0;    // position dimensionality
+    int                      valueDim = 1;
+    std::vector<std::string> channels;   // names (may be empty)
+    std::vector<FieldPoint>  points;
+    std::vector<int>         shape;      // grid: samples per axis (empty for scatter)
+    bool                     isGrid = false;
+};
+
+static void readFlatVecs(const minijson::Value* a, std::vector<std::vector<float>>& out) {
+    out.clear();
+    if (!a || !a->isArray()) return;
+    for (const auto& row : a->arr) {
+        std::vector<float> v;
+        if (row.isArray()) for (const auto& x : row.arr) v.push_back((float)x.asNumber(0.0));
+        else               v.push_back((float)row.asNumber(0.0));
+        out.push_back(std::move(v));
+    }
+}
+
+static std::vector<FieldGeom> collectFields(const Sidecar& sc) {
+    std::vector<FieldGeom> fields;
+    const minijson::Value* ds = sc.arr("datasets");
+    if (!ds) return fields;
+    for (const auto& d : ds->arr) {
+        std::string kind = scalarStr(d.find("kind"), "");
+        bool isGrid = (kind == "grid"), isScat = (kind == "scatter");
+        if (!isGrid && !isScat) continue;
+        FieldGeom f;
+        f.id       = scalarStr(d.find("id"), "");
+        f.kind     = kind;
+        f.isGrid   = isGrid;
+        f.valueDim = std::max(1, d.intAt("value_dim", 1));
+        if (const minijson::Value* ch = d.find("channels"); ch && ch->isArray())
+            for (const auto& c : ch->arr) f.channels.push_back(c.asString(""));
+
+        std::vector<std::vector<float>> vals;
+        readFlatVecs(d.find("values"), vals);
+
+        if (isScat) {
+            std::vector<std::vector<float>> pts;
+            readFlatVecs(d.find("points"), pts);
+            f.dim = pts.empty() ? 0 : (int)pts[0].size();
+            for (size_t i = 0; i < pts.size(); ++i) {
+                FieldPoint fp;
+                fp.pos = pts[i];
+                if (i < vals.size()) fp.val = vals[i];
+                f.points.push_back(std::move(fp));
+            }
+        } else {  // grid: reconstruct node positions from axes + shape (C order)
+            std::vector<std::vector<float>> axes;
+            readFlatVecs(d.find("axes"), axes);
+            if (const minijson::Value* sh = d.find("shape"); sh && sh->isArray())
+                for (const auto& s : sh->arr) f.shape.push_back(std::max(1, s.asInt(1)));
+            int ndim = (int)f.shape.size();
+            f.dim = ndim;
+            std::vector<int> strides(ndim, 1);
+            for (int a = ndim - 2; a >= 0; --a) strides[a] = strides[a + 1] * f.shape[a + 1];
+            for (size_t i = 0; i < vals.size(); ++i) {
+                FieldPoint fp;
+                fp.idx.resize(ndim);
+                fp.pos.resize(ndim);
+                for (int a = 0; a < ndim; ++a) {
+                    int k = (strides[a] ? ((int)i / strides[a]) % f.shape[a] : 0);
+                    fp.idx[a] = k;
+                    fp.pos[a] = (a < (int)axes.size() && k < (int)axes[a].size())
+                                    ? axes[a][k] : (float)k;
+                }
+                fp.val = vals[i];
+                f.points.push_back(std::move(fp));
+            }
+        }
+        fields.push_back(std::move(f));
+    }
+    return fields;
+}
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -532,6 +621,207 @@ static void drawStripCharts(const std::vector<StripSeries>& strips, OrbitView& v
 }
 
 // --------------------------------------------------------------------------
+// F6 — field pane: scatter / grid sample points in a 3-D orbit view, colour-mapped
+// by a selectable channel (or ch0/1/2 -> RGB), click-to-inspect, and per-extra-dim
+// slice sliders for N-D grids (dims not shown collapse to a chosen lattice index).
+// --------------------------------------------------------------------------
+struct FieldView {
+    float yaw = 0.6f, pitch = 0.4f, zoom = 1.0f;
+    int   dx = 0, dy = 1, dz = 2;   // which position dims map to screen X/Y/Z
+    int   maxDim = 3;
+    int   colorMode = 0;            // 0 = scalar heatmap of `channel`, 1 = ch0/1/2 -> RGB
+    int   channel = 0;             // heatmap channel index
+    std::vector<int> slice;         // per-dim chosen lattice index (grids); size maxDim
+    int   picked = -1;              // last clicked point (global index over the flat list)
+    int   pickedField = -1;
+};
+
+// heat colour ramp (blue -> cyan -> green -> yellow -> red) for a 0..1 value
+static ImU32 heat(float t) {
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4 * t - 3)));
+    float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4 * t - 2)));
+    float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4 * t - 1)));
+    return IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
+}
+
+static void drawFieldPane(const std::vector<FieldGeom>& fields, FieldView& view) {
+    ImGui::TextUnformatted("Fields - drag to orbit, wheel to zoom, click a point to inspect");
+    if (view.maxDim > 3) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(showing 3 of %d dims)", view.maxDim);
+    }
+    auto dimCombo = [&](const char* label, int& sel) {
+        ImGui::SetNextItemWidth(60);
+        std::string cur = "d" + std::to_string(sel);
+        if (ImGui::BeginCombo(label, cur.c_str())) {
+            for (int k = 0; k < view.maxDim; ++k) {
+                std::string it = "d" + std::to_string(k);
+                if (ImGui::Selectable(it.c_str(), sel == k)) sel = k;
+            }
+            ImGui::EndCombo();
+        }
+    };
+    dimCombo("X", view.dx); ImGui::SameLine();
+    dimCombo("Y", view.dy); ImGui::SameLine();
+    dimCombo("Z", view.dz); ImGui::SameLine();
+
+    // channel / colour controls
+    int maxVDim = 1;
+    for (const auto& f : fields) maxVDim = std::max(maxVDim, f.valueDim);
+    ImGui::SetNextItemWidth(140);
+    const char* cmodes[] = { "heatmap channel", "ch0/1/2 -> RGB" };
+    ImGui::Combo("colour", &view.colorMode, cmodes, 2);
+    if (view.colorMode == 0 && maxVDim > 1) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(60);
+        if (view.channel >= maxVDim) view.channel = 0;
+        ImGui::SliderInt("chan", &view.channel, 0, maxVDim - 1);
+    }
+
+    // N-D grid slice sliders: for any dim not on screen, pick a lattice index to show
+    if ((int)view.slice.size() < view.maxDim) view.slice.resize(view.maxDim, 0);
+    if (view.maxDim > 3) {
+        // widest per-dim lattice extent across grids (so the slider range is sensible)
+        std::vector<int> ext(view.maxDim, 1);
+        for (const auto& f : fields)
+            for (int a = 0; a < (int)f.shape.size() && a < view.maxDim; ++a)
+                ext[a] = std::max(ext[a], f.shape[a]);
+        for (int a = 0; a < view.maxDim; ++a) {
+            if (a == view.dx || a == view.dy || a == view.dz) continue;
+            if (ext[a] <= 1) continue;
+            ImGui::SetNextItemWidth(160);
+            std::string lbl = "slice d" + std::to_string(a);
+            if (view.slice[a] >= ext[a]) view.slice[a] = ext[a] - 1;
+            ImGui::SliderInt(lbl.c_str(), &view.slice[a], 0, ext[a] - 1);
+        }
+    }
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.y < 80.0f) avail.y = 80.0f;
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("field_canvas", avail);
+    bool hovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        view.yaw   += d.x * 0.01f;
+        view.pitch += d.y * 0.01f;
+    }
+    if (hovered) {
+        float w = ImGui::GetIO().MouseWheel;
+        if (w != 0.0f) view.zoom *= (1.0f + w * 0.1f);
+    }
+    if (view.zoom < 0.05f) view.zoom = 0.05f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 br(origin.x + avail.x, origin.y + avail.y);
+    dl->AddRectFilled(origin, br, IM_COL32(16, 18, 20, 255));
+    dl->PushClipRect(origin, br, true);
+
+    // Reuse the curve pane's projection via a throwaway OrbitView with the same angles.
+    OrbitView ov; ov.yaw = view.yaw; ov.pitch = view.pitch; ov.zoom = view.zoom;
+    ov.dx = view.dx; ov.dy = view.dy; ov.dz = view.dz;
+
+    int seldim[3] = { view.dx, view.dy, view.dz };
+    auto visible = [&](const FieldGeom& f, const FieldPoint& p) -> bool {
+        if (!f.isGrid || view.maxDim <= 3) return true;
+        for (int a = 0; a < (int)p.idx.size(); ++a) {
+            if (a == view.dx || a == view.dy || a == view.dz) continue;
+            if (a < (int)view.slice.size() && p.idx[a] != view.slice[a]) return false;
+        }
+        return true;
+    };
+
+    // auto-fit bounds over the (visible) sample positions
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (const auto& f : fields)
+        for (const auto& p : f.points) {
+            if (!visible(f, p)) continue;
+            for (int k = 0; k < 3; ++k)
+                if (seldim[k] < (int)p.pos.size()) {
+                    lo[k] = std::min(lo[k], p.pos[seldim[k]]);
+                    hi[k] = std::max(hi[k], p.pos[seldim[k]]);
+                }
+        }
+    float ext = 1.0f;
+    for (int k = 0; k < 3; ++k) if (hi[k] > lo[k]) ext = std::max(ext, hi[k] - lo[k]);
+    float mid[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; ++k) if (hi[k] >= lo[k]) mid[k] = 0.5f * (lo[k] + hi[k]);
+    ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
+    float scale = 0.4f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
+
+    // per-channel value range (for the heatmap normalisation)
+    float vlo = 1e30f, vhi = -1e30f;
+    for (const auto& f : fields)
+        for (const auto& p : f.points) {
+            if (!visible(f, p)) continue;
+            int c = std::min(view.channel, (int)p.val.size() - 1);
+            if (c >= 0) { vlo = std::min(vlo, p.val[c]); vhi = std::max(vhi, p.val[c]); }
+        }
+    float vspan = (vhi > vlo) ? (vhi - vlo) : 1.0f;
+
+    // draw points, tracking the nearest to the mouse for click-to-inspect
+    int   bestField = -1, bestPt = -1; float bestD2 = 1e30f;
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    for (int fi = 0; fi < (int)fields.size(); ++fi) {
+        const FieldGeom& f = fields[fi];
+        for (int pi = 0; pi < (int)f.points.size(); ++pi) {
+            const FieldPoint& p = f.points[pi];
+            if (!visible(f, p)) continue;
+            float x, y, z;
+            pick3(p.pos.data(), (int)p.pos.size(), ov, mid, x, y, z);
+            ImVec2 s = project3(x, y, z, ov, 0.0f, center, scale);
+            ImU32 col;
+            if (view.colorMode == 1) {   // ch0/1/2 -> RGB
+                float r = p.val.size() > 0 ? p.val[0] : 0.0f;
+                float g = p.val.size() > 1 ? p.val[1] : 0.0f;
+                float b = p.val.size() > 2 ? p.val[2] : 0.0f;
+                auto cl = [](float u){ return (int)(std::min(1.0f, std::max(0.0f, u)) * 255); };
+                col = IM_COL32(cl(r), cl(g), cl(b), 255);
+            } else {
+                int c = std::min(view.channel, (int)p.val.size() - 1);
+                float t = (c >= 0) ? (p.val[c] - vlo) / vspan : 0.5f;
+                col = heat(t);
+            }
+            float rad = (f.isGrid ? 3.0f : 4.0f);
+            bool sel = (fi == view.pickedField && pi == view.picked);
+            dl->AddCircleFilled(s, rad, col);
+            dl->AddCircle(s, rad + 1.5f, sel ? IM_COL32(255, 240, 80, 255)
+                                             : IM_COL32(0, 0, 0, 140), 0, 1.2f);
+            float d2 = (s.x - mouse.x) * (s.x - mouse.x) + (s.y - mouse.y) * (s.y - mouse.y);
+            if (d2 < bestD2) { bestD2 = d2; bestField = fi; bestPt = pi; }
+        }
+    }
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && bestD2 < 14.0f * 14.0f) {
+        view.pickedField = bestField;
+        view.picked = bestPt;
+    }
+    dl->PopClipRect();
+
+    // inspector line for the picked sample
+    if (view.pickedField >= 0 && view.pickedField < (int)fields.size()) {
+        const FieldGeom& f = fields[view.pickedField];
+        if (view.picked >= 0 && view.picked < (int)f.points.size()) {
+            const FieldPoint& p = f.points[view.picked];
+            std::string pos = "(";
+            for (size_t k = 0; k < p.pos.size(); ++k)
+                pos += (k ? ", " : "") + std::string(std::to_string(p.pos[k]));
+            pos += ")";
+            std::string val;
+            for (size_t k = 0; k < p.val.size(); ++k) {
+                std::string nm = (k < f.channels.size() && !f.channels[k].empty())
+                                     ? f.channels[k] : ("c" + std::to_string(k));
+                val += (k ? "  " : "") + nm + "=" + std::to_string(p.val[k]);
+            }
+            ImGui::TextWrapped("#%s[%d]  pos %s  |  %s",
+                               f.id.c_str(), view.picked, pos.c_str(), val.c_str());
+        }
+    } else {
+        ImGui::TextDisabled("(click a sample point to inspect its position & channels)");
+    }
+}
+
+// --------------------------------------------------------------------------
 // The panels
 // --------------------------------------------------------------------------
 static void drawObjectsPanel(const Sidecar& sc) {
@@ -761,9 +1051,12 @@ int runViewerGui(const std::string& sidecarPath) {
     std::vector<CurveGeom> curves = collectCurves(sc);
     std::vector<StripSeries> strips = buildStrips(curves);
     DagGraph dag = collectDag(sc);
+    std::vector<FieldGeom> fields = collectFields(sc);
 
     OrbitView view;
     for (const auto& c : curves) view.maxDim = std::max(view.maxDim, c.dim);
+    FieldView fview;
+    for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
 
     // --- window ---
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
@@ -834,17 +1127,29 @@ int runViewerGui(const std::string& sidecarPath) {
 
         ImGui::SameLine();
         ImGui::BeginChild("right", ImVec2(0, 0), true);
-        if (!strips.empty()) {
-            // curve pane on top, scroll-locked strip charts below
-            float paneH = ImGui::GetContentRegionAvail().y * 0.58f;
-            ImGui::BeginChild("curvepane", ImVec2(0, paneH), false);
-            drawCurvePane(curves, view);
-            ImGui::EndChild();
-            ImGui::BeginChild("stripcharts", ImVec2(0, 0), false);
-            drawStripCharts(strips, view);
-            ImGui::EndChild();
-        } else {
-            drawCurvePane(curves, view);
+        // Curves and Fields each get a tab. A tab is shown only when its kind is
+        // present, so whichever exists is the default-selected one (no empty tabs).
+        bool haveCurves = !curves.empty();
+        if (ImGui::BeginTabBar("rightTabs")) {
+            if ((haveCurves || fields.empty()) && ImGui::BeginTabItem("Curves")) {
+                if (!strips.empty()) {
+                    float paneH = ImGui::GetContentRegionAvail().y * 0.58f;
+                    ImGui::BeginChild("curvepane", ImVec2(0, paneH), false);
+                    drawCurvePane(curves, view);
+                    ImGui::EndChild();
+                    ImGui::BeginChild("stripcharts", ImVec2(0, 0), false);
+                    drawStripCharts(strips, view);
+                    ImGui::EndChild();
+                } else {
+                    drawCurvePane(curves, view);
+                }
+                ImGui::EndTabItem();
+            }
+            if (!fields.empty() && ImGui::BeginTabItem("Fields")) {
+                drawFieldPane(fields, fview);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
         ImGui::EndChild();
 
