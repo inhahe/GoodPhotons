@@ -115,11 +115,14 @@ Origin tags point at the authoritative design text for each item.
         site saturates it.
       - **Rebinding an already-named axis: `(a=u)`.** If the material *did* name an axis — say it declared the
         parameter with a formal axis `a` (`reflect [0 1](a)`) — a user who wants to feed a *different* driver than
-        the formal name uses the **keyword form** `(a=u)`: "bind my `u` to the array's `a` axis." Positional `(u)`
-        rebinds the sole/next axis; keyword `(a=u)` targets a named one (needed once there are ≥2 axes, e.g.
-        `(a=u, b=v)`). This is ordinary call-site argument binding — positional or by-name — lifted onto the
-        array-sample. Semantics to pin when built: whether a formal axis name is a *binding site* (rebindable) vs a
-        *literal coordinate source* (fixed), and the error when a bare array reaches the renderer unsaturated.
+        the formal name uses the **keyword form** `(a=u)` — read `formal=driver` — "bind my `u` to the array's `a`
+        axis." Positional `(u)` rebinds the sole/next axis; keyword `formal=driver` targets a named one. **Keyword
+        rebinds take multiple arguments**, one per axis — e.g. a 2-D array whose formals are `u,v` is rebound to the
+        drivers `a,x` as `(u=a, v=x)` (and `(a=u, b=v)` likewise for formals `a,b`). Mix is allowed the usual way
+        (positionals first, then keywords). This is ordinary call-site argument binding — positional or by-name —
+        lifted onto the array-sample. Semantics to pin when built: whether a formal axis name is a *binding site*
+        (rebindable) vs a *literal coordinate source* (fixed), and the error when a bare array reaches the renderer
+        unsaturated.
     * **Grammar sketch (shared `.epeg`, one production reused by array / grid / scatter).** The axis tuple hangs off
       any value; args are positional coords or `name=coord` rebinds:
       ```
@@ -130,9 +133,10 @@ Origin tags point at the authoritative design text for each item.
       coord     = NAME | NUMBER | value   # an axis driver: a var (u/v/x), a constant, or a nested sampled value
       ```
       Notes: `value` is the existing context-free array/vec tree (`values.py`); `axistuple` is optional, so an
-      un-called array stays a plain `value` (the *unsaturated* case). `coord` allowing a nested `sampled` gives
-      composition (`n( m(u), v )`). Reuse the **same** `axistuple` on the N-D grid and scatter element grammars so
-      literal-array / grid / scatter all sample identically.
+      un-called array stays a plain `value` (the *unsaturated* case). The `arg (',' arg)*` repetition is what makes
+      multi-axis calls work — positional `(u, v)` or keyword `(u=a, v=x)` (and mixes, positionals first). `coord`
+      allowing a nested `sampled` gives composition (`n( m(u), v )`). Reuse the **same** `axistuple` on the N-D grid
+      and scatter element grammars so literal-array / grid / scatter all sample identically.
     * **Carry loom's constructor conveniences into the ftsl grid/scatter datatype** (already shipped in loom
       `data.py`, port them alongside the datatype):
       - **`shape=` is redundant when the data is nested.** The nesting *is* the shape — `[[0 1 2][3 4 5]]` is a
