@@ -1309,11 +1309,31 @@ replacement for the renderer or the primary editing tool.**
   `Scene` whenever it needs to re-derive geometry.
 
 **Tasks:**
-- [ ] **F1 — scene/object enumeration + `build()` load contract.** Load a loom file, call its
-      `build(clock, **params)`, walk the resulting `Scene`, and present a selectable list of objects
-      (curves, SweptMeshes, isosurfaces, scatter/grid fields). Selecting one drives the panes below.
-      Define + document the `build()` contract (signature, that it must be side-effect-free at import,
-      how params are surfaced to the UI).
+- [x] **F1 — scene/object enumeration + `build()` load contract.** ✅ 2026-07-24 (**loom side**, `loom/viewer.py`).
+      Load a loom file, call its `build(clock, **params)`, walk the resulting `Scene`, and produce the
+      selectable-object data the viewer needs. Since the viewer is C++ and loom is Python, the loom side is
+      the **load contract + a JSON introspection sidecar** (the C++ host that renders the list/panes is F2–F7).
+      - **`build()` contract (documented in `viewer.py`):** `def build(clock=None, **params) -> Scene` —
+        returns a **fresh** Scene each call (no module-level `scene`; **side-effect-free at import** — importing
+        never renders/emits/opens windows), so the viewer re-derives geometry live. `clock` optional (viewer's
+        scrub frame; `None` ⇒ frame-0). Keyword params with defaults are surfaced as UI controls.
+      - **`load_build(path, func="build")`** imports a scene file → its `build`; **`ViewerModel(build, **params)`**
+        / `.from_file(path)` wraps it: `.scene(clock, **overrides)` builds, `.declared_params()` returns the
+        build's advertised keyword defaults, `.introspect(clock)` / `.save_sidecar(path, clock)` emit the sidecar
+        (atomic write). `build_scene(build, clock, **params)` passes `clock` only when the signature accepts it.
+      - **`introspect(scene)` sidecar:** `version`, `frame`; `objects` (geometry elements — Sphere/Beads/
+        SweptMesh/IsoMesh/Group/Volume/Raw/Isosurface — Groups recursed, each linking the `datasets` it
+        references by node id + kind-specific meta: name/material/count/res/iso/closed_*); `datasets` (every
+        `PointPath`/`TrackedPath`/`Grid`/`Scatter` reachable from geometry **or** materials/lights/camera, with
+        dim/shape/lo/hi/channels/tracks); minimal `camera`/`lights`; and `dag` (modulator graph — `nodes` =
+        id+op+label, `edges` = child→parent; per-edge parameter labels deferred to F5). 20 tests
+        (`tests/test_viewer.py`): contract loader (missing/non-callable/custom-name), clock passing/param
+        forwarding, object kinds + dataset linking, path/grid/scatter coverage, DAG node/edge integrity,
+        ViewerModel scene/introspect/declared-params/from-file/save-sidecar. 972 loom green.
+      - **Remaining (C++ host):** the selectable object list + panes are F2–F7 on the ImGui/ImPlot/imnodes +
+        `-raster-gpu` viewer. Recommended backend **Win32 + Direct3D 11** (ftrace is already Win32 → no new
+        windowing dep; mature CUDA↔D3D11 interop; a first cut can upload `kIsoPreview`'s host RGB to a dynamic
+        texture, with zero-copy interop as a later optimization).
 - [ ] **F2 — N-D curve 3-D view.** Show an N-D curve by picking **3 of N** dims to display. **Rotating
       the displayed dims = a view-only transform** (no recompute); **rotating into other dims = recompute
       the projection.** Index markers along the curve show curve progression. **Stereoscopic viewing:**

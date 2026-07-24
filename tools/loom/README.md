@@ -66,7 +66,8 @@ tools/loom/
 │   ├── xvideo.py    two-pass spacetime transforms (rotate/shear a 4-D block)
 │   ├── ftsl_emit.py .ftsl emission
 │   ├── drive.py     drivers: render a frame range → ftrace → GIF/MP4 assembly
-│   └── preview.py   resident preview server (keeps ftrace + GPU context warm)
+│   ├── preview.py   resident preview server (keeps ftrace + GPU context warm)
+│   └── viewer.py    native-viewer contract: build() loader + scene-introspection JSON sidecar (§F1)
 ├── examples/        runnable scripts (see below)
 ├── tests/           pytest suite
 └── DESIGN.md        the architecture / roadmap document

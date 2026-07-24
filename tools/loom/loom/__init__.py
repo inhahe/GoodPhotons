@@ -67,6 +67,9 @@ from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
 from .preview import PreviewServer, preview_range
+from .viewer import (
+    load_build, build_scene, introspect, ViewerModel,
+)
 from .spatial import (
     SpatialExpr, sexpr, X, Y, Z, T, SPATIAL_PATTERNS,
     sin, cos, tan, sqrt, exp, log, floor, fract, sign, saturate, sabs,
@@ -119,6 +122,7 @@ __all__ = [
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
     "PreviewServer", "preview_range",
+    "load_build", "build_scene", "introspect", "ViewerModel",
     "SpatialExpr", "sexpr", "X", "Y", "Z", "T", "SPATIAL_PATTERNS",
     "sin", "cos", "tan", "sqrt", "exp", "log", "floor", "fract", "sign",
     "saturate", "sabs", "smin", "smax", "spow", "atan2", "step", "clamp",

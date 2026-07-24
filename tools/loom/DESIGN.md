@@ -425,6 +425,7 @@ tools/loom/
     anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
+    viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
   tests/                    unit tests (cycle detection, closed-curve seamlessness, slicer)
 ```
@@ -605,6 +606,20 @@ tools/loom/
   pipe. Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (23).
   Remaining slice: (3) the interactive ftrace `camera_curve` **editor** generalization (seed from / write
   back the sidecar, drive arbitrary scene variables) — the C++ part, best done with the user present.
+- **F1 (native viewer — the loom↔viewer data contract).** ✅ done (`loom/viewer.py`). The §F native viewer is
+  a C++ process; loom is Python, so (per the locked architecture) loom exposes a scene via a **`build()`
+  load contract** and a **JSON introspection sidecar**, not in-process sharing. `build(clock=None, **params)
+  -> Scene` returns a *fresh* Scene per call (side-effect-free at import — no module-level `scene`), so the
+  viewer re-derives geometry live (scrub/param/re-tessellate). `load_build(path)` imports a scene file and
+  returns its `build`; `ViewerModel(build, **params)` (or `.from_file`) wraps it — `.scene(clock)` builds,
+  `.declared_params()` surfaces the build's keyword defaults as UI controls, `.introspect(clock)` /
+  `.save_sidecar` produce the sidecar. `introspect(scene)` enumerates: `objects` (geometry elements, Groups
+  recursed, each linking the `datasets` it references by node id), `datasets` (every `PointPath`/
+  `TrackedPath`/`Grid`/`Scatter` reachable — dim/shape/channels/etc.), minimal `camera`/`lights`, and the
+  modulator `dag` (`nodes` = id+op+label, `edges` = child→parent; per-edge **param** labels are §F5's job).
+  Tests: `tests/test_viewer.py` (20). Remaining §F slices (F2–F7, the ImGui/ImPlot/imnodes + `-raster-gpu`
+  panes) are the C++ host — recommended backend **Win32 + Direct3D 11** (no new windowing dep; mature
+  CUDA↔D3D11 interop; a first cut can just upload `kIsoPreview`'s host RGB to a dynamic texture).
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
