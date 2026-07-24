@@ -81,6 +81,13 @@ if(CMAKE_CUDA_COMPILER)
     # lets compute-sanitizer / cuda-gdb map GPU faults back to file:line — the
     # difference between "an OOB happened somewhere" and "OOB at render_cuda.cu:1234".
     target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    # CCCL 3.x (the thrust/cub shipped with CUDA 13) requires MSVC's standard-conforming
+    # preprocessor; without it the thrust headers #error out. Scoped to the CUDA host
+    # pass-through so plain C++ TUs keep their default flags.
+    if(MSVC)
+        target_compile_options(ftrace PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    endif()
     if(FTRACE_GPU_FP32)
         target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=1)
     else()

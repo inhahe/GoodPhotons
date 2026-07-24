@@ -122,8 +122,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   state (`tau`/`radius`/`nAcc`/`directSum` + this pass's visible point) lives on the device
   across passes, and each pass runs `kSppmVisiblePoint` (resample the camera visible point +
   direct term via the specular walk), reuses the mode-M forward deposit (`launchForward`,
-  fresh seed = cumulative emitted), host-builds the grid at the largest current per-pixel
-  radius, then `kSppmGather` (query + Hachisuka shared-statistics radius/flux update) and
+  fresh seed = cumulative emitted), builds the grid **on-device** at the largest current
+  per-pixel radius (0.39.1: deposits stay resident in a grow-only device buffer; rMax via
+  `transform_reduce`, `kSppmCellKey` + stable sort + `lower_bound` cell ranges,
+  `kSppmGatherConvert` bakes the photon records with double-precision cie tables — per-pass
+  PCIe traffic drops from the full photon slab to a few bytes; ~13× faster passes), then
+  `kSppmGather` (query + Hachisuka shared-statistics radius/flux update) and
   `kSppmResolve` (`L = directSum/passes + tau/(pi R^2 Nemit)`). The SPPM photon record bakes
   `pX = cie(lambda)·power/pi` with NO area/nEmitted fold (those depend on the current
   per-pixel radius, applied at resolve) — unlike mode M, which folds them in. Validated
@@ -142,11 +146,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   only) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
   storing connectible vertices into a **per-path slab** (`lvSlab[i·vcmCap+k]`, no cross-thread
   atomics) and splatting the connect-to-camera (t=1) light-image contributions (atomic into a
-  per-pass double buffer); (2) the host downloads the slab + per-path counts and compacts them into
-  contiguous per-path ranges (`pathBegin/pathEnd`) so the same-λ vertex CONNECTION reads its PAIRED
-  light subpath exactly (single-wavelength spectral BDPT); (3) counting-sort-builds the uniform hash
-  grid over the compacted vertices (cell = merge radius — a byte-for-byte host mirror of
-  `VcmGrid::build`, reusing the M3 device-grid query layout); (4) `kVcmCamera` traces one camera
+  per-pass double buffer); (2) compacts the slab **on-device** (0.39.1: thrust scans over the
+  per-path counts → `pathBegin`/`pathEnd` + `kVcmCompactScatter`; only the 4-byte total vertex
+  count crosses PCIe per pass, vs the former ~69 MB slab download) into contiguous per-path
+  ranges so the same-λ vertex CONNECTION reads its PAIRED light subpath exactly
+  (single-wavelength spectral BDPT); (3) sort-builds the uniform hash grid on-device
+  (`kVcmCellKey` + `thrust::sequence` + stable sort + `lower_bound` — order-identical to the
+  former host counting sort; cell = merge radius, reusing the M3 device-grid query layout;
+  ~4× faster passes, byte-identical output); (4) `kVcmCamera` traces one camera
   subpath per pixel doing emission (s=0) / NEE (s=1) / paired-path vertex connection (c) / grid merge
   from ALL paths (d) under one **balance-heuristic** MIS (SmallVCM `dVCM`/`dVC`/`dVM` bookkeeping,
   misArrival/misScatter inlined with Mis=identity), accumulating the running per-pixel XYZ sum
