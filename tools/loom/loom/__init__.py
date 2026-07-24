@@ -44,7 +44,7 @@ from .sweep import (
     write_obj,
 )
 from .iso import (
-    Isosurface, gyroid_surface, phase_drift, FIELDS,
+    Isosurface, Room, gyroid_surface, phase_drift, FIELDS,
     gyroid, schwarz_p, schwarz_d, neovius,
 )
 from .pov import (
@@ -95,7 +95,7 @@ __all__ = [
     "mesh_field",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
-    "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",
+    "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",

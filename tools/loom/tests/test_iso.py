@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loom import (  # noqa: E402
     Clock, Cache, Const, Sine, rotations, vec,
-    Scene, Material, Camera, Isosurface, gyroid_surface, phase_drift,
+    Scene, Material, Camera, Isosurface, Room, gyroid_surface, phase_drift,
+    affine, Affine,
 )
 from loom.ftsl_emit import EmitCtx  # noqa: E402
 
@@ -105,6 +106,85 @@ def test_placement_animatable():
     a = _emit(iso, Clock(t=0.1))
     b = _emit(iso, Clock(t=0.35))
     assert a != b, "an animated placement should move the surface"
+
+
+def test_room_namespaces_child_names():
+    room = Room("hall",
+                gyroid_surface(freq=1.0, name="a", material="m"),
+                Isosurface("schwarz_p", freq=1.0, name="b", material="m"))
+    txt = _emit(room, Clock(t=0.0))
+    assert "hall/a = isosurface" in txt, txt
+    assert "hall/b = isosurface" in txt, txt
+    # child names are restored after emit (no leakage)
+    assert room.children[0].name == "a"
+    assert room.children[1].name == "b"
+
+
+def test_room_translation_moves_children():
+    # a room translated by +5 in x moves an origin-placed child's box to x∈[4,6].
+    room = Room("hall",
+                gyroid_surface(freq=1.0, name="g", material="m",
+                               bounds=((-1, -1, -1), (1, 1, 1))),
+                frame=Affine.translation((5.0, 0.0, 0.0)))
+    txt = _emit(room, Clock(t=0.0))
+    assert "min 4 -1 -1" in txt, txt
+    assert "max 6 1 1" in txt, txt
+    # the coordinate frame shifts too: x -> (x-(5))
+    assert "(x-(5))" in txt, txt
+
+
+def test_room_child_placement_composes_with_frame():
+    # child placed at (2,0,0) inside a room translated (5,0,0) -> world x=7.
+    child = gyroid_surface(freq=1.0, name="g", material="m",
+                           placement=(2.0, 0.0, 0.0),
+                           bounds=((-1, -1, -1), (1, 1, 1)))
+    room = Room("hall", child, frame=Affine.translation((5.0, 0.0, 0.0)))
+    txt = _emit(room, Clock(t=0.0))
+    assert "min 6 -1 -1" in txt, txt   # 7-1
+    assert "max 8 1 1" in txt, txt     # 7+1
+    assert "(x-(7))" in txt, txt
+
+
+def test_room_frame_leaves_child_parent_unset():
+    child = gyroid_surface(freq=1.0, name="g", material="m")
+    room = Room("hall", child, frame=Affine.translation((3.0, 0.0, 0.0)))
+    _emit(room, Clock(t=0.0))
+    assert child._parent is None, "room must restore child _parent after emit"
+
+
+def test_nested_rooms_stack_names_and_frames():
+    inner = Room("inner",
+                 gyroid_surface(freq=1.0, name="g", material="m",
+                                bounds=((-1, -1, -1), (1, 1, 1))),
+                 frame=Affine.translation((2.0, 0.0, 0.0)))
+    outer = Room("outer", inner, frame=Affine.translation((5.0, 0.0, 0.0)))
+    txt = _emit(outer, Clock(t=0.0))
+    assert "outer/inner/g = isosurface" in txt, txt
+    # composed translation 5+2 = 7
+    assert "min 6 -1 -1" in txt, txt
+    assert "max 8 1 1" in txt, txt
+
+
+def test_room_animatable_frame_moves_over_time():
+    room = Room("hall",
+                gyroid_surface(freq=1.0, name="g", material="m"),
+                frame=affine(3, [("move", vec(Sine(cycles=1, amp=4.0), 0.0, 0.0))]))
+    a = _emit(room, Clock(t=0.1))
+    b = _emit(room, Clock(t=0.6))
+    assert a != b, "an animated room frame should move its children"
+
+
+def test_room_in_scene_emits_and_checks_cycles():
+    s = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0), res=(16, 16)))
+    room = Room("hall",
+                gyroid_surface(freq=Const(1.5), name="a", material="m"),
+                gyroid_surface(freq=1.0, name="b", material="m",
+                               placement=(3.0, 0.0, 0.0)),
+                frame=affine(3, [("rot", 0, 2, Sine(cycles=1, amp=1.0))]))
+    s.add(Material("m", "diffuse", reflect=0.7), room)
+    s.check_cycles()  # must not raise
+    txt = s.emit(Clock.at_frame(3, 24), Cache())
+    assert "hall/a = isosurface" in txt and "hall/b = isosurface" in txt
 
 
 def test_scene_check_cycles_ok():

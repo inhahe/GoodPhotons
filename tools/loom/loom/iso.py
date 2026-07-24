@@ -268,6 +268,76 @@ class Isosurface(Element):
         return "\n".join(lines)
 
 
+class Room(Element):
+    """A group of placed :class:`Isosurface` (or nested :class:`Room`) children under
+    one animatable :class:`~loom.mathnd.Affine` frame.
+
+    A ``Room`` owns a child list and a rigid ``frame`` (rotation + translation, e.g.
+    from :func:`loom.affine` / :func:`loom.rotations`).  On :meth:`emit` it hands each
+    child the composed frame as its transient ``_parent`` — so a child authored at a
+    local ``placement`` lands at ``frame ∘ child_placement`` in the world, its
+    coordinate field tilts with the room, and its ``contained_by`` box/sphere tracks
+    along (see :class:`Isosurface`).  Child ``name``\\s are namespaced ``room/child`` so
+    the emitted ``isosurface`` blocks never collide, and the whole subtree animates:
+    ``frame`` is baked per frame, so the room can tumble while its blobs drift inside.
+
+    Rooms nest: an enclosing room folds its frame into this one before passing it down
+    (``outer ∘ inner``), and names stack (``outer/inner/gyroidA``).  The frame should
+    stay **rigid** (orthonormal linear part) — the child fold assumes ``Pᵀ`` inverts
+    ``P``.  For a seamless loop, translate on *closed* curves and rotate by integer
+    turns so ``frame`` returns to its start at the wrap.
+    """
+
+    def __init__(self, name: str, *children: Element,
+                 frame: Optional[Affine] = None) -> None:
+        self.name = name
+        self.children: list = list(children)
+        if frame is not None and frame.dim != 3:
+            raise ValueError("Room frame must be a 3-D Affine")
+        self.frame = frame if frame is not None else Affine.identity(3)
+        # transient parent frame, set by an enclosing Room during its emit.
+        self._parent: Optional[Affine] = None
+
+    def add(self, *children: Element) -> "Room":
+        self.children.extend(children)
+        return self
+
+    def roots(self):
+        out: list = []
+        # the room frame's animatable parts (matrix entries + translation)
+        for r in self.frame.linear.rows:
+            out.extend(r)
+        out.append(self.frame.offset)
+        for c in self.children:
+            out.extend(c.roots() if hasattr(c, "roots") else [])
+        return out
+
+    def _effective_frame(self) -> Affine:
+        """This room's frame with any enclosing room folded in (``parent ∘ frame``)."""
+        return self.frame if self._parent is None else self._parent.compose(self.frame)
+
+    def emit(self, ctx: EmitCtx) -> str:
+        eff = self._effective_frame()
+        blocks = []
+        for c in self.children:
+            if not hasattr(c, "_parent"):
+                # a plain element with no placement hook: emit as-is.
+                blocks.append(c.emit(ctx))
+                continue
+            saved_parent = c._parent
+            saved_name = getattr(c, "name", None)
+            try:
+                c._parent = eff if saved_parent is None else eff.compose(saved_parent)
+                if saved_name is not None:
+                    c.name = f"{self.name}/{saved_name}"
+                blocks.append(c.emit(ctx))
+            finally:
+                c._parent = saved_parent
+                if saved_name is not None:
+                    c.name = saved_name
+        return "\n\n".join(blocks)
+
+
 def gyroid_surface(**kw) -> Isosurface:
     """Convenience: an :class:`Isosurface` using the gyroid field."""
     kw.setdefault("name", "gyroid")
