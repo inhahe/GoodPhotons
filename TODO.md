@@ -1421,10 +1421,13 @@ replacement for the renderer or the primary editing tool.**
         `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process
         holds a `ViewerModel` and answers newline-delimited-JSON `introspect {clock,params}` requests
         with a fresh sidecar (the thing the frozen sidecar can't do), mirroring `loom.anim.serve_live`
-        in the viewer→loom direction. 9 new tests (`tests/test_viewer.py`, 1004 loom green). **C++ half
-        still open** (best done with the user present): wire the `-viewer` GUI to spawn that process and
-        request re-introspection on rotate/scrub, feeding the new geometry through a latest-wins job
-        queue. Same channel unblocks F7's live field edit.
+        in the viewer→loom direction. 9 new tests (`tests/test_viewer.py`, 1004 loom green). The channel
+        also gained an **`emit`** command 2026-07-24 (re-emit `.ftsl` for a clock/params) that **F7's
+        in-process primary path (v0.56.0) already uses the static form of** — the viewer parses loom's
+        emitted `.ftsl` and raymarches it live. **C++ half still open** (best done with the user present):
+        wire the `-viewer` GUI to spawn that process (or reuse the in-process `ViewerModel` bridge F7
+        established) and request re-introspection/`emit` on rotate/scrub, feeding the new **mesh** geometry
+        through a latest-wins job queue into the Meshes tab. Same channel unblocks F7's live field edit.
 - [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
       and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
       each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
@@ -1454,14 +1457,25 @@ replacement for the renderer or the primary editing tool.**
       shown collapse to a chosen lattice index). Tabs auto-hide when their kind is absent so the
       present one is default-selected. VERSION → 0.54.0. Verified via PrintWindow screenshot.
       *(No glyphs yet — points only, as speced; deferred as a later polish.)*
-- [~] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** ✅ MC-mesh
-      **fallback done** 2026-07-24. `_describe_element` now bakes each `IsoMesh`'s scalar field to a
-      marching-cubes triangle mesh at the clock (`_iso_mesh_geometry` → `mcubes.mesh_field`) and emits
-      it under the object's `mesh` key — so the **existing Meshes tab draws the isosurface with zero C++
-      changes** (it renders any object carrying a `mesh`). Verified with a torus isosurface
-      (6.1k verts / 12.2k tris) — smooth shaded surface, orbit/wireframe/colour all work. 1 new test.
-      No VERSION bump (loom-only; the shipped `ftrace.exe` already renders `mesh` keys).
-      - **Still open (the primary path) — RE-SCOPED 2026-07-24 after an architecture audit.** The
+- [x] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** ✅ **primary path
+      DONE 2026-07-24** (v0.56.0), ✅ MC-mesh fallback done 2026-07-24.
+      - **Primary path (in-process raymarch) — DONE 2026-07-24 (v0.56.0).** Took the **in-process**
+        route rather than the `-serve` subprocess: the `-viewer` **is** the ftrace binary, so it already
+        contains both the `.ftsl` parser (`ftsl::load`) and `renderIsoPreviewCuda`. loom's
+        `ViewerModel.save_sidecar` now emits the scene's **`.ftsl` beside the sidecar** and records its
+        absolute path under a new sidecar **`"source"`** key (and a matching `ViewerSession` **`emit`**
+        command re-emits `.ftsl` for a new clock/params over the live channel — for scrub/param/edit).
+        `viewer_gui.cpp` parses `source` with `ftsl::load` and adds a **"Render" tab** (default-selected,
+        the primary view) that calls `renderIsoPreviewCuda(scene, orbitCam, W, H, …)` in-process, blits
+        the RGB frame into a **D3D11 dynamic texture** (`ImGui::…AddImage`), and drives an **orbit camera**
+        (drag = yaw/pitch, wheel = dolly) around the scene bounding sphere; re-renders only on camera
+        change (idle pane is free). Validated end-to-end: a gyroid `build()` → sidecar+`.ftsl` → the
+        viewer's Render tab sphere-traces the real field (identical to `-raster-gpu`, **no tessellation**).
+        This replaces F7's static MC-mesh with the actual field for the native viewer too. New loom tests
+        (6) + the whole loom suite green; C++ compiled with the new `ftsl.h`/`render_cuda.h` includes.
+        *Deferred within F7:* the `-serve` streaming path (only needed if the raymarch is ever pushed to a
+        separate process) and F4's C++ texture display (image/formula → sampled D3D11 texture at mesh UVs).
+      - **How the primary path used to be scoped — RE-SCOPED 2026-07-24 after an architecture audit.** The
         field-raymarcher itself **already exists and already ships**: `-raster-gpu` (feature **G2**) casts
         primary rays straight at the implicit **with NO tessellation** — `renderIsoPreviewCuda` →
         `kIsoPreview` → `closestHit` → `intersectImplicit` sphere-traces the postfix field bytecode

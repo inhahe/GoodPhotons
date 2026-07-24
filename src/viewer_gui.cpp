@@ -32,6 +32,17 @@ int runViewerGui(const std::string&) {
 #include <map>
 #include <unordered_map>
 #include <functional>
+#include <thread>
+
+// Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
+// The viewer IS the ftrace binary, so it can parse loom's emitted `.ftsl` with the
+// exact loader main() uses and render the real isosurface field in-process via
+// renderIsoPreviewCuda — the `-raster-gpu` preview kernel that sphere-traces the
+// field's bytecode with NO tessellation (the static marching-cubes mesh in the
+// sidecar is only a fallback). These headers are plain-C++ (main.cpp includes them
+// under MSVC too); the raymarch itself is guarded by HAVE_CUDA below.
+#include "ftsl.h"
+#include "render_cuda.h"
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -175,6 +186,13 @@ struct Sidecar {
     const minijson::Value* arr(const char* key) const {
         const minijson::Value* v = root.find(key);
         return (v && v->isArray()) ? v : nullptr;
+    }
+    // Absolute path to the scene's `.ftsl` source loom emitted next to the sidecar
+    // (F7). Empty when the sidecar predates the source key or loom skipped it — the
+    // viewer then shows only the static sidecar geometry (no live raymarch).
+    std::string source() const {
+        const minijson::Value* v = root.find("source");
+        return (v && v->isString()) ? v->str : std::string();
     }
 };
 
@@ -1229,6 +1247,159 @@ static void drawDagPanel(DagGraph& g) {
 }
 
 // --------------------------------------------------------------------------
+// Render pane (F7 primary path): raymarch the real field in-process.
+//
+// The viewer parses loom's emitted `.ftsl` (Sidecar::source) with ftrace's own
+// ftsl::load, then renders it through renderIsoPreviewCuda — the same `-raster-gpu`
+// preview kernel `-explore`/`-fly` and stills use, which sphere-traces the
+// isosurface bytecode with NO tessellation. An orbit camera around the scene bounds
+// drives it; each rendered RGB frame is blitted into a D3D11 texture shown with
+// ImGui::Image. Re-rendering happens only when the camera moves (dirty), so an idle
+// pane is free. Compiled only with CUDA (renderIsoPreviewCuda lives in the .cu).
+// --------------------------------------------------------------------------
+#ifdef HAVE_CUDA
+struct RenderPane {
+    // orbit camera around the scene bounding sphere
+    float yaw = 0.6f, pitch = 0.3f;   // radians
+    float distMul = 2.6f;             // eye distance = radius * distMul
+    float fov = 40.0f;                // vertical fov, degrees
+    Vec3  center{0, 0, 0};
+    float radius = 1.0f;
+    bool  inited = false;
+
+    // last raymarched frame -> a dynamic D3D11 texture shown with ImGui::Image
+    ID3D11Texture2D*          tex = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    int  texW = 0, texH = 0;
+    bool dirty = true;
+    int  resLong = 640;               // square raymarch resolution (long edge)
+    std::string status;
+
+    void initFrom(const Scene& s) {
+        center = s.sceneCenter;
+        radius = (s.sceneRadius > 0.0) ? (float)s.sceneRadius : 1.0f;
+        inited = true;
+        dirty  = true;
+    }
+    void release() {
+        if (srv) { srv->Release(); srv = nullptr; }
+        if (tex) { tex->Release(); tex = nullptr; }
+        texW = texH = 0;
+    }
+
+    Camera camera(int W, int H) const {
+        float cp = std::cos(pitch), sp = std::sin(pitch);
+        float cy = std::cos(yaw),   sy = std::sin(yaw);
+        Vec3 dir{ (double)(cp * sy), (double)sp, (double)(cp * cy) };  // center -> eye
+        Vec3 eye = center + dir * (double)(radius * distMul);
+        Camera c;
+        c.lookAt(eye, center, Vec3{0, 1, 0}, fov, W, H);
+        return c;
+    }
+
+    bool upload(const std::vector<uint8_t>& rgb, int W, int H,
+                ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+        if ((int)rgb.size() < W * H * 3) return false;
+        if (!tex || texW != W || texH != H) {
+            release();
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DYNAMIC;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (dev->CreateTexture2D(&td, nullptr, &tex) != S_OK) return false;
+            if (dev->CreateShaderResourceView(tex, nullptr, &srv) != S_OK) { release(); return false; }
+            texW = W; texH = H;
+        }
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (ctx->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms) != S_OK) return false;
+        for (int y = 0; y < H; ++y) {
+            uint8_t* dst = (uint8_t*)ms.pData + (size_t)y * ms.RowPitch;
+            const uint8_t* src = &rgb[(size_t)y * W * 3];
+            for (int x = 0; x < W; ++x) {
+                dst[x * 4 + 0] = src[x * 3 + 0];
+                dst[x * 4 + 1] = src[x * 3 + 1];
+                dst[x * 4 + 2] = src[x * 3 + 2];
+                dst[x * 4 + 3] = 255;
+            }
+        }
+        ctx->Unmap(tex, 0);
+        return true;
+    }
+
+    void render(const Scene& s, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+        int W = resLong, H = resLong;
+        Camera cam = camera(W, H);
+        unsigned hw = std::thread::hardware_concurrency();
+        int nThreads = hw ? (int)hw : 4;
+        std::vector<uint8_t> img =
+            renderIsoPreviewCuda(s, cam, W, H, nThreads, 1.0, true, nullptr);
+        if (img.empty()) { status = "raymarch unavailable (no CUDA device or unsupported scene)"; return; }
+        if (upload(img, W, H, dev, ctx)) { status.clear(); dirty = false; }
+        else status = "D3D11 texture upload failed";
+    }
+};
+
+// The Render tab body: orbit controls + the blitted raymarch image.
+static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
+                           const std::string& sceneErr,
+                           ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    if (!sceneOk) {
+        ImGui::TextWrapped("No live scene to raymarch.");
+        if (!sceneErr.empty()) ImGui::TextWrapped("(%s)", sceneErr.c_str());
+        ImGui::TextWrapped("The sidecar carries no `source` .ftsl (older loom, or "
+                           "emit_source was off). Re-save it with a current loom to "
+                           "enable the in-process field raymarch.");
+        return;
+    }
+    if (!rp.inited) rp.initFrom(scene);
+
+    ImGui::TextUnformatted("GPU field raymarch (renderIsoPreviewCuda) - drag to orbit, wheel to zoom");
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::SliderInt("res", &rp.resLong, 128, 1024)) rp.dirty = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::SliderFloat("fov", &rp.fov, 10.0f, 110.0f, "%.0f deg")) rp.dirty = true;
+    ImGui::SameLine();
+    if (ImGui::Button("re-render")) rp.dirty = true;
+    if (!rp.status.empty()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", rp.status.c_str()); }
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.y < 80.0f) avail.y = 80.0f;
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("render_canvas", avail);
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        rp.yaw   -= d.x * 0.01f;
+        rp.pitch += d.y * 0.01f;
+        const float lim = 1.55f;   // keep the up vector well-defined
+        if (rp.pitch >  lim) rp.pitch =  lim;
+        if (rp.pitch < -lim) rp.pitch = -lim;
+        rp.dirty = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        float w = ImGui::GetIO().MouseWheel;
+        if (w != 0.0f) { rp.distMul *= (1.0f - w * 0.1f); if (rp.distMul < 0.2f) rp.distMul = 0.2f; rp.dirty = true; }
+    }
+
+    if (rp.dirty) rp.render(scene, dev, ctx);
+
+    // Fit the square texture into the pane, centered, preserving aspect.
+    if (rp.srv && rp.texW > 0 && rp.texH > 0) {
+        float side = std::min(avail.x, avail.y);
+        ImVec2 img0(origin.x + 0.5f * (avail.x - side), origin.y + 0.5f * (avail.y - side));
+        ImVec2 img1(img0.x + side, img0.y + side);
+        ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)rp.srv, img0, img1);
+    } else {
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            origin, ImVec2(origin.x + avail.x, origin.y + avail.y), IM_COL32(18, 18, 22, 255));
+    }
+}
+#endif // HAVE_CUDA
+
+// --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
 int runViewerGui(const std::string& sidecarPath) {
@@ -1248,6 +1419,22 @@ int runViewerGui(const std::string& sidecarPath) {
     FieldView fview;
     for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
     MeshView mview;
+
+    // F7 primary path: parse loom's emitted `.ftsl` (Sidecar::source) with ftrace's
+    // own loader so the Render tab can raymarch the real field in-process. Failure is
+    // non-fatal — the viewer still shows the static sidecar geometry.
+    ftsl::Loaded loaded;
+    bool sceneOk = false;
+    std::string sceneErr;
+    const std::string sourcePath = sc.source();
+    if (!sourcePath.empty()) {
+        if (ftsl::load(sourcePath, loaded, sceneErr)) sceneOk = true;
+        else std::fprintf(stderr, "[viewer] could not load scene '%s': %s\n",
+                          sourcePath.c_str(), sceneErr.c_str());
+    }
+#ifdef HAVE_CUDA
+    RenderPane rpane;
+#endif
 
     // --- window ---
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
@@ -1323,7 +1510,24 @@ int runViewerGui(const std::string& sidecarPath) {
         // present, so whichever exists is the default-selected one (no empty tabs).
         bool haveCurves = !curves.empty();
         bool curvesTab = haveCurves || (fields.empty() && meshes.empty());
+#ifdef HAVE_CUDA
+        const bool haveRender = sceneOk;
+#else
+        const bool haveRender = false;
+#endif
         if (ImGui::BeginTabBar("rightTabs")) {
+#ifdef HAVE_CUDA
+            if (haveRender) {
+                // F7 primary path: the in-process raymarch of the real field is the
+                // point of the viewer, so it opens selected.
+                ImGuiTabItemFlags rf = firstFrame ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem("Render", nullptr, rf)) {
+                    drawRenderPane(rpane, loaded.scene, sceneOk, sceneErr,
+                                   g_pd3dDevice, g_pd3dDeviceContext);
+                    ImGui::EndTabItem();
+                }
+            }
+#endif
             if (curvesTab && ImGui::BeginTabItem("Curves")) {
                 if (!strips.empty()) {
                     float paneH = ImGui::GetContentRegionAvail().y * 0.58f;
@@ -1344,8 +1548,9 @@ int runViewerGui(const std::string& sidecarPath) {
             }
             if (!meshes.empty()) {
                 // a swept-mesh scene is "about" its surface, so open on Meshes even
-                // though the internal spine curves also populate the Curves tab
-                ImGuiTabItemFlags mf = firstFrame ? ImGuiTabItemFlags_SetSelected : 0;
+                // though the internal spine curves also populate the Curves tab —
+                // unless the live Render tab is present, which takes priority.
+                ImGuiTabItemFlags mf = (firstFrame && !haveRender) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Meshes", nullptr, mf)) {
                     drawMeshPane(meshes, mview);
                     ImGui::EndTabItem();
@@ -1366,6 +1571,9 @@ int runViewerGui(const std::string& sidecarPath) {
         firstFrame = false;
     }
 
+#ifdef HAVE_CUDA
+    rpane.release();   // free the raymarch texture before the D3D device goes away
+#endif
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImNodes::DestroyContext();

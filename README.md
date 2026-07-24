@@ -2293,9 +2293,14 @@ the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `S
 surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
 lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker
 colouring; orbiting spins the existing tessellation (view-only). `IsoMesh` isosurfaces are
-baked to a marching-cubes mesh and shown in the same Meshes tab. (Early stage: real mesh
-textures and the `-raster-gpu` field-raymarch isosurface path are still in progress — see §F
-in `TODO.md`.)
+baked to a marching-cubes mesh and shown in the same Meshes tab. When the sidecar carries a
+`source` key — the `.ftsl` `save_sidecar` emits beside it — a **Render tab** raymarches the
+*real* isosurface **field** in-process: it parses the `.ftsl` with ftrace's own `ftsl::load`
+and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview
+kernel — no tessellation), driven by an orbit camera (drag to rotate, wheel to dolly) with
+resolution and FOV controls, blitting each converged frame into a D3D11 texture. This is the
+actual field rather than the static marching-cubes mesh. (Still in progress: real mesh
+textures — see §F in `TODO.md`.)
 
 ---
 

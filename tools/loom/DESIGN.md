@@ -425,7 +425,7 @@ tools/loom/
     anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
-    viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1) + live re-introspection server (F4/F7)
+    viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1) + .ftsl source emission (F7) + live re-introspection/emit server (F4/F7)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
   tests/                    unit tests (cycle detection, closed-curve seamlessness, slicer)
 ```
@@ -646,9 +646,14 @@ tools/loom/
   parameter dim** (needs a live viewer↔loom channel, since the static sidecar can't re-bake geometry).
   **F7's MC-mesh fallback is complete:** `_describe_element` bakes each `IsoMesh`'s field to a
   marching-cubes mesh (`_iso_mesh_geometry`→`mcubes.mesh_field`) into the object's `mesh` key, so the
-  existing Meshes tab draws the isosurface with no C++ change. F7's **primary path** — raymarching the
-  field *expression* through `-raster-gpu` (a D3D11 sphere-tracer, no re-tessellation) — remains the one
-  big open §F piece.
+  existing Meshes tab draws the isosurface with no C++ change. **F7's primary path is also complete:**
+  `save_sidecar` now emits the scene's `.ftsl` beside the JSON (via `scene.emit`) and records its path
+  under a `source` key (`emit_source=True` by default); `ViewerSession` gains an **`emit`** command that
+  bakes the scene to `.ftsl` for a given clock/params. In C++ the viewer parses that `.ftsl` with ftrace's
+  own `ftsl::load` and adds a **Render tab** that raymarches the real field in-process via
+  `renderIsoPreviewCuda` (the `-raster-gpu` sphere-tracer — no tessellation), driven by an orbit camera and
+  blitted into a D3D11 texture. This closes the last big open §F piece; the `emit` command also lays the
+  groundwork for F4 off-thread re-tessellation over the live channel.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

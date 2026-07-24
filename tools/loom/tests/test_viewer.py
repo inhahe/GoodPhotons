@@ -504,6 +504,70 @@ def test_session_params_advertises_declared_controls():
     assert ack["params"] == {"radius": 0.12}
 
 
+# --------------------------------------------------------------------------
+# F7 primary path — the .ftsl source the C++ viewer raymarches
+# --------------------------------------------------------------------------
+
+def test_save_sidecar_emits_ftsl_source(tmp_path):
+    # save_sidecar drops a sibling .ftsl and records its absolute path so the
+    # C++ -viewer can parse it and raymarch the real field (the F7 primary path).
+    out = tmp_path / "scene.viewer.json"
+    ViewerModel(build).save_sidecar(str(out))
+    d = json.loads(out.read_text())
+    src = d.get("source")
+    assert src and src.endswith(".ftsl")
+    import os
+    assert os.path.isabs(src) and os.path.exists(src)
+    text = open(src).read()
+    assert "scene {" in text          # a real ftsl document
+
+
+def _sphere_build(clock=None, *, radius=0.25):
+    # a build whose param lands inline in the .ftsl (a Sphere's radius), unlike the
+    # SweptMesh tube which bakes to an external mesh file
+    cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
+    mat = Material("skin", "diffuse")
+    sc = Scene(cam)
+    sc.add(mat, Sphere((0, 0, 0), radius, "skin"), Light("point", intensity=1.0))
+    return sc
+
+
+def test_save_sidecar_source_reflects_params(tmp_path):
+    out = tmp_path / "scene.viewer.json"
+    ViewerModel(_sphere_build, radius=0.42).save_sidecar(str(out))
+    src = json.loads(out.read_text())["source"]
+    # the sphere radius lands inline in the emitted source
+    assert "0.42" in open(src).read()
+
+
+def test_save_sidecar_can_skip_source(tmp_path):
+    out = tmp_path / "scene.viewer.json"
+    ViewerModel(build).save_sidecar(str(out), emit_source=False)
+    d = json.loads(out.read_text())
+    assert "source" not in d
+    assert not (tmp_path / "scene.ftsl").exists()
+
+
+def test_session_emit_inline_returns_ftsl_source():
+    ack = _session().handle({"cmd": "emit"})
+    assert ack["ok"] is True
+    assert "scene {" in ack["source"]
+
+
+def test_session_emit_out_writes_ftsl_file(tmp_path):
+    out = str(tmp_path / "live.ftsl")
+    ack = _session().handle({"cmd": "emit", "out": out})
+    assert ack == {"ok": True, "out": out}
+    assert "scene {" in open(out).read()
+
+
+def test_session_emit_reflects_params():
+    sess = ViewerSession(ViewerModel(_sphere_build))
+    a = sess.handle({"cmd": "emit", "params": {"radius": 0.12}})["source"]
+    b = sess.handle({"cmd": "emit", "params": {"radius": 0.40}})["source"]
+    assert a != b
+
+
 def test_session_unknown_cmd_and_errors_dont_crash():
     assert _session().handle({"cmd": "nope"})["ok"] is False
     # a bad param surfaces as an error ack, not an exception

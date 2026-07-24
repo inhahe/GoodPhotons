@@ -547,10 +547,42 @@ class ViewerModel:
         return introspect(self.scene(clock, **overrides), clock=clock)
 
     def save_sidecar(self, path: str, clock: Optional[Clock] = None,
-                     **overrides: Any) -> None:
-        """Atomically write the introspection sidecar JSON for the viewer."""
-        _atomic_write_text(path, json.dumps(self.introspect(clock, **overrides),
-                                            indent=2))
+                     *, emit_source: bool = True, **overrides: Any) -> None:
+        """Atomically write the introspection sidecar JSON for the viewer.
+
+        With ``emit_source`` (default), also emit the scene's ``.ftsl`` next to the
+        sidecar and record its absolute path under the sidecar's ``"source"`` key,
+        so the C++ ``-viewer`` can parse it with ftrace's own loader and raymarch
+        the real field via ``-raster-gpu`` (``renderIsoPreviewCuda``) — the F7
+        primary path — instead of the static marching-cubes fallback mesh.
+        """
+        scene = self.scene(clock, **overrides)
+        data = introspect(scene, clock=clock)
+        if emit_source:
+            src = self._emit_source(scene, path, clock)
+            if src is not None:
+                data["source"] = src
+        _atomic_write_text(path, json.dumps(data, indent=2))
+
+    @staticmethod
+    def _emit_source(scene: Any, sidecar_path: str,
+                     clock: Optional[Clock]) -> Optional[str]:
+        """Emit ``scene``'s ``.ftsl`` beside ``sidecar_path``; return its abs path.
+
+        Returns ``None`` (and leaves no file) if the scene can't be emitted, so a
+        sidecar is still written — the viewer just falls back to its static mesh.
+        """
+        from .signals.core import Cache
+        try:
+            base = os.path.splitext(os.path.abspath(sidecar_path))[0]
+            ftsl_path = base + ".ftsl"
+            clk = clock if clock is not None else Clock.at_frame(0, 1)
+            assets = os.path.dirname(ftsl_path)
+            text = scene.emit(clk, Cache(), assets_dir=assets)
+            _atomic_write_text(ftsl_path, text)
+            return ftsl_path
+        except Exception:
+            return None
 
 
 def _atomic_write_text(path: str, text: str) -> None:
@@ -593,6 +625,12 @@ class ViewerSession:
       re-derive the scene at that clock/params and introspect it.  With ``out`` the
       sidecar JSON is written there (atomically) and the ack is ``{ok, out}``; else
       the sidecar dict rides back inline as ``{ok, sidecar}``.
+    * ``emit`` — ``{clock?:{…}, params?:{…}, out?:"path"}``: re-derive the scene at
+      that clock/params and emit its ``.ftsl`` (the source ftrace parses to raymarch
+      the real field — the F7 primary path).  With ``out`` the ``.ftsl`` is written
+      there (atomically) and the ack is ``{ok, out}``; else the source text rides
+      back inline as ``{ok, source}``.  This is what the viewer calls on
+      rotate/scrub/param-edit to get freshly re-tessellated geometry (F4).
     * ``params`` — ack ``{ok, params}``: the build's declared keyword controls
       (name→default), so the viewer can build its parameter UI.
     * ``quit`` — stop the serve loop; ack ``{ok, bye:true}``.
@@ -606,6 +644,8 @@ class ViewerSession:
         try:
             if cmd == "introspect":
                 return self._introspect(msg)
+            if cmd == "emit":
+                return self._emit(msg)
             if cmd == "params":
                 return {"ok": True, "params": self.model.declared_params()}
             if cmd == "quit":
@@ -631,6 +671,20 @@ class ViewerSession:
             _atomic_write_text(out, json.dumps(sidecar, indent=2))
             return {"ok": True, "out": out}
         return {"ok": True, "sidecar": sidecar}
+
+    def _emit(self, msg: dict) -> dict:
+        from .signals.core import Cache
+        clock = self._clock(msg.get("clock"))
+        params = {str(k): v for k, v in (msg.get("params") or {}).items()}
+        scene = self.model.scene(clock, **params)
+        clk = clock if clock is not None else Clock.at_frame(0, 1)
+        out = msg.get("out")
+        assets = os.path.dirname(os.path.abspath(out)) if out else None
+        text = scene.emit(clk, Cache(), assets_dir=assets)
+        if out:
+            _atomic_write_text(out, text)
+            return {"ok": True, "out": out}
+        return {"ok": True, "source": text}
 
 
 def serve_viewer(session: ViewerSession, in_stream=None, out_stream=None) -> None:
