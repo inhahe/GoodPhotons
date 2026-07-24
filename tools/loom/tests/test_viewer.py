@@ -153,6 +153,34 @@ def test_introspect_datasets_cover_path_grid_scatter():
     assert path["dim"] == 3 and path["closed"] is True and path["count"] == 4
 
 
+def test_introspect_path_carries_geometry():
+    d = introspect(build())
+    path = [ds for ds in d["datasets"] if ds["kind"] == "path"][0]
+    # control points: 4 points, each 3-D
+    assert len(path["control_points"]) == 4
+    assert all(len(p) == 3 for p in path["control_points"])
+    assert path["control_points"][0] == [0.0, 0.0, 0.0]
+    # polyline: sampled + closed (first point repeated at the end)
+    poly = path["polyline"]
+    assert len(poly) == 96 + 1
+    assert poly[0] == poly[-1]
+    assert all(len(p) == 3 for p in poly)
+
+
+def test_introspect_open_path_polyline_not_wrapped(tmp_path):
+    from loom.data import PointPath
+    from loom.scene import Scene, Camera, Beads
+    cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
+    sc = Scene(cam)
+    sc.add(Beads(PointPath([(0, 0, 0), (1, 1, 1), (2, 0, 0)], closed=False),
+                 count=3, radius=0.1, material="m"))
+    d = introspect(sc)
+    path = [ds for ds in d["datasets"] if ds["kind"] == "path"][0]
+    assert path["closed"] is False
+    assert len(path["polyline"]) == 96          # not wrapped
+    assert path["polyline"][0] != path["polyline"][-1]
+
+
 def test_introspect_dag_nodes_and_edges():
     d = introspect(build())
     dag = d["dag"]

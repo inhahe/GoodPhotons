@@ -47,8 +47,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .signals.core import Clock, walk
 from .data import PointPath, TrackedPath, Grid, Scatter
+from .interp import eval_curve
 
 SIDECAR_VERSION = 1
+
+# how many points to sample along a curve for the viewer's display polyline
+_POLYLINE_SAMPLES = 96
 
 # dataset classes we surface as first-class inspectable data
 _DATASET_KINDS = {
@@ -128,13 +132,33 @@ def _dataset_kind(obj: Any) -> Optional[str]:
     return None
 
 
-def _describe_dataset(obj: Any, kind: str) -> Dict[str, Any]:
+def _curve_geometry(path: Any, clock: Optional[Clock]) -> Dict[str, Any]:
+    """Evaluate a :class:`PointPath`'s control points at ``clock`` and sample a
+    display **polyline** along the interpolated (loop) curve — the actual N-D
+    geometry the viewer's curve pane draws (F2).  Returns ``control_points``
+    (one N-D coord list per control point) and ``polyline`` (``_POLYLINE_SAMPLES``
+    sampled N-D points; a closed curve repeats the first point to visibly close)."""
+    clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+    cps = [list(p.at(clk)) for p in path.points]
+    tup = [tuple(c) for c in cps]
+    n = _POLYLINE_SAMPLES
+    # eval_curve wraps u to [0,1), so sample u = k/n (never hitting 1.0) for both
+    # cases; a closed curve then repeats the first point to visibly close the loop.
+    poly = [list(eval_curve(tup, k / n, path.closed)) for k in range(n)]
+    if path.closed:
+        poly.append(list(poly[0]))
+    return {"control_points": cps, "polyline": poly}
+
+
+def _describe_dataset(obj: Any, kind: str, clock: Optional[Clock]) -> Dict[str, Any]:
     d: Dict[str, Any] = {"id": obj.id, "kind": kind}
     if kind == "path":
         d.update(dim=obj.dim, closed=obj.closed, count=len(obj))
+        d.update(_curve_geometry(obj, clock))
     elif kind == "tracked_path":
         d.update(dim=obj.dim, closed=obj.closed, count=len(obj),
                  tracks=list(obj.tracks.keys()))
+        d.update(_curve_geometry(obj.path, clock))
     elif kind == "grid":
         d.update(ndim=obj.ndim, shape=list(obj.shape),
                  lo=list(obj.lo), hi=list(obj.hi),
@@ -244,7 +268,8 @@ def introspect(scene: Any, *, clock: Optional[Clock] = None) -> Dict[str, Any]:
     Keys: ``version``; ``frame`` (the clock's frame/frames); ``objects`` (the
     geometry elements, Groups recursed, each linking the ``datasets`` it
     references by id); ``datasets`` (every :class:`PointPath` / :class:`TrackedPath`
-    / :class:`Grid` / :class:`Scatter` reachable in the scene); ``camera`` /
+    / :class:`Grid` / :class:`Scatter` reachable in the scene — paths also carry
+    their evaluated ``control_points`` + a sampled display ``polyline``); ``camera`` /
     ``lights`` (minimal); and ``dag`` (the modulator graph — ``nodes`` + ``edges``).
     """
     datasets: Dict[int, Any] = {}
@@ -253,7 +278,7 @@ def introspect(scene: Any, *, clock: Optional[Clock] = None) -> Dict[str, Any]:
     # datasets reachable from camera / materials / lights too (not just geometry)
     for extra in (*scene.materials, *scene.lights, scene.camera):
         _datasets_in(extra, datasets)
-    ds_list = [_describe_dataset(obj, _dataset_kind(obj))
+    ds_list = [_describe_dataset(obj, _dataset_kind(obj), clock)
                for obj in datasets.values()]
     ds_list.sort(key=lambda d: d["id"])
     frame = {"frame": clock.frame, "frames": clock.frames} if clock else \
