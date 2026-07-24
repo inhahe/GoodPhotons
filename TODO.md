@@ -729,7 +729,34 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       python-blosc on the official OpenVDB smoke/sphere/cube samples and render-validated
       (`scraps/vdb_smoke_native.ftsl`). Other blosc codecs (BloscLZ/Zlib/Zstd) + ZIP report a clear
       "re-export with LZ4" message — see known-issues.md.
-- [ ] **C5 Mesh: emissive triangles** (mesh area lights).
+- [x] **C5 Mesh: emissive triangles** (mesh area lights).  **DONE 2026-07-24**.
+      Any material may carry an `emit <spd>` spectrum; a `mesh` bound to it becomes an
+      `EmitterShape::Mesh` area light. `scene.h` adds `EmitTri`/`Emitter::meshTris` (a
+      per-triangle cumulative-area CDF), a `samplePoint` Mesh branch (binary-search a
+      triangle by area, then barycentric sample; pdf = 1/total-area), and
+      `Scene::addMeshLight`. Emission-on-hit was already generic (`m.isLight`/`m.emit`);
+      NEE / forward emission / BDPT s=0 all consume the new emitter through the existing
+      `samplePoint` + 1/area paths — no per-renderer changes. `ftsl.h`: `buildMaterial`
+      parses `emit` (sets `isLight`); `addMesh` auto-registers the emitter and, with a
+      mesh-block `power`/`lumens`, rescales the SPD over the mesh area (clones the
+      material + rebinds the range's triangles so a shared material is untouched); the
+      "scene has no light" guard now also accepts an emissive mesh. GPU: `DEmitter`
+      gains a device `DEmitTri*` CDF + `emitterSamplePoint` shape-5 branch + per-emitter
+      upload (fixes a crash where a Mesh emitter fell through to the quad path with a
+      null CDF). Emission is one-sided (front face only), so a CLOSED emissive mesh
+      whose triangles are wound INWARD (e.g. an imported `torus.obj`, every face facing
+      the interior) would radiate into its own hollow and look black; `addMesh` now
+      auto-orients such shells outward at load — signed volume about the centroid < 0
+      (thresholded against area^1.5 so planar/open sheets are never touched) reverses
+      every triangle's winding (swap v1↔v2 + uv/normal, re-`finalize()`) before emitter
+      registration, so both the per-Tri geometric normals used by emission-on-hit and
+      the `addMeshLight` sampler normals point outward. Validated CPU **and** GPU: an
+      emissive quad mesh reproduces an equivalent `light area` visually
+      (`scraps/cmp_meshlight.ftsl` vs `cmp_arealight.ftsl`), and a 16384-tri inward-wound
+      emissive torus (`scraps/mesh_light.ftsl`) now glows and lights the Cornell box on
+      both backends with matching results (overall/torus/red-wall/green-wall means agree
+      to <1%). glTF/GLB meshes that import their own materials are not auto-lit (bind an
+      FTSL `emit` material) — noted in known-issues.
 - [ ] **C6 Mesh: tangent-space normal maps.**
 - [x] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.  **DONE 2026-07-18**.
       Replaced Möller–Trumbore with the Woop/Benthin/Wald/Áfra watertight test (JCGT 2013) on BOTH the

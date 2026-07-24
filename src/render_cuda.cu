@@ -527,16 +527,23 @@ struct DMedium {
     double            rbLam0, rbDLam; // wavelength axis origin/step (nm)
 };
 
+// One triangle of a Mesh emitter (mirrors host EmitTri): v0 + two edge vectors, the
+// unit normal, and the inclusive cumulative-area CDF value used for area sampling.
+struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; };
+
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
 struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
-    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder (EmitterShape)
+    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh
     double radius;             // sphere radius (shape==1) / tube radius (shape==4)
     int    caps;               // cylinder (shape==4): also emit from the two end discs
     double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
+    // Mesh area light (shape==5): device pointer to this emitter's triangle CDF and its
+    // count. nullptr/0 for every other shape. area == sum of the triangle areas.
+    const DEmitTri* meshTris; int meshTriN;
     int    cdfOffset, cdfN;
     double cdfStep;
     // BDPT (mode D) extras. matId links this emitter to its emissive surface material
@@ -601,6 +608,28 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
             y = em.origin + em.v * (Real)u1 + rad * (Real)em.radius;
             nOut = rad;
         }
+    } else if (em.shape == 5) {
+        // Mesh area light: pick a triangle with probability proportional to its area
+        // (binary-search u1*area over the cumulative-area CDF), remap the leftover to a
+        // fresh uniform, then sample the chosen triangle barycentrically (mirrors host
+        // Emitter::samplePoint's Mesh branch). pdf = 1/area over the whole surface.
+        double target = u1 * em.area;
+        int lo = 0, hi = em.meshTriN;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (em.meshTris[mid].cumArea < target) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo >= em.meshTriN) lo = em.meshTriN - 1;
+        const DEmitTri& t = em.meshTris[lo];
+        double prev = (lo == 0) ? 0.0 : em.meshTris[lo - 1].cumArea;
+        double span = t.cumArea - prev;
+        double uu = (span > 0.0) ? (target - prev) / span : u1;
+        double su = sqrt(fmax(0.0, uu));
+        double b1 = 1.0 - su;
+        double b2 = u2 * su;
+        y = t.v0 + t.e1 * (Real)b1 + t.e2 * (Real)b2;
+        nOut = t.nrm;
     } else {
         y = em.origin + em.u * (Real)u1 + em.v * (Real)u2;
         nOut = em.normal;
@@ -8189,9 +8218,27 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.shape = (e.shape == EmitterShape::Sphere)   ? 1
                  : (e.shape == EmitterShape::Spot)     ? 2
                  : (e.shape == EmitterShape::Env)      ? 3
-                 : (e.shape == EmitterShape::Cylinder) ? 4 : 0;
+                 : (e.shape == EmitterShape::Cylinder) ? 4
+                 : (e.shape == EmitterShape::Mesh)     ? 5 : 0;
         de.radius = e.radius;
         de.caps = e.caps ? 1 : 0;
+        // Mesh area light: upload this emitter's triangle CDF to the device and point the
+        // DEmitter at it (device pointer inside a POD later uploaded to device memory).
+        // Every non-mesh emitter keeps a null pointer so nothing dereferences garbage.
+        de.meshTris = nullptr; de.meshTriN = 0;
+        if (e.shape == EmitterShape::Mesh && !e.meshTris.empty()) {
+            std::vector<DEmitTri> dtris(e.meshTris.size());
+            for (size_t i = 0; i < e.meshTris.size(); ++i) {
+                const EmitTri& s = e.meshTris[i];
+                dtris[i].v0  = {(Real)s.v0.x,  (Real)s.v0.y,  (Real)s.v0.z};
+                dtris[i].e1  = {(Real)s.e1.x,  (Real)s.e1.y,  (Real)s.e1.z};
+                dtris[i].e2  = {(Real)s.e2.x,  (Real)s.e2.y,  (Real)s.e2.z};
+                dtris[i].nrm = {(Real)s.nrm.x, (Real)s.nrm.y, (Real)s.nrm.z};
+                dtris[i].cumArea = s.cumArea;
+            }
+            de.meshTris = (const DEmitTri*)keep(uploadVec(dtris));
+            de.meshTriN = (int)dtris.size();
+        }
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
         de.cdfOffset = (int)cdfAll.size();

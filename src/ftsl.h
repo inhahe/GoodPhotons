@@ -835,7 +835,13 @@ public:
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) { if (!addMedium(*mb, L)) return false; }
-        if (!haveLight) { fail("scene has no 'light' block"); return false; }
+        // A scene is lit if it has an explicit `light` block OR any emitter was
+        // registered implicitly — e.g. an emissive mesh (a material with `emit` bound
+        // to a mesh registers a Mesh area light in addMesh).
+        if (!haveLight && L.scene.emitters.empty()) {
+            fail("scene has no light: add a 'light' block or an emissive ('emit') mesh");
+            return false;
+        }
         // Catch errors recorded via fail() inside add* helpers that returned true
         // without re-checking `err` (e.g. an unknown `spd preset:`/`spectrum:` name
         // in a light or material silently falls back otherwise). Any recorded error
@@ -2019,6 +2025,18 @@ private:
         // (only consulted for dielectric-like ones); unset => the ahead-of-time audit
         // warns if this material overlaps another dielectric without a priority.
         if (find(b, "priority")) m.priority = (int)std::lround(dblOf(b, "priority", 0.0));
+        // Emissive surfaces (§ mesh area lights): any material may carry an `emit`
+        // spectrum, turning every triangle it is bound to into a light that radiates
+        // `emit(lambda)` from its front face. This drives emission-on-hit generically
+        // (m.isLight + m.emit, already consumed by every renderer); a mesh bound to
+        // such a material is additionally registered as a Mesh area emitter in addMesh
+        // so NEE / forward emission sample it. The SPD is radiance per unit solid angle
+        // per unit area (absolute if the scene is absolute); a mesh block's optional
+        // `power`/`lumens` rescales it there to hit a target flux over the mesh area.
+        if (find(b, "emit")) {
+            m.emit = spectrumParam(b, "emit", constantSpectrum(0.0));
+            m.isLight = true;
+        }
         return m;
     }
 
@@ -2274,6 +2292,77 @@ private:
             g.blasId   = -1;
             g.matId    = id;
             L.scene.meshGroups.push_back(std::move(g));
+        }
+        // Emissive mesh → register a Mesh area light (§ mesh area lights). When the
+        // bound material carries an `emit` spectrum, the triangles just appended form
+        // one area light: emission-on-hit already works via m.isLight/m.emit, and this
+        // adds the emitter so NEE / forward emission sample the mesh. An optional
+        // `power`/`lumens` on the mesh block rescales the SPD to a target flux over the
+        // mesh's total area; to keep emission-on-hit consistent (and not disturb the
+        // material if it is shared with a non-emissive or differently-scaled mesh), the
+        // scaled case clones the material, rebinds this range's triangles to the clone,
+        // and registers the emitter against the clone. Only the single-material OBJ/FBX
+        // path is handled (glTF meshes that import their own materials are not auto-lit).
+        if (id >= 0 && id < (int)L.scene.mats.size() && L.scene.mats[id].isLight &&
+            L.scene.tris.size() > triStart) {
+            size_t triEnd = L.scene.tris.size();
+            // Orient a CLOSED emissive mesh outward. Emission is one-sided (radiates
+            // along each triangle's geometric normal / front face only), so an
+            // inward-wound imported shell — e.g. torus.obj, all faces wound toward the
+            // interior — would emit into its own hollow and look black from outside.
+            // Detect closure via the signed volume about the centroid: for a closed
+            // shell |V| = enclosed volume and sign follows the winding (negative =
+            // inward); for a planar/open sheet V≈0. If V is negative AND large enough to
+            // be a real enclosed volume (thresholded against area^1.5 so open meshes are
+            // never touched), reverse every triangle's winding so its front face — and
+            // thus its emission — points OUTWARD. This runs before emitter registration
+            // so both the per-Tri geometric normals used by emission-on-hit and the
+            // addMeshLight sampler normals come out consistent.
+            {
+                size_t n = triEnd - triStart;
+                Vec3 cen{0, 0, 0};
+                for (size_t t = triStart; t < triEnd; ++t) {
+                    const Tri& tr = L.scene.tris[t];
+                    cen = cen + tr.v0 + tr.v1 + tr.v2;
+                }
+                cen = cen / (3.0 * (double)n);
+                double vol = 0.0, area2 = 0.0;
+                for (size_t t = triStart; t < triEnd; ++t) {
+                    const Tri& tr = L.scene.tris[t];
+                    Vec3 a = tr.v0 - cen, bb = tr.v1 - cen, cc = tr.v2 - cen;
+                    vol += dot(a, cross(bb, cc));
+                    area2 += length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+                }
+                vol /= 6.0;
+                double area = 0.5 * area2;
+                if (vol < -1e-6 * std::pow(area, 1.5)) {
+                    for (size_t t = triStart; t < triEnd; ++t) {
+                        Tri& tr = L.scene.tris[t];
+                        std::swap(tr.v1, tr.v2);
+                        std::swap(tr.uv1, tr.uv2);
+                        std::swap(tr.n1, tr.n2);
+                        tr.finalize();
+                    }
+                }
+            }
+            if (find(b, "power") || find(b, "lumens")) {
+                // Total front-facing area of the range → power law geomW = area*PI.
+                double area = 0.0;
+                for (size_t t = triStart; t < triEnd; ++t) {
+                    const Tri& tr = L.scene.tris[t];
+                    area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+                }
+                Spectrum scaled = absPower(b, L.scene.mats[id].emit, area * PI, L);
+                Material clone = L.scene.mats[id];
+                clone.emit = scaled;
+                int newId = (int)L.scene.mats.size();
+                L.scene.mats.push_back(std::move(clone));
+                for (size_t t = triStart; t < triEnd; ++t) L.scene.tris[t].matId = newId;
+                L.scene.addMeshLight(triStart, triEnd - triStart, scaled, binWidth_, newId);
+            } else {
+                L.scene.addMeshLight(triStart, triEnd - triStart,
+                                     L.scene.mats[id].emit, binWidth_, id);
+            }
         }
         // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
         // is approximated by its box — true containment is deferred, see known-issues).

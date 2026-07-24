@@ -39,7 +39,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   PNG/PPM output.
 - **`scene.h` / `ftsl.h`** — scene model and the FTSL scene-language parser
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
-  `FTSL.md` documents the language.
+  `FTSL.md` documents the language. Lights are `Emitter`s with an `EmitterShape`
+  (Quad/Sphere/Spot/Env/Cylinder/**Mesh**); each carries its own SPD and a `power`
+  = emitIntegral·geomWeight selection weight. **Mesh area lights** (since 0.41.0): a
+  material with an `emit` spectrum bound to a `mesh` registers an
+  `EmitterShape::Mesh` emitter (`Scene::addMeshLight`) holding a per-triangle
+  cumulative-area CDF (`Emitter::meshTris`, `EmitTri`); `samplePoint` binary-searches
+  the CDF to pick a triangle by area then samples it barycentrically (pdf = 1/total
+  area — the same law as a quad, so NEE / forward emission / BDPT s=0 all consume it
+  through the existing generic paths). `ftsl.h addMesh` auto-registers it and, with a
+  mesh-block `power`/`lumens`, rescales the SPD over the mesh area (cloning the
+  material + rebinding the range's triangles so a shared material is untouched).
+  Emission is one-sided (front face), so `addMesh` auto-orients a *closed* emissive
+  shell outward before registration: it computes the signed volume about the range's
+  centroid and, if it is negative (inward winding) and large enough to be a real
+  enclosed volume (thresholded vs area^1.5, so planar/open sheets are left alone),
+  reverses every triangle (swap v1↔v2 + uv/shading-normal, re-`finalize()`). This
+  keeps an inward-wound import (e.g. `torus.obj`) from radiating into its own hollow.
+  The GPU mirrors the sampler: `DEmitter` gains a device `DEmitTri*` CDF +
+  `emitterSamplePoint` shape-5 branch, uploaded per emitter.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning).

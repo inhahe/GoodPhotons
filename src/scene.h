@@ -446,7 +446,11 @@ struct Sensor {
 // phase-space volume 4*PI^2*R^2 (R = scene bounding radius), so total power =
 // emitIntegral*4*PI^2*R^2; forward photons are emitted from a disk of radius R on
 // the bounding sphere and the backward tracer picks it up on ray misses.
-enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder };
+// A Mesh emitter is an arbitrary emissive triangle soup sharing one SPD/material:
+// samplePoint area-samples uniformly across all its triangles (pick a tri by a
+// cumulative-area CDF, then barycentric point), so a glowing OBJ / tessellated shape
+// acts as one area light. Its "geometric weight" is the same area*PI as a quad.
+enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh };
 
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
@@ -462,6 +466,15 @@ inline double spotFalloff(double ct, double cosInner, double cosOuter) {
 // power-weighted CDF. The geometric weight is area*PI for area/sphere lights and
 // the falloff-weighted solid angle spotOmega for a spot. For a collimated Quad
 // every photon fires along `beamDir` from that quad (the prism demo).
+// One triangle of a Mesh emitter, precomputed for uniform area sampling: v0 is a
+// vertex, e1/e2 are the two edge vectors from it, nrm is the unit geometric normal,
+// and cumArea is the running (inclusive) sum of triangle areas up to and including
+// this one — so a binary search over cumArea picks a triangle in proportion to area.
+struct EmitTri {
+    Vec3 v0, e1, e2, nrm;
+    double cumArea = 0.0;
+};
+
 struct Emitter {
     Vec3 origin, u, v, normal;
     double area = 0.0;
@@ -484,6 +497,7 @@ struct Emitter {
     double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
     double spotOmega = 0.0;   // spot falloff-weighted solid angle = PI*(2-ci-co)
     double envGeom = 0.0;     // env phase-space weight 4*PI^2*R^2 (Env; set in build())
+    std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
@@ -545,6 +559,30 @@ struct Emitter {
                 y = origin + v * u1 + rad * radius;
                 nOut = rad;                            // unit outward normal
             }
+        } else if (shape == EmitterShape::Mesh) {
+            // Uniform over the whole triangle soup: pick a triangle with probability
+            // proportional to its area (binary-search u1*area over the cumulative-area
+            // CDF), remap the leftover to a fresh [0,1) uniform, then sample the chosen
+            // triangle barycentrically. Combined density is 1/area over the surface, so
+            // the caller's pdf = 1/area law holds exactly as for a quad.
+            double target = u1 * area;
+            // Lower-bound: first triangle whose inclusive cumArea >= target.
+            size_t lo = 0, hi = meshTris.size();
+            while (lo < hi) {
+                size_t mid = (lo + hi) >> 1;
+                if (meshTris[mid].cumArea < target) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo >= meshTris.size()) lo = meshTris.size() - 1;
+            const EmitTri& t = meshTris[lo];
+            double prev = (lo == 0) ? 0.0 : meshTris[lo - 1].cumArea;
+            double span = t.cumArea - prev;
+            double uu = (span > 0.0) ? (target - prev) / span : u1; // remap within tri
+            double su = std::sqrt(std::max(0.0, uu));
+            double b1 = 1.0 - su;
+            double b2 = u2 * su;
+            y = t.v0 + t.e1 * b1 + t.e2 * b2;
+            nOut = t.nrm;
         } else {
             y = origin + u * u1 + v * u2;
             nOut = normal;
@@ -815,6 +853,39 @@ struct Scene {
         e.area = 2.0 * PI * r * len + (caps ? 2.0 * PI * r * r : 0.0);
         e.caps = caps;
         e.shape = EmitterShape::Cylinder; e.matId = matId;
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
+    // Register a mesh area light over the triangles Scene::tris[triStart, triStart+
+    // triCount): the whole emissive triangle soup acts as one area light with a shared
+    // SPD. Builds a cumulative-area CDF from the triangles (skipping any degenerate
+    // zero-area ones) so samplePoint draws uniformly over the total surface; area = sum
+    // of triangle areas feeds the same power law (power = emitIntegral*area*PI) and the
+    // same 1/area point-sampling pdf as a quad. Call after the triangles are appended
+    // to Scene::tris. If every triangle is degenerate, registers nothing.
+    void addMeshLight(size_t triStart, size_t triCount, const Spectrum& spd,
+                      double stepNm, int matId = -1) {
+        Emitter e;
+        e.shape = EmitterShape::Mesh; e.matId = matId;
+        double total = 0.0;
+        size_t end = triStart + triCount;
+        if (end > tris.size()) end = tris.size();
+        for (size_t i = triStart; i < end; ++i) {
+            const Tri& t = tris[i];
+            Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;
+            Vec3 nc = cross(e1, e2);
+            double a = 0.5 * length(nc);
+            if (a <= 0.0) continue;               // skip degenerate triangles
+            total += a;
+            EmitTri et;
+            et.v0 = t.v0; et.e1 = e1; et.e2 = e2;
+            et.nrm = nc / (2.0 * a);              // == normalize(cross(e1,e2))
+            et.cumArea = total;
+            e.meshTris.push_back(et);
+        }
+        if (e.meshTris.empty() || total <= 0.0) return; // nothing emissive
+        e.area = total;
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
     }

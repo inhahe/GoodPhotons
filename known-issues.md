@@ -1721,10 +1721,12 @@ follow-up, not a bug:
   strength, sheen, specular). A glass glTF loads as an opaque glossy/diffuse, not a
   dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
   `MatType::Dielectric` with the given ior; other extensions as feasible.
-- **No `emissiveFactor` import.** Emissive glTF materials load unlit. (Intentionally
-  skipped for now: setting `emit` without registering the tris as a sampled light would
-  desync NEE; doing it right means adding mesh-emitter area lights — tied to ROADMAP §5
-  "emissive triangles".)
+- **No `emissiveFactor` import.** Emissive glTF materials load unlit. The underlying
+  mechanism now exists — mesh-emitter area lights shipped in 0.41.0 (C5): an FTSL `emit`
+  material bound to a `mesh` registers an `EmitterShape::Mesh` sampled light. What's
+  missing is wiring glTF's `emissiveFactor`/`KHR_materials_emissive_strength` into that
+  path (set `Material::emit` from the factor and call `Scene::addMeshLight` for the
+  imported range). Bind an FTSL `emit` material to the mesh as a workaround.
 - **No skinning, morph targets, animation, or sparse accessors.** Static bind pose only.
 - **Non-triangle primitives** (points/lines/strips/fans, `mode != 4`) are skipped with a
   note; only `mode 4` (TRIANGLES) is baked.
@@ -3499,9 +3501,11 @@ correctly on **both** backends.
     smooth dielectric (no rough transmission in FTSL); plastic/roughplastic →
     glossy (diffuse+specular coat merged); bumpmap/normalmap dropped to base BSDF;
     mask opacity ignored; `.ply`/`.serialized` meshes emitted as `mesh` lines but
-    ftrace's loader is OBJ-only (convert first); mesh area-emitters have no FTSL
-    equivalent (emitted as lit geometry, emission dropped); mesh `to_world` with
-    rotation/shear only partly expressible (translate+scale + euler).
+    ftrace's loader is OBJ-only (convert first); mesh `to_world` with
+    rotation/shear only partly expressible (translate+scale + euler). (Mesh
+    area-emitters *do* now have an FTSL equivalent — a `mesh` bound to an `emit`
+    material, since 0.41.0 — so the exporter could emit that instead of dropping the
+    emission; not yet wired up.)
   - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
     support (needs an emissive-triangle light primitive in the core); rough
     transmission material.

@@ -1117,6 +1117,26 @@ mode**: the film is physically linear, the auto-exposure is replaced by a fixed
 sensor gain, and `iso`/`shutter`/`exposure` become true absolute stops (doubling
 `power` is exactly one stop brighter). See `scenes/absolute.ftsl`.
 
+**Emissive meshes (mesh area lights).** Any material may carry an **`emit <spd>`**
+spectrum (e.g. `material "glow" { type diffuse reflect rgb 0.02 0.02 0.02 emit
+preset:bb6500 }`). A `mesh` bound to such a material becomes a real **area light**:
+every triangle it appended radiates `emit(λ)` from its front face, and the whole
+triangle soup is registered as one emitter that next-event estimation, forward
+photon emission and BDPT all sample uniformly by triangle area (pick a triangle from
+a cumulative-area CDF, then a barycentric point; pdf = 1/total-area, the same law as
+a quad light). So an arbitrary glowing shape — a torus ring, a tessellated logo, an
+imported OBJ — lights the scene like a physically-sized luminaire, on both CPU and
+GPU. An optional `power`/`lumens` on the mesh block rescales the SPD to that flux
+over the mesh's total area (cloning the material so a shared material isn't
+disturbed). Emission is **one-sided** (front face only); a closed shell whose
+triangles happen to be wound *inward* (common in imported OBJs) would otherwise
+radiate into its own interior and look black, so such shells are auto-oriented
+outward at load — the loader flips the winding of any emissive mesh that encloses a
+volume with inward orientation, leaving flat/open sheets (which enclose no volume)
+exactly as authored. Emissive meshes count as lights, so a scene lit *only* by one
+needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
+are not auto-lit; bind an FTSL `emit` material instead.)
+
 ---
 
 ## Geometry
