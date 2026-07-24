@@ -1461,12 +1461,25 @@ replacement for the renderer or the primary editing tool.**
       changes** (it renders any object carrying a `mesh`). Verified with a torus isosurface
       (6.1k verts / 12.2k tris) — smooth shaded surface, orbit/wireframe/colour all work. 1 new test.
       No VERSION bump (loom-only; the shipped `ftrace.exe` already renders `mesh` keys).
-      - **Still open (the primary path):** raymarching the isosurface **through `-raster-gpu`** — the
-        whole reason for the native viewer, letting the user *modify* the field and see it re-evaluated
-        fast with no re-tessellation. That needs the loom field **expression** (an ftsl `function { expr }`
-        string, which `Isosurface.emit` already produces) emitted into the sidecar, then compiled into a
-        D3D11 pixel-shader sphere-tracer in the viewer (or driven over the `ftrace -serve` pipe). Large;
-        the MC mesh is the working stand-in until then. Textures via **G5**.
+      - **Still open (the primary path) — RE-SCOPED 2026-07-24 after an architecture audit.** The
+        field-raymarcher itself **already exists and already ships**: `-raster-gpu` (feature **G2**) casts
+        primary rays straight at the implicit **with NO tessellation** — `renderIsoPreviewCuda` →
+        `kIsoPreview` → `closestHit` → `intersectImplicit` sphere-traces the postfix field bytecode
+        (`render_cuda.cu` ~L1801/2201), the *same* field VM the full path tracer uses. And it is already
+        the **shared** preview renderer: the `rasterOne` lambda (`main.cpp` ~L4923) routes *every* preview
+        consumer through it — single stills, flyby frames, **and the interactive `-explore`/`-fly` loop +
+        the camera-curve editor inside it**. So `-explore`/`-fly`/the editor **already raymarch the field
+        live, no re-tessellation**, whenever launched with `-raster-gpu`. The one consumer NOT yet using it
+        is the **native ImGui `-viewer`**, which still shows F7's static **MC-mesh fallback**.
+      - **So F7's remaining work is NOT a new raymarcher** (and NOT a duplicate D3D11/HLSL field VM in the
+        viewer — that would fork the evaluator). It's a **bridge**: drive the existing `-raster-gpu`
+        raymarcher over the **`ftrace -serve` pipe** and blit its frames into the viewer pane, reusing the
+        §F4/§F7 **live re-introspection channel** (`ViewerSession`/`serve_viewer`, loom half done
+        2026-07-24) + the M12 resident `-serve` server. When the user edits the field, loom re-emits the
+        `.ftsl` (the `function { expr }` `Isosurface.emit` already produces) → the resident `-raster-gpu
+        -serve` re-renders instantly. This is **C++ interactive-viewer work** (spawn/drive the resident
+        process, present its frames, wire scrub/param/edit) — best done with the user present; the MC mesh
+        is the working stand-in until then. Textures via **G5** + the F4 material/texture sidecar (done).
 
 ---
 
